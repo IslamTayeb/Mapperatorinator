@@ -74,6 +74,9 @@ class InferenceConfig:
     timer_iterations: int = 20  # Number of iterations for timer
     use_server: bool = True  # Use server for optimized multiprocess inference
     max_batch_size: int = 16  # Maximum batch size for inference (only used for parallel sampling or super timing)
+    profile_inference: bool = False  # Write stage and generation timing profile JSON
+    profile_output_path: Optional[str] = None  # Path to write profile JSON; defaults next to generated beatmap
+    profile_sync_cuda: bool = True  # Synchronize CUDA around profiled regions for accurate timings
     resnap_events: bool = True  # Resnap notes to the timing after generation
     snap_near_perfect_overlaps: bool = True  # Snap nearly overlapping positions to each other
 

@@ -54,14 +54,21 @@ def _build_generation_stats(
         elapsed_seconds: float,
 ) -> dict:
     prompt_token_counts = _prompt_token_counts(model_kwargs, pad_token_id)
-    generated_token_counts = _output_token_counts(result, pad_token_id)
+    output_token_counts = _output_token_counts(result, pad_token_id).cpu()
+    generated_token_counts = output_token_counts.clone()
     if prompt_token_counts is not None:
         generated_token_counts = torch.clamp(generated_token_counts - prompt_token_counts, min=0)
 
     generated_tokens = int(generated_token_counts.sum().item())
     tokens_per_second = generated_tokens / elapsed_seconds if elapsed_seconds > 0 else 0.0
+    prompt_tokens = int(prompt_token_counts.sum().item()) if prompt_token_counts is not None else None
 
     return {
+        "batch_size": int(result.shape[0]),
+        "prompt_tokens": prompt_tokens,
+        "prompt_tokens_per_sample": prompt_token_counts.tolist() if prompt_token_counts is not None else None,
+        "output_tokens": int(output_token_counts.sum().item()),
+        "output_tokens_per_sample": output_token_counts.tolist(),
         "generated_tokens": generated_tokens,
         "generated_tokens_per_sample": generated_token_counts.tolist(),
         "elapsed_seconds": float(elapsed_seconds),
@@ -152,6 +159,13 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
 
     result = result.cpu()
     stats = _build_generation_stats(result, model_kwargs, pad_token_id, elapsed_seconds)
+    stats.update({
+        "precision": precision,
+        "context_type": context_type.value if context_type is not None else None,
+        "num_beams": int(generate_kwargs.get("num_beams", 1)),
+        "cfg_scale": float(cfg_scale),
+        "do_sample": bool(generate_kwargs.get("do_sample", False)),
+    })
 
     return result, stats
 
@@ -298,6 +312,11 @@ class InferenceServer:
                         'event': response_event,
                         'result': None,
                         'generated_tokens': 0,
+                        'prompt_tokens': 0,
+                        'output_tokens': 0,
+                        'generated_tokens_per_sample': [],
+                        'prompt_tokens_per_sample': [],
+                        'output_tokens_per_sample': [],
                         'elapsed_seconds': 0.0,
                     }
 
@@ -371,17 +390,27 @@ class InferenceServer:
 
                 outputs, stats = model_generate(self.model, self.tokenizer, model_kwargs, generate_kwargs)
                 generated_tokens_per_sample = stats.get('generated_tokens_per_sample', [])
+                prompt_tokens_per_sample = stats.get('prompt_tokens_per_sample') or []
+                output_tokens_per_sample = stats.get('output_tokens_per_sample', [])
 
                 # Split and dispatch results
                 batch_i = 0
                 for i, (_, request, work_done) in enumerate(batch_requests):
                     padding = paddings[i]
                     out = outputs[batch_i:batch_i + work_done, padding:]  # Remove padding from the left
-                    request_generated_tokens = sum(generated_tokens_per_sample[batch_i:batch_i + work_done])
+                    request_generated_counts = generated_tokens_per_sample[batch_i:batch_i + work_done]
+                    request_prompt_counts = prompt_tokens_per_sample[batch_i:batch_i + work_done]
+                    request_output_counts = output_tokens_per_sample[batch_i:batch_i + work_done]
+                    request_generated_tokens = sum(request_generated_counts)
                     batch_i += work_done
                     request['result'] = out if request['result'] is None else torch.cat((request['result'], out), dim=0)
                     request['work_done'] += work_done
                     request['generated_tokens'] += request_generated_tokens
+                    request['prompt_tokens'] += sum(request_prompt_counts)
+                    request['output_tokens'] += sum(request_output_counts)
+                    request['generated_tokens_per_sample'].extend(request_generated_counts)
+                    request['prompt_tokens_per_sample'].extend(request_prompt_counts)
+                    request['output_tokens_per_sample'].extend(request_output_counts)
                     request['elapsed_seconds'] += stats.get('elapsed_seconds', 0.0)
                     if request['work_done'] >= request['total_work']:
                         # All work done for this record, signal completion
@@ -390,9 +419,20 @@ class InferenceServer:
                         request['result'] = {
                             'output': request['result'],
                             'stats': {
+                                'batch_size': request['total_work'],
+                                'prompt_tokens': request['prompt_tokens'],
+                                'prompt_tokens_per_sample': request['prompt_tokens_per_sample'],
+                                'output_tokens': request['output_tokens'],
+                                'output_tokens_per_sample': request['output_tokens_per_sample'],
                                 'generated_tokens': generated_tokens,
+                                'generated_tokens_per_sample': request['generated_tokens_per_sample'],
                                 'elapsed_seconds': elapsed_seconds,
                                 'tokens_per_second': generated_tokens / elapsed_seconds if elapsed_seconds > 0 else 0.0,
+                                'precision': stats.get('precision'),
+                                'context_type': stats.get('context_type'),
+                                'num_beams': stats.get('num_beams'),
+                                'cfg_scale': stats.get('cfg_scale'),
+                                'do_sample': stats.get('do_sample'),
                             },
                         }
                         request['event'].set()

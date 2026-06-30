@@ -26,6 +26,7 @@ from osuT5.osuT5.config import TrainConfig
 from osuT5.osuT5.dataset.data_utils import events_of_type, TIMING_TYPES, merge_events
 from osuT5.osuT5.inference import Preprocessor, Processor, Postprocessor, BeatmapConfig, GenerationConfig, \
     generation_config_from_beatmap, beatmap_config_from_beatmap, background_line
+from osuT5.osuT5.inference.profiler import InferenceProfiler
 from osuT5.osuT5.inference.server import InferenceClient
 from osuT5.osuT5.inference.super_timing_generator import SuperTimingGenerator
 from osuT5.osuT5.model import Mapperatorinator
@@ -425,31 +426,58 @@ def generate(
         refine_model=None,
         verbose=True,
         logger=None,
+        profiler: InferenceProfiler | None = None,
 ):
     audio_path = args.audio_path if audio_path is None else audio_path
     beatmap_path = args.beatmap_path if beatmap_path is None else beatmap_path
     output_path = args.output_path if output_path is None else output_path
     logger = get_default_logger() if logger is None else logger.getChild(__name__)
+    profiler = profiler or InferenceProfiler.from_args(args)
+    profiler.set_metadata(
+        audio_path=audio_path,
+        beatmap_path=beatmap_path,
+        output_path=output_path,
+        model_path=args.model_path,
+        device=args.device,
+        precision=args.precision,
+        attn_implementation=args.attn_implementation,
+        use_server=args.use_server,
+        parallel=args.parallel,
+        max_batch_size=args.max_batch_size,
+        in_context=[context.value for context in args.in_context],
+        output_type=[context.value for context in args.output_type],
+    )
 
     # Do some validation
-    if not Path(audio_path).exists() or not Path(audio_path).is_file():
-        raise FileNotFoundError(f"Provided audio file path does not exist: {audio_path}")
-    if beatmap_path:
-        beatmap_path_obj = Path(beatmap_path)
-        if not beatmap_path_obj.exists() or not beatmap_path_obj.is_file():
-            raise FileNotFoundError(f"Provided beatmap file path does not exist: {beatmap_path}")
-        # Validate beatmap file type
-        if beatmap_path_obj.suffix.lower() != '.osu':
-            raise ValueError(f"Beatmap file must have .osu extension: {beatmap_path}")
-    if (output_path is None or output_path == "") and (not args.add_to_beatmap or not args.overwrite_reference_beatmap or args.export_osz):
-        raise ValueError("Output path is required.")
+    with profiler.stage("validate_inputs"):
+        if not Path(audio_path).exists() or not Path(audio_path).is_file():
+            raise FileNotFoundError(f"Provided audio file path does not exist: {audio_path}")
+        if beatmap_path:
+            beatmap_path_obj = Path(beatmap_path)
+            if not beatmap_path_obj.exists() or not beatmap_path_obj.is_file():
+                raise FileNotFoundError(f"Provided beatmap file path does not exist: {beatmap_path}")
+            # Validate beatmap file type
+            if beatmap_path_obj.suffix.lower() != '.osu':
+                raise ValueError(f"Beatmap file must have .osu extension: {beatmap_path}")
+        if (output_path is None or output_path == "") and (not args.add_to_beatmap or not args.overwrite_reference_beatmap or args.export_osz):
+            raise ValueError("Output path is required.")
 
-    preprocessor = Preprocessor(args, parallel=args.parallel)
-    processor = Processor(args, model, tokenizer)
-    postprocessor = Postprocessor(args, logger=logger)
+    with profiler.stage("setup_processors"):
+        preprocessor = Preprocessor(args, parallel=args.parallel)
+        processor = Processor(args, model, tokenizer, profiler=profiler)
+        postprocessor = Postprocessor(args, logger=logger)
 
-    audio = preprocessor.load(audio_path)
-    sequences = preprocessor.segment(audio)
+    with profiler.stage("audio_load"):
+        audio = preprocessor.load(audio_path)
+    with profiler.stage("audio_segment"):
+        sequences = preprocessor.segment(audio)
+    profiler.set_metadata(
+        audio_samples=len(audio),
+        song_length_ms=sequences[2],
+        sequence_count=len(sequences[0]),
+        milliseconds_per_sequence=preprocessor.miliseconds_per_sequence,
+        milliseconds_per_stride=preprocessor.miliseconds_per_stride,
+    )
     extra_in_context = {}
     output_type = args.output_type.copy()
     timing_model = model if timing_model is None else timing_model
@@ -458,74 +486,88 @@ def generate(
     # Auto generate timing if not provided in in_context and required for the model and this output_type
     timing_events, timing_times, timing = None, None, None
     if args.super_timing and (len(args.in_context) == 0 or ContextType.NONE in args.in_context):
-        super_timing_generator = SuperTimingGenerator(args, timing_model, timing_tokenizer)
-        timing_events, timing_times = super_timing_generator.generate(audio, generation_config, verbose=verbose)
-        timing = postprocessor.generate_timing(timing_events)
+        with profiler.stage("super_timing_generation"):
+            super_timing_generator = SuperTimingGenerator(args, timing_model, timing_tokenizer, profiler=profiler)
+            timing_events, timing_times = super_timing_generator.generate(audio, generation_config, verbose=verbose)
+        with profiler.stage("super_timing_postprocess"):
+            timing = postprocessor.generate_timing(timing_events)
         extra_in_context[ContextType.TIMING] = timing
         if ContextType.TIMING in output_type:
             output_type.remove(ContextType.TIMING)
     elif should_generate_timing_context(args, output_type):
         # Generate timing context with the base model and reuse it for the main generation pass.
-        timing_processor = Processor(args, timing_model, timing_tokenizer)
-        timing_events, timing_times = timing_processor.generate(
-            sequences=sequences,
-            generation_config=generation_config,
-            in_context=[ContextType.NONE],
-            out_context=[ContextType.TIMING],
-            beatmap_path=beatmap_path,
-            verbose=verbose,
-        )[0]
-        timing_events, timing_times = events_of_type(timing_events, timing_times, TIMING_TYPES)
-        timing = postprocessor.generate_timing(timing_events)
+        with profiler.stage("timing_context_generation"):
+            timing_processor = Processor(args, timing_model, timing_tokenizer, profiler=profiler)
+            timing_events, timing_times = timing_processor.generate(
+                sequences=sequences,
+                generation_config=generation_config,
+                in_context=[ContextType.NONE],
+                out_context=[ContextType.TIMING],
+                beatmap_path=beatmap_path,
+                verbose=verbose,
+                profile_label="timing_context",
+            )[0]
+        with profiler.stage("timing_context_postprocess"):
+            timing_events, timing_times = events_of_type(timing_events, timing_times, TIMING_TYPES)
+            timing = postprocessor.generate_timing(timing_events)
         extra_in_context[ContextType.TIMING] = timing
         if ContextType.TIMING in output_type:
             output_type.remove(ContextType.TIMING)
     elif ContextType.TIMING in args.in_context or (
             args.train.data.add_timing and any(t in args.in_context for t in [ContextType.GD, ContextType.NO_HS])):
         # Exact timing is provided in the other beatmap, so we don't need to generate it
-        timing = [tp for tp in Beatmap.from_path(Path(beatmap_path)).timing_points if tp.parent is None]
+        with profiler.stage("load_reference_timing"):
+            timing = [tp for tp in Beatmap.from_path(Path(beatmap_path)).timing_points if tp.parent is None]
 
     # Generate beatmap
     if len(output_type) > 0:
-        result = processor.generate(
-            sequences=sequences,
-            generation_config=generation_config,
-            in_context=args.in_context,
-            out_context=output_type,
-            beatmap_path=beatmap_path,
-            extra_in_context=extra_in_context,
-            verbose=verbose,
-        )
+        with profiler.stage("main_generation", output_type=[context.value for context in output_type]):
+            result = processor.generate(
+                sequences=sequences,
+                generation_config=generation_config,
+                in_context=args.in_context,
+                out_context=output_type,
+                beatmap_path=beatmap_path,
+                extra_in_context=extra_in_context,
+                verbose=verbose,
+                profile_label="main_generation",
+            )
 
-        events, _ = reduce(merge_events, result)
+        with profiler.stage("merge_generated_events"):
+            events, _ = reduce(merge_events, result)
 
         if timing is None and (ContextType.TIMING in args.output_type or args.train.data.add_timing):
-            timing = postprocessor.generate_timing(events)
+            with profiler.stage("derive_timing_from_generated_events"):
+                timing = postprocessor.generate_timing(events)
 
         # Resnap timing events
         if args.resnap_events and timing is not None:
-            events = postprocessor.resnap_events(events, timing)
+            with profiler.stage("resnap_events"):
+                events = postprocessor.resnap_events(events, timing)
     else:
         events = timing_events
 
     # Generate positions with diffusion
     if args.generate_positions and args.gamemode in [0, 2] and ContextType.MAP in output_type:
-        diffusion_pipeline = DiffisionPipeline(args, diff_model, diff_tokenizer, refine_model)
-        events = diffusion_pipeline.generate(
+        with profiler.stage("diffusion_position_generation"):
+            diffusion_pipeline = DiffisionPipeline(args, diff_model, diff_tokenizer, refine_model)
+            events = diffusion_pipeline.generate(
+                events=events,
+                generation_config=generation_config,
+                timing=timing,
+                verbose=verbose,
+            )
+
+    with profiler.stage("postprocess_generate_osu"):
+        result = postprocessor.generate(
             events=events,
-            generation_config=generation_config,
+            beatmap_config=beatmap_config,
             timing=timing,
-            verbose=verbose,
         )
 
-    result = postprocessor.generate(
-        events=events,
-        beatmap_config=beatmap_config,
-        timing=timing,
-    )
-
     if args.add_to_beatmap:
-        result = postprocessor.add_to_beatmap(result, beatmap_path)
+        with profiler.stage("merge_with_reference_beatmap"):
+            result = postprocessor.add_to_beatmap(result, beatmap_path)
         if verbose:
             logger.info(f"Merged generated content with reference beatmap")
 
@@ -538,15 +580,21 @@ def generate(
     if args.export_osz:
         # noinspection PyTypeChecker
         result_path = Path(output_path) / f"beatmap{str(uuid.uuid4().hex)}.osz"
-        postprocessor.export_osz(result_path, result, output_osu_path.name, audio_path, args.background)
+        with profiler.stage("write_osz"):
+            postprocessor.export_osz(result_path, result, output_osu_path.name, audio_path, args.background)
         if verbose:
             logger.info(f"Generated .osz saved to {result_path}")
     else:
         result_path = output_osu_path
-        postprocessor.write_result(result_path, result)
+        with profiler.stage("write_osu"):
+            postprocessor.write_result(result_path, result)
         if verbose:
             logger.info(f"Generated beatmap saved to {result_path}")
 
+    profiler.set_metadata(result_path=result_path)
+    profile_path = profiler.write(args.profile_output_path or profiler.default_output_path(result_path))
+    if verbose and profile_path is not None:
+        logger.info(f"Inference profile saved to {profile_path}")
 
     return result, result_path
 
@@ -647,41 +695,48 @@ def load_diff_model(
 @hydra.main(config_path="configs/inference", config_name="v32", version_base="1.1")
 def main(args: InferenceConfig):
     args = OmegaConf.to_object(args) if isinstance(args, DictConfig) else args
-    compile_args(args)
-    setup_inference_environment(args.seed)
+    profiler = InferenceProfiler.from_args(args)
+    with profiler.stage("compile_args"):
+        compile_args(args)
+    with profiler.stage("setup_inference_environment"):
+        setup_inference_environment(args.seed)
 
-    model, tokenizer = load_model_with_server(args.model_path, args.train, args.device,
-                                              max_batch_size=args.max_batch_size, use_server=args.use_server,
-                                              precision=args.precision, attn_implementation=args.attn_implementation,
-                                              lora_path=args.lora_path, gamemode=args.gamemode,
-                                              auto_select_gamemode_model=args.auto_select_gamemode_model)
+    with profiler.stage("load_main_model"):
+        model, tokenizer = load_model_with_server(args.model_path, args.train, args.device,
+                                                  max_batch_size=args.max_batch_size, use_server=args.use_server,
+                                                  precision=args.precision, attn_implementation=args.attn_implementation,
+                                                  lora_path=args.lora_path, gamemode=args.gamemode,
+                                                  auto_select_gamemode_model=args.auto_select_gamemode_model)
 
     timing_model, timing_tokenizer = None, None
     if should_load_separate_timing_model(args):
         print("Using base model for timing generation.")
-        timing_model, timing_tokenizer = load_model_with_server(
-            args.model_path,
-            args.train,
-            args.device,
-            max_batch_size=args.max_batch_size,
-            use_server=args.use_server,
-            precision=args.precision,
-            attn_implementation=args.attn_implementation,
-            gamemode=args.gamemode,
-            auto_select_gamemode_model=False,
-        )
+        with profiler.stage("load_timing_model"):
+            timing_model, timing_tokenizer = load_model_with_server(
+                args.model_path,
+                args.train,
+                args.device,
+                max_batch_size=args.max_batch_size,
+                use_server=args.use_server,
+                precision=args.precision,
+                attn_implementation=args.attn_implementation,
+                gamemode=args.gamemode,
+                auto_select_gamemode_model=False,
+            )
 
     diff_model, diff_tokenizer, refine_model = None, None, None
     if args.generate_positions:
-        diff_model, diff_tokenizer = load_diff_model(args.diff_ckpt, args.diffusion, args.device)
+        with profiler.stage("load_diffusion_model"):
+            diff_model, diff_tokenizer = load_diff_model(args.diff_ckpt, args.diffusion, args.device)
 
-        if os.path.exists(args.diff_refine_ckpt):
-            refine_model = load_diff_model(args.diff_refine_ckpt, args.diffusion, args.device)[0]
+            if os.path.exists(args.diff_refine_ckpt):
+                refine_model = load_diff_model(args.diff_refine_ckpt, args.diffusion, args.device)[0]
 
-        if args.compile:
-            diff_model.forward = torch.compile(diff_model.forward, mode="reduce-overhead", fullgraph=True)
+            if args.compile:
+                diff_model.forward = torch.compile(diff_model.forward, mode="reduce-overhead", fullgraph=True)
 
-    generation_config, beatmap_config = get_config(args)
+    with profiler.stage("build_generation_config"):
+        generation_config, beatmap_config = get_config(args)
 
     return generate(
         args,
@@ -695,6 +750,7 @@ def main(args: InferenceConfig):
         diff_model=diff_model,
         diff_tokenizer=diff_tokenizer,
         refine_model=refine_model,
+        profiler=profiler,
     )
 
 

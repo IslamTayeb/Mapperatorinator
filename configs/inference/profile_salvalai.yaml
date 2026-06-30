@@ -1,0 +1,19 @@
+defaults:
+  - v32
+  - _self_
+
+audio_path: "/Users/islamtayeb/Downloads/SALVALAI / SALVALAI [Music Video] (_VmnBu3IZ9s).mp3"
+output_path: "${oc.env:MAPPERATORINATOR_PROFILE_OUTPUT,./logs/profile_salvalai}"
+
+profile_inference: true
+profile_sync_cuda: true
+
+gamemode: 0
+difficulty: 6.0
+year: 2015
+hitsounded: true
+descriptors:
+  - skillset/streams
+  - streams/flow aim
+  - streams/spaced streams
+  - streams/bursts
