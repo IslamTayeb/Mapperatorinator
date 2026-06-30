@@ -6,3 +6,4 @@
 - Preserve server and non-server inference paths when changing profiling code; both should retain prompt, output, generated-token, and elapsed-time stats.
 - Keep profiling run instructions and schema notes in `docs/inference_profiling.md` when the workflow changes.
 - For DCC profiling jobs, put the conda env `bin` directory on `PATH` so `ffmpeg`/`ffprobe` are visible, and keep Hugging Face cache variables consistent between warmup and measured runs.
+- For DCC FlashAttention 2 builds, use node-local `/tmp`, `FLASH_ATTN_CUDA_ARCHS=80`, and an A5000/5000 Ada runtime validation; login-node `is_flash_attn_2_available()` can be false because CUDA is unavailable there.

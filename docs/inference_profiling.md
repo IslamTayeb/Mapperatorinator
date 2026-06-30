@@ -69,6 +69,39 @@ Observed full SALVALAI run on 2026-06-30:
 
 The dominant bottleneck is autoregressive map generation. The first map window was the slowest record in this run at 7.655s for 520 generated tokens; most other slow windows were around 2.0-2.4s.
 
+## FlashAttention 2 On DCC
+
+FlashAttention 2 is the relevant package for A5000/5000 Ada testing through the normal Transformers `flash_attention_2` path. FlashAttention 3 is Hopper-focused and should be treated as a separate H100/H800-class ablation, not as a replacement for A5000 runs.
+
+The DCC env at `/hpc/group/romerolab/imt11/envs/mapperatorinator` has been validated with `flash-attn==2.8.3.post1` on an `NVIDIA RTX A5000`:
+
+- `torch==2.10.0+cu128`
+- CUDA runtime: 12.8
+- GPU capability: `(8, 6)`
+- `transformers.utils.is_flash_attn_2_available()` returned `True` on the A5000 allocation.
+- A tiny `flash_attn_func` fp16 call returned finite output.
+
+Build source wheels on node-local temp storage. A `/work`-backed build reached 73/73 CUDA compile steps but failed during wheel packaging with an `egg-info` directory cleanup error. The successful build used:
+
+```bash
+ENV=/hpc/group/romerolab/imt11/envs/mapperatorinator
+export PATH="$ENV/bin:$PATH"
+export CUDA_HOME="$ENV"
+export CUDA_PATH="$ENV"
+export TMPDIR="/tmp/imt11-flash-attn-${SLURM_JOB_ID}"
+export TEMP="$TMPDIR"
+export TMP="$TMPDIR"
+export FLASH_ATTN_CUDA_ARCHS=80
+export MAX_JOBS=2
+export LD_LIBRARY_PATH="$ENV/targets/x86_64-linux/lib:$ENV/lib:${LD_LIBRARY_PATH:-}"
+export CPATH="$ENV/targets/x86_64-linux/include:$ENV/lib/python3.10/site-packages/nvidia/cuda_runtime/include:${CPATH:-}"
+
+python -m pip install ninja packaging "wheel<0.46" "setuptools<81"
+python -m pip install flash-attn==2.8.3.post1 --no-build-isolation --no-cache-dir -v
+```
+
+Do not use a login-node `is_flash_attn_2_available()` result as the final check; it can return `False` because CUDA is unavailable even when `import flash_attn` works. Validate inside a GPU Slurm allocation.
+
 ## What The Profile Captures
 
 Top-level `stages` report wall time for setup, model loading, audio loading, segmentation, timing generation, main generation, diffusion, postprocessing, and file writes.
