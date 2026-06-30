@@ -102,6 +102,26 @@ python -m pip install flash-attn==2.8.3.post1 --no-build-isolation --no-cache-di
 
 Do not use a login-node `is_flash_attn_2_available()` result as the final check; it can return `False` because CUDA is unavailable even when `import flash_attn` works. Validate inside a GPU Slurm allocation.
 
+For FlashAttention profiling runs, keep Triton temp and cache directories on node-local storage too:
+
+```bash
+export TMPDIR="/tmp/imt11-profile-fa2-${SLURM_JOB_ID}"
+export TEMP="$TMPDIR"
+export TMP="$TMPDIR"
+export TRITON_CACHE_DIR="$TMPDIR/triton"
+```
+
+A `/work`-backed `TMPDIR` hit a Triton temporary-directory cleanup failure before map generation.
+
+Observed A5000 SALVALAI ablation on 2026-06-30 with `precision=fp16`, `seed=12345`, full-song input, and `use_server=false`:
+
+| attention | main generation | map tokens | map tok/s | timing generation | timing tok/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `sdpa` | 110.956s | 6,992 | 63.4 | 29.376s | 28.3 |
+| `flash_attention_2` | 187.007s | 8,554 | 45.9 | 31.656s | 26.2 |
+
+FlashAttention 2 did not improve this single-song profile. It generated more map tokens despite the same seed, so raw wall time is partly output-length-dependent, but normalized map throughput was still lower than SDPA.
+
 ## What The Profile Captures
 
 Top-level `stages` report wall time for setup, model loading, audio loading, segmentation, timing generation, main generation, diffusion, postprocessing, and file writes.
