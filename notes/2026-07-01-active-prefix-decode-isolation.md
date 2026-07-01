@@ -65,3 +65,33 @@ Graduation gates remain:
 - Use normal prefill, then decode-only active-prefix inside the one-token model forward.
 - Expect a shape/capture challenge: the active prefix length changes per generated token. A real implementation may need bucketed CUDA graphs, per-length graph caches, or an active-prefix kernel/cache layout that keeps graph shapes stable.
 - Do not revive prefill active-prefix unless a new isolated test explains and fixes the large logits mismatch.
+
+## Bucketed Decode Follow-Up
+
+Job `49140217` tested graph-reusable active-prefix decode bucket lengths after commit `fb2b2ae`.
+
+- Node/GPU: `dcc-core-ferc-s-z25-21`, NVIDIA GeForce RTX 2080 Ti, driver `595.71.05`, capability `7.5`
+- Run dir: `/work/imt11/Mapperatorinator/runs/active-prefix-buckets-49140217-fb2b2ae`
+- Logs:
+  - `/work/imt11/Mapperatorinator/logs/active-prefix-buckets-49140217.out`
+  - `/work/imt11/Mapperatorinator/logs/active-prefix-buckets-49140217.err`
+
+All tested buckets preserved the one-token logits gate:
+
+| Bucket | Compile | Gate max_abs | Gate top-k | Graph ms/step |
+| ---: | --- | ---: | --- | ---: |
+| 128 | false | `0.0` | PASS | `3.8920ms` |
+| 256 | false | `0.0` | PASS | `4.1022ms` |
+| 512 | false | `0.0` | PASS | `4.4178ms` |
+| 128 | true | `2.2888e-05` | PASS | `3.7597ms` |
+| 256 | true | `2.2888e-05` | PASS | `3.9840ms` |
+| 512 | true | `2.2888e-05` | PASS | `4.4166ms` |
+
+Interpretation:
+
+- Bucketed decode is exact for the tested `seq9` probe as long as prefill remains unchanged.
+- Bucket lengths preserve the causal mask for future positions while avoiding the full `kv2560` static-cache SDPA shape.
+- Bucketed shapes are a better candidate for real runtime work than exact-prefix shapes, because they create reusable graph/kernel shape families such as `128`, `256`, and `512`.
+- Even bucket512 remains much faster than the prior full-static fixed-step graph ceiling (`8.09ms`), so a graph-backed bucketed loop is still plausibly `200 tok/s`-class if loop overhead and cache-buffer discipline can be controlled.
+
+Next direct-loop work should compute `bucket = ceil(prefix_length / bucket_size) * bucket_size`, cap it at the static cache length, and apply active-prefix only during one-token decode. Generated-token equivalence is still required before any throughput claim.

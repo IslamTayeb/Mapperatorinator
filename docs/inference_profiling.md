@@ -647,13 +647,30 @@ Fixed-step graph timing for the passing decode-only variant:
 | false | `graph_decode_compile_false.json` | `11.4996ms` | `3.7891ms` | `3.035x` |
 | true | `graph_decode_compile_true.json` | `11.7837ms` | `3.7899ms` | `3.109x` |
 
+Bucketed active-prefix follow-up job `49140217`, node `dcc-core-ferc-s-z25-21`, RTX 2080 Ti, commit `fb2b2ae`:
+
+- Run dir: `/work/imt11/Mapperatorinator/runs/active-prefix-buckets-49140217-fb2b2ae`
+- Logs: `/work/imt11/Mapperatorinator/logs/active-prefix-buckets-49140217.out` and `.err`
+
+All tested graph-reusable decode bucket lengths preserved the one-token logits gate:
+
+| Bucket | Compile | Gate max_abs | Gate top-k | Graph ms/step |
+| ---: | --- | ---: | --- | ---: |
+| 128 | false | `0.0` | PASS | `3.8920ms` |
+| 256 | false | `0.0` | PASS | `4.1022ms` |
+| 512 | false | `0.0` | PASS | `4.4178ms` |
+| 128 | true | `2.2888e-05` | PASS | `3.7597ms` |
+| 256 | true | `2.2888e-05` | PASS | `3.9840ms` |
+| 512 | true | `2.2888e-05` | PASS | `4.4166ms` |
+
 Interpretation:
 
 - Do not apply active-prefix self-attention during static-cache prefill; it is not equivalent in the current model path.
 - One-token decode-only active-prefix is logits-equivalent for this gate and gives a fixed-step graph ceiling near `264 tok/s` before real loop overhead.
 - This is the first measured exact-calculation path with plausible arithmetic for a `200 tok/s` runtime project, but it still needs a real generated-token loop. The current graph POC replays one prepared `[1, 1]` step and does not handle changing tokens, changing prefix lengths, logits processors, sampling/RNG, EOS, or generated-token accounting.
+- Bucketed decode is the preferred next strategy over exact-prefix graph captures because buckets preserve exact logits in the tested gate while giving reusable shape families.
 
-Next implementation direction: leave prefill unchanged, then build an opt-in batch-1 direct decode loop using `osuT5.osuT5.inference.direct_decode` with active-prefix applied only around the one-token model forward. Expect the main engineering problem to be graph/capture discipline with changing active prefix lengths, likely requiring bucketed graph caches, per-length captures, or a more stable active-prefix cache/kernel layout.
+Next implementation direction: leave prefill unchanged, then build an opt-in batch-1 direct decode loop using `osuT5.osuT5.inference.direct_decode` with active-prefix applied only around the one-token model forward. Use bucketed active-prefix lengths first, e.g. `ceil(prefix_length / bucket_size) * bucket_size`, because bucketed graph shapes are reusable and already passed the one-token gate.
 
 ## Runtime Backend Feasibility Notes
 
