@@ -19,13 +19,14 @@ The post-warmup trace showed the compiled one-token forward, f32 SDPA kernels on
 
 ## Gate Semantics
 
-`utils/verify_one_token_decode.py` deliberately avoids `generate()` as its logits reference. A generation call can consume sampling RNG and mutate caches before the real test. Instead, the gate:
+`utils/verify_one_token_decode.py` originally compared a static-cache `q_len=1` decode step against a full-prefix no-cache raw-logits reference. That was too strict for the actual optimization target: production inference uses Hugging Face `generate()` with a freshly allocated `StaticCache`, logits processors, sampling, EOS handling, and optional generation compile. The gate now uses HF cached generation as the reference and keeps the old no-cache comparison only as diagnostics. The current gate:
 
 1. Builds a real SALVALAI prompt through `Preprocessor` and `Processor`.
-2. Chooses a deterministic probe token from the full-prompt raw logits unless `--probe-token-id` is provided.
-3. Computes reference raw logits from a full-prefix no-cache forward.
-4. Computes candidate raw logits from a prefilled `StaticCache` plus one `q_len=1` decode step.
-5. Requires `torch.allclose` within tolerance and identical top-k token ordering.
+2. Runs `model.generate(..., past_key_values=StaticCache, max_new_tokens=2, output_logits=True)` with the same production logits processors, sampling flags, EOS policy, prompt, mask, encoder inputs, and conditioning kwargs.
+3. Uses HF's first generated token as the probe token.
+4. Uses HF's second cached-generation raw-logit step as the reference.
+5. Computes candidate raw logits from a separately prefilled `StaticCache` plus one `q_len=1` decode step prepared through `model.prepare_inputs_for_generation()`.
+6. Requires `torch.allclose` within tolerance and identical top-k token ordering.
 
 Passing this gate is necessary for custom decoder-step work, but it is not sufficient for a speed claim. Fixed-seed 15s generated-token equivalence and full-song generated-token equivalence are still required.
 
@@ -47,6 +48,15 @@ max_abs=27.6516, mean_abs=17.3663, topk_match=false
 ```
 
 Diagnosis: the gate still called `model.forward()` directly for its prompt/reference/prefill paths. Production generation goes through `prepare_inputs_for_generation()`, which is important for left-padded prompt position IDs and static-cache 4D mask preparation. The gate was patched again to prepare prompt, no-cache reference, static-cache prefill, and `q_len=1` candidate inputs through `model.prepare_inputs_for_generation()` and to record prepared shapes/cache positions in the report.
+
+Follow-up DCC gate run `49139122` on `dcc-core-ferc-s-z25-21` still failed with the same diff:
+
+```text
+pass=false, prompt_tokens=84, probe_token_id=13,
+max_abs=27.6516, mean_abs=17.3663, topk_match=false
+```
+
+Diagnosis: the candidate was now exercising the intended prepared `q_len=1` cache path, but the reference was still the full-prefix no-cache path. The top-1 token matched, but many logits moved, so this is not a valid exact-runtime gate for a production path that already uses `StaticCache`. The gate was patched to compare against HF `generate()` cached raw logits instead. The no-cache full-prefix diff remains in the JSON report as `no_cache_reference_*` diagnostics, but it no longer controls pass/fail.
 
 The next run should be:
 

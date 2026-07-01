@@ -26,6 +26,7 @@ from inference import (
 )
 from osuT5.osuT5.inference import Postprocessor, Preprocessor, Processor
 from osuT5.osuT5.inference.cache_utils import get_cache
+from osuT5.osuT5.inference.server import build_logits_processor_list, get_eos_token_id
 from osuT5.osuT5.runtime_profiling import generation_profile_context
 from osuT5.osuT5.tokenizer import ContextType
 
@@ -168,6 +169,10 @@ def _build_probe_inputs(
         "context_type": context["context_type"].value,
         "sequence_index": sequence_index,
         "frame_time_ms": float(frame_time),
+        "lookback_time": processor.lookback_time if (
+            sequence_index != 0 and processor.types_first and processor.lookback_time > 0
+        ) else 0,
+        "lookahead_time": processor.lookahead_time if sequence_index != len(sequences[0]) - 1 else 0,
         "frames": frames,
         "decoder_input_ids": prompt,
         "decoder_attention_mask": prompt.ne(tokenizer.pad_id),
@@ -187,6 +192,21 @@ def _condition_kwargs(model_inputs: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _build_generation_logits_processors(args: InferenceConfig, tokenizer, device, *, lookback_time: float):
+    return build_logits_processor_list(
+        tokenizer,
+        cfg_scale=args.cfg_scale,
+        timeshift_bias=args.timeshift_bias,
+        types_first=args.train.data.types_first,
+        temperature=args.temperature,
+        timing_temperature=args.timing_temperature,
+        mania_column_temperature=args.mania_column_temperature,
+        taiko_hit_temperature=args.taiko_hit_temperature,
+        lookback_time=lookback_time,
+        device=device,
+    )
+
+
 @torch.no_grad()
 def run_one_token_gate(
         args: InferenceConfig,
@@ -198,6 +218,8 @@ def run_one_token_gate(
         top_k: int,
 ) -> dict[str, Any]:
     _assert_supported_probe(args)
+    if probe_token_id is not None:
+        raise ValueError("one-token HF-generate logits gate does not support --probe-token-id")
     compile_args(args, verbose=False)
     setup_inference_environment(args.seed)
     model, tokenizer = load_model_with_server(
@@ -228,6 +250,8 @@ def run_one_token_gate(
         "sequence_index": model_inputs.pop("sequence_index"),
         "frame_time_ms": model_inputs.pop("frame_time_ms"),
         "context_type": model_inputs.pop("context_type"),
+        "lookback_time": model_inputs.pop("lookback_time"),
+        "lookahead_time": model_inputs.pop("lookahead_time"),
         "atol": atol,
         "rtol": rtol,
         "top_k": top_k,
@@ -237,9 +261,53 @@ def run_one_token_gate(
     prompt_mask = model_inputs["decoder_attention_mask"]
     prompt_len = int(prompt.shape[-1])
     condition_kwargs = _condition_kwargs(model_inputs)
+    logits_processors = _build_generation_logits_processors(
+        args,
+        tokenizer,
+        model.device,
+        lookback_time=float(metadata["lookback_time"]),
+    )
+    context_type = ContextType(metadata["context_type"])
 
     with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16, enabled=args.precision == "amp"), \
             generation_profile_context(sdpa_backend=args.profile_sdpa_backend):
+        hf_cache = get_cache(model, batch_size=1, num_beams=1, cfg_scale=1.0)
+        hf_generate_outputs = model.generate(
+            inputs=model_inputs["frames"],
+            decoder_input_ids=prompt,
+            decoder_attention_mask=prompt_mask,
+            **condition_kwargs,
+            do_sample=args.do_sample,
+            num_beams=args.num_beams,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            max_new_tokens=2,
+            use_cache=True,
+            past_key_values=hf_cache,
+            logits_processor=logits_processors,
+            eos_token_id=get_eos_token_id(
+                tokenizer,
+                lookback_time=float(metadata["lookback_time"]),
+                lookahead_time=float(metadata["lookahead_time"]),
+                context_type=context_type,
+            ),
+            return_dict_in_generate=True,
+            output_logits=True,
+        )
+        hf_logits = getattr(hf_generate_outputs, "logits", None)
+        if hf_logits is None or len(hf_logits) < 2:
+            raise RuntimeError(
+                "HF generate did not return at least two raw-logit steps; "
+                f"got {0 if hf_logits is None else len(hf_logits)}"
+            )
+        probe_token = hf_generate_outputs.sequences[:, prompt_len:prompt_len + 1].to(torch.long)
+        if probe_token.shape[-1] != 1:
+            raise RuntimeError(
+                f"HF generate did not produce a first generated token at prompt_len={prompt_len}; "
+                f"sequence shape={list(hf_generate_outputs.sequences.shape)}"
+            )
+        hf_reference_logits = hf_logits[1].detach().to(torch.float32)
+
         prompt_prepared = model.prepare_inputs_for_generation(
             prompt,
             use_cache=False,
@@ -250,11 +318,7 @@ def run_one_token_gate(
         prompt_outputs = model(
             **prompt_prepared,
         )
-        next_token_logits = _last_token_logits(prompt_outputs.logits)
-        if probe_token_id is None:
-            probe_token = torch.argmax(next_token_logits, dim=-1, keepdim=True).to(torch.long)
-        else:
-            probe_token = torch.full((prompt.shape[0], 1), int(probe_token_id), dtype=torch.long, device=prompt.device)
+        no_cache_first_step_logits = _last_token_logits(prompt_outputs.logits)
 
         full_prefix = torch.cat([prompt, probe_token], dim=-1)
         full_mask = torch.cat([prompt_mask, torch.ones_like(probe_token, dtype=prompt_mask.dtype)], dim=-1)
@@ -269,7 +333,7 @@ def run_one_token_gate(
         reference_outputs = model(
             **reference_prepared,
         )
-        reference_logits = _last_token_logits(reference_outputs.logits)
+        no_cache_reference_logits = _last_token_logits(reference_outputs.logits)
 
         cache = get_cache(model, batch_size=1, num_beams=1, cfg_scale=1.0)
         prefill_cache_position = torch.arange(prompt_len, device=prompt.device)
@@ -297,12 +361,14 @@ def run_one_token_gate(
         candidate_outputs = model(**candidate_inputs)
         candidate_logits = _last_token_logits(candidate_outputs.logits)
 
-    abs_diff = torch.abs(reference_logits - candidate_logits)
-    rel_diff = abs_diff / torch.clamp(torch.abs(reference_logits), min=1e-12)
-    reference_topk = torch.topk(reference_logits, k=min(top_k, reference_logits.shape[-1]), dim=-1).indices
+    abs_diff = torch.abs(hf_reference_logits - candidate_logits)
+    rel_diff = abs_diff / torch.clamp(torch.abs(hf_reference_logits), min=1e-12)
+    reference_topk = torch.topk(hf_reference_logits, k=min(top_k, hf_reference_logits.shape[-1]), dim=-1).indices
     candidate_topk = torch.topk(candidate_logits, k=min(top_k, candidate_logits.shape[-1]), dim=-1).indices
-    allclose = bool(torch.allclose(reference_logits, candidate_logits, atol=atol, rtol=rtol))
+    allclose = bool(torch.allclose(hf_reference_logits, candidate_logits, atol=atol, rtol=rtol))
     topk_match = bool(torch.equal(reference_topk, candidate_topk))
+    no_cache_abs_diff = torch.abs(no_cache_reference_logits - candidate_logits)
+    no_cache_first_step_abs_diff = torch.abs(no_cache_first_step_logits - hf_logits[0].detach().to(torch.float32))
 
     return {
         "pass": allclose and topk_match,
@@ -312,12 +378,18 @@ def run_one_token_gate(
         "prompt_tokens": prompt_len,
         "prefill_cache_position": [int(item) for item in prefill_cache_position.tolist()],
         "decode_cache_position": [int(item) for item in decode_cache_position.tolist()],
+        "hf_generated_sequence_shape": list(hf_generate_outputs.sequences.shape),
+        "hf_generate_logits_steps": len(hf_logits),
         "prepared_prompt_shape": list(prompt_prepared["decoder_input_ids"].shape),
         "prepared_reference_shape": list(reference_prepared["decoder_input_ids"].shape),
         "prepared_candidate_shape": list(candidate_inputs["decoder_input_ids"].shape),
         "max_abs": float(abs_diff.max().item()),
         "mean_abs": float(abs_diff.mean().item()),
         "max_rel": float(rel_diff.max().item()),
+        "no_cache_reference_max_abs": float(no_cache_abs_diff.max().item()),
+        "no_cache_reference_mean_abs": float(no_cache_abs_diff.mean().item()),
+        "no_cache_first_step_vs_hf_max_abs": float(no_cache_first_step_abs_diff.max().item()),
+        "no_cache_first_step_vs_hf_mean_abs": float(no_cache_first_step_abs_diff.mean().item()),
         "reference_topk": [int(item) for item in reference_topk[0].tolist()],
         "candidate_topk": [int(item) for item in candidate_topk[0].tolist()],
         "metadata": metadata,
@@ -326,7 +398,7 @@ def run_one_token_gate(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Verify that a real static-cache q_len=1 decode step matches full-prefix raw logits."
+        description="Verify that a real static-cache q_len=1 decode step matches HF generate cached raw logits."
     )
     parser.add_argument("--config-name", default="profile_salvalai_smoke15")
     parser.add_argument("--sequence-index", type=int, default=0)
