@@ -248,6 +248,16 @@ Rejected naive TorchInductor cudagraph-tree disabling, DCC jobs `49162564`, `491
 
 `torch._inductor.config.triton.cudagraph_trees=False` is diagnostic evidence, not an accepted optimization. Setting it globally from process start made active-prefix main generation exact and much faster on the 15s smoke (`+30.4%` vs compile-only main generation), but it more than doubled timing-context model time. A follow-up default-off scoped patch that limited active-prefix/no-cudagraph-trees to `MAP` preserved token equivalence and kept timing closer to baseline, but it catastrophically regressed main generation (`-64.5%`). The code was reverted. The useful conclusion is that active-prefix still needs deeper graph-state isolation, likely bucket-scoped compiled calls or a direct decode runtime, not a naive global or per-call cudagraph-tree switch. See `notes/2026-07-01-active-prefix-cudagraph-trees.md`.
 
+Rejected bucket-scoped active-prefix `torch.compile` wrappers, DCC job `49163585` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti, commit `b4f3f11` with the code reverted in `ea1c422`:
+
+| variant | main tokens | main model time | tok/s | token equivalence | decision |
+| --- | ---: | ---: | ---: | --- | --- |
+| compile-only | `1,084` | `21.773s` | `49.786` | baseline | retained smoke baseline |
+| active512 shared compile | `1,084` | `29.741s` | `36.448` | PASS vs bucket | existing active-prefix path |
+| active512 bucket-scoped compile | `1,084` | `31.946s` | `33.933` | PASS | rejected |
+
+The direct-loop gate passed first (`token_match=true`, `logits_pass=true`, `rng_match=true`, `max_abs=0.0`, `8` steps), so the wrapper was exact. It still made cold 15s smoke performance worse: `-6.9%` main-generation throughput versus active512 shared compile and `-31.8%` versus compile-only, with strict per-window non-regression failing for all active-shared-vs-bucket main records. This means simply giving each active-prefix bucket its own compiled wrapper adds more compile/graph overhead than it removes. See `notes/2026-07-01-active-prefix-bucket-compile-scope.md`.
+
 ## Smoke-To-Full Profiling Loop
 
 Start with the middle 15s SALVALAI smoke config for fastest iteration:
