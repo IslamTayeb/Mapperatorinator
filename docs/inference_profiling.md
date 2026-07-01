@@ -227,6 +227,16 @@ Rejected active-prefix direct per-layer static-cache update dispatch bypass, DCC
 
 The candidate bypassed `Cache.update(..., layer_idx, ...)` dispatch by calling the selected static-cache layer update directly during active-prefix VarWhisper SDPA self-attention decode. One-token logits gates passed with compile disabled (`max_abs=0.0`) and compile enabled (`max_abs=2.2888e-05`), and the 15s smoke matched all `1,084 / 1,084` generated main-token IDs. It still regressed active512 by `-1.4%`, did not improve the first long map window (`seq3 26.539s -> 26.926s`), and slightly worsened a post-warm window (`seq9 1.574s -> 1.599s`). The code was reverted. See `notes/2026-07-01-active-prefix-direct-layer-cache-update.md`.
 
+Rejected active-prefix buffered input-id preallocation, DCC job `49162138` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti:
+
+| run | main tokens | main model time | tok/s | token equivalence | status |
+| --- | ---: | ---: | ---: | --- | --- |
+| cold compile-only | `1,084` | `21.460s` | `50.513` | baseline | baseline |
+| active512 old path | `1,084` | `29.006s` | `37.372` | PASS | baseline active-prefix candidate |
+| active512 buffered input IDs | `1,084` | `29.802s` | `36.373` | PASS | rejected |
+
+The candidate preallocated the generated `input_ids` buffer inside the active-prefix custom decode loop to avoid per-token `torch.cat`. The multi-token direct-loop gate had already shown this can preserve token/logit/RNG semantics, but 15s profile evidence showed it regressed active512 main generation by `-2.7%` and remained `-28.0%` below the compile-only smoke baseline. Timing generation improved in this specific run (`4.4 -> 7.0 tok/s`), but the objective is main-generation throughput and the main path got worse. The code was reverted. See `notes/2026-07-01-active-prefix-buffered-input-ids.md`.
+
 ## Smoke-To-Full Profiling Loop
 
 Start with the middle 15s SALVALAI smoke config for fastest iteration:
