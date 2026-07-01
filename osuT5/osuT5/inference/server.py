@@ -97,6 +97,8 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     # To device
     model_kwargs = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v for k, v in model_kwargs.items()}
     model_kwargs = {k: v.to(model.dtype) if k != "inputs" and isinstance(v, torch.Tensor) and v.dtype == torch.float32 else v for k, v in model_kwargs.items()}
+    if getattr(getattr(model, "transformer", None), "supports_logits_to_keep", False):
+        model_kwargs["logits_to_keep"] = 1
     batch_size = model_kwargs['inputs'].shape[0]
     # print(f"[Model Generate] Batch size: {batch_size}, Model device: {model.device}")
 
@@ -176,6 +178,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         "cfg_scale": float(cfg_scale),
         "do_sample": bool(generate_kwargs.get("do_sample", False)),
         "sync_model_timing": sync_model_timing,
+        "logits_to_keep": model_kwargs.get("logits_to_keep"),
     })
 
     return result, stats

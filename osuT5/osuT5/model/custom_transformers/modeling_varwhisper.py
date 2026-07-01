@@ -1346,6 +1346,7 @@ class VarWhisperModel(VarWhisperPreTrainedModel):
 class VarWhisperForConditionalGeneration(WhisperGenerationMixin, VarWhisperPreTrainedModel):
     base_model_prefix = "model"
     _tied_weights_keys = ["proj_out.weight"]
+    supports_logits_to_keep = True
 
     def __init__(self, config: VarWhisperConfig):
         super().__init__(config)
@@ -1394,6 +1395,7 @@ class VarWhisperForConditionalGeneration(WhisperGenerationMixin, VarWhisperPreTr
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
             cache_position: Optional[torch.LongTensor] = None,
+            logits_to_keep: int = 0,
     ) -> Union[Tuple[torch.Tensor], Seq2SeqLMOutput]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -1412,7 +1414,10 @@ class VarWhisperForConditionalGeneration(WhisperGenerationMixin, VarWhisperPreTr
             return_dict=return_dict,
             cache_position=cache_position,
         )
-        lm_logits = self.proj_out(outputs[0])
+        sequence_output = outputs[0]
+        if labels is None and logits_to_keep > 0:
+            sequence_output = sequence_output[:, -logits_to_keep:, :]
+        lm_logits = self.proj_out(sequence_output)
 
         loss = None
         if labels is not None:

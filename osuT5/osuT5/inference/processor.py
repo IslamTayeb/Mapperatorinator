@@ -1471,6 +1471,7 @@ class Processor(object):
                 metadata.pop("output_tokens_per_sample", None),
             ),
             "precision": stats.get("precision", self.precision),
+            "logits_to_keep": stats.get("logits_to_keep"),
             "use_server": isinstance(self.model, InferenceClient),
             "parallel": self.parallel,
         }
