@@ -112,7 +112,6 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     lookahead_time = generate_kwargs.pop('lookahead_time', 0.0)
     context_type = generate_kwargs.pop('context_type', None)
     sync_model_timing = bool(generate_kwargs.pop('sync_model_timing', False))
-    static_cache = bool(generate_kwargs.pop('static_cache', True))
     if context_type is not None:
         context_type = ContextType(context_type)  # Convert to ContextType enum
 
@@ -148,11 +147,8 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         logits_processor_list.append(LookbackBiasLogitsWarper(lookback_time, tokenizer, types_first, model.device))
 
     # Prepare cache
-    cache = get_cache(model, batch_size, generate_kwargs.get('num_beams', 1), cfg_scale) if static_cache else None
+    cache = get_cache(model, batch_size, generate_kwargs.get('num_beams', 1), cfg_scale)
     pad_token_id = generate_kwargs.get('pad_token_id', getattr(tokenizer, 'pad_id', None))
-    generate_call_kwargs = {}
-    if cache is not None:
-        generate_call_kwargs["past_key_values"] = cache
 
     # Perform batched generation
     with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16, enabled=precision == 'amp'):
@@ -163,7 +159,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
             **model_kwargs,
             **generate_kwargs,
             use_cache=True,
-            **generate_call_kwargs,
+            past_key_values=cache,
             logits_processor=logits_processor_list,
             eos_token_id=get_eos_token_id(tokenizer, lookback_time=lookback_time, lookahead_time=lookahead_time, context_type=context_type),
         )
@@ -181,7 +177,6 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         "do_sample": bool(generate_kwargs.get("do_sample", False)),
         "sync_model_timing": sync_model_timing,
         "generation_compile_enabled": not bool(getattr(getattr(model, "generation_config", None), "disable_compile", True)),
-        "static_cache": static_cache,
     })
 
     return result, stats
