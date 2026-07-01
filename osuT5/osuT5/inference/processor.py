@@ -180,6 +180,8 @@ class Processor(object):
             sync_model_timing=self.profiler.enabled and self.profiler.sync_cuda,
             profile_generation_detail_ranges=bool(getattr(self.args, "profile_generation_detail_ranges", False)),
             profile_sdpa_backend=getattr(self.args, "profile_sdpa_backend", None),
+            active_prefix_decode_loop=bool(getattr(self.args, "inference_active_prefix_decode_loop", False)),
+            active_prefix_decode_bucket_size=int(getattr(self.args, "inference_active_prefix_decode_bucket_size", 128)),
         )
 
         if isinstance(self.model, InferenceClient):
@@ -1476,6 +1478,8 @@ class Processor(object):
             "generation_compile_enabled": stats.get("generation_compile_enabled"),
             "profile_generation_detail_ranges": stats.get("profile_generation_detail_ranges"),
             "profile_sdpa_backend": stats.get("profile_sdpa_backend"),
+            "active_prefix_decode_loop_enabled": stats.get("active_prefix_decode_loop_enabled"),
+            "active_prefix_decode_bucket_size": stats.get("active_prefix_decode_bucket_size"),
             "use_server": isinstance(self.model, InferenceClient),
             "parallel": self.parallel,
         }

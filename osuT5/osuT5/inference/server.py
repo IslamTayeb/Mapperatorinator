@@ -4,6 +4,7 @@ import time
 import threading
 import traceback
 import torch
+from functools import partial
 from multiprocessing.connection import Listener, Client
 
 from transformers import LogitsProcessorList, ClassifierFreeGuidanceLogitsProcessor, TemperatureLogitsWarper
@@ -13,6 +14,7 @@ from .logit_processors import ConditionalTemperatureLogitsWarper, get_beat_type_
     get_mania_type_tokens, get_scroll_speed_tokens, TimeshiftBias, LookbackBiasLogitsWarper, \
     MonotonicTimeShiftLogitsProcessor
 from .cache_utils import get_cache
+from .decode_loop import active_prefix_decode_generate
 from ..runtime_profiling import generation_profile_context
 from ..model import Mapperatorinator
 from ..tokenizer import Tokenizer
@@ -166,6 +168,8 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     sync_model_timing = bool(generate_kwargs.pop('sync_model_timing', False))
     profile_generation_detail_ranges = bool(generate_kwargs.pop('profile_generation_detail_ranges', False))
     profile_sdpa_backend = generate_kwargs.pop('profile_sdpa_backend', None)
+    active_prefix_decode_loop = bool(generate_kwargs.pop('active_prefix_decode_loop', False))
+    active_prefix_decode_bucket_size = int(generate_kwargs.pop('active_prefix_decode_bucket_size', 128))
     if context_type is not None:
         context_type = ContextType(context_type)  # Convert to ContextType enum
 
@@ -186,6 +190,15 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     # Prepare cache
     cache = get_cache(model, batch_size, generate_kwargs.get('num_beams', 1), cfg_scale)
     pad_token_id = generate_kwargs.get('pad_token_id', getattr(tokenizer, 'pad_id', None))
+    if active_prefix_decode_loop:
+        if batch_size != 1:
+            raise ValueError("active_prefix_decode_loop currently supports batch_size=1 only.")
+        if cfg_scale != 1.0:
+            raise ValueError("active_prefix_decode_loop currently does not support classifier-free guidance.")
+        if int(generate_kwargs.get('num_beams', 1)) != 1:
+            raise ValueError("active_prefix_decode_loop currently supports num_beams=1 only.")
+        if active_prefix_decode_bucket_size <= 0:
+            raise ValueError("active_prefix_decode_bucket_size must be positive.")
 
     # Perform batched generation
     with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16, enabled=precision == 'amp'), \
@@ -203,6 +216,10 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
             past_key_values=cache,
             logits_processor=logits_processor_list,
             eos_token_id=get_eos_token_id(tokenizer, lookback_time=lookback_time, lookahead_time=lookahead_time, context_type=context_type),
+            custom_generate=partial(
+                active_prefix_decode_generate,
+                active_prefix_bucket_size=active_prefix_decode_bucket_size,
+            ) if active_prefix_decode_loop else None,
         )
         if sync_model_timing:
             _sync_cuda_for_model(model)
@@ -220,6 +237,8 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         "generation_compile_enabled": not bool(getattr(getattr(model, "generation_config", None), "disable_compile", True)),
         "profile_generation_detail_ranges": profile_generation_detail_ranges,
         "profile_sdpa_backend": profile_sdpa_backend,
+        "active_prefix_decode_loop_enabled": active_prefix_decode_loop,
+        "active_prefix_decode_bucket_size": active_prefix_decode_bucket_size if active_prefix_decode_loop else None,
     })
 
     return result, stats
