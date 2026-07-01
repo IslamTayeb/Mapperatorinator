@@ -272,6 +272,7 @@ def run_one_token_gate(
         candidate_active_prefix_self_attention: bool = False,
         candidate_active_prefix_prefill: bool | None = None,
         candidate_active_prefix_decode: bool | None = None,
+        candidate_active_prefix_decode_length: int | None = None,
 ) -> dict[str, Any]:
     _assert_supported_probe(args)
     if probe_token_id is not None:
@@ -305,6 +306,8 @@ def run_one_token_gate(
         if candidate_active_prefix_decode is None
         else bool(candidate_active_prefix_decode)
     )
+    if candidate_active_prefix_decode_length is not None and not active_prefix_decode:
+        raise ValueError("--candidate-active-prefix-decode-length requires active-prefix decode to be enabled")
 
     metadata = {
         "config_name": None,
@@ -336,6 +339,7 @@ def run_one_token_gate(
         "candidate_active_prefix_self_attention": bool(candidate_active_prefix_self_attention),
         "candidate_active_prefix_prefill": active_prefix_prefill,
         "candidate_active_prefix_decode": active_prefix_decode,
+        "candidate_active_prefix_decode_length": candidate_active_prefix_decode_length,
     }
 
     prompt = model_inputs["decoder_input_ids"]
@@ -443,6 +447,7 @@ def run_one_token_gate(
             full_attention_mask=full_mask,
             condition_kwargs=condition_kwargs,
             active_prefix_self_attention=active_prefix_decode,
+            active_prefix_self_attention_length=candidate_active_prefix_decode_length,
         )
         candidate_inputs = candidate_result.prepared_inputs
         candidate_logits = candidate_result.logits
@@ -530,6 +535,12 @@ def main() -> None:
         action="store_true",
         help="Enable active-prefix SDPA self-attention only for the direct candidate one-token decode step.",
     )
+    parser.add_argument(
+        "--candidate-active-prefix-decode-length",
+        type=int,
+        default=None,
+        help="Use this fixed active-prefix K/V length during candidate decode, e.g. a graph-reusable bucket.",
+    )
     parser.add_argument("--report-path", type=Path, default=None)
     parser.add_argument("overrides", nargs="*", help="Hydra overrides, e.g. model_path=/path/to/model")
     cli_args = parser.parse_args()
@@ -551,7 +562,9 @@ def main() -> None:
         candidate_active_prefix_decode=(
             cli_args.candidate_active_prefix_decode
             or cli_args.candidate_active_prefix_self_attention
+            or cli_args.candidate_active_prefix_decode_length is not None
         ),
+        candidate_active_prefix_decode_length=cli_args.candidate_active_prefix_decode_length,
     )
     result["metadata"]["config_name"] = cli_args.config_name
     result["wall_seconds"] = time.perf_counter() - start

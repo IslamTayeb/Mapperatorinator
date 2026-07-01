@@ -77,6 +77,7 @@ def decode_one_token_raw_logits(
         condition_kwargs: dict[str, Any] | None = None,
         cache_position: torch.LongTensor | None = None,
         active_prefix_self_attention: bool = False,
+        active_prefix_self_attention_length: int | None = None,
 ) -> OneTokenDecodeResult:
     """Run one cached decoder step and return raw last-token logits."""
     condition_kwargs = condition_kwargs or {}
@@ -86,7 +87,9 @@ def decode_one_token_raw_logits(
             state.prompt_length + 1,
             device=full_prefix.device,
         )
-    prefix_length = int(cache_position[-1].detach().cpu().item()) + 1
+    prefix_length = active_prefix_self_attention_length
+    if prefix_length is None and active_prefix_self_attention:
+        prefix_length = int(cache_position[-1].detach().cpu().item()) + 1
     with active_prefix_self_attention_context(prefix_length if active_prefix_self_attention else None):
         prepared_inputs = model.prepare_inputs_for_generation(
             full_prefix,
