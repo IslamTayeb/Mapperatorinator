@@ -177,6 +177,9 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         "do_sample": bool(generate_kwargs.get("do_sample", False)),
         "sync_model_timing": sync_model_timing,
         "generation_compile_enabled": not bool(getattr(getattr(model, "generation_config", None), "disable_compile", True)),
+        "persistent_static_mask_enabled": bool(
+            getattr(getattr(model, "transformer", None), "inference_persistent_static_mask", False)
+        ),
     })
 
     return result, stats
