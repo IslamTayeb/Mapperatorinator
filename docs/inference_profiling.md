@@ -152,6 +152,14 @@ For the 200 tok/s phase, rank the next experiments this way:
 
 Custom runtime work must prove token identity in stages before any speed claim graduates: compile-disabled 15s smoke equivalence, compile-enabled 15s smoke equivalence, then full-song equivalence.
 
+Post-warmup torch-profiler diagnostic for the 15s retained baseline:
+
+- Job `49133341`, profile `/work/imt11/Mapperatorinator/runs/smoke15-trace-seq9-49133341-ce92ebb/beatmap574d4d0acdf84cef8c7efd2758fb74bb.osu.profile.json`.
+- Traced label: `generation.main_generation.seq9`, `234` generated tokens.
+- Normal synchronized model time for the traced record was `2.562s` (`91.3 tok/s`); torch-profiler/export inflated outer wall to `24.207s`, so use the trace only for event mix.
+- Top CUDA self-time events were the compiled forward region and f32 memory-efficient attention on SM75: `Torch-Compiled Region: 0/2` `1.717s`, `fmha_cutlassF_f32_aligned_64x64_rf_sm75` `1.476s`.
+- Sampling/logits overhead was visible but not target-sized in this trace: `aten::sort` `234` calls, `7.601ms` CUDA total; `aten::_softmax` `468` calls, `1.759ms` self CUDA; `aten::cat` `542` calls, `1.433ms` self CUDA. Do not prioritize a fused sampler unless a future trace shows it has grown to at least `10%` of synchronized main-generation time.
+
 ## Codex Goal Prompt
 
 ```text
