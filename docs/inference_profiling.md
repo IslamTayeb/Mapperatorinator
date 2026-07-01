@@ -185,6 +185,15 @@ Conclusion: active-prefix is weak or unstable cold because the first long genera
 
 Next implementation target: graph/runtime stabilization for active-prefix bucket512. Good candidates are explicit graph/cache priming with setup cost honestly included, reducing cache-update specialization by decoder layer, or a bufferized/direct decode loop that avoids repeated HF compiled graph variants. Do not hide prewarm cost outside cold single-song timing; cold claims must include setup/timing/main/total non-regression. For warm-repeat or future batch serving, report first-song cold cost and warmed amortized throughput separately.
 
+Rejected active-prefix mask fast path, DCC jobs `49158276` and `49158365` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti:
+
+| run | main tokens | main model time | tok/s | token equivalence | status |
+| --- | ---: | ---: | ---: | --- | --- |
+| cold compile-only | `1,084` | `22.369s` | `48.461` | baseline | baseline |
+| active512 mask fast path | `1,084` | `30.544s` | `35.490` | PASS | rejected |
+
+The candidate moved active-prefix decode input preparation under the active-prefix context and capped static-cache mask construction to bucket length. One-token logits gates passed for compile disabled and enabled (`seq9`, active-prefix decode length `512`), and the 15s smoke matched all `1,084 / 1,084` generated main-token IDs. It still regressed cold main generation by `-26.8%`: the first long map window worsened (`seq3 16.259s -> 26.186s`) despite faster post-warm windows (`seq9 103.007 -> 150.046 tok/s`). The patch was reverted. See `notes/2026-07-01-active-prefix-mask-fastpath.md`.
+
 ## Smoke-To-Full Profiling Loop
 
 Start with the middle 15s SALVALAI smoke config for fastest iteration:
