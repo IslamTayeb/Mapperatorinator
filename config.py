@@ -88,6 +88,7 @@ class InferenceConfig:
     profile_torch_profile_memory: bool = True  # Record memory events in torch.profiler traces
     profile_torch_with_stack: bool = False  # Record Python stacks in torch.profiler traces
     profile_torch_event_limit: int = 50  # Maximum torch profiler key-average events to store in profile JSON
+    profile_nvtx_generation_ranges: bool = False  # Add top-level NVTX ranges for generation windows without torch.profiler
     profile_record_token_ids: bool = False  # Record generated token IDs in profile JSON for fixed-seed equivalence checks
     profile_generation_detail_ranges: bool = False  # Add detailed NVTX/torch profiler ranges inside generation
     profile_sdpa_backend: Optional[str] = None  # Force one PyTorch SDPA backend for profiling (flash/efficient/math/cudnn)

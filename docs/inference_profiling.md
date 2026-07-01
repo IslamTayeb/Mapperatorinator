@@ -265,6 +265,8 @@ python inference.py --config-name profile_salvalai_smoke15 \
 
 `profile_generation_detail_ranges=true` adds NVTX and `record_function` ranges inside VarWhisper decoder self-attention, cross-attention, MLP `fc1`/activation/`fc2`, final norm, and output projection. These traces are diagnostic only; do not use traced wall time for throughput claims.
 
+For Nsight Systems timeline work, add `profile_nvtx_generation_ranges=true` to emit top-level `generation.<label>.seqN` NVTX ranges without enabling `torch.profiler`. This makes cold `main_generation.seq0` and warmed windows such as `main_generation.seq9` visible in the timeline while keeping torch-profiler overhead out of the run. The resulting Nsight wall times are still diagnostic; use normal `profile_inference` model timings for throughput claims.
+
 For SDPA dispatch audits, force one PyTorch SDPA backend at a time:
 
 ```bash

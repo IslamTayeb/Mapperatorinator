@@ -25,6 +25,7 @@ class InferenceProfiler:
             torch_profile_memory: bool = True,
             torch_with_stack: bool = False,
             torch_event_limit: int = 50,
+            nvtx_generation_ranges: bool = False,
     ):
         self.enabled = enabled
         self.output_path = output_path
@@ -37,6 +38,7 @@ class InferenceProfiler:
         self.torch_profile_memory = torch_profile_memory
         self.torch_with_stack = torch_with_stack
         self.torch_event_limit = max(0, int(torch_event_limit))
+        self.nvtx_generation_ranges = nvtx_generation_ranges
         self.started_at = time.time()
         self.metadata: dict[str, Any] = {}
         self.stages: list[dict[str, Any]] = []
@@ -59,6 +61,7 @@ class InferenceProfiler:
             torch_profile_memory=bool(getattr(args, "profile_torch_profile_memory", True)),
             torch_with_stack=bool(getattr(args, "profile_torch_with_stack", False)),
             torch_event_limit=int(getattr(args, "profile_torch_event_limit", 50)),
+            nvtx_generation_ranges=bool(getattr(args, "profile_nvtx_generation_ranges", False)),
         )
 
     def set_metadata(self, **metadata: Any) -> None:
@@ -100,7 +103,11 @@ class InferenceProfiler:
     @contextmanager
     def torch_generation_trace(self, name: str, **metadata: Any) -> Iterator[None]:
         if not self._should_trace_torch_generation(name):
-            yield
+            if self._should_emit_nvtx_generation(name):
+                with self._nvtx_range(name):
+                    yield
+            else:
+                yield
             return
 
         trace_index = self._torch_generation_count
@@ -192,6 +199,11 @@ class InferenceProfiler:
             and self.torch_generation
             and self._torch_generation_count < self.torch_generation_limit
         )
+
+    def _should_emit_nvtx_generation(self, name: str) -> bool:
+        if self.torch_generation_label_filter and self.torch_generation_label_filter not in name:
+            return False
+        return self.enabled and self.nvtx_generation_ranges
 
     def _torch_trace_output_dir(self) -> Path:
         if self.torch_output_dir:

@@ -489,6 +489,7 @@ def generate(
         "profile_record_token_ids": args.profile_record_token_ids,
         "profile_sync_cuda": args.profile_sync_cuda,
         "profile_torch_generation": args.profile_torch_generation,
+        "profile_nvtx_generation_ranges": args.profile_nvtx_generation_ranges,
         "profile_generation_detail_ranges": args.profile_generation_detail_ranges,
         "profile_sdpa_backend": args.profile_sdpa_backend,
         "seed": args.seed,
