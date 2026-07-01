@@ -483,6 +483,8 @@ def generate(
         "use_server": args.use_server,
         "parallel": args.parallel,
         "max_batch_size": args.max_batch_size,
+        "inference_generation_compile": args.inference_generation_compile,
+        "inference_preallocated_sample": args.inference_preallocated_sample,
         "profile_record_token_ids": args.profile_record_token_ids,
         "profile_sync_cuda": args.profile_sync_cuda,
         "profile_torch_generation": args.profile_torch_generation,
