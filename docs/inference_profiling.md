@@ -151,7 +151,7 @@ python utils/summarize_inference_profile.py \
   --json-output "$RUN_DIR/compare-suite-warmed.json"
 ```
 
-Use `--suite-scope warmed_runs` for warmed-repeat or long-lived process claims. Use `--suite-scope all_runs` only when claiming all-run aggregate performance. The suite comparator checks shape, paired token hashes/token counts, and selected-scope aggregate non-regression. It also prints cold run0 diagnostics, but cold single-song promotion still requires normal full-song profile strict gates against the retained cold baseline.
+Use `--suite-scope warmed_runs` for warmed-repeat or long-lived process claims. Use `--suite-scope all_runs` only when claiming all-run aggregate performance. In suite mode, `--strict` checks schema/shape/run contract, paired token hashes/token counts, selected-scope aggregate main-generation non-regression, selected-scope first-record and remaining-record segment non-regression, selected-scope timing-context non-regression, and per-song main-generation non-regression. It also prints cold run0 diagnostics. Add `--gate-cold-run0` only when the suite claim includes cold run0 non-regression; cold single-song promotion still requires normal full-song profile strict gates against the retained cold baseline.
 
 First smoke result, DCC job `49154124` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti, commit `d20f26a`:
 

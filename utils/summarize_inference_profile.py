@@ -225,6 +225,44 @@ def _suite_aggregate(manifest: dict[str, Any], scope: str) -> dict[str, Any]:
     return aggregate.get("all_runs", {})
 
 
+def _suite_runs_for_scope(manifest: dict[str, Any], scope: str) -> list[dict[str, Any]]:
+    runs = manifest.get("runs", [])
+    if scope == "warmed_runs":
+        return [
+            run
+            for run in runs
+            if int(run.get("repeat_index", run.get("run_index", 0)) or 0) > 0
+        ]
+    return runs
+
+
+def _compare_suite_scope_availability(
+        baseline: dict[str, Any],
+        candidate: dict[str, Any],
+        *,
+        scope: str,
+) -> dict[str, Any]:
+    baseline_runs = _suite_runs_for_scope(baseline, scope)
+    candidate_runs = _suite_runs_for_scope(candidate, scope)
+    missing = []
+    if not baseline_runs:
+        missing.append("baseline")
+    if not candidate_runs:
+        missing.append("candidate")
+    passed = not missing
+    print(f"Suite scope availability ({scope})")
+    print(f"  {'PASS' if passed else 'FAIL'}")
+    if missing:
+        print(f"  missing_{scope}: {', '.join(missing)}")
+    print()
+    return {
+        "pass": passed,
+        "baseline_runs": len(baseline_runs),
+        "candidate_runs": len(candidate_runs),
+        "missing": missing,
+    }
+
+
 def _suite_run_key(run: dict[str, Any], index: int) -> str:
     return "run{index}/song{song}/repeat{repeat}".format(
         index=run.get("run_index", index),
@@ -236,6 +274,16 @@ def _suite_run_key(run: dict[str, Any], index: int) -> str:
 def _compare_suite_shape(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
     keys = ["run_kind", "song_count", "seed_step"]
     mismatches = []
+    missing = []
+    baseline_schema = int(baseline.get("schema_version", 0) or 0)
+    candidate_schema = int(candidate.get("schema_version", 0) or 0)
+    if baseline_schema < 3 or candidate_schema < 3:
+        mismatches.append({
+            "key": "schema_version",
+            "baseline": baseline.get("schema_version"),
+            "candidate": candidate.get("schema_version"),
+            "expected": "both >= 3",
+        })
     for key in keys:
         if baseline.get(key) != candidate.get(key):
             mismatches.append({"key": key, "baseline": baseline.get(key), "candidate": candidate.get(key)})
@@ -243,13 +291,64 @@ def _compare_suite_shape(baseline: dict[str, Any], candidate: dict[str, Any]) ->
     candidate_runs = candidate.get("runs", [])
     if len(baseline_runs) != len(candidate_runs):
         mismatches.append({"key": "run_count", "baseline": len(baseline_runs), "candidate": len(candidate_runs)})
-    passed = len(mismatches) == 0
-    print("Suite shape")
+
+    run_contract_keys = [
+        "run_index",
+        "repeat_index",
+        "song_index",
+        "song_id",
+        "audio_path",
+        "start_time",
+        "end_time",
+        "seed",
+        "sequence_count",
+        "song_length_ms",
+        "mode",
+        "batch_size",
+        "batch_start_index",
+    ]
+    for index in range(min(len(baseline_runs), len(candidate_runs))):
+        baseline_run = baseline_runs[index]
+        candidate_run = candidate_runs[index]
+        for key in run_contract_keys:
+            if key not in baseline_run and key not in candidate_run:
+                continue
+            if key not in baseline_run or key not in candidate_run:
+                missing.append({
+                    "index": index,
+                    "key": key,
+                    "baseline_key": _suite_run_key(baseline_run, index),
+                    "candidate_key": _suite_run_key(candidate_run, index),
+                })
+                continue
+            if baseline_run.get(key) != candidate_run.get(key):
+                mismatches.append({
+                    "index": index,
+                    "key": key,
+                    "baseline": baseline_run.get(key),
+                    "candidate": candidate_run.get(key),
+                    "baseline_key": _suite_run_key(baseline_run, index),
+                    "candidate_key": _suite_run_key(candidate_run, index),
+                })
+
+    if baseline.get("run_kind") == "serial_multi_song" or candidate.get("run_kind") == "serial_multi_song":
+        if int(baseline.get("song_count", 0) or 0) < 5 or int(candidate.get("song_count", 0) or 0) < 5:
+            mismatches.append({
+                "key": "song_count",
+                "baseline": baseline.get("song_count"),
+                "candidate": candidate.get("song_count"),
+                "expected": "serial_multi_song performance evidence should use at least 5 songs",
+            })
+
+    passed = len(mismatches) == 0 and len(missing) == 0
+    print("Suite shape/contract")
     print(f"  {'PASS' if passed else 'FAIL'}")
-    for mismatch in mismatches:
-        print(f"  {mismatch['key']}: baseline={mismatch['baseline']!r}, candidate={mismatch['candidate']!r}")
+    for mismatch in mismatches[:8]:
+        print(f"  {mismatch['key']}: baseline={mismatch.get('baseline')!r}, candidate={mismatch.get('candidate')!r}")
+    if missing:
+        print(f"  missing_contract_fields: {len(missing)}")
     print()
-    return {"pass": passed, "mismatches": mismatches}
+    return {"pass": passed, "mismatches": mismatches, "missing": missing}
 
 
 def _compare_suite_token_hashes(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
@@ -333,6 +432,124 @@ def _compare_suite_metric_block(
     }
 
 
+def _aggregate_suite_timing_runs(selected: list[dict[str, Any]]) -> dict[str, Any]:
+    generated_tokens = sum(int(run.get("timing_generated_tokens") or 0) for run in selected)
+    model_elapsed_seconds = sum(float(run.get("timing_model_elapsed_seconds") or 0.0) for run in selected)
+    wall_seconds = sum(float(run.get("timing_wall_seconds") or 0.0) for run in selected)
+    return {
+        "runs": len(selected),
+        "records": len(selected),
+        "generated_tokens": generated_tokens,
+        "model_elapsed_seconds": model_elapsed_seconds,
+        "wall_seconds": wall_seconds,
+        "tokens_per_second": generated_tokens / model_elapsed_seconds if model_elapsed_seconds > 0 else 0.0,
+    }
+
+
+def _aggregate_suite_main_runs(selected: list[dict[str, Any]]) -> dict[str, Any]:
+    generated_tokens = sum(int(run.get("main_generated_tokens") or 0) for run in selected)
+    model_elapsed_seconds = sum(float(run.get("main_model_elapsed_seconds") or 0.0) for run in selected)
+    wall_seconds = sum(float(run.get("main_wall_seconds") or 0.0) for run in selected)
+    return {
+        "runs": len(selected),
+        "records": len(selected),
+        "generated_tokens": generated_tokens,
+        "model_elapsed_seconds": model_elapsed_seconds,
+        "wall_seconds": wall_seconds,
+        "tokens_per_second": generated_tokens / model_elapsed_seconds if model_elapsed_seconds > 0 else 0.0,
+    }
+
+
+def _compare_suite_per_song(
+        baseline: dict[str, Any],
+        candidate: dict[str, Any],
+        *,
+        scope: str,
+        regression_tolerance_pct: float,
+) -> dict[str, Any]:
+    baseline_by_song: dict[int, list[dict[str, Any]]] = {}
+    candidate_by_song: dict[int, list[dict[str, Any]]] = {}
+    for run in _suite_runs_for_scope(baseline, scope):
+        baseline_by_song.setdefault(int(run.get("song_index", -1)), []).append(run)
+    for run in _suite_runs_for_scope(candidate, scope):
+        candidate_by_song.setdefault(int(run.get("song_index", -1)), []).append(run)
+
+    baseline_keys = set(baseline_by_song)
+    candidate_keys = set(candidate_by_song)
+    missing = sorted(baseline_keys.symmetric_difference(candidate_keys))
+    songs = []
+    for song_index in sorted(baseline_keys & candidate_keys):
+        baseline_runs = baseline_by_song[song_index]
+        candidate_runs = candidate_by_song[song_index]
+        report = _compare_suite_metric_block(
+            _aggregate_suite_main_runs(baseline_runs),
+            _aggregate_suite_main_runs(candidate_runs),
+            regression_tolerance_pct=regression_tolerance_pct,
+        )
+        report.update({
+            "song_index": song_index,
+            "song_id": baseline_runs[0].get("song_id"),
+            "runs": len(baseline_runs),
+        })
+        songs.append(report)
+
+    failed = [song for song in songs if not song.get("pass", False)]
+    passed = not missing and not failed
+    print(f"Suite per-song main-generation no-regression ({scope})")
+    print(f"  {'PASS' if passed else 'FAIL'} (songs={len(songs)}, failed={len(failed)}, missing={len(missing)})")
+    for song in failed[:5]:
+        metric = song["metrics"]["tokens_per_second"]
+        print(
+            "  song_index={song_index}, song_id={song_id}: "
+            "baseline={baseline:.3f}, candidate={candidate:.3f}".format(
+                song_index=song["song_index"],
+                song_id=song.get("song_id"),
+                baseline=float(metric["baseline"]),
+                candidate=float(metric["candidate"]),
+            )
+        )
+    if missing:
+        print(f"  missing_song_indices: {missing[:8]}")
+    print()
+    return {
+        "pass": passed,
+        "songs": songs,
+        "failed": failed,
+        "missing_song_indices": missing,
+    }
+
+
+def _compare_suite_optional_block(
+        name: str,
+        baseline_block: Any,
+        candidate_block: Any,
+        *,
+        regression_tolerance_pct: float,
+) -> dict[str, Any]:
+    if not isinstance(baseline_block, dict) or not isinstance(candidate_block, dict):
+        report = {
+            "available": False,
+            "pass": False,
+            "missing": True,
+            "metrics": {},
+            "generated_tokens_match": False,
+            "records_match": False,
+        }
+        print(name)
+        print("  not available")
+        print()
+        return report
+
+    report = _compare_suite_metric_block(
+        baseline_block,
+        candidate_block,
+        regression_tolerance_pct=regression_tolerance_pct,
+    )
+    report["available"] = True
+    _print_suite_metric_block(name, report)
+    return report
+
+
 def _print_suite_metric_block(name: str, report: dict[str, Any]) -> None:
     print(name)
     for metric_name, metric in report["metrics"].items():
@@ -365,8 +582,12 @@ def compare_suite_manifests(
         "scope": scope,
         "regression_tolerance_pct": regression_tolerance_pct,
         "shape": {},
+        "scope_availability": {},
         "token_equivalence": {},
         "performance": {},
+        "timing_context": {},
+        "segments": {},
+        "per_song": {},
         "cold_run0": {},
     }
 
@@ -376,6 +597,7 @@ def compare_suite_manifests(
     print()
 
     report["shape"] = _compare_suite_shape(baseline, candidate)
+    report["scope_availability"] = _compare_suite_scope_availability(baseline, candidate, scope=scope)
     report["token_equivalence"] = _compare_suite_token_hashes(baseline, candidate)
     report["performance"] = _compare_suite_metric_block(
         baseline_block,
@@ -383,6 +605,36 @@ def compare_suite_manifests(
         regression_tolerance_pct=regression_tolerance_pct,
     )
     _print_suite_metric_block(f"Suite no-regression ({scope})", report["performance"])
+
+    report["segments"] = {
+        "first_records": _compare_suite_optional_block(
+            f"Suite first-record no-regression ({scope})",
+            baseline_block.get("first_records"),
+            candidate_block.get("first_records"),
+            regression_tolerance_pct=regression_tolerance_pct,
+        ),
+        "remaining_records": _compare_suite_optional_block(
+            f"Suite remaining-record no-regression ({scope})",
+            baseline_block.get("remaining_records"),
+            candidate_block.get("remaining_records"),
+            regression_tolerance_pct=regression_tolerance_pct,
+        ),
+    }
+
+    baseline_timing_block = _aggregate_suite_timing_runs(_suite_runs_for_scope(baseline, scope))
+    candidate_timing_block = _aggregate_suite_timing_runs(_suite_runs_for_scope(candidate, scope))
+    report["timing_context"] = _compare_suite_optional_block(
+        f"Suite timing-context no-regression ({scope})",
+        baseline_timing_block,
+        candidate_timing_block,
+        regression_tolerance_pct=regression_tolerance_pct,
+    )
+    report["per_song"] = _compare_suite_per_song(
+        baseline,
+        candidate,
+        scope=scope,
+        regression_tolerance_pct=regression_tolerance_pct,
+    )
 
     baseline_runs = baseline.get("runs", [])
     candidate_runs = candidate.get("runs", [])
@@ -711,9 +963,53 @@ def main() -> None:
         help="Exit nonzero if candidate throughput, model time, wall time, token count, or record count regresses.",
     )
     parser.add_argument(
+        "--require-suite-segment-no-regression",
+        "--require-suite-segments",
+        dest="require_suite_segment_no_regression",
+        action="store_true",
+        help=(
+            "For --compare-suite, exit nonzero if selected-scope first-record or remaining-record "
+            "main-generation segment metrics regress."
+        ),
+    )
+    parser.add_argument(
+        "--require-suite-timing-no-regression",
+        "--require-suite-timing",
+        dest="require_suite_timing_no_regression",
+        action="store_true",
+        help="For --compare-suite, exit nonzero if selected-scope timing-context metrics regress.",
+    )
+    parser.add_argument(
+        "--require-per-song-no-regression",
+        "--require-per-song-non-regression",
+        dest="require_per_song_no_regression",
+        action="store_true",
+        help="For --compare-suite, exit nonzero if any selected-scope song-level main-generation metrics regress.",
+    )
+    parser.add_argument(
+        "--require-mode-contract",
+        action="store_true",
+        help=(
+            "For --compare-suite, exit nonzero if suite schema, run order, song/window/seed, "
+            "or available mode/batch contract fields differ."
+        ),
+    )
+    parser.add_argument(
+        "--gate-cold-run0",
+        action="store_true",
+        help=(
+            "For --compare-suite, also fail if run0 regresses. This is not included in --strict "
+            "because warmed/batch claims report cold cost separately."
+        ),
+    )
+    parser.add_argument(
         "--strict",
         action="store_true",
-        help="Shortcut for all --require-* comparison gates.",
+        help=(
+            "Shortcut for default strict comparison gates. In suite mode this includes contract, "
+            "token, aggregate, segment, timing, per-song, and scope checks; cold run0 still "
+            "requires --gate-cold-run0."
+        ),
     )
     parser.add_argument(
         "--json-output",
@@ -758,10 +1054,26 @@ def main() -> None:
         require_contract_match = args.require_contract_match or args.strict
         require_token_equivalence = args.require_token_equivalence or args.strict
         require_no_regression = args.require_no_regression or args.strict
+        require_segment_no_regression = args.require_suite_segment_no_regression or args.strict
+        require_timing_no_regression = args.require_suite_timing_no_regression or args.strict
         failed = (
-            (require_contract_match and not report["shape"].get("pass", False))
+            ((require_contract_match or args.require_mode_contract) and not report["shape"].get("pass", False))
+            or (args.strict and not report["scope_availability"].get("pass", False))
             or (require_token_equivalence and not report["token_equivalence"].get("pass", False))
             or (require_no_regression and not report["performance"].get("pass", False))
+            or (
+                require_segment_no_regression
+                and not all(block.get("pass", False) for block in report["segments"].values())
+            )
+            or (
+                require_timing_no_regression
+                and not report["timing_context"].get("pass", False)
+            )
+            or (
+                (args.require_per_song_no_regression or args.strict)
+                and not report["per_song"].get("pass", False)
+            )
+            or (args.gate_cold_run0 and not report["cold_run0"].get("pass", False))
         )
         raise SystemExit(1 if failed else 0)
     elif args.profile:

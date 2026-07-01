@@ -15,6 +15,19 @@ Added dependency-light suite metrics and comparison gates for warm-repeat, futur
 - Added `utils/summarize_inference_profile.py --compare-suite BASE CANDIDATE --suite-scope warmed_runs|all_runs` so warmed and multi-song suites can be gated by paired token hashes and selected-scope performance.
 - Added lightweight tests for the profile metric helper and suite manifest comparison.
 
+## Strict Suite Gate Follow-up
+
+Updated `--compare-suite --strict` so suite v3 evidence is gated instead of only recorded:
+
+- schema/shape/run contract checks now require `schema_version >= 3`, matching run kind, song count, seed step, run order, song IDs, audio paths, seeds, windows, sequence counts, song lengths, and available mode/batch fields;
+- selected-scope aggregate main-generation non-regression still gates the headline suite claim;
+- selected-scope `main_first_record` and `main_remaining_records` non-regression now gates first-window and warmed-window segment behavior;
+- selected-scope timing-context non-regression now gates timing regressions, which were a real failure mode in active-prefix experiments;
+- selected-scope per-song main-generation non-regression now catches aggregate multi-song wins that hide one bad song;
+- cold run0 remains reported by default and can be gated explicitly with `--gate-cold-run0` when the claim includes cold-run non-regression.
+
+Additional tests cover segment regression, timing-context regression, a per-song regression hidden by aggregate improvement, and run-contract mismatch.
+
 ## Why
 
 Active-prefix is strategically useful for warmed/batch inference, but prior runs showed the risk directly: warmed aggregate throughput can be strong while the first generation window pays graph/capture/specialization cost. The suite manifest now records both sides explicitly so future batch or serving claims report first-song cold cost and warmed steady-state behavior separately.
