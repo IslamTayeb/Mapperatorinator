@@ -434,6 +434,19 @@ RTX 2080 Ti smoke comparison on DCC `gpu-common`, node `dcc-core-ferc-s-z25-21`:
 
 `utils/summarize_inference_profile.py --compare` reported token equivalence PASS for all `2,894` generated main-generation token IDs, but throughput was `-10.0%` worse. Slurm stderr showed repeated cudagraph partition messages and a large first-window setup cost. Do not force `CompileConfig(dynamic=True)` for this workload unless a future PyTorch/Transformers version changes the compile behavior and a fresh smoke run proves a win.
 
+### Max-autotune generation compile config
+
+Attempted in commit `0cccf36` and reverted after 15s smoke profiling. The change added a default-off `inference_generation_compile_mode` scout flag and tested `model.generation_config.compile_config = CompileConfig(mode="max-autotune")` while leaving `dynamic=None`, `fullgraph=False`, and the retained SDPA/static-cache generation path unchanged.
+
+RTX 2080 Ti middle-15s SALVALAI comparison on DCC `gpu-common`, node `dcc-core-ferc-s-z25-21`:
+
+| run | commit | job | profile | main tokens | main model time | tok/s |
+| --- | --- | --- | --- | ---: | ---: | ---: |
+| baseline | `0cccf36` | `49136379` | `/work/imt11/Mapperatorinator/runs/smoke15-compile-default-0cccf36/beatmap1572085922b24c95b60ecf1f5abe5ec4.osu.profile.json` | 1,084 | 21.422s | 50.6 |
+| candidate | `0cccf36` | `49136380` | `/work/imt11/Mapperatorinator/runs/smoke15-compile-maxautotune-0cccf36/beatmapf92dca264acf4af3bd5a08b78880c75a.osu.profile.json` | 1,084 | 34.126s | 31.8 |
+
+Token equivalence PASS: all `1,084` generated main-generation token IDs matched. Throughput was `-37.2%` worse overall and post-warmup windows were also slower, for example seq9 fell from `104.1 tok/s` to `88.9 tok/s`. Stderr showed autotuning selected some Triton kernels, but that did not improve this Turing/SM75 single-token decode workload. Do not force `CompileConfig(mode="max-autotune")` for this baseline unless a future PyTorch/Transformers version changes the kernel choices and a fresh smoke run proves a win.
+
 ### Preallocated sample loop
 
 Attempted in commits `6d6ba7c` and `f7b5222` and reverted after smoke profiling. The change added an opt-in Mapperatorinator override for Hugging Face `_sample` that preallocated `input_ids` and `decoder_attention_mask` buffers to avoid per-token `torch.cat` in the generation loop while preserving the compiled one-token forward path.
