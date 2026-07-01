@@ -516,6 +516,31 @@ RTX 2080 Ti full-song comparison on DCC `gpu-common`, node `dcc-core-ferc-s-z25-
 
 Smoke profiling looked promising (`+31.9%`), but the accepted full-song comparison was only `+2.3%` with token equivalence PASS for all `7,639` generated main-generation token IDs. This is below the keep threshold, so the change was reverted. Do not reintroduce inference-mode wrapping unless a future full-song result clears the acceptance threshold.
 
+## Runtime Backend Feasibility Notes
+
+### Torch-TensorRT and TensorRT-RTX
+
+The current DCC Mapperatorinator environment does not include Torch-TensorRT, TensorRT, ONNX, ONNX Runtime, or Polygraphy. The initial GPU-node probe was job `49134026` on `dcc-core-ferc-s-z25-21` with RTX 2080 Ti capability `(7, 5)`, PyTorch `2.10.0+cu128`, and repo commit `a2cf83a`. Its log is `/work/imt11/Mapperatorinator/logs/trt-probe-49134026.out`.
+
+Package dry-runs on 2026-07-01 show that TensorRT work should use a separate isolated env rather than mutating `/hpc/group/romerolab/imt11/envs/mapperatorinator`:
+
+| path | dry-run evidence | key resolved packages | concern |
+| --- | --- | --- | --- |
+| standard Torch-TensorRT | `/work/imt11/Mapperatorinator/logs/torch_tensorrt_210_unpinned_dryrun_report.json` | `torch_tensorrt==2.10.0`, `tensorrt==10.14.1.48.post1`, `cuda-toolkit==13.3.1`, `nvidia-cuda-runtime==13.3.29` | current DCC driver probe reported CUDA `13.2`, so import/runtime needs GPU-node validation |
+| Torch-TensorRT-RTX | `/work/imt11/Mapperatorinator/logs/torch_tensorrt_rtx_dryrun_report.json` | `torch-tensorrt-rtx==2.12.1`, `torch==2.12.1`, `tensorrt_rtx==1.4.0.76`, CUDA `13.0` package family, `executorch==1.3.1` | changes the PyTorch line and pulls a large runtime stack |
+
+Official docs describe Torch-TensorRT-RTX as experimental and installed via `torch-tensorrt-rtx`; the Python import remains `torch_tensorrt`, and NVIDIA's PyTorch walkthrough uses `torch.compile(..., backend="tensorrt")`. NVIDIA's TensorRT-RTX support matrix lists Turing/RTX 2080Ti compute capability `7.5` support, but its TensorRT-RTX 1.5 footnote says Turing does not support FP32 GEMMs in that release. Since the retained Mapperatorinator baseline is same-calculation FP32-style inference on RTX 2080 Ti, do not assume TensorRT-RTX accelerates the dominant decoder GEMMs without direct logits and token-equivalence evidence.
+
+The next TensorRT gate is environment and import validation, not an inference speed claim:
+
+1. Build an isolated DCC env such as `/hpc/group/romerolab/imt11/envs/mapperatorinator-trt`.
+2. Run a Slurm GPU import/compile smoke on RTX 2080 Ti that prints driver, CUDA, PyTorch, `torch_tensorrt`, and TensorRT versions.
+3. Compile a tiny fixed-shape CUDA module with `torch.compile(..., backend="tensorrt")`.
+4. Compile/export only the repeated one-token decoder forward.
+5. Compare logits, then run 15s smoke token-equivalence, then full-song token-equivalence before any speed claim can graduate.
+
+See `notes/2026-07-01-tensorrt-packaging-probe.md` for the full resolver details.
+
 ## What The Profile Captures
 
 Top-level `stages` report wall time for setup, model loading, audio loading, segmentation, timing generation, main generation, diffusion, postprocessing, and file writes.

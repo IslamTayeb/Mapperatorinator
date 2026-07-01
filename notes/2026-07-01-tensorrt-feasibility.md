@@ -34,4 +34,4 @@ Graduation requirements remain unchanged:
 
 ## Next Step
 
-Keep the retained runtime baseline as SDPA plus `inference_generation_compile=true`. Start the exact custom decode-loop feasibility spike behind an opt-in flag, with v1 hard-disabled for CFG, beams, parallel generation, and server batching.
+Keep the retained runtime baseline as SDPA plus `inference_generation_compile=true`. If TensorRT work continues, first create an isolated DCC env and run only import/tiny-compile validation before touching Mapperatorinator inference code. See `notes/2026-07-01-tensorrt-packaging-probe.md` for the resolver evidence and isolated-env gate.
