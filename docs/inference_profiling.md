@@ -225,6 +225,15 @@ Run dir: `/work/imt11/Mapperatorinator/runs/direct-graph-gate-49165810-0602d32`.
 
 This remains a verifier-only result. It proves that `utils/verify_direct_decode_loop.py --candidate-cuda-graph-forward` can replay a captured active-prefix bucket512 one-token forward across changing sampled tokens and `cache_position` while preserving generated-token identity, final RNG state, logits allclose, and top-k order for this 8-token gate. It does not prove inference throughput because the verifier still pays short-run setup, input preparation, tensor-copy, and reporting overhead. Before any speed claim, extend the graph gate to a longer direct-loop sample, then run 15s smoke token equivalence and untraced `profile_inference` throughput.
 
+Follow-up 64-token graph gate, DCC job `49165980` on `dcc-dhvimdcore-gpu-ferc-s-p15-10`, RTX 2080 Ti, commit `26ec057`:
+
+| gate | token match | RNG match | raw-logit steps | max_abs | graph replays | wall |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| compile false, graph active512 | PASS | PASS | 64 | `0.0` | `63` | `28.448s` |
+| compile true, graph active512 | PASS | PASS | 64 | `1.068e-4` | `63` | `70.252s` |
+
+Run dir: `/work/imt11/Mapperatorinator/runs/direct-graph-gate64-49165980-26ec057`. This strengthens the correctness signal for graph replay across longer sampled-token/RNG progression, but it still stayed inside one active-prefix bucket and is not a throughput result.
+
 Rejected active-prefix mask fast path, DCC jobs `49158276` and `49158365` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti:
 
 | run | main tokens | main model time | tok/s | token equivalence | status |

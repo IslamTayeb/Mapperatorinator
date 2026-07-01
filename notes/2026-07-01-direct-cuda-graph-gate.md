@@ -73,8 +73,29 @@ It is not a throughput claim:
 
 Keep the verifier infrastructure and use it before any production CUDA graph decode-loop attempt.
 
+## Longer Gate Follow-Up
+
+Follow-up job `49165980` repeated the graph replay gate at 64 generated tokens:
+
+- Partition: `common`
+- Node/GPU: `dcc-dhvimdcore-gpu-ferc-s-p15-10`, NVIDIA GeForce RTX 2080 Ti, compute capability `7.5`, driver `595.71.05`
+- Commit: `26ec057`
+- Config: `profile_salvalai_smoke15`, sequence index `9`, `max_new_tokens=64`, active-prefix bucket `512`
+- Run dir: `/work/imt11/Mapperatorinator/runs/direct-graph-gate64-49165980-26ec057`
+- Logs: `/work/imt11/Mapperatorinator/logs/direct-graph-gate64-49165980.out` and `.err`
+- Slurm state: `COMPLETED`, exit code `0:0`
+
+| Gate | Token match | RNG match | Logits allclose | Top-k match | Steps | Max abs | Graph capture | Graph replays | Wall |
+| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| graph active512, compile false | PASS | PASS | PASS | PASS | `64` | `0.0` | `0.0770s` | `63` | `28.448s` |
+| graph active512, compile true | PASS | PASS | PASS | PASS | `64` | `1.068e-4` | `0.0764s` | `63` | `70.252s` |
+
+The retained generated-token sequence length was `64` in both cases, and both reference and candidate stopped because of `max_new_tokens`.
+
+This strengthens the correctness signal but keeps the same limits: the gate stayed inside one active-prefix bucket and still measured verifier overhead, not production throughput.
+
 Next useful checks:
 
-1. Increase the graph gate to a longer direct-loop sample, such as 64 tokens, to catch bucket changes, EOS/stopping edge cases, and longer RNG progression.
-2. If the longer gate passes, prototype an opt-in smoke-only direct graph loop that reports untraced `profile_inference` model time.
+1. Add bucket-transition handling to the verifier or run an expected-fail transition probe so production graph recapture logic is explicit.
+2. Prototype an opt-in smoke-only direct graph loop that reports untraced `profile_inference` model time.
 3. Keep active-prefix default-off and do not claim speed until 15s smoke and then full-song SALVALAI runs pass token equivalence and no-regression gates.
