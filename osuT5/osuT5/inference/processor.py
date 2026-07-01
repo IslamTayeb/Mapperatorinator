@@ -365,18 +365,26 @@ class Processor(object):
 
                 self.profiler.sync()
                 generation_start = time.perf_counter()
-                result, generation_stats = self.model_generate(
-                    model_kwargs | dict(
-                        inputs=frames,
-                        decoder_input_ids=prompt,
-                        decoder_attention_mask=prompt.ne(self.tokenizer.pad_id),
-                        negative_prompt=uncond_prompt,
-                        negative_prompt_attention_mask=uncond_prompt.ne(self.tokenizer.pad_id) if uncond_prompt is not None else None,
-                    ),
-                    lookback_time=self.lookback_time if trim_lookback else 0,
-                    lookahead_time=self.lookahead_time if trim_lookahead else 0,
-                    context_type=context["context_type"].value,
-                )
+                with self.profiler.torch_generation_trace(
+                    f"generation.{profile_label or context['context_type'].value}.seq{sequence_index}",
+                    profile_label=profile_label,
+                    mode="sequential",
+                    context_type=context["context_type"],
+                    sequence_index=sequence_index,
+                    frame_time_ms=frame_time,
+                ):
+                    result, generation_stats = self.model_generate(
+                        model_kwargs | dict(
+                            inputs=frames,
+                            decoder_input_ids=prompt,
+                            decoder_attention_mask=prompt.ne(self.tokenizer.pad_id),
+                            negative_prompt=uncond_prompt,
+                            negative_prompt_attention_mask=uncond_prompt.ne(self.tokenizer.pad_id) if uncond_prompt is not None else None,
+                        ),
+                        lookback_time=self.lookback_time if trim_lookback else 0,
+                        lookahead_time=self.lookahead_time if trim_lookahead else 0,
+                        context_type=context["context_type"].value,
+                    )
                 self.profiler.sync()
                 model_wall_seconds = time.perf_counter() - generation_start
                 self._record_generation_stats(generation_stats)
@@ -766,16 +774,24 @@ class Processor(object):
             # Start generation
             self.profiler.sync()
             generation_start = time.perf_counter()
-            result = generate_func(
-                model_kwargs_batch | dict(
-                    inputs=frames_batch,
-                    decoder_input_ids=cond_prompt_batch,
-                    decoder_attention_mask=cond_prompt_batch.ne(self.tokenizer.pad_id),
-                    negative_prompt=uncond_prompt_batch,
-                    negative_prompt_attention_mask=uncond_prompt_batch.ne(
-                        self.tokenizer.pad_id) if uncond_prompt_batch is not None else None,
-                ),
-            )
+            with self.profiler.torch_generation_trace(
+                f"generation.{profile_label or context_type or 'parallel'}.batch{i}",
+                profile_label=profile_label,
+                mode="parallel",
+                context_type=context_type,
+                batch_start_index=i,
+                batch_size=int(frames_batch.shape[0]),
+            ):
+                result = generate_func(
+                    model_kwargs_batch | dict(
+                        inputs=frames_batch,
+                        decoder_input_ids=cond_prompt_batch,
+                        decoder_attention_mask=cond_prompt_batch.ne(self.tokenizer.pad_id),
+                        negative_prompt=uncond_prompt_batch,
+                        negative_prompt_attention_mask=uncond_prompt_batch.ne(
+                            self.tokenizer.pad_id) if uncond_prompt_batch is not None else None,
+                    ),
+                )
             self.profiler.sync()
             model_wall_seconds = time.perf_counter() - generation_start
 

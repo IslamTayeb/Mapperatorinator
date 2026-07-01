@@ -335,12 +335,18 @@ def profile_callable(
     trace_path: Path | None,
 ) -> dict[str, object]:
     activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
-    with profile(
-        activities=activities,
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=False,
-    ) as prof:
+    profile_kwargs = {
+        "activities": activities,
+        "record_shapes": True,
+        "profile_memory": True,
+        "with_stack": False,
+    }
+    try:
+        profiler_context = profile(**profile_kwargs, acc_events=True)
+    except TypeError:
+        profiler_context = profile(**profile_kwargs)
+
+    with profiler_context as prof:
         for _ in range(profile_iters):
             with _nvtx_record(label):
                 fn()

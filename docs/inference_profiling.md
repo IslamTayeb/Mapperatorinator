@@ -112,6 +112,47 @@ Outputs:
 
 The default cases cover single-token cached decode, cross-attention against encoder-like lengths up to `2048`, prefill-like self-attention up to `2048`, and a few batch-size-8 what-if cases. Keep this as a microprofile: it does not replace full inference profiling because it does not include model GEMMs, cache updates, tokenizer/server overhead, or sampling.
 
+Observed A5000 kernel microprofile on 2026-06-30:
+
+- Job: `49097689` on `dcc-rental-gpu-07`, `NVIDIA RTX A5000`.
+- Artifacts: `/work/imt11/Mapperatorinator/runs/attn-kernels-49097689/attention_kernel_profile.json`, matching `.txt`, and 20 Chrome traces.
+- Runtime: `torch==2.10.0+cu128`, `flash-attn==2.8.3.post1`, CUDA runtime `12.8`.
+
+Representative timings:
+
+| case | mode | SDPA | FA2 | FA2/SDPA |
+| --- | --- | ---: | ---: | ---: |
+| `decode_self_kv512` | attention only | 0.0407ms | 0.1229ms | 3.02x |
+| `decode_self_kv512` | repo-like layout | 0.0465ms | 0.1695ms | 3.65x |
+| `cross_attn_kv2048` | attention only | 0.0391ms | 0.1237ms | 3.16x |
+| `cross_attn_kv2048` | repo-like layout | 0.0453ms | 0.1668ms | 3.69x |
+| `prefill_self_len512` | attention only | 0.0389ms | 0.1270ms | 3.26x |
+| `prefill_self_len2048` | attention only | 0.1088ms | 0.1131ms | 1.04x |
+| `prefill_self_len2048` | repo-like layout | 0.1167ms | 0.2098ms | 1.80x |
+| `batch8_cross_attn_kv2048` | attention only | 0.0500ms | 0.1245ms | 2.49x |
+| `batch8_cross_attn_kv2048` | repo-like layout | 0.0501ms | 0.1973ms | 3.94x |
+
+Kernel traces showed SDPA dispatching to `aten::_scaled_dot_product_flash_attention` and `pytorch_flash::flash_fwd*` kernels, so SDPA is already using fused flash-style kernels on A5000. FA2 used `flash_attn::_flash_attn_forward` and `flash::flash_fwd*` kernels. For long prefill, raw attention kernel time was close; for single-token decode and cross-attention, FA2 lost mostly to wrapper/launch gaps and repo-like packing overhead. In repo-like FA2 traces, `aten::cat`/`CatArrayBatchedCopy` was a visible extra cost, especially for batch-size what-if cases.
+
+## Full Generation Torch Traces
+
+For full-model kernel traces around actual `model.generate` calls, enable the opt-in torch profiler:
+
+```bash
+python inference.py --config-name profile_salvalai \
+  audio_path="$WORK/data/salvalai.mp3" \
+  output_path="$WORK/runs/profile-torch-${SLURM_JOB_ID}" \
+  device=cuda \
+  precision=fp16 \
+  attn_implementation=sdpa \
+  use_server=false \
+  profile_torch_generation=true \
+  profile_torch_output_dir="$WORK/runs/profile-torch-${SLURM_JOB_ID}/torch_profiles" \
+  profile_torch_generation_limit=3
+```
+
+This writes Chrome traces for the first selected `model.generate` calls and adds a `torch_profiles` section to the normal `.profile.json`. Keep `profile_torch_generation_limit` small for full songs; each trace includes CPU/CUDA activities, shapes, memory events, NVTX/record-function ranges, and the top profiler events by self CUDA time.
+
 ## FlashAttention 2 On DCC
 
 FlashAttention 2 is the relevant package for A5000/5000 Ada testing through the normal Transformers `flash_attention_2` path. FlashAttention 3 is Hopper-focused and should be treated as a separate H100/H800-class ablation, not as a replacement for A5000 runs.

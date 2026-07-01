@@ -77,6 +77,12 @@ class InferenceConfig:
     profile_inference: bool = False  # Write stage and generation timing profile JSON
     profile_output_path: Optional[str] = None  # Path to write profile JSON; defaults next to generated beatmap
     profile_sync_cuda: bool = True  # Synchronize CUDA around profiled regions for accurate timings
+    profile_torch_generation: bool = False  # Write torch.profiler Chrome traces around selected model.generate calls
+    profile_torch_output_dir: Optional[str] = None  # Directory for torch.profiler Chrome traces
+    profile_torch_generation_limit: int = 3  # Maximum number of model.generate calls to trace
+    profile_torch_record_shapes: bool = True  # Record tensor shapes in torch.profiler traces
+    profile_torch_profile_memory: bool = True  # Record memory events in torch.profiler traces
+    profile_torch_with_stack: bool = False  # Record Python stacks in torch.profiler traces
     resnap_events: bool = True  # Resnap notes to the timing after generation
     snap_near_perfect_overlaps: bool = True  # Snap nearly overlapping positions to each other
 

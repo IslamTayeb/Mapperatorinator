@@ -64,6 +64,12 @@ max_batch_size: 16       # Maximum batch size for inference
 profile_inference: false # Write stage and generation timing profile JSON
 profile_output_path: null # Path to write profile JSON; defaults next to generated beatmap
 profile_sync_cuda: true  # Synchronize CUDA around profiled regions for accurate timings
+profile_torch_generation: false # Write torch.profiler Chrome traces around selected model.generate calls
+profile_torch_output_dir: null # Directory for torch.profiler Chrome traces
+profile_torch_generation_limit: 3 # Maximum number of model.generate calls to trace
+profile_torch_record_shapes: true # Record tensor shapes in torch.profiler traces
+profile_torch_profile_memory: true # Record memory events in torch.profiler traces
+profile_torch_with_stack: false # Record Python stacks in torch.profiler traces
 resnap_events: true      # Resnap events to the timing after generation
 snap_near_perfect_overlaps: true  # Snap nearly overlapping positions to each other
 
