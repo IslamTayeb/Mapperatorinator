@@ -13,7 +13,9 @@ if str(REPO_ROOT) not in sys.path:
 
 import hydra
 import torch
+import transformers
 from omegaconf import DictConfig, OmegaConf
+from transformers import LogitsProcessor
 from transformers.modeling_outputs import BaseModelOutput
 
 from config import InferenceConfig
@@ -184,6 +186,47 @@ def _last_token_logits(logits: torch.Tensor) -> torch.Tensor:
     return logits[:, -1, :].detach().to(torch.float32)
 
 
+def _compare_logits(
+        reference: torch.Tensor,
+        candidate: torch.Tensor,
+        *,
+        atol: float,
+        rtol: float,
+        top_k: int,
+) -> dict[str, Any]:
+    reference = reference.detach().to(torch.float32)
+    candidate = candidate.detach().to(torch.float32)
+    finite_mask = torch.isfinite(reference) & torch.isfinite(candidate)
+    reference_nonfinite = ~torch.isfinite(reference)
+    candidate_nonfinite = ~torch.isfinite(candidate)
+    nonfinite_match = bool(torch.equal(reference_nonfinite, candidate_nonfinite))
+    positive_inf_match = bool(torch.equal(torch.isposinf(reference), torch.isposinf(candidate)))
+    negative_inf_match = bool(torch.equal(torch.isneginf(reference), torch.isneginf(candidate)))
+    finite_reference = reference[finite_mask]
+    finite_candidate = candidate[finite_mask]
+    finite_allclose = bool(torch.allclose(finite_reference, finite_candidate, atol=atol, rtol=rtol))
+    abs_diff = torch.abs(finite_reference - finite_candidate)
+    rel_diff = abs_diff / torch.clamp(torch.abs(finite_reference), min=1e-12)
+    reference_topk = torch.topk(reference, k=min(top_k, reference.shape[-1]), dim=-1).indices
+    candidate_topk = torch.topk(candidate, k=min(top_k, candidate.shape[-1]), dim=-1).indices
+    topk_match = bool(torch.equal(reference_topk, candidate_topk))
+    return {
+        "allclose": finite_allclose and nonfinite_match and positive_inf_match and negative_inf_match,
+        "finite_allclose": finite_allclose,
+        "nonfinite_match": nonfinite_match,
+        "positive_inf_match": positive_inf_match,
+        "negative_inf_match": negative_inf_match,
+        "topk_match": topk_match,
+        "finite_count": int(finite_mask.sum().item()),
+        "nonfinite_mismatch_count": int((reference_nonfinite != candidate_nonfinite).sum().item()),
+        "max_abs": float(abs_diff.max().item()) if abs_diff.numel() > 0 else 0.0,
+        "mean_abs": float(abs_diff.mean().item()) if abs_diff.numel() > 0 else 0.0,
+        "max_rel": float(rel_diff.max().item()) if rel_diff.numel() > 0 else 0.0,
+        "reference_topk": [int(item) for item in reference_topk[0].tolist()],
+        "candidate_topk": [int(item) for item in candidate_topk[0].tolist()],
+    }
+
+
 def _condition_kwargs(model_inputs: dict[str, Any]) -> dict[str, Any]:
     return {
         key: value
@@ -205,6 +248,15 @@ def _build_generation_logits_processors(args: InferenceConfig, tokenizer, device
         lookback_time=lookback_time,
         device=device,
     )
+
+
+class _CaptureRawLogitsProcessor(LogitsProcessor):
+    def __init__(self, captures: list[torch.Tensor]):
+        self.captures = captures
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.Tensor:
+        self.captures.append(scores.detach().clone().to(torch.float32))
+        return scores
 
 
 @torch.no_grad()
@@ -247,11 +299,23 @@ def run_one_token_gate(
         "attn_implementation": args.attn_implementation,
         "profile_sdpa_backend": args.profile_sdpa_backend,
         "generation_compile_enabled": not bool(getattr(getattr(model, "generation_config", None), "disable_compile", True)),
+        "torch_version": torch.__version__,
+        "transformers_version": transformers.__version__,
         "sequence_index": model_inputs.pop("sequence_index"),
         "frame_time_ms": model_inputs.pop("frame_time_ms"),
         "context_type": model_inputs.pop("context_type"),
         "lookback_time": model_inputs.pop("lookback_time"),
         "lookahead_time": model_inputs.pop("lookahead_time"),
+        "do_sample": args.do_sample,
+        "top_p": args.top_p,
+        "top_k_sampling": args.top_k,
+        "temperature": args.temperature,
+        "timing_temperature": args.timing_temperature,
+        "mania_column_temperature": args.mania_column_temperature,
+        "taiko_hit_temperature": args.taiko_hit_temperature,
+        "timeshift_bias": args.timeshift_bias,
+        "cfg_scale": args.cfg_scale,
+        "num_beams": args.num_beams,
         "atol": atol,
         "rtol": rtol,
         "top_k": top_k,
@@ -267,7 +331,16 @@ def run_one_token_gate(
         model.device,
         lookback_time=float(metadata["lookback_time"]),
     )
+    hf_raw_logit_captures: list[torch.Tensor] = []
+    logits_processors.insert(0, _CaptureRawLogitsProcessor(hf_raw_logit_captures))
     context_type = ContextType(metadata["context_type"])
+    eos_token_ids = get_eos_token_id(
+        tokenizer,
+        lookback_time=float(metadata["lookback_time"]),
+        lookahead_time=float(metadata["lookahead_time"]),
+        context_type=context_type,
+    )
+    metadata["eos_token_ids"] = [int(item) for item in eos_token_ids]
 
     with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16, enabled=args.precision == "amp"), \
             generation_profile_context(sdpa_backend=args.profile_sdpa_backend):
@@ -285,15 +358,15 @@ def run_one_token_gate(
             use_cache=True,
             past_key_values=hf_cache,
             logits_processor=logits_processors,
-            eos_token_id=get_eos_token_id(
-                tokenizer,
-                lookback_time=float(metadata["lookback_time"]),
-                lookahead_time=float(metadata["lookahead_time"]),
-                context_type=context_type,
-            ),
+            eos_token_id=eos_token_ids,
             return_dict_in_generate=True,
             output_logits=True,
         )
+        if len(hf_raw_logit_captures) < 2:
+            raise RuntimeError(
+                "HF generate did not execute at least two captured raw-logit steps; "
+                f"got {len(hf_raw_logit_captures)}"
+            )
         hf_logits = getattr(hf_generate_outputs, "logits", None)
         if hf_logits is None or len(hf_logits) < 2:
             raise RuntimeError(
@@ -306,7 +379,10 @@ def run_one_token_gate(
                 f"HF generate did not produce a first generated token at prompt_len={prompt_len}; "
                 f"sequence shape={list(hf_generate_outputs.sequences.shape)}"
             )
-        hf_reference_logits = hf_logits[1].detach().to(torch.float32)
+        if not torch.equal(hf_generate_outputs.sequences[:, :prompt_len], prompt):
+            raise RuntimeError("HF generate output prefix does not match the probe prompt")
+        hf_reference_logits = hf_raw_logit_captures[1].detach().to(torch.float32)
+        hf_output_logits_reference = hf_logits[1].detach().to(torch.float32)
 
         prompt_prepared = model.prepare_inputs_for_generation(
             prompt,
@@ -361,37 +437,59 @@ def run_one_token_gate(
         candidate_outputs = model(**candidate_inputs)
         candidate_logits = _last_token_logits(candidate_outputs.logits)
 
-    abs_diff = torch.abs(hf_reference_logits - candidate_logits)
-    rel_diff = abs_diff / torch.clamp(torch.abs(hf_reference_logits), min=1e-12)
-    reference_topk = torch.topk(hf_reference_logits, k=min(top_k, hf_reference_logits.shape[-1]), dim=-1).indices
-    candidate_topk = torch.topk(candidate_logits, k=min(top_k, candidate_logits.shape[-1]), dim=-1).indices
-    allclose = bool(torch.allclose(hf_reference_logits, candidate_logits, atol=atol, rtol=rtol))
-    topk_match = bool(torch.equal(reference_topk, candidate_topk))
+    comparison = _compare_logits(hf_reference_logits, candidate_logits, atol=atol, rtol=rtol, top_k=top_k)
+    output_logits_comparison = _compare_logits(
+        hf_output_logits_reference,
+        candidate_logits,
+        atol=atol,
+        rtol=rtol,
+        top_k=top_k,
+    )
     no_cache_abs_diff = torch.abs(no_cache_reference_logits - candidate_logits)
-    no_cache_first_step_abs_diff = torch.abs(no_cache_first_step_logits - hf_logits[0].detach().to(torch.float32))
+    no_cache_first_step_abs_diff = torch.abs(no_cache_first_step_logits - hf_raw_logit_captures[0])
 
     return {
-        "pass": allclose and topk_match,
-        "allclose": allclose,
-        "topk_match": topk_match,
+        "pass": comparison["allclose"] and comparison["topk_match"],
+        "allclose": comparison["allclose"],
+        "topk_match": comparison["topk_match"],
         "probe_token_id": int(probe_token.item()),
         "prompt_tokens": prompt_len,
+        "prompt_nonpad_tokens": int(prompt_mask.to(torch.long).sum().item()),
         "prefill_cache_position": [int(item) for item in prefill_cache_position.tolist()],
         "decode_cache_position": [int(item) for item in decode_cache_position.tolist()],
         "hf_generated_sequence_shape": list(hf_generate_outputs.sequences.shape),
         "hf_generate_logits_steps": len(hf_logits),
+        "hf_captured_raw_logit_steps": len(hf_raw_logit_captures),
+        "hf_logit_shape_step0": list(hf_raw_logit_captures[0].shape),
+        "hf_logit_shape_step1": list(hf_raw_logit_captures[1].shape),
         "prepared_prompt_shape": list(prompt_prepared["decoder_input_ids"].shape),
         "prepared_reference_shape": list(reference_prepared["decoder_input_ids"].shape),
         "prepared_candidate_shape": list(candidate_inputs["decoder_input_ids"].shape),
-        "max_abs": float(abs_diff.max().item()),
-        "mean_abs": float(abs_diff.mean().item()),
-        "max_rel": float(rel_diff.max().item()),
+        "finite_allclose": comparison["finite_allclose"],
+        "nonfinite_match": comparison["nonfinite_match"],
+        "positive_inf_match": comparison["positive_inf_match"],
+        "negative_inf_match": comparison["negative_inf_match"],
+        "finite_count": comparison["finite_count"],
+        "nonfinite_mismatch_count": comparison["nonfinite_mismatch_count"],
+        "max_abs": comparison["max_abs"],
+        "mean_abs": comparison["mean_abs"],
+        "max_rel": comparison["max_rel"],
+        "hf_output_logits_vs_candidate": {
+            "allclose": output_logits_comparison["allclose"],
+            "topk_match": output_logits_comparison["topk_match"],
+            "finite_allclose": output_logits_comparison["finite_allclose"],
+            "nonfinite_match": output_logits_comparison["nonfinite_match"],
+            "nonfinite_mismatch_count": output_logits_comparison["nonfinite_mismatch_count"],
+            "max_abs": output_logits_comparison["max_abs"],
+            "mean_abs": output_logits_comparison["mean_abs"],
+            "max_rel": output_logits_comparison["max_rel"],
+        },
         "no_cache_reference_max_abs": float(no_cache_abs_diff.max().item()),
         "no_cache_reference_mean_abs": float(no_cache_abs_diff.mean().item()),
         "no_cache_first_step_vs_hf_max_abs": float(no_cache_first_step_abs_diff.max().item()),
         "no_cache_first_step_vs_hf_mean_abs": float(no_cache_first_step_abs_diff.mean().item()),
-        "reference_topk": [int(item) for item in reference_topk[0].tolist()],
-        "candidate_topk": [int(item) for item in candidate_topk[0].tolist()],
+        "reference_topk": comparison["reference_topk"],
+        "candidate_topk": comparison["candidate_topk"],
         "metadata": metadata,
     }
 

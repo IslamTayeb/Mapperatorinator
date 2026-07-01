@@ -58,6 +58,16 @@ max_abs=27.6516, mean_abs=17.3663, topk_match=false
 
 Diagnosis: the candidate was now exercising the intended prepared `q_len=1` cache path, but the reference was still the full-prefix no-cache path. The top-1 token matched, but many logits moved, so this is not a valid exact-runtime gate for a production path that already uses `StaticCache`. The gate was patched to compare against HF `generate()` cached raw logits instead. The no-cache full-prefix diff remains in the JSON report as `no_cache_reference_*` diagnostics, but it no longer controls pass/fail.
 
+Follow-up DCC gate run `49139158` on `dcc-core-ferc-s-z25-21` used HF cached generation as the reference and improved the comparison substantially:
+
+```text
+pass=false, topk_match=true, prompt_tokens=84, probe_token_id=12,
+hf_generate_logits_steps=2, max_abs=Infinity, mean_abs=Infinity
+reference_topk == candidate_topk for all 20 reported tokens
+```
+
+Diagnosis: this was a gate-harness issue. Transformers 4.57.3 stores `output_logits` after calling `logits_processor(input_ids, next_token_logits)`. Mapperatorinator's `MonotonicTimeShiftLogitsProcessor` mutates the logits tensor in-place by writing `-inf`, so the supposedly raw `output_logits` tuple can contain processor masks. The gate was patched to prepend a passive capture processor that clones the true model logits before repo processors run, then compare the direct `q_len=1` candidate against that captured raw tensor. HF's returned `output_logits` remain in the report only as a diagnostic under `hf_output_logits_vs_candidate`.
+
 The next run should be:
 
 ```bash
