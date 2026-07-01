@@ -60,6 +60,8 @@ def profile_direct_step(
         rtol: float,
         top_k: int,
         candidate_active_prefix_self_attention: bool,
+        candidate_active_prefix_prefill: bool | None = None,
+        candidate_active_prefix_decode: bool | None = None,
 ) -> dict[str, Any]:
     if not torch.cuda.is_available():
         raise RuntimeError("Direct decode step profiling requires CUDA")
@@ -83,6 +85,16 @@ def profile_direct_step(
         model,
         _build_probe_inputs(args, model, tokenizer, sequence_index=sequence_index),
     )
+    active_prefix_prefill = (
+        bool(candidate_active_prefix_self_attention)
+        if candidate_active_prefix_prefill is None
+        else bool(candidate_active_prefix_prefill)
+    )
+    active_prefix_decode = (
+        bool(candidate_active_prefix_self_attention)
+        if candidate_active_prefix_decode is None
+        else bool(candidate_active_prefix_decode)
+    )
     metadata = {
         "model_path": args.model_path,
         "precision": args.precision,
@@ -98,6 +110,8 @@ def profile_direct_step(
         "warmup": warmup,
         "iters": iters,
         "candidate_active_prefix_self_attention": bool(candidate_active_prefix_self_attention),
+        "candidate_active_prefix_prefill": active_prefix_prefill,
+        "candidate_active_prefix_decode": active_prefix_decode,
     }
     prompt = model_inputs["decoder_input_ids"]
     prompt_mask = model_inputs["decoder_attention_mask"]
@@ -151,7 +165,7 @@ def profile_direct_step(
             prompt_attention_mask=prompt_mask,
             frames=model_inputs["frames"],
             condition_kwargs=condition_kwargs,
-            active_prefix_self_attention=candidate_active_prefix_self_attention,
+            active_prefix_self_attention=active_prefix_prefill,
         )
         direct_result = decode_one_token_raw_logits(
             model,
@@ -159,7 +173,7 @@ def profile_direct_step(
             full_prefix=full_prefix,
             full_attention_mask=full_mask,
             condition_kwargs=condition_kwargs,
-            active_prefix_self_attention=candidate_active_prefix_self_attention,
+            active_prefix_self_attention=active_prefix_decode,
         )
         prepared_inputs = direct_result.prepared_inputs
         reference_logits = direct_result.logits.detach().clone()
@@ -172,7 +186,7 @@ def profile_direct_step(
         )
         active_prefix_length = (
             int(direct_result.cache_position[-1].detach().cpu().item()) + 1
-            if candidate_active_prefix_self_attention
+            if active_prefix_decode
             else None
         )
 
@@ -238,7 +252,17 @@ def main() -> None:
     parser.add_argument(
         "--candidate-active-prefix-self-attention",
         action="store_true",
-        help="Enable active-prefix SDPA self-attention for the direct candidate path.",
+        help="Enable active-prefix SDPA self-attention for both direct candidate prefill and decode.",
+    )
+    parser.add_argument(
+        "--candidate-active-prefix-prefill",
+        action="store_true",
+        help="Enable active-prefix SDPA self-attention only while prefilling the direct candidate cache.",
+    )
+    parser.add_argument(
+        "--candidate-active-prefix-decode",
+        action="store_true",
+        help="Enable active-prefix SDPA self-attention only for the direct candidate one-token decode step.",
     )
     parser.add_argument("--report-path", type=Path, default=None)
     parser.add_argument("overrides", nargs="*", help="Hydra overrides, e.g. model_path=/path/to/model")
@@ -255,6 +279,14 @@ def main() -> None:
         rtol=cli_args.rtol,
         top_k=cli_args.top_k,
         candidate_active_prefix_self_attention=cli_args.candidate_active_prefix_self_attention,
+        candidate_active_prefix_prefill=(
+            cli_args.candidate_active_prefix_prefill
+            or cli_args.candidate_active_prefix_self_attention
+        ),
+        candidate_active_prefix_decode=(
+            cli_args.candidate_active_prefix_decode
+            or cli_args.candidate_active_prefix_self_attention
+        ),
     )
     result["metadata"]["config_name"] = cli_args.config_name
     result["wall_seconds"] = time.perf_counter() - start
