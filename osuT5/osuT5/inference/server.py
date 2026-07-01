@@ -13,6 +13,7 @@ from .logit_processors import ConditionalTemperatureLogitsWarper, get_beat_type_
     get_mania_type_tokens, get_scroll_speed_tokens, TimeshiftBias, LookbackBiasLogitsWarper, \
     MonotonicTimeShiftLogitsProcessor
 from .cache_utils import get_cache
+from .decode_loop import generate_with_custom_decode_loop
 from ..model import Mapperatorinator
 from ..tokenizer import Tokenizer
 
@@ -111,6 +112,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     lookback_time = generate_kwargs.pop('lookback_time', 0.0)
     lookahead_time = generate_kwargs.pop('lookahead_time', 0.0)
     context_type = generate_kwargs.pop('context_type', None)
+    custom_decode_loop = bool(generate_kwargs.pop('custom_decode_loop', False))
     sync_model_timing = bool(generate_kwargs.pop('sync_model_timing', False))
     if context_type is not None:
         context_type = ContextType(context_type)  # Convert to ContextType enum
@@ -149,20 +151,30 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     # Prepare cache
     cache = get_cache(model, batch_size, generate_kwargs.get('num_beams', 1), cfg_scale)
     pad_token_id = generate_kwargs.get('pad_token_id', getattr(tokenizer, 'pad_id', None))
+    eos_token_id = get_eos_token_id(tokenizer, lookback_time=lookback_time, lookahead_time=lookahead_time, context_type=context_type)
+    if custom_decode_loop:
+        if batch_size != 1:
+            raise ValueError("custom_decode_loop currently supports batch_size=1 only.")
+        if cfg_scale > 1.0:
+            raise ValueError("custom_decode_loop currently does not support classifier-free guidance.")
+        if int(generate_kwargs.get('num_beams', 1)) != 1:
+            raise ValueError("custom_decode_loop currently supports num_beams=1 only.")
 
     # Perform batched generation
     with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16, enabled=precision == 'amp'):
         if sync_model_timing:
             _sync_cuda_for_model(model)
         start_time = time.perf_counter()
-        result = model.generate(
-            **model_kwargs,
-            **generate_kwargs,
+        generation_call_kwargs = model_kwargs | generate_kwargs | dict(
             use_cache=True,
             past_key_values=cache,
             logits_processor=logits_processor_list,
-            eos_token_id=get_eos_token_id(tokenizer, lookback_time=lookback_time, lookahead_time=lookahead_time, context_type=context_type),
+            eos_token_id=eos_token_id,
         )
+        if custom_decode_loop:
+            result = generate_with_custom_decode_loop(model, **generation_call_kwargs)
+        else:
+            result = model.generate(**generation_call_kwargs)
         if sync_model_timing:
             _sync_cuda_for_model(model)
         elapsed_seconds = time.perf_counter() - start_time
@@ -177,6 +189,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         "do_sample": bool(generate_kwargs.get("do_sample", False)),
         "sync_model_timing": sync_model_timing,
         "generation_compile_enabled": not bool(getattr(getattr(model, "generation_config", None), "disable_compile", True)),
+        "custom_decode_loop_enabled": custom_decode_loop,
     })
 
     return result, stats
