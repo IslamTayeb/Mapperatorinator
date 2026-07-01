@@ -486,7 +486,6 @@ def generate(
         "inference_generation_compile": args.inference_generation_compile,
         "inference_active_prefix_decode_loop": args.inference_active_prefix_decode_loop,
         "inference_active_prefix_decode_bucket_size": args.inference_active_prefix_decode_bucket_size,
-        "inference_active_prefix_decode_compile_scope": args.inference_active_prefix_decode_compile_scope,
         "profile_record_token_ids": args.profile_record_token_ids,
         "profile_sync_cuda": args.profile_sync_cuda,
         "profile_torch_generation": args.profile_torch_generation,

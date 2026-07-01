@@ -170,7 +170,6 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     profile_sdpa_backend = generate_kwargs.pop('profile_sdpa_backend', None)
     active_prefix_decode_loop = bool(generate_kwargs.pop('active_prefix_decode_loop', False))
     active_prefix_decode_bucket_size = int(generate_kwargs.pop('active_prefix_decode_bucket_size', 128))
-    active_prefix_decode_compile_scope = str(generate_kwargs.pop('active_prefix_decode_compile_scope', 'shared'))
     if context_type is not None:
         context_type = ContextType(context_type)  # Convert to ContextType enum
 
@@ -200,8 +199,6 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
             raise ValueError("active_prefix_decode_loop currently supports num_beams=1 only.")
         if active_prefix_decode_bucket_size <= 0:
             raise ValueError("active_prefix_decode_bucket_size must be positive.")
-        if active_prefix_decode_compile_scope not in {"shared", "bucket"}:
-            raise ValueError("active_prefix_decode_compile_scope must be 'shared' or 'bucket'.")
 
     # Perform batched generation
     with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16, enabled=precision == 'amp'), \
@@ -222,7 +219,6 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
             custom_generate=partial(
                 active_prefix_decode_generate,
                 active_prefix_bucket_size=active_prefix_decode_bucket_size,
-                active_prefix_compile_scope=active_prefix_decode_compile_scope,
             ) if active_prefix_decode_loop else None,
         )
         if sync_model_timing:
@@ -243,7 +239,6 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         "profile_sdpa_backend": profile_sdpa_backend,
         "active_prefix_decode_loop_enabled": active_prefix_decode_loop,
         "active_prefix_decode_bucket_size": active_prefix_decode_bucket_size if active_prefix_decode_loop else None,
-        "active_prefix_decode_compile_scope": active_prefix_decode_compile_scope if active_prefix_decode_loop else None,
     })
 
     return result, stats

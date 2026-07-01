@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from functools import partial
@@ -20,13 +21,7 @@ from transformers import LogitsProcessor
 from config import InferenceConfig
 from inference import compile_args, load_model_with_server, setup_inference_environment
 from osuT5.osuT5.inference.cache_utils import get_cache
-from osuT5.osuT5.inference.decode_loop import (
-    _bucketed_prefix_length,
-    _decode_can_compile,
-    _generation_compile_config,
-    _get_active_prefix_compiled_call,
-    _max_cache_shape,
-)
+from osuT5.osuT5.inference.decode_loop import _bucketed_prefix_length, _max_cache_shape
 from osuT5.osuT5.inference.server import get_eos_token_id
 from osuT5.osuT5.runtime_profiling import active_prefix_self_attention_context, generation_profile_context
 from osuT5.osuT5.tokenizer import ContextType
@@ -128,7 +123,6 @@ def direct_decode_loop_generate(
         active_prefix_decode: bool = False,
         active_prefix_decode_length: int | None = None,
         active_prefix_bucket_size: int = 512,
-        active_prefix_compile_scope: str = "shared",
         **model_kwargs,
 ) -> torch.LongTensor:
     """Verification-only direct cached decode loop used by utils/verify_direct_decode_loop.py."""
@@ -151,8 +145,6 @@ def direct_decode_loop_generate(
     batch_size, cur_len = input_ids.shape[:2]
     if batch_size != 1:
         raise ValueError("direct_decode_loop_generate currently supports batch_size=1 only")
-    if active_prefix_compile_scope not in {"shared", "bucket"}:
-        raise ValueError("active_prefix_compile_scope must be 'shared' or 'bucket'")
 
     pad_token_id = generation_config._pad_token_tensor
     has_eos_stopping_criteria = any(hasattr(criteria, "eos_token_id") for criteria in stopping_criteria)
@@ -170,9 +162,14 @@ def direct_decode_loop_generate(
     max_cache_len = _max_cache_shape(model_kwargs, generation_config)
 
     model_forward = model.__call__
-    can_compile_decode = _decode_can_compile(model, model_kwargs, generation_config)
-    if can_compile_decode and active_prefix_compile_scope == "shared":
-        model_forward = model.get_compiled_call(_generation_compile_config(model, generation_config))
+    if model._valid_auto_compile_criteria(model_kwargs, generation_config):
+        os.environ["TOKENIZERS_PARALLELISM"] = "0"
+        if model.config._attn_implementation == "flash_attention_2":
+            compile_config = generation_config.compile_config
+            if compile_config is not None and compile_config.fullgraph:
+                compile_config.fullgraph = False
+        model_forward = model.get_compiled_call(generation_config.compile_config)
+
     is_prefill = True
     scores = None
     while model._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
@@ -189,16 +186,8 @@ def direct_decode_loop_generate(
                 active_prefix_bucket_size=active_prefix_bucket_size,
                 max_cache_len=max_cache_len,
             )
-            if (
-                    can_compile_decode
-                    and active_prefix_compile_scope == "bucket"
-                    and prefix_length is not None
-            ):
-                bucket_forward = _get_active_prefix_compiled_call(model, generation_config, prefix_length)
-                outputs = bucket_forward(**model_inputs)
-            else:
-                with active_prefix_self_attention_context(prefix_length):
-                    outputs = model_forward(**model_inputs, return_dict=True)
+            with active_prefix_self_attention_context(prefix_length):
+                outputs = model_forward(**model_inputs, return_dict=True)
 
         model_kwargs = model._update_model_kwargs_for_generation(
             outputs,
@@ -308,11 +297,6 @@ def run_direct_decode_loop_gate(
         "candidate_active_prefix_decode": bool(candidate_active_prefix_decode),
         "candidate_active_prefix_decode_length": candidate_active_prefix_decode_length,
         "candidate_active_prefix_decode_bucket_size": candidate_active_prefix_decode_bucket_size,
-        "candidate_active_prefix_decode_compile_scope": getattr(
-            args,
-            "inference_active_prefix_decode_compile_scope",
-            "shared",
-        ),
     }
 
     prompt = model_inputs["decoder_input_ids"]
@@ -391,9 +375,6 @@ def run_direct_decode_loop_gate(
                 active_prefix_decode=candidate_active_prefix_decode,
                 active_prefix_decode_length=candidate_active_prefix_decode_length,
                 active_prefix_bucket_size=candidate_active_prefix_decode_bucket_size,
-                active_prefix_compile_scope=str(
-                    getattr(args, "inference_active_prefix_decode_compile_scope", "shared")
-                ),
             ),
         )
         candidate_end_rng_state = _rng_state()

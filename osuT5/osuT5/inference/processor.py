@@ -182,9 +182,6 @@ class Processor(object):
             profile_sdpa_backend=getattr(self.args, "profile_sdpa_backend", None),
             active_prefix_decode_loop=bool(getattr(self.args, "inference_active_prefix_decode_loop", False)),
             active_prefix_decode_bucket_size=int(getattr(self.args, "inference_active_prefix_decode_bucket_size", 128)),
-            active_prefix_decode_compile_scope=str(
-                getattr(self.args, "inference_active_prefix_decode_compile_scope", "shared")
-            ),
         )
 
         if isinstance(self.model, InferenceClient):
@@ -1483,7 +1480,6 @@ class Processor(object):
             "profile_sdpa_backend": stats.get("profile_sdpa_backend"),
             "active_prefix_decode_loop_enabled": stats.get("active_prefix_decode_loop_enabled"),
             "active_prefix_decode_bucket_size": stats.get("active_prefix_decode_bucket_size"),
-            "active_prefix_decode_compile_scope": stats.get("active_prefix_decode_compile_scope"),
             "use_server": isinstance(self.model, InferenceClient),
             "parallel": self.parallel,
         }
