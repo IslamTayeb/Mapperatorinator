@@ -158,6 +158,15 @@ the direct candidate step. The old no-cache full-prefix comparison is kept only 
 necessary for decoder-runtime work, but not sufficient for a speed claim; still require fixed-seed 15s generated-token
 equivalence and full-song equivalence.
 
+The reusable one-token ABI lives in `osuT5.osuT5.inference.direct_decode`. DCC job `49139917` validated the ABI on
+`main_generation.seq9` after extraction:
+
+- Compile disabled: `/work/imt11/Mapperatorinator/runs/one-token-abi-gate-49139917-8cb1160/one_token_decode_seq9_compile_false.json`, PASS, `max_abs=0.0`, candidate prepared shape `[1, 1]`.
+- Compile enabled: `/work/imt11/Mapperatorinator/runs/one-token-abi-gate-49139917-8cb1160/one_token_decode_seq9_compile_true.json`, PASS, `max_abs=2.2888e-05`, top-k match, candidate prepared shape `[1, 1]`.
+
+Use this helper as the starting point for manual CUDA graph or narrow `torch.compile(mode="reduce-overhead")`
+experiments. Do not maintain a second direct-step path unless this ABI is proven wrong or insufficient.
+
 For post-warmup diagnosis, use detailed internal ranges only in torch-profiler or Nsight runs:
 
 ```bash
@@ -196,6 +205,14 @@ RTX 2080 Ti SDPA backend audit result:
 - Smoke job `49139404` found forced `profile_sdpa_backend=math` was token-equivalent and much faster on the 15s aggregate (`78.862 tok/s` vs `50.850 tok/s`), while forced `efficient` was noise and forced `flash` failed on SM75 with no available kernel.
 - The full-song paired validation job `49139420` rejected forced `math` for main generation: `/work/imt11/Mapperatorinator/runs/full-sdpa-math-49139420-9d92c34/beatmap8241a2b3f0be495592a5cf2b9bb9d6a2.osu.profile.json` produced `7,639` main tokens in `85.177s`, `89.684 tok/s`, token equivalence PASS, which is slower than the retained `92.465 tok/s` baseline.
 - Conclusion: keep SDPA plus `inference_generation_compile=true` as the retained baseline. Do not promote forced `math` from smoke-only evidence; use it only as a diagnostic if a future trace shows a backend-specific reason.
+
+TorchDynamo cache-limit scout result:
+
+- Compile-health job `49139485` showed CUDA graph recordings across smoke map windows and recompiles from
+  `decoder_input_ids` stride changes plus timing-model to map-model `proj_out.weight` size changes.
+- Raising `torch._dynamo.config.recompile_limit` and `torch._dynamo.config.cache_size_limit` to `32` in job `49139564`
+  was token-equivalent but not a main-generation win: `50.850 -> 50.867 tok/s` on the 15s smoke. Do not promote this
+  as an optimization; keep it as evidence that the missing gain is not solved by a larger Dynamo cache.
 
 Promote a change to a full-song SALVALAI run only when smoke results are stable, token IDs match, and the speedup is plausibly meaningful. For compile-like changes with one-time first-window costs, inspect post-warmup per-window throughput before rejecting a weak total smoke result. Keep changes that improve RTX 2080 full-song main-generation throughput by about 10% or more. Keep 5-10% wins only when they are simple and well-contained or strategically de-risk the custom runtime path. Remove 1-3% complexity by default.
 

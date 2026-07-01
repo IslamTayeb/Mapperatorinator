@@ -82,6 +82,19 @@ Decision: reject Dynamo cache-limit tuning as a main-generation optimization. It
 - The next exact-runtime work should build on the one-token gate: extract a reusable logits-only direct-step ABI, then test manual CUDA graph or narrow `torch.compile(mode="reduce-overhead")` around that stable step.
 - Native CUTLASS or other kernel work should wait until the direct-step ABI and compile-health audit identify one isolated operation with enough ceiling.
 
+## Direct-Step ABI Extraction
+
+Commit `8cb1160` extracted the static-cache one-token path into `osuT5.osuT5.inference.direct_decode` and rewired `utils/verify_one_token_decode.py` to use it. The helper is intentionally logits-only and does not replace HF sampling, EOS handling, RNG, or production `model.generate`.
+
+DCC validation job `49139917`, node `dcc-core-ferc-s-z25-20`, commit `8cb1160`:
+
+| Mode | Report | Result | Notes |
+| --- | --- | --- | --- |
+| `inference_generation_compile=false` | `/work/imt11/Mapperatorinator/runs/one-token-abi-gate-49139917-8cb1160/one_token_decode_seq9_compile_false.json` | PASS, `max_abs=0.0`, top-k match | Candidate prepared shape `[1, 1]`, prefill shape `[1, 84]` |
+| `inference_generation_compile=true` | `/work/imt11/Mapperatorinator/runs/one-token-abi-gate-49139917-8cb1160/one_token_decode_seq9_compile_true.json` | PASS, `max_abs=2.2888e-05`, top-k match | Candidate prepared shape `[1, 1]`, prefill shape `[1, 84]` |
+
+Decision: keep the ABI extraction as infrastructure. It is not a speed claim, but it is the required launch point for manual CUDA graph and direct-step compile experiments.
+
 ## Next
 
 - Run a no-profiler compile/CUDA-graph health audit with `TORCH_LOGS=recompiles,cudagraphs` on the 15s smoke slice.
