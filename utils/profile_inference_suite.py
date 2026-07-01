@@ -5,6 +5,7 @@ import copy
 import hashlib
 import json
 import os
+import socket
 import subprocess
 import sys
 import uuid
@@ -30,6 +31,7 @@ from inference import (  # noqa: E402
     setup_inference_environment,
     should_load_separate_timing_model,
 )
+from utils.inference_profile_metrics import first_record_breakdown  # noqa: E402
 from osuT5.osuT5.inference.profiler import InferenceProfiler  # noqa: E402
 
 
@@ -252,11 +254,38 @@ def _token_sha256(tokens: list[int] | None) -> str | None:
 def _aggregate_runs(selected: list[dict[str, Any]]) -> dict[str, Any]:
     generated_tokens = sum(int(run.get("main_generated_tokens") or 0) for run in selected)
     model_elapsed_seconds = sum(float(run.get("main_model_elapsed_seconds") or 0.0) for run in selected)
+    wall_seconds = sum(float(run.get("main_wall_seconds") or 0.0) for run in selected)
     return {
         "runs": len(selected),
         "generated_tokens": generated_tokens,
         "model_elapsed_seconds": model_elapsed_seconds,
+        "wall_seconds": wall_seconds,
         "tokens_per_second": generated_tokens / model_elapsed_seconds if model_elapsed_seconds > 0 else 0.0,
+        "wall_tokens_per_second": generated_tokens / wall_seconds if wall_seconds > 0 else 0.0,
+        "first_records": _aggregate_run_segments(selected, "main_first_record"),
+        "remaining_records": _aggregate_run_segments(selected, "main_remaining_records"),
+    }
+
+
+def _aggregate_run_segments(selected: list[dict[str, Any]], key: str) -> dict[str, Any]:
+    segments = [
+        segment
+        for run in selected
+        for segment in [run.get(key)]
+        if isinstance(segment, dict)
+    ]
+    generated_tokens = sum(int(segment.get("generated_tokens") or 0) for segment in segments)
+    model_elapsed_seconds = sum(float(segment.get("model_elapsed_seconds") or 0.0) for segment in segments)
+    wall_seconds = sum(float(segment.get("wall_seconds") or 0.0) for segment in segments)
+    records = sum(int(segment.get("records", 1) or 0) for segment in segments)
+    return {
+        "runs": len(segments),
+        "records": records,
+        "generated_tokens": generated_tokens,
+        "model_elapsed_seconds": model_elapsed_seconds,
+        "wall_seconds": wall_seconds,
+        "tokens_per_second": generated_tokens / model_elapsed_seconds if model_elapsed_seconds > 0 else 0.0,
+        "wall_tokens_per_second": generated_tokens / wall_seconds if wall_seconds > 0 else 0.0,
     }
 
 
@@ -304,6 +333,30 @@ def _aggregate_by_song(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return summaries
 
 
+def _runtime_environment() -> dict[str, Any]:
+    env_keys = [
+        "TORCHINDUCTOR_CACHE_DIR",
+        "TRITON_CACHE_DIR",
+        "CUDA_CACHE_PATH",
+        "XDG_CACHE_HOME",
+        "HF_HOME",
+        "TRANSFORMERS_CACHE",
+        "TORCH_LOGS",
+        "TMPDIR",
+    ]
+    return {
+        "hostname": socket.gethostname(),
+        "pid": os.getpid(),
+        "argv": sys.argv,
+        "python": sys.version,
+        "torch_version": getattr(torch, "__version__", None),
+        "torch_cuda_version": getattr(torch.version, "cuda", None),
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_device_name": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
+        "env": {key: os.environ.get(key) for key in env_keys},
+    }
+
+
 def _write_manifest(
         suite_dir: Path,
         *,
@@ -317,7 +370,7 @@ def _write_manifest(
         runs: list[dict[str, Any]],
 ) -> Path:
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "suite_id": suite_id,
         "run_kind": run_kind,
         "config_name": config_name,
@@ -332,6 +385,7 @@ def _write_manifest(
         "warmed_run_indices": [int(run["run_index"]) for run in _warmed_runs(runs)],
         "git_commit": _git_value("rev-parse", "HEAD"),
         "git_branch": _git_value("branch", "--show-current"),
+        "runtime_environment": _runtime_environment(),
         "runs": runs,
         "aggregate": {
             "all_runs": _aggregate(runs, start_index=0),
@@ -469,6 +523,8 @@ def main() -> None:
         profile_path = Path(run_args.profile_output_path)
         profile = json.loads(profile_path.read_text(encoding="utf-8"))
         main_summary = _summary_for_label(profile, "main_generation")
+        timing_summary = _summary_for_label(profile, "timing_context")
+        main_record_breakdown = first_record_breakdown(profile, "main_generation")
         profile_metadata = profile.get("metadata", {})
         tokens = _flatten_token_ids(profile, "main_generation")
         token_sha256 = _token_sha256(tokens)
@@ -498,7 +554,14 @@ def main() -> None:
             "song_length_ms": profile_metadata.get("song_length_ms"),
             "main_generated_tokens": int(main_summary.get("generated_tokens", 0) or 0),
             "main_model_elapsed_seconds": float(main_summary.get("model_elapsed_seconds", 0.0) or 0.0),
+            "main_wall_seconds": float(main_summary.get("wall_seconds", 0.0) or 0.0),
             "main_tokens_per_second": float(main_summary.get("tokens_per_second", 0.0) or 0.0),
+            "main_first_record": main_record_breakdown["first_record"],
+            "main_remaining_records": main_record_breakdown["remaining_records"],
+            "timing_generated_tokens": int(timing_summary.get("generated_tokens", 0) or 0),
+            "timing_model_elapsed_seconds": float(timing_summary.get("model_elapsed_seconds", 0.0) or 0.0),
+            "timing_wall_seconds": float(timing_summary.get("wall_seconds", 0.0) or 0.0),
+            "timing_tokens_per_second": float(timing_summary.get("tokens_per_second", 0.0) or 0.0),
             "main_token_count": len(tokens) if tokens is not None else None,
             "main_token_sha256": token_sha256,
             "token_equivalence_to_song_baseline": token_equivalence,

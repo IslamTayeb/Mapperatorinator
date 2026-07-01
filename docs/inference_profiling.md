@@ -137,7 +137,19 @@ songs:
     end_time: null
 ```
 
-The harness loads the model once, resets RNG before every `generate()` call, writes one profile JSON per run, and writes `suite_manifest.json` with first-run, warmed-run, aggregate throughput, per-song throughput, profile paths, token hashes, and token-equivalence status. `warm_repeat` compares token IDs against run 0. `serial_multi_song` compares token IDs against each song's first repeat, so every song has its own equivalence baseline. Its warmed and multi-song results are useful operational evidence, but they are not cold single-song acceptance evidence.
+The harness loads the model once, resets RNG before every `generate()` call, writes one profile JSON per run, and writes `suite_manifest.json` with first-run, warmed-run, aggregate throughput, per-song throughput, profile paths, token hashes, and token-equivalence status. Manifest schema v3 also records `main_first_record`, `main_remaining_records`, aggregate first-record/remaining-record metrics, timing-context metrics, and runtime cache/env metadata (`TORCHINDUCTOR_CACHE_DIR`, `TRITON_CACHE_DIR`, `CUDA_CACHE_PATH`, `HF_HOME`, `TORCH_LOGS`, etc.). This makes active-prefix first-window cold tax visible instead of letting warmed aggregate numbers hide setup or graph-capture cost. `warm_repeat` compares token IDs against run 0. `serial_multi_song` compares token IDs against each song's first repeat, so every song has its own equivalence baseline. Its warmed and multi-song results are useful operational evidence, but they are not cold single-song acceptance evidence.
+
+Compare suite manifests with:
+
+```bash
+python utils/summarize_inference_profile.py \
+  --compare-suite "$BASE_SUITE/suite_manifest.json" "$CANDIDATE_SUITE/suite_manifest.json" \
+  --suite-scope warmed_runs \
+  --strict \
+  --json-output "$RUN_DIR/compare-suite-warmed.json"
+```
+
+Use `--suite-scope warmed_runs` for warmed-repeat or long-lived process claims. Use `--suite-scope all_runs` only when claiming all-run aggregate performance. The suite comparator checks shape, paired token hashes/token counts, and selected-scope aggregate non-regression. It also prints cold run0 diagnostics, but cold single-song promotion still requires normal full-song profile strict gates against the retained cold baseline.
 
 First smoke result, DCC job `49154124` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti, commit `d20f26a`:
 

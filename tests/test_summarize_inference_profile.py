@@ -110,3 +110,82 @@ def test_compare_profiles_reports_token_and_performance_failures(tmp_path):
     assert not report["performance"]["metrics"]["tokens_per_second"]["pass"]
     assert not report["performance"]["metrics"]["model_elapsed_seconds"]["pass"]
     assert not report["performance"]["per_window"]["pass"]
+
+
+def _suite_manifest(*, hash_suffix: str = "same", warmed_tok_s: float = 120.0):
+    runs = [
+        {
+            "run_index": 0,
+            "repeat_index": 0,
+            "song_index": 0,
+            "main_generated_tokens": 100,
+            "main_model_elapsed_seconds": 2.0,
+            "main_wall_seconds": 2.5,
+            "main_tokens_per_second": 50.0,
+            "main_token_count": 100,
+            "main_token_sha256": f"hash-cold-{hash_suffix}",
+        },
+        {
+            "run_index": 1,
+            "repeat_index": 1,
+            "song_index": 0,
+            "main_generated_tokens": 120,
+            "main_model_elapsed_seconds": 1.0,
+            "main_wall_seconds": 1.2,
+            "main_tokens_per_second": warmed_tok_s,
+            "main_token_count": 120,
+            "main_token_sha256": f"hash-warm-{hash_suffix}",
+        },
+    ]
+    return {
+        "run_kind": "warm_repeat",
+        "song_count": 1,
+        "seed_step": 0,
+        "runs": runs,
+        "aggregate": {
+            "all_runs": {
+                "runs": 2,
+                "generated_tokens": 220,
+                "model_elapsed_seconds": 3.0,
+                "wall_seconds": 3.7,
+                "tokens_per_second": 73.333,
+            },
+            "warmed_runs": {
+                "runs": 1,
+                "generated_tokens": 120,
+                "model_elapsed_seconds": 120 / warmed_tok_s,
+                "wall_seconds": 1.2,
+                "tokens_per_second": warmed_tok_s,
+            },
+        },
+    }
+
+
+def test_compare_suite_manifests_passes_warmed_non_regression(tmp_path):
+    module = _load_module()
+    baseline = tmp_path / "baseline-suite.json"
+    candidate = tmp_path / "candidate-suite.json"
+    baseline.write_text(module.json.dumps(_suite_manifest(warmed_tok_s=100.0)))
+    candidate.write_text(module.json.dumps(_suite_manifest(warmed_tok_s=120.0)))
+
+    report = module.compare_suite_manifests(baseline, candidate, scope="warmed_runs")
+
+    assert report["shape"]["pass"]
+    assert report["token_equivalence"]["pass"]
+    assert report["performance"]["pass"]
+
+
+def test_compare_suite_manifests_reports_hash_and_warmed_regressions(tmp_path):
+    module = _load_module()
+    baseline = tmp_path / "baseline-suite.json"
+    candidate = tmp_path / "candidate-suite.json"
+    baseline.write_text(module.json.dumps(_suite_manifest(hash_suffix="base", warmed_tok_s=100.0)))
+    candidate.write_text(module.json.dumps(_suite_manifest(hash_suffix="cand", warmed_tok_s=80.0)))
+
+    report = module.compare_suite_manifests(baseline, candidate, scope="warmed_runs")
+
+    assert report["shape"]["pass"]
+    assert not report["token_equivalence"]["pass"]
+    assert report["token_equivalence"]["mismatches"]
+    assert not report["performance"]["pass"]
+    assert not report["performance"]["metrics"]["tokens_per_second"]["pass"]

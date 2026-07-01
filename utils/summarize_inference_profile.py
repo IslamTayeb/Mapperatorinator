@@ -66,6 +66,10 @@ def _load_profile(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _load_json(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def summarize(path: Path, *, limit: int) -> None:
     profile = _load_profile(path)
     print(f"Profile: {path}")
@@ -209,6 +213,199 @@ def _metric_comparison(
         "higher_is_better": higher_is_better,
         "pass": passed,
     }
+
+
+def _suite_aggregate(manifest: dict[str, Any], scope: str) -> dict[str, Any]:
+    aggregate = manifest.get("aggregate", {})
+    if scope == "warmed_runs":
+        warmed = aggregate.get("warmed_runs")
+        if warmed is not None:
+            return warmed
+        return aggregate.get("all_runs", {})
+    return aggregate.get("all_runs", {})
+
+
+def _suite_run_key(run: dict[str, Any], index: int) -> str:
+    return "run{index}/song{song}/repeat{repeat}".format(
+        index=run.get("run_index", index),
+        song=run.get("song_index", "n/a"),
+        repeat=run.get("repeat_index", "n/a"),
+    )
+
+
+def _compare_suite_shape(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    keys = ["run_kind", "song_count", "seed_step"]
+    mismatches = []
+    for key in keys:
+        if baseline.get(key) != candidate.get(key):
+            mismatches.append({"key": key, "baseline": baseline.get(key), "candidate": candidate.get(key)})
+    baseline_runs = baseline.get("runs", [])
+    candidate_runs = candidate.get("runs", [])
+    if len(baseline_runs) != len(candidate_runs):
+        mismatches.append({"key": "run_count", "baseline": len(baseline_runs), "candidate": len(candidate_runs)})
+    passed = len(mismatches) == 0
+    print("Suite shape")
+    print(f"  {'PASS' if passed else 'FAIL'}")
+    for mismatch in mismatches:
+        print(f"  {mismatch['key']}: baseline={mismatch['baseline']!r}, candidate={mismatch['candidate']!r}")
+    print()
+    return {"pass": passed, "mismatches": mismatches}
+
+
+def _compare_suite_token_hashes(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    baseline_runs = baseline.get("runs", [])
+    candidate_runs = candidate.get("runs", [])
+    paired = min(len(baseline_runs), len(candidate_runs))
+    mismatches = []
+    missing = []
+    for index in range(paired):
+        baseline_run = baseline_runs[index]
+        candidate_run = candidate_runs[index]
+        baseline_hash = baseline_run.get("main_token_sha256")
+        candidate_hash = candidate_run.get("main_token_sha256")
+        if baseline_hash is None or candidate_hash is None:
+            missing.append(_suite_run_key(baseline_run, index))
+            continue
+        if (
+                baseline_hash != candidate_hash
+                or baseline_run.get("main_token_count") != candidate_run.get("main_token_count")
+                or baseline_run.get("main_generated_tokens") != candidate_run.get("main_generated_tokens")
+        ):
+            mismatches.append({
+                "index": index,
+                "baseline_key": _suite_run_key(baseline_run, index),
+                "candidate_key": _suite_run_key(candidate_run, index),
+                "baseline_hash": baseline_hash,
+                "candidate_hash": candidate_hash,
+                "baseline_tokens": baseline_run.get("main_token_count"),
+                "candidate_tokens": candidate_run.get("main_token_count"),
+            })
+    passed = len(mismatches) == 0 and len(missing) == 0 and len(baseline_runs) == len(candidate_runs)
+    print("Suite token equivalence")
+    if passed:
+        print(f"  PASS ({paired} paired runs)")
+    else:
+        print(f"  FAIL (paired={paired}, mismatches={len(mismatches)}, missing={len(missing)})")
+        for mismatch in mismatches[:5]:
+            print(
+                f"  {mismatch['baseline_key']} -> {mismatch['candidate_key']}: "
+                f"baseline_hash={mismatch['baseline_hash']}, candidate_hash={mismatch['candidate_hash']}"
+            )
+        if missing:
+            print(f"  missing_hashes: {', '.join(missing[:5])}")
+    print()
+    return {
+        "pass": passed,
+        "paired_runs": paired,
+        "mismatches": mismatches,
+        "missing": missing,
+    }
+
+
+def _compare_suite_metric_block(
+        baseline_block: dict[str, Any],
+        candidate_block: dict[str, Any],
+        *,
+        regression_tolerance_pct: float,
+) -> dict[str, Any]:
+    metric_specs = {
+        "tokens_per_second": True,
+        "model_elapsed_seconds": False,
+        "wall_seconds": False,
+    }
+    metrics = {}
+    for key, higher_is_better in metric_specs.items():
+        metrics[key] = _metric_comparison(
+            float(baseline_block.get(key, 0.0) or 0.0),
+            float(candidate_block.get(key, 0.0) or 0.0),
+            higher_is_better=higher_is_better,
+            tolerance_pct=regression_tolerance_pct,
+        )
+    generated_tokens_match = baseline_block.get("generated_tokens") == candidate_block.get("generated_tokens")
+    records_match = baseline_block.get("records") == candidate_block.get("records")
+    if "runs" in baseline_block or "runs" in candidate_block:
+        records_match = records_match and baseline_block.get("runs") == candidate_block.get("runs")
+    return {
+        "pass": all(metric["pass"] for metric in metrics.values()) and generated_tokens_match and records_match,
+        "metrics": metrics,
+        "generated_tokens_match": generated_tokens_match,
+        "records_match": records_match,
+    }
+
+
+def _print_suite_metric_block(name: str, report: dict[str, Any]) -> None:
+    print(name)
+    for metric_name, metric in report["metrics"].items():
+        _compare_number(
+            metric_name,
+            float(metric["baseline"]),
+            float(metric["candidate"]),
+            higher_is_better=bool(metric["higher_is_better"]),
+        )
+    print(f"  generated_tokens_match: {report['generated_tokens_match']}")
+    print(f"  records_match: {report['records_match']}")
+    print(f"  no_regression_gate: {'PASS' if report['pass'] else 'FAIL'}")
+    print()
+
+
+def compare_suite_manifests(
+        baseline_path: Path,
+        candidate_path: Path,
+        *,
+        scope: str,
+        regression_tolerance_pct: float = 0.0,
+) -> dict[str, Any]:
+    baseline = _load_json(baseline_path)
+    candidate = _load_json(candidate_path)
+    baseline_block = _suite_aggregate(baseline, scope)
+    candidate_block = _suite_aggregate(candidate, scope)
+    report: dict[str, Any] = {
+        "baseline_path": str(baseline_path),
+        "candidate_path": str(candidate_path),
+        "scope": scope,
+        "regression_tolerance_pct": regression_tolerance_pct,
+        "shape": {},
+        "token_equivalence": {},
+        "performance": {},
+        "cold_run0": {},
+    }
+
+    print(f"Baseline suite:  {baseline_path}")
+    print(f"Candidate suite: {candidate_path}")
+    print(f"Scope:           {scope}")
+    print()
+
+    report["shape"] = _compare_suite_shape(baseline, candidate)
+    report["token_equivalence"] = _compare_suite_token_hashes(baseline, candidate)
+    report["performance"] = _compare_suite_metric_block(
+        baseline_block,
+        candidate_block,
+        regression_tolerance_pct=regression_tolerance_pct,
+    )
+    _print_suite_metric_block(f"Suite no-regression ({scope})", report["performance"])
+
+    baseline_runs = baseline.get("runs", [])
+    candidate_runs = candidate.get("runs", [])
+    if baseline_runs and candidate_runs:
+        report["cold_run0"] = _compare_suite_metric_block(
+            {
+                "records": 1,
+                "generated_tokens": baseline_runs[0].get("main_generated_tokens"),
+                "tokens_per_second": baseline_runs[0].get("main_tokens_per_second"),
+                "model_elapsed_seconds": baseline_runs[0].get("main_model_elapsed_seconds"),
+                "wall_seconds": baseline_runs[0].get("main_wall_seconds"),
+            },
+            {
+                "records": 1,
+                "generated_tokens": candidate_runs[0].get("main_generated_tokens"),
+                "tokens_per_second": candidate_runs[0].get("main_tokens_per_second"),
+                "model_elapsed_seconds": candidate_runs[0].get("main_model_elapsed_seconds"),
+                "wall_seconds": candidate_runs[0].get("main_wall_seconds"),
+            },
+            regression_tolerance_pct=regression_tolerance_pct,
+        )
+        _print_suite_metric_block("Cold run0 diagnostic (not scoped acceptance unless selected)", report["cold_run0"])
+    return report
 
 
 def _compare_contract_metadata(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
@@ -478,6 +675,19 @@ def main() -> None:
         type=Path,
         help="Compare two profile JSON files.",
     )
+    parser.add_argument(
+        "--compare-suite",
+        nargs=2,
+        metavar=("BASE_MANIFEST", "CANDIDATE_MANIFEST"),
+        type=Path,
+        help="Compare two profile_inference_suite suite_manifest.json files.",
+    )
+    parser.add_argument(
+        "--suite-scope",
+        choices=["all_runs", "warmed_runs"],
+        default="warmed_runs",
+        help="Aggregate scope for --compare-suite no-regression gating. Default: warmed_runs.",
+    )
     parser.add_argument("--label", default="main_generation", help="Generation label to compare.")
     parser.add_argument(
         "--regression-tolerance-pct",
@@ -512,6 +722,8 @@ def main() -> None:
         help="Write a machine-readable comparison report.",
     )
     args = parser.parse_args()
+    if args.compare and args.compare_suite:
+        parser.error("use either --compare or --compare-suite, not both")
     if args.compare:
         report = compare_profiles(
             args.compare[0],
@@ -532,10 +744,30 @@ def main() -> None:
             or (require_no_regression and not report["performance"].get("pass", False))
         )
         raise SystemExit(1 if failed else 0)
+    elif args.compare_suite:
+        report = compare_suite_manifests(
+            args.compare_suite[0],
+            args.compare_suite[1],
+            scope=args.suite_scope,
+            regression_tolerance_pct=args.regression_tolerance_pct,
+        )
+        if args.json_output is not None:
+            args.json_output.parent.mkdir(parents=True, exist_ok=True)
+            args.json_output.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+        require_contract_match = args.require_contract_match or args.strict
+        require_token_equivalence = args.require_token_equivalence or args.strict
+        require_no_regression = args.require_no_regression or args.strict
+        failed = (
+            (require_contract_match and not report["shape"].get("pass", False))
+            or (require_token_equivalence and not report["token_equivalence"].get("pass", False))
+            or (require_no_regression and not report["performance"].get("pass", False))
+        )
+        raise SystemExit(1 if failed else 0)
     elif args.profile:
         summarize(args.profile, limit=args.limit)
     else:
-        parser.error("provide a profile path or --compare BASELINE CANDIDATE")
+        parser.error("provide a profile path, --compare BASELINE CANDIDATE, or --compare-suite BASE CANDIDATE")
 
 
 if __name__ == "__main__":
