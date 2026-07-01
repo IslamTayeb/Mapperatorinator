@@ -6,6 +6,7 @@ from typing import Optional, Dict
 import torch
 import torch.nn as nn
 from transformers import PreTrainedModel, GenerationMixin, WhisperForConditionalGeneration
+from transformers.cache_utils import EncoderDecoderCache, StaticCache
 from transformers.modeling_outputs import Seq2SeqLMOutput, BaseModelOutput
 
 from .configuration_mapperatorinator import MapperatorinatorConfig
@@ -59,7 +60,15 @@ def get_backbone_model(config: MapperatorinatorConfig):
 
 
 class Mapperatorinator(PreTrainedModel, GenerationMixin):
-    __slots__ = ["spectrogram", "decoder_embedder", "encoder_embedder", "transformer", "style_embedder", "num_classes"]
+    __slots__ = [
+        "spectrogram",
+        "decoder_embedder",
+        "encoder_embedder",
+        "transformer",
+        "style_embedder",
+        "num_classes",
+        "_mapperatorinator_preallocated_sample_used",
+    ]
     config_class = MapperatorinatorConfig
     base_model_prefix = "model"
     main_input_name = "frames"
@@ -71,6 +80,7 @@ class Mapperatorinator(PreTrainedModel, GenerationMixin):
 
     def __init__(self, config: MapperatorinatorConfig):
         super().__init__(config)
+        self._mapperatorinator_preallocated_sample_used = False
 
         if not config.input_raw_wave:
             self.spectrogram = MelSpectrogram(
@@ -281,7 +291,15 @@ class Mapperatorinator(PreTrainedModel, GenerationMixin):
             streamer=None,
             **model_kwargs,
     ):
-        if not self._can_use_preallocated_sample(input_ids, generation_config, synced_gpus, streamer, model_kwargs):
+        self._mapperatorinator_preallocated_sample_used = False
+        if not self._can_use_preallocated_sample(
+                input_ids,
+                logits_processor,
+                generation_config,
+                synced_gpus,
+                streamer,
+                model_kwargs,
+        ):
             return GenerationMixin._sample(
                 self,
                 input_ids,
@@ -301,9 +319,27 @@ class Mapperatorinator(PreTrainedModel, GenerationMixin):
             **model_kwargs,
         )
 
-    def _can_use_preallocated_sample(self, input_ids, generation_config, synced_gpus, streamer, model_kwargs) -> bool:
+    def _can_use_preallocated_sample(
+            self,
+            input_ids,
+            logits_processor,
+            generation_config,
+            synced_gpus,
+            streamer,
+            model_kwargs,
+    ) -> bool:
         if not bool(getattr(generation_config, "mapperatorinator_preallocated_sample", False)):
             return False
+
+        past_key_values = model_kwargs.get("past_key_values")
+        uses_static_encoder_decoder_cache = (
+                isinstance(past_key_values, EncoderDecoderCache)
+                and isinstance(past_key_values.self_attention_cache, StaticCache)
+                and isinstance(past_key_values.cross_attention_cache, StaticCache)
+        )
+        has_cfg_processor = any(processor.__class__.__name__ == "ClassifierFreeGuidanceLogitsProcessor"
+                                for processor in logits_processor)
+        pad_token_id = generation_config._pad_token_tensor
 
         return (
                 self.config.is_encoder_decoder
@@ -311,6 +347,7 @@ class Mapperatorinator(PreTrainedModel, GenerationMixin):
                 and not synced_gpus
                 and streamer is None
                 and generation_config.do_sample
+                and generation_config.num_beams == 1
                 and not generation_config.return_dict_in_generate
                 and not generation_config.output_attentions
                 and not generation_config.output_hidden_states
@@ -318,10 +355,15 @@ class Mapperatorinator(PreTrainedModel, GenerationMixin):
                 and not generation_config.output_logits
                 and generation_config.prefill_chunk_size is None
                 and generation_config.max_length is not None
+                and pad_token_id is not None
+                and pad_token_id.numel() == 1
                 and model_kwargs.get("decoder_attention_mask") is not None
-                and model_kwargs.get("past_key_values") is not None
+                and uses_static_encoder_decoder_cache
+                and model_kwargs.get("use_cache", True)
                 and model_kwargs.get("negative_prompt") is None
                 and model_kwargs.get("negative_prompt_attention_mask") is None
+                and not has_cfg_processor
+                and (generation_config.guidance_scale is None or generation_config.guidance_scale == 1)
                 and "token_type_ids" not in model_kwargs
         )
 
@@ -341,6 +383,7 @@ class Mapperatorinator(PreTrainedModel, GenerationMixin):
         if cur_len >= max_length:
             return input_ids
 
+        self._mapperatorinator_preallocated_sample_used = True
         input_ids_full = input_ids.new_full((batch_size, max_length), pad_token_value)
         input_ids_full[:, :cur_len] = input_ids
 

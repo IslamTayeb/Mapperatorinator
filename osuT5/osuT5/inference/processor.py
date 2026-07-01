@@ -1474,6 +1474,7 @@ class Processor(object):
             ),
             "precision": stats.get("precision", self.precision),
             "generation_compile_enabled": stats.get("generation_compile_enabled"),
+            "preallocated_sample_requested": stats.get("preallocated_sample_requested"),
             "preallocated_sample_enabled": stats.get("preallocated_sample_enabled"),
             "use_server": isinstance(self.model, InferenceClient),
             "parallel": self.parallel,
