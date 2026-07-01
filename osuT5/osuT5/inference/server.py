@@ -92,7 +92,7 @@ def _sync_cuda_for_model(model) -> None:
         torch.cuda.synchronize(model.device)
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     # To device
     model_kwargs = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v for k, v in model_kwargs.items()}
@@ -182,7 +182,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     return result, stats
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def model_forward(model, model_kwargs, generate_kwargs):
     # To device
     model_kwargs = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v for k, v in model_kwargs.items()}
