@@ -16,6 +16,7 @@
 - Preserve server and non-server inference paths when changing profiling code; both should retain prompt, output, generated-token, and elapsed-time stats.
 - Full-song accepted profiling runs should pin the seed and record generated token IDs, not only smoke runs.
 - Treat `torch_profiled=true` generation windows as diagnostic traces only; use synchronized `model_elapsed_seconds` from untraced profile records for throughput claims.
+- When cleaning DCC profiling artifacts, restrict deletion to explicit `/work/imt11/Mapperatorinator/runs/smoke-*` and `/work/imt11/Mapperatorinator/logs/smoke-*` paths owned by `imt11`, leave full-song accepted runs intact, and write a manifest of deleted smoke paths.
 - Keep profiling run instructions and schema notes in `docs/inference_profiling.md` when the workflow changes.
 - DCC source paths: repo at `/hpc/group/romerolab/imt11/projects/Mapperatorinator`, env at `/hpc/group/romerolab/imt11/envs/mapperatorinator`, and active data/cache/runs/logs under `/work/imt11/Mapperatorinator`.
 - Run expensive DCC work through Slurm only. Use login nodes for git, file inspection, and job submission; capture Slurm stdout/stderr under `/work/imt11/Mapperatorinator/logs` and report job id, GPU node/type, profile paths, and `sacct` status.

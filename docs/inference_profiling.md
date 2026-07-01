@@ -111,6 +111,13 @@ Promote a change to a full-song SALVALAI run only when smoke results are stable,
 
 Stop the long-running optimization loop when either the full-song RTX 2080 run reaches at least `100 tok/s` with identical fixed-seed tokens, or profiling across multiple exact-calculation optimization families shows no remaining plausible `>=10%` improvement.
 
+Current status after 2026-07-01 scouting:
+
+- Retained full-song baseline: `92.465 tok/s` main generation from job `49113713`, profile `/work/imt11/Mapperatorinator/runs/full-compile-49113713-3e9033c/beatmapcfb70d0020da473c90f6c1acb32d6bbf.osu.profile.json`.
+- This is below the `100 tok/s` target, but most low/medium-complexity exact-calculation candidates have been measured and rejected.
+- In the retained full-song run, main-generation model time was `82.615s` and summed outer wall was `82.793s`; only `0.178s` total sat outside the synchronized model call across `87` map windows. That means prompt setup, cache construction, device transfer outside the timed region, result CPU transfer, and profile bookkeeping cannot plausibly close the gap to `100 tok/s`.
+- A custom decode loop remains a possible research project only if it preserves the compiled one-token forward path and exact HF sampling/RNG semantics. A naive replacement for `model.generate` is more likely to lose the accepted compile win than to provide a clean `>=10%` full-song gain.
+
 ## Codex Goal Prompt
 
 ```text
