@@ -1,5 +1,7 @@
 # 200 tok/s Stop Decision
 
+Superseded update: this was the quick-tweak stop decision before the renewed active-prefix runtime pass. Full-song job `49150185` later accepted bucketed active-prefix decode with bucket `256`, raising the retained baseline to `121.926 tok/s` with token equivalence PASS for `7,639/7,639` main tokens. Keep this note as historical closure for the quick-tweak phase.
+
 ## Decision
 
 Stop current-architecture same-calculation scouting by the documented 200 tok/s stop condition. The target was not reached, but the measured and audited candidate families no longer show a plausible remaining major exact-calculation path on RTX 2080/2080 Ti.

@@ -1,5 +1,7 @@
 # 200 tok/s Next Steps
 
+Superseded update: full-song job `49150185` later accepted bucketed active-prefix decode with `inference_active_prefix_decode_bucket_size=256`, raising the retained baseline to `121.926 tok/s` with token equivalence PASS for `7,639/7,639` main tokens. Keep this note as the pre-acceptance plan; use `docs/inference_profiling.md` and `notes/2026-07-01-active-prefix-decode-loop-full-song.md` for the current baseline and next gates.
+
 ## Current Baseline
 
 The retained same-calculation baseline is SDPA plus `inference_generation_compile=true`:
