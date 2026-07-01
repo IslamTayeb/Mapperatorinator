@@ -185,6 +185,19 @@ Conclusion: active-prefix is weak or unstable cold because the first long genera
 
 Next implementation target: graph/runtime stabilization for active-prefix bucket512. Good candidates are explicit graph/cache priming with setup cost honestly included, reducing cache-update specialization by decoder layer, or a bufferized/direct decode loop that avoids repeated HF compiled graph variants. Do not hide prewarm cost outside cold single-song timing; cold claims must include setup/timing/main/total non-regression. For warm-repeat or future batch serving, report first-song cold cost and warmed amortized throughput separately.
 
+Multi-token direct decode loop correctness gate, DCC job `49161597` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti, torch `2.10.0+cu128`, Transformers `4.57.3`, dirty test patch on commit `cb874ee`:
+
+| gate | token match | RNG match | raw-logit steps | max_abs | wall |
+| --- | --- | --- | ---: | ---: | ---: |
+| compile false, plain loop | PASS | PASS | 8 | `0.0` | `8.110s` |
+| compile true, plain loop | PASS | PASS | 8 | `0.0` | `40.794s` |
+| compile false, buffered active512 | PASS | PASS | 8 | `0.0` | `7.713s` |
+| compile true, buffered active512 | PASS | PASS | 8 | `0.0` | `49.090s` |
+
+Run dir: `/work/imt11/Mapperatorinator/runs/direct-loop-gate-49161597-cb874ee`.
+
+This is a testing-suite improvement, not an inference speed result. `utils/verify_direct_decode_loop.py` compares normal HF `generate()` against a candidate loop passed through `custom_generate`, so HF still constructs the final `logits_processor`, `stopping_criteria`, cache, and generation config for both paths. It resets CPU/CUDA RNG state before each path, captures raw logits before in-place processors, compares generated token IDs, compares per-step raw logits/top-k, and verifies final RNG state. Use it before 15s smoke for direct/custom decode loop changes, especially when touching buffering, active-prefix decode, sampling, or stopping behavior.
+
 Rejected active-prefix mask fast path, DCC jobs `49158276` and `49158365` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti:
 
 | run | main tokens | main model time | tok/s | token equivalence | status |
