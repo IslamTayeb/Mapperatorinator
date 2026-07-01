@@ -95,8 +95,43 @@ DCC validation job `49139917`, node `dcc-core-ferc-s-z25-20`, commit `8cb1160`:
 
 Decision: keep the ABI extraction as infrastructure. It is not a speed claim, but it is the required launch point for manual CUDA graph and direct-step compile experiments.
 
+## Direct-Step CUDA Graph POC
+
+Commit `596f221` added `utils/profile_direct_decode_step.py`, a diagnostic-only profiler for the fixed direct one-token step. It captures the model forward for the prepared `[1, 1]` cached candidate step and compares eager vs manual `torch.cuda.CUDAGraph` replay. It does not include HF sampling, dynamic token input updates, EOS handling, or generated-token accounting, so it is a ceiling probe rather than an inference speed claim.
+
+DCC job `49139948`, node `dcc-core-ferc-s-z25-20`, commit `596f221`:
+
+| Mode | Report | Result |
+| --- | --- | --- |
+| `inference_generation_compile=false` | `/work/imt11/Mapperatorinator/runs/direct-step-graph-49139948-596f221/direct_step_seq9_compile_false.json` | PASS, eager `12.181ms`, graph `8.089ms`, `1.506x`, logits exact |
+| `inference_generation_compile=true` | `/work/imt11/Mapperatorinator/runs/direct-step-graph-49139948-596f221/direct_step_seq9_compile_true.json` | PASS, eager `12.360ms`, graph `8.087ms`, `1.528x`, logits exact |
+
+Interpretation: manual graph replay has real ceiling, but graphing the current one-token forward alone is not a `200 tok/s` path. `8.087ms` is about `124 tok/s` before real generation-loop work such as token copy, logits processors, sampling, EOS checks, and cache-position movement. This supports building an exact graph-backed direct loop if the target is the `120 tok/s` milestone, but `200 tok/s` still needs attention/cache-layout work.
+
+## Attention Ceiling Microprofiles
+
+SM75 fp32 SDPA-only microprofile job `49139966`, node `dcc-core-ferc-s-z25-20`, commit `596f221`:
+
+- Output JSON: `/work/imt11/Mapperatorinator/runs/attn-sm75-fp32-49139966-596f221/attention_kernel_profile.json`
+- q_len=1 `decode_self_kv512`: repo-like `0.0686ms`.
+- q_len=1 `decode_self_kv2048`: repo-like `0.2884ms`.
+- q_len=1 `cross_attn_kv2048`: repo-like `0.2892ms`.
+
+Focused mask/length microbench job `49139981`:
+
+- Output JSON: `/work/imt11/Mapperatorinator/runs/sdpa-mask-2560-49139981.json`
+- q_len=1 `kv2048`: maskless `0.3105ms`, zero mask `0.3202ms`, static position-84 mask `0.3002ms`.
+- q_len=1 `kv2560`: maskless `0.3576ms`, zero mask `0.3741ms`, static position-84 mask `0.3739ms`.
+
+Interpretation:
+
+- The real trace's FMHA total, `2032.006ms / 5628 calls = 0.361ms/call`, lines up with q_len=1 `kv2560` SDPA microbench timing. That means the model trace is not hiding a huge SDPA wrapper artifact; it is mostly paying real full-length attention kernel time.
+- The static 4D mask adds only about `4-5%` at `kv2560`. The embarrassing cost is using the full static self-attention cache length for every one-token decode step.
+- A Python-level static-cache prefix trim was already rejected because slicing hurt full inference. The remaining plausible lever is a graph/runtime/cache-layout path that lets self-attention see the active prefix length without per-token slicing and without changing tokens. If that could move self-attention from `kv2560` toward `kv512`-class cost, the arithmetic has a plausible path toward `200 tok/s`; if not, manual graphing alone likely tops out near `120-125 tok/s`.
+
 ## Next
 
 - Run a no-profiler compile/CUDA-graph health audit with `TORCH_LOGS=recompiles,cudagraphs` on the 15s smoke slice.
 - Start the direct one-token ABI extraction from `utils/verify_one_token_decode.py` and then prototype manual CUDA graph replay around the exact candidate step.
 - Keep static-cache update rewrites as a later experiment only if direct-step graphing shows `StaticCache.update` remains a measured blocker. Raising Dynamo limits alone was not enough.
+- Next high-ceiling target: use the validated direct-step ABI to prototype an exact active-prefix self-attention/cache layout that avoids full `max_target_positions` SDPA work without the rejected per-token slicing overhead.

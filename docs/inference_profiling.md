@@ -214,6 +214,23 @@ TorchDynamo cache-limit scout result:
   was token-equivalent but not a main-generation win: `50.850 -> 50.867 tok/s` on the 15s smoke. Do not promote this
   as an optimization; keep it as evidence that the missing gain is not solved by a larger Dynamo cache.
 
+Direct-step CUDA graph and attention ceiling results:
+
+- Direct-step graph POC job `49139948` used `utils/profile_direct_decode_step.py` on `main_generation.seq9`. It was
+  logits-exact and measured fixed one-token eager forward at `12.18-12.36ms` vs manual CUDA graph replay at about
+  `8.09ms`, `1.5x` faster. This is a diagnostic ceiling only: `8.09ms` is about `124 tok/s` before real sampling,
+  token-copy, EOS, and loop control work, so graphing the current forward alone is not a `200 tok/s` path.
+- SM75 fp32 SDPA microprofile job `49139966` wrote
+  `/work/imt11/Mapperatorinator/runs/attn-sm75-fp32-49139966-596f221/attention_kernel_profile.json`.
+  q_len=1 `decode_self_kv512` repo-like SDPA was `0.0686ms`; `decode_self_kv2048` was `0.2884ms`; and
+  `cross_attn_kv2048` was `0.2892ms`.
+- Focused mask-length job `49139981` wrote `/work/imt11/Mapperatorinator/runs/sdpa-mask-2560-49139981.json`.
+  q_len=1 `kv2560` was `0.3576ms` maskless and `0.3739ms` with a static position-84 mask. The mask overhead is small;
+  the full static self-attention length is the large cost.
+- Interpretation: the next plausible `200 tok/s` lever is exact active-prefix self-attention/cache layout that avoids
+  full `max_target_positions` work without the rejected per-token slicing path. Manual CUDA graphing remains useful for
+  a likely `120 tok/s`-class runtime path but needs an attention/cache-layout win to approach `200 tok/s`.
+
 Promote a change to a full-song SALVALAI run only when smoke results are stable, token IDs match, and the speedup is plausibly meaningful. For compile-like changes with one-time first-window costs, inspect post-warmup per-window throughput before rejecting a weak total smoke result. Keep changes that improve RTX 2080 full-song main-generation throughput by about 10% or more. Keep 5-10% wins only when they are simple and well-contained or strategically de-risk the custom runtime path. Remove 1-3% complexity by default.
 
 For the current 200 tok/s phase, stop the long-running optimization loop only when either the full-song RTX 2080/2080 Ti run reaches at least `200 tok/s` with identical fixed-seed tokens, or profiling across multiple exact-calculation optimization families shows no remaining plausible major exact-calculation path.
