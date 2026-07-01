@@ -460,6 +460,19 @@ RTX 2080 Ti middle-15s SALVALAI comparison on DCC `gpu-common`, node `dcc-core-f
 
 Token equivalence PASS: all `1,084` generated main-generation token IDs matched. Throughput was `-37.2%` worse overall and post-warmup windows were also slower, for example seq9 fell from `104.1 tok/s` to `88.9 tok/s`. Stderr showed autotuning selected some Triton kernels, but that did not improve this Turing/SM75 single-token decode workload. Do not force `CompileConfig(mode="max-autotune")` for this baseline unless a future PyTorch/Transformers version changes the kernel choices and a fresh smoke run proves a win.
 
+### Fullgraph generation compile config
+
+Attempted in commit `149fe88` and reverted after 15s smoke profiling. The change forced `model.generation_config.compile_config = CompileConfig(fullgraph=True, mode="reduce-overhead")` while keeping the retained SDPA/static-cache generation path.
+
+RTX 2080 Ti middle-15s SALVALAI comparison on DCC `gpu-common`, node `dcc-core-ferc-s-z25-21`:
+
+| run | commit | job | profile | main tokens | main model time | tok/s |
+| --- | --- | --- | --- | ---: | ---: | ---: |
+| baseline | `2d807c1` | `49137140` | `/work/imt11/Mapperatorinator/runs/smoke15-mask-base-2d807c1/beatmap4438946a6a864548b8d968d4a3a24682.osu.profile.json` | 1,084 | 21.093s | 51.4 |
+| candidate | `149fe88` | `49137638` | `/work/imt11/Mapperatorinator/runs/smoke15-fullgraph-149fe88/beatmapa2f8469fd07e475aaa4d7f68477dd5ca.osu.profile.json` | 1,084 | 21.258s | 51.0 |
+
+Token equivalence PASS: all `1,084` generated main-generation token IDs matched. The candidate was only `-0.8%` overall and post-warmup windows were mixed, with no plausible `>=10%` signal. Per the keep/revert policy, do not keep this complexity or force `CompileConfig(fullgraph=True)` unless a future PyTorch/Transformers version changes generation compile behavior and a fresh smoke run shows a meaningful win.
+
 ### Preallocated sample loop
 
 Attempted in commits `6d6ba7c` and `f7b5222` and reverted after smoke profiling. The change added an opt-in Mapperatorinator override for Hugging Face `_sample` that preallocated `input_ids` and `decoder_attention_mask` buffers to avoid per-token `torch.cat` in the generation loop while preserving the compiled one-token forward path.
