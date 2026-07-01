@@ -547,6 +547,18 @@ The next TensorRT gate, if revisited with another package/CUDA/runtime combinati
 
 See `notes/2026-07-01-tensorrt-packaging-probe.md` for the full resolver details.
 
+## 200 tok/s Stop Decision
+
+The current-architecture 200 tok/s scouting loop stopped on 2026-07-01 by the documented stop condition. The target was not reached, but the measured exact-calculation candidate families no longer show a plausible remaining major full-song win on RTX 2080/2080 Ti.
+
+The final retained baseline remains SDPA plus `inference_generation_compile=true`: full-song job `49113713`, `7,639` main-generation tokens, `82.615s` synchronized model time, `92.465 tok/s`, and fixed-seed token equivalence PASS against the compile-disabled full-song baseline.
+
+The final rejection set includes copy-compatible custom `_sample` hook, preallocated `_sample` loop, persistent static-mask mutation, compile-config variants (`dynamic=False`, `dynamic=True`, `mode="max-autotune"`, `fullgraph=True`), TensorRT-RTX current-env lowering, static-cache prefix trim, dynamic/default cache generation, final-position logits, stateful monotonic masking, and `torch.inference_mode` wrapping. Sampling/logits fusion remains below the profiling threshold in the post-warmup trace, and batching/parallel/server/window changes are non-equivalent unless separately proven token-identical.
+
+Final read-only subagent `019f1c3b-a844-73d1-8e67-858ad3b51732` agreed with stopping: no remaining exact-calculation path was both plausible for a `>=10%` full-song win and worth running before the stop decision.
+
+See `notes/2026-07-01-200tps-stop-decision.md` for the closure summary. Future attempts toward `200 tok/s` should start as a separate runtime/kernel project with new evidence, not by rerunning the documented failed scouts.
+
 ## What The Profile Captures
 
 Top-level `stages` report wall time for setup, model loading, audio loading, segmentation, timing generation, main generation, diffusion, postprocessing, and file writes.
