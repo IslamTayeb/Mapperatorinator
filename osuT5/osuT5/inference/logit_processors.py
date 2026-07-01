@@ -139,15 +139,84 @@ class MonotonicTimeShiftLogitsProcessor(LogitsProcessor):
         self.time_shift_start = tokenizer.event_start[EventType.TIME_SHIFT]
         self.time_shift_end = tokenizer.event_end[EventType.TIME_SHIFT]
         self.sos_ids = torch.tensor([tokenizer.sos_id] + list(getattr(tokenizer, "context_sos", {}).values()))
+        self._sos_ids_by_device: dict[torch.device, torch.Tensor] = {}
+        self._time_shift_offsets_by_device: dict[torch.device, torch.Tensor] = {}
+        self._single_seq_len: int | None = None
+        self._single_has_time_shift: torch.Tensor | None = None
+        self._single_last_time_shift_value: torch.Tensor | None = None
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        if input_ids.shape[0] == 1 and scores.shape[0] == 1:
+            return self._single_sequence_call(input_ids, scores)
+        return self._full_scan_call(input_ids, scores)
+
+    def _single_sequence_call(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        seq_len = input_ids.shape[1]
+        if self._single_seq_len is None or seq_len != self._single_seq_len + 1:
+            self._initialize_single_sequence_state(input_ids)
+        else:
+            self._update_single_sequence_state(input_ids[:, -1])
+            self._single_seq_len = seq_len
+
+        if self._single_has_time_shift is None or self._single_last_time_shift_value is None:
+            return scores
+
+        offsets = self._time_shift_offsets(input_ids.device)
+        invalid_mask = offsets < self._single_last_time_shift_value.reshape(1)
+        score_slice = scores[:, self.time_shift_start:self.time_shift_end]
+        masked_slice = score_slice.masked_fill(invalid_mask.unsqueeze(0), -torch.inf)
+        scores[:, self.time_shift_start:self.time_shift_end] = torch.where(
+            self._single_has_time_shift.reshape(1, 1),
+            masked_slice,
+            score_slice,
+        )
+        return scores
+
+    def _initialize_single_sequence_state(self, input_ids: torch.LongTensor) -> None:
+        device = input_ids.device
+        tokens = input_ids[0]
+        seq_len = tokens.shape[0]
+        indices = torch.arange(seq_len, device=device)
+
+        is_time_shift = (tokens >= self.time_shift_start) & (tokens < self.time_shift_end)
+        is_sos = self._is_sos(tokens)
+
+        last_time_shift_idx = torch.max(torch.where(is_time_shift, indices, -1), dim=0).values
+        last_sos_idx = torch.max(torch.where(is_sos, indices, -1), dim=0).values
+        has_time_shift = (last_time_shift_idx != -1) & (last_time_shift_idx > last_sos_idx)
+        last_time_shift_value = torch.where(
+            last_time_shift_idx != -1,
+            tokens[last_time_shift_idx] - self.time_shift_start,
+            torch.zeros((), dtype=tokens.dtype, device=device),
+        )
+
+        self._single_seq_len = seq_len
+        self._single_has_time_shift = has_time_shift.reshape(1)
+        self._single_last_time_shift_value = last_time_shift_value.reshape(1)
+
+    def _update_single_sequence_state(self, last_token: torch.LongTensor) -> None:
+        is_time_shift = (last_token >= self.time_shift_start) & (last_token < self.time_shift_end)
+        is_sos = self._is_sos(last_token)
+        last_time_shift_value = last_token - self.time_shift_start
+
+        self._single_has_time_shift = torch.where(
+            is_sos,
+            torch.zeros_like(self._single_has_time_shift, dtype=torch.bool),
+            torch.where(is_time_shift, torch.ones_like(self._single_has_time_shift, dtype=torch.bool), self._single_has_time_shift),
+        )
+        self._single_last_time_shift_value = torch.where(
+            is_time_shift,
+            last_time_shift_value,
+            self._single_last_time_shift_value,
+        )
+
+    def _full_scan_call(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
         device = input_ids.device
         batch_size, seq_len = input_ids.shape
-        self.sos_ids = self.sos_ids.to(device)
 
         # Create masks for time_shift and sos tokens
         is_time_shift = (input_ids >= self.time_shift_start) & (input_ids < self.time_shift_end)
-        is_sos = torch.isin(input_ids, self.sos_ids)
+        is_sos = self._is_sos(input_ids)
 
         # Create a sequence of indices [0, 1, ..., seq_len-1]
         indices = torch.arange(seq_len, device=device).expand(batch_size, -1)
@@ -181,3 +250,20 @@ class MonotonicTimeShiftLogitsProcessor(LogitsProcessor):
         scores[apply_mask] = scores[apply_mask].masked_fill(batch_mask[apply_mask], -torch.inf)
 
         return scores
+
+    def _is_sos(self, input_ids: torch.LongTensor) -> torch.Tensor:
+        sos_ids = self._sos_ids(input_ids.device)
+        return (input_ids.unsqueeze(-1) == sos_ids).any(dim=-1)
+
+    def _sos_ids(self, device: torch.device) -> torch.Tensor:
+        if device not in self._sos_ids_by_device:
+            self._sos_ids_by_device[device] = self.sos_ids.to(device)
+        return self._sos_ids_by_device[device]
+
+    def _time_shift_offsets(self, device: torch.device) -> torch.Tensor:
+        if device not in self._time_shift_offsets_by_device:
+            self._time_shift_offsets_by_device[device] = torch.arange(
+                self.time_shift_end - self.time_shift_start,
+                device=device,
+            )
+        return self._time_shift_offsets_by_device[device]
