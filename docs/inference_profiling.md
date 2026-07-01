@@ -204,6 +204,16 @@ Rejected simple measured active-prefix primer, DCC job `49159121` on `dcc-core-f
 
 The primer used a scratch cache, fresh logits processors, and an RNG fork. It moved work out of the first long active-prefix map window (`seq3 25.909s -> 14.923s`) but paid setup in earlier records (`seq0=11.705s`) and regressed the active512 aggregate by `-3.8%`. The code was reverted. This supports the graph/capture/specialization diagnosis but shows that naive throwaway-generate priming is not enough; future priming needs better bucket/shape coverage and explicit profile schema support. See `notes/2026-07-01-active-prefix-primer.md`.
 
+Rejected active-prefix direct per-layer static-cache update dispatch bypass, DCC job `49160690` on `dcc-core-ferc-s-z25-21`, RTX 2080 Ti:
+
+| run | main tokens | main model time | tok/s | token equivalence | status |
+| --- | ---: | ---: | ---: | --- | --- |
+| cold compile-only | `1,084` | `22.406s` | `48.380` | baseline | baseline |
+| active512 old path | `1,084` | `30.906s` | `35.074` | PASS | baseline active-prefix candidate |
+| active512 direct-layer update | `1,084` | `31.330s` | `34.599` | PASS | rejected |
+
+The candidate bypassed `Cache.update(..., layer_idx, ...)` dispatch by calling the selected static-cache layer update directly during active-prefix VarWhisper SDPA self-attention decode. One-token logits gates passed with compile disabled (`max_abs=0.0`) and compile enabled (`max_abs=2.2888e-05`), and the 15s smoke matched all `1,084 / 1,084` generated main-token IDs. It still regressed active512 by `-1.4%`, did not improve the first long map window (`seq3 26.539s -> 26.926s`), and slightly worsened a post-warm window (`seq9 1.574s -> 1.599s`). The code was reverted. See `notes/2026-07-01-active-prefix-direct-layer-cache-update.md`.
+
 ## Smoke-To-Full Profiling Loop
 
 Start with the middle 15s SALVALAI smoke config for fastest iteration:
