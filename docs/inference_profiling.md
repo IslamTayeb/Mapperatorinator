@@ -96,6 +96,20 @@ Keep future batch and multiple-song results in separate reporting classes:
 
 Do not use warmed-cache, multi-song, or server-batch wins as cold single-song speedups. They can still matter for future batch inference and the planned autoregressive encoder-decoder component, but label them by result class.
 
+Use the same-process suite harness for warm-repeat and future serial multi-song scouting:
+
+```bash
+python utils/profile_inference_suite.py \
+  --config-name profile_salvalai \
+  --repeats 3 \
+  --run-kind warm_repeat \
+  --output-root "$RUN_DIR" \
+  inference_active_prefix_decode_loop=true \
+  inference_active_prefix_decode_bucket_size=512
+```
+
+The harness loads the model once, resets RNG before every `generate()` call, writes one profile JSON per run, and writes `suite_manifest.json` with first-run, warmed-run, aggregate throughput, profile paths, and token-equivalence status against run 0. It currently supports only `warm_repeat`; `serial_multi_song` fails loudly until an explicit multi-song config/list exists. Its warmed results are useful operational evidence, but they are not cold single-song acceptance evidence.
+
 ## Smoke-To-Full Profiling Loop
 
 Start with the middle 15s SALVALAI smoke config for fastest iteration:
