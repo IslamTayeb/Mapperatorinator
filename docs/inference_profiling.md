@@ -281,6 +281,19 @@ RTX 2080 Ti smoke comparison on DCC `gpu-common`, node `dcc-core-ferc-s-z25-21`:
 
 `utils/summarize_inference_profile.py --compare` reported token equivalence PASS for all `2,894` generated main-generation token IDs, but throughput was `-4.1%` worse. The likely reason is that removing `torch.isin`/full-prefix work also added per-token state, mask, slice, `masked_fill`, and `torch.where` work; this did not pay back in normal generation. Do not reintroduce this shape of stateful logits processor without profiler evidence that the replacement removes more work than it adds.
 
+### Last-position generation logits
+
+Attempted in commits `1011c1d` and `786a5fd` and reverted after smoke profiling. The change passed `logits_to_keep=1` during generation for VarWhisper so the LM head projected only the last decoder position instead of all positions.
+
+RTX 2080 Ti smoke comparison on DCC `gpu-common`, node `dcc-core-ferc-s-z25-21`:
+
+| run | commit | job | profile | main tokens | main model time | tok/s |
+| --- | --- | --- | --- | ---: | ---: | ---: |
+| baseline | `01c18d6` | `49109301` | `/work/imt11/Mapperatorinator/runs/smoke-base-49109301-01c18d6/beatmap6f980906005d441fb87edde94f269b83.osu.profile.json` | 2,894 | 41.707s | 69.4 |
+| candidate | `786a5fd` | `49110976` | `/work/imt11/Mapperatorinator/runs/smoke-logits2-49110976-786a5fd/beatmapac03a230f58f4de5a23bf66b2074c844.osu.profile.json` | 2,894 | 53.091s | 54.5 |
+
+`utils/summarize_inference_profile.py --compare` reported token equivalence PASS for all `2,894` generated main-generation token IDs, but throughput was `-21.4%` worse. The likely reason is that the smaller LM-head projection shape loses the efficient larger GEMM path or causes less favorable per-token kernel behavior, despite doing less nominal arithmetic. Do not reintroduce final-logit-only projection for VarWhisper generation without profiler evidence that the GEMM/kernel path has changed.
+
 ## What The Profile Captures
 
 Top-level `stages` report wall time for setup, model loading, audio loading, segmentation, timing generation, main generation, diffusion, postprocessing, and file writes.

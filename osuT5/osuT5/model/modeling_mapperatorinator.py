@@ -148,7 +148,6 @@ class Mapperatorinator(PreTrainedModel, GenerationMixin):
             encoder_outputs: Optional[torch.FloatTensor] = None,
             labels: Optional[torch.LongTensor] = None,
             sample_weights: Optional[torch.FloatTensor] = None,
-            logits_to_keep: int = 0,
             **kwargs
     ) -> Seq2SeqLMOutput:
         """
@@ -166,11 +165,8 @@ class Mapperatorinator(PreTrainedModel, GenerationMixin):
         inputs = dict(
             decoder_input_ids=decoder_input_ids,
             decoder_attention_mask=decoder_attention_mask,
-            encoder_outputs=encoder_outputs,
-            **kwargs
+            encoder_outputs=encoder_outputs, **kwargs
         )
-        if logits_to_keep > 0 and getattr(self.transformer, "supports_logits_to_keep", False):
-            inputs["logits_to_keep"] = logits_to_keep
 
         inputs_embeds = None
         if encoder_outputs is None and frames is not None:
@@ -241,7 +237,6 @@ class Mapperatorinator(PreTrainedModel, GenerationMixin):
         cache_position=None,
         negative_prompt=None,
         negative_prompt_attention_mask=None,
-        logits_to_keep=None,
         **kwargs,
     ):
         # Add negative prompt to the input for classifier free guidance
@@ -267,8 +262,6 @@ class Mapperatorinator(PreTrainedModel, GenerationMixin):
             cache_position=cache_position,
             **kwargs,
         )
-        if logits_to_keep is not None:
-            model_inputs["logits_to_keep"] = logits_to_keep
 
         # 7. Forward ALL kwargs that are uninitialized (e.g. `beatmap_idx`).
         for key, value in kwargs.items():
