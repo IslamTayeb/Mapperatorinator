@@ -648,7 +648,7 @@ def generate(
 def load_model_with_server(ckpt_path: str | Path | None, t5_args: TrainConfig, device, max_batch_size: int = 8,
                            use_server: bool = False, precision: str = "fp32", attn_implementation: str = "sdpa",
                            eval_mode: bool = True, lora_path=None, gamemode: int | None = None,
-                           auto_select_gamemode_model: bool = True):
+                           auto_select_gamemode_model: bool = True, generation_compile: bool = False):
     model_loader, tokenizer_loader = load_model_loaders(
         ckpt_path=ckpt_path,
         t5_args=t5_args,
@@ -660,6 +660,7 @@ def load_model_with_server(ckpt_path: str | Path | None, t5_args: TrainConfig, d
         lora_path=lora_path,
         gamemode=gamemode,
         auto_select_gamemode_model=auto_select_gamemode_model,
+        generation_compile=generation_compile,
     )
 
     return InferenceClient(
@@ -752,7 +753,8 @@ def main(args: InferenceConfig):
                                                   max_batch_size=args.max_batch_size, use_server=args.use_server,
                                                   precision=args.precision, attn_implementation=args.attn_implementation,
                                                   lora_path=args.lora_path, gamemode=args.gamemode,
-                                                  auto_select_gamemode_model=args.auto_select_gamemode_model)
+                                                  auto_select_gamemode_model=args.auto_select_gamemode_model,
+                                                  generation_compile=args.inference_generation_compile)
 
     timing_model, timing_tokenizer = None, None
     if should_load_separate_timing_model(args):
@@ -768,6 +770,7 @@ def main(args: InferenceConfig):
                 attn_implementation=args.attn_implementation,
                 gamemode=args.gamemode,
                 auto_select_gamemode_model=False,
+                generation_compile=args.inference_generation_compile,
             )
 
     diff_model, diff_tokenizer, refine_model = None, None, None

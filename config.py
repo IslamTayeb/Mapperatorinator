@@ -72,6 +72,7 @@ class InferenceConfig:
     timer_bpm_threshold: float = 0.7  # Threshold requirement for BPM change in timer, higher values will result in less BPM changes
     timer_cfg_scale: float = 1.0  # Scale of classifier-free guidance for timer
     timer_iterations: int = 20  # Number of iterations for timer
+    inference_generation_compile: bool = False  # Enable Transformers generation compile path for profiling/scouting
     use_server: bool = True  # Use server for optimized multiprocess inference
     max_batch_size: int = 16  # Maximum batch size for inference (only used for parallel sampling or super timing)
     profile_inference: bool = False  # Write stage and generation timing profile JSON
