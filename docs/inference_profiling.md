@@ -151,7 +151,12 @@ python utils/verify_one_token_decode.py \
   num_beams=1
 ```
 
-This gate compares full-prefix raw logits against the static-cache `q_len=1` decode step for the real SALVALAI prompt-building path. It deliberately avoids calling `generate()` as the reference so it does not consume sampling RNG or mutate generation caches. Passing this gate is necessary for decoder-runtime work, but not sufficient for a speed claim; still require fixed-seed 15s generated-token equivalence and full-song equivalence.
+This gate compares a direct static-cache `q_len=1` decode step against captured raw logits from HF cached
+`generate(max_new_tokens=2)` on the real SALVALAI prompt-building path. The capture processor clones logits before
+Mapperatorinator logits processors can mutate them in-place, and HF's first generated token becomes the probe token for
+the direct candidate step. The old no-cache full-prefix comparison is kept only as a diagnostic. Passing this gate is
+necessary for decoder-runtime work, but not sufficient for a speed claim; still require fixed-seed 15s generated-token
+equivalence and full-song equivalence.
 
 For post-warmup diagnosis, use detailed internal ranges only in torch-profiler or Nsight runs:
 
@@ -185,6 +190,12 @@ python inference.py --config-name profile_salvalai_smoke15 \
 ```
 
 Valid backend values are `flash`, `efficient`, `math`, and `cudnn` when the installed PyTorch exposes them. Record PyTorch warnings, actual profiler kernel names, token equivalence, and untraced speed. A forced backend micro-result does not replace the retained SDPA baseline without full-song token-equivalent evidence.
+
+RTX 2080 Ti SDPA backend audit result:
+
+- Smoke job `49139404` found forced `profile_sdpa_backend=math` was token-equivalent and much faster on the 15s aggregate (`78.862 tok/s` vs `50.850 tok/s`), while forced `efficient` was noise and forced `flash` failed on SM75 with no available kernel.
+- The full-song paired validation job `49139420` rejected forced `math` for main generation: `/work/imt11/Mapperatorinator/runs/full-sdpa-math-49139420-9d92c34/beatmap8241a2b3f0be495592a5cf2b9bb9d6a2.osu.profile.json` produced `7,639` main tokens in `85.177s`, `89.684 tok/s`, token equivalence PASS, which is slower than the retained `92.465 tok/s` baseline.
+- Conclusion: keep SDPA plus `inference_generation_compile=true` as the retained baseline. Do not promote forced `math` from smoke-only evidence; use it only as a diagnostic if a future trace shows a backend-specific reason.
 
 Promote a change to a full-song SALVALAI run only when smoke results are stable, token IDs match, and the speedup is plausibly meaningful. For compile-like changes with one-time first-window costs, inspect post-warmup per-window throughput before rejecting a weak total smoke result. Keep changes that improve RTX 2080 full-song main-generation throughput by about 10% or more. Keep 5-10% wins only when they are simple and well-contained or strategically de-risk the custom runtime path. Remove 1-3% complexity by default.
 
@@ -639,7 +650,9 @@ The `generation` records report per-window or per-batch details:
 
 Torch profiler records include a bounded key-average event summary in the profile JSON. Use
 `profile_torch_event_limit=<N>` to keep more than the default top 50 events, or `profile_torch_event_limit=0` to keep
-all events. This changes only profile artifact size; it is diagnostic and must not be used as a throughput claim.
+all events. The bounded summary is sorted by the largest self/total CUDA or self CPU signal so nested semantic
+`record_function` ranges are not dropped only because their self CUDA time is low. This changes only profile artifact
+size; it is diagnostic and must not be used as a throughput claim.
 
 Use `wall_seconds - model_elapsed_seconds` to spot server/IPC/queue overhead. Use token counts and `tokens_per_second` to separate model throughput problems from unusually long outputs. When `profile_sync_cuda=true`, profiling requests synchronized model timing inside `model_generate` so `model_elapsed_seconds` includes pending CUDA work. Do not use `wall_seconds` from records with `torch_profiled=true` as normal throughput; the profiler can inflate traced windows by orders of magnitude.
 

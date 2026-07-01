@@ -235,7 +235,14 @@ class InferenceProfiler:
                 "self_cpu_time_total_us": self_cpu_total,
                 "input_shapes": getattr(event, "input_shapes", None),
             })
-        events.sort(key=lambda item: float(item["self_cuda_time_total_us"]), reverse=True)
+        events.sort(
+            key=lambda item: max(
+                float(item["self_cuda_time_total_us"]),
+                float(item["cuda_time_total_us"]),
+                float(item["self_cpu_time_total_us"]),
+            ),
+            reverse=True,
+        )
         return events if limit <= 0 else events[:limit]
 
     @staticmethod
