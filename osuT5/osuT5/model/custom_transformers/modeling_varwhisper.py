@@ -553,6 +553,15 @@ class VarWhisperAttention(nn.Module):
                     # sin and cos are specific to RoPE models; cache_position needed for the static cache
                     cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
                     key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+                    attention_mask = kwargs.get("attention_mask")
+                    if (
+                            isinstance(past_key_value, StaticCache)
+                            and attention_mask is not None
+                            and attention_mask.dim() == 4
+                    ):
+                        valid_length = attention_mask.shape[-1]
+                        key_states = key_states[:, :, :valid_length, :]
+                        value_states = value_states[:, :, :valid_length, :]
 
             attn_outputs = attn_func(
                 query=query_states,
@@ -1502,7 +1511,7 @@ class VarWhisperForConditionalGeneration(WhisperGenerationMixin, VarWhisperPreTr
             decoder_attention_mask = self.get_decoder()._prepare_4d_causal_attention_mask_with_cache_position(
                 decoder_attention_mask,
                 sequence_length=sequence_length,
-                target_length=past_key_values.self_attention_cache.get_max_cache_shape(),
+                target_length=decoder_attention_mask.shape[-1],
                 dtype=self.proj_out.weight.dtype,
                 device=decoder_input_ids.device,
                 cache_position=cache_position,
