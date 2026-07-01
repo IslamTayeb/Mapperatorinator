@@ -237,6 +237,17 @@ Rejected active-prefix buffered input-id preallocation, DCC job `49162138` on `d
 
 The candidate preallocated the generated `input_ids` buffer inside the active-prefix custom decode loop to avoid per-token `torch.cat`. The multi-token direct-loop gate had already shown this can preserve token/logit/RNG semantics, but 15s profile evidence showed it regressed active512 main generation by `-2.7%` and remained `-28.0%` below the compile-only smoke baseline. Timing generation improved in this specific run (`4.4 -> 7.0 tok/s`), but the objective is main-generation throughput and the main path got worse. The code was reverted. See `notes/2026-07-01-active-prefix-buffered-input-ids.md`.
 
+Rejected naive TorchInductor cudagraph-tree disabling, DCC jobs `49162564`, `49162714`, and `49162877` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti:
+
+| run | main tokens | main model time | tok/s | timing model time | token equivalence | status |
+| --- | ---: | ---: | ---: | ---: | --- | --- |
+| compile-only baseline | `1,084` | `21.855s` | `49.600` | `34.243s` | baseline | baseline |
+| active512 default | `1,084` | `29.820s` | `36.352` | `39.420s` | PASS | baseline active-prefix candidate |
+| active512 global no-cudagraph-trees | `1,084` | `16.755s` | `64.696` | `73.607s` | PASS | rejected, timing regression |
+| active512 MAP-only no-cudagraph-trees | `1,084` | `63.546s` | `17.059` | `37.651s` | PASS | rejected |
+
+`torch._inductor.config.triton.cudagraph_trees=False` is diagnostic evidence, not an accepted optimization. Setting it globally from process start made active-prefix main generation exact and much faster on the 15s smoke (`+30.4%` vs compile-only main generation), but it more than doubled timing-context model time. A follow-up default-off scoped patch that limited active-prefix/no-cudagraph-trees to `MAP` preserved token equivalence and kept timing closer to baseline, but it catastrophically regressed main generation (`-64.5%`). The code was reverted. The useful conclusion is that active-prefix still needs deeper graph-state isolation, likely bucket-scoped compiled calls or a direct decode runtime, not a naive global or per-call cudagraph-tree switch. See `notes/2026-07-01-active-prefix-cudagraph-trees.md`.
+
 ## Smoke-To-Full Profiling Loop
 
 Start with the middle 15s SALVALAI smoke config for fastest iteration:
