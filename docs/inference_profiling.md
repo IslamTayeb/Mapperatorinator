@@ -212,6 +212,19 @@ Run dir: `/work/imt11/Mapperatorinator/runs/direct-loop-gate-49161597-cb874ee`.
 
 This is a testing-suite improvement, not an inference speed result. `utils/verify_direct_decode_loop.py` compares normal HF `generate()` against a candidate loop passed through `custom_generate`, so HF still constructs the final `logits_processor`, `stopping_criteria`, cache, and generation config for both paths. It resets CPU/CUDA RNG state before each path, captures raw logits before in-place processors, compares generated token IDs, compares per-step raw logits/top-k, and verifies final RNG state. Use it before 15s smoke for direct/custom decode loop changes, especially when touching buffering, active-prefix decode, sampling, or stopping behavior.
 
+Direct CUDA graph replay gate, DCC job `49165810` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti, commit `0602d32`:
+
+| gate | token match | RNG match | raw-logit steps | max_abs | graph replays | wall |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| compile false, direct active512 | PASS | PASS | 8 | `0.0` | n/a | `17.989s` |
+| compile true, direct active512 | PASS | PASS | 8 | `0.0` | n/a | `47.984s` |
+| compile false, graph active512 | PASS | PASS | 8 | `0.0` | `7` | `7.415s` |
+| compile true, graph active512 | PASS | PASS | 8 | `1.068e-4` | `7` | `18.623s` |
+
+Run dir: `/work/imt11/Mapperatorinator/runs/direct-graph-gate-49165810-0602d32`.
+
+This remains a verifier-only result. It proves that `utils/verify_direct_decode_loop.py --candidate-cuda-graph-forward` can replay a captured active-prefix bucket512 one-token forward across changing sampled tokens and `cache_position` while preserving generated-token identity, final RNG state, logits allclose, and top-k order for this 8-token gate. It does not prove inference throughput because the verifier still pays short-run setup, input preparation, tensor-copy, and reporting overhead. Before any speed claim, extend the graph gate to a longer direct-loop sample, then run 15s smoke token equivalence and untraced `profile_inference` throughput.
+
 Rejected active-prefix mask fast path, DCC jobs `49158276` and `49158365` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti:
 
 | run | main tokens | main model time | tok/s | token equivalence | status |

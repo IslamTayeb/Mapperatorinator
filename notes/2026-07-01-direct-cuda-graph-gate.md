@@ -1,0 +1,80 @@
+# Direct CUDA Graph Decode Gate
+
+## Summary
+
+Added and validated a verifier-only CUDA graph path inside `utils/verify_direct_decode_loop.py`. This is not an inference speed win and should not be reported as one. It is a correctness gate proving that a manual CUDA graph replay can advance through multiple sampled one-token decode steps under active-prefix bucket512 without changing generated tokens, raw-logit agreement, top-k order, or final RNG state.
+
+## Why This Matters
+
+The earlier fixed-step graph profile proved that one prepared decoder step could be captured and replayed, but that did not answer whether a graph-backed decode loop could handle changing generated tokens, changing `cache_position`, updated masks, sampling, logits processors, EOS checks, and RNG accounting.
+
+This gate is narrower than production inference, but it closes the next correctness question: copy the current prepared one-token inputs into static graph buffers, replay the captured model forward, then leave sampling and stopping outside the graph so HF generation semantics remain comparable.
+
+## Implementation
+
+Commit: `0602d32`
+
+New verifier flags:
+
+```bash
+python utils/verify_direct_decode_loop.py \
+  --candidate-active-prefix-decode \
+  --candidate-active-prefix-decode-bucket-size 512 \
+  --candidate-cuda-graph-forward \
+  --candidate-cuda-graph-warmup 3
+```
+
+The graph path:
+
+- Captures only the one-token model forward after the first candidate decode step prepares static-shape inputs.
+- Copies later prepared inputs into the captured static buffers before each replay.
+- Requires the active-prefix bucket length to stay fixed during the short gate.
+- Keeps logits processors, sampling, EOS handling, and RNG state checks outside the graph.
+- Records graph diagnostics in the JSON report.
+
+## DCC Validation
+
+- Job: `49165810`
+- Node/GPU: `dcc-core-ferc-s-z25-20`, RTX 2080 Ti allocation
+- Commit: `0602d32`
+- Config: `profile_salvalai_smoke15`, sequence index `9`, `max_new_tokens=8`, `seed=12345`, `attn_implementation=sdpa`, `use_server=false`, active-prefix bucket `512`
+- Run dir: `/work/imt11/Mapperatorinator/runs/direct-graph-gate-49165810-0602d32`
+- Logs: `/work/imt11/Mapperatorinator/logs/direct-graph-gate-49165810.out` and `.err`
+- Slurm state: `COMPLETED`, exit code `0:0`
+
+All four gates generated the same token IDs:
+
+```text
+[12, 1648, 2242, 2717, 3915, 4012, 4053, 32]
+```
+
+| Gate | Token match | RNG match | Logits allclose | Top-k match | Max abs | Graph capture | Graph replays | Wall |
+| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: |
+| direct active512, compile false | PASS | PASS | PASS | PASS | `0.0` | n/a | n/a | `17.989s` |
+| direct active512, compile true | PASS | PASS | PASS | PASS | `0.0` | n/a | n/a | `47.984s` |
+| graph active512, compile false | PASS | PASS | PASS | PASS | `0.0` | `0.0541s` | `7` | `7.415s` |
+| graph active512, compile true | PASS | PASS | PASS | PASS | `1.068e-4` | `0.0537s` | `7` | `18.623s` |
+
+The compile-enabled graph path had small fp32-level logit drift within the configured tolerance. Top-k ordering and generated tokens still matched.
+
+## Interpretation
+
+This is a useful direct-runtime correctness milestone. It shows the active-prefix graph idea is not immediately invalidated by token progression, cache-position updates, logits processors, or RNG accounting in the sampled direct-loop gate.
+
+It is not a throughput claim:
+
+- The gate is only 8 decode tokens.
+- It uses one sequence/window and does not cross active-prefix bucket changes.
+- The graph path still calls `prepare_inputs_for_generation()` and copies tensors into static buffers each step.
+- The wall time includes short-run verifier overhead, model setup, compile/setup effects, and report generation.
+- It has not run 15s smoke token equivalence or full-song non-regression.
+
+## Decision
+
+Keep the verifier infrastructure and use it before any production CUDA graph decode-loop attempt.
+
+Next useful checks:
+
+1. Increase the graph gate to a longer direct-loop sample, such as 64 tokens, to catch bucket changes, EOS/stopping edge cases, and longer RNG progression.
+2. If the longer gate passes, prototype an opt-in smoke-only direct graph loop that reports untraced `profile_inference` model time.
+3. Keep active-prefix default-off and do not claim speed until 15s smoke and then full-song SALVALAI runs pass token equivalence and no-regression gates.
