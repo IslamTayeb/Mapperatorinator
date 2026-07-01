@@ -337,6 +337,19 @@ RTX 2080 Ti smoke comparison on DCC `gpu-common`, node `dcc-core-ferc-s-z25-21`:
 
 `utils/summarize_inference_profile.py --compare` reported token equivalence FAIL: baseline generated `2,894` main-generation token IDs, candidate generated `1,633`, and the first mismatch was at token `0`. This is not an equivalent speed result. Do not use dynamic/default-cache generation for accepted same-calculation claims unless a future implementation proves fixed-seed token equivalence first.
 
+### Static generation compile config
+
+Attempted in commit `d6ce772` and reverted after smoke profiling. The change kept `inference_generation_compile=true` but forced `model.generation_config.compile_config = CompileConfig(dynamic=False, mode="reduce-overhead")`.
+
+RTX 2080 Ti smoke comparison on DCC `gpu-common`, node `dcc-core-ferc-s-z25-21`:
+
+| run | commit | job | profile | main tokens | main model time | tok/s |
+| --- | --- | --- | --- | ---: | ---: | ---: |
+| baseline | `3e9033c` | `49113275` | `/work/imt11/Mapperatorinator/runs/smoke-compile-49113275-3e9033c/beatmapa00e6b0a1f394a05a1bc95ab28a1dac4.osu.profile.json` | 2,894 | 41.190s | 70.3 |
+| candidate | `d6ce772` | `49116934` | `/work/imt11/Mapperatorinator/runs/smoke-compilecfg-49116934-d6ce772/beatmap9c4f9667e17a4de8a00b5e3a86400669.osu.profile.json` | 2,894 | 53.836s | 53.8 |
+
+`utils/summarize_inference_profile.py --compare` reported token equivalence PASS for all `2,894` generated main-generation token IDs, but throughput was `-23.5%` worse. Slurm stderr showed TorchDynamo hit its recompile limit in `modeling_mapperatorinator.py:139`; the last reason was a `decoder_input_ids` stride mismatch, expected `24` but actual `25`. This likely defeated the useful stable decode-loop compile behavior. Do not force `CompileConfig(dynamic=False)` for generation unless a future Transformers/PyTorch version fixes the recompile pattern and a fresh smoke run proves a win.
+
 ### `torch.inference_mode` generation wrapper
 
 Attempted in commit `02b2437` and reverted after full-song profiling. The change replaced `@torch.no_grad()` with `@torch.inference_mode()` around `model_generate` and `model_forward`.

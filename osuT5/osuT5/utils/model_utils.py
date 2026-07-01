@@ -6,7 +6,6 @@ from multiprocessing.managers import Namespace
 from pathlib import Path
 
 import torch
-from transformers.generation.configuration_utils import CompileConfig
 import numpy as np
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader, IterableDataset, default_collate
@@ -385,8 +384,6 @@ def load_model_loaders(
                 subfolder=ckpt_subfolder,
             )
             model.generation_config.disable_compile = not generation_compile
-            if generation_compile:
-                model.generation_config.compile_config = CompileConfig(dynamic=False, mode="reduce-overhead")
         else:
             model_state = torch.load(ckpt_path / "pytorch_model.bin", weights_only=True)
             model = _get_model(t5_args, tokenizer, dtype=dtype, attn_implementation=attn_implementation)
