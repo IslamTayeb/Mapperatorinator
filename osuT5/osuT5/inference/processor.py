@@ -156,6 +156,7 @@ class Processor(object):
         self.num_beams = args.num_beams
         self.parallel = args.parallel
         self.max_batch_size = args.max_batch_size
+        self.static_cache = args.inference_static_cache
 
         self.timeshift_bias = args.timeshift_bias
         self.types_first = args.train.data.types_first
@@ -178,6 +179,7 @@ class Processor(object):
             mania_column_temperature=self.mania_column_temperature,
             taiko_hit_temperature=self.taiko_hit_temperature,
             sync_model_timing=self.profiler.enabled and self.profiler.sync_cuda,
+            static_cache=self.static_cache,
         )
 
         if isinstance(self.model, InferenceClient):
@@ -1472,6 +1474,7 @@ class Processor(object):
             ),
             "precision": stats.get("precision", self.precision),
             "generation_compile_enabled": stats.get("generation_compile_enabled"),
+            "static_cache": stats.get("static_cache"),
             "use_server": isinstance(self.model, InferenceClient),
             "parallel": self.parallel,
         }
