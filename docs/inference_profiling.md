@@ -531,7 +531,13 @@ Package dry-runs on 2026-07-01 show that TensorRT work should use a separate iso
 
 Official docs describe Torch-TensorRT-RTX as experimental and installed via `torch-tensorrt-rtx`; the Python import remains `torch_tensorrt`, and NVIDIA's PyTorch walkthrough uses `torch.compile(..., backend="tensorrt")`. NVIDIA's TensorRT-RTX support matrix lists Turing/RTX 2080Ti compute capability `7.5` support, but its TensorRT-RTX 1.5 footnote says Turing does not support FP32 GEMMs in that release. Since the retained Mapperatorinator baseline is same-calculation FP32-style inference on RTX 2080 Ti, do not assume TensorRT-RTX accelerates the dominant decoder GEMMs without direct logits and token-equivalence evidence.
 
-The next TensorRT gate is environment and import validation, not an inference speed claim:
+Follow-up isolated TensorRT-RTX validation created `/hpc/group/romerolab/imt11/envs/mapperatorinator-trt-rtx` without modifying the retained env. GPU import passed in job `49138760` on `dcc-core-ferc-s-z25-21`: `torch==2.12.1+cu130`, `torch_tensorrt==2.12.1`, `tensorrt_rtx==1.4.0.76`, RTX 2080 Ti capability `(7, 5)`, driver `595.71.05`.
+
+That import success did not become a TensorRT optimization path. The first toy `torch.compile(..., backend="tensorrt")` smoke skipped lowering because the graph was below `min_block_size=5`. A stricter lowering smoke in job `49138769` tested a larger FP32 MLP and a tiny FP32 MLP with `min_block_size=1`; both produced correct outputs only after TensorRT conversion failed and the backend returned GraphModule/PyTorch fallback. Stderr included `MyelinCheckException: cudnn_graph_utils.h:405: CHECK(false) failed. cuDNN graph compilation failed`, `Unable to create TensorRT execution context`, and `Returning GraphModule forward instead`.
+
+Current status: Torch-TensorRT-RTX is importable in an isolated env on the 2080 Ti, but it is rejected as a current same-calculation FP32 acceleration path because true TensorRT lowering failed before Mapperatorinator model work. Do not proceed to one-token decoder export until a toy graph proves real engine creation. Future TensorRT tests must fail loudly on fallback, for example with `pass_through_build_failures=True` or equivalent stderr/module-type checks.
+
+The next TensorRT gate, if revisited with another package/CUDA/runtime combination, is engine validation before any inference speed claim:
 
 1. Build an isolated DCC env such as `/hpc/group/romerolab/imt11/envs/mapperatorinator-trt`.
 2. Run a Slurm GPU import/compile smoke on RTX 2080 Ti that prints driver, CUDA, PyTorch, `torch_tensorrt`, and TensorRT versions.
