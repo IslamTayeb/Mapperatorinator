@@ -6,6 +6,8 @@ Added `utils/profile_inference_suite.py` to measure same-process inference behav
 
 The first use case is `warm_repeat`: load the model once, run the same config multiple times, reset RNG before each run, write one profile JSON per run, and write a `suite_manifest.json` that separates first-run cold/specialization cost from warmed subsequent runs.
 
+The second use case is `serial_multi_song`: load the model once, run an explicit song list in one process, reset RNG before each song/repeat, and compare token identity per song rather than across different songs.
+
 ## Why
 
 Active-prefix validation showed strong order and warm-state sensitivity. That means a candidate can be unattractive as a cold single-song baseline but still matter for future long-lived batch or multi-song serving. The old single-profile schema did not make that distinction explicit enough.
@@ -16,9 +18,9 @@ Active-prefix validation showed strong order and warm-state sensitivity. That me
 - Requires `profile_record_token_ids=true`.
 - Requires `use_server=false` until server reseeding is explicit.
 - Resets RNG before each run with `accelerate.set_seed`.
-- Labels suite metadata with `suite_id`, `run_kind`, `suite_run_index`, `run_index`, `song_index`, `suite_repeat_count`, `rng_reset_policy`, and `warmup_excluded`.
-- Reports token equivalence against run 0 in the suite manifest.
-- Fails loudly for `serial_multi_song` until the harness accepts an explicit multi-song config/list.
+- Labels suite metadata with `suite_id`, `run_kind`, `suite_run_index`, `run_index`, `repeat_index`, `song_index`, `song_id`, `suite_song_count`, `suite_repeat_count`, `rng_reset_policy`, and `warmup_excluded`.
+- Reports token equivalence against run 0 for `warm_repeat` and against each song's first repeat for `serial_multi_song`.
+- Requires `--song-list` for `serial_multi_song`; the default gate expects at least 5 songs, with `--allow-short-suite` reserved for harness smoke tests.
 
 ## Non-Claim
 
@@ -76,3 +78,16 @@ Cross-suite token equivalence also passed for compile-only vs active512 on all t
 | 2 warmed | 101.046 | 148.777 | +47.2% | PASS, 1,084 / 1,084 |
 
 Interpretation: active-prefix bucket512 remains a bad cold smoke default, but it is a strong exact warmed-repeat signal. This supports keeping the path default-off while prioritizing first-window/specialization and graph/runtime-stability work. It also justifies a full-song `warm_repeat` run if future batch or long-lived serving throughput becomes the active question.
+
+## Full-Song Result
+
+DCC job `49154643` validated the same warm-repeat question on the full SALVALAI profile on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti, driver `595.71.05`, torch `2.10.0+cu128`, Transformers `4.57.3`, commit `b394a9d`.
+
+- Run dir: `/work/imt11/Mapperatorinator/runs/warm-repeat-full-49154643-b394a9d`
+- Logs: `/work/imt11/Mapperatorinator/logs/warm-suite-full-49154643.out` and `.err`
+- Status: `COMPLETED`, exit code `0:0`, elapsed `00:10:48`
+- Compile-only warmed aggregate: `15,278` tokens, `165.692s`, `92.207 tok/s`
+- Active512 warmed aggregate: `15,278` tokens, `118.816s`, `128.585 tok/s`
+- Paired cross-suite token equivalence: PASS for runs 0, 1, and 2 (`7,639 / 7,639` main tokens each)
+
+Decision: this clears the threshold for more default-off active-prefix runtime-discipline work for warm-repeat/future batch-serving. It does not replace the retained cold single-song baseline because the active suite ran after a compile suite in the same Slurm job context, and previous cold-first active-prefix validation remained order-sensitive.

@@ -108,7 +108,36 @@ python utils/profile_inference_suite.py \
   inference_active_prefix_decode_bucket_size=512
 ```
 
-The harness loads the model once, resets RNG before every `generate()` call, writes one profile JSON per run, and writes `suite_manifest.json` with first-run, warmed-run, aggregate throughput, profile paths, and token-equivalence status against run 0. It currently supports only `warm_repeat`; `serial_multi_song` fails loudly until an explicit multi-song config/list exists. Its warmed results are useful operational evidence, but they are not cold single-song acceptance evidence.
+For 5+ song operational scouting, use `serial_multi_song` with an explicit song list:
+
+```bash
+python utils/profile_inference_suite.py \
+  --config-name profile_salvalai \
+  --repeats 2 \
+  --run-kind serial_multi_song \
+  --song-list "$RUN_DIR/songs.yaml" \
+  --output-root "$RUN_DIR" \
+  inference_active_prefix_decode_loop=true \
+  inference_active_prefix_decode_bucket_size=512
+```
+
+`serial_multi_song` requires at least 5 songs by default because 5+ songs is the expected operational workload. Use `--allow-short-suite` only for harness smoke tests that are not performance evidence.
+
+The song list can be YAML/JSON with a top-level `songs` list, or a plain text file with one audio path per line. YAML/JSON entries can be strings or mappings. Mapping entries support per-song `song_id`/`id`, `audio_path`, `beatmap_path`, `seed`, `start_time`, `end_time`, and `output_subdir`:
+
+```yaml
+songs:
+  - song_id: salvalai
+    audio_path: /work/imt11/Mapperatorinator/data/salvalai.mp3
+  - song_id: second-song
+    audio_path: /work/imt11/Mapperatorinator/data/second.mp3
+    beatmap_path: /work/imt11/Mapperatorinator/data/second.osu
+    seed: 12345
+    start_time: null
+    end_time: null
+```
+
+The harness loads the model once, resets RNG before every `generate()` call, writes one profile JSON per run, and writes `suite_manifest.json` with first-run, warmed-run, aggregate throughput, per-song throughput, profile paths, token hashes, and token-equivalence status. `warm_repeat` compares token IDs against run 0. `serial_multi_song` compares token IDs against each song's first repeat, so every song has its own equivalence baseline. Its warmed and multi-song results are useful operational evidence, but they are not cold single-song acceptance evidence.
 
 First smoke result, DCC job `49154124` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti, commit `d20f26a`:
 
@@ -118,6 +147,15 @@ First smoke result, DCC job `49154124` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti,
 | active512 | `36.107 tok/s` | `148.298 tok/s` aggregate | PASS vs compile-only for runs 0, 1, and 2 | exact warmed-repeat win, cold regression |
 
 Run dir: `/work/imt11/Mapperatorinator/runs/warm-repeat-smoke15-49154124-d20f26a`. This is `warm_repeat` evidence only. It strengthens the case for fixing active-prefix first-window/specialization cost and for future batch/serving work, but it does not replace the cold single-song baseline.
+
+Full-song warm-repeat validation, DCC job `49154643` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti, driver `595.71.05`, torch `2.10.0+cu128`, Transformers `4.57.3`, commit `b394a9d`:
+
+| suite | run 0 | warmed runs | cross-suite equivalence | interpretation |
+| --- | ---: | ---: | --- | --- |
+| compile-only | `84.335 tok/s` | `92.207 tok/s` aggregate | baseline | retained path warms to roughly the accepted cold baseline |
+| active512 | `95.698 tok/s` | `128.585 tok/s` aggregate | PASS vs compile-only for runs 0, 1, and 2 | exact warmed full-song win, still warm/batch evidence only |
+
+Run dir: `/work/imt11/Mapperatorinator/runs/warm-repeat-full-49154643-b394a9d`. Active512 improved warmed full-song main generation by `+39.5%` over warmed compile-only (`128.585` vs `92.207 tok/s`) with `7,639 / 7,639` generated main tokens matching on each paired run. The same job also showed active512 run 0 at `95.698 tok/s`, but this is not a cold single-song baseline replacement because the active suite ran after a compile suite in the same process/job context and earlier cold-first active-prefix validation remained order-sensitive. Keep active-prefix default-off and use this only as `warm_repeat`/future batch-serving evidence.
 
 ## Smoke-To-Full Profiling Loop
 
