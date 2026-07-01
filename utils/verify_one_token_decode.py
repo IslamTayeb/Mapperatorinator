@@ -28,6 +28,11 @@ from inference import (
 )
 from osuT5.osuT5.inference import Postprocessor, Preprocessor, Processor
 from osuT5.osuT5.inference.cache_utils import get_cache
+from osuT5.osuT5.inference.direct_decode import (
+    decode_one_token_raw_logits,
+    last_token_logits as _last_token_logits,
+    prefill_static_cache,
+)
 from osuT5.osuT5.inference.server import build_logits_processor_list, get_eos_token_id
 from osuT5.osuT5.runtime_profiling import generation_profile_context
 from osuT5.osuT5.tokenizer import ContextType
@@ -180,10 +185,6 @@ def _build_probe_inputs(
         "decoder_attention_mask": prompt.ne(tokenizer.pad_id),
         **model_kwargs,
     }
-
-
-def _last_token_logits(logits: torch.Tensor) -> torch.Tensor:
-    return logits[:, -1, :].detach().to(torch.float32)
 
 
 def _compare_logits(
@@ -411,31 +412,22 @@ def run_one_token_gate(
         )
         no_cache_reference_logits = _last_token_logits(reference_outputs.logits)
 
-        cache = get_cache(model, batch_size=1, num_beams=1, cfg_scale=1.0)
-        prefill_cache_position = torch.arange(prompt_len, device=prompt.device)
-        prefill_prepared = model.prepare_inputs_for_generation(
-            prompt,
-            past_key_values=cache,
-            use_cache=True,
-            decoder_attention_mask=prompt_mask,
-            cache_position=prefill_cache_position,
+        decode_state = prefill_static_cache(
+            model,
+            prompt=prompt,
+            prompt_attention_mask=prompt_mask,
             frames=model_inputs["frames"],
-            **condition_kwargs,
+            condition_kwargs=condition_kwargs,
         )
-        prefill_outputs = model(**prefill_prepared)
-        encoder_outputs = BaseModelOutput(last_hidden_state=prefill_outputs.encoder_last_hidden_state)
-        decode_cache_position = torch.arange(prompt_len, prompt_len + 1, device=prompt.device)
-        candidate_inputs = model.prepare_inputs_for_generation(
-            full_prefix,
-            past_key_values=cache,
-            use_cache=True,
-            encoder_outputs=encoder_outputs,
-            decoder_attention_mask=full_mask,
-            cache_position=decode_cache_position,
-            **condition_kwargs,
+        candidate_result = decode_one_token_raw_logits(
+            model,
+            decode_state,
+            full_prefix=full_prefix,
+            full_attention_mask=full_mask,
+            condition_kwargs=condition_kwargs,
         )
-        candidate_outputs = model(**candidate_inputs)
-        candidate_logits = _last_token_logits(candidate_outputs.logits)
+        candidate_inputs = candidate_result.prepared_inputs
+        candidate_logits = candidate_result.logits
 
     comparison = _compare_logits(hf_reference_logits, candidate_logits, atol=atol, rtol=rtol, top_k=top_k)
     output_logits_comparison = _compare_logits(
@@ -455,8 +447,8 @@ def run_one_token_gate(
         "probe_token_id": int(probe_token.item()),
         "prompt_tokens": prompt_len,
         "prompt_nonpad_tokens": int(prompt_mask.to(torch.long).sum().item()),
-        "prefill_cache_position": [int(item) for item in prefill_cache_position.tolist()],
-        "decode_cache_position": [int(item) for item in decode_cache_position.tolist()],
+        "prefill_cache_position": [int(item) for item in decode_state.prefill_cache_position.tolist()],
+        "decode_cache_position": [int(item) for item in candidate_result.cache_position.tolist()],
         "hf_generated_sequence_shape": list(hf_generate_outputs.sequences.shape),
         "hf_generate_logits_steps": len(hf_logits),
         "hf_captured_raw_logit_steps": len(hf_raw_logit_captures),
@@ -464,6 +456,7 @@ def run_one_token_gate(
         "hf_logit_shape_step1": list(hf_raw_logit_captures[1].shape),
         "prepared_prompt_shape": list(prompt_prepared["decoder_input_ids"].shape),
         "prepared_reference_shape": list(reference_prepared["decoder_input_ids"].shape),
+        "prepared_prefill_shape": list(decode_state.prefill_prepared_inputs["decoder_input_ids"].shape),
         "prepared_candidate_shape": list(candidate_inputs["decoder_input_ids"].shape),
         "finite_allclose": comparison["finite_allclose"],
         "nonfinite_match": comparison["nonfinite_match"],
