@@ -73,7 +73,7 @@ The dominant bottleneck is autoregressive map generation. The first map window w
 
 ## Same-Calculation Optimization Goal
 
-The current RTX 2080/2080 Ti baseline is roughly `65-78 tok/s` for main-generation throughput. Use these targets:
+The current RTX 2080/2080 Ti baseline after the accepted generation-compile win is roughly `92 tok/s` for full-song main-generation throughput. Use these targets:
 
 - Starter success target: `100 tok/s` on a full-song run.
 - Strong first milestone: `120 tok/s`.
@@ -107,7 +107,7 @@ python utils/summarize_inference_profile.py \
   --compare /path/to/baseline.profile.json /path/to/candidate.profile.json
 ```
 
-Promote a change to a full-song SALVALAI run only when smoke results are stable, token IDs match, and the speedup is plausibly meaningful. Keep changes that improve RTX 2080 full-song main-generation throughput by about 10% or more. Keep 5-10% wins only when they are simple and well-contained. Remove 1-3% complexity by default.
+Promote a change to a full-song SALVALAI run only when smoke results are stable, token IDs match, and the speedup is plausibly meaningful. For compile-like changes with one-time first-window costs, inspect post-warmup per-window throughput before rejecting a weak total smoke result. Keep changes that improve RTX 2080 full-song main-generation throughput by about 10% or more. Keep 5-10% wins only when they are simple and well-contained. Remove 1-3% complexity by default.
 
 Stop the long-running optimization loop when either the full-song RTX 2080 run reaches at least `100 tok/s` with identical fixed-seed tokens, or profiling across multiple exact-calculation optimization families shows no remaining plausible `>=10%` improvement.
 
@@ -265,6 +265,23 @@ Observed A5000 SALVALAI ablation on 2026-06-30 with `precision=fp16`, `seed=1234
 | `flash_attention_2` | 187.007s | 8,554 | 45.9 | 31.656s | 26.2 |
 
 FlashAttention 2 did not improve this single-song profile. It generated more map tokens despite the same seed, so raw wall time is partly output-length-dependent, but normalized map throughput was still lower than SDPA.
+
+## Accepted Exact-Calculation Optimizations
+
+### Transformers generation compile
+
+Accepted in commit `3e9033c` after smoke and full-song profiling. The change adds `inference_generation_compile`, which leaves the global default disabled but allows profiling/long inference runs to opt into the Transformers generation compile path by setting `model.generation_config.disable_compile = False`.
+
+RTX 2080 Ti full-song comparison on DCC `gpu-common`, node `dcc-core-ferc-s-z25-21`:
+
+| run | commit | job | profile | main tokens | main model time | tok/s |
+| --- | --- | --- | --- | ---: | ---: | ---: |
+| baseline | `3e9033c` | `49113712` | `/work/imt11/Mapperatorinator/runs/full-base-49113712-3e9033c/beatmap9024531ea69844218e3c15e53ad2972c.osu.profile.json` | 7,639 | 121.410s | 62.9 |
+| candidate | `3e9033c` | `49113713` | `/work/imt11/Mapperatorinator/runs/full-compile-49113713-3e9033c/beatmapcfb70d0020da473c90f6c1acb32d6bbf.osu.profile.json` | 7,639 | 82.615s | 92.5 |
+
+`utils/summarize_inference_profile.py --compare` reported token equivalence PASS for all `7,639` generated main-generation token IDs. Throughput improved by `+47.0%`; synchronized model time dropped by `38.795s` (`-32.0%`). Smoke profiling was only `+1.3%` overall because the first compiled main-generation window paid a one-time compile cost, but post-warmup smoke windows ran around `94-96 tok/s` compared with `68-69 tok/s` baseline. This win should carry to future Mapperatorinator-like autoregressive encoder-decoder cores because it improves the repeated single-token decode loop rather than beatmap-specific output logic.
+
+Keep `inference_generation_compile=true` for full-song profiling baselines. For very short one-off inference, the global default remains `false` so callers can choose whether the compile warmup cost is worthwhile.
 
 ## Rejected Exact-Calculation Experiments
 
