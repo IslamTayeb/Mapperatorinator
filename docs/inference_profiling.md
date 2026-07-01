@@ -194,6 +194,16 @@ Rejected active-prefix mask fast path, DCC jobs `49158276` and `49158365` on `dc
 
 The candidate moved active-prefix decode input preparation under the active-prefix context and capped static-cache mask construction to bucket length. One-token logits gates passed for compile disabled and enabled (`seq9`, active-prefix decode length `512`), and the 15s smoke matched all `1,084 / 1,084` generated main-token IDs. It still regressed cold main generation by `-26.8%`: the first long map window worsened (`seq3 16.259s -> 26.186s`) despite faster post-warm windows (`seq9 103.007 -> 150.046 tok/s`). The patch was reverted. See `notes/2026-07-01-active-prefix-mask-fastpath.md`.
 
+Rejected simple measured active-prefix primer, DCC job `49159121` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti:
+
+| run | main tokens | main model time | tok/s | token equivalence | status |
+| --- | ---: | ---: | ---: | --- | --- |
+| cold compile-only | `1,084` | `22.599s` | `47.967` | baseline | baseline |
+| active512 | `1,084` | `30.266s` | `35.816` | PASS | baseline active-prefix candidate |
+| active512 + measured primer | `1,084` | `31.477s` | `34.438` | PASS | rejected |
+
+The primer used a scratch cache, fresh logits processors, and an RNG fork. It moved work out of the first long active-prefix map window (`seq3 25.909s -> 14.923s`) but paid setup in earlier records (`seq0=11.705s`) and regressed the active512 aggregate by `-3.8%`. The code was reverted. This supports the graph/capture/specialization diagnosis but shows that naive throwaway-generate priming is not enough; future priming needs better bucket/shape coverage and explicit profile schema support. See `notes/2026-07-01-active-prefix-primer.md`.
+
 ## Smoke-To-Full Profiling Loop
 
 Start with the middle 15s SALVALAI smoke config for fastest iteration:
