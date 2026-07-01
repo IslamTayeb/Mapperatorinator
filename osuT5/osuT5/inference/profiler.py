@@ -40,6 +40,7 @@ class InferenceProfiler:
         self.stages: list[dict[str, Any]] = []
         self.generation: list[dict[str, Any]] = []
         self.torch_profiles: list[dict[str, Any]] = []
+        self._pending_torch_generation_traces: list[dict[str, Any]] = []
         self._torch_generation_count = 0
 
     @classmethod
@@ -87,6 +88,11 @@ class InferenceProfiler:
             return
         self._add_cuda_memory(record)
         self.generation.append(self._to_jsonable(record))
+
+    def pop_torch_generation_trace(self) -> dict[str, Any] | None:
+        if not self._pending_torch_generation_traces:
+            return None
+        return self._pending_torch_generation_traces.pop(0)
 
     @contextmanager
     def torch_generation_trace(self, name: str, **metadata: Any) -> Iterator[None]:
@@ -141,7 +147,9 @@ class InferenceProfiler:
                 prof.export_chrome_trace(str(trace_path))
                 record["events"] = self._torch_profile_events(prof)
             self._add_cuda_memory(record)
-            self.torch_profiles.append(self._to_jsonable(record))
+            record = self._to_jsonable(record)
+            self.torch_profiles.append(record)
+            self._pending_torch_generation_traces.append(record)
 
     def sync(self) -> None:
         if self.enabled:

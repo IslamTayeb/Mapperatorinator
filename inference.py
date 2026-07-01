@@ -1,9 +1,11 @@
 import logging
 import multiprocessing
+import os
+import socket
+import subprocess
 import sys
 
 import utils.excepthook  # noqa
-import os.path
 import uuid
 from functools import reduce
 from pathlib import Path
@@ -45,6 +47,43 @@ def get_default_logger():
     logger.addHandler(handler)
     logger.propagate = False
     return logger
+
+
+def get_profile_runtime_metadata() -> dict:
+    metadata = {
+        "hostname": socket.gethostname(),
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+        "slurm_job_partition": os.environ.get("SLURM_JOB_PARTITION"),
+        "torch_version": torch.__version__,
+        "torch_cuda_version": torch.version.cuda,
+        "cuda_available": torch.cuda.is_available(),
+        "hf_home": os.environ.get("HF_HOME"),
+        "transformers_cache": os.environ.get("TRANSFORMERS_CACHE"),
+        "xdg_cache_home": os.environ.get("XDG_CACHE_HOME"),
+        "tmpdir": os.environ.get("TMPDIR"),
+    }
+    if torch.cuda.is_available():
+        metadata["cuda_device_name"] = torch.cuda.get_device_name()
+        metadata["cuda_device_capability"] = list(torch.cuda.get_device_capability())
+
+    repo_root = Path(__file__).resolve().parent
+    for key, command in {
+        "git_commit": ["git", "rev-parse", "HEAD"],
+        "git_branch": ["git", "branch", "--show-current"],
+    }.items():
+        try:
+            result = subprocess.run(
+                command,
+                cwd=repo_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except Exception:
+            continue
+        metadata[key] = result.stdout.strip()
+
+    return metadata
 
 
 def assert_package_version(package_name: str, required_version: str):
@@ -433,21 +472,27 @@ def generate(
     output_path = args.output_path if output_path is None else output_path
     logger = get_default_logger() if logger is None else logger.getChild(__name__)
     profiler = profiler or InferenceProfiler.from_args(args)
-    profiler.set_metadata(
-        audio_path=audio_path,
-        beatmap_path=beatmap_path,
-        output_path=output_path,
-        model_path=args.model_path,
-        device=args.device,
-        precision=args.precision,
-        attn_implementation=args.attn_implementation,
-        use_server=args.use_server,
-        parallel=args.parallel,
-        max_batch_size=args.max_batch_size,
-        profile_record_token_ids=args.profile_record_token_ids,
-        in_context=[context.value for context in args.in_context],
-        output_type=[context.value for context in args.output_type],
-    )
+    profile_metadata = {
+        "audio_path": audio_path,
+        "beatmap_path": beatmap_path,
+        "output_path": output_path,
+        "model_path": args.model_path,
+        "device": args.device,
+        "precision": args.precision,
+        "attn_implementation": args.attn_implementation,
+        "use_server": args.use_server,
+        "parallel": args.parallel,
+        "max_batch_size": args.max_batch_size,
+        "profile_record_token_ids": args.profile_record_token_ids,
+        "profile_sync_cuda": args.profile_sync_cuda,
+        "profile_torch_generation": args.profile_torch_generation,
+        "seed": args.seed,
+        "in_context": [context.value for context in args.in_context],
+        "output_type": [context.value for context in args.output_type],
+    }
+    if profiler.enabled:
+        profile_metadata.update(get_profile_runtime_metadata())
+    profiler.set_metadata(**profile_metadata)
 
     # Do some validation
     with profiler.stage("validate_inputs"):

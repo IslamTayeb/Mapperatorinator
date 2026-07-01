@@ -87,6 +87,11 @@ def get_eos_token_id(tokenizer, lookback_time: float = 0, lookahead_time: float 
     return eos_token_id
 
 
+def _sync_cuda_for_model(model) -> None:
+    if torch.cuda.is_available() and getattr(getattr(model, "device", None), "type", None) == "cuda":
+        torch.cuda.synchronize(model.device)
+
+
 @torch.no_grad()
 def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     # To device
@@ -106,6 +111,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     lookback_time = generate_kwargs.pop('lookback_time', 0.0)
     lookahead_time = generate_kwargs.pop('lookahead_time', 0.0)
     context_type = generate_kwargs.pop('context_type', None)
+    sync_model_timing = bool(generate_kwargs.pop('sync_model_timing', False))
     if context_type is not None:
         context_type = ContextType(context_type)  # Convert to ContextType enum
 
@@ -146,6 +152,8 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
 
     # Perform batched generation
     with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16, enabled=precision == 'amp'):
+        if sync_model_timing:
+            _sync_cuda_for_model(model)
         start_time = time.perf_counter()
         result = model.generate(
             **model_kwargs,
@@ -155,6 +163,8 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
             logits_processor=logits_processor_list,
             eos_token_id=get_eos_token_id(tokenizer, lookback_time=lookback_time, lookahead_time=lookahead_time, context_type=context_type),
         )
+        if sync_model_timing:
+            _sync_cuda_for_model(model)
         elapsed_seconds = time.perf_counter() - start_time
 
     result = result.cpu()
@@ -165,6 +175,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         "num_beams": int(generate_kwargs.get("num_beams", 1)),
         "cfg_scale": float(cfg_scale),
         "do_sample": bool(generate_kwargs.get("do_sample", False)),
+        "sync_model_timing": sync_model_timing,
     })
 
     return result, stats

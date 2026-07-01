@@ -177,6 +177,7 @@ class Processor(object):
             timing_temperature=self.timing_temperature,
             mania_column_temperature=self.mania_column_temperature,
             taiko_hit_temperature=self.taiko_hit_temperature,
+            sync_model_timing=self.profiler.enabled and self.profiler.sync_cuda,
         )
 
         if isinstance(self.model, InferenceClient):
@@ -1473,6 +1474,16 @@ class Processor(object):
             "use_server": isinstance(self.model, InferenceClient),
             "parallel": self.parallel,
         }
+        torch_trace = self.profiler.pop_torch_generation_trace()
+        if torch_trace is None:
+            record["torch_profiled"] = False
+        else:
+            record.update({
+                "torch_profiled": True,
+                "torch_trace_index": torch_trace.get("trace_index"),
+                "torch_trace_path": torch_trace.get("trace_path"),
+                "torch_trace_wall_seconds": torch_trace.get("wall_seconds"),
+            })
         record.update(metadata)
         self.profiler.record_generation(**record)
 

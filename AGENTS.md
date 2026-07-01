@@ -12,6 +12,8 @@
 - Prioritize optimizations that improve the inference engine in general: generation loop overhead, cache behavior, batching/windowing, model-call structure, memory movement, and profiling clarity. Treat backend-specific work as secondary unless profiling shows it is the actual bottleneck.
 - Use explicit `attn_implementation=sdpa` as the current inference/profiling baseline on DCC. Do not frame SDPA as a permanent commitment; revisit FA2 or other backends only if broader inference-engine profiling indicates a likely win.
 - Preserve server and non-server inference paths when changing profiling code; both should retain prompt, output, generated-token, and elapsed-time stats.
+- Full-song accepted profiling runs should pin the seed and record generated token IDs, not only smoke runs.
+- Treat `torch_profiled=true` generation windows as diagnostic traces only; use synchronized `model_elapsed_seconds` from untraced profile records for throughput claims.
 - Keep profiling run instructions and schema notes in `docs/inference_profiling.md` when the workflow changes.
 - DCC source paths: repo at `/hpc/group/romerolab/imt11/projects/Mapperatorinator`, env at `/hpc/group/romerolab/imt11/envs/mapperatorinator`, and active data/cache/runs/logs under `/work/imt11/Mapperatorinator`.
 - Run expensive DCC work through Slurm only. Use login nodes for git, file inspection, and job submission; capture Slurm stdout/stderr under `/work/imt11/Mapperatorinator/logs` and report job id, GPU node/type, profile paths, and `sacct` status.
