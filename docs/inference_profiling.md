@@ -166,6 +166,25 @@ Order-flipped full-song warm-repeat validation, DCC job `49155778` on `dcc-core-
 
 Run dir: `/work/imt11/Mapperatorinator/runs/warm-repeat-active-first-49155778-19e74a9`. This repeated the full-song test with active512 first and separate TorchInductor/CUDA caches for each suite. Active512 improved warmed main generation by `+39.2%` (`128.026` vs `91.982 tok/s`), improved warmed timing generation (`98.324` vs `73.690 tok/s`), and reduced paired main/timing stage wall time on every run. Generated main-token IDs matched compile-only for all three paired runs (`7,639 / 7,639`). This strengthens active-prefix as a warm-repeat, long-lived process, and future batch-serving candidate, but it still does not replace the cold single-song baseline.
 
+Targeted cold-overhead attribution, DCC jobs `49156700`, `49156749`, and `49157290` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti, commit `daa1828`:
+
+| run | main tok/s | seq0 | seq1+ | token equivalence | interpretation |
+| --- | ---: | ---: | ---: | --- | --- |
+| cold compile-only | `84.608` | `16.413s`, `35.703 tok/s` | `95.473 tok/s` | baseline | retained path in this matrix was slower than clean baseline |
+| cold active512 | `96.247` | `25.531s`, `22.953 tok/s` | `131.003 tok/s` | PASS vs cold compile | cold tax is front-loaded |
+| warm active512 run 1 | `127.877` | `3.809s`, `153.829 tok/s` | `126.109 tok/s` | PASS vs run 0 and cold compile | warmed first window is fixed |
+| warm active512 run 2 | `126.610` | `3.871s`, `151.393 tok/s` | `124.911 tok/s` | PASS vs run 0 and cold compile | warmed signal repeats |
+
+Run dirs:
+
+- Full-song matrix: `/work/imt11/Mapperatorinator/runs/active-prefix-cold-matrix-49156700-daa1828`
+- Torch logs, Nsight, and torch-profiler diagnostics: `/work/imt11/Mapperatorinator/runs/active-prefix-diagnostics-49156749-daa1828`
+- Nsight post-processing: `/work/imt11/Mapperatorinator/runs/active-prefix-diagnostics-49156749-daa1828/nsys_active512_smoke15`
+
+Conclusion: active-prefix is weak or unstable cold because the first long generation window pays extra graph/capture/specialization cost. It is not weak in steady state: the same cold active512 run is already `131.003 tok/s` after `seq0`, and warmed repeats reduce `seq0` from about `25-26s` to about `3.8s`. Torch logs support this attribution: diagnostic job `49156749` recorded `244` recompilation lines, `3,441` graph-recording lines, `8,665` CUDA graph/cudagraph log matches, and a `cache_utils.py:update` `recompile_limit` warning keyed on `layer_idx`. The focused post-warmup torch-profiler trace is diagnostic only; it still showed graph/runtime overhead alongside kernels (`20,504` TorchDynamo cache lookups, `16,310` `cudaGraphLaunch` calls, `131` `CUDAGraphNode.record` events, and `5,628` FMHA kernels with `1.063s` self CUDA). Nsight Systems exported `ap512.nsys-rep` and `ap512.sqlite`, but the smoke15 trace generated only one token for early map windows and had heavy diagnostic overhead, so use it for qualitative NVTX availability rather than throughput or full-song seq0 timing.
+
+Next implementation target: graph/runtime stabilization for active-prefix bucket512. Good candidates are explicit graph/cache priming with setup cost honestly included, reducing cache-update specialization by decoder layer, or a bufferized/direct decode loop that avoids repeated HF compiled graph variants. Do not hide prewarm cost outside cold single-song timing; cold claims must include setup/timing/main/total non-regression. For warm-repeat or future batch serving, report first-song cold cost and warmed amortized throughput separately.
+
 ## Smoke-To-Full Profiling Loop
 
 Start with the middle 15s SALVALAI smoke config for fastest iteration:

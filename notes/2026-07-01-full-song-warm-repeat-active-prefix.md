@@ -75,3 +75,33 @@ Warmed aggregate:
 Active512 warmed full-song main generation was `+39.2%` over warmed compile-only with exact paired generated-token equivalence. Timing generation also improved (`98.324` vs `73.690 tok/s` warmed), and generated-stage wall time was lower on every paired run.
 
 Decision: active-prefix remains default-off for cold single-song profiling, but the warm-repeat signal is now robust enough to prioritize it for future batch/multi-song and long-lived-process runtime work.
+
+## Cold-Overhead Attribution
+
+Jobs `49156700`, `49156749`, and `49157290` were a targeted profiling pass at commit `daa1828` to explain why active-prefix is strong warmed but weak/order-sensitive cold.
+
+- Full-song untraced matrix: `/work/imt11/Mapperatorinator/runs/active-prefix-cold-matrix-49156700-daa1828`
+- Diagnostics: `/work/imt11/Mapperatorinator/runs/active-prefix-diagnostics-49156749-daa1828`
+- Nsight report: `/work/imt11/Mapperatorinator/runs/active-prefix-diagnostics-49156749-daa1828/nsys_active512_smoke15/ap512.nsys-rep`
+- Nsight SQLite export: `/work/imt11/Mapperatorinator/runs/active-prefix-diagnostics-49156749-daa1828/nsys_active512_smoke15/ap512.sqlite`
+
+Main result:
+
+| run | total tok/s | seq0 | seq1+ tok/s | timing tok/s | equivalence |
+| --- | ---: | ---: | ---: | ---: | --- |
+| cold compile-only | 84.608 | 16.413s, 35.703 tok/s | 95.473 | 19.425 | baseline |
+| cold active512 | 96.247 | 25.531s, 22.953 tok/s | 131.003 | 20.862 | PASS vs cold compile |
+| warm active512 run 0 | 95.002 | 26.434s, 22.168 tok/s | 130.672 | 20.771 | baseline |
+| warm active512 run 1 | 127.877 | 3.809s, 153.829 tok/s | 126.109 | 98.275 | PASS |
+| warm active512 run 2 | 126.610 | 3.871s, 151.393 tok/s | 124.911 | 97.655 | PASS |
+
+Interpretation: the active-prefix cold problem is almost entirely the first long window. Once the graphs/cache state are established, active512 is already much faster than compile-only. The cold active512 run is `131.003 tok/s` after `seq0`; warmed repeats make `seq0` itself fast.
+
+Torch diagnostic evidence supports graph/runtime churn rather than sampling or kernel fusion as the next target:
+
+- `TORCH_LOGS=recompiles,perf_hints,cudagraphs` produced `244` recompile-line matches, `3,441` graph-recording lines, and `8,665` CUDA graph/cudagraph log matches across the diagnostic smoke runs.
+- The logs show `transformers/cache_utils.py:update` recompiling by `layer_idx` and hitting `torch._dynamo` `recompile_limit`.
+- The focused `main_generation.seq9` torch-profiler run is diagnostic only; it inflated the traced range to `71.170s` wall. Its event mix still showed `20,504` TorchDynamo cache lookups, `16,310` `cudaGraphLaunch` calls, `131` `CUDAGraphNode.record` events, and `5,628` FMHA kernels with `1.063s` self CUDA.
+- Nsight Systems was available only inside the allocation. It wrote `ap512.nsys-rep` and `ap512.sqlite`. The smoke15 Nsight run generated one-token early map windows, so it is useful for validating NVTX capture but not for full-song `seq0` timing.
+
+Decision: do not start kernel work yet. The next implementation should target graph stabilization or explicit active-prefix graph/cache priming, with all setup cost included for cold single-song claims. For future batch or long-lived serving, report cold first-song cost and warmed amortized throughput separately.
