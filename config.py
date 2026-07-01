@@ -91,6 +91,7 @@ class InferenceConfig:
     profile_nvtx_generation_ranges: bool = False  # Add top-level NVTX ranges for generation windows without torch.profiler
     profile_record_token_ids: bool = False  # Record generated token IDs in profile JSON for fixed-seed equivalence checks
     profile_generation_detail_ranges: bool = False  # Add detailed NVTX/torch profiler ranges inside generation
+    profile_active_prefix_decode_diagnostics: bool = False  # Record active-prefix decode-loop diagnostic counters
     profile_sdpa_backend: Optional[str] = None  # Force one PyTorch SDPA backend for profiling (flash/efficient/math/cudnn)
     resnap_events: bool = True  # Resnap notes to the timing after generation
     snap_near_perfect_overlaps: bool = True  # Snap nearly overlapping positions to each other

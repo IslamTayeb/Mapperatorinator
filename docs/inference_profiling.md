@@ -383,6 +383,14 @@ python inference.py --config-name profile_salvalai_smoke15 \
 
 `profile_generation_detail_ranges=true` adds NVTX and `record_function` ranges inside VarWhisper decoder self-attention, cross-attention, MLP `fc1`/activation/`fc2`, final norm, and output projection. These traces are diagnostic only; do not use traced wall time for throughput claims.
 
+For active-prefix cold-overhead attribution, add:
+
+```bash
+profile_active_prefix_decode_diagnostics=true
+```
+
+This is default-off and only records diagnostics when `inference_active_prefix_decode_loop=true`. It adds an `active_prefix_decode_diagnostics` object to each generation profile record with CPU-side wall counters for compile lookup, prepare inputs, prefill, decode forward, cache/model-kwargs update, logits processors, sampling, token append, and stopping checks, plus `decode_steps`, `bucket_lengths_seen`, and `bucket_transition_count`. It does not call `.cpu()`, `.item()`, or `torch.cuda.synchronize()` inside the decode loop. Pair it with `profile_generation_detail_ranges=true` when NVTX/`record_function` ranges are needed; otherwise it still writes JSON counters without enabling the broader VarWhisper detail ranges. This mode is diagnostic only and should not be used for throughput claims.
+
 For Nsight Systems timeline work, add `profile_nvtx_generation_ranges=true` to emit top-level `generation.<label>.seqN` NVTX ranges without enabling `torch.profiler`. This makes cold `main_generation.seq0` and warmed windows such as `main_generation.seq9` visible in the timeline while keeping torch-profiler overhead out of the run. The resulting Nsight wall times are still diagnostic; use normal `profile_inference` model timings for throughput claims.
 
 For SDPA dispatch audits, force one PyTorch SDPA backend at a time:

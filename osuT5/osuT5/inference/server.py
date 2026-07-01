@@ -167,6 +167,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     context_type = generate_kwargs.pop('context_type', None)
     sync_model_timing = bool(generate_kwargs.pop('sync_model_timing', False))
     profile_generation_detail_ranges = bool(generate_kwargs.pop('profile_generation_detail_ranges', False))
+    profile_active_prefix_decode_diagnostics = bool(generate_kwargs.pop('profile_active_prefix_decode_diagnostics', False))
     profile_sdpa_backend = generate_kwargs.pop('profile_sdpa_backend', None)
     active_prefix_decode_loop = bool(generate_kwargs.pop('active_prefix_decode_loop', False))
     active_prefix_decode_bucket_size = int(generate_kwargs.pop('active_prefix_decode_bucket_size', 128))
@@ -199,6 +200,16 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
             raise ValueError("active_prefix_decode_loop currently supports num_beams=1 only.")
         if active_prefix_decode_bucket_size <= 0:
             raise ValueError("active_prefix_decode_bucket_size must be positive.")
+    active_prefix_decode_diagnostics = (
+        {
+            "enabled": True,
+            "decode_steps": 0,
+            "bucket_lengths_seen": [],
+            "bucket_transition_count": 0,
+        }
+        if active_prefix_decode_loop and profile_active_prefix_decode_diagnostics
+        else None
+    )
 
     # Perform batched generation
     with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16, enabled=precision == 'amp'), \
@@ -219,6 +230,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
             custom_generate=partial(
                 active_prefix_decode_generate,
                 active_prefix_bucket_size=active_prefix_decode_bucket_size,
+                active_prefix_decode_diagnostics=active_prefix_decode_diagnostics,
             ) if active_prefix_decode_loop else None,
         )
         if sync_model_timing:
@@ -236,10 +248,13 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         "sync_model_timing": sync_model_timing,
         "generation_compile_enabled": not bool(getattr(getattr(model, "generation_config", None), "disable_compile", True)),
         "profile_generation_detail_ranges": profile_generation_detail_ranges,
+        "profile_active_prefix_decode_diagnostics": profile_active_prefix_decode_diagnostics,
         "profile_sdpa_backend": profile_sdpa_backend,
         "active_prefix_decode_loop_enabled": active_prefix_decode_loop,
         "active_prefix_decode_bucket_size": active_prefix_decode_bucket_size if active_prefix_decode_loop else None,
     })
+    if active_prefix_decode_diagnostics is not None:
+        stats["active_prefix_decode_diagnostics"] = active_prefix_decode_diagnostics
 
     return result, stats
 
