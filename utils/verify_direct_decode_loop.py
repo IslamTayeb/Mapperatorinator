@@ -109,6 +109,62 @@ def _prepare_sequence_buffer(input_ids: torch.LongTensor, max_length: int, pad_t
     return sequence_buffer
 
 
+def _clone_static_graph_inputs(model_inputs: dict[str, Any]) -> dict[str, Any]:
+    static_inputs: dict[str, Any] = {}
+    for key, value in model_inputs.items():
+        if isinstance(value, torch.Tensor):
+            static_inputs[key] = value.clone(memory_format=torch.contiguous_format)
+        else:
+            static_inputs[key] = value
+    return static_inputs
+
+
+def _copy_static_graph_inputs(static_inputs: dict[str, Any], model_inputs: dict[str, Any]) -> None:
+    for key, static_value in static_inputs.items():
+        value = model_inputs.get(key)
+        if not isinstance(static_value, torch.Tensor):
+            continue
+        if not isinstance(value, torch.Tensor):
+            raise RuntimeError(f"CUDA graph input {key} changed from tensor to {type(value).__name__}")
+        if tuple(static_value.shape) != tuple(value.shape):
+            raise RuntimeError(
+                f"CUDA graph input {key} shape changed from {tuple(static_value.shape)} "
+                f"to {tuple(value.shape)}"
+            )
+        if static_value.dtype != value.dtype:
+            raise RuntimeError(f"CUDA graph input {key} dtype changed from {static_value.dtype} to {value.dtype}")
+        static_value.copy_(value)
+
+
+def _capture_decode_cuda_graph(
+        model,
+        static_inputs: dict[str, Any],
+        *,
+        active_prefix_length: int | None,
+        warmup: int,
+) -> tuple[torch.cuda.CUDAGraph, Any, float]:
+    if not torch.cuda.is_available():
+        raise RuntimeError("candidate CUDA graph forward requires CUDA")
+
+    start = time.perf_counter()
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    graph_outputs = None
+    with torch.cuda.stream(capture_stream):
+        for _ in range(max(int(warmup), 0)):
+            with active_prefix_self_attention_context(active_prefix_length):
+                graph_outputs = model(**static_inputs, return_dict=True)
+    torch.cuda.current_stream().wait_stream(capture_stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        with active_prefix_self_attention_context(active_prefix_length):
+            graph_outputs = model(**static_inputs, return_dict=True)
+    graph.replay()
+    torch.cuda.synchronize()
+    return graph, graph_outputs, time.perf_counter() - start
+
+
 @torch.no_grad()
 def direct_decode_loop_generate(
         model,
@@ -123,6 +179,9 @@ def direct_decode_loop_generate(
         active_prefix_decode: bool = False,
         active_prefix_decode_length: int | None = None,
         active_prefix_bucket_size: int = 512,
+        cuda_graph_forward: bool = False,
+        cuda_graph_warmup: int = 3,
+        cuda_graph_diagnostics: dict[str, Any] | None = None,
         **model_kwargs,
 ) -> torch.LongTensor:
     """Verification-only direct cached decode loop used by utils/verify_direct_decode_loop.py."""
@@ -145,6 +204,8 @@ def direct_decode_loop_generate(
     batch_size, cur_len = input_ids.shape[:2]
     if batch_size != 1:
         raise ValueError("direct_decode_loop_generate currently supports batch_size=1 only")
+    if cuda_graph_forward and not torch.cuda.is_available():
+        raise RuntimeError("cuda_graph_forward requires CUDA")
 
     pad_token_id = generation_config._pad_token_tensor
     has_eos_stopping_criteria = any(hasattr(criteria, "eos_token_id") for criteria in stopping_criteria)
@@ -172,6 +233,10 @@ def direct_decode_loop_generate(
 
     is_prefill = True
     scores = None
+    graph: torch.cuda.CUDAGraph | None = None
+    graph_outputs = None
+    graph_static_inputs: dict[str, Any] | None = None
+    graph_active_prefix_length: int | None = None
     while model._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
         current_input_ids = sequence_buffer[:, :cur_len] if sequence_buffer is not None else input_ids
         model_inputs = model.prepare_inputs_for_generation(current_input_ids, **model_kwargs)
@@ -186,8 +251,47 @@ def direct_decode_loop_generate(
                 active_prefix_bucket_size=active_prefix_bucket_size,
                 max_cache_len=max_cache_len,
             )
-            with active_prefix_self_attention_context(prefix_length):
-                outputs = model_forward(**model_inputs, return_dict=True)
+            if cuda_graph_forward:
+                if graph is None:
+                    graph_active_prefix_length = prefix_length
+                    graph_static_inputs = _clone_static_graph_inputs(model_inputs)
+                    graph, graph_outputs, capture_seconds = _capture_decode_cuda_graph(
+                        model,
+                        graph_static_inputs,
+                        active_prefix_length=graph_active_prefix_length,
+                        warmup=cuda_graph_warmup,
+                    )
+                    if cuda_graph_diagnostics is not None:
+                        cuda_graph_diagnostics.update({
+                            "enabled": True,
+                            "warmup": int(cuda_graph_warmup),
+                            "capture_seconds": float(capture_seconds),
+                            "active_prefix_length": graph_active_prefix_length,
+                            "static_input_shapes": {
+                                key: list(value.shape)
+                                for key, value in graph_static_inputs.items()
+                                if isinstance(value, torch.Tensor)
+                            },
+                            "decode_replays": 0,
+                        })
+                elif prefix_length != graph_active_prefix_length:
+                    raise RuntimeError(
+                        "CUDA graph active-prefix length changed from "
+                        f"{graph_active_prefix_length} to {prefix_length}; rerun with a fixed bucket/shorter gate"
+                    )
+                else:
+                    if graph_static_inputs is None:
+                        raise RuntimeError("CUDA graph static inputs missing")
+                    _copy_static_graph_inputs(graph_static_inputs, model_inputs)
+                    graph.replay()
+                if cuda_graph_diagnostics is not None:
+                    cuda_graph_diagnostics["decode_replays"] = int(
+                        cuda_graph_diagnostics.get("decode_replays", 0)
+                    ) + 1
+                outputs = graph_outputs
+            else:
+                with active_prefix_self_attention_context(prefix_length):
+                    outputs = model_forward(**model_inputs, return_dict=True)
 
         model_kwargs = model._update_model_kwargs_for_generation(
             outputs,
@@ -241,6 +345,8 @@ def run_direct_decode_loop_gate(
         candidate_active_prefix_decode: bool,
         candidate_active_prefix_decode_length: int | None,
         candidate_active_prefix_decode_bucket_size: int,
+        candidate_cuda_graph_forward: bool,
+        candidate_cuda_graph_warmup: int,
 ) -> dict[str, Any]:
     _assert_supported_probe(args)
     if max_new_tokens <= 0:
@@ -297,6 +403,8 @@ def run_direct_decode_loop_gate(
         "candidate_active_prefix_decode": bool(candidate_active_prefix_decode),
         "candidate_active_prefix_decode_length": candidate_active_prefix_decode_length,
         "candidate_active_prefix_decode_bucket_size": candidate_active_prefix_decode_bucket_size,
+        "candidate_cuda_graph_forward": bool(candidate_cuda_graph_forward),
+        "candidate_cuda_graph_warmup": int(candidate_cuda_graph_warmup),
     }
 
     prompt = model_inputs["decoder_input_ids"]
@@ -351,6 +459,7 @@ def run_direct_decode_loop_gate(
         lookback_time=float(metadata["lookback_time"]),
     )
     candidate_processors.insert(0, _CaptureRawLogitsProcessor(candidate_captures))
+    candidate_cuda_graph_diagnostics: dict[str, Any] = {}
 
     with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16, enabled=args.precision == "amp"), \
             generation_profile_context(sdpa_backend=args.profile_sdpa_backend):
@@ -375,6 +484,9 @@ def run_direct_decode_loop_gate(
                 active_prefix_decode=candidate_active_prefix_decode,
                 active_prefix_decode_length=candidate_active_prefix_decode_length,
                 active_prefix_bucket_size=candidate_active_prefix_decode_bucket_size,
+                cuda_graph_forward=candidate_cuda_graph_forward,
+                cuda_graph_warmup=candidate_cuda_graph_warmup,
+                cuda_graph_diagnostics=candidate_cuda_graph_diagnostics,
             ),
         )
         candidate_end_rng_state = _rng_state()
@@ -420,6 +532,11 @@ def run_direct_decode_loop_gate(
         "candidate_captured_raw_logit_steps": len(candidate_captures),
         "logits_step_count": logits_step_count,
         "logits_comparisons": logits_comparisons,
+        "candidate_cuda_graph_diagnostics": (
+            candidate_cuda_graph_diagnostics
+            if candidate_cuda_graph_forward
+            else None
+        ),
         "metadata": metadata,
     }
 
@@ -456,6 +573,17 @@ def main() -> None:
         default=512,
         help="Bucket size for candidate active-prefix decode when no fixed length is provided.",
     )
+    parser.add_argument(
+        "--candidate-cuda-graph-forward",
+        action="store_true",
+        help="Capture and replay the candidate one-token decode forward with torch.cuda.CUDAGraph.",
+    )
+    parser.add_argument(
+        "--candidate-cuda-graph-warmup",
+        type=int,
+        default=3,
+        help="Warmup forwards before candidate CUDA graph capture.",
+    )
     parser.add_argument("--report-path", type=Path, default=None)
     parser.add_argument("overrides", nargs="*", help="Hydra overrides, e.g. model_path=/path/to/model")
     cli_args = parser.parse_args()
@@ -476,6 +604,8 @@ def main() -> None:
         ),
         candidate_active_prefix_decode_length=cli_args.candidate_active_prefix_decode_length,
         candidate_active_prefix_decode_bucket_size=cli_args.candidate_active_prefix_decode_bucket_size,
+        candidate_cuda_graph_forward=cli_args.candidate_cuda_graph_forward,
+        candidate_cuda_graph_warmup=cli_args.candidate_cuda_graph_warmup,
     )
     result["metadata"]["config_name"] = cli_args.config_name
     result["wall_seconds"] = time.perf_counter() - start
