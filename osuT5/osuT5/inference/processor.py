@@ -1472,7 +1472,6 @@ class Processor(object):
             ),
             "precision": stats.get("precision", self.precision),
             "generation_compile_enabled": stats.get("generation_compile_enabled"),
-            "persistent_static_mask_enabled": stats.get("persistent_static_mask_enabled"),
             "use_server": isinstance(self.model, InferenceClient),
             "parallel": self.parallel,
         }

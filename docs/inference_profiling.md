@@ -395,6 +395,19 @@ RTX 2080 Ti smoke comparison on DCC `gpu-common`, node `dcc-core-ferc-s-z25-21`:
 
 `utils/summarize_inference_profile.py --compare` reported token equivalence PASS for all `2,894` generated main-generation token IDs, but throughput was `-3.9%` worse. The likely reason is that the shorter attention shape saved masked attention work but added slicing and less favorable SDPA/kernel dispatch behavior. Do not reintroduce this exact static-cache K/V prefix trim unless a new trace shows max-cache attention is still dominant and the replacement avoids per-token slicing overhead.
 
+### Persistent static causal-mask buffer
+
+Attempted in commit `2d807c1` and reverted after 15s smoke profiling. The change added a default-off `inference_persistent_static_mask` path that reused a full-size 4D static-cache causal mask buffer for the guarded SDPA, batch-size-1, one-token decode path. Unlike the rejected prefix trim, it kept the full static-cache attention shape and tried to stabilize the mask data pointer for compiled decode.
+
+RTX 2080 Ti middle-15s SALVALAI comparison on DCC `gpu-common`, node `dcc-core-ferc-s-z25-21`:
+
+| run | commit | job | profile | main tokens | main model time | tok/s |
+| --- | --- | --- | --- | ---: | ---: | ---: |
+| baseline | `2d807c1` | `49137140` | `/work/imt11/Mapperatorinator/runs/smoke15-mask-base-2d807c1/beatmap4438946a6a864548b8d968d4a3a24682.osu.profile.json` | 1,084 | 21.093s | 51.4 |
+| candidate | `2d807c1` | `49137141` | `/work/imt11/Mapperatorinator/runs/smoke15-mask-cand-2d807c1/beatmap63be4f635c7147cd9b127038054db1d2.osu.profile.json` | 1,084 | 25.590s | 42.4 |
+
+Token equivalence PASS: all `1,084` generated main-generation token IDs matched, and profile records showed `persistent_static_mask_enabled=true` for the candidate. Throughput was `-17.6%` worse overall and post-warmup seq9 fell from `104.6 tok/s` to `91.5 tok/s`, so the regression was not just first-window compile noise. The likely reason is that stable buffer reuse still added per-token `fill_`, boolean mask construction, and `masked_fill_` work, while the existing mask path is already efficient enough relative to the compiled forward. Do not reintroduce persistent mask mutation unless a future trace shows mask construction itself is target-sized and the replacement avoids extra per-token kernels.
+
 ### Dynamic/default cache generation
 
 Attempted in commit `52b8871` and reverted after smoke profiling. The change added an `inference_static_cache=false` path that skipped the preallocated `StaticCache` and let generation use the default/dynamic cache behavior while keeping `inference_generation_compile=true`.

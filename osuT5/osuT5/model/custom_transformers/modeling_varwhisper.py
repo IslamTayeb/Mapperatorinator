@@ -1498,32 +1498,16 @@ class VarWhisperForConditionalGeneration(WhisperGenerationMixin, VarWhisperPreTr
                 and decoder_attention_mask.ndim == 2
         ):
             batch_size, sequence_length = decoder_input_ids.shape
-            target_length = past_key_values.self_attention_cache.get_max_cache_shape()
 
-            if (
-                    getattr(self, "inference_persistent_static_mask", False)
-                    and self.config._attn_implementation == "sdpa"
-                    and batch_size == 1
-                    and sequence_length == 1
-                    and decoder_attention_mask.device.type == "cuda"
-            ):
-                decoder_attention_mask = self._prepare_persistent_static_causal_mask(
-                    decoder_attention_mask,
-                    target_length=target_length,
-                    dtype=self.proj_out.weight.dtype,
-                    device=decoder_input_ids.device,
-                    cache_position=cache_position,
-                )
-            else:
-                decoder_attention_mask = self.get_decoder()._prepare_4d_causal_attention_mask_with_cache_position(
-                    decoder_attention_mask,
-                    sequence_length=sequence_length,
-                    target_length=target_length,
-                    dtype=self.proj_out.weight.dtype,
-                    device=decoder_input_ids.device,
-                    cache_position=cache_position,
-                    batch_size=batch_size,
-                )
+            decoder_attention_mask = self.get_decoder()._prepare_4d_causal_attention_mask_with_cache_position(
+                decoder_attention_mask,
+                sequence_length=sequence_length,
+                target_length=past_key_values.self_attention_cache.get_max_cache_shape(),
+                dtype=self.proj_out.weight.dtype,
+                device=decoder_input_ids.device,
+                cache_position=cache_position,
+                batch_size=batch_size,
+            )
 
         return {
             "encoder_outputs": encoder_outputs,
@@ -1534,32 +1518,3 @@ class VarWhisperForConditionalGeneration(WhisperGenerationMixin, VarWhisperPreTr
             "decoder_position_ids": decoder_position_ids,
             "cache_position": cache_position,
         }
-
-    def _prepare_persistent_static_causal_mask(
-            self,
-            attention_mask: torch.Tensor,
-            target_length: int,
-            dtype: torch.dtype,
-            device: torch.device,
-            cache_position: torch.Tensor,
-    ) -> torch.Tensor:
-        min_dtype = torch.finfo(dtype).min
-        buffer = getattr(self, "_inference_static_causal_mask", None)
-        cache_key = (target_length, dtype, device)
-        if buffer is None or getattr(self, "_inference_static_causal_mask_key", None) != cache_key:
-            buffer = torch.empty((1, 1, 1, target_length), dtype=dtype, device=device)
-            self._inference_static_causal_mask = buffer
-            self._inference_static_causal_mask_key = cache_key
-
-        positions = getattr(self, "_inference_static_causal_mask_positions", None)
-        if positions is None or positions.shape[-1] < target_length or positions.device != device:
-            positions = torch.arange(target_length, device=device)
-            self._inference_static_causal_mask_positions = positions
-
-        buffer.fill_(min_dtype)
-        mask_length = min(attention_mask.shape[-1], target_length)
-        valid_positions = positions[:mask_length] <= cache_position[-1]
-        visible_mask = attention_mask[:, :mask_length].to(torch.bool) & valid_positions.unsqueeze(0)
-        buffer[:, :, :, :mask_length].masked_fill_(visible_mask[:, None, None, :], 0)
-
-        return AttentionMaskConverter._unmask_unattended(buffer, min_dtype)

@@ -330,7 +330,6 @@ def load_model_loaders(
         gamemode: int | None = None,
         auto_select_gamemode_model: bool = True,
         generation_compile: bool = False,
-        persistent_static_mask: bool = False,
 ):
     if not ckpt_path:
         if eval_mode:
@@ -409,10 +408,6 @@ def load_model_loaders(
 
         if eval_mode:
             model.eval()
-
-        transformer = getattr(model, "transformer", None)
-        if transformer is not None:
-            setattr(transformer, "inference_persistent_static_mask", persistent_static_mask)
 
         print(f"Model loaded: {resolved_source} on device {device}")
         return model
