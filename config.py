@@ -80,6 +80,7 @@ class InferenceConfig:
     profile_torch_generation: bool = False  # Write torch.profiler Chrome traces around selected model.generate calls
     profile_torch_output_dir: Optional[str] = None  # Directory for torch.profiler Chrome traces
     profile_torch_generation_limit: int = 3  # Maximum number of model.generate calls to trace
+    profile_torch_generation_label_filter: Optional[str] = None  # Only trace generation ranges whose name contains this text
     profile_torch_record_shapes: bool = True  # Record tensor shapes in torch.profiler traces
     profile_torch_profile_memory: bool = True  # Record memory events in torch.profiler traces
     profile_torch_with_stack: bool = False  # Record Python stacks in torch.profiler traces

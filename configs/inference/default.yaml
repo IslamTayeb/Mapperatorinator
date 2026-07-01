@@ -67,6 +67,7 @@ profile_sync_cuda: true  # Synchronize CUDA around profiled regions for accurate
 profile_torch_generation: false # Write torch.profiler Chrome traces around selected model.generate calls
 profile_torch_output_dir: null # Directory for torch.profiler Chrome traces
 profile_torch_generation_limit: 3 # Maximum number of model.generate calls to trace
+profile_torch_generation_label_filter: null # Only trace generation ranges whose name contains this text
 profile_torch_record_shapes: true # Record tensor shapes in torch.profiler traces
 profile_torch_profile_memory: true # Record memory events in torch.profiler traces
 profile_torch_with_stack: false # Record Python stacks in torch.profiler traces

@@ -148,10 +148,11 @@ python inference.py --config-name profile_salvalai \
   use_server=false \
   profile_torch_generation=true \
   profile_torch_output_dir="$WORK/runs/profile-torch-${SLURM_JOB_ID}/torch_profiles" \
-  profile_torch_generation_limit=3
+  profile_torch_generation_limit=3 \
+  profile_torch_generation_label_filter=main_generation
 ```
 
-This writes Chrome traces for the first selected `model.generate` calls and adds a `torch_profiles` section to the normal `.profile.json`. Keep `profile_torch_generation_limit` small for full songs; each trace includes CPU/CUDA activities, shapes, memory events, NVTX/record-function ranges, and the top profiler events by self CUDA time.
+This writes Chrome traces for the first selected `model.generate` calls and adds a `torch_profiles` section to the normal `.profile.json`. Use `profile_torch_generation_label_filter=main_generation` to skip timing-context windows and trace map generation directly, or leave it unset to trace the first generation calls of any label. Keep `profile_torch_generation_limit` small for full songs; each trace includes CPU/CUDA activities, shapes, memory events, NVTX/record-function ranges, and the top profiler events by self CUDA time.
 
 ## FlashAttention 2 On DCC
 

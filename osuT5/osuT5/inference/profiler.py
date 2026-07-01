@@ -20,6 +20,7 @@ class InferenceProfiler:
             torch_generation: bool = False,
             torch_output_dir: str | None = None,
             torch_generation_limit: int = 3,
+            torch_generation_label_filter: str | None = None,
             torch_record_shapes: bool = True,
             torch_profile_memory: bool = True,
             torch_with_stack: bool = False,
@@ -30,6 +31,7 @@ class InferenceProfiler:
         self.torch_generation = torch_generation
         self.torch_output_dir = torch_output_dir
         self.torch_generation_limit = max(0, torch_generation_limit)
+        self.torch_generation_label_filter = torch_generation_label_filter
         self.torch_record_shapes = torch_record_shapes
         self.torch_profile_memory = torch_profile_memory
         self.torch_with_stack = torch_with_stack
@@ -49,6 +51,7 @@ class InferenceProfiler:
             torch_generation=bool(getattr(args, "profile_torch_generation", False)),
             torch_output_dir=getattr(args, "profile_torch_output_dir", None),
             torch_generation_limit=int(getattr(args, "profile_torch_generation_limit", 3)),
+            torch_generation_label_filter=getattr(args, "profile_torch_generation_label_filter", None),
             torch_record_shapes=bool(getattr(args, "profile_torch_record_shapes", True)),
             torch_profile_memory=bool(getattr(args, "profile_torch_profile_memory", True)),
             torch_with_stack=bool(getattr(args, "profile_torch_with_stack", False)),
@@ -87,7 +90,7 @@ class InferenceProfiler:
 
     @contextmanager
     def torch_generation_trace(self, name: str, **metadata: Any) -> Iterator[None]:
-        if not self._should_trace_torch_generation():
+        if not self._should_trace_torch_generation(name):
             yield
             return
 
@@ -170,7 +173,9 @@ class InferenceProfiler:
         if self.sync_cuda and torch.cuda.is_available():
             torch.cuda.synchronize()
 
-    def _should_trace_torch_generation(self) -> bool:
+    def _should_trace_torch_generation(self, name: str) -> bool:
+        if self.torch_generation_label_filter and self.torch_generation_label_filter not in name:
+            return False
         return (
             self.enabled
             and self.torch_generation
