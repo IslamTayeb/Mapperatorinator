@@ -637,6 +637,10 @@ The `generation` records report per-window or per-batch details:
 - `torch_trace_index`, `torch_trace_path`, and `torch_trace_wall_seconds` when a torch profiler trace covered that generation window
 - CUDA memory counters when CUDA is available
 
+Torch profiler records include a bounded key-average event summary in the profile JSON. Use
+`profile_torch_event_limit=<N>` to keep more than the default top 50 events, or `profile_torch_event_limit=0` to keep
+all events. This changes only profile artifact size; it is diagnostic and must not be used as a throughput claim.
+
 Use `wall_seconds - model_elapsed_seconds` to spot server/IPC/queue overhead. Use token counts and `tokens_per_second` to separate model throughput problems from unusually long outputs. When `profile_sync_cuda=true`, profiling requests synchronized model timing inside `model_generate` so `model_elapsed_seconds` includes pending CUDA work. Do not use `wall_seconds` from records with `torch_profiled=true` as normal throughput; the profiler can inflate traced windows by orders of magnitude.
 
 Profile metadata also captures reproducibility context when profiling is enabled: seed, hostname, Slurm job id/partition, git commit/branch, torch/CUDA versions, CUDA device name/capability, and cache/temp environment paths. Report the profile path plus this metadata when accepting or rejecting an optimization.

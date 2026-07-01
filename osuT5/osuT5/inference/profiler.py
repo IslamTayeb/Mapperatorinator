@@ -24,6 +24,7 @@ class InferenceProfiler:
             torch_record_shapes: bool = True,
             torch_profile_memory: bool = True,
             torch_with_stack: bool = False,
+            torch_event_limit: int = 50,
     ):
         self.enabled = enabled
         self.output_path = output_path
@@ -35,6 +36,7 @@ class InferenceProfiler:
         self.torch_record_shapes = torch_record_shapes
         self.torch_profile_memory = torch_profile_memory
         self.torch_with_stack = torch_with_stack
+        self.torch_event_limit = max(0, int(torch_event_limit))
         self.started_at = time.time()
         self.metadata: dict[str, Any] = {}
         self.stages: list[dict[str, Any]] = []
@@ -56,6 +58,7 @@ class InferenceProfiler:
             torch_record_shapes=bool(getattr(args, "profile_torch_record_shapes", True)),
             torch_profile_memory=bool(getattr(args, "profile_torch_profile_memory", True)),
             torch_with_stack=bool(getattr(args, "profile_torch_with_stack", False)),
+            torch_event_limit=int(getattr(args, "profile_torch_event_limit", 50)),
         )
 
     def set_metadata(self, **metadata: Any) -> None:
@@ -145,7 +148,7 @@ class InferenceProfiler:
             record.update(metadata)
             if "prof" in locals():
                 prof.export_chrome_trace(str(trace_path))
-                record["events"] = self._torch_profile_events(prof)
+                record["events"] = self._torch_profile_events(prof, limit=self.torch_event_limit)
             self._add_cuda_memory(record)
             record = self._to_jsonable(record)
             self.torch_profiles.append(record)
@@ -213,7 +216,7 @@ class InferenceProfiler:
                     torch.cuda.nvtx.range_pop()
 
     @classmethod
-    def _torch_profile_events(cls, prof) -> list[dict[str, Any]]:
+    def _torch_profile_events(cls, prof, *, limit: int = 50) -> list[dict[str, Any]]:
         key_averages = prof.key_averages(group_by_input_shape=True)
         events: list[dict[str, Any]] = []
         for event in key_averages:
@@ -233,7 +236,7 @@ class InferenceProfiler:
                 "input_shapes": getattr(event, "input_shapes", None),
             })
         events.sort(key=lambda item: float(item["self_cuda_time_total_us"]), reverse=True)
-        return events[:50]
+        return events if limit <= 0 else events[:limit]
 
     @staticmethod
     def _event_time(event: object, *names: str) -> float:

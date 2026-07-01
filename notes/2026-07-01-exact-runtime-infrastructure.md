@@ -68,6 +68,36 @@ reference_topk == candidate_topk for all 20 reported tokens
 
 Diagnosis: this was a gate-harness issue. Transformers 4.57.3 stores `output_logits` after calling `logits_processor(input_ids, next_token_logits)`. Mapperatorinator's `MonotonicTimeShiftLogitsProcessor` mutates the logits tensor in-place by writing `-inf`, so the supposedly raw `output_logits` tuple can contain processor masks. The gate was patched to prepend a passive capture processor that clones the true model logits before repo processors run, then compare the direct `q_len=1` candidate against that captured raw tensor. HF's returned `output_logits` remain in the report only as a diagnostic under `hf_output_logits_vs_candidate`.
 
+Follow-up DCC gate run `49139313` on `dcc-core-ferc-s-z25-21` passed:
+
+```text
+commit=9681150, torch=2.10.0+cu128, transformers=4.57.3,
+pass=true, allclose=true, topk_match=true, prompt_tokens=84,
+probe_token_id=12, hf_captured_raw_logit_steps=2,
+max_abs=2.2888e-05, mean_abs=9.8508e-06, finite_count=4069,
+prepared_candidate_shape=[1, 1], decode_cache_position=[84]
+```
+
+The old no-cache diagnostics stayed large (`no_cache_reference_max_abs=31.2936`), confirming that the no-cache full-prefix path is not a valid exactness reference for production cached generation. The HF-returned `output_logits` diagnostic still had 3 non-finite mismatches because of in-place processor masks, as expected.
+
+Current-commit 15s smoke job `49139323` on the same node produced token-equivalent normal inference against prior same-config compile baseline `49136379`:
+
+```text
+1,084 / 1,084 generated main-generation token IDs matched.
+main model time: 21.422s -> 21.317s, +0.5% tok/s, not a speed claim.
+untraced seq9: 234 tokens in 2.251s, 104.1 tok/s.
+```
+
+Detailed seq9 torch-profiler job `49139325` produced:
+
+```text
+profile=/work/imt11/Mapperatorinator/runs/smoke15-detail-seq9-49139325-9681150/beatmapab535ed9cb3140c5adc38fa049e21805.osu.profile.json
+trace=/work/imt11/Mapperatorinator/runs/smoke15-detail-seq9-49139325-9681150/torch_profiles/000_generation_main_generation_seq9.trace.json
+seq9 torch trace wall=74.250s, seq9 outer wall=114.495s, seq9 synchronized model time=11.105s
+```
+
+This is diagnostic only: the same untraced seq9 window was 2.251s. The top retained key-average events showed `fmha_cutlassF_f32_aligned_64x64_rf_sm75` at 2.031s self CUDA across 5,628 calls, matching roughly 234 tokens x 12 decoder layers x self/cross attention. The first top-50 summary was too shallow for all detailed ranges, so `profile_torch_event_limit` was added to keep more key-average events in JSON before opening large Chrome traces.
+
 The next run should be:
 
 ```bash
