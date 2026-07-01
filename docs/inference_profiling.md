@@ -262,7 +262,7 @@ python inference.py --config-name profile_salvalai_smoke15 \
   use_server=false
 ```
 
-`configs/inference/profile_salvalai_smoke15.yaml` sets `start_time=71000`, `end_time=86000`, `seed=12345`, and `profile_record_token_ids=true`, inheriting the retained compile-only cold single-song path from `profile_salvalai`. Use this for first-pass scouting; promote to the 30s smoke or full-song configs only when the 15s result is token-equivalent and plausibly meaningful. For compile/runtime changes with one-time specialization costs, inspect post-warmup windows before rejecting a token-equivalent candidate, but full-song non-regression is still required before acceptance.
+`configs/inference/profile_salvalai_smoke15.yaml` sets `start_time=71000`, `end_time=86000`, `seed=12345`, `attn_implementation=sdpa`, `use_server=false`, `inference_generation_compile=true`, `inference_active_prefix_decode_loop=false`, and `profile_record_token_ids=true`. Use this for first-pass scouting; promote to the 30s smoke or full-song configs only when the 15s result is token-equivalent and plausibly meaningful. For compile/runtime changes with one-time specialization costs, inspect post-warmup windows before rejecting a token-equivalent candidate, but full-song non-regression is still required before acceptance.
 
 Reference 15s smoke profiles from commit `ce92ebb` on RTX 2080 Ti node `dcc-core-ferc-s-z25-21`:
 
@@ -270,6 +270,18 @@ Reference 15s smoke profiles from commit `ce92ebb` on RTX 2080 Ti node `dcc-core
 | --- | --- | --- | ---: | ---: | ---: |
 | compile-disabled | `49132862` | `/work/imt11/Mapperatorinator/runs/smoke15-nocompile-49132862-ce92ebb/beatmap3ccc5112a05940db8fdd747994c4bef2.osu.profile.json` | 1,084 | 22.068s | 49.1 |
 | retained compile baseline | `49132861` | `/work/imt11/Mapperatorinator/runs/smoke15-compile-49132861-ce92ebb/beatmapfb8360ef206b41f4a6cc1fe7a6a735ed.osu.profile.json` | 1,084 | 13.335s | 81.3 |
+
+Use the comparison helper as a real gate, not only a readable summary:
+
+```bash
+python utils/summarize_inference_profile.py \
+  --compare "$BASELINE_PROFILE" "$CANDIDATE_PROFILE" \
+  --label main_generation \
+  --strict \
+  --json-output "$WORK/runs/profile-compare-${SLURM_JOB_ID}.json"
+```
+
+`--strict` exits nonzero when same-calculation metadata differs, generated token IDs are missing or different, generated-token or record counts change, aggregate throughput/model/wall/stage time regresses, or any selected-label per-window record regresses. Run it at least for `main_generation` before promotion; full-song acceptance still needs timing-generation and total-stage inspection for non-regression.
 
 `utils/summarize_inference_profile.py --compare` reported token equivalence PASS for all `1,084` generated main-token IDs. This short slice is warmup-sensitive: the retained compile baseline is `+65.5%` over compile-disabled overall, while post-warmup map windows are mostly around `94-105 tok/s`.
 
@@ -301,6 +313,7 @@ Before any custom decoder-step, CUDA graph, backend, or kernel path is treated a
 ```bash
 python utils/verify_one_token_decode.py \
   --config-name profile_salvalai_smoke15 \
+  --sequence-index 9 \
   --report-path "$WORK/runs/one-token-decode-${SLURM_JOB_ID}.json" \
   audio_path="$WORK/data/salvalai.mp3" \
   output_path="$WORK/runs/profile-smoke15-${SLURM_JOB_ID}" \
@@ -316,7 +329,8 @@ python utils/verify_one_token_decode.py \
 This gate compares a direct static-cache `q_len=1` decode step against captured raw logits from HF cached
 `generate(max_new_tokens=2)` on the real SALVALAI prompt-building path. The capture processor clones logits before
 Mapperatorinator logits processors can mutate them in-place, and HF's first generated token becomes the probe token for
-the direct candidate step. The old no-cache full-prefix comparison is kept only as a diagnostic. Passing this gate is
+the direct candidate step. Add `--include-no-cache-diagnostics` only when debugging the ABI; it runs slower no-cache
+full-prefix forwards that are not part of the pass condition. Passing this gate is
 necessary for decoder-runtime work, but not sufficient for a speed claim; still require fixed-seed 15s generated-token
 equivalence and full-song equivalence.
 

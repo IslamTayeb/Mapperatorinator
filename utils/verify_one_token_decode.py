@@ -269,6 +269,7 @@ def run_one_token_gate(
         atol: float,
         rtol: float,
         top_k: int,
+        include_no_cache_diagnostics: bool = False,
         candidate_active_prefix_self_attention: bool = False,
         candidate_active_prefix_prefill: bool | None = None,
         candidate_active_prefix_decode: bool | None = None,
@@ -336,6 +337,7 @@ def run_one_token_gate(
         "atol": atol,
         "rtol": rtol,
         "top_k": top_k,
+        "include_no_cache_diagnostics": bool(include_no_cache_diagnostics),
         "candidate_active_prefix_self_attention": bool(candidate_active_prefix_self_attention),
         "candidate_active_prefix_prefill": active_prefix_prefill,
         "candidate_active_prefix_decode": active_prefix_decode,
@@ -405,32 +407,37 @@ def run_one_token_gate(
         hf_reference_logits = hf_raw_logit_captures[1].detach().to(torch.float32)
         hf_output_logits_reference = hf_logits[1].detach().to(torch.float32)
 
-        prompt_prepared = model.prepare_inputs_for_generation(
-            prompt,
-            use_cache=False,
-            decoder_attention_mask=prompt_mask,
-            frames=model_inputs["frames"],
-            **condition_kwargs,
-        )
-        prompt_outputs = model(
-            **prompt_prepared,
-        )
-        no_cache_first_step_logits = _last_token_logits(prompt_outputs.logits)
-
         full_prefix = torch.cat([prompt, probe_token], dim=-1)
         full_mask = torch.cat([prompt_mask, torch.ones_like(probe_token, dtype=prompt_mask.dtype)], dim=-1)
-        encoder_outputs = BaseModelOutput(last_hidden_state=prompt_outputs.encoder_last_hidden_state)
-        reference_prepared = model.prepare_inputs_for_generation(
-            full_prefix,
-            use_cache=False,
-            encoder_outputs=encoder_outputs,
-            decoder_attention_mask=full_mask,
-            **condition_kwargs,
-        )
-        reference_outputs = model(
-            **reference_prepared,
-        )
-        no_cache_reference_logits = _last_token_logits(reference_outputs.logits)
+        prompt_prepared = None
+        reference_prepared = None
+        no_cache_reference_logits = None
+        no_cache_first_step_logits = None
+        if include_no_cache_diagnostics:
+            prompt_prepared = model.prepare_inputs_for_generation(
+                prompt,
+                use_cache=False,
+                decoder_attention_mask=prompt_mask,
+                frames=model_inputs["frames"],
+                **condition_kwargs,
+            )
+            prompt_outputs = model(
+                **prompt_prepared,
+            )
+            no_cache_first_step_logits = _last_token_logits(prompt_outputs.logits)
+
+            encoder_outputs = BaseModelOutput(last_hidden_state=prompt_outputs.encoder_last_hidden_state)
+            reference_prepared = model.prepare_inputs_for_generation(
+                full_prefix,
+                use_cache=False,
+                encoder_outputs=encoder_outputs,
+                decoder_attention_mask=full_mask,
+                **condition_kwargs,
+            )
+            reference_outputs = model(
+                **reference_prepared,
+            )
+            no_cache_reference_logits = _last_token_logits(reference_outputs.logits)
 
         decode_state = prefill_static_cache(
             model,
@@ -460,8 +467,16 @@ def run_one_token_gate(
         rtol=rtol,
         top_k=top_k,
     )
-    no_cache_abs_diff = torch.abs(no_cache_reference_logits - candidate_logits)
-    no_cache_first_step_abs_diff = torch.abs(no_cache_first_step_logits - hf_raw_logit_captures[0])
+    no_cache_abs_diff = (
+        torch.abs(no_cache_reference_logits - candidate_logits)
+        if no_cache_reference_logits is not None
+        else None
+    )
+    no_cache_first_step_abs_diff = (
+        torch.abs(no_cache_first_step_logits - hf_raw_logit_captures[0])
+        if no_cache_first_step_logits is not None
+        else None
+    )
 
     return {
         "pass": comparison["allclose"] and comparison["topk_match"],
@@ -477,8 +492,16 @@ def run_one_token_gate(
         "hf_captured_raw_logit_steps": len(hf_raw_logit_captures),
         "hf_logit_shape_step0": list(hf_raw_logit_captures[0].shape),
         "hf_logit_shape_step1": list(hf_raw_logit_captures[1].shape),
-        "prepared_prompt_shape": list(prompt_prepared["decoder_input_ids"].shape),
-        "prepared_reference_shape": list(reference_prepared["decoder_input_ids"].shape),
+        "prepared_prompt_shape": (
+            list(prompt_prepared["decoder_input_ids"].shape)
+            if prompt_prepared is not None
+            else None
+        ),
+        "prepared_reference_shape": (
+            list(reference_prepared["decoder_input_ids"].shape)
+            if reference_prepared is not None
+            else None
+        ),
         "prepared_prefill_shape": list(decode_state.prefill_prepared_inputs["decoder_input_ids"].shape),
         "prepared_candidate_shape": list(candidate_inputs["decoder_input_ids"].shape),
         "finite_allclose": comparison["finite_allclose"],
@@ -500,10 +523,26 @@ def run_one_token_gate(
             "mean_abs": output_logits_comparison["mean_abs"],
             "max_rel": output_logits_comparison["max_rel"],
         },
-        "no_cache_reference_max_abs": float(no_cache_abs_diff.max().item()),
-        "no_cache_reference_mean_abs": float(no_cache_abs_diff.mean().item()),
-        "no_cache_first_step_vs_hf_max_abs": float(no_cache_first_step_abs_diff.max().item()),
-        "no_cache_first_step_vs_hf_mean_abs": float(no_cache_first_step_abs_diff.mean().item()),
+        "no_cache_reference_max_abs": (
+            float(no_cache_abs_diff.max().item())
+            if no_cache_abs_diff is not None
+            else None
+        ),
+        "no_cache_reference_mean_abs": (
+            float(no_cache_abs_diff.mean().item())
+            if no_cache_abs_diff is not None
+            else None
+        ),
+        "no_cache_first_step_vs_hf_max_abs": (
+            float(no_cache_first_step_abs_diff.max().item())
+            if no_cache_first_step_abs_diff is not None
+            else None
+        ),
+        "no_cache_first_step_vs_hf_mean_abs": (
+            float(no_cache_first_step_abs_diff.mean().item())
+            if no_cache_first_step_abs_diff is not None
+            else None
+        ),
         "reference_topk": comparison["reference_topk"],
         "candidate_topk": comparison["candidate_topk"],
         "metadata": metadata,
@@ -520,6 +559,11 @@ def main() -> None:
     parser.add_argument("--atol", type=float, default=1e-4)
     parser.add_argument("--rtol", type=float, default=1e-4)
     parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument(
+        "--include-no-cache-diagnostics",
+        action="store_true",
+        help="Also run slower no-cache full-prefix comparisons for debugging. Not required for the gate pass.",
+    )
     parser.add_argument(
         "--candidate-active-prefix-self-attention",
         action="store_true",
@@ -554,6 +598,7 @@ def main() -> None:
         atol=cli_args.atol,
         rtol=cli_args.rtol,
         top_k=cli_args.top_k,
+        include_no_cache_diagnostics=cli_args.include_no_cache_diagnostics,
         candidate_active_prefix_self_attention=cli_args.candidate_active_prefix_self_attention,
         candidate_active_prefix_prefill=(
             cli_args.candidate_active_prefix_prefill

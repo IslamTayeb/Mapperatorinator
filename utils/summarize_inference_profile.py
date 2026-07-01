@@ -131,6 +131,33 @@ def _summary_for_label(profile: dict[str, Any], label: str) -> dict[str, Any]:
     return {}
 
 
+def _total_stage_wall_seconds(profile: dict[str, Any]) -> float:
+    return sum(float(stage.get("wall_seconds", 0.0) or 0.0) for stage in profile.get("stages", []))
+
+
+def _records_for_label(profile: dict[str, Any], label: str) -> list[dict[str, Any]]:
+    return [record for record in profile.get("generation", []) if record.get("profile_label") == label]
+
+
+def _record_key(record: dict[str, Any], index: int) -> str:
+    context = record.get("context_type", "unknown")
+    mode = record.get("mode", "unknown")
+    if "sequence_index" in record:
+        unit = f"seq{record['sequence_index']}"
+    else:
+        unit = f"batch{record.get('batch_start_index', index)}"
+    return f"{context}/{mode}/{unit}"
+
+
+def _record_tokens_per_second(record: dict[str, Any]) -> float:
+    value = record.get("tokens_per_second")
+    if isinstance(value, (int, float)) and value > 0:
+        return float(value)
+    generated_tokens = int(record.get("generated_tokens", 0) or 0)
+    model_elapsed = float(record.get("model_elapsed_seconds", 0.0) or 0.0)
+    return generated_tokens / model_elapsed if model_elapsed > 0 else 0.0
+
+
 def _flatten_token_ids(profile: dict[str, Any], label: str) -> list[int] | None:
     tokens: list[int] = []
     saw_tokens = False
@@ -160,7 +187,31 @@ def _compare_number(name: str, baseline: float, candidate: float, *, higher_is_b
     print(f"  {name}: baseline={baseline:.3f}, candidate={candidate:.3f}, delta={delta:+.3f} ({pct:+.1f}%, {direction})")
 
 
-def _compare_contract_metadata(baseline: dict[str, Any], candidate: dict[str, Any]) -> bool:
+def _metric_comparison(
+        baseline: float,
+        candidate: float,
+        *,
+        higher_is_better: bool,
+        tolerance_pct: float,
+) -> dict[str, Any]:
+    delta = candidate - baseline
+    pct = (delta / baseline * 100.0) if baseline else 0.0
+    tolerance = abs(baseline) * tolerance_pct / 100.0
+    if higher_is_better:
+        passed = candidate >= baseline - tolerance
+    else:
+        passed = candidate <= baseline + tolerance
+    return {
+        "baseline": baseline,
+        "candidate": candidate,
+        "delta": delta,
+        "pct": pct,
+        "higher_is_better": higher_is_better,
+        "pass": passed,
+    }
+
+
+def _compare_contract_metadata(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
     baseline_metadata = baseline.get("metadata", {})
     candidate_metadata = candidate.get("metadata", {})
     mismatches = []
@@ -173,7 +224,8 @@ def _compare_contract_metadata(baseline: dict[str, Any], candidate: dict[str, An
             mismatches.append((key, baseline_metadata[key], candidate_metadata[key]))
 
     print("Same-calculation metadata contract")
-    if mismatches:
+    passed = not mismatches and not missing
+    if mismatches or missing:
         print("  FAIL")
         for key, baseline_value, candidate_value in mismatches:
             print(f"  {key}: baseline={baseline_value!r}, candidate={candidate_value!r}")
@@ -182,56 +234,220 @@ def _compare_contract_metadata(baseline: dict[str, Any], candidate: dict[str, An
     if missing:
         print(f"  missing_keys: {', '.join(missing)}")
     print()
-    return not mismatches
+    return {
+        "pass": passed,
+        "mismatches": [
+            {"key": key, "baseline": baseline_value, "candidate": candidate_value}
+            for key, baseline_value, candidate_value in mismatches
+        ],
+        "missing_keys": missing,
+    }
 
 
-def compare_profiles(baseline_path: Path, candidate_path: Path, *, label: str) -> None:
+def _compare_label_records(
+        baseline: dict[str, Any],
+        candidate: dict[str, Any],
+        *,
+        label: str,
+        regression_tolerance_pct: float,
+) -> dict[str, Any]:
+    baseline_records = _records_for_label(baseline, label)
+    candidate_records = _records_for_label(candidate, label)
+    window_results = []
+    comparable_count = min(len(baseline_records), len(candidate_records))
+    for index in range(comparable_count):
+        baseline_record = baseline_records[index]
+        candidate_record = candidate_records[index]
+        metric_results = {
+            "tokens_per_second": _metric_comparison(
+                _record_tokens_per_second(baseline_record),
+                _record_tokens_per_second(candidate_record),
+                higher_is_better=True,
+                tolerance_pct=regression_tolerance_pct,
+            ),
+            "model_elapsed_seconds": _metric_comparison(
+                float(baseline_record.get("model_elapsed_seconds", 0.0) or 0.0),
+                float(candidate_record.get("model_elapsed_seconds", 0.0) or 0.0),
+                higher_is_better=False,
+                tolerance_pct=regression_tolerance_pct,
+            ),
+            "outer_wall_seconds": _metric_comparison(
+                float(baseline_record.get("wall_seconds", 0.0) or 0.0),
+                float(candidate_record.get("wall_seconds", 0.0) or 0.0),
+                higher_is_better=False,
+                tolerance_pct=regression_tolerance_pct,
+            ),
+        }
+        generated_tokens_match = (
+            int(baseline_record.get("generated_tokens", 0) or 0)
+            == int(candidate_record.get("generated_tokens", 0) or 0)
+        )
+        keys_match = _record_key(baseline_record, index) == _record_key(candidate_record, index)
+        window_results.append({
+            "index": index,
+            "baseline_key": _record_key(baseline_record, index),
+            "candidate_key": _record_key(candidate_record, index),
+            "keys_match": keys_match,
+            "generated_tokens_match": generated_tokens_match,
+            "metrics": metric_results,
+            "pass": (
+                keys_match
+                and generated_tokens_match
+                and all(metric["pass"] for metric in metric_results.values())
+            ),
+        })
+
+    failed = [record for record in window_results if not record["pass"]]
+    pass_result = (
+        len(baseline_records) == len(candidate_records)
+        and all(record["pass"] for record in window_results)
+    )
+    print("Per-window no-regression")
+    if pass_result:
+        print(f"  PASS ({len(window_results)} records)")
+    else:
+        print(
+            "  FAIL "
+            f"(baseline_records={len(baseline_records)}, candidate_records={len(candidate_records)}, "
+            f"failed_records={len(failed)})"
+        )
+        for record in failed[:5]:
+            print(
+                "  {index}: baseline={baseline}, candidate={candidate}".format(
+                    index=record["index"],
+                    baseline=record["baseline_key"],
+                    candidate=record["candidate_key"],
+                )
+            )
+    print()
+    return {
+        "pass": pass_result,
+        "baseline_records": len(baseline_records),
+        "candidate_records": len(candidate_records),
+        "failed_records": len(failed),
+        "windows": window_results,
+    }
+
+
+def compare_profiles(
+        baseline_path: Path,
+        candidate_path: Path,
+        *,
+        label: str,
+        regression_tolerance_pct: float = 0.0,
+) -> dict[str, Any]:
     baseline = _load_profile(baseline_path)
     candidate = _load_profile(candidate_path)
     baseline_summary = _summary_for_label(baseline, label)
     candidate_summary = _summary_for_label(candidate, label)
+    report: dict[str, Any] = {
+        "baseline_path": str(baseline_path),
+        "candidate_path": str(candidate_path),
+        "label": label,
+        "regression_tolerance_pct": regression_tolerance_pct,
+        "same_calculation": {},
+        "performance": {
+            "pass": False,
+            "metrics": {},
+            "generated_tokens_match": None,
+            "records_match": None,
+            "per_window": {},
+        },
+        "token_equivalence": {
+            "status": "not_checked",
+            "pass": False,
+            "baseline_len": None,
+            "candidate_len": None,
+            "first_mismatch": None,
+        },
+    }
 
     print(f"Baseline:  {baseline_path}")
     print(f"Candidate: {candidate_path}")
     print(f"Label:     {label}")
     print()
 
-    _compare_contract_metadata(baseline, candidate)
+    report["same_calculation"] = _compare_contract_metadata(baseline, candidate)
 
     if not baseline_summary or not candidate_summary:
         print("Missing generation summary for requested label.")
-        return
+        report["performance"]["missing_summary"] = True
+        return report
 
-    _compare_number(
-        "tokens_per_second",
-        float(baseline_summary.get("tokens_per_second", 0.0) or 0.0),
-        float(candidate_summary.get("tokens_per_second", 0.0) or 0.0),
-        higher_is_better=True,
+    metric_specs = {
+        "tokens_per_second": True,
+        "model_elapsed_seconds": False,
+        "outer_wall_seconds": False,
+        "total_stage_wall_seconds": False,
+    }
+    metric_values = {
+        "tokens_per_second": (
+            float(baseline_summary.get("tokens_per_second", 0.0) or 0.0),
+            float(candidate_summary.get("tokens_per_second", 0.0) or 0.0),
+        ),
+        "model_elapsed_seconds": (
+            float(baseline_summary.get("model_elapsed_seconds", 0.0) or 0.0),
+            float(candidate_summary.get("model_elapsed_seconds", 0.0) or 0.0),
+        ),
+        "outer_wall_seconds": (
+            float(baseline_summary.get("wall_seconds", 0.0) or 0.0),
+            float(candidate_summary.get("wall_seconds", 0.0) or 0.0),
+        ),
+        "total_stage_wall_seconds": (
+            _total_stage_wall_seconds(baseline),
+            _total_stage_wall_seconds(candidate),
+        ),
+    }
+    for name, higher_is_better in metric_specs.items():
+        baseline_value, candidate_value = metric_values[name]
+        _compare_number(name, baseline_value, candidate_value, higher_is_better=higher_is_better)
+        report["performance"]["metrics"][name] = _metric_comparison(
+            baseline_value,
+            candidate_value,
+            higher_is_better=higher_is_better,
+            tolerance_pct=regression_tolerance_pct,
+        )
+
+    baseline_tokens_count = baseline_summary.get("generated_tokens")
+    candidate_tokens_count = candidate_summary.get("generated_tokens")
+    baseline_records = baseline_summary.get("records")
+    candidate_records = candidate_summary.get("records")
+    generated_tokens_match = baseline_tokens_count == candidate_tokens_count
+    records_match = baseline_records == candidate_records
+    report["performance"]["generated_tokens_match"] = generated_tokens_match
+    report["performance"]["records_match"] = records_match
+    report["performance"]["per_window"] = _compare_label_records(
+        baseline,
+        candidate,
+        label=label,
+        regression_tolerance_pct=regression_tolerance_pct,
     )
-    _compare_number(
-        "model_elapsed_seconds",
-        float(baseline_summary.get("model_elapsed_seconds", 0.0) or 0.0),
-        float(candidate_summary.get("model_elapsed_seconds", 0.0) or 0.0),
-        higher_is_better=False,
+    report["performance"]["pass"] = (
+        all(metric["pass"] for metric in report["performance"]["metrics"].values())
+        and generated_tokens_match
+        and records_match
+        and report["performance"]["per_window"]["pass"]
     )
-    _compare_number(
-        "outer_wall_seconds",
-        float(baseline_summary.get("wall_seconds", 0.0) or 0.0),
-        float(candidate_summary.get("wall_seconds", 0.0) or 0.0),
-        higher_is_better=False,
-    )
-    print(f"  generated_tokens: baseline={baseline_summary.get('generated_tokens')}, candidate={candidate_summary.get('generated_tokens')}")
-    print(f"  records: baseline={baseline_summary.get('records')}, candidate={candidate_summary.get('records')}")
+    print(f"  generated_tokens: baseline={baseline_tokens_count}, candidate={candidate_tokens_count}")
+    print(f"  records: baseline={baseline_records}, candidate={candidate_records}")
+    print(f"  no_regression_gate: {'PASS' if report['performance']['pass'] else 'FAIL'}")
     print()
 
     baseline_tokens = _flatten_token_ids(baseline, label)
     candidate_tokens = _flatten_token_ids(candidate, label)
     if baseline_tokens is None or candidate_tokens is None:
         print("Token equivalence: not checked; rerun with profile_record_token_ids=true.")
-        return
+        return report
     if baseline_tokens == candidate_tokens:
         print(f"Token equivalence: PASS ({len(baseline_tokens)} generated token IDs match).")
-        return
+        report["token_equivalence"] = {
+            "status": "PASS",
+            "pass": True,
+            "baseline_len": len(baseline_tokens),
+            "candidate_len": len(candidate_tokens),
+            "first_mismatch": None,
+        }
+        return report
 
     mismatch = next(
         (idx for idx, pair in enumerate(zip(baseline_tokens, candidate_tokens)) if pair[0] != pair[1]),
@@ -241,6 +457,14 @@ def compare_profiles(baseline_path: Path, candidate_path: Path, *, label: str) -
         "Token equivalence: FAIL "
         f"(baseline_len={len(baseline_tokens)}, candidate_len={len(candidate_tokens)}, first_mismatch={mismatch})."
     )
+    report["token_equivalence"] = {
+        "status": "FAIL",
+        "pass": False,
+        "baseline_len": len(baseline_tokens),
+        "candidate_len": len(candidate_tokens),
+        "first_mismatch": mismatch,
+    }
+    return report
 
 
 def main() -> None:
@@ -255,9 +479,59 @@ def main() -> None:
         help="Compare two profile JSON files.",
     )
     parser.add_argument("--label", default="main_generation", help="Generation label to compare.")
+    parser.add_argument(
+        "--regression-tolerance-pct",
+        type=float,
+        default=0.0,
+        help="Tolerance used by --require-no-regression. Default 0 means no tolerated degradation.",
+    )
+    parser.add_argument(
+        "--require-contract-match",
+        action="store_true",
+        help="Exit nonzero if same-calculation metadata differs.",
+    )
+    parser.add_argument(
+        "--require-token-equivalence",
+        action="store_true",
+        help="Exit nonzero unless generated token IDs are present and exactly match.",
+    )
+    parser.add_argument(
+        "--require-no-regression",
+        action="store_true",
+        help="Exit nonzero if candidate throughput, model time, wall time, token count, or record count regresses.",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Shortcut for all --require-* comparison gates.",
+    )
+    parser.add_argument(
+        "--json-output",
+        type=Path,
+        default=None,
+        help="Write a machine-readable comparison report.",
+    )
     args = parser.parse_args()
     if args.compare:
-        compare_profiles(args.compare[0], args.compare[1], label=args.label)
+        report = compare_profiles(
+            args.compare[0],
+            args.compare[1],
+            label=args.label,
+            regression_tolerance_pct=args.regression_tolerance_pct,
+        )
+        if args.json_output is not None:
+            args.json_output.parent.mkdir(parents=True, exist_ok=True)
+            args.json_output.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+        require_contract_match = args.require_contract_match or args.strict
+        require_token_equivalence = args.require_token_equivalence or args.strict
+        require_no_regression = args.require_no_regression or args.strict
+        failed = (
+            (require_contract_match and not report["same_calculation"].get("pass", False))
+            or (require_token_equivalence and not report["token_equivalence"].get("pass", False))
+            or (require_no_regression and not report["performance"].get("pass", False))
+        )
+        raise SystemExit(1 if failed else 0)
     elif args.profile:
         summarize(args.profile, limit=args.limit)
     else:
