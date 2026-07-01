@@ -617,6 +617,44 @@ RTX 2080 Ti full-song comparison on DCC `gpu-common`, node `dcc-core-ferc-s-z25-
 
 Smoke profiling looked promising (`+31.9%`), but the accepted full-song comparison was only `+2.3%` with token equivalence PASS for all `7,639` generated main-generation token IDs. This is below the keep threshold, so the change was reverted. Do not reintroduce inference-mode wrapping unless a future full-song result clears the acceptance threshold.
 
+## Active-Prefix Decode Isolation
+
+Commit `51f189f` added diagnostic switches to isolate active-prefix self-attention during direct-cache prefill vs the one-token decode step. This is not a production inference path and not a throughput claim; it is a correctness and fixed-step ceiling test.
+
+DCC job `49140082`, node `dcc-core-ferc-s-z25-20`, RTX 2080 Ti, commit `51f189f`:
+
+- Run dir: `/work/imt11/Mapperatorinator/runs/active-prefix-isolate-49140082-51f189f`
+- Logs: `/work/imt11/Mapperatorinator/logs/active-prefix-isolate-49140082.out` and `.err`
+- Config: `profile_salvalai_smoke15`, `seq9`, `precision=fp32`, `attn_implementation=sdpa`, `use_server=false`, `parallel=false`, `cfg_scale=1.0`, `num_beams=1`
+
+Correctness split:
+
+| Variant | Compile | Result |
+| --- | --- | --- |
+| baseline | false | PASS, `max_abs=0.0`, top-k match |
+| active-prefix prefill only | false | FAIL, `max_abs=15.413055`, top-k mismatch |
+| active-prefix decode only | false | PASS, `max_abs=0.0`, top-k match |
+| active-prefix prefill + decode | false | FAIL, `max_abs=15.413055`, top-k mismatch |
+| baseline | true | PASS, `max_abs=2.2888e-05`, top-k match |
+| active-prefix prefill only | true | FAIL, `max_abs=15.413059`, top-k mismatch |
+| active-prefix decode only | true | PASS, `max_abs=2.2888e-05`, top-k match |
+| active-prefix prefill + decode | true | FAIL, `max_abs=15.413059`, top-k mismatch |
+
+Fixed-step graph timing for the passing decode-only variant:
+
+| Compile | Report | Eager ms/step | Graph ms/step | Speedup |
+| --- | --- | ---: | ---: | ---: |
+| false | `graph_decode_compile_false.json` | `11.4996ms` | `3.7891ms` | `3.035x` |
+| true | `graph_decode_compile_true.json` | `11.7837ms` | `3.7899ms` | `3.109x` |
+
+Interpretation:
+
+- Do not apply active-prefix self-attention during static-cache prefill; it is not equivalent in the current model path.
+- One-token decode-only active-prefix is logits-equivalent for this gate and gives a fixed-step graph ceiling near `264 tok/s` before real loop overhead.
+- This is the first measured exact-calculation path with plausible arithmetic for a `200 tok/s` runtime project, but it still needs a real generated-token loop. The current graph POC replays one prepared `[1, 1]` step and does not handle changing tokens, changing prefix lengths, logits processors, sampling/RNG, EOS, or generated-token accounting.
+
+Next implementation direction: leave prefill unchanged, then build an opt-in batch-1 direct decode loop using `osuT5.osuT5.inference.direct_decode` with active-prefix applied only around the one-token model forward. Expect the main engineering problem to be graph/capture discipline with changing active prefix lengths, likely requiring bucketed graph caches, per-length captures, or a more stable active-prefix cache/kernel layout.
+
 ## Runtime Backend Feasibility Notes
 
 ### Torch-TensorRT and TensorRT-RTX
@@ -648,9 +686,9 @@ The next TensorRT gate, if revisited with another package/CUDA/runtime combinati
 
 See `notes/2026-07-01-tensorrt-packaging-probe.md` for the full resolver details.
 
-## 200 tok/s Stop Decision
+## 200 tok/s Quick-Tweak Stop Decision
 
-The current-architecture 200 tok/s scouting loop stopped on 2026-07-01 by the documented stop condition. The target was not reached, but the measured exact-calculation candidate families no longer show a plausible remaining major full-song win on RTX 2080/2080 Ti.
+The first current-architecture 200 tok/s scouting loop stopped on 2026-07-01 by the documented stop condition. The target was not reached, and the measured quick-tweak candidate families no longer showed a plausible remaining major full-song win on RTX 2080/2080 Ti.
 
 The final retained baseline remains SDPA plus `inference_generation_compile=true`: full-song job `49113713`, `7,639` main-generation tokens, `82.615s` synchronized model time, `92.465 tok/s`, and fixed-seed token equivalence PASS against the compile-disabled full-song baseline.
 
@@ -659,6 +697,8 @@ The final rejection set includes copy-compatible custom `_sample` hook, prealloc
 Final read-only subagent `019f1c3b-a844-73d1-8e67-858ad3b51732` agreed with stopping: no remaining exact-calculation path was both plausible for a `>=10%` full-song win and worth running before the stop decision.
 
 See `notes/2026-07-01-200tps-stop-decision.md` for the closure summary. Future attempts toward `200 tok/s` should start as a separate runtime/kernel project with new evidence, not by rerunning the documented failed scouts.
+
+The renewed runtime/kernel pass later found new evidence in job `49140082`: decode-only active-prefix self-attention passed the one-token logits gate and cut fixed graph replay to about `3.79ms`, while active-prefix prefill failed. Treat that as new runtime evidence that supersedes the old "no remaining quick tweak" state without changing the retained full-song baseline.
 
 ## What The Profile Captures
 
