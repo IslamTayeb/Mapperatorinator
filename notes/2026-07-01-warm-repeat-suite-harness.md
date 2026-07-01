@@ -46,3 +46,33 @@ python utils/profile_inference_suite.py \
 ```
 
 Compare run 0 separately from runs 1..2. If active-prefix only wins warmed runs, document it as `warm_repeat` evidence and keep it default-off for cold single-song profiling.
+
+## Smoke15 Result
+
+DCC job `49154124` validated the harness on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti, driver `595.71.05`, torch `2.10.0+cu128`, Transformers `4.57.3`, commit `d20f26a`.
+
+- Run dir: `/work/imt11/Mapperatorinator/runs/warm-repeat-smoke15-49154124-d20f26a`
+- Logs: `/work/imt11/Mapperatorinator/logs/warm-suite-smoke15-49154124.out` and `.err`
+- Status: `COMPLETED`, exit code `0:0`, elapsed `00:04:01`
+- Config: `profile_salvalai_smoke15`, `audio_path=/work/imt11/Mapperatorinator/data/salvalai.mp3`, `use_server=false`, `attn_implementation=sdpa`, `profile_record_token_ids=true`, `seed=12345`
+
+Main-generation results:
+
+| suite | run | tokens | model time | tok/s | token equivalence |
+| --- | ---: | ---: | ---: | ---: | --- |
+| compile-only | 0 cold | 1,084 | 22.245s | 48.730 | baseline |
+| compile-only | 1 warmed | 1,084 | 10.729s | 101.033 | PASS vs run 0 |
+| compile-only | 2 warmed | 1,084 | 10.728s | 101.046 | PASS vs run 0 |
+| active512 | 0 cold | 1,084 | 30.022s | 36.107 | baseline |
+| active512 | 1 warmed | 1,084 | 7.333s | 147.822 | PASS vs run 0 |
+| active512 | 2 warmed | 1,084 | 7.286s | 148.777 | PASS vs run 0 |
+
+Cross-suite token equivalence also passed for compile-only vs active512 on all three matching runs. `utils/summarize_inference_profile.py --compare` reported:
+
+| run | compile tok/s | active512 tok/s | delta | token equivalence |
+| ---: | ---: | ---: | ---: | --- |
+| 0 cold | 48.730 | 36.107 | -25.9% | PASS, 1,084 / 1,084 |
+| 1 warmed | 101.033 | 147.822 | +46.3% | PASS, 1,084 / 1,084 |
+| 2 warmed | 101.046 | 148.777 | +47.2% | PASS, 1,084 / 1,084 |
+
+Interpretation: active-prefix bucket512 remains a bad cold smoke default, but it is a strong exact warmed-repeat signal. This supports keeping the path default-off while prioritizing first-window/specialization and graph/runtime-stability work. It also justifies a full-song `warm_repeat` run if future batch or long-lived serving throughput becomes the active question.

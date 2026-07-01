@@ -22,6 +22,7 @@ if str(REPO_ROOT) not in sys.path:
 from inference import (  # noqa: E402
     compile_args,
     generate,
+    get_default_logger,
     get_config,
     load_diff_model,
     load_model_with_server,
@@ -225,6 +226,7 @@ def main() -> None:
     assets = _load_models(base_args)
 
     generation_config, beatmap_config = get_config(base_args)
+    logger = get_default_logger()
     baseline_tokens: list[int] | None = None
     runs: list[dict[str, Any]] = []
 
@@ -268,6 +270,7 @@ def main() -> None:
             diff_tokenizer=assets["diff_tokenizer"],
             refine_model=assets["refine_model"],
             profiler=profiler,
+            logger=logger,
         )
 
         profile_path = Path(run_args.profile_output_path)

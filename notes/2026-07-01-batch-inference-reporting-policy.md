@@ -28,3 +28,5 @@ Active-prefix validation showed the risk directly: bucketed active-prefix had st
 ## Rule
 
 Report warmed or multi-song improvements as warmed or multi-song improvements. Do not use them to replace the retained cold single-song baseline unless they pass the normal cold single-song graduation gates.
+
+For realistic batch or multi-song scouting, prefer suites of at least 5 songs when feasible. If `batch_mode` and `normal_mode` diverge materially, report paired mode-specific results instead of averaging them into one headline number.

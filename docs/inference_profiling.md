@@ -110,6 +110,15 @@ python utils/profile_inference_suite.py \
 
 The harness loads the model once, resets RNG before every `generate()` call, writes one profile JSON per run, and writes `suite_manifest.json` with first-run, warmed-run, aggregate throughput, profile paths, and token-equivalence status against run 0. It currently supports only `warm_repeat`; `serial_multi_song` fails loudly until an explicit multi-song config/list exists. Its warmed results are useful operational evidence, but they are not cold single-song acceptance evidence.
 
+First smoke result, DCC job `49154124` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti, commit `d20f26a`:
+
+| suite | cold run | warmed runs | cross-suite equivalence | interpretation |
+| --- | ---: | ---: | --- | --- |
+| compile-only | `48.730 tok/s` | `101.040 tok/s` aggregate | baseline | retained path warms substantially |
+| active512 | `36.107 tok/s` | `148.298 tok/s` aggregate | PASS vs compile-only for runs 0, 1, and 2 | exact warmed-repeat win, cold regression |
+
+Run dir: `/work/imt11/Mapperatorinator/runs/warm-repeat-smoke15-49154124-d20f26a`. This is `warm_repeat` evidence only. It strengthens the case for fixing active-prefix first-window/specialization cost and for future batch/serving work, but it does not replace the cold single-song baseline.
+
 ## Smoke-To-Full Profiling Loop
 
 Start with the middle 15s SALVALAI smoke config for fastest iteration:
