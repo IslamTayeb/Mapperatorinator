@@ -178,6 +178,8 @@ class Processor(object):
             mania_column_temperature=self.mania_column_temperature,
             taiko_hit_temperature=self.taiko_hit_temperature,
             sync_model_timing=self.profiler.enabled and self.profiler.sync_cuda,
+            profile_generation_detail_ranges=bool(getattr(self.args, "profile_generation_detail_ranges", False)),
+            profile_sdpa_backend=getattr(self.args, "profile_sdpa_backend", None),
         )
 
         if isinstance(self.model, InferenceClient):
@@ -1472,6 +1474,8 @@ class Processor(object):
             ),
             "precision": stats.get("precision", self.precision),
             "generation_compile_enabled": stats.get("generation_compile_enabled"),
+            "profile_generation_detail_ranges": stats.get("profile_generation_detail_ranges"),
+            "profile_sdpa_backend": stats.get("profile_sdpa_backend"),
             "use_server": isinstance(self.model, InferenceClient),
             "parallel": self.parallel,
         }

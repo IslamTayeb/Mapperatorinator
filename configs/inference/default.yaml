@@ -73,6 +73,8 @@ profile_torch_record_shapes: true # Record tensor shapes in torch.profiler trace
 profile_torch_profile_memory: true # Record memory events in torch.profiler traces
 profile_torch_with_stack: false # Record Python stacks in torch.profiler traces
 profile_record_token_ids: false # Record generated token IDs in profile JSON for fixed-seed equivalence checks
+profile_generation_detail_ranges: false # Add detailed NVTX/torch profiler ranges inside generation
+profile_sdpa_backend: null # Force one PyTorch SDPA backend for profiling (flash/efficient/math/cudnn)
 resnap_events: true      # Resnap events to the timing after generation
 snap_near_perfect_overlaps: true  # Snap nearly overlapping positions to each other
 

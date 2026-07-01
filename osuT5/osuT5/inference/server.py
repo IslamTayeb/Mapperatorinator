@@ -13,6 +13,7 @@ from .logit_processors import ConditionalTemperatureLogitsWarper, get_beat_type_
     get_mania_type_tokens, get_scroll_speed_tokens, TimeshiftBias, LookbackBiasLogitsWarper, \
     MonotonicTimeShiftLogitsProcessor
 from .cache_utils import get_cache
+from ..runtime_profiling import generation_profile_context
 from ..model import Mapperatorinator
 from ..tokenizer import Tokenizer
 
@@ -87,35 +88,24 @@ def get_eos_token_id(tokenizer, lookback_time: float = 0, lookahead_time: float 
     return eos_token_id
 
 
-def _sync_cuda_for_model(model) -> None:
-    if torch.cuda.is_available() and getattr(getattr(model, "device", None), "type", None) == "cuda":
-        torch.cuda.synchronize(model.device)
+def build_logits_processor_list(
+        tokenizer,
+        *,
+        cfg_scale: float = 1.0,
+        timeshift_bias: float = 0.0,
+        types_first: bool = False,
+        temperature: float = 1.0,
+        timing_temperature: float | None = None,
+        mania_column_temperature: float | None = None,
+        taiko_hit_temperature: float | None = None,
+        lookback_time: float = 0.0,
+        device=None,
+) -> LogitsProcessorList:
+    timing_temperature = temperature if timing_temperature is None else timing_temperature
+    mania_column_temperature = temperature if mania_column_temperature is None else mania_column_temperature
+    taiko_hit_temperature = temperature if taiko_hit_temperature is None else taiko_hit_temperature
+    device = device if device is not None else getattr(tokenizer, "device", None)
 
-
-@torch.no_grad()
-def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
-    # To device
-    model_kwargs = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v for k, v in model_kwargs.items()}
-    model_kwargs = {k: v.to(model.dtype) if k != "inputs" and isinstance(v, torch.Tensor) and v.dtype == torch.float32 else v for k, v in model_kwargs.items()}
-    batch_size = model_kwargs['inputs'].shape[0]
-    # print(f"[Model Generate] Batch size: {batch_size}, Model device: {model.device}")
-
-    precision = generate_kwargs.pop('precision', 'fp32')
-    cfg_scale = generate_kwargs.pop('cfg_scale', 1.0)
-    timeshift_bias = generate_kwargs.pop('timeshift_bias', 0)
-    types_first = generate_kwargs.pop('types_first', False)
-    temperature = generate_kwargs.pop('temperature', 1.0)
-    timing_temperature = generate_kwargs.pop('timing_temperature', temperature)
-    mania_column_temperature = generate_kwargs.pop('mania_column_temperature', temperature)
-    taiko_hit_temperature = generate_kwargs.pop('taiko_hit_temperature', temperature)
-    lookback_time = generate_kwargs.pop('lookback_time', 0.0)
-    lookahead_time = generate_kwargs.pop('lookahead_time', 0.0)
-    context_type = generate_kwargs.pop('context_type', None)
-    sync_model_timing = bool(generate_kwargs.pop('sync_model_timing', False))
-    if context_type is not None:
-        context_type = ContextType(context_type)  # Convert to ContextType enum
-
-    # Create the logits processors
     logits_processor_list = LogitsProcessorList()
     if cfg_scale > 1.0:
         logits_processor_list.append(ClassifierFreeGuidanceLogitsProcessor(cfg_scale))
@@ -144,14 +134,65 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     else:
         logits_processor_list.append(TemperatureLogitsWarper(temperature))
     if lookback_time > 0:
-        logits_processor_list.append(LookbackBiasLogitsWarper(lookback_time, tokenizer, types_first, model.device))
+        logits_processor_list.append(LookbackBiasLogitsWarper(lookback_time, tokenizer, types_first, device))
+
+    return logits_processor_list
+
+
+def _sync_cuda_for_model(model) -> None:
+    if torch.cuda.is_available() and getattr(getattr(model, "device", None), "type", None) == "cuda":
+        torch.cuda.synchronize(model.device)
+
+
+@torch.no_grad()
+def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
+    # To device
+    model_kwargs = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v for k, v in model_kwargs.items()}
+    model_kwargs = {k: v.to(model.dtype) if k != "inputs" and isinstance(v, torch.Tensor) and v.dtype == torch.float32 else v for k, v in model_kwargs.items()}
+    batch_size = model_kwargs['inputs'].shape[0]
+    # print(f"[Model Generate] Batch size: {batch_size}, Model device: {model.device}")
+
+    precision = generate_kwargs.pop('precision', 'fp32')
+    cfg_scale = generate_kwargs.pop('cfg_scale', 1.0)
+    timeshift_bias = generate_kwargs.pop('timeshift_bias', 0)
+    types_first = generate_kwargs.pop('types_first', False)
+    temperature = generate_kwargs.pop('temperature', 1.0)
+    timing_temperature = generate_kwargs.pop('timing_temperature', temperature)
+    mania_column_temperature = generate_kwargs.pop('mania_column_temperature', temperature)
+    taiko_hit_temperature = generate_kwargs.pop('taiko_hit_temperature', temperature)
+    lookback_time = generate_kwargs.pop('lookback_time', 0.0)
+    lookahead_time = generate_kwargs.pop('lookahead_time', 0.0)
+    context_type = generate_kwargs.pop('context_type', None)
+    sync_model_timing = bool(generate_kwargs.pop('sync_model_timing', False))
+    profile_generation_detail_ranges = bool(generate_kwargs.pop('profile_generation_detail_ranges', False))
+    profile_sdpa_backend = generate_kwargs.pop('profile_sdpa_backend', None)
+    if context_type is not None:
+        context_type = ContextType(context_type)  # Convert to ContextType enum
+
+    # Create the logits processors
+    logits_processor_list = build_logits_processor_list(
+        tokenizer,
+        cfg_scale=cfg_scale,
+        timeshift_bias=timeshift_bias,
+        types_first=types_first,
+        temperature=temperature,
+        timing_temperature=timing_temperature,
+        mania_column_temperature=mania_column_temperature,
+        taiko_hit_temperature=taiko_hit_temperature,
+        lookback_time=lookback_time,
+        device=model.device,
+    )
 
     # Prepare cache
     cache = get_cache(model, batch_size, generate_kwargs.get('num_beams', 1), cfg_scale)
     pad_token_id = generate_kwargs.get('pad_token_id', getattr(tokenizer, 'pad_id', None))
 
     # Perform batched generation
-    with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16, enabled=precision == 'amp'):
+    with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16, enabled=precision == 'amp'), \
+            generation_profile_context(
+                detail_ranges=profile_generation_detail_ranges,
+                sdpa_backend=profile_sdpa_backend,
+            ):
         if sync_model_timing:
             _sync_cuda_for_model(model)
         start_time = time.perf_counter()
@@ -177,6 +218,8 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         "do_sample": bool(generate_kwargs.get("do_sample", False)),
         "sync_model_timing": sync_model_timing,
         "generation_compile_enabled": not bool(getattr(getattr(model, "generation_config", None), "disable_compile", True)),
+        "profile_generation_detail_ranges": profile_generation_detail_ranges,
+        "profile_sdpa_backend": profile_sdpa_backend,
     })
 
     return result, stats

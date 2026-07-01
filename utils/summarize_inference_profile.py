@@ -6,6 +6,34 @@ from pathlib import Path
 from typing import Any
 
 
+CONTRACT_METADATA_KEYS = [
+    "model_path",
+    "audio_path",
+    "seed",
+    "precision",
+    "attn_implementation",
+    "use_server",
+    "parallel",
+    "temperature",
+    "timing_temperature",
+    "mania_column_temperature",
+    "taiko_hit_temperature",
+    "timeshift_bias",
+    "top_p",
+    "top_k",
+    "do_sample",
+    "num_beams",
+    "cfg_scale",
+    "lookback",
+    "lookahead",
+    "start_time",
+    "end_time",
+    "in_context",
+    "output_type",
+    "profile_record_token_ids",
+]
+
+
 def _fmt_seconds(value: Any) -> str:
     try:
         return f"{float(value):8.3f}s"
@@ -132,6 +160,31 @@ def _compare_number(name: str, baseline: float, candidate: float, *, higher_is_b
     print(f"  {name}: baseline={baseline:.3f}, candidate={candidate:.3f}, delta={delta:+.3f} ({pct:+.1f}%, {direction})")
 
 
+def _compare_contract_metadata(baseline: dict[str, Any], candidate: dict[str, Any]) -> bool:
+    baseline_metadata = baseline.get("metadata", {})
+    candidate_metadata = candidate.get("metadata", {})
+    mismatches = []
+    missing = []
+    for key in CONTRACT_METADATA_KEYS:
+        if key not in baseline_metadata or key not in candidate_metadata:
+            missing.append(key)
+            continue
+        if baseline_metadata[key] != candidate_metadata[key]:
+            mismatches.append((key, baseline_metadata[key], candidate_metadata[key]))
+
+    print("Same-calculation metadata contract")
+    if mismatches:
+        print("  FAIL")
+        for key, baseline_value, candidate_value in mismatches:
+            print(f"  {key}: baseline={baseline_value!r}, candidate={candidate_value!r}")
+    else:
+        print("  PASS")
+    if missing:
+        print(f"  missing_keys: {', '.join(missing)}")
+    print()
+    return not mismatches
+
+
 def compare_profiles(baseline_path: Path, candidate_path: Path, *, label: str) -> None:
     baseline = _load_profile(baseline_path)
     candidate = _load_profile(candidate_path)
@@ -142,6 +195,8 @@ def compare_profiles(baseline_path: Path, candidate_path: Path, *, label: str) -
     print(f"Candidate: {candidate_path}")
     print(f"Label:     {label}")
     print()
+
+    _compare_contract_metadata(baseline, candidate)
 
     if not baseline_summary or not candidate_summary:
         print("Missing generation summary for requested label.")

@@ -132,6 +132,60 @@ python utils/summarize_inference_profile.py \
   --compare /path/to/baseline.profile.json /path/to/candidate.profile.json
 ```
 
+The comparer now prints a same-calculation metadata contract before token comparison. A candidate is not promotable if it differs from the baseline in model, audio, seed, precision, sampling policy, windowing, context/output policy, server/parallel mode, or token-recording setup unless the run is explicitly labeled non-equivalent.
+
+Before any custom decoder-step, CUDA graph, backend, or kernel path is treated as a candidate, run the one-token logits gate on the same 15s smoke config:
+
+```bash
+python utils/verify_one_token_decode.py \
+  --config-name profile_salvalai_smoke15 \
+  --report-path "$WORK/runs/one-token-decode-${SLURM_JOB_ID}.json" \
+  audio_path="$WORK/data/salvalai.mp3" \
+  output_path="$WORK/runs/profile-smoke15-${SLURM_JOB_ID}" \
+  device=cuda \
+  precision=fp32 \
+  attn_implementation=sdpa \
+  use_server=false \
+  parallel=false \
+  cfg_scale=1.0 \
+  num_beams=1
+```
+
+This gate compares full-prefix raw logits against the static-cache `q_len=1` decode step for the real SALVALAI prompt-building path. It deliberately avoids calling `generate()` as the reference so it does not consume sampling RNG or mutate generation caches. Passing this gate is necessary for decoder-runtime work, but not sufficient for a speed claim; still require fixed-seed 15s generated-token equivalence and full-song equivalence.
+
+For post-warmup diagnosis, use detailed internal ranges only in torch-profiler or Nsight runs:
+
+```bash
+python inference.py --config-name profile_salvalai_smoke15 \
+  audio_path="$WORK/data/salvalai.mp3" \
+  output_path="$WORK/runs/profile-smoke15-trace-${SLURM_JOB_ID}" \
+  device=cuda \
+  precision=fp32 \
+  attn_implementation=sdpa \
+  use_server=false \
+  profile_torch_generation=true \
+  profile_torch_generation_limit=1 \
+  profile_torch_generation_label_filter=main_generation \
+  profile_generation_detail_ranges=true
+```
+
+`profile_generation_detail_ranges=true` adds NVTX and `record_function` ranges inside VarWhisper decoder self-attention, cross-attention, MLP `fc1`/activation/`fc2`, final norm, and output projection. These traces are diagnostic only; do not use traced wall time for throughput claims.
+
+For SDPA dispatch audits, force one PyTorch SDPA backend at a time:
+
+```bash
+python inference.py --config-name profile_salvalai_smoke15 \
+  audio_path="$WORK/data/salvalai.mp3" \
+  output_path="$WORK/runs/profile-smoke15-sdpa-flash-${SLURM_JOB_ID}" \
+  device=cuda \
+  precision=fp32 \
+  attn_implementation=sdpa \
+  use_server=false \
+  profile_sdpa_backend=flash
+```
+
+Valid backend values are `flash`, `efficient`, `math`, and `cudnn` when the installed PyTorch exposes them. Record PyTorch warnings, actual profiler kernel names, token equivalence, and untraced speed. A forced backend micro-result does not replace the retained SDPA baseline without full-song token-equivalent evidence.
+
 Promote a change to a full-song SALVALAI run only when smoke results are stable, token IDs match, and the speedup is plausibly meaningful. For compile-like changes with one-time first-window costs, inspect post-warmup per-window throughput before rejecting a weak total smoke result. Keep changes that improve RTX 2080 full-song main-generation throughput by about 10% or more. Keep 5-10% wins only when they are simple and well-contained or strategically de-risk the custom runtime path. Remove 1-3% complexity by default.
 
 For the current 200 tok/s phase, stop the long-running optimization loop only when either the full-song RTX 2080/2080 Ti run reaches at least `200 tok/s` with identical fixed-seed tokens, or profiling across multiple exact-calculation optimization families shows no remaining plausible major exact-calculation path.
@@ -145,10 +199,12 @@ Current status after 2026-07-01 scouting:
 
 For the 200 tok/s phase, rank the next experiments this way:
 
-1. Exact custom decode-loop prototype with CUDA graph discipline.
-2. Fused sampling/logits-processor profiling, then exact fusion only if sampling is at least `10%` of synchronized main-generation time.
-3. Torch-TensorRT / TensorRT-RTX feasibility for the repeated one-token decoder forward.
-4. Backend/version refresh only after new runtime traces show attention is the limiting cost.
+1. Preflight exactness and measurement infrastructure: metadata contract checks, one-token raw-logits gate, detailed decoder-step ranges, and SDPA backend dispatch audits.
+2. Exact custom decode-loop prototype with CUDA graph discipline, gated to local batch-one static-cache generation first.
+3. Attention/cache backend spike only if detailed ranges show `q_len=1` self-attention or cross-attention is target-sized after PyTorch graph work.
+4. Linear/GEMV launch-reduction work only if detailed ranges show MLP/projection launches dominate after attention/cache work.
+5. Fused sampling/logits-processor work only if sampling grows to at least `10%` of synchronized main-generation time.
+6. Torch-TensorRT / TensorRT-RTX feasibility only after a toy FP32 graph proves real engine execution with fallback disabled.
 
 Custom runtime work must prove token identity in stages before any speed claim graduates: compile-disabled 15s smoke equivalence, compile-enabled 15s smoke equivalence, then full-song equivalence.
 
@@ -179,17 +235,17 @@ Scout improvement ideas with subagents and web research as useful, but accept on
 ## 200 tok/s Goal Prompt
 
 ```text
-Optimize Mapperatorinator inference toward 200 tok/s main-generation throughput on RTX 2080/2080 Ti, same-calculation only. Current retained baseline is SDPA + `inference_generation_compile=true`: 7,639 full-song SALVALAI main tokens, 82.615s synchronized model time, 92.465 tok/s, fixed-seed token equivalence PASS against compile-disabled baseline.
+Optimize Mapperatorinator inference toward 200 tok/s main-generation throughput on RTX 2080/2080 Ti, same-calculation only. Current retained baseline is SDPA + inference_generation_compile=true: 7,639 full-song SALVALAI main tokens, 82.615s synchronized model time, 92.465 tok/s, fixed-seed token equivalence PASS against compile-disabled baseline.
 
-Treat 200 tok/s as a serious research target, not permission to change the calculation. Do not claim speedups from changed precision, sampling policy, output policy, model quality, windowing/overlap, generated-token behavior, output length, or non-equivalent RNG behavior unless explicitly labeled non-equivalent.
+Use a PyTorch-first, bounded opt-in runtime/kernel plan. Start with measurement and exactness infrastructure: preflight equivalence checks, one-token decoder logits equivalence against the current raw-logits path, 15s middle-song SALVALAI smoke token equivalence, and untraced profile_inference model-time throughput. Treat torch profiler and Nsight traces as diagnostic only.
 
-Use a profiling-first loop. Start with a middle-15-second SALVALAI smoke slice, prove fixed-seed generated main-token IDs match the retained baseline, and promote only promising exact-calculation changes to longer smoke or full-song SALVALAI runs. Use full-song runs for accepted results. Keep SDPA + generation compile as the baseline unless profiler evidence and full-song token-equivalent runs strongly justify replacing it. Separate true model time from torch.profiler overhead.
+Prioritize changes that could reduce real one-token decoder forward cost: SDPA backend dispatch audit, static one-token decode ABI, CUDA graph discipline, q_len=1 self-attention and cross-attention cache/layout work, and only then isolated FlashInfer or narrow native CUDA/CUTLASS kernels for measured dominant hotspots. Keep SDPA + generation compile as the baseline unless full-song token-equivalent evidence justifies replacement.
 
-Prioritize deeper runtime/kernel work that could plausibly remove about 54% of retained full-song model time: exact custom decode loop, CUDA graph discipline, fused sampling/logits processors, static-cache/layout work, and Torch-TensorRT/TensorRT-RTX feasibility. Do not reintroduce rejected quick tweaks unless new profiler evidence explains why the old negative or non-equivalent result no longer applies.
+Do not claim wins from changed precision, sampling policy, output policy, model quality, windowing/overlap, generated-token behavior, output length, or non-equivalent RNG behavior unless explicitly labeled non-equivalent. Do not restart rejected quick tweaks unless new profiling evidence explains why old negative or non-equivalent results no longer apply.
 
-For custom runtime work, require compile-disabled 15s smoke token equivalence first, then compile-enabled 15s smoke token equivalence, then full-song token equivalence before any speed claim graduates. Keep changes that improve RTX 2080 full-song main-generation throughput by >=10%; keep 5-10% only if simple and strategic toward the custom runtime; remove 1-3% complexity by default.
+Use configs/inference/profile_salvalai_smoke15.yaml for first-pass scouting with seed=12345, use_server=false, attn_implementation=sdpa, and profile_record_token_ids=true. Promote only after one-token logits gate PASS and 15s fixed-seed generated-token equivalence PASS. Full-song SALVALAI token equivalence and untraced throughput are required for accepted results.
 
-Commit and push clean checkpoints for accepted wins, document every accepted/rejected experiment in docs/inference_profiling.md and notes/, update AGENTS.md with durable conventions, and stop only when 200 tok/s is reached or profiling shows no remaining plausible exact-calculation path toward a major gain.
+Keep full-song RTX 2080/2080 Ti wins >=10%; keep 5-10% only if simple or strategically unlocks the runtime path; revert 1-3% complexity by default. Commit and push clean checkpoints for accepted wins, document accepted and rejected experiments in docs/inference_profiling.md and notes/, update AGENTS.md with durable conventions, and stop only when 200 tok/s is reached or profiling shows no remaining plausible exact-calculation path to a major gain.
 ```
 
 ## Attention Kernel Profiling
