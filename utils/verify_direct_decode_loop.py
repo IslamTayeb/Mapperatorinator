@@ -165,6 +165,59 @@ def _capture_decode_cuda_graph(
     return graph, graph_outputs, time.perf_counter() - start
 
 
+def _cuda_graph_signature(active_prefix_length: int | None, model_inputs: dict[str, Any]) -> tuple[Any, ...]:
+    signature: list[Any] = [active_prefix_length]
+    for key in sorted(model_inputs):
+        value = model_inputs[key]
+        if isinstance(value, torch.Tensor):
+            signature.append((key, tuple(value.shape), str(value.dtype), str(value.device)))
+        else:
+            signature.append((key, type(value).__name__, id(value)))
+    return tuple(signature)
+
+
+def _update_cuda_graph_diagnostics(
+        diagnostics: dict[str, Any] | None,
+        *,
+        warmup: int,
+        graph_cache: dict[tuple[Any, ...], dict[str, Any]],
+) -> None:
+    if diagnostics is None:
+        return
+
+    graphs = []
+    for entry in graph_cache.values():
+        static_inputs = entry["static_inputs"]
+        graphs.append({
+            "active_prefix_length": entry["active_prefix_length"],
+            "capture_seconds": float(entry["capture_seconds"]),
+            "decode_replays": int(entry["decode_replays"]),
+            "static_input_shapes": {
+                key: list(value.shape)
+                for key, value in static_inputs.items()
+                if isinstance(value, torch.Tensor)
+            },
+        })
+
+    total_capture_seconds = sum(graph["capture_seconds"] for graph in graphs)
+    total_replays = sum(graph["decode_replays"] for graph in graphs)
+    diagnostics.update({
+        "enabled": True,
+        "warmup": int(warmup),
+        "capture_count": len(graphs),
+        "total_capture_seconds": float(total_capture_seconds),
+        "decode_replays": int(total_replays),
+        "graphs": graphs,
+    })
+    if graphs:
+        first_graph = graphs[0]
+        diagnostics.update({
+            "capture_seconds": first_graph["capture_seconds"],
+            "active_prefix_length": first_graph["active_prefix_length"],
+            "static_input_shapes": first_graph["static_input_shapes"],
+        })
+
+
 @torch.no_grad()
 def direct_decode_loop_generate(
         model,
@@ -233,10 +286,7 @@ def direct_decode_loop_generate(
 
     is_prefill = True
     scores = None
-    graph: torch.cuda.CUDAGraph | None = None
-    graph_outputs = None
-    graph_static_inputs: dict[str, Any] | None = None
-    graph_active_prefix_length: int | None = None
+    graph_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
     while model._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
         current_input_ids = sequence_buffer[:, :cur_len] if sequence_buffer is not None else input_ids
         model_inputs = model.prepare_inputs_for_generation(current_input_ids, **model_kwargs)
@@ -252,43 +302,36 @@ def direct_decode_loop_generate(
                 max_cache_len=max_cache_len,
             )
             if cuda_graph_forward:
-                if graph is None:
-                    graph_active_prefix_length = prefix_length
+                graph_key = _cuda_graph_signature(prefix_length, model_inputs)
+                graph_entry = graph_cache.get(graph_key)
+                if graph_entry is None:
                     graph_static_inputs = _clone_static_graph_inputs(model_inputs)
                     graph, graph_outputs, capture_seconds = _capture_decode_cuda_graph(
                         model,
                         graph_static_inputs,
-                        active_prefix_length=graph_active_prefix_length,
+                        active_prefix_length=prefix_length,
                         warmup=cuda_graph_warmup,
                     )
-                    if cuda_graph_diagnostics is not None:
-                        cuda_graph_diagnostics.update({
-                            "enabled": True,
-                            "warmup": int(cuda_graph_warmup),
-                            "capture_seconds": float(capture_seconds),
-                            "active_prefix_length": graph_active_prefix_length,
-                            "static_input_shapes": {
-                                key: list(value.shape)
-                                for key, value in graph_static_inputs.items()
-                                if isinstance(value, torch.Tensor)
-                            },
-                            "decode_replays": 0,
-                        })
-                elif prefix_length != graph_active_prefix_length:
-                    raise RuntimeError(
-                        "CUDA graph active-prefix length changed from "
-                        f"{graph_active_prefix_length} to {prefix_length}; rerun with a fixed bucket/shorter gate"
-                    )
+                    graph_entry = {
+                        "graph": graph,
+                        "outputs": graph_outputs,
+                        "static_inputs": graph_static_inputs,
+                        "active_prefix_length": prefix_length,
+                        "capture_seconds": capture_seconds,
+                        "decode_replays": 0,
+                    }
+                    graph_cache[graph_key] = graph_entry
                 else:
-                    if graph_static_inputs is None:
-                        raise RuntimeError("CUDA graph static inputs missing")
+                    graph_static_inputs = graph_entry["static_inputs"]
                     _copy_static_graph_inputs(graph_static_inputs, model_inputs)
-                    graph.replay()
-                if cuda_graph_diagnostics is not None:
-                    cuda_graph_diagnostics["decode_replays"] = int(
-                        cuda_graph_diagnostics.get("decode_replays", 0)
-                    ) + 1
-                outputs = graph_outputs
+                    graph_entry["graph"].replay()
+                graph_entry["decode_replays"] = int(graph_entry["decode_replays"]) + 1
+                _update_cuda_graph_diagnostics(
+                    cuda_graph_diagnostics,
+                    warmup=cuda_graph_warmup,
+                    graph_cache=graph_cache,
+                )
+                outputs = graph_entry["outputs"]
             else:
                 with active_prefix_self_attention_context(prefix_length):
                     outputs = model_forward(**model_inputs, return_dict=True)
