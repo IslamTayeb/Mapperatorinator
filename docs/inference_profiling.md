@@ -69,6 +69,49 @@ Observed full SALVALAI run on 2026-06-30:
 
 The dominant bottleneck is autoregressive map generation. The first map window was the slowest record in this run at 7.655s for 520 generated tokens; most other slow windows were around 2.0-2.4s.
 
+## Attention Kernel Profiling
+
+Use `utils/profile_attention_kernels.py` to isolate SDPA vs FlashAttention 2 without loading model weights or audio. The script uses fixed random tensors with VarWhisper small v3-like shapes (`6` heads, `64` head dimension) and reports both raw attention-call timing and a repo-like layout path that includes output reshaping and FlashAttention packing overhead.
+
+Run on a GPU Slurm allocation:
+
+```bash
+ENV=/hpc/group/romerolab/imt11/envs/mapperatorinator
+WORK=/work/imt11/Mapperatorinator
+REPO=/hpc/group/romerolab/imt11/projects/Mapperatorinator
+LOCAL_TMP="/tmp/imt11-attn-kernels-${SLURM_JOB_ID}"
+
+export PATH="$ENV/bin:$PATH"
+export LD_LIBRARY_PATH="$ENV/targets/x86_64-linux/lib:$ENV/lib:${LD_LIBRARY_PATH:-}"
+export TMPDIR="$LOCAL_TMP"
+export TEMP="$LOCAL_TMP"
+export TMP="$LOCAL_TMP"
+export TRITON_CACHE_DIR="$LOCAL_TMP/triton"
+export XDG_CACHE_HOME="$WORK/cache"
+export HF_HOME="$WORK/cache/huggingface"
+export TRANSFORMERS_CACHE="$WORK/cache/huggingface"
+export TOKENIZERS_PARALLELISM=false
+
+mkdir -p "$LOCAL_TMP" "$WORK/runs" "$WORK/logs"
+cd "$REPO"
+
+python utils/profile_attention_kernels.py \
+  --output-dir "$WORK/runs/attn-kernels-${SLURM_JOB_ID}" \
+  --dtype fp16 \
+  --warmup 50 \
+  --iters 200 \
+  --repeats 3 \
+  --profile-iters 20
+```
+
+Outputs:
+
+- `attention_kernel_profile.json`: metadata, per-case timings, tensor shapes, CUDA memory peaks, and top profiler events.
+- `attention_kernel_profile.txt`: readable timing table, FA2/SDPA ratios, and profiler tables.
+- `*.trace.json`: Chrome trace files for representative decode, cross-attention, prefill, and batch cases.
+
+The default cases cover single-token cached decode, cross-attention against encoder-like lengths up to `2048`, prefill-like self-attention up to `2048`, and a few batch-size-8 what-if cases. Keep this as a microprofile: it does not replace full inference profiling because it does not include model GEMMs, cache updates, tokenizer/server overhead, or sampling.
+
 ## FlashAttention 2 On DCC
 
 FlashAttention 2 is the relevant package for A5000/5000 Ada testing through the normal Transformers `flash_attention_2` path. FlashAttention 3 is Hopper-focused and should be treated as a separate H100/H800-class ablation, not as a replacement for A5000 runs.
