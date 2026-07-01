@@ -8,6 +8,7 @@ from torch.profiler import record_function
 
 
 _DETAIL_RANGES_ENABLED = False
+_ACTIVE_PREFIX_SELF_ATTENTION_LENGTH: int | None = None
 
 _SDPA_BACKEND_ALIASES = {
     "flash": "FLASH_ATTENTION",
@@ -26,22 +27,43 @@ def detail_ranges_enabled() -> bool:
     return _DETAIL_RANGES_ENABLED
 
 
+def active_prefix_self_attention_length() -> int | None:
+    return _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH
+
+
 @contextmanager
 def generation_profile_context(
         *,
         detail_ranges: bool = False,
         sdpa_backend: str | None = None,
+        active_prefix_self_attention_length: int | None = None,
 ) -> Iterator[None]:
     """Temporarily enable opt-in generation profiling controls."""
-    global _DETAIL_RANGES_ENABLED
+    global _DETAIL_RANGES_ENABLED, _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH
 
     previous_detail_ranges = _DETAIL_RANGES_ENABLED
+    previous_active_prefix_length = _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH
     _DETAIL_RANGES_ENABLED = bool(detail_ranges)
+    _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH = active_prefix_self_attention_length
     try:
         with sdpa_backend_context(sdpa_backend):
             yield
     finally:
         _DETAIL_RANGES_ENABLED = previous_detail_ranges
+        _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH = previous_active_prefix_length
+
+
+@contextmanager
+def active_prefix_self_attention_context(prefix_length: int | None) -> Iterator[None]:
+    """Temporarily trim SDPA self-attention K/V and mask to a fixed active prefix length."""
+    global _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH
+
+    previous_active_prefix_length = _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH
+    _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH = prefix_length
+    try:
+        yield
+    finally:
+        _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH = previous_active_prefix_length
 
 
 @contextmanager

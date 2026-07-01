@@ -7,6 +7,7 @@ import torch
 from transformers.modeling_outputs import BaseModelOutput
 
 from osuT5.osuT5.inference.cache_utils import MapperatorinatorCache, get_cache
+from osuT5.osuT5.runtime_profiling import active_prefix_self_attention_context
 
 
 @dataclass
@@ -38,22 +39,24 @@ def prefill_static_cache(
         frames: torch.Tensor,
         condition_kwargs: dict[str, Any] | None = None,
         batch_size: int = 1,
+        active_prefix_self_attention: bool = False,
 ) -> OneTokenDecodeState:
     """Run the exact production prefill path into a fresh static cache."""
     condition_kwargs = condition_kwargs or {}
     prompt_length = int(prompt.shape[-1])
     cache = get_cache(model, batch_size=batch_size, num_beams=1, cfg_scale=1.0)
     cache_position = torch.arange(prompt_length, device=prompt.device)
-    prepared_inputs = model.prepare_inputs_for_generation(
-        prompt,
-        past_key_values=cache,
-        use_cache=True,
-        decoder_attention_mask=prompt_attention_mask,
-        cache_position=cache_position,
-        frames=frames,
-        **condition_kwargs,
-    )
-    outputs = model(**prepared_inputs)
+    with active_prefix_self_attention_context(prompt_length if active_prefix_self_attention else None):
+        prepared_inputs = model.prepare_inputs_for_generation(
+            prompt,
+            past_key_values=cache,
+            use_cache=True,
+            decoder_attention_mask=prompt_attention_mask,
+            cache_position=cache_position,
+            frames=frames,
+            **condition_kwargs,
+        )
+        outputs = model(**prepared_inputs)
     encoder_outputs = BaseModelOutput(last_hidden_state=outputs.encoder_last_hidden_state)
     return OneTokenDecodeState(
         cache=cache,
@@ -73,6 +76,7 @@ def decode_one_token_raw_logits(
         full_attention_mask: torch.Tensor,
         condition_kwargs: dict[str, Any] | None = None,
         cache_position: torch.LongTensor | None = None,
+        active_prefix_self_attention: bool = False,
 ) -> OneTokenDecodeResult:
     """Run one cached decoder step and return raw last-token logits."""
     condition_kwargs = condition_kwargs or {}
@@ -82,16 +86,18 @@ def decode_one_token_raw_logits(
             state.prompt_length + 1,
             device=full_prefix.device,
         )
-    prepared_inputs = model.prepare_inputs_for_generation(
-        full_prefix,
-        past_key_values=state.cache,
-        use_cache=True,
-        encoder_outputs=state.encoder_outputs,
-        decoder_attention_mask=full_attention_mask,
-        cache_position=cache_position,
-        **condition_kwargs,
-    )
-    outputs = model(**prepared_inputs)
+    prefix_length = int(cache_position[-1].detach().cpu().item()) + 1
+    with active_prefix_self_attention_context(prefix_length if active_prefix_self_attention else None):
+        prepared_inputs = model.prepare_inputs_for_generation(
+            full_prefix,
+            past_key_values=state.cache,
+            use_cache=True,
+            encoder_outputs=state.encoder_outputs,
+            decoder_attention_mask=full_attention_mask,
+            cache_position=cache_position,
+            **condition_kwargs,
+        )
+        outputs = model(**prepared_inputs)
     return OneTokenDecodeResult(
         logits=last_token_logits(outputs.logits),
         cache_position=cache_position,

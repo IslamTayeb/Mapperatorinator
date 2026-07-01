@@ -28,7 +28,7 @@ from transformers.utils import (
     logging,
 )
 
-from ...runtime_profiling import detail_ranges_enabled, profile_range
+from ...runtime_profiling import active_prefix_self_attention_length, detail_ranges_enabled, profile_range
 from .configuration_varwhisper import VarWhisperConfig
 
 if is_flash_attn_2_available():
@@ -371,6 +371,23 @@ def sdpa_attention_forward(
     return (attn_output,)
 
 
+def _maybe_apply_active_prefix_self_attention(
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        kwargs: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    prefix_length = active_prefix_self_attention_length()
+    if prefix_length is None or prefix_length <= 0 or key_states.shape[-2] <= prefix_length:
+        return key_states, value_states
+
+    key_states = key_states[:, :, :prefix_length, :]
+    value_states = value_states[:, :, :prefix_length, :]
+    attention_mask = kwargs.get("attention_mask")
+    if isinstance(attention_mask, torch.Tensor) and attention_mask.shape[-1] > prefix_length:
+        kwargs["attention_mask"] = attention_mask[..., :prefix_length]
+    return key_states, value_states
+
+
 VARWHISPER_ATTENTION_FUNCTION = {
     # (implementation, type)
     "flash_attention_2": flash_attention_forward,
@@ -588,6 +605,11 @@ class VarWhisperAttention(nn.Module):
                             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
                     else:
                         key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+                    key_states, value_states = _maybe_apply_active_prefix_self_attention(
+                        key_states,
+                        value_states,
+                        kwargs,
+                    )
 
             if profile_ranges:
                 with profile_range(f"{range_prefix}.sdpa"):

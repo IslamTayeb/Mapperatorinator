@@ -21,7 +21,7 @@ from osuT5.osuT5.inference.direct_decode import (
     prefill_static_cache,
 )
 from osuT5.osuT5.inference.server import get_eos_token_id
-from osuT5.osuT5.runtime_profiling import generation_profile_context
+from osuT5.osuT5.runtime_profiling import active_prefix_self_attention_context, generation_profile_context
 from osuT5.osuT5.tokenizer import ContextType
 from utils.verify_one_token_decode import (
     _CaptureRawLogitsProcessor,
@@ -59,6 +59,7 @@ def profile_direct_step(
         atol: float,
         rtol: float,
         top_k: int,
+        candidate_active_prefix_self_attention: bool,
 ) -> dict[str, Any]:
     if not torch.cuda.is_available():
         raise RuntimeError("Direct decode step profiling requires CUDA")
@@ -96,6 +97,7 @@ def profile_direct_step(
         "lookahead_time": model_inputs.pop("lookahead_time"),
         "warmup": warmup,
         "iters": iters,
+        "candidate_active_prefix_self_attention": bool(candidate_active_prefix_self_attention),
     }
     prompt = model_inputs["decoder_input_ids"]
     prompt_mask = model_inputs["decoder_attention_mask"]
@@ -149,6 +151,7 @@ def profile_direct_step(
             prompt_attention_mask=prompt_mask,
             frames=model_inputs["frames"],
             condition_kwargs=condition_kwargs,
+            active_prefix_self_attention=candidate_active_prefix_self_attention,
         )
         direct_result = decode_one_token_raw_logits(
             model,
@@ -156,12 +159,26 @@ def profile_direct_step(
             full_prefix=full_prefix,
             full_attention_mask=full_mask,
             condition_kwargs=condition_kwargs,
+            active_prefix_self_attention=candidate_active_prefix_self_attention,
         )
         prepared_inputs = direct_result.prepared_inputs
         reference_logits = direct_result.logits.detach().clone()
+        hf_comparison = _compare_logits(
+            hf_raw_logit_captures[1].detach().to(torch.float32),
+            reference_logits,
+            atol=atol,
+            rtol=rtol,
+            top_k=top_k,
+        )
+        active_prefix_length = (
+            int(direct_result.cache_position[-1].detach().cpu().item()) + 1
+            if candidate_active_prefix_self_attention
+            else None
+        )
 
         def eager_step() -> torch.Tensor:
-            return last_token_logits(model(**prepared_inputs).logits)
+            with active_prefix_self_attention_context(active_prefix_length):
+                return last_token_logits(model(**prepared_inputs).logits)
 
         eager_logits = eager_step()
         eager_comparison = _compare_logits(reference_logits, eager_logits, atol=atol, rtol=rtol, top_k=top_k)
@@ -171,12 +188,14 @@ def profile_direct_step(
         capture_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(capture_stream):
             for _ in range(warmup):
-                graph_outputs = model(**prepared_inputs)
+                with active_prefix_self_attention_context(active_prefix_length):
+                    graph_outputs = model(**prepared_inputs)
         torch.cuda.current_stream().wait_stream(capture_stream)
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            graph_outputs = model(**prepared_inputs)
+            with active_prefix_self_attention_context(active_prefix_length):
+                graph_outputs = model(**prepared_inputs)
         graph.replay()
         graph_logits = last_token_logits(graph_outputs.logits)
         graph_comparison = _compare_logits(reference_logits, graph_logits, atol=atol, rtol=rtol, top_k=top_k)
@@ -187,7 +206,8 @@ def profile_direct_step(
         graph_ms = _cuda_event_time_ms(graph_step, warmup=warmup, iters=iters)
 
     return {
-        "pass": eager_comparison["allclose"] and eager_comparison["topk_match"]
+        "pass": hf_comparison["allclose"] and hf_comparison["topk_match"]
+        and eager_comparison["allclose"] and eager_comparison["topk_match"]
         and graph_comparison["allclose"] and graph_comparison["topk_match"],
         "prompt_tokens": prompt_len,
         "probe_token_id": int(probe_token.item()),
@@ -197,6 +217,7 @@ def profile_direct_step(
         "eager_ms_per_step": eager_ms,
         "graph_ms_per_step": graph_ms,
         "graph_speedup": eager_ms / graph_ms if graph_ms > 0 else None,
+        "hf_comparison": hf_comparison,
         "eager_comparison": eager_comparison,
         "graph_comparison": graph_comparison,
         "metadata": metadata,
@@ -214,6 +235,11 @@ def main() -> None:
     parser.add_argument("--atol", type=float, default=1e-4)
     parser.add_argument("--rtol", type=float, default=1e-4)
     parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument(
+        "--candidate-active-prefix-self-attention",
+        action="store_true",
+        help="Enable active-prefix SDPA self-attention for the direct candidate path.",
+    )
     parser.add_argument("--report-path", type=Path, default=None)
     parser.add_argument("overrides", nargs="*", help="Hydra overrides, e.g. model_path=/path/to/model")
     cli_args = parser.parse_args()
@@ -228,6 +254,7 @@ def main() -> None:
         atol=cli_args.atol,
         rtol=cli_args.rtol,
         top_k=cli_args.top_k,
+        candidate_active_prefix_self_attention=cli_args.candidate_active_prefix_self_attention,
     )
     result["metadata"]["config_name"] = cli_args.config_name
     result["wall_seconds"] = time.perf_counter() - start

@@ -269,6 +269,7 @@ def run_one_token_gate(
         atol: float,
         rtol: float,
         top_k: int,
+        candidate_active_prefix_self_attention: bool = False,
 ) -> dict[str, Any]:
     _assert_supported_probe(args)
     if probe_token_id is not None:
@@ -320,6 +321,7 @@ def run_one_token_gate(
         "atol": atol,
         "rtol": rtol,
         "top_k": top_k,
+        "candidate_active_prefix_self_attention": bool(candidate_active_prefix_self_attention),
     }
 
     prompt = model_inputs["decoder_input_ids"]
@@ -418,6 +420,7 @@ def run_one_token_gate(
             prompt_attention_mask=prompt_mask,
             frames=model_inputs["frames"],
             condition_kwargs=condition_kwargs,
+            active_prefix_self_attention=candidate_active_prefix_self_attention,
         )
         candidate_result = decode_one_token_raw_logits(
             model,
@@ -425,6 +428,7 @@ def run_one_token_gate(
             full_prefix=full_prefix,
             full_attention_mask=full_mask,
             condition_kwargs=condition_kwargs,
+            active_prefix_self_attention=candidate_active_prefix_self_attention,
         )
         candidate_inputs = candidate_result.prepared_inputs
         candidate_logits = candidate_result.logits
@@ -497,6 +501,11 @@ def main() -> None:
     parser.add_argument("--atol", type=float, default=1e-4)
     parser.add_argument("--rtol", type=float, default=1e-4)
     parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument(
+        "--candidate-active-prefix-self-attention",
+        action="store_true",
+        help="Enable active-prefix SDPA self-attention only for the direct candidate path.",
+    )
     parser.add_argument("--report-path", type=Path, default=None)
     parser.add_argument("overrides", nargs="*", help="Hydra overrides, e.g. model_path=/path/to/model")
     cli_args = parser.parse_args()
@@ -510,6 +519,7 @@ def main() -> None:
         atol=cli_args.atol,
         rtol=cli_args.rtol,
         top_k=cli_args.top_k,
+        candidate_active_prefix_self_attention=cli_args.candidate_active_prefix_self_attention,
     )
     result["metadata"]["config_name"] = cli_args.config_name
     result["wall_seconds"] = time.perf_counter() - start
