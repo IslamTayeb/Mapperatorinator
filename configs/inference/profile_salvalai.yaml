@@ -9,8 +9,7 @@ profile_inference: true
 profile_sync_cuda: true
 profile_record_token_ids: true
 inference_generation_compile: true
-inference_active_prefix_decode_loop: true
-inference_active_prefix_decode_bucket_size: 256
+inference_active_prefix_decode_loop: false
 seed: 12345
 
 gamemode: 0

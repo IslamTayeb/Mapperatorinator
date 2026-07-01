@@ -1,25 +1,10 @@
-# Active-Prefix Decode Loop Full-Song Acceptance
+# Active-Prefix Decode Loop Full-Song Validation
 
 ## Summary
 
-Bucketed active-prefix decode loop with bucket size `256` is now an accepted exact-calculation inference speedup for the validated full-song SALVALAI path.
+Bucketed active-prefix decode is exact in the tested simple generation path and remains useful runtime evidence, but it is not the retained cold single-song baseline.
 
-This replaces SDPA plus generation compile as the retained profiling baseline, but only for the scoped simple path that was tested.
-
-## Accepted Baseline
-
-- Commit: `821fb41`
-- Job: `49150185`
-- Slurm status: `COMPLETED`
-- Elapsed: `00:04:15`
-- Partition: `gpu-common`
-- Node/GPU: `dcc-core-ferc-s-z25-20`, `NVIDIA GeForce RTX 2080 Ti`
-- Driver: `595.71.05`
-- PyTorch: `2.10.0+cu128`
-- Transformers: `4.57.3`
-- Run dir: `/work/imt11/Mapperatorinator/runs/active-prefix256-full-49150185-821fb41`
-- Candidate profile: `/work/imt11/Mapperatorinator/runs/active-prefix256-full-49150185-821fb41/compile-active256/beatmapfc1c76f54dbc48a4bbf2097ba5227fc4.osu.profile.json`
-- Baseline profile: `/work/imt11/Mapperatorinator/runs/active-prefix256-full-49150185-821fb41/compile-baseline/beatmapd8db783700284b039c0e9a172c47e992.osu.profile.json`
+The retained cold single-song baseline is still SDPA plus `inference_generation_compile=true`, active-prefix disabled: job `49113713`, `7,639` SALVALAI main tokens, `82.615s` synchronized model time, `92.465 tok/s`, token equivalence PASS against compile-disabled.
 
 ## Hypothesis
 
@@ -27,82 +12,70 @@ Full static-cache self-attention forces most one-token decode steps to attend ov
 
 Bucketing keeps graph/cache shapes reusable while cutting the effective self-attention length for most decode steps.
 
-## Full-Song Result
+## Validation Evidence
 
-| run | main tokens | main model time | tok/s | token equivalence |
-| --- | ---: | ---: | ---: | --- |
-| compile-only baseline | 7,639 | 82.142s | 92.998 | baseline |
-| active-prefix bucket 256 | 7,639 | 62.653s | 121.926 | PASS, 7,639 / 7,639 |
+| job | run | main tokens | main model time | tok/s | token equivalence | status |
+| --- | --- | ---: | ---: | ---: | --- | --- |
+| `49150185` | compile-only baseline | 7,639 | 82.142s | 92.998 | baseline | clean same-job compile comparison |
+| `49150185` | active-prefix bucket 256 | 7,639 | 62.653s | 121.926 | PASS, 7,639 / 7,639 | over-promoted; not reproduced as cold baseline |
+| `49151748` | bucket 256, first in sweep | 7,639 | 86.122s | 88.699 | PASS vs bucket 128 | rejected for cold baseline |
+| `49151748` | bucket 128, second in sweep | 7,639 | 93.850s | 81.396 | PASS vs bucket 256 | rejected |
+| `49151748` | bucket 512, third in sweep | 7,639 | 70.527s | 108.313 | PASS vs bucket 256 | warm/order-sensitive candidate |
+| `49152465` | bucket 512, cold-first validation | 7,639 | 78.108s | 97.800 | PASS vs same-job compile-only | strategic opt-in candidate |
+| `49152465` | compile-only after active512 | 7,639 | 89.888s | 84.984 | baseline for same-job compare | anomalously slow versus retained baseline |
 
-Delta:
+Important paths:
 
-- Throughput: `+28.928 tok/s`, `+31.1%`
-- Model time: `-19.489s`, `-23.7%`
-- Generated main tokens: unchanged
-- Records: unchanged, `87`
-- Same-calculation metadata contract: PASS
+- `49150185` run dir: `/work/imt11/Mapperatorinator/runs/active-prefix256-full-49150185-821fb41`
+- `49151748` run dir: `/work/imt11/Mapperatorinator/runs/active-prefix-bucket-full-49151748-1f20478`
+- `49152465` run dir: `/work/imt11/Mapperatorinator/runs/active-prefix512-validate-49152465-1f20478`
+- Active512 cold-first profile: `/work/imt11/Mapperatorinator/runs/active-prefix512-validate-49152465-1f20478/active512-cold/beatmap88846e053e3d447bb4eac47696c387e2.osu.profile.json`
 
-## Non-Regression Check
+## Regression Check
 
-The user explicitly wants accepted changes to prove performance has not degraded at all. This run passed that broader check:
+The user explicitly wants accepted changes to prove performance has not degraded. Active-prefix does not pass that bar as a retained cold single-song baseline.
 
-| metric | compile-only baseline | active-prefix bucket 256 | result |
+Job `49152465` active512 cold-first versus the retained compile-only baseline:
+
+| metric | retained compile-only | active512 cold-first | result |
 | --- | ---: | ---: | --- |
-| main generation stage | 82.912s | 63.405s | improved |
-| timing generation stage | 24.379s | 20.815s | improved |
-| total profiled stage time | 111.531s | 88.389s | improved |
-| timing generation model throughput | 34.1 tok/s | 40.0 tok/s | improved |
+| main generation | 82.615s, 92.465 tok/s | 78.108s, 97.800 tok/s | small `~5.8%` improvement |
+| first main-generation window | compile-only clean runs around `8.138-15.971s` | 24.739s, 23.7 tok/s | regressed |
+| timing generation | clean compile-only job `49150185`: 24.060s, 34.1 tok/s | 39.610s, 20.7 tok/s | regressed |
+| total profiled stage time | clean compile-only job `49150185`: 111.531s | active512 stage sum about 123s | regressed |
 | generated main tokens | 7,639 | 7,639 | unchanged |
+| token IDs | baseline | candidate | PASS in same-job compare |
 
-## Smoke Evidence
-
-15s smoke results were not sufficient by aggregate throughput alone:
-
-- Job `49149223`, active bucket `128`: token equivalence PASS but aggregate compile smoke regressed badly because of compile/specialization spikes.
-- Job `49149328`, active bucket `512`: token equivalence PASS, aggregate `52.188 tok/s`, post-warmup `~140 tok/s`.
-- Job `49149328`, active bucket `256`: token equivalence PASS, aggregate `71.452 tok/s`, post-warmup `~145 tok/s`.
-
-Lesson: for compiler/runtime paths, the 15s smoke slice is an exactness and directional filter, not a final acceptance metric. If aggregate smoke is hurt by one-time specialization but post-warmup windows are clearly faster, a full-song acceptance run can be justified. Full-song equivalence and non-regression remain mandatory.
-
-## Why It Worked
-
-- The earlier direct-step and attention profiles showed full static self-attention length was target-sized.
-- Active-prefix during prefill is non-equivalent, but decode-only active-prefix preserved logits in the tested gates.
-- Bucket `256` hits a useful tradeoff: it avoids most full-length static-cache attention while keeping reusable compiled shapes.
-- Full-song length amortizes the first-window compile/specialization cost that made short smoke aggregates look weak.
-
-## Scope And Risks
-
-Validated scope:
-
-- `batch_size=1`
-- `use_server=false`
-- `parallel=false`
-- `cfg_scale=1.0`
-- `num_beams=1`
-- static cache
-- SDPA
-- `inference_generation_compile=true`
-- active-prefix decode only
-- bucket size `256`
-
-Do not broaden this path to server batching, CFG, beams, parallel sampling, or prefill without fresh one-token logits gates, 15s generated-token equivalence, full-song generated-token equivalence, and full non-regression checks.
+The same-job compile-only run in `49152465` was unusually slow (`84.984 tok/s`), so do not claim the `+15.1%` paired delta as the retained cold single-song improvement.
 
 ## Decision
 
-Keep and push. `configs/inference/profile_salvalai.yaml` should opt into the accepted path with:
+Keep the opt-in active-prefix code and notes because the idea is exact in the tested decode-only path and strategically useful for a future custom runtime or warmed multi-song process. Do not enable it in `configs/inference/profile_salvalai.yaml`.
+
+Use the retained cold baseline:
 
 ```yaml
 inference_generation_compile: true
-inference_active_prefix_decode_loop: true
-inference_active_prefix_decode_bucket_size: 256
+inference_active_prefix_decode_loop: false
 ```
 
-The new retained baseline is `121.926 tok/s` full-song main generation. Reaching `200 tok/s` now requires reducing main-generation model time from `62.653s` to about `38.195s`, a further `39.0%` reduction.
+Use active-prefix only for explicitly labeled experiments, for example:
+
+```bash
+python inference.py --config-name profile_salvalai \
+  inference_active_prefix_decode_loop=true \
+  inference_active_prefix_decode_bucket_size=512
+```
+
+## Lessons
+
+- Active-prefix during prefill is non-equivalent; keep it decode-only.
+- Bucket size matters. Bucket `512` appears less harmful cold than bucket `128`/`256`, but it still has a first-window tax.
+- Warm/post-specialization windows can reach about `130-145 tok/s`, which is valuable for future warm-repeat or multi-song work but cannot be reported as cold single-song throughput.
+- Future work should target graph/runtime discipline: stable bucket capture, fewer graph variants, fewer per-token compiled graph calls, and less repeated cache/mask/update plumbing.
 
 ## Next
 
-- Profile post-warmup active-prefix windows to see whether the remaining cost is now MLP/projection, cross-attention, self-attention, or loop/sampling overhead.
-- Compare bucket sizes only with full-song non-regression if smoke shows a plausible signal.
-- Prototype a graph-disciplined direct loop only if it can preserve this active-prefix win and reduce the remaining per-window overhead.
-- Keep the no-degradation rule: a candidate must not regress timing generation, total profiled stage time, token counts, or exactness while improving main generation.
+- Add a warm-repeat SALVALAI suite before making batch or multi-song claims: same model process, repeated song, per-run seed reset, first run reported separately from runs 2..N.
+- Prototype graph-backed or bufferized direct decode only if it can preserve active-prefix exactness and reduce the first-window/specialization tax.
+- Keep the no-degradation rule: a candidate must not regress timing generation, total profiled stage time, token counts, exactness, or per-window performance unless explicitly labeled as a scoped regression and approved.

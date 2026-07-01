@@ -73,20 +73,28 @@ The dominant bottleneck is autoregressive map generation. The first map window w
 
 ## Same-Calculation Optimization Goal
 
-The current RTX 2080/2080 Ti retained baseline after the accepted generation-compile and active-prefix decode-loop wins is roughly `122 tok/s` for full-song main-generation throughput. Use these targets:
+The current RTX 2080/2080 Ti retained cold single-song baseline is SDPA plus `inference_generation_compile=true`, with active-prefix disabled: full-song job `49113713` generated `7,639` SALVALAI main tokens in `82.615s` synchronized model time, `92.465 tok/s`, with fixed-seed token equivalence PASS against the compile-disabled baseline. Use these targets:
 
-- Starter success target: `100 tok/s` on a full-song run. Reached by DCC job `49150185`.
-- Strong first milestone: `120 tok/s`. Reached by DCC job `49150185`.
+- Starter success target: `100 tok/s` on a cold full-song run.
+- Strong first milestone: `120 tok/s` on a cold full-song run.
 - Stretch target: `150+ tok/s`.
 - Active long-range research target: `200 tok/s`.
 
-The first 100 tok/s loop ended below target by the documented stop condition because profiling showed no remaining plausible current-architecture quick win of `>=10%`. The renewed runtime/kernel pass then found and accepted bucketed active-prefix decode. Reaching `200 tok/s` from the retained `121.926 tok/s` baseline requires cutting full-song synchronized main-generation model time from `62.653s` to about `38.195s`, a `39.0%` reduction.
+The first 100 tok/s loop ended below target by the documented stop condition because profiling showed no remaining plausible current-architecture quick win of `>=10%`. A renewed runtime pass found exact active-prefix evidence, but follow-up validation showed it is order/warm-state sensitive and not the retained cold single-song baseline. Reaching `200 tok/s` from the retained `92.465 tok/s` baseline requires cutting full-song synchronized main-generation model time from `82.615s` to about `38.195s`, a `53.8%` reduction.
 
 Only count a speedup as equivalent when fixed-seed generated token IDs match the baseline for the same audio/config slice. Do not claim wins from changed precision, sampling policy, output policy, model quality, windowing/overlap, or generated-token behavior unless the run is explicitly labeled non-equivalent.
 
-Always verify that performance has not degraded before accepting a change. For full-song candidates, compare main generation, timing generation, total profiled stage time, generated-token counts, and token equivalence against the current retained baseline. If any meaningful same-config metric regresses, document it as a scoped regression and do not promote it without explicit approval.
+Always verify that performance has not degraded before accepting a change. For full-song candidates, compare main generation, timing generation, total profiled stage time, generated-token counts, token equivalence, and per-window main-generation timings against the current retained baseline. If any meaningful same-config metric regresses, document it as a scoped regression and do not promote it without explicit approval.
 
 Keep SDPA as the current baseline unless profiler evidence strongly contradicts it. Torch profiler wall time is diagnostic only; compare normal `profile_inference` model elapsed time and token throughput.
+
+Keep future batch and multiple-song results in separate reporting classes:
+
+- `cold_single_song`: current acceptance gate. Fresh process/job, one song, fixed seed, full token equivalence, main/timing/total/per-window non-regression.
+- `warm_repeat`: same loaded model process, same song repeated. Report the first run separately from runs 2..N; compare warmed results only to warmed results.
+- `serial_multi_song` or `batched_multi_request`: operational throughput. Report per-song token equivalence, first-song cold cost, warmed subsequent-song cost, aggregate wall/model throughput, batch-size distribution, RNG reset policy, and any batching/windowing behavior changes.
+
+Do not use warmed-cache, multi-song, or server-batch wins as cold single-song speedups. They can still matter for future batch inference and the planned autoregressive encoder-decoder component, but label them by result class.
 
 ## Smoke-To-Full Profiling Loop
 
@@ -102,7 +110,7 @@ python inference.py --config-name profile_salvalai_smoke15 \
   use_server=false
 ```
 
-`configs/inference/profile_salvalai_smoke15.yaml` sets `start_time=71000`, `end_time=86000`, `seed=12345`, and `profile_record_token_ids=true`, inheriting the current retained active-prefix bucket-256 path from `profile_salvalai`. Use this for first-pass scouting; promote to the 30s smoke or full-song configs only when the 15s result is token-equivalent and plausibly meaningful. For compile/runtime changes with one-time specialization costs, inspect post-warmup windows before rejecting a token-equivalent candidate, but full-song non-regression is still required before acceptance.
+`configs/inference/profile_salvalai_smoke15.yaml` sets `start_time=71000`, `end_time=86000`, `seed=12345`, and `profile_record_token_ids=true`, inheriting the retained compile-only cold single-song path from `profile_salvalai`. Use this for first-pass scouting; promote to the 30s smoke or full-song configs only when the 15s result is token-equivalent and plausibly meaningful. For compile/runtime changes with one-time specialization costs, inspect post-warmup windows before rejecting a token-equivalent candidate, but full-song non-regression is still required before acceptance.
 
 Reference 15s smoke profiles from commit `ce92ebb` on RTX 2080 Ti node `dcc-core-ferc-s-z25-21`:
 
@@ -205,8 +213,8 @@ Valid backend values are `flash`, `efficient`, `math`, and `cudnn` when the inst
 RTX 2080 Ti SDPA backend audit result:
 
 - Smoke job `49139404` found forced `profile_sdpa_backend=math` was token-equivalent and much faster on the 15s aggregate (`78.862 tok/s` vs `50.850 tok/s`), while forced `efficient` was noise and forced `flash` failed on SM75 with no available kernel.
-- The full-song paired validation job `49139420` rejected forced `math` for main generation: `/work/imt11/Mapperatorinator/runs/full-sdpa-math-49139420-9d92c34/beatmap8241a2b3f0be495592a5cf2b9bb9d6a2.osu.profile.json` produced `7,639` main tokens in `85.177s`, `89.684 tok/s`, token equivalence PASS, which was slower than the then-retained `92.465 tok/s` baseline and is far below the current `121.926 tok/s` active-prefix baseline.
-- Conclusion: keep SDPA plus the current retained active-prefix decode-loop config as the baseline. Do not promote forced `math` from smoke-only evidence; use it only as a diagnostic if a future trace shows a backend-specific reason.
+- The full-song paired validation job `49139420` rejected forced `math` for main generation: `/work/imt11/Mapperatorinator/runs/full-sdpa-math-49139420-9d92c34/beatmap8241a2b3f0be495592a5cf2b9bb9d6a2.osu.profile.json` produced `7,639` main tokens in `85.177s`, `89.684 tok/s`, token equivalence PASS, which was slower than the retained compile-only `92.465 tok/s` baseline.
+- Conclusion: keep default SDPA plus `inference_generation_compile=true` as the baseline. Do not promote forced `math` from smoke-only evidence; use it only as a diagnostic if a future trace shows a backend-specific reason.
 
 TorchDynamo cache-limit scout result:
 
@@ -237,13 +245,13 @@ Promote a change to a full-song SALVALAI run only when smoke results are stable,
 
 For the current 200 tok/s phase, stop the long-running optimization loop only when either the full-song RTX 2080/2080 Ti run reaches at least `200 tok/s` with identical fixed-seed tokens, or profiling across multiple exact-calculation optimization families shows no remaining plausible major exact-calculation path.
 
-Current status after accepted active-prefix decode:
+Current status after active-prefix validation:
 
-- Retained full-song baseline: `121.926 tok/s` main generation from job `49150185`, profile `/work/imt11/Mapperatorinator/runs/active-prefix256-full-49150185-821fb41/compile-active256/beatmapfc1c76f54dbc48a4bbf2097ba5227fc4.osu.profile.json`.
-- Current retained flags: `attn_implementation=sdpa`, `inference_generation_compile=true`, `inference_active_prefix_decode_loop=true`, `inference_active_prefix_decode_bucket_size=256`, `seed=12345`, `profile_record_token_ids=true`.
-- This reached the `100 tok/s` target and the `120 tok/s` milestone with token equivalence PASS for all `7,639` main-generation tokens against the same-commit compile baseline.
-- Main-generation model time is `62.653s`; reaching `200 tok/s` requires `38.195s`, so about `24.458s` or `39.0%` of current model time remains to remove.
-- Full-song acceptance must check non-regression outside main generation too. In job `49150185`, timing generation improved from `34.1` to `40.0 tok/s`, and total profiled stage time improved from `111.531s` to `88.389s`.
+- Retained cold single-song baseline: SDPA plus `inference_generation_compile=true`, active-prefix disabled. Full-song job `49113713` generated `7,639` main tokens in `82.615s`, `92.465 tok/s`, token equivalence PASS against the compile-disabled baseline. Same-commit paired job `49150185` measured compile-only at `92.998 tok/s`.
+- Current retained flags: `attn_implementation=sdpa`, `inference_generation_compile=true`, `inference_active_prefix_decode_loop=false`, `seed=12345`, `profile_record_token_ids=true`.
+- Active-prefix is an opt-in strategic candidate, not the retained cold baseline. Bucket `256` in job `49150185` looked like a large exact win (`92.998 -> 121.926 tok/s`), but later full-song runs showed order/warm-state sensitivity. Job `49151748` measured bucket `256` cold at `88.699 tok/s`, bucket `128` at `81.396 tok/s`, and bucket `512` warm at `108.313 tok/s`, all token-equivalent against bucket `256`.
+- Bucket `512` cold-first validation job `49152465` generated `7,639` main tokens in `78.108s`, `97.800 tok/s`, token equivalence PASS against a same-job compile-only run. That is only about `+5.8%` against the retained `92.465 tok/s` compile-only baseline and it still regressed the first main-generation window and timing/total stage against clean retained runs, so it stays default-off.
+- Reaching `200 tok/s` from the retained `92.465 tok/s` baseline requires reducing main-generation model time to `38.195s`, so about `44.420s` or `53.8%` of retained model time remains to remove.
 
 For the 200 tok/s phase, rank the next experiments this way:
 
@@ -283,7 +291,7 @@ Scout improvement ideas with subagents and web research as useful, but accept on
 ## 200 tok/s Goal Prompt
 
 ```text
-Optimize Mapperatorinator inference toward 200 tok/s main-generation throughput on RTX 2080/2080 Ti, same-calculation only. Current retained baseline is SDPA + inference_generation_compile=true + inference_active_prefix_decode_loop=true with bucket size 256: 7,639 full-song SALVALAI main tokens, 62.653s synchronized model time, 121.926 tok/s, fixed-seed token equivalence PASS against the same-commit compile-only baseline.
+Optimize Mapperatorinator inference toward 200 tok/s main-generation throughput on RTX 2080/2080 Ti, same-calculation only. Current retained baseline is SDPA + inference_generation_compile=true with active-prefix disabled: 7,639 full-song SALVALAI main tokens, 82.615s synchronized model time, 92.465 tok/s, fixed-seed token equivalence PASS against the compile-disabled full-song baseline.
 
 Use a PyTorch-first, bounded opt-in runtime/kernel plan. Start with measurement and exactness infrastructure: preflight equivalence checks, one-token decoder logits equivalence against the current raw-logits path, 15s middle-song SALVALAI smoke token equivalence, and untraced profile_inference model-time throughput. Treat torch profiler and Nsight traces as diagnostic only.
 
@@ -291,9 +299,11 @@ Prioritize changes that could reduce real one-token decoder forward cost: SDPA b
 
 Do not claim wins from changed precision, sampling policy, output policy, model quality, windowing/overlap, generated-token behavior, output length, or non-equivalent RNG behavior unless explicitly labeled non-equivalent. Do not restart rejected quick tweaks unless new profiling evidence explains why old negative or non-equivalent results no longer apply.
 
-Use configs/inference/profile_salvalai_smoke15.yaml for first-pass scouting with seed=12345, use_server=false, attn_implementation=sdpa, inference_generation_compile=true, inference_active_prefix_decode_loop=true, inference_active_prefix_decode_bucket_size=256, and profile_record_token_ids=true. Promote only after one-token logits gate PASS and 15s fixed-seed generated-token equivalence PASS. Full-song SALVALAI token equivalence, untraced throughput, and no performance degradation in timing generation or total profiled stage time are required for accepted results.
+Use configs/inference/profile_salvalai_smoke15.yaml for first-pass scouting with seed=12345, use_server=false, attn_implementation=sdpa, inference_generation_compile=true, inference_active_prefix_decode_loop=false, and profile_record_token_ids=true. Promote only after one-token logits gate PASS and 15s fixed-seed generated-token equivalence PASS. Full-song SALVALAI token equivalence, untraced throughput, and no performance degradation in timing generation or total profiled stage time are required for accepted cold single-song results.
 
 Keep full-song RTX 2080/2080 Ti wins >=10%; keep 5-10% only if simple or strategically unlocks the runtime path; revert 1-3% complexity by default. Commit and push clean checkpoints for accepted wins, document accepted and rejected experiments in docs/inference_profiling.md and notes/, update AGENTS.md with durable conventions, and stop only when 200 tok/s is reached or profiling shows no remaining plausible exact-calculation path to a major gain.
+
+Improvements that help future batch inference or multiple-song throughput matter too, but report them separately from cold single-song speedups: first-song cold cost, warmed subsequent-song cost, aggregate multi-song throughput, token equivalence per song, RNG reset policy, and any batching/windowing behavior changes.
 ```
 
 ## Attention Kernel Profiling
@@ -460,30 +470,25 @@ Keep `inference_generation_compile=true` for full-song profiling baselines. For 
 
 ### Bucketed active-prefix decode loop
 
-Accepted in commit `821fb41` after one-token logits gates, 15s smoke token-equivalence runs, and a full-song SALVALAI acceptance run. The change adds an opt-in active-prefix decode loop for the simple batch-1 path and leaves the global default disabled. The retained profiling config now opts in with `inference_active_prefix_decode_loop=true` and `inference_active_prefix_decode_bucket_size=256`.
+Implemented in commit `821fb41` as an opt-in batch-1 decode loop, but not retained as the cold single-song baseline after follow-up validation. The global default and `profile_salvalai` retained config keep active-prefix disabled.
 
-Why it works: the loop leaves prefill unchanged, then applies active-prefix self-attention only during one-token decode. Bucketed active-prefix lengths preserve causal-mask equivalence while avoiding the full static-cache self-attention length for most decode steps. The full-song result shows the first-window compile/specialization cost amortizes over the whole song.
+Why it is still useful: the loop leaves prefill unchanged, then applies active-prefix self-attention only during one-token decode. One-token gates showed decode-only active-prefix can preserve logits, while active-prefix prefill is non-equivalent. Bucketed active-prefix lengths preserve causal-mask equivalence while avoiding the full static-cache self-attention length for most decode steps.
 
-RTX 2080 Ti full-song comparison on DCC `gpu-common`, node `dcc-core-ferc-s-z25-20`, job `49150185`, commit `821fb41`:
+The first full-song validation looked very strong but was later shown to be order/warm-state sensitive:
 
-| run | profile | main tokens | main model time | tok/s | token equivalence |
-| --- | --- | ---: | ---: | ---: | --- |
-| compile-only baseline | `/work/imt11/Mapperatorinator/runs/active-prefix256-full-49150185-821fb41/compile-baseline/beatmapd8db783700284b039c0e9a172c47e992.osu.profile.json` | 7,639 | 82.142s | 92.998 | baseline |
-| active-prefix bucket 256 | `/work/imt11/Mapperatorinator/runs/active-prefix256-full-49150185-821fb41/compile-active256/beatmapfc1c76f54dbc48a4bbf2097ba5227fc4.osu.profile.json` | 7,639 | 62.653s | 121.926 | PASS, 7,639 / 7,639 |
+| job | run | main tokens | main model time | tok/s | token equivalence | status |
+| --- | --- | ---: | ---: | ---: | --- | --- |
+| `49150185` | compile-only baseline | 7,639 | 82.142s | 92.998 | baseline | clean compile-only comparison |
+| `49150185` | active-prefix bucket 256 | 7,639 | 62.653s | 121.926 | PASS, 7,639 / 7,639 | over-promoted; later validation did not reproduce as cold baseline |
+| `49151748` | active-prefix bucket 256, first in bucket sweep | 7,639 | 86.122s | 88.699 | PASS vs bucket 128 | rejected for cold baseline |
+| `49151748` | active-prefix bucket 512, third in bucket sweep | 7,639 | 70.527s | 108.313 | PASS vs bucket 256 | warm/order-sensitive candidate |
+| `49152465` | active-prefix bucket 512, cold-first validation | 7,639 | 78.108s | 97.800 | PASS vs same-job compile-only | strategic opt-in candidate, not retained |
 
-`utils/summarize_inference_profile.py --compare` reported the same-calculation metadata contract PASS and token equivalence PASS. Main-generation throughput improved by `+31.1%`; synchronized model time dropped by `19.489s` (`-23.7%`).
+Job `49152465` compared bucket `512` against a same-job compile-only run and passed token equivalence. However, the same-job compile-only baseline was anomalously slow (`84.984 tok/s`) compared with the retained clean compile-only baseline (`92.465-92.998 tok/s`). Against the retained clean baseline, bucket `512` is only about a `5-6%` main-generation gain, and it still regressed first-window behavior and timing/total stage time versus clean retained runs. This does not meet the normal cold single-song graduation bar.
 
-Non-regression check from the same full-song job:
+Keep this path scoped to the validated simple generation mode: batch size `1`, `use_server=false`, `parallel=false`, `cfg_scale=1.0`, `num_beams=1`, static cache, SDPA, and no active-prefix during prefill. Any broader scope, bucket-size change, warmed-repeat claim, or batch/multi-song claim requires new one-token logits gates, 15s token-equivalent smoke, full-song token equivalence, and result-class-specific non-regression checks.
 
-| metric | compile-only baseline | active-prefix bucket 256 | result |
-| --- | ---: | ---: | --- |
-| timing generation | 24.060s, 34.1 tok/s | 20.519s, 40.0 tok/s | improved |
-| total profiled stage time | 111.531s | 88.389s | improved |
-| generated main tokens | 7,639 | 7,639 | unchanged |
-
-The 15s smoke aggregate was misleading because of compile/specialization overhead. Job `49149328` found active-prefix bucket 256 was token-equivalent but slower in total 15s aggregate (`82.202 -> 71.452 tok/s`), while post-warmup windows were much faster (`~145 tok/s`). Promote similar runtime/compiler candidates only when smoke equivalence passes and the post-warmup evidence justifies a full-song acceptance run; never accept them without full-song non-regression.
-
-Keep this path scoped to the validated simple generation mode: batch size `1`, `use_server=false`, `parallel=false`, `cfg_scale=1.0`, `num_beams=1`, static cache, SDPA, and no active-prefix during prefill. Any broader scope or bucket-size change requires new one-token logits gates, 15s token-equivalent smoke, full-song token equivalence, and the full non-regression check.
+Post-active-prefix attribution job `49150687` traced the bucket-256 path with detailed ranges and `TORCH_LOGS=recompiles,cudagraphs`. It is diagnostic only, because torch profiler/logging inflated the traced `seq9` wall time to `107.836s`. The useful evidence is that sampling/logits processors remained small, while graph/runtime churn was large: `1,058` graph-recording log lines, `20,504` TorchDynamo cache lookups, `16,310` CUDA graph launches, and a visible `sdpa_attention_forward` recompile from full static key length `2560` to active length `1024`. See `notes/2026-07-01-post-active-prefix-attribution.md`.
 
 ## Rejected Exact-Calculation Experiments
 
@@ -649,7 +654,7 @@ Smoke profiling looked promising (`+31.9%`), but the accepted full-song comparis
 
 ## Active-Prefix Decode Isolation
 
-This section records the diagnostic evidence that led to the accepted bucketed active-prefix decode loop. The full generated-token loop later graduated in job `49150185`; see "Bucketed active-prefix decode loop" under accepted optimizations for the retained baseline.
+This section records the diagnostic evidence that led to the opt-in bucketed active-prefix decode loop. The full generated-token loop produced useful exact, post-warmup speed signals, but later validation kept it out of the retained cold single-song baseline; see "Bucketed active-prefix decode loop" above.
 
 Commit `51f189f` added diagnostic switches to isolate active-prefix self-attention during direct-cache prefill vs the one-token decode step. This is not a production inference path and not a throughput claim; it is a correctness and fixed-step ceiling test.
 
@@ -739,15 +744,15 @@ See `notes/2026-07-01-tensorrt-packaging-probe.md` for the full resolver details
 
 The first current-architecture 200 tok/s scouting loop stopped on 2026-07-01 by the documented stop condition. This is a historical stop decision for quick-tweak work before the renewed active-prefix runtime pass. The target was not reached, and the measured quick-tweak candidate families no longer showed a plausible remaining major full-song win on RTX 2080/2080 Ti.
 
-The retained baseline at that time was SDPA plus `inference_generation_compile=true`: full-song job `49113713`, `7,639` main-generation tokens, `82.615s` synchronized model time, `92.465 tok/s`, and fixed-seed token equivalence PASS against the compile-disabled full-song baseline. The current retained baseline has since been superseded by bucketed active-prefix decode from job `49150185`.
+The retained baseline at that time was SDPA plus `inference_generation_compile=true`: full-song job `49113713`, `7,639` main-generation tokens, `82.615s` synchronized model time, `92.465 tok/s`, and fixed-seed token equivalence PASS against the compile-disabled full-song baseline. After active-prefix follow-up validation, this remains the retained cold single-song baseline.
 
 The final rejection set includes copy-compatible custom `_sample` hook, preallocated `_sample` loop, persistent static-mask mutation, compile-config variants (`dynamic=False`, `dynamic=True`, `mode="max-autotune"`, `fullgraph=True`), TensorRT-RTX current-env lowering, static-cache prefix trim, dynamic/default cache generation, final-position logits, stateful monotonic masking, and `torch.inference_mode` wrapping. Sampling/logits fusion remains below the profiling threshold in the post-warmup trace, and batching/parallel/server/window changes are non-equivalent unless separately proven token-identical.
 
 Final read-only subagent `019f1c3b-a844-73d1-8e67-858ad3b51732` agreed with stopping: no remaining exact-calculation path was both plausible for a `>=10%` full-song win and worth running before the stop decision.
 
-See `notes/2026-07-01-200tps-stop-decision.md` for the closure summary. Future attempts toward `200 tok/s` should start from the current retained active-prefix baseline and new profiling evidence, not by rerunning the documented failed scouts.
+See `notes/2026-07-01-200tps-stop-decision.md` for the closure summary. Future attempts toward `200 tok/s` should start from the retained compile-only baseline and new profiling evidence, not by rerunning the documented failed scouts.
 
-The renewed runtime/kernel pass later found new evidence in job `49140082`: decode-only active-prefix self-attention passed the one-token logits gate and cut fixed graph replay to about `3.79ms`, while active-prefix prefill failed. That evidence led to the full generated-loop candidate accepted in job `49150185`.
+The renewed runtime/kernel pass later found new evidence in job `49140082`: decode-only active-prefix self-attention passed the one-token logits gate and cut fixed graph replay to about `3.79ms`, while active-prefix prefill failed. That evidence led to the opt-in generated-loop candidate, but full-song follow-up kept it as strategic runtime evidence rather than the retained cold single-song baseline.
 
 ## What The Profile Captures
 

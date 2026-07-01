@@ -1,6 +1,6 @@
 # 200 tok/s Next Steps
 
-Superseded update: full-song job `49150185` later accepted bucketed active-prefix decode with `inference_active_prefix_decode_bucket_size=256`, raising the retained baseline to `121.926 tok/s` with token equivalence PASS for `7,639/7,639` main tokens. Keep this note as the pre-acceptance plan; use `docs/inference_profiling.md` and `notes/2026-07-01-active-prefix-decode-loop-full-song.md` for the current baseline and next gates.
+Superseded update: full-song job `49150185` initially looked like a bucketed active-prefix decode win, but follow-up jobs `49151748` and `49152465` showed order/warm-state sensitivity. Keep this note as the pre-runtime-pass plan; use `docs/inference_profiling.md` and `notes/2026-07-01-active-prefix-decode-loop-full-song.md` for the current retained compile-only baseline and active-prefix validation status.
 
 ## Current Baseline
 

@@ -2,7 +2,7 @@
 
 ## Summary
 
-This note records the first strong positive runtime signal after the retained generation-compile win. At the time it was a diagnostic ceiling probe, not an accepted inference speedup. Follow-up full-song job `49150185` later promoted the bucket-256 generated-token loop to the retained baseline; see `notes/2026-07-01-active-prefix-decode-loop-full-song.md`.
+This note records the first strong positive runtime signal after the retained generation-compile win. At the time it was a diagnostic ceiling probe, not an accepted inference speedup. Follow-up full-song jobs kept the generated-token loop as an opt-in strategic candidate rather than the retained cold single-song baseline; see `notes/2026-07-01-active-prefix-decode-loop-full-song.md`.
 
 The active-prefix idea should only be applied to the one-token decode step. Applying it during prefill is not equivalent.
 

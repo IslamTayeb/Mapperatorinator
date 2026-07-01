@@ -1,6 +1,6 @@
 # 200 tok/s Stop Decision
 
-Superseded update: this was the quick-tweak stop decision before the renewed active-prefix runtime pass. Full-song job `49150185` later accepted bucketed active-prefix decode with bucket `256`, raising the retained baseline to `121.926 tok/s` with token equivalence PASS for `7,639/7,639` main tokens. Keep this note as historical closure for the quick-tweak phase.
+Superseded update: this was the quick-tweak stop decision before the renewed active-prefix runtime pass. Full-song job `49150185` later looked like a large bucketed active-prefix win, but follow-up jobs `49151748` and `49152465` showed order/warm-state sensitivity, so the retained cold single-song baseline returned to compile-only. Keep this note as historical closure for the quick-tweak phase.
 
 ## Decision
 
