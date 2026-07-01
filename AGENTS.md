@@ -3,6 +3,12 @@
 - Keep inference profiling opt-in via `profile_inference`; default inference behavior should not emit profile artifacts.
 - Do not commit generated beatmaps, audio files, model weights, or `*.profile.json` outputs.
 - For expensive profiling, use a GPU host and the `configs/inference/profile_salvalai.yaml` style of reproducible Hydra config rather than running local Mac inference.
+- The current inference optimization objective is same-performance, faster inference on RTX 2080/2080 Ti: do not claim wins from changed precision, sampling policy, output policy, model quality, windowing/overlap, or generated-token behavior unless the run is explicitly labeled non-equivalent.
+- Measure before and after every optimization. Preserve fixed-seed generated token IDs for smoke equivalence when practical, separate true model time from torch-profiler overhead, and ask why each change worked before keeping it.
+- Start scouting with bounded smoke profiles such as `configs/inference/profile_salvalai_smoke.yaml`; promote only promising exact-calculation changes to full-song SALVALAI runs.
+- Keep optimizations that improve RTX 2080 full-song main-generation throughput by about 10% or more. Keep 5-10% wins only when they are simple and well-contained; remove 1-3% complexity by default.
+- Commit and push clean checkpoints for accepted wins, and remove marginal experiments regularly so the branch remains easy to roll back.
+- Write durable experiment notes under `notes/`, especially accepted wins, failed/marginal ideas, why a change worked, why it was reverted, and the DCC job/profile paths that support the decision.
 - Prioritize optimizations that improve the inference engine in general: generation loop overhead, cache behavior, batching/windowing, model-call structure, memory movement, and profiling clarity. Treat backend-specific work as secondary unless profiling shows it is the actual bottleneck.
 - Use explicit `attn_implementation=sdpa` as the current inference/profiling baseline on DCC. Do not frame SDPA as a permanent commitment; revisit FA2 or other backends only if broader inference-engine profiling indicates a likely win.
 - Preserve server and non-server inference paths when changing profiling code; both should retain prompt, output, generated-token, and elapsed-time stats.

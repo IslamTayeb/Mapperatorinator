@@ -69,6 +69,56 @@ Observed full SALVALAI run on 2026-06-30:
 
 The dominant bottleneck is autoregressive map generation. The first map window was the slowest record in this run at 7.655s for 520 generated tokens; most other slow windows were around 2.0-2.4s.
 
+## Same-Calculation Optimization Goal
+
+The current RTX 2080/2080 Ti baseline is roughly `65-78 tok/s` for main-generation throughput. Use these targets:
+
+- Starter success target: `100 tok/s` on a full-song run.
+- Strong first milestone: `120 tok/s`.
+- Stretch target: `150+ tok/s`.
+- Long-range north star: `200 tok/s`, but do not use it as the first stop condition.
+
+Only count a speedup as equivalent when fixed-seed generated token IDs match the baseline for the same audio/config slice. Do not claim wins from changed precision, sampling policy, output policy, model quality, windowing/overlap, or generated-token behavior unless the run is explicitly labeled non-equivalent.
+
+Keep SDPA as the current baseline unless profiler evidence strongly contradicts it. Torch profiler wall time is diagnostic only; compare normal `profile_inference` model elapsed time and token throughput.
+
+## Smoke-To-Full Profiling Loop
+
+Start with the middle 30s SALVALAI smoke config:
+
+```bash
+python inference.py --config-name profile_salvalai_smoke \
+  audio_path="$WORK/data/salvalai.mp3" \
+  output_path="$WORK/runs/profile-smoke-${SLURM_JOB_ID}" \
+  device=cuda \
+  precision=fp32 \
+  attn_implementation=sdpa \
+  use_server=false
+```
+
+`configs/inference/profile_salvalai_smoke.yaml` sets `start_time=63500`, `end_time=93500`, `seed=12345`, and `profile_record_token_ids=true`. This keeps scouting runs short while allowing token-equivalence checks.
+
+Compare baseline and candidate smoke profiles:
+
+```bash
+python utils/summarize_inference_profile.py \
+  --compare /path/to/baseline.profile.json /path/to/candidate.profile.json
+```
+
+Promote a change to a full-song SALVALAI run only when smoke results are stable, token IDs match, and the speedup is plausibly meaningful. Keep changes that improve RTX 2080 full-song main-generation throughput by about 10% or more. Keep 5-10% wins only when they are simple and well-contained. Remove 1-3% complexity by default.
+
+Stop the long-running optimization loop when either the full-song RTX 2080 run reaches at least `100 tok/s` with identical fixed-seed tokens, or profiling across multiple exact-calculation optimization families shows no remaining plausible `>=10%` improvement.
+
+## Codex Goal Prompt
+
+```text
+Optimize Mapperatorinator inference on RTX 2080/2080 Ti for same-calculation speedups only. Current baseline is roughly 65-78 tok/s; first success target is 100 tok/s main-generation throughput, strong milestone is 120 tok/s, and 150+ tok/s is stretch. Do not claim speedups from changed precision, sampling policy, output policy, model quality, windowing/overlap, or generated-token behavior unless explicitly labeled non-equivalent.
+
+Use a profiling-first loop. Start with a middle-30-second song smoke slice, prove fixed-seed generated tokens match baseline, and only promote promising changes to full-song SALVALAI runs. Use full-song runs for accepted results. Keep SDPA as the baseline unless profiler evidence strongly contradicts it. Separate true model time from torch.profiler overhead.
+
+Scout improvement ideas with subagents and web research as useful, but accept only measured wins. Prioritize big wins in generation-loop structure, cache behavior, mask construction, logits processors, repeated small kernels, memory movement, and avoidable per-token setup. Keep changes that improve RTX 2080 full-song main-generation throughput by >=10%; keep 5-10% only if very simple; remove 1-3% complexity. Commit and push clean checkpoints for accepted wins, document why each win worked or failed in docs/inference_profiling.md, update AGENTS.md with durable conventions, write notes under notes/, and stop when the 100 tok/s goal is reached or profiling shows no remaining plausible >=10% exact-calculation improvement.
+```
+
 ## Attention Kernel Profiling
 
 Use `utils/profile_attention_kernels.py` to isolate SDPA vs FlashAttention 2 without loading model weights or audio. The script uses fixed random tensors with VarWhisper small v3-like shapes (`6` heads, `64` head dimension) and reports both raw attention-call timing and a repo-like layout path that includes output reshaping and FlashAttention packing overhead.

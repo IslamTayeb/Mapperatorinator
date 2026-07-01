@@ -1,0 +1,13 @@
+defaults:
+  - profile_salvalai
+  - _self_
+
+# Middle 30s smoke window for exact-calculation inference optimization scouting.
+# Use this before full-song SALVALAI runs; promote only stable, meaningful wins.
+start_time: 63500
+end_time: 93500
+seed: 12345
+attn_implementation: sdpa
+use_server: false
+profile_record_token_ids: true
+output_path: "${oc.env:MAPPERATORINATOR_PROFILE_OUTPUT,./logs/profile_salvalai_smoke}"

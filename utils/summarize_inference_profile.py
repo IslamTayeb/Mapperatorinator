@@ -34,8 +34,12 @@ def _generation_name(record: dict[str, Any]) -> str:
     return f"{label}/{context}/{mode}/{unit}, generated={tokens}{tok_s_text}"
 
 
+def _load_profile(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def summarize(path: Path, *, limit: int) -> None:
-    profile = json.loads(path.read_text(encoding="utf-8"))
+    profile = _load_profile(path)
     print(f"Profile: {path}")
 
     metadata = profile.get("metadata", {})
@@ -92,12 +96,117 @@ def summarize(path: Path, *, limit: int) -> None:
             )
 
 
+def _summary_for_label(profile: dict[str, Any], label: str) -> dict[str, Any]:
+    by_label = profile.get("summary", {}).get("generation_by_label", {})
+    if label in by_label:
+        return by_label[label]
+    return {}
+
+
+def _flatten_token_ids(profile: dict[str, Any], label: str) -> list[int] | None:
+    tokens: list[int] = []
+    saw_tokens = False
+    for record in profile.get("generation", []):
+        if record.get("profile_label") != label:
+            continue
+        if "generated_token_ids" in record:
+            value = record.get("generated_token_ids")
+            if value is None:
+                continue
+            saw_tokens = True
+            tokens.extend(int(token) for token in value)
+        elif "generated_token_ids_per_sample" in record:
+            value = record.get("generated_token_ids_per_sample")
+            if value is None:
+                continue
+            saw_tokens = True
+            for sample in value:
+                tokens.extend(int(token) for token in sample)
+    return tokens if saw_tokens else None
+
+
+def _compare_number(name: str, baseline: float, candidate: float, *, higher_is_better: bool) -> None:
+    delta = candidate - baseline
+    pct = (delta / baseline * 100.0) if baseline else 0.0
+    direction = "better" if (delta >= 0) == higher_is_better else "worse"
+    print(f"  {name}: baseline={baseline:.3f}, candidate={candidate:.3f}, delta={delta:+.3f} ({pct:+.1f}%, {direction})")
+
+
+def compare_profiles(baseline_path: Path, candidate_path: Path, *, label: str) -> None:
+    baseline = _load_profile(baseline_path)
+    candidate = _load_profile(candidate_path)
+    baseline_summary = _summary_for_label(baseline, label)
+    candidate_summary = _summary_for_label(candidate, label)
+
+    print(f"Baseline:  {baseline_path}")
+    print(f"Candidate: {candidate_path}")
+    print(f"Label:     {label}")
+    print()
+
+    if not baseline_summary or not candidate_summary:
+        print("Missing generation summary for requested label.")
+        return
+
+    _compare_number(
+        "tokens_per_second",
+        float(baseline_summary.get("tokens_per_second", 0.0) or 0.0),
+        float(candidate_summary.get("tokens_per_second", 0.0) or 0.0),
+        higher_is_better=True,
+    )
+    _compare_number(
+        "model_elapsed_seconds",
+        float(baseline_summary.get("model_elapsed_seconds", 0.0) or 0.0),
+        float(candidate_summary.get("model_elapsed_seconds", 0.0) or 0.0),
+        higher_is_better=False,
+    )
+    _compare_number(
+        "outer_wall_seconds",
+        float(baseline_summary.get("wall_seconds", 0.0) or 0.0),
+        float(candidate_summary.get("wall_seconds", 0.0) or 0.0),
+        higher_is_better=False,
+    )
+    print(f"  generated_tokens: baseline={baseline_summary.get('generated_tokens')}, candidate={candidate_summary.get('generated_tokens')}")
+    print(f"  records: baseline={baseline_summary.get('records')}, candidate={candidate_summary.get('records')}")
+    print()
+
+    baseline_tokens = _flatten_token_ids(baseline, label)
+    candidate_tokens = _flatten_token_ids(candidate, label)
+    if baseline_tokens is None or candidate_tokens is None:
+        print("Token equivalence: not checked; rerun with profile_record_token_ids=true.")
+        return
+    if baseline_tokens == candidate_tokens:
+        print(f"Token equivalence: PASS ({len(baseline_tokens)} generated token IDs match).")
+        return
+
+    mismatch = next(
+        (idx for idx, pair in enumerate(zip(baseline_tokens, candidate_tokens)) if pair[0] != pair[1]),
+        min(len(baseline_tokens), len(candidate_tokens)),
+    )
+    print(
+        "Token equivalence: FAIL "
+        f"(baseline_len={len(baseline_tokens)}, candidate_len={len(candidate_tokens)}, first_mismatch={mismatch})."
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Summarize Mapperatorinator inference profile JSON.")
-    parser.add_argument("profile", type=Path, help="Path to a .profile.json file.")
+    parser.add_argument("profile", type=Path, nargs="?", help="Path to a .profile.json file.")
     parser.add_argument("--limit", type=int, default=12, help="Number of stage/window rows to print.")
+    parser.add_argument(
+        "--compare",
+        nargs=2,
+        metavar=("BASELINE", "CANDIDATE"),
+        type=Path,
+        help="Compare two profile JSON files.",
+    )
+    parser.add_argument("--label", default="main_generation", help="Generation label to compare.")
     args = parser.parse_args()
-    summarize(args.profile, limit=args.limit)
+    if args.compare:
+        compare_profiles(args.compare[0], args.compare[1], label=args.label)
+    elif args.profile:
+        summarize(args.profile, limit=args.limit)
+    else:
+        parser.error("provide a profile path or --compare BASELINE CANDIDATE")
 
 
 if __name__ == "__main__":

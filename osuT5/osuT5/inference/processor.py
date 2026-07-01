@@ -393,6 +393,9 @@ class Processor(object):
 
                 # Only support batch size 1
                 predicted_tokens = result[0, max_len:].cpu()
+                generated_token_ids = None
+                if self.args.profile_record_token_ids:
+                    generated_token_ids = self._generated_token_ids(result[0], prompt[0])
                 self._record_generation_profile(
                     profile_label=profile_label,
                     mode="sequential",
@@ -404,6 +407,7 @@ class Processor(object):
                     prompt_tokens_per_sample=[int(prompt.ne(self.tokenizer.pad_id).sum().item())],
                     output_tokens_per_sample=[int(result[0].ne(self.tokenizer.pad_id).sum().item())],
                     generated_tokens_per_sample=[int(predicted_tokens.ne(self.tokenizer.pad_id).sum().item())],
+                    generated_token_ids=generated_token_ids,
                     stats=generation_stats,
                     trim_lookback=trim_lookback,
                     trim_lookahead=trim_lookahead,
@@ -800,6 +804,14 @@ class Processor(object):
                 result, generation_stats = result
 
             self._record_generation_stats(generation_stats)
+            generated_token_ids_per_sample = None
+            if self.args.profile_record_token_ids:
+                maybe_generated_token_ids = [
+                    self._generated_token_ids(row, prompt)
+                    for row, prompt in zip(result, cond_prompt_batch)
+                ]
+                if all(tokens is not None for tokens in maybe_generated_token_ids):
+                    generated_token_ids_per_sample = maybe_generated_token_ids
             self._record_generation_profile(
                 profile_label=profile_label,
                 mode="parallel",
@@ -810,6 +822,7 @@ class Processor(object):
                 wall_seconds=model_wall_seconds,
                 prompt_tokens_per_sample=cond_prompt_batch.ne(self.tokenizer.pad_id).sum(dim=-1).tolist(),
                 output_tokens_per_sample=result.ne(self.tokenizer.pad_id).sum(dim=-1).tolist(),
+                generated_token_ids_per_sample=generated_token_ids_per_sample,
                 stats=generation_stats,
             )
             if verbose:
@@ -1462,6 +1475,13 @@ class Processor(object):
         }
         record.update(metadata)
         self.profiler.record_generation(**record)
+
+    def _generated_token_ids(self, output: torch.Tensor, prompt: torch.Tensor) -> list[int] | None:
+        if torch.is_floating_point(output):
+            return None
+        output_ids = output[output.ne(self.tokenizer.pad_id)]
+        prompt_len = int(prompt.ne(self.tokenizer.pad_id).sum().item())
+        return [int(token) for token in output_ids[prompt_len:].tolist()]
 
     @staticmethod
     def _create_tokens_per_second_meter(alpha: float = 0.1) -> dict[str, float | None]:

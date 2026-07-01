@@ -84,6 +84,7 @@ class InferenceConfig:
     profile_torch_record_shapes: bool = True  # Record tensor shapes in torch.profiler traces
     profile_torch_profile_memory: bool = True  # Record memory events in torch.profiler traces
     profile_torch_with_stack: bool = False  # Record Python stacks in torch.profiler traces
+    profile_record_token_ids: bool = False  # Record generated token IDs in profile JSON for fixed-seed equivalence checks
     resnap_events: bool = True  # Resnap notes to the timing after generation
     snap_near_perfect_overlaps: bool = True  # Snap nearly overlapping positions to each other
 

@@ -444,6 +444,7 @@ def generate(
         use_server=args.use_server,
         parallel=args.parallel,
         max_batch_size=args.max_batch_size,
+        profile_record_token_ids=args.profile_record_token_ids,
         in_context=[context.value for context in args.in_context],
         output_type=[context.value for context in args.output_type],
     )
