@@ -157,6 +157,15 @@ Full-song warm-repeat validation, DCC job `49154643` on `dcc-core-ferc-s-z25-20`
 
 Run dir: `/work/imt11/Mapperatorinator/runs/warm-repeat-full-49154643-b394a9d`. Active512 improved warmed full-song main generation by `+39.5%` over warmed compile-only (`128.585` vs `92.207 tok/s`) with `7,639 / 7,639` generated main tokens matching on each paired run. The same job also showed active512 run 0 at `95.698 tok/s`, but this is not a cold single-song baseline replacement because the active suite ran after a compile suite in the same process/job context and earlier cold-first active-prefix validation remained order-sensitive. Keep active-prefix default-off and use this only as `warm_repeat`/future batch-serving evidence.
 
+Order-flipped full-song warm-repeat validation, DCC job `49155778` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti, driver `595.71.05`, torch `2.10.0+cu128`, Transformers `4.57.3`, commit `19e74a9`:
+
+| suite | run 0 | warmed runs | paired equivalence | interpretation |
+| --- | ---: | ---: | --- | --- |
+| active512 | `95.242 tok/s` | `128.026 tok/s` aggregate | PASS vs compile-only for runs 0, 1, and 2 | exact warmed full-song win, measured active-first |
+| compile-only | `83.820 tok/s` | `91.982 tok/s` aggregate | baseline | retained path, isolated cache after active512 |
+
+Run dir: `/work/imt11/Mapperatorinator/runs/warm-repeat-active-first-49155778-19e74a9`. This repeated the full-song test with active512 first and separate TorchInductor/CUDA caches for each suite. Active512 improved warmed main generation by `+39.2%` (`128.026` vs `91.982 tok/s`), improved warmed timing generation (`98.324` vs `73.690 tok/s`), and reduced paired main/timing stage wall time on every run. Generated main-token IDs matched compile-only for all three paired runs (`7,639 / 7,639`). This strengthens active-prefix as a warm-repeat, long-lived process, and future batch-serving candidate, but it still does not replace the cold single-song baseline.
+
 ## Smoke-To-Full Profiling Loop
 
 Start with the middle 15s SALVALAI smoke config for fastest iteration:

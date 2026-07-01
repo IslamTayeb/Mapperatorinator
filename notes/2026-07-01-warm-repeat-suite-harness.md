@@ -92,6 +92,28 @@ DCC job `49154643` validated the same warm-repeat question on the full SALVALAI 
 
 Decision: this clears the threshold for more default-off active-prefix runtime-discipline work for warm-repeat/future batch-serving. It does not replace the retained cold single-song baseline because the active suite ran after a compile suite in the same Slurm job context, and previous cold-first active-prefix validation remained order-sensitive.
 
+## Order-Flipped Full-Song Result
+
+DCC job `49155778` repeated the full-song warm-repeat validation with active512 first and isolated TorchInductor/CUDA caches per suite on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti, driver `595.71.05`, torch `2.10.0+cu128`, Transformers `4.57.3`, commit `19e74a9`.
+
+- Run dir: `/work/imt11/Mapperatorinator/runs/warm-repeat-active-first-49155778-19e74a9`
+- Logs: `/work/imt11/Mapperatorinator/logs/warm-active-first-49155778.out` and `.err`
+- Status: `COMPLETED`, exit code `0:0`, elapsed `00:10:56`
+- Active512 warmed aggregate: `15,278` tokens, `119.335s`, `128.026 tok/s`
+- Compile-only warmed aggregate: `15,278` tokens, `166.098s`, `91.982 tok/s`
+- Paired cross-suite token equivalence: PASS for runs 0, 1, and 2 (`7,639 / 7,639` main tokens each)
+- Warmed timing generation also improved: active512 `1,642` tokens in `16.700s` (`98.324 tok/s`) vs compile-only `1,642` tokens in `22.282s` (`73.690 tok/s`)
+
+Paired main-generation comparison:
+
+| run | compile tok/s | active512 tok/s | delta | token equivalence |
+| ---: | ---: | ---: | ---: | --- |
+| 0 | 83.820 | 95.242 | +13.6% | PASS |
+| 1 warmed | 93.345 | 129.406 | +38.6% | PASS |
+| 2 warmed | 90.658 | 126.676 | +39.7% | PASS |
+
+Decision: this confirms the active-prefix warmed full-song signal is not just an artifact of running after compile-only. The result is still `warm_repeat`/future batch-serving evidence, not a cold single-song baseline replacement. The useful next work is first-window/specialization and graph/runtime-stability, plus realistic 5+ song `serial_multi_song` suites when the data list is ready.
+
 ## Serial Multi-Song Harness Smoke
 
 After commit `dd7bdbb`, DCC login-node checks validated the new `serial_multi_song` CLI guardrails without running inference:
