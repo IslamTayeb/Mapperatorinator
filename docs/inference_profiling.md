@@ -78,7 +78,9 @@ The current RTX 2080/2080 Ti baseline after the accepted generation-compile win 
 - Starter success target: `100 tok/s` on a full-song run.
 - Strong first milestone: `120 tok/s`.
 - Stretch target: `150+ tok/s`.
-- Long-range north star: `200 tok/s`, but do not use it as the first stop condition.
+- Active long-range research target: `200 tok/s`.
+
+The first 100 tok/s loop ended below target by the documented stop condition because profiling showed no remaining plausible current-architecture quick win of `>=10%`. The next 200 tok/s phase should be treated as deeper runtime/kernel work. Reaching `200 tok/s` from the retained `92.465 tok/s` baseline requires cutting full-song synchronized main-generation model time from `82.615s` to about `38.195s`, a `53.8%` reduction.
 
 Only count a speedup as equivalent when fixed-seed generated token IDs match the baseline for the same audio/config slice. Do not claim wins from changed precision, sampling policy, output policy, model quality, windowing/overlap, or generated-token behavior unless the run is explicitly labeled non-equivalent.
 
@@ -86,7 +88,21 @@ Keep SDPA as the current baseline unless profiler evidence strongly contradicts 
 
 ## Smoke-To-Full Profiling Loop
 
-Start with the middle 30s SALVALAI smoke config:
+Start with the middle 15s SALVALAI smoke config for fastest iteration:
+
+```bash
+python inference.py --config-name profile_salvalai_smoke15 \
+  audio_path="$WORK/data/salvalai.mp3" \
+  output_path="$WORK/runs/profile-smoke15-${SLURM_JOB_ID}" \
+  device=cuda \
+  precision=fp32 \
+  attn_implementation=sdpa \
+  use_server=false
+```
+
+`configs/inference/profile_salvalai_smoke15.yaml` sets `start_time=71000`, `end_time=86000`, `seed=12345`, and `profile_record_token_ids=true`. Use this for first-pass scouting; promote to the 30s smoke or full-song configs only when the 15s result is token-equivalent and plausibly meaningful.
+
+Use the middle 30s SALVALAI smoke config when a longer smoke slice is needed before full-song promotion:
 
 ```bash
 python inference.py --config-name profile_salvalai_smoke \
@@ -107,7 +123,7 @@ python utils/summarize_inference_profile.py \
   --compare /path/to/baseline.profile.json /path/to/candidate.profile.json
 ```
 
-Promote a change to a full-song SALVALAI run only when smoke results are stable, token IDs match, and the speedup is plausibly meaningful. For compile-like changes with one-time first-window costs, inspect post-warmup per-window throughput before rejecting a weak total smoke result. Keep changes that improve RTX 2080 full-song main-generation throughput by about 10% or more. Keep 5-10% wins only when they are simple and well-contained. Remove 1-3% complexity by default.
+Promote a change to a full-song SALVALAI run only when smoke results are stable, token IDs match, and the speedup is plausibly meaningful. For compile-like changes with one-time first-window costs, inspect post-warmup per-window throughput before rejecting a weak total smoke result. Keep changes that improve RTX 2080 full-song main-generation throughput by about 10% or more. Keep 5-10% wins only when they are simple and well-contained or strategically de-risk the custom runtime path. Remove 1-3% complexity by default.
 
 Stop the long-running optimization loop when either the full-song RTX 2080 run reaches at least `100 tok/s` with identical fixed-seed tokens, or profiling across multiple exact-calculation optimization families shows no remaining plausible `>=10%` improvement.
 
@@ -118,6 +134,15 @@ Current status after 2026-07-01 scouting:
 - In the retained full-song run, main-generation model time was `82.615s` and summed outer wall was `82.793s`; only `0.178s` total sat outside the synchronized model call across `87` map windows. That means prompt setup, cache construction, device transfer outside the timed region, result CPU transfer, and profile bookkeeping cannot plausibly close the gap to `100 tok/s`.
 - A custom decode loop remains a possible research project only if it preserves the compiled one-token forward path and exact HF sampling/RNG semantics. A naive replacement for `model.generate` is more likely to lose the accepted compile win than to provide a clean `>=10%` full-song gain.
 
+For the 200 tok/s phase, rank the next experiments this way:
+
+1. Exact custom decode-loop prototype with CUDA graph discipline.
+2. Fused sampling/logits-processor profiling, then exact fusion only if sampling is at least `10%` of synchronized main-generation time.
+3. Torch-TensorRT / TensorRT-RTX feasibility for the repeated one-token decoder forward.
+4. Backend/version refresh only after new runtime traces show attention is the limiting cost.
+
+Custom runtime work must prove token identity in stages before any speed claim graduates: compile-disabled 15s smoke equivalence, compile-enabled 15s smoke equivalence, then full-song equivalence.
+
 ## Codex Goal Prompt
 
 ```text
@@ -126,6 +151,22 @@ Optimize Mapperatorinator inference on RTX 2080/2080 Ti for same-calculation spe
 Use a profiling-first loop. Start with a middle-30-second song smoke slice, prove fixed-seed generated tokens match baseline, and only promote promising changes to full-song SALVALAI runs. Use full-song runs for accepted results. Keep SDPA as the baseline unless profiler evidence strongly contradicts it. Separate true model time from torch.profiler overhead.
 
 Scout improvement ideas with subagents and web research as useful, but accept only measured wins. Prioritize big wins in generation-loop structure, cache behavior, mask construction, logits processors, repeated small kernels, memory movement, and avoidable per-token setup. Keep changes that improve RTX 2080 full-song main-generation throughput by >=10%; keep 5-10% only if very simple; remove 1-3% complexity. Commit and push clean checkpoints for accepted wins, document why each win worked or failed in docs/inference_profiling.md, update AGENTS.md with durable conventions, write notes under notes/, and stop when the 100 tok/s goal is reached or profiling shows no remaining plausible >=10% exact-calculation improvement.
+```
+
+## 200 tok/s Goal Prompt
+
+```text
+Optimize Mapperatorinator inference toward 200 tok/s main-generation throughput on RTX 2080/2080 Ti, same-calculation only. Current retained baseline is SDPA + `inference_generation_compile=true`: 7,639 full-song SALVALAI main tokens, 82.615s synchronized model time, 92.465 tok/s, fixed-seed token equivalence PASS against compile-disabled baseline.
+
+Treat 200 tok/s as a serious research target, not permission to change the calculation. Do not claim speedups from changed precision, sampling policy, output policy, model quality, windowing/overlap, generated-token behavior, output length, or non-equivalent RNG behavior unless explicitly labeled non-equivalent.
+
+Use a profiling-first loop. Start with a middle-15-second SALVALAI smoke slice, prove fixed-seed generated main-token IDs match the retained baseline, and promote only promising exact-calculation changes to longer smoke or full-song SALVALAI runs. Use full-song runs for accepted results. Keep SDPA + generation compile as the baseline unless profiler evidence and full-song token-equivalent runs strongly justify replacing it. Separate true model time from torch.profiler overhead.
+
+Prioritize deeper runtime/kernel work that could plausibly remove about 54% of retained full-song model time: exact custom decode loop, CUDA graph discipline, fused sampling/logits processors, static-cache/layout work, and Torch-TensorRT/TensorRT-RTX feasibility. Do not reintroduce rejected quick tweaks unless new profiler evidence explains why the old negative or non-equivalent result no longer applies.
+
+For custom runtime work, require compile-disabled 15s smoke token equivalence first, then compile-enabled 15s smoke token equivalence, then full-song token equivalence before any speed claim graduates. Keep changes that improve RTX 2080 full-song main-generation throughput by >=10%; keep 5-10% only if simple and strategic toward the custom runtime; remove 1-3% complexity by default.
+
+Commit and push clean checkpoints for accepted wins, document every accepted/rejected experiment in docs/inference_profiling.md and notes/, update AGENTS.md with durable conventions, and stop only when 200 tok/s is reached or profiling shows no remaining plausible exact-calculation path toward a major gain.
 ```
 
 ## Attention Kernel Profiling
