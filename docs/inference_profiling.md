@@ -134,7 +134,7 @@ python utils/summarize_inference_profile.py \
 
 Promote a change to a full-song SALVALAI run only when smoke results are stable, token IDs match, and the speedup is plausibly meaningful. For compile-like changes with one-time first-window costs, inspect post-warmup per-window throughput before rejecting a weak total smoke result. Keep changes that improve RTX 2080 full-song main-generation throughput by about 10% or more. Keep 5-10% wins only when they are simple and well-contained or strategically de-risk the custom runtime path. Remove 1-3% complexity by default.
 
-Stop the long-running optimization loop when either the full-song RTX 2080 run reaches at least `100 tok/s` with identical fixed-seed tokens, or profiling across multiple exact-calculation optimization families shows no remaining plausible `>=10%` improvement.
+For the current 200 tok/s phase, stop the long-running optimization loop only when either the full-song RTX 2080/2080 Ti run reaches at least `200 tok/s` with identical fixed-seed tokens, or profiling across multiple exact-calculation optimization families shows no remaining plausible major exact-calculation path.
 
 Current status after 2026-07-01 scouting:
 
@@ -151,6 +151,12 @@ For the 200 tok/s phase, rank the next experiments this way:
 4. Backend/version refresh only after new runtime traces show attention is the limiting cost.
 
 Custom runtime work must prove token identity in stages before any speed claim graduates: compile-disabled 15s smoke equivalence, compile-enabled 15s smoke equivalence, then full-song equivalence.
+
+Torch-TensorRT/TensorRT environment probe:
+
+- Job `49134026` on `dcc-core-ferc-s-z25-21`, RTX 2080 Ti capability `(7, 5)`, commit `a2cf83a`, log `/work/imt11/Mapperatorinator/logs/trt-probe-49134026.out`.
+- DCC env `/hpc/group/romerolab/imt11/envs/mapperatorinator` has `torch 2.10.0+cu128` with CUDA `12.8`, but `torch_tensorrt`, `tensorrt`, `onnx`, `onnxruntime`, and `polygraphy` are not installed on the GPU node.
+- Treat TensorRT as a separate environment-install feasibility project, not the immediate runnable optimization path. Do not spend runtime-spike time on TensorRT until the stack exists in an isolated env and can compile the repeated one-token decoder forward with logits/token equivalence checks.
 
 Post-warmup torch-profiler diagnostic for the 15s retained baseline:
 
