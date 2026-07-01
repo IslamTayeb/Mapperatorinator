@@ -179,6 +179,14 @@ def _last_token_logits(logits: torch.Tensor) -> torch.Tensor:
     return logits[:, -1, :].detach().to(torch.float32)
 
 
+def _condition_kwargs(model_inputs: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in model_inputs.items()
+        if key not in {"frames", "decoder_input_ids", "decoder_attention_mask"}
+    }
+
+
 @torch.no_grad()
 def run_one_token_gate(
         args: InferenceConfig,
@@ -228,12 +236,19 @@ def run_one_token_gate(
     prompt = model_inputs["decoder_input_ids"]
     prompt_mask = model_inputs["decoder_attention_mask"]
     prompt_len = int(prompt.shape[-1])
+    condition_kwargs = _condition_kwargs(model_inputs)
 
     with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16, enabled=args.precision == "amp"), \
             generation_profile_context(sdpa_backend=args.profile_sdpa_backend):
-        prompt_outputs = model(
-            **model_inputs,
+        prompt_prepared = model.prepare_inputs_for_generation(
+            prompt,
             use_cache=False,
+            decoder_attention_mask=prompt_mask,
+            frames=model_inputs["frames"],
+            **condition_kwargs,
+        )
+        prompt_outputs = model(
+            **prompt_prepared,
         )
         next_token_logits = _last_token_logits(prompt_outputs.logits)
         if probe_token_id is None:
@@ -243,32 +258,41 @@ def run_one_token_gate(
 
         full_prefix = torch.cat([prompt, probe_token], dim=-1)
         full_mask = torch.cat([prompt_mask, torch.ones_like(probe_token, dtype=prompt_mask.dtype)], dim=-1)
-        reference_outputs = model(
-            **{**model_inputs, "decoder_input_ids": full_prefix, "decoder_attention_mask": full_mask},
+        encoder_outputs = BaseModelOutput(last_hidden_state=prompt_outputs.encoder_last_hidden_state)
+        reference_prepared = model.prepare_inputs_for_generation(
+            full_prefix,
             use_cache=False,
+            encoder_outputs=encoder_outputs,
+            decoder_attention_mask=full_mask,
+            **condition_kwargs,
+        )
+        reference_outputs = model(
+            **reference_prepared,
         )
         reference_logits = _last_token_logits(reference_outputs.logits)
 
         cache = get_cache(model, batch_size=1, num_beams=1, cfg_scale=1.0)
-        prefill_outputs = model(
-            **model_inputs,
-            use_cache=True,
+        prefill_cache_position = torch.arange(prompt_len, device=prompt.device)
+        prefill_prepared = model.prepare_inputs_for_generation(
+            prompt,
             past_key_values=cache,
-            cache_position=torch.arange(prompt_len, device=prompt.device),
+            use_cache=True,
+            decoder_attention_mask=prompt_mask,
+            cache_position=prefill_cache_position,
+            frames=model_inputs["frames"],
+            **condition_kwargs,
         )
+        prefill_outputs = model(**prefill_prepared)
         encoder_outputs = BaseModelOutput(last_hidden_state=prefill_outputs.encoder_last_hidden_state)
+        decode_cache_position = torch.arange(prompt_len, prompt_len + 1, device=prompt.device)
         candidate_inputs = model.prepare_inputs_for_generation(
             full_prefix,
             past_key_values=cache,
             use_cache=True,
             encoder_outputs=encoder_outputs,
             decoder_attention_mask=full_mask,
-            cache_position=torch.arange(prompt_len, prompt_len + 1, device=prompt.device),
-            **{
-                key: value
-                for key, value in model_inputs.items()
-                if key not in {"frames", "decoder_input_ids", "decoder_attention_mask"}
-            },
+            cache_position=decode_cache_position,
+            **condition_kwargs,
         )
         candidate_outputs = model(**candidate_inputs)
         candidate_logits = _last_token_logits(candidate_outputs.logits)
@@ -286,6 +310,11 @@ def run_one_token_gate(
         "topk_match": topk_match,
         "probe_token_id": int(probe_token.item()),
         "prompt_tokens": prompt_len,
+        "prefill_cache_position": [int(item) for item in prefill_cache_position.tolist()],
+        "decode_cache_position": [int(item) for item in decode_cache_position.tolist()],
+        "prepared_prompt_shape": list(prompt_prepared["decoder_input_ids"].shape),
+        "prepared_reference_shape": list(reference_prepared["decoder_input_ids"].shape),
+        "prepared_candidate_shape": list(candidate_inputs["decoder_input_ids"].shape),
         "max_abs": float(abs_diff.max().item()),
         "mean_abs": float(abs_diff.mean().item()),
         "max_rel": float(rel_diff.max().item()),

@@ -39,6 +39,15 @@ ValueError: Invalid special event name song_position.
 
 Cause: the first version of `utils/verify_one_token_decode.py` built the probe prompt from only the selected output context. Production sequential generation passes the output-context prefix `out_context[:i + 1]`, which matters for required extra special tokens such as `song_position`. The gate was patched to mirror the production prefix path before rerunning.
 
+Follow-up DCC gate run `49139107` on the same node reached the raw-logits comparison but failed:
+
+```text
+pass=false, prompt_tokens=84, probe_token_id=13,
+max_abs=27.6516, mean_abs=17.3663, topk_match=false
+```
+
+Diagnosis: the gate still called `model.forward()` directly for its prompt/reference/prefill paths. Production generation goes through `prepare_inputs_for_generation()`, which is important for left-padded prompt position IDs and static-cache 4D mask preparation. The gate was patched again to prepare prompt, no-cache reference, static-cache prefill, and `q_len=1` candidate inputs through `model.prepare_inputs_for_generation()` and to record prepared shapes/cache positions in the report.
+
 The next run should be:
 
 ```bash
