@@ -6,6 +6,7 @@ from multiprocessing.managers import Namespace
 from pathlib import Path
 
 import torch
+from transformers.generation.configuration_utils import CompileConfig
 import numpy as np
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader, IterableDataset, default_collate
@@ -330,6 +331,7 @@ def load_model_loaders(
         gamemode: int | None = None,
         auto_select_gamemode_model: bool = True,
         generation_compile: bool = False,
+        generation_compile_mode: str | None = None,
 ):
     if not ckpt_path:
         if eval_mode:
@@ -384,6 +386,10 @@ def load_model_loaders(
                 subfolder=ckpt_subfolder,
             )
             model.generation_config.disable_compile = not generation_compile
+            if generation_compile_mode is not None:
+                if not generation_compile:
+                    raise ValueError("generation_compile_mode requires generation_compile=true.")
+                model.generation_config.compile_config = CompileConfig(mode=generation_compile_mode)
         else:
             model_state = torch.load(ckpt_path / "pytorch_model.bin", weights_only=True)
             model = _get_model(t5_args, tokenizer, dtype=dtype, attn_implementation=attn_implementation)
