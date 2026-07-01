@@ -140,15 +140,19 @@ def _build_probe_inputs(
         song_length=song_length,
         verbose=False,
     )
-    context = next((item for item in out_context_data if not item["finished"]), None)
-    if context is None:
+    context_index, context = next(
+        ((idx, item) for idx, item in enumerate(out_context_data) if not item["finished"]),
+        (None, None),
+    )
+    if context is None or context_index is None:
         raise RuntimeError("No unfinished output context available for one-token probe")
+    out_context_prefix = out_context_data[:context_index + 1]
 
     frames = processor.prepare_frames(sequences[0][sequence_index])
     frame_time = sequences[1][sequence_index].item()
     cond_prompt, uncond_prompt = processor.get_prompts(
         processor.prepare_context_sequences(in_context_data, frame_time, False, req_special_tokens),
-        processor.prepare_context_sequences([context], frame_time, True, req_special_tokens),
+        processor.prepare_context_sequences(out_context_prefix, frame_time, True, req_special_tokens),
     )
     if uncond_prompt is not None:
         raise RuntimeError("Unexpected unconditional prompt with cfg_scale=1.0")

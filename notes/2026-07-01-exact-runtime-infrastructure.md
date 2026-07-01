@@ -31,7 +31,15 @@ Passing this gate is necessary for custom decoder-step work, but it is not suffi
 
 ## Current Status
 
-No DCC GPU runs have been made for this checkpoint yet. The next run should be:
+Initial DCC gate run `49139099` on `dcc-core-ferc-s-z25-21` reached model load, then failed before logits comparison:
+
+```text
+ValueError: Invalid special event name song_position.
+```
+
+Cause: the first version of `utils/verify_one_token_decode.py` built the probe prompt from only the selected output context. Production sequential generation passes the output-context prefix `out_context[:i + 1]`, which matters for required extra special tokens such as `song_position`. The gate was patched to mirror the production prefix path before rerunning.
+
+The next run should be:
 
 ```bash
 python utils/verify_one_token_decode.py \
