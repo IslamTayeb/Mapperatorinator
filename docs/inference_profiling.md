@@ -447,6 +447,23 @@ RTX 2080 Ti smoke comparison on DCC `gpu-common`:
 
 `utils/summarize_inference_profile.py --compare` reported token equivalence FAIL: baseline generated `2,894` main-generation token IDs, candidate generated `3,000`, and the first mismatch was at token `1,350`. Instrumented profile records confirmed the preallocated path actually ran in all `20` candidate main-generation windows. Throughput was only `+0.5%` by token-normalized rate while model time was `+3.2%` worse, so this is both non-equivalent and too small. The candidate also logged one TorchDynamo recompile caused by timing/main model parameter shape mismatch. Do not reintroduce a mutable preallocated `_sample` loop unless a future prototype first proves exact token identity with compile disabled and then with compile enabled.
 
+### Copy-compatible custom sample hook
+
+Attempted in commit `07b36a5` and reverted after 15s smoke profiling. The change added an opt-in `inference_custom_decode_loop` path that temporarily replaced Hugging Face's internal `_sample` method with a local copy-compatible loop while still letting `model.generate()` perform its normal generation setup, logits-processor construction, stopping criteria, static-cache wiring, and generation compile checks.
+
+RTX 2080 Ti middle-15s SALVALAI smoke comparisons on DCC `gpu-common`, node `dcc-core-ferc-s-z25-21`:
+
+| gate | run | commit | job | profile | main tokens | main model time | tok/s |
+| --- | --- | --- | --- | --- | ---: | ---: | ---: |
+| compile disabled | baseline | `07b36a5` | `49135145` | `/work/imt11/Mapperatorinator/runs/smoke15-loop-base2-compileoff-07b36a5/beatmapba4408b7bf2e444e9a7c761640053d40.osu.profile.json` | 1,084 | 17.564s | 61.7 |
+| compile disabled | candidate | `07b36a5` | `49135146` | `/work/imt11/Mapperatorinator/runs/smoke15-loop-custom2-compileoff-07b36a5/beatmapcba4ff105a834900bb11cb79e288b873.osu.profile.json` | 1,084 | 19.711s | 55.0 |
+| compile enabled | baseline | `07b36a5` | `49135380` | `/work/imt11/Mapperatorinator/runs/smoke15-loop-base-compileon-07b36a5/beatmap2dcd0585607145de8553c8d57889c856.osu.profile.json` | 1,084 | 21.390s | 50.7 |
+| compile enabled | candidate | `07b36a5` | `49135381` | `/work/imt11/Mapperatorinator/runs/smoke15-loop-custom-compileon-07b36a5/beatmapc7f1c08725d445aaaf73d0e57e40eaa6.osu.profile.json` | 1,084 | 25.079s | 43.2 |
+
+Token equivalence passed in both gates: `1,084 / 1,084` generated main-generation token IDs matched with compile disabled and with compile enabled. The path also recorded `custom_decode_loop_enabled=true`, so the candidate did exercise the local loop. It was still slower by `-10.9%` with compile disabled and `-14.7%` with compile enabled. Post-warmup compile-enabled windows were slower too, for example seq9 fell from `104.8 tok/s` to `93.5 tok/s`, so this was not only first-window compile noise.
+
+Interpretation: a conservative local `_sample` hook is useful evidence that the HF sampling loop can be replaced without changing tokens, but a copy-compatible Python loop by itself adds overhead rather than removing it. Do not keep or retry a copy-only `_sample` monkeypatch as an optimization. Future custom runtime work must attack a real cost center such as CUDA graph capture discipline, stable preallocated buffers that preserve RNG/token identity, or compiled/exported one-token decoder forward execution.
+
 ### `torch.inference_mode` generation wrapper
 
 Attempted in commit `02b2437` and reverted after full-song profiling. The change replaced `@torch.no_grad()` with `@torch.inference_mode()` around `model_generate` and `model_forward`.

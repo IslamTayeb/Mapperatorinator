@@ -60,7 +60,6 @@ timer_bpm_threshold: 0.1  # Threshold requirement for BPM change in timer, highe
 timer_cfg_scale: 1.0     # Scale of classifier-free guidance for timer
 timer_iterations: 20     # Number of iterations for timer
 inference_generation_compile: false # Enable Transformers generation compile path for profiling/scouting
-inference_custom_decode_loop: false # Experimental exact decode-loop hook for profiling/scouting
 use_server: false        # Use server for optimized multiprocess inference (adds about 8% overhead)
 max_batch_size: 16       # Maximum batch size for inference
 profile_inference: false # Write stage and generation timing profile JSON

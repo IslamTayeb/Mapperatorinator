@@ -156,7 +156,6 @@ class Processor(object):
         self.num_beams = args.num_beams
         self.parallel = args.parallel
         self.max_batch_size = args.max_batch_size
-        self.inference_custom_decode_loop = args.inference_custom_decode_loop
 
         self.timeshift_bias = args.timeshift_bias
         self.types_first = args.train.data.types_first
@@ -178,18 +177,13 @@ class Processor(object):
             timing_temperature=self.timing_temperature,
             mania_column_temperature=self.mania_column_temperature,
             taiko_hit_temperature=self.taiko_hit_temperature,
-            custom_decode_loop=self.inference_custom_decode_loop,
             sync_model_timing=self.profiler.enabled and self.profiler.sync_cuda,
         )
 
         if isinstance(self.model, InferenceClient):
-            if self.inference_custom_decode_loop:
-                raise ValueError("inference_custom_decode_loop is only supported with use_server=false.")
             response = self.model.generate(model_kwargs, generate_kwargs2)
             return response, getattr(self.model, "last_generation_stats", None)
         else:
-            if self.inference_custom_decode_loop and self.parallel:
-                raise ValueError("inference_custom_decode_loop is only supported with parallel=false.")
             return model_generate(self.model, self.tokenizer, model_kwargs, generate_kwargs2)
 
     def model_forward(self, model_kwargs) -> Any:
@@ -1478,7 +1472,6 @@ class Processor(object):
             ),
             "precision": stats.get("precision", self.precision),
             "generation_compile_enabled": stats.get("generation_compile_enabled"),
-            "custom_decode_loop_enabled": stats.get("custom_decode_loop_enabled"),
             "use_server": isinstance(self.model, InferenceClient),
             "parallel": self.parallel,
         }
