@@ -53,7 +53,7 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "YAML/JSON/text song list for serial_multi_song. YAML/JSON may be a list or a dict "
             "with a songs list; each item is an audio path string or a dict with audio_path, "
-            "optional id, output_subdir, beatmap_path, and seed."
+            "optional song_id/id, output_subdir, beatmap_path, seed, start_time, and end_time."
         ),
     )
     parser.add_argument(
@@ -322,7 +322,7 @@ def _write_manifest(
         "run_kind": run_kind,
         "config_name": config_name,
         "overrides": overrides,
-        "rng_reset_policy": "accelerate.set_seed(seed + run_index * seed_step) before each generate()",
+        "rng_reset_policy": "accelerate.set_seed(song_seed + repeat_index * seed_step) before each generate()",
         "seed_step": seed_step,
         "song_list_path": song_list_path,
         "song_count": len(songs),

@@ -91,3 +91,13 @@ DCC job `49154643` validated the same warm-repeat question on the full SALVALAI 
 - Paired cross-suite token equivalence: PASS for runs 0, 1, and 2 (`7,639 / 7,639` main tokens each)
 
 Decision: this clears the threshold for more default-off active-prefix runtime-discipline work for warm-repeat/future batch-serving. It does not replace the retained cold single-song baseline because the active suite ran after a compile suite in the same Slurm job context, and previous cold-first active-prefix validation remained order-sensitive.
+
+## Serial Multi-Song Harness Smoke
+
+After commit `dd7bdbb`, DCC login-node checks validated the new `serial_multi_song` CLI guardrails without running inference:
+
+- `python -m py_compile utils/profile_inference_suite.py` passed in the DCC env.
+- `--run-kind serial_multi_song --song-list <one-song-list>` failed loudly without `--allow-short-suite`: `serial_multi_song expects at least 5 songs`.
+- Adding `--allow-short-suite` parsed the same song list and reached the next intended guard, failing before model loading with `profile_inference must be true for suite profiling` when `profile_inference=false`.
+
+This confirms the song-list path and short-suite guard work. It is not a performance result.
