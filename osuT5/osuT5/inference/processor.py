@@ -156,7 +156,6 @@ class Processor(object):
         self.num_beams = args.num_beams
         self.parallel = args.parallel
         self.max_batch_size = args.max_batch_size
-        self.inference_preallocated_sample = args.inference_preallocated_sample
 
         self.timeshift_bias = args.timeshift_bias
         self.types_first = args.train.data.types_first
@@ -178,7 +177,6 @@ class Processor(object):
             timing_temperature=self.timing_temperature,
             mania_column_temperature=self.mania_column_temperature,
             taiko_hit_temperature=self.taiko_hit_temperature,
-            preallocated_sample=self.inference_preallocated_sample,
             sync_model_timing=self.profiler.enabled and self.profiler.sync_cuda,
         )
 
@@ -1474,8 +1472,6 @@ class Processor(object):
             ),
             "precision": stats.get("precision", self.precision),
             "generation_compile_enabled": stats.get("generation_compile_enabled"),
-            "preallocated_sample_requested": stats.get("preallocated_sample_requested"),
-            "preallocated_sample_enabled": stats.get("preallocated_sample_enabled"),
             "use_server": isinstance(self.model, InferenceClient),
             "parallel": self.parallel,
         }

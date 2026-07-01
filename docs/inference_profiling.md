@@ -370,6 +370,19 @@ RTX 2080 Ti smoke comparison on DCC `gpu-common`, node `dcc-core-ferc-s-z25-21`:
 
 `utils/summarize_inference_profile.py --compare` reported token equivalence PASS for all `2,894` generated main-generation token IDs, but throughput was `-10.0%` worse. Slurm stderr showed repeated cudagraph partition messages and a large first-window setup cost. Do not force `CompileConfig(dynamic=True)` for this workload unless a future PyTorch/Transformers version changes the compile behavior and a fresh smoke run proves a win.
 
+### Preallocated sample loop
+
+Attempted in commits `6d6ba7c` and `f7b5222` and reverted after smoke profiling. The change added an opt-in Mapperatorinator override for Hugging Face `_sample` that preallocated `input_ids` and `decoder_attention_mask` buffers to avoid per-token `torch.cat` in the generation loop while preserving the compiled one-token forward path.
+
+RTX 2080 Ti smoke comparison on DCC `gpu-common`:
+
+| run | commit | job | node | profile | main tokens | main model time | tok/s |
+| --- | --- | --- | --- | --- | ---: | ---: | ---: |
+| baseline | `f7b5222` | `49121863` | `dcc-core-ferc-s-z25-21` | `/work/imt11/Mapperatorinator/runs/smoke-pairbase-49121863-f7b5222/beatmap93c5d8f5a9504f92af53f1698a535fa8.osu.profile.json` | 2,894 | 31.368s | 92.3 |
+| candidate | `f7b5222` | `49121864` | `dcc-core-gpu-ferc-s-h36-6` | `/work/imt11/Mapperatorinator/runs/smoke-prealloc2-49121864-f7b5222/beatmape999b779433b4f8395818898648fd657.osu.profile.json` | 3,000 | 32.367s | 92.7 |
+
+`utils/summarize_inference_profile.py --compare` reported token equivalence FAIL: baseline generated `2,894` main-generation token IDs, candidate generated `3,000`, and the first mismatch was at token `1,350`. Instrumented profile records confirmed the preallocated path actually ran in all `20` candidate main-generation windows. Throughput was only `+0.5%` by token-normalized rate while model time was `+3.2%` worse, so this is both non-equivalent and too small. The candidate also logged one TorchDynamo recompile caused by timing/main model parameter shape mismatch. Do not reintroduce a mutable preallocated `_sample` loop unless a future prototype first proves exact token identity with compile disabled and then with compile enabled.
+
 ### `torch.inference_mode` generation wrapper
 
 Attempted in commit `02b2437` and reverted after full-song profiling. The change replaced `@torch.no_grad()` with `@torch.inference_mode()` around `model_generate` and `model_forward`.

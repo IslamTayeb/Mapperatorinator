@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import os
 from typing import Optional, Dict
 
 import torch
 import torch.nn as nn
 from transformers import PreTrainedModel, GenerationMixin, WhisperForConditionalGeneration
-from transformers.cache_utils import EncoderDecoderCache, StaticCache
 from transformers.modeling_outputs import Seq2SeqLMOutput, BaseModelOutput
 
 from .configuration_mapperatorinator import MapperatorinatorConfig
@@ -60,15 +58,7 @@ def get_backbone_model(config: MapperatorinatorConfig):
 
 
 class Mapperatorinator(PreTrainedModel, GenerationMixin):
-    __slots__ = [
-        "spectrogram",
-        "decoder_embedder",
-        "encoder_embedder",
-        "transformer",
-        "style_embedder",
-        "num_classes",
-        "_mapperatorinator_preallocated_sample_used",
-    ]
+    __slots__ = ["spectrogram", "decoder_embedder", "encoder_embedder", "transformer", "style_embedder", "num_classes"]
     config_class = MapperatorinatorConfig
     base_model_prefix = "model"
     main_input_name = "frames"
@@ -80,7 +70,6 @@ class Mapperatorinator(PreTrainedModel, GenerationMixin):
 
     def __init__(self, config: MapperatorinatorConfig):
         super().__init__(config)
-        self._mapperatorinator_preallocated_sample_used = False
 
         if not config.input_raw_wave:
             self.spectrogram = MelSpectrogram(
@@ -280,168 +269,6 @@ class Mapperatorinator(PreTrainedModel, GenerationMixin):
                 model_inputs[key] = value
 
         return model_inputs
-
-    def _sample(
-            self,
-            input_ids,
-            logits_processor,
-            stopping_criteria,
-            generation_config,
-            synced_gpus: bool = False,
-            streamer=None,
-            **model_kwargs,
-    ):
-        self._mapperatorinator_preallocated_sample_used = False
-        if not self._can_use_preallocated_sample(
-                input_ids,
-                logits_processor,
-                generation_config,
-                synced_gpus,
-                streamer,
-                model_kwargs,
-        ):
-            return GenerationMixin._sample(
-                self,
-                input_ids,
-                logits_processor,
-                stopping_criteria,
-                generation_config,
-                synced_gpus=synced_gpus,
-                streamer=streamer,
-                **model_kwargs,
-            )
-
-        return self._preallocated_sample(
-            input_ids,
-            logits_processor,
-            stopping_criteria,
-            generation_config,
-            **model_kwargs,
-        )
-
-    def _can_use_preallocated_sample(
-            self,
-            input_ids,
-            logits_processor,
-            generation_config,
-            synced_gpus,
-            streamer,
-            model_kwargs,
-    ) -> bool:
-        if not bool(getattr(generation_config, "mapperatorinator_preallocated_sample", False)):
-            return False
-
-        past_key_values = model_kwargs.get("past_key_values")
-        uses_static_encoder_decoder_cache = (
-                isinstance(past_key_values, EncoderDecoderCache)
-                and isinstance(past_key_values.self_attention_cache, StaticCache)
-                and isinstance(past_key_values.cross_attention_cache, StaticCache)
-        )
-        has_cfg_processor = any(processor.__class__.__name__ == "ClassifierFreeGuidanceLogitsProcessor"
-                                for processor in logits_processor)
-        pad_token_id = generation_config._pad_token_tensor
-
-        return (
-                self.config.is_encoder_decoder
-                and input_ids.shape[0] == 1
-                and not synced_gpus
-                and streamer is None
-                and generation_config.do_sample
-                and generation_config.num_beams == 1
-                and not generation_config.return_dict_in_generate
-                and not generation_config.output_attentions
-                and not generation_config.output_hidden_states
-                and not generation_config.output_scores
-                and not generation_config.output_logits
-                and generation_config.prefill_chunk_size is None
-                and generation_config.max_length is not None
-                and pad_token_id is not None
-                and pad_token_id.numel() == 1
-                and model_kwargs.get("decoder_attention_mask") is not None
-                and uses_static_encoder_decoder_cache
-                and model_kwargs.get("use_cache", True)
-                and model_kwargs.get("negative_prompt") is None
-                and model_kwargs.get("negative_prompt_attention_mask") is None
-                and not has_cfg_processor
-                and (generation_config.guidance_scale is None or generation_config.guidance_scale == 1)
-                and "token_type_ids" not in model_kwargs
-        )
-
-    def _preallocated_sample(
-            self,
-            input_ids,
-            logits_processor,
-            stopping_criteria,
-            generation_config,
-            **model_kwargs,
-    ):
-        pad_token_id = generation_config._pad_token_tensor
-        pad_token_value = int(pad_token_id.item()) if pad_token_id is not None else 0
-        batch_size, cur_len = input_ids.shape[:2]
-        max_length = int(generation_config.max_length)
-
-        if cur_len >= max_length:
-            return input_ids
-
-        self._mapperatorinator_preallocated_sample_used = True
-        input_ids_full = input_ids.new_full((batch_size, max_length), pad_token_value)
-        input_ids_full[:, :cur_len] = input_ids
-
-        decoder_attention_mask = model_kwargs.pop("decoder_attention_mask")
-        decoder_attention_mask_full = decoder_attention_mask.new_zeros((batch_size, max_length))
-        decoder_attention_mask_full[:, :cur_len] = decoder_attention_mask
-
-        unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
-        has_eos_stopping_criteria = any(hasattr(criteria, "eos_token_id") for criteria in stopping_criteria)
-        model_kwargs = self._get_initial_cache_position(cur_len, input_ids.device, model_kwargs)
-
-        model_forward = self.__call__
-        if self._valid_auto_compile_criteria(model_kwargs, generation_config):
-            os.environ["TOKENIZERS_PARALLELISM"] = "0"
-            model_forward = self.get_compiled_call(generation_config.compile_config)
-
-        this_peer_finished = False
-        while not this_peer_finished:
-            current_input_ids = input_ids_full[:, :cur_len]
-            model_kwargs["decoder_attention_mask"] = decoder_attention_mask_full[:, :cur_len]
-            model_inputs = self.prepare_inputs_for_generation(current_input_ids, **model_kwargs)
-
-            if cur_len == input_ids.shape[1]:
-                outputs = self(**model_inputs, return_dict=True)
-            else:
-                outputs = model_forward(**model_inputs, return_dict=True)
-
-            if getattr(outputs, "past_key_values", None) is not None:
-                model_kwargs["past_key_values"] = outputs.past_key_values
-            if model_kwargs.get("use_cache", True):
-                model_kwargs["cache_position"] = model_kwargs["cache_position"][-1:] + 1
-            else:
-                return GenerationMixin._sample(
-                    self,
-                    current_input_ids,
-                    logits_processor,
-                    stopping_criteria,
-                    generation_config,
-                    **model_kwargs,
-                )
-
-            next_token_logits = outputs.logits[:, -1, :].to(copy=True, dtype=torch.float32, device=input_ids.device)
-            next_token_scores = logits_processor(current_input_ids, next_token_logits)
-            probs = nn.functional.softmax(next_token_scores, dim=-1)
-            next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
-
-            if has_eos_stopping_criteria:
-                next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
-
-            input_ids_full[:, cur_len] = next_tokens
-            decoder_attention_mask_full[:, cur_len] = 1
-            cur_len += 1
-
-            unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids_full[:, :cur_len], None)
-            this_peer_finished = bool(unfinished_sequences.max() == 0 or cur_len >= max_length)
-            del outputs
-
-        return input_ids_full[:, :cur_len]
 
     def _prepare_decoder_input_ids_for_generation(
         self,

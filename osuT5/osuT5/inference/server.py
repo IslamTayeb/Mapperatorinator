@@ -111,7 +111,6 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     lookback_time = generate_kwargs.pop('lookback_time', 0.0)
     lookahead_time = generate_kwargs.pop('lookahead_time', 0.0)
     context_type = generate_kwargs.pop('context_type', None)
-    preallocated_sample = bool(generate_kwargs.pop('preallocated_sample', False))
     sync_model_timing = bool(generate_kwargs.pop('sync_model_timing', False))
     if context_type is not None:
         context_type = ContextType(context_type)  # Convert to ContextType enum
@@ -156,19 +155,14 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         if sync_model_timing:
             _sync_cuda_for_model(model)
         start_time = time.perf_counter()
-        old_preallocated_sample = getattr(model.generation_config, "mapperatorinator_preallocated_sample", False)
-        model.generation_config.mapperatorinator_preallocated_sample = preallocated_sample
-        try:
-            result = model.generate(
-                **model_kwargs,
-                **generate_kwargs,
-                use_cache=True,
-                past_key_values=cache,
-                logits_processor=logits_processor_list,
-                eos_token_id=get_eos_token_id(tokenizer, lookback_time=lookback_time, lookahead_time=lookahead_time, context_type=context_type),
-            )
-        finally:
-            model.generation_config.mapperatorinator_preallocated_sample = old_preallocated_sample
+        result = model.generate(
+            **model_kwargs,
+            **generate_kwargs,
+            use_cache=True,
+            past_key_values=cache,
+            logits_processor=logits_processor_list,
+            eos_token_id=get_eos_token_id(tokenizer, lookback_time=lookback_time, lookahead_time=lookahead_time, context_type=context_type),
+        )
         if sync_model_timing:
             _sync_cuda_for_model(model)
         elapsed_seconds = time.perf_counter() - start_time
@@ -183,8 +177,6 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         "do_sample": bool(generate_kwargs.get("do_sample", False)),
         "sync_model_timing": sync_model_timing,
         "generation_compile_enabled": not bool(getattr(getattr(model, "generation_config", None), "disable_compile", True)),
-        "preallocated_sample_requested": preallocated_sample,
-        "preallocated_sample_enabled": bool(getattr(model, "_mapperatorinator_preallocated_sample_used", False)),
     })
 
     return result, stats

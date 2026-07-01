@@ -9,7 +9,6 @@ profile_inference: true
 profile_sync_cuda: true
 profile_record_token_ids: true
 inference_generation_compile: true
-inference_preallocated_sample: true
 seed: 12345
 
 gamemode: 0
