@@ -63,6 +63,25 @@ def _record_decode_bucket(diagnostics: dict[str, Any] | None, prefix_length: int
         buckets.append(prefix_length)
 
 
+def _apply_logits_processors_with_diagnostics(
+        logits_processor,
+        input_ids: torch.LongTensor,
+        scores: torch.FloatTensor,
+        diagnostics: dict[str, Any],
+) -> torch.FloatTensor:
+    processor_times = diagnostics.setdefault("logits_processor_detail_wall_cpu_s", {})
+    processor_calls = diagnostics.setdefault("logits_processor_detail_calls", {})
+    for index, processor in enumerate(logits_processor):
+        name = f"{index}:{processor.__class__.__name__}"
+        start = time.perf_counter()
+        with profile_range(f"active_prefix.logits_processor.{processor.__class__.__name__}"):
+            scores = processor(input_ids, scores)
+        elapsed = time.perf_counter() - start
+        processor_times[name] = float(processor_times.get(name, 0.0)) + float(elapsed)
+        processor_calls[name] = int(processor_calls.get(name, 0)) + 1
+    return scores
+
+
 def _clone_static_graph_inputs(model_inputs: dict[str, Any]) -> dict[str, Any]:
     static_inputs: dict[str, Any] = {}
     for key, value in model_inputs.items():
@@ -383,7 +402,12 @@ def active_prefix_decode_generate(
                     "logits_processor",
                     wall_key="logits_processor_wall_cpu_s",
             ):
-                next_token_scores = logits_processor(input_ids, next_token_logits)
+                next_token_scores = _apply_logits_processors_with_diagnostics(
+                    logits_processor,
+                    input_ids,
+                    next_token_logits,
+                    active_prefix_decode_diagnostics,
+                )
         else:
             next_token_logits = outputs.logits[:, -1, :].to(copy=True, dtype=torch.float32, device=input_ids.device)
             next_token_scores = logits_processor(input_ids, next_token_logits)
