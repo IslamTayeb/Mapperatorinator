@@ -194,6 +194,9 @@ class Processor(object):
             active_prefix_decode_cuda_graph_min_decode_steps=int(
                 getattr(self.args, "inference_active_prefix_decode_cuda_graph_min_decode_steps", 1)
             ),
+            stateful_monotonic_logits_processor=bool(
+                getattr(self.args, "inference_stateful_monotonic_logits_processor", False)
+            ),
         )
         if generate_kwargs2["active_prefix_decode_cuda_graph"] and isinstance(self.model, InferenceClient):
             raise ValueError("inference_active_prefix_decode_cuda_graph requires use_server=false.")
@@ -1494,6 +1497,7 @@ class Processor(object):
             "profile_active_prefix_decode_diagnostics": stats.get("profile_active_prefix_decode_diagnostics"),
             "active_prefix_decode_diagnostics": stats.get("active_prefix_decode_diagnostics"),
             "profile_sdpa_backend": stats.get("profile_sdpa_backend"),
+            "stateful_monotonic_logits_processor": stats.get("stateful_monotonic_logits_processor"),
             "active_prefix_decode_loop_enabled": stats.get("active_prefix_decode_loop_enabled"),
             "active_prefix_decode_bucket_size": stats.get("active_prefix_decode_bucket_size"),
             "active_prefix_decode_cuda_graph_enabled": stats.get("active_prefix_decode_cuda_graph_enabled"),

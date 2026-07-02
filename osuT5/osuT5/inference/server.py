@@ -102,6 +102,7 @@ def build_logits_processor_list(
         taiko_hit_temperature: float | None = None,
         lookback_time: float = 0.0,
         device=None,
+        stateful_monotonic: bool = False,
 ) -> LogitsProcessorList:
     timing_temperature = temperature if timing_temperature is None else timing_temperature
     mania_column_temperature = temperature if mania_column_temperature is None else mania_column_temperature
@@ -112,7 +113,9 @@ def build_logits_processor_list(
     if cfg_scale > 1.0:
         logits_processor_list.append(ClassifierFreeGuidanceLogitsProcessor(cfg_scale))
 
-    logits_processor_list.append(MonotonicTimeShiftLogitsProcessor(tokenizer))
+    logits_processor_list.append(
+        MonotonicTimeShiftLogitsProcessor(tokenizer, stateful_batch1=stateful_monotonic)
+    )
 
     if timeshift_bias != 0:
         logits_processor_list.append(
@@ -176,6 +179,9 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     active_prefix_decode_cuda_graph_min_decode_steps = int(
         generate_kwargs.pop('active_prefix_decode_cuda_graph_min_decode_steps', 1)
     )
+    stateful_monotonic_logits_processor = bool(
+        generate_kwargs.pop('stateful_monotonic_logits_processor', False)
+    )
     if context_type is not None:
         context_type = ContextType(context_type)  # Convert to ContextType enum
 
@@ -191,6 +197,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         taiko_hit_temperature=taiko_hit_temperature,
         lookback_time=lookback_time,
         device=model.device,
+        stateful_monotonic=stateful_monotonic_logits_processor,
     )
 
     # Prepare cache
@@ -262,6 +269,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         "profile_generation_detail_ranges": profile_generation_detail_ranges,
         "profile_active_prefix_decode_diagnostics": profile_active_prefix_decode_diagnostics,
         "profile_sdpa_backend": profile_sdpa_backend,
+        "stateful_monotonic_logits_processor": stateful_monotonic_logits_processor,
         "active_prefix_decode_loop_enabled": active_prefix_decode_loop,
         "active_prefix_decode_bucket_size": active_prefix_decode_bucket_size if active_prefix_decode_loop else None,
         "active_prefix_decode_cuda_graph_enabled": active_prefix_decode_cuda_graph if active_prefix_decode_loop else False,
