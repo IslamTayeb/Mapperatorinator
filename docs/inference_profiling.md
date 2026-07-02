@@ -243,6 +243,39 @@ Bucket-transition CUDA graph gate, DCC jobs `49166191` and `49166213` on `dcc-dh
 
 Run dirs: `/work/imt11/Mapperatorinator/runs/direct-graph-transition-seq0-49166191-13335e5` and `/work/imt11/Mapperatorinator/runs/direct-graph-transition-seq0-compile-49166213-13335e5`. This proves the verifier can recapture graph buckets when active-prefix decode crosses from `512` to `1024`, with generated tokens, final RNG state, logits allclose, and top-k order still matching. It remains a verifier-only result, not throughput: `prepare_inputs_for_generation()`, tensor copies, short-run setup, and report overhead are still outside the captured graph.
 
+Production active-prefix CUDA graph loop validation, DCC jobs `49166771` and `49167356` on RTX 2080 Ti, commit `8e8757b`:
+
+| run | main tokens | main model time | main tok/s | total timing+map stage | token equivalence | strict status |
+| --- | ---: | ---: | ---: | ---: | --- | --- |
+| retained compile-only baseline, job `49113713` | `7,639` | `82.615s` | `92.465` | `113.928s` | baseline | baseline |
+| active512 graph full-song, job `49167356` | `7,639` | `71.981s` | `106.125` | `101.481s` | PASS, `7,639 / 7,639` | aggregate PASS, per-window FAIL |
+
+Run dirs:
+
+- 15s smoke: `/work/imt11/Mapperatorinator/runs/active-graph-immediate-smoke-49166771-8e8757b`
+- Full song: `/work/imt11/Mapperatorinator/runs/active-graph-immediate-full-49167356-8e8757b`
+
+The 15s smoke compared immediate-capture active512 graph against compile-only with isolated compiler/CUDA caches. It passed same-calculation metadata, token equivalence (`1,084 / 1,084`), and strict per-window no-regression, with main-generation throughput `29.556 -> 110.451 tok/s` in that paired run. This promoted the candidate to full-song validation.
+
+The full-song current-branch validation improved main generation by `+14.8%` (`92.465 -> 106.125 tok/s`) and total timing+map profiled stage time by `-10.9%` (`113.928s -> 101.481s`) while preserving exact fixed-seed main-token IDs. The compare metadata contract failed only because the retained baseline profile predates newer metadata keys (`temperature`, `top_p`, `cfg_scale`, `lookback`, etc.); there were no mismatched metadata values.
+
+The strict per-window zero-regression gate still failed on 11/87 map windows. The failing windows totaled `128ms` of model-time overhead, compared with `10.634s` total main-generation model-time savings. Treat this as a scoped micro-regression, not a strict-pass result. Do not silently use it as the cold default; it is an accepted default-off opt-in performance path for explicit profiling or user-enabled fast inference.
+
+Use:
+
+```bash
+python inference.py --config-name profile_salvalai \
+  inference_generation_compile=true \
+  inference_active_prefix_decode_loop=true \
+  inference_active_prefix_decode_bucket_size=512 \
+  inference_active_prefix_decode_cuda_graph=true \
+  inference_active_prefix_decode_cuda_graph_min_decode_steps=1
+```
+
+Keep the hard restrictions from the implementation: batch size 1, `use_server=false`, `parallel=false`, `cfg_scale=1`, `num_beams=1`, static cache, and decode-only active-prefix. Sampling, logits processors, RNG consumption, EOS behavior, generated-token accounting, and timing generation remain outside the captured graph path.
+
+Rejected delayed-capture variant, DCC job `49166715`, commit `f712b59`: setting `inference_active_prefix_decode_cuda_graph_min_decode_steps=16` remained token-equivalent on 15s smoke but failed per-window no-regression on 5/10 windows and reduced graph-path aggregate throughput versus immediate capture. Keep `min_decode_steps=1` as the default. Only revisit delayed capture if a future profiler trace shows graph capture itself has become the dominant cost and a better adaptive policy can avoid medium-window regressions.
+
 Rejected active-prefix mask fast path, DCC jobs `49158276` and `49158365` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti:
 
 | run | main tokens | main model time | tok/s | token equivalence | status |
