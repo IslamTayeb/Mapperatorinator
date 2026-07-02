@@ -174,7 +174,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     active_prefix_decode_cuda_graph = bool(generate_kwargs.pop('active_prefix_decode_cuda_graph', False))
     active_prefix_decode_cuda_graph_warmup = int(generate_kwargs.pop('active_prefix_decode_cuda_graph_warmup', 3))
     active_prefix_decode_cuda_graph_min_decode_steps = int(
-        generate_kwargs.pop('active_prefix_decode_cuda_graph_min_decode_steps', 16)
+        generate_kwargs.pop('active_prefix_decode_cuda_graph_min_decode_steps', 1)
     )
     if context_type is not None:
         context_type = ContextType(context_type)  # Convert to ContextType enum
