@@ -488,6 +488,9 @@ def generate(
         "inference_active_prefix_decode_bucket_size": args.inference_active_prefix_decode_bucket_size,
         "inference_active_prefix_decode_cuda_graph": args.inference_active_prefix_decode_cuda_graph,
         "inference_active_prefix_decode_cuda_graph_warmup": args.inference_active_prefix_decode_cuda_graph_warmup,
+        "inference_active_prefix_decode_cuda_graph_min_decode_steps": (
+            args.inference_active_prefix_decode_cuda_graph_min_decode_steps
+        ),
         "profile_record_token_ids": args.profile_record_token_ids,
         "profile_sync_cuda": args.profile_sync_cuda,
         "profile_torch_generation": args.profile_torch_generation,

@@ -191,6 +191,9 @@ class Processor(object):
             active_prefix_decode_cuda_graph_warmup=int(
                 getattr(self.args, "inference_active_prefix_decode_cuda_graph_warmup", 3)
             ),
+            active_prefix_decode_cuda_graph_min_decode_steps=int(
+                getattr(self.args, "inference_active_prefix_decode_cuda_graph_min_decode_steps", 16)
+            ),
         )
         if generate_kwargs2["active_prefix_decode_cuda_graph"] and isinstance(self.model, InferenceClient):
             raise ValueError("inference_active_prefix_decode_cuda_graph requires use_server=false.")
@@ -1495,6 +1498,9 @@ class Processor(object):
             "active_prefix_decode_bucket_size": stats.get("active_prefix_decode_bucket_size"),
             "active_prefix_decode_cuda_graph_enabled": stats.get("active_prefix_decode_cuda_graph_enabled"),
             "active_prefix_decode_cuda_graph_warmup": stats.get("active_prefix_decode_cuda_graph_warmup"),
+            "active_prefix_decode_cuda_graph_min_decode_steps": stats.get(
+                "active_prefix_decode_cuda_graph_min_decode_steps"
+            ),
             "use_server": isinstance(self.model, InferenceClient),
             "parallel": self.parallel,
         }

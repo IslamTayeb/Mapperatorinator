@@ -173,6 +173,9 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     active_prefix_decode_bucket_size = int(generate_kwargs.pop('active_prefix_decode_bucket_size', 128))
     active_prefix_decode_cuda_graph = bool(generate_kwargs.pop('active_prefix_decode_cuda_graph', False))
     active_prefix_decode_cuda_graph_warmup = int(generate_kwargs.pop('active_prefix_decode_cuda_graph_warmup', 3))
+    active_prefix_decode_cuda_graph_min_decode_steps = int(
+        generate_kwargs.pop('active_prefix_decode_cuda_graph_min_decode_steps', 16)
+    )
     if context_type is not None:
         context_type = ContextType(context_type)  # Convert to ContextType enum
 
@@ -204,6 +207,8 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
             raise ValueError("active_prefix_decode_loop currently supports num_beams=1 only.")
         if active_prefix_decode_bucket_size <= 0:
             raise ValueError("active_prefix_decode_bucket_size must be positive.")
+        if active_prefix_decode_cuda_graph_min_decode_steps <= 0:
+            raise ValueError("active_prefix_decode_cuda_graph_min_decode_steps must be positive.")
     active_prefix_decode_diagnostics = (
         {
             "enabled": True,
@@ -236,6 +241,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
                 active_prefix_bucket_size=active_prefix_decode_bucket_size,
                 cuda_graph_forward=active_prefix_decode_cuda_graph,
                 cuda_graph_warmup=active_prefix_decode_cuda_graph_warmup,
+                cuda_graph_min_decode_steps=active_prefix_decode_cuda_graph_min_decode_steps,
                 active_prefix_decode_diagnostics=active_prefix_decode_diagnostics,
             ) if active_prefix_decode_loop else None,
         )
@@ -261,6 +267,9 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         "active_prefix_decode_cuda_graph_enabled": active_prefix_decode_cuda_graph if active_prefix_decode_loop else False,
         "active_prefix_decode_cuda_graph_warmup": (
             active_prefix_decode_cuda_graph_warmup if active_prefix_decode_cuda_graph else None
+        ),
+        "active_prefix_decode_cuda_graph_min_decode_steps": (
+            active_prefix_decode_cuda_graph_min_decode_steps if active_prefix_decode_cuda_graph else None
         ),
     })
     if active_prefix_decode_diagnostics is not None:

@@ -77,6 +77,7 @@ class InferenceConfig:
     inference_active_prefix_decode_bucket_size: int = 128  # Active-prefix decode bucket length for reusable graph shapes
     inference_active_prefix_decode_cuda_graph: bool = False  # Capture active-prefix one-token decode forwards with manual CUDA graphs
     inference_active_prefix_decode_cuda_graph_warmup: int = 3  # Warmup forwards before each active-prefix CUDA graph capture
+    inference_active_prefix_decode_cuda_graph_min_decode_steps: int = 16  # First 1-based decode step eligible for graph capture
     use_server: bool = True  # Use server for optimized multiprocess inference
     max_batch_size: int = 16  # Maximum batch size for inference (only used for parallel sampling or super timing)
     profile_inference: bool = False  # Write stage and generation timing profile JSON

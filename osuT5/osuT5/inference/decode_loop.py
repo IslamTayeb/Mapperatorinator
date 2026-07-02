@@ -176,6 +176,7 @@ def active_prefix_decode_generate(
         active_prefix_bucket_size: int = 128,
         cuda_graph_forward: bool = False,
         cuda_graph_warmup: int = 3,
+        cuda_graph_min_decode_steps: int = 16,
         active_prefix_decode_diagnostics: dict[str, Any] | None = None,
         **model_kwargs,
 ) -> torch.LongTensor:
@@ -205,6 +206,8 @@ def active_prefix_decode_generate(
         raise ValueError("active_prefix_decode_generate currently supports batch_size=1 only")
     if cuda_graph_forward and input_ids.device.type != "cuda":
         raise RuntimeError("active-prefix CUDA graph decode requires CUDA input tensors")
+    if cuda_graph_min_decode_steps <= 0:
+        raise ValueError("cuda_graph_min_decode_steps must be positive")
 
     this_peer_finished = False
     unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
@@ -249,6 +252,7 @@ def active_prefix_decode_generate(
 
     is_prefill = True
     scores = None
+    decode_steps = 0
     graph_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
     while model._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
         if active_prefix_decode_diagnostics is not None:
@@ -273,9 +277,14 @@ def active_prefix_decode_generate(
                 outputs = model(**model_inputs, return_dict=True)
             is_prefill = False
         else:
+            decode_steps += 1
             prefix_length = _bucketed_prefix_length(cur_len, active_prefix_bucket_size, max_cache_len)
             _record_decode_bucket(active_prefix_decode_diagnostics, prefix_length)
-            if cuda_graph_forward:
+            use_cuda_graph = cuda_graph_forward and decode_steps >= cuda_graph_min_decode_steps
+            if cuda_graph_forward and not use_cuda_graph:
+                with active_prefix_self_attention_context(prefix_length):
+                    outputs = model(**model_inputs, return_dict=True)
+            elif cuda_graph_forward:
                 if active_prefix_decode_diagnostics is not None:
                     first_decode = int(active_prefix_decode_diagnostics.get("decode_steps", 0)) == 1
                     wall_key = (
