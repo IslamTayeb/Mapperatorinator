@@ -171,6 +171,8 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     profile_sdpa_backend = generate_kwargs.pop('profile_sdpa_backend', None)
     active_prefix_decode_loop = bool(generate_kwargs.pop('active_prefix_decode_loop', False))
     active_prefix_decode_bucket_size = int(generate_kwargs.pop('active_prefix_decode_bucket_size', 128))
+    active_prefix_decode_cuda_graph = bool(generate_kwargs.pop('active_prefix_decode_cuda_graph', False))
+    active_prefix_decode_cuda_graph_warmup = int(generate_kwargs.pop('active_prefix_decode_cuda_graph_warmup', 3))
     if context_type is not None:
         context_type = ContextType(context_type)  # Convert to ContextType enum
 
@@ -191,6 +193,8 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     # Prepare cache
     cache = get_cache(model, batch_size, generate_kwargs.get('num_beams', 1), cfg_scale)
     pad_token_id = generate_kwargs.get('pad_token_id', getattr(tokenizer, 'pad_id', None))
+    if active_prefix_decode_cuda_graph and not active_prefix_decode_loop:
+        raise ValueError("active_prefix_decode_cuda_graph requires active_prefix_decode_loop.")
     if active_prefix_decode_loop:
         if batch_size != 1:
             raise ValueError("active_prefix_decode_loop currently supports batch_size=1 only.")
@@ -230,6 +234,8 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
             custom_generate=partial(
                 active_prefix_decode_generate,
                 active_prefix_bucket_size=active_prefix_decode_bucket_size,
+                cuda_graph_forward=active_prefix_decode_cuda_graph,
+                cuda_graph_warmup=active_prefix_decode_cuda_graph_warmup,
                 active_prefix_decode_diagnostics=active_prefix_decode_diagnostics,
             ) if active_prefix_decode_loop else None,
         )
@@ -252,6 +258,10 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         "profile_sdpa_backend": profile_sdpa_backend,
         "active_prefix_decode_loop_enabled": active_prefix_decode_loop,
         "active_prefix_decode_bucket_size": active_prefix_decode_bucket_size if active_prefix_decode_loop else None,
+        "active_prefix_decode_cuda_graph_enabled": active_prefix_decode_cuda_graph if active_prefix_decode_loop else False,
+        "active_prefix_decode_cuda_graph_warmup": (
+            active_prefix_decode_cuda_graph_warmup if active_prefix_decode_cuda_graph else None
+        ),
     })
     if active_prefix_decode_diagnostics is not None:
         stats["active_prefix_decode_diagnostics"] = active_prefix_decode_diagnostics

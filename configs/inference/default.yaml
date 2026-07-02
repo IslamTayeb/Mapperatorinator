@@ -62,6 +62,8 @@ timer_iterations: 20     # Number of iterations for timer
 inference_generation_compile: false # Enable Transformers generation compile path for profiling/scouting
 inference_active_prefix_decode_loop: false # Experimental batch-1 decode loop with bucketed active-prefix self-attention
 inference_active_prefix_decode_bucket_size: 128 # Active-prefix decode bucket length for reusable graph shapes
+inference_active_prefix_decode_cuda_graph: false # Capture active-prefix one-token decode forwards with manual CUDA graphs
+inference_active_prefix_decode_cuda_graph_warmup: 3 # Warmup forwards before each active-prefix CUDA graph capture
 use_server: false        # Use server for optimized multiprocess inference (adds about 8% overhead)
 max_batch_size: 16       # Maximum batch size for inference
 profile_inference: false # Write stage and generation timing profile JSON

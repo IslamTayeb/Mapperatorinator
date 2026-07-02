@@ -63,6 +63,107 @@ def _record_decode_bucket(diagnostics: dict[str, Any] | None, prefix_length: int
         buckets.append(prefix_length)
 
 
+def _clone_static_graph_inputs(model_inputs: dict[str, Any]) -> dict[str, Any]:
+    static_inputs: dict[str, Any] = {}
+    for key, value in model_inputs.items():
+        if isinstance(value, torch.Tensor):
+            static_inputs[key] = value.clone(memory_format=torch.contiguous_format)
+        else:
+            static_inputs[key] = value
+    return static_inputs
+
+
+def _copy_static_graph_inputs(static_inputs: dict[str, Any], model_inputs: dict[str, Any]) -> None:
+    for key, static_value in static_inputs.items():
+        value = model_inputs.get(key)
+        if not isinstance(static_value, torch.Tensor):
+            continue
+        if not isinstance(value, torch.Tensor):
+            raise RuntimeError(f"CUDA graph input {key} changed from tensor to {type(value).__name__}")
+        if tuple(static_value.shape) != tuple(value.shape):
+            raise RuntimeError(
+                f"CUDA graph input {key} shape changed from {tuple(static_value.shape)} "
+                f"to {tuple(value.shape)}"
+            )
+        if static_value.dtype != value.dtype:
+            raise RuntimeError(f"CUDA graph input {key} dtype changed from {static_value.dtype} to {value.dtype}")
+        static_value.copy_(value)
+
+
+def _capture_decode_cuda_graph(
+        model,
+        static_inputs: dict[str, Any],
+        *,
+        active_prefix_length: int,
+        warmup: int,
+) -> tuple[torch.cuda.CUDAGraph, Any, float]:
+    if not torch.cuda.is_available():
+        raise RuntimeError("active-prefix CUDA graph decode requires CUDA")
+
+    start = time.perf_counter()
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    graph_outputs = None
+    with torch.cuda.stream(capture_stream):
+        for _ in range(max(int(warmup), 0)):
+            with active_prefix_self_attention_context(active_prefix_length):
+                graph_outputs = model(**static_inputs, return_dict=True)
+    torch.cuda.current_stream().wait_stream(capture_stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        with active_prefix_self_attention_context(active_prefix_length):
+            graph_outputs = model(**static_inputs, return_dict=True)
+    graph.replay()
+    torch.cuda.synchronize()
+    return graph, graph_outputs, time.perf_counter() - start
+
+
+def _cuda_graph_signature(active_prefix_length: int, model_inputs: dict[str, Any]) -> tuple[Any, ...]:
+    signature: list[Any] = [active_prefix_length]
+    for key in sorted(model_inputs):
+        value = model_inputs[key]
+        if isinstance(value, torch.Tensor):
+            signature.append((key, tuple(value.shape), str(value.dtype), str(value.device)))
+        else:
+            signature.append((key, type(value).__name__, id(value)))
+    return tuple(signature)
+
+
+def _update_cuda_graph_diagnostics(
+        diagnostics: dict[str, Any] | None,
+        *,
+        warmup: int,
+        graph_cache: dict[tuple[Any, ...], dict[str, Any]],
+) -> None:
+    if diagnostics is None:
+        return
+
+    graphs = []
+    for entry in graph_cache.values():
+        static_inputs = entry["static_inputs"]
+        graphs.append({
+            "active_prefix_length": entry["active_prefix_length"],
+            "capture_seconds": float(entry["capture_seconds"]),
+            "decode_replays": int(entry["decode_replays"]),
+            "static_input_shapes": {
+                key: list(value.shape)
+                for key, value in static_inputs.items()
+                if isinstance(value, torch.Tensor)
+            },
+        })
+
+    cuda_graph_diagnostics = diagnostics.setdefault("cuda_graph", {})
+    cuda_graph_diagnostics.update({
+        "enabled": True,
+        "warmup": int(warmup),
+        "capture_count": len(graphs),
+        "total_capture_seconds": float(sum(graph["capture_seconds"] for graph in graphs)),
+        "decode_replays": int(sum(graph["decode_replays"] for graph in graphs)),
+        "graphs": graphs,
+    })
+
+
 def active_prefix_decode_generate(
         model,
         input_ids: torch.LongTensor,
@@ -73,6 +174,8 @@ def active_prefix_decode_generate(
         streamer=None,
         *,
         active_prefix_bucket_size: int = 128,
+        cuda_graph_forward: bool = False,
+        cuda_graph_warmup: int = 3,
         active_prefix_decode_diagnostics: dict[str, Any] | None = None,
         **model_kwargs,
 ) -> torch.LongTensor:
@@ -100,6 +203,8 @@ def active_prefix_decode_generate(
     batch_size, cur_len = input_ids.shape[:2]
     if batch_size != 1:
         raise ValueError("active_prefix_decode_generate currently supports batch_size=1 only")
+    if cuda_graph_forward and input_ids.device.type != "cuda":
+        raise RuntimeError("active-prefix CUDA graph decode requires CUDA input tensors")
 
     this_peer_finished = False
     unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
@@ -144,6 +249,7 @@ def active_prefix_decode_generate(
 
     is_prefill = True
     scores = None
+    graph_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
     while model._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
         if active_prefix_decode_diagnostics is not None:
             with _diagnostic_range(
@@ -169,7 +275,7 @@ def active_prefix_decode_generate(
         else:
             prefix_length = _bucketed_prefix_length(cur_len, active_prefix_bucket_size, max_cache_len)
             _record_decode_bucket(active_prefix_decode_diagnostics, prefix_length)
-            with active_prefix_self_attention_context(prefix_length):
+            if cuda_graph_forward:
                 if active_prefix_decode_diagnostics is not None:
                     first_decode = int(active_prefix_decode_diagnostics.get("decode_steps", 0)) == 1
                     wall_key = (
@@ -177,15 +283,62 @@ def active_prefix_decode_generate(
                         if first_decode
                         else "steady_decode_forward_wall_cpu_s"
                     )
-                    with _diagnostic_range(
-                            active_prefix_decode_diagnostics,
-                            "decode_forward",
-                            wall_key=wall_key,
-                            aggregate_wall_key="decode_forward_wall_cpu_s",
-                    ):
-                        outputs = model_forward(**model_inputs, return_dict=True)
+                    decode_context = _diagnostic_range(
+                        active_prefix_decode_diagnostics,
+                        "decode_forward.cuda_graph",
+                        wall_key=wall_key,
+                        aggregate_wall_key="decode_forward_wall_cpu_s",
+                    )
                 else:
-                    outputs = model_forward(**model_inputs, return_dict=True)
+                    decode_context = _diagnostic_range(None, "decode_forward.cuda_graph")
+                with decode_context:
+                    graph_key = _cuda_graph_signature(prefix_length, model_inputs)
+                    graph_entry = graph_cache.get(graph_key)
+                    if graph_entry is None:
+                        graph_static_inputs = _clone_static_graph_inputs(model_inputs)
+                        graph, graph_outputs, capture_seconds = _capture_decode_cuda_graph(
+                            model,
+                            graph_static_inputs,
+                            active_prefix_length=prefix_length,
+                            warmup=cuda_graph_warmup,
+                        )
+                        graph_entry = {
+                            "graph": graph,
+                            "outputs": graph_outputs,
+                            "static_inputs": graph_static_inputs,
+                            "active_prefix_length": prefix_length,
+                            "capture_seconds": capture_seconds,
+                            "decode_replays": 0,
+                        }
+                        graph_cache[graph_key] = graph_entry
+                    else:
+                        _copy_static_graph_inputs(graph_entry["static_inputs"], model_inputs)
+                        graph_entry["graph"].replay()
+                    graph_entry["decode_replays"] = int(graph_entry["decode_replays"]) + 1
+                    _update_cuda_graph_diagnostics(
+                        active_prefix_decode_diagnostics,
+                        warmup=cuda_graph_warmup,
+                        graph_cache=graph_cache,
+                    )
+                    outputs = graph_entry["outputs"]
+            else:
+                with active_prefix_self_attention_context(prefix_length):
+                    if active_prefix_decode_diagnostics is not None:
+                        first_decode = int(active_prefix_decode_diagnostics.get("decode_steps", 0)) == 1
+                        wall_key = (
+                            "first_decode_forward_wall_cpu_s"
+                            if first_decode
+                            else "steady_decode_forward_wall_cpu_s"
+                        )
+                        with _diagnostic_range(
+                                active_prefix_decode_diagnostics,
+                                "decode_forward",
+                                wall_key=wall_key,
+                                aggregate_wall_key="decode_forward_wall_cpu_s",
+                        ):
+                            outputs = model_forward(**model_inputs, return_dict=True)
+                    else:
+                        outputs = model_forward(**model_inputs, return_dict=True)
 
         if active_prefix_decode_diagnostics is not None:
             with _diagnostic_range(
