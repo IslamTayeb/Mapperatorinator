@@ -234,6 +234,15 @@ Follow-up 64-token graph gate, DCC job `49165980` on `dcc-dhvimdcore-gpu-ferc-s-
 
 Run dir: `/work/imt11/Mapperatorinator/runs/direct-graph-gate64-49165980-26ec057`. This strengthens the correctness signal for graph replay across longer sampled-token/RNG progression, but it still stayed inside one active-prefix bucket and is not a throughput result.
 
+Bucket-transition CUDA graph gate, DCC jobs `49166191` and `49166213` on `dcc-dhvimdcore-gpu-ferc-s-p15-12`, RTX 2080 Ti, commit `13335e5`:
+
+| gate | token match | RNG match | raw-logit steps | max_abs | graph captures | graph replays | buckets | wall |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- | ---: |
+| compile false, graph active512 | PASS | PASS | 512 | `0.0` | `2` | `511` | `512:414`, `1024:97` | `66.538s` |
+| compile true, graph active512 | PASS | PASS | 512 | `1.373e-4` | `2` | `511` | `512:414`, `1024:97` | `82.194s` |
+
+Run dirs: `/work/imt11/Mapperatorinator/runs/direct-graph-transition-seq0-49166191-13335e5` and `/work/imt11/Mapperatorinator/runs/direct-graph-transition-seq0-compile-49166213-13335e5`. This proves the verifier can recapture graph buckets when active-prefix decode crosses from `512` to `1024`, with generated tokens, final RNG state, logits allclose, and top-k order still matching. It remains a verifier-only result, not throughput: `prepare_inputs_for_generation()`, tensor copies, short-run setup, and report overhead are still outside the captured graph.
+
 Rejected active-prefix mask fast path, DCC jobs `49158276` and `49158365` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti:
 
 | run | main tokens | main model time | tok/s | token equivalence | status |

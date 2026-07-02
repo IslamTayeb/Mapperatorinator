@@ -12,7 +12,8 @@ This gate is narrower than production inference, but it closes the next correctn
 
 ## Implementation
 
-Commit: `0602d32`
+Initial graph gate commit: `0602d32`
+Bucket-recapture verifier commit: `13335e5`
 
 New verifier flags:
 
@@ -26,9 +27,9 @@ python utils/verify_direct_decode_loop.py \
 
 The graph path:
 
-- Captures only the one-token model forward after the first candidate decode step prepares static-shape inputs.
-- Copies later prepared inputs into the captured static buffers before each replay.
-- Requires the active-prefix bucket length to stay fixed during the short gate.
+- Captures only the one-token model forward after the candidate decode step prepares static-shape inputs.
+- Copies later prepared inputs into captured static buffers before each replay.
+- Caches captured graphs by active-prefix length and model-input signature, so longer gates can recapture when bucket512 becomes bucket1024.
 - Keeps logits processors, sampling, EOS handling, and RNG state checks outside the graph.
 - Records graph diagnostics in the JSON report.
 
@@ -92,10 +93,35 @@ Follow-up job `49165980` repeated the graph replay gate at 64 generated tokens:
 
 The retained generated-token sequence length was `64` in both cases, and both reference and candidate stopped because of `max_new_tokens`.
 
-This strengthens the correctness signal but keeps the same limits: the gate stayed inside one active-prefix bucket and still measured verifier overhead, not production throughput.
+This strengthened the correctness signal but stayed inside one active-prefix bucket and still measured verifier overhead, not production throughput.
+
+## Bucket Transition Follow-Up
+
+Job `49166100` first attempted a 448-token transition gate on `profile_salvalai_smoke15`, sequence index `9`, but the generated sequence hit EOS at 353 tokens before crossing bucket512. It still passed both compile-disabled and compile-enabled graph gates with one captured graph:
+
+| Gate | Token match | RNG match | Steps | Stop | Max abs | Capture count | Graphs | Wall |
+| --- | --- | --- | ---: | --- | ---: | ---: | --- | ---: |
+| graph active512, compile false | PASS | PASS | `353` | EOS | `0.0` | `1` | `512:352` | `33.201s` |
+| graph active512, compile true | PASS | PASS | `353` | EOS | `1.221e-4` | `1` | `512:352` | `59.609s` |
+
+Run dir: `/work/imt11/Mapperatorinator/runs/direct-graph-transition-49166100-13335e5`.
+
+The actual bucket-transition gate used full-song `profile_salvalai`, sequence index `0`, `max_new_tokens=512`:
+
+- Compile-disabled job: `49166191`, node `dcc-dhvimdcore-gpu-ferc-s-p15-12`, commit `13335e5`, run dir `/work/imt11/Mapperatorinator/runs/direct-graph-transition-seq0-49166191-13335e5`
+- Compile-enabled job: `49166213`, node `dcc-dhvimdcore-gpu-ferc-s-p15-12`, commit `13335e5`, run dir `/work/imt11/Mapperatorinator/runs/direct-graph-transition-seq0-compile-49166213-13335e5`
+
+| Gate | Token match | RNG match | Logits allclose | Top-k match | Steps | Stop | Max abs | Capture count | Graphs | Wall |
+| --- | --- | --- | --- | --- | ---: | --- | ---: | ---: | --- | ---: |
+| graph active512, compile false | PASS | PASS | PASS | PASS | `512` | max_new_tokens | `0.0` | `2` | `512:414`, `1024:97` | `66.538s` |
+| graph active512, compile true | PASS | PASS | PASS | PASS | `512` | max_new_tokens | `1.373e-4` | `2` | `512:414`, `1024:97` | `82.194s` |
+
+This proves the verifier can recapture a second CUDA graph when the active-prefix bucket changes from `512` to `1024`, while preserving generated-token identity, final RNG state, logits allclose, and top-k order in both compile modes.
+
+It is still not a speed claim. The verifier continues to run `prepare_inputs_for_generation()` and tensor copies outside the graph; the wall times are gate overhead and should not be compared to `profile_inference` throughput.
 
 Next useful checks:
 
-1. Add bucket-transition handling to the verifier or run an expected-fail transition probe so production graph recapture logic is explicit.
-2. Prototype an opt-in smoke-only direct graph loop that reports untraced `profile_inference` model time.
+1. Prototype an opt-in smoke-only direct graph loop that reports untraced `profile_inference` model time.
+2. Keep graph caching keyed by active-prefix bucket/signature and count capture cost honestly in cold runs.
 3. Keep active-prefix default-off and do not claim speed until 15s smoke and then full-song SALVALAI runs pass token equivalence and no-regression gates.
