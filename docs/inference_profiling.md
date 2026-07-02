@@ -80,7 +80,7 @@ The current RTX 2080/2080 Ti retained cold single-song baseline is SDPA plus `in
 - Stretch target: `150+ tok/s`.
 - Active long-range research target: `200 tok/s`.
 
-The first 100 tok/s loop ended below target by the documented stop condition because profiling showed no remaining plausible current-architecture quick win of `>=10%`. A renewed runtime pass found exact active-prefix evidence, but follow-up validation showed it is order/warm-state sensitive and not the retained cold single-song baseline. Reaching `200 tok/s` from the retained `92.465 tok/s` baseline requires cutting full-song synchronized main-generation model time from `82.615s` to about `38.195s`, a `53.8%` reduction.
+The first 100 tok/s loop ended below target by the documented stop condition because profiling showed no remaining plausible current-architecture quick win of `>=10%`. A renewed runtime pass found exact active-prefix and CUDA graph evidence, then job `49168188` added a stateful monotonic logits processor on top of that default-off path and reached `134.873 tok/s` with fixed-seed token equivalence and per-window non-regression. Reaching `200 tok/s` from the retained `92.465 tok/s` conservative baseline requires cutting full-song synchronized main-generation model time from `82.615s` to about `38.195s`, a `53.8%` reduction. Reaching `200 tok/s` from the current fastest accepted exact opt-in path requires cutting `56.639s` to `38.195s`, removing another `18.444s` or `32.6%` of that path's model time.
 
 Only count a speedup as equivalent when fixed-seed generated token IDs match the baseline for the same audio/config slice. Do not claim wins from changed precision, sampling policy, output policy, model quality, windowing/overlap, or generated-token behavior unless the run is explicitly labeled non-equivalent.
 
@@ -273,6 +273,36 @@ python inference.py --config-name profile_salvalai \
 ```
 
 Keep the hard restrictions from the implementation: batch size 1, `use_server=false`, `parallel=false`, `cfg_scale=1`, `num_beams=1`, static cache, and decode-only active-prefix. Sampling, logits processors, RNG consumption, EOS behavior, generated-token accounting, and timing generation remain outside the captured graph path.
+
+Stateful monotonic processor validation on top of active512 graph, DCC jobs `49167587`, `49168158`, and `49168188`:
+
+| run | main tokens | main model time | main tok/s | total timing+map stage | token equivalence | strict status |
+| --- | ---: | ---: | ---: | ---: | --- | --- |
+| retained compile-only baseline, job `49113713` | `7,639` | `82.615s` | `92.465` | `113.928s` | baseline | baseline |
+| active512 graph baseline, job `49167356` | `7,639` | `71.981s` | `106.125` | `101.481s` | PASS, `7,639 / 7,639` | aggregate PASS, per-window micro-regression |
+| active512 graph + stateful monotonic, job `49168188` | `7,639` | `56.639s` | `134.873` | `78.473s` | PASS, `7,639 / 7,639` | PASS, `87 / 87` |
+
+Run dirs:
+
+- Logits processor diagnostic: `/work/imt11/Mapperatorinator/runs/active-graph-logitdiag-smoke-49167587-269f7ea`
+- 15s smoke: `/work/imt11/Mapperatorinator/runs/stateful-monotonic-smoke-49168158-a980c8d`
+- Full song: `/work/imt11/Mapperatorinator/runs/stateful-monotonic-full-49168188-a980c8d`
+
+Job `49167587` used diagnostic counters, not throughput claims, and showed `MonotonicTimeShiftLogitsProcessor` dominated active-graph logits-processor time (`5.373s / 5.602s`) on the 15s smoke. Job `49168158` then passed same-calculation metadata, fixed-seed token equivalence (`1,084 / 1,084`), and improved active512 graph smoke throughput from `132.593` to `149.321 tok/s`; the only per-window regression was a `0.299ms` one-token window. Job `49168188` promoted the change to full song on RTX 2080 Ti, torch `2.10.0+cu128`, Transformers `4.57.3`, and passed token equivalence against both the retained compile-only baseline and the active512 graph baseline.
+
+Use:
+
+```bash
+python inference.py --config-name profile_salvalai \
+  inference_generation_compile=true \
+  inference_active_prefix_decode_loop=true \
+  inference_active_prefix_decode_bucket_size=512 \
+  inference_active_prefix_decode_cuda_graph=true \
+  inference_active_prefix_decode_cuda_graph_min_decode_steps=1 \
+  inference_stateful_monotonic_logits_processor=true
+```
+
+Keep this path default-off and scoped to the active-prefix CUDA graph/simple batch-1 mode until fresh profiling validates broader modes. The older pre-graph stateful monotonic attempt stayed rejected for normal generation because it regressed smoke throughput; the new result was accepted only after active-graph diagnostics made the logits processor a target-sized cost.
 
 Rejected delayed-capture variant, DCC job `49166715`, commit `f712b59`: setting `inference_active_prefix_decode_cuda_graph_min_decode_steps=16` remained token-equivalent on 15s smoke but failed per-window no-regression on 5/10 windows and reduced graph-path aggregate throughput versus immediate capture. Keep `min_decode_steps=1` as the default. Only revisit delayed capture if a future profiler trace shows graph capture itself has become the dominant cost and a better adaptive policy can avoid medium-window regressions.
 
@@ -756,11 +786,15 @@ Job `49152465` compared bucket `512` against a same-job compile-only run and pas
 
 Keep this path scoped to the validated simple generation mode: batch size `1`, `use_server=false`, `parallel=false`, `cfg_scale=1.0`, `num_beams=1`, static cache, SDPA, and no active-prefix during prefill. Any broader scope, bucket-size change, warmed-repeat claim, or batch/multi-song claim requires new one-token logits gates, 15s token-equivalent smoke, full-song token equivalence, and result-class-specific non-regression checks.
 
-Post-active-prefix attribution job `49150687` traced the bucket-256 path with detailed ranges and `TORCH_LOGS=recompiles,cudagraphs`. It is diagnostic only, because torch profiler/logging inflated the traced `seq9` wall time to `107.836s`. The useful evidence is that sampling/logits processors remained small, while graph/runtime churn was large: `1,058` graph-recording log lines, `20,504` TorchDynamo cache lookups, `16,310` CUDA graph launches, and a visible `sdpa_attention_forward` recompile from full static key length `2560` to active length `1024`. See `notes/2026-07-01-post-active-prefix-attribution.md`.
+Post-active-prefix attribution job `49150687` traced the bucket-256 path with detailed ranges and `TORCH_LOGS=recompiles,cudagraphs`. It is diagnostic only, because torch profiler/logging inflated the traced `seq9` wall time to `107.836s`. The useful evidence at that point was that sampling/logits processors remained small, while graph/runtime churn was large: `1,058` graph-recording log lines, `20,504` TorchDynamo cache lookups, `16,310` CUDA graph launches, and a visible `sdpa_attention_forward` recompile from full static key length `2560` to active length `1024`. See `notes/2026-07-01-post-active-prefix-attribution.md`.
+
+The later manual CUDA graph path changed the cost mix enough that logits processors became target-sized. Job `49168188` accepted `inference_stateful_monotonic_logits_processor=true` only in that active512 graph context; it should not be generalized back to normal generation without new evidence.
 
 ## Rejected Exact-Calculation Experiments
 
-### Stateful monotonic time-shift masking
+### Historical pre-graph stateful monotonic time-shift masking
+
+This rejection applies to the old normal-generation/pre-graph implementation. It was superseded in the active-prefix CUDA graph context by job `49168188`, where diagnostics showed monotonic masking had become a dominant CPU-side cost and the new default-off flag passed full-song token equivalence and non-regression.
 
 Attempted in commit `9d7e5b7` and reverted after smoke profiling. The change replaced the per-token full-prefix scan in `MonotonicTimeShiftLogitsProcessor` with a stateful batch-size-1 path that tracks the last time-shift token after the last SOS token.
 
@@ -771,7 +805,7 @@ RTX 2080 Ti smoke comparison on DCC `gpu-common`, node `dcc-core-ferc-s-z25-21`:
 | baseline | `01c18d6` | `49109301` | `/work/imt11/Mapperatorinator/runs/smoke-base-49109301-01c18d6/beatmap6f980906005d441fb87edde94f269b83.osu.profile.json` | 2,894 | 41.707s | 69.4 |
 | candidate | `9d7e5b7` | `49109743` | `/work/imt11/Mapperatorinator/runs/smoke-cand-49109743-9d7e5b7/beatmapd81b370ad0ac422cb1b5a01b3d3a093d.osu.profile.json` | 2,894 | 43.487s | 66.5 |
 
-`utils/summarize_inference_profile.py --compare` reported token equivalence PASS for all `2,894` generated main-generation token IDs, but throughput was `-4.1%` worse. The likely reason is that removing `torch.isin`/full-prefix work also added per-token state, mask, slice, `masked_fill`, and `torch.where` work; this did not pay back in normal generation. Do not reintroduce this shape of stateful logits processor without profiler evidence that the replacement removes more work than it adds.
+`utils/summarize_inference_profile.py --compare` reported token equivalence PASS for all `2,894` generated main-generation token IDs, but throughput was `-4.1%` worse. The likely reason is that removing `torch.isin`/full-prefix work also added per-token state, mask, slice, `masked_fill`, and `torch.where` work; this did not pay back in normal generation. Do not reintroduce this shape of stateful logits processor in normal generation without profiler evidence that the replacement removes more work than it adds.
 
 ### Last-position generation logits
 
@@ -1014,7 +1048,7 @@ The first current-architecture 200 tok/s scouting loop stopped on 2026-07-01 by 
 
 The retained baseline at that time was SDPA plus `inference_generation_compile=true`: full-song job `49113713`, `7,639` main-generation tokens, `82.615s` synchronized model time, `92.465 tok/s`, and fixed-seed token equivalence PASS against the compile-disabled full-song baseline. After active-prefix follow-up validation, this remains the retained cold single-song baseline.
 
-The final rejection set includes copy-compatible custom `_sample` hook, preallocated `_sample` loop, persistent static-mask mutation, compile-config variants (`dynamic=False`, `dynamic=True`, `mode="max-autotune"`, `fullgraph=True`), TensorRT-RTX current-env lowering, static-cache prefix trim, dynamic/default cache generation, final-position logits, stateful monotonic masking, and `torch.inference_mode` wrapping. Sampling/logits fusion remains below the profiling threshold in the post-warmup trace, and batching/parallel/server/window changes are non-equivalent unless separately proven token-identical.
+The final rejection set includes copy-compatible custom `_sample` hook, preallocated `_sample` loop, persistent static-mask mutation, compile-config variants (`dynamic=False`, `dynamic=True`, `mode="max-autotune"`, `fullgraph=True`), TensorRT-RTX current-env lowering, static-cache prefix trim, dynamic/default cache generation, final-position logits, old pre-graph stateful monotonic masking, and `torch.inference_mode` wrapping. Sampling/logits fusion stayed below the profiling threshold in the post-warmup trace, and batching/parallel/server/window changes are non-equivalent unless separately proven token-identical. Later active-prefix CUDA graph diagnostics changed the cost mix and justified reintroducing stateful monotonic masking only as a default-off active-graph path.
 
 Final read-only subagent `019f1c3b-a844-73d1-8e67-858ad3b51732` agreed with stopping: no remaining exact-calculation path was both plausible for a `>=10%` full-song win and worth running before the stop decision.
 

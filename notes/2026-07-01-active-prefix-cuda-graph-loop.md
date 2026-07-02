@@ -4,6 +4,8 @@
 
 Added a default-off production path that captures the active-prefix one-token decode forward with manual CUDA graphs. This is the first current-branch exact full-song result to clear the original `100 tok/s` main-generation target, but it is not the cold default because strict zero-regression still fails on a small set of windows.
 
+Superseded update on 2026-07-02: this graph path remains the required base for the current fastest accepted opt-in path. Adding `inference_stateful_monotonic_logits_processor=true` in commit `a980c8d` raised full-song main generation to `134.873 tok/s` in job `49168188`, with token equivalence PASS and per-window no-regression PASS. See `notes/2026-07-02-stateful-monotonic-graph.md`.
+
 Use:
 
 ```bash
@@ -114,4 +116,3 @@ Delayed capture avoided some tiny capture costs but threw away too much graph be
 Keep the graph path as a default-off opt-in performance mode because it is exact and improves full-song main generation by more than 10% on RTX 2080 Ti. Do not make it the default cold single-song path yet because strict zero-regression still fails on a small number of windows and the feature is limited to the simple non-server generation path.
 
 The current retained conservative default baseline remains compile-only SDPA with active-prefix disabled. For future 200 tok/s work, use active512 graph as the fastest exact opt-in starting point, and focus next on reducing the remaining one-token decoder cost rather than wrapper cleanup.
-

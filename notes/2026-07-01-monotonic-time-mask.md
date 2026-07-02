@@ -8,6 +8,8 @@ Replace the per-token full-prefix scan in `MonotonicTimeShiftLogitsProcessor` wi
 
 Rejected and reverted.
 
+Superseded context on 2026-07-02: this rejection applies to the old normal-generation/pre-graph experiment. After active-prefix CUDA graph replay changed the cost mix, diagnostics showed monotonic masking became a dominant CPU-side cost. Commit `a980c8d` reintroduced a default-off `inference_stateful_monotonic_logits_processor=true` flag scoped to active512 graph/simple batch-1 generation, and full-song job `49168188` accepted it with token equivalence PASS and `92.465 -> 134.873 tok/s` against the retained compile-only baseline. See `notes/2026-07-02-stateful-monotonic-graph.md`.
+
 RTX 2080 Ti smoke slice on DCC `gpu-common`, node `dcc-core-ferc-s-z25-21`:
 
 - Baseline commit: `01c18d6`
