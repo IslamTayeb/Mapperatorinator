@@ -23,7 +23,7 @@ from osuT5.osuT5.inference.direct_decode import (
     last_token_logits,
     prefill_static_cache,
 )
-from osuT5.osuT5.inference.native_q1_attention import native_q1_attention
+from osuT5.osuT5.inference.native_q1_attention import native_q1_attention, native_q1_rope_cache_attention
 from osuT5.osuT5.inference.server import get_eos_token_id
 from osuT5.osuT5.model.custom_transformers import modeling_varwhisper
 from osuT5.osuT5.runtime_profiling import generation_profile_context
@@ -97,6 +97,29 @@ def _effective_self_attention_inputs(
     return query_states, key_states, value_states, attention_mask
 
 
+def _active_prefix_attention_mask(capture: SelfAttentionIslandCapture) -> torch.Tensor | None:
+    attention_mask = capture.attention_mask
+    if isinstance(attention_mask, torch.Tensor) and attention_mask.shape[-1] > capture.active_prefix_length:
+        attention_mask = attention_mask[..., :capture.active_prefix_length]
+    return attention_mask
+
+
+def _self_attention_cache_tensors(capture: SelfAttentionIslandCapture) -> tuple[torch.Tensor, torch.Tensor]:
+    cache_layer = capture.past_key_value.self_attention_cache.layers[capture.layer_idx]
+    if not getattr(cache_layer, "is_initialized", False):
+        raise RuntimeError(f"self-attention cache layer {capture.layer_idx} is not initialized")
+    return cache_layer.keys, cache_layer.values
+
+
+def _qkv_and_rope(capture: SelfAttentionIslandCapture) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    module = capture.module
+    hidden_states = capture.hidden_states
+    bs = hidden_states.shape[0]
+    qkv = module.Wqkv(hidden_states).view(bs, -1, 3, module.num_heads, module.head_dim)
+    cos, sin = module.rotary_emb(qkv, position_ids=capture.position_ids)
+    return qkv, cos, sin
+
+
 def _native_attention_module_output(capture: SelfAttentionIslandCapture) -> torch.Tensor:
     query, key, value, attention_mask = _effective_self_attention_inputs(capture)
     hidden_states = native_q1_attention(query, key, value, attention_mask).transpose(1, 2).contiguous()
@@ -116,6 +139,33 @@ def _native_attention_only(
         attention_mask: torch.Tensor | None,
 ) -> torch.Tensor:
     return native_q1_attention(query, key, value, attention_mask)
+
+
+def _fused_rope_cache_attention_only(
+        capture: SelfAttentionIslandCapture,
+        qkv: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+) -> torch.Tensor:
+    cache_keys, cache_values = _self_attention_cache_tensors(capture)
+    return native_q1_rope_cache_attention(
+        qkv,
+        cache_keys,
+        cache_values,
+        cos,
+        sin,
+        capture.cache_position,
+        _active_prefix_attention_mask(capture),
+        capture.active_prefix_length,
+    )
+
+
+def _fused_rope_cache_attention_module_output(capture: SelfAttentionIslandCapture) -> torch.Tensor:
+    qkv, cos, sin = _qkv_and_rope(capture)
+    attention_output = _fused_rope_cache_attention_only(capture, qkv, cos, sin)
+    hidden_states = attention_output.transpose(1, 2).contiguous()
+    hidden_states = hidden_states.view(capture.hidden_states.shape[0], -1, capture.module.all_head_size)
+    return capture.module.out_drop(capture.module.Wo(hidden_states))
 
 
 def _out_projection_only(capture: SelfAttentionIslandCapture, attention_output: torch.Tensor) -> torch.Tensor:
@@ -182,9 +232,14 @@ def _benchmark_capture(
             precomputed_value,
             precomputed_mask,
         ).detach()
+        precomputed_qkv, precomputed_cos, precomputed_sin = _qkv_and_rope(capture)
         variants: dict[str, tuple[Callable[[], torch.Tensor], torch.Tensor]] = {
             "repo_module_forward": (lambda: _module_forward(capture), reference),
             "manual_native_attention_island": (lambda: _native_attention_module_output(capture), reference),
+            "fused_rope_cache_attention_island": (
+                lambda: _fused_rope_cache_attention_module_output(capture),
+                reference,
+            ),
             "pre_attention_setup_only": (lambda: _pre_attention_setup_only(capture), _pre_attention_setup_only(capture)),
             "native_attention_only": (
                 lambda: _native_attention_only(
@@ -192,6 +247,15 @@ def _benchmark_capture(
                     precomputed_key,
                     precomputed_value,
                     precomputed_mask,
+                ),
+                precomputed_attention,
+            ),
+            "fused_post_wqkv_attention_only": (
+                lambda: _fused_rope_cache_attention_only(
+                    capture,
+                    precomputed_qkv,
+                    precomputed_cos,
+                    precomputed_sin,
                 ),
                 precomputed_attention,
             ),
