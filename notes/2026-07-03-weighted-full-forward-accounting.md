@@ -138,9 +138,39 @@ Weighted graph-replay totals:
 
 The repo module and manual native island are essentially tied, so the Python/manual decomposition is not itself an optimization. The important split is that qkv/RoPE/cache/setup remains larger than the native attention kernel. Freeing the entire weighted self-attention module would raise the accepted baseline only to about `326 tok/s`; it is a good target, but not sufficient for `500 tok/s` alone.
 
+## Weighted Cross-Attention And Layer Split
+
+Follow-up DCC job `49229539` on commit `2cf7c5f` ran `utils/profile_decode_cross_attention_island.py --cuda-graph-replay` across the same active-prefix buckets:
+
+- Run dir: `/work/imt11/Mapperatorinator/runs/cross-attn-buckets-20260703-075230-2cf7c5f`
+- Result: every bucket PASS, `logits_replay_max_abs=0.0`
+
+Weighted graph-replay totals:
+
+| cross-attention component | weighted full-song seconds | model-time share |
+| --- | ---: | ---: |
+| repo cross-attention module | `3.124s` | `9.7%` |
+| manual q1 BMM island | `3.071s` | `9.5%` |
+| q1 BMM attention only | `1.713s` | `5.3%` |
+| q projection only | `0.646s` | `2.0%` |
+| output projection only | `0.640s` | `2.0%` |
+
+Combining the weighted probes gives this approximate decoder-layer split:
+
+| decoder-layer bucket | weighted full-song seconds | share of decoder-layer time | share of model time |
+| --- | ---: | ---: | ---: |
+| self-attention module | `8.806s` | `46.5%` | `27.3%` |
+| MLP island | `3.724s` | `19.7%` | `11.6%` |
+| cross-attention module | `3.124s` | `16.5%` | `9.7%` |
+| three RMSNorms | `1.181s` | `6.2%` | `3.7%` |
+| residual/glue/measurement remainder | `2.083s` | `11.0%` | `6.5%` |
+| total decoder layer | `18.918s` | `100%` | `58.7%` |
+
+The remainder is not a single proven operation; it includes residual additions, dropout identity calls, activation/layout effects not fully captured by the simple MLP island, and probe-boundary differences. Treat it as a reason to prefer fused layer/block prototypes over isolated per-op rewrites.
+
 ## Decision
 
-Use `utils/profile_decode_full_forward_island.py` plus bucket weighting before any future broad runtime/kernel rewrite. The next implementation-class project should target a large decoder-layer island or multi-layer decoder stack with stable C++/CUDA/CUTLASS/cuBLASLt work, and it should show an exclusive projected saving of at least `1.6s`, preferably several seconds, before production integration.
+Use `utils/profile_decode_full_forward_island.py` plus bucket weighting before any future broad runtime/kernel rewrite. The next implementation-class project should target a large decoder-layer island or multi-layer decoder stack with stable C++/CUDA/CUTLASS/cuBLASLt work, and it should show an exclusive projected saving of at least `1.6s`, preferably several seconds, before production integration. The largest measured sub-target is self-attention setup/cache/layout plus native attention (`8.806s`), followed by MLP (`3.724s`) and cross-attention (`3.124s`).
 
 Do not start standalone work on:
 
@@ -155,4 +185,5 @@ Do not start standalone work on:
 - Local syntax check passed for `utils/profile_decode_full_forward_island.py`.
 - DCC jobs `49229391` and `49229433` completed successfully.
 - DCC job `49229477` completed successfully.
+- DCC job `49229539` completed successfully.
 - All captured bucket probes had exact replay logits (`max_abs=0.0`).
