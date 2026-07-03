@@ -88,6 +88,8 @@ Acceptance gates:
 
 This checkpoint adds default-off campaign flags and a verifier-first `DecodeSession` wrapper around the existing exact one-token prefill/decode helpers. It is not a speed win and must not be reported as one.
 
+Normal inference fails loudly if a reserved DecodeSession/native-kernel flag is enabled before implementation. Use `utils/verify_one_token_decode.py --candidate-decode-session` for the current one-token verifier path instead of setting `inference_decode_session_runtime=true`.
+
 ## Codex `/goal` Prompt
 
 ```text

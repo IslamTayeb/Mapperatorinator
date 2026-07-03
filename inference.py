@@ -357,8 +357,33 @@ def compile_derived_args(args: InferenceConfig):
         args.tags = " ".join(f"{k}={v}" for k, v in tags.items())
 
 
+def validate_reserved_runtime_flags(args: InferenceConfig):
+    if args.inference_decode_session_runtime:
+        raise NotImplementedError(
+            "inference_decode_session_runtime is reserved for verifier-first DecodeSession work and is not wired "
+            "into normal inference yet. Use utils/verify_one_token_decode.py --candidate-decode-session for the "
+            "current one-token verifier path."
+        )
+    if args.inference_decode_session_cuda_graph:
+        raise NotImplementedError(
+            "inference_decode_session_cuda_graph is reserved until DecodeSession owns an exact generated-token/RNG "
+            "validated CUDA graph runtime."
+        )
+    if args.inference_decode_session_chunk_size != 1:
+        raise NotImplementedError(
+            "inference_decode_session_chunk_size is reserved and must remain 1 until chunked DecodeSession "
+            "generation preserves exact RNG/token behavior."
+        )
+    if args.inference_native_decode_kernels:
+        raise NotImplementedError(
+            "inference_native_decode_kernels is reserved for isolated C++/CUDA/CUTLASS experiments after profiler "
+            "evidence selects a hotspot."
+        )
+
+
 def compile_args(args: InferenceConfig, verbose=True):
     """Validates and populates missing args."""
+    validate_reserved_runtime_flags(args)
     compile_device_and_seed(args, verbose=verbose)
     compile_paths(args)
 

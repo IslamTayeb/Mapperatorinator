@@ -76,7 +76,7 @@ class InferenceConfig:
     inference_active_prefix_decode_loop: bool = False  # Experimental batch-1 decode loop with bucketed active-prefix self-attention
     inference_active_prefix_decode_bucket_size: int = 128  # Active-prefix decode bucket length for reusable graph shapes
     inference_active_prefix_decode_cuda_graph: bool = False  # Capture active-prefix one-token decode forwards with manual CUDA graphs
-    inference_active_prefix_decode_cuda_graph_warmup: int = 3  # Warmup forwards before each active-prefix CUDA graph capture
+    inference_active_prefix_decode_cuda_graph_warmup: int = 0  # Warmup forwards before each active-prefix CUDA graph capture
     inference_active_prefix_decode_cuda_graph_min_decode_steps: int = 1  # First 1-based decode step eligible for graph capture
     inference_stateful_monotonic_logits_processor: bool = False  # Experimental batch-1 stateful monotonic time-shift mask
     inference_q1_bmm_cross_attention: bool = False  # Experimental fp32 q_len=1 cross-attention via bmm/softmax/bmm

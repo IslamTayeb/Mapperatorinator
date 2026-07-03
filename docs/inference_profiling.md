@@ -113,6 +113,8 @@ The first campaign checkpoint adds default-off verifier infrastructure, not a sp
 
 `DecodeSession` lives in `osuT5.osuT5.inference.direct_decode` and currently delegates to the existing exact static-cache one-token helpers. Keep it verifier-first until generated-token identity, raw-logit/top-k equality, final RNG-state identity, and output/map behavior are proven across multiple sampled decode steps and windows.
 
+Normal inference intentionally raises if any reserved DecodeSession/native-kernel flag is enabled before that path is implemented. Use `utils/verify_one_token_decode.py --candidate-decode-session` for the current one-token logits verifier path; do not treat the reserved Hydra flags as production runtime switches yet.
+
 Prefer PyTorch built-ins first, then isolated C++/CUDA/CUTLASS/cuBLASLt kernels for measured dominant hotspots. Avoid Triton-first work unless there is no stable practical alternative and the path is default-off, isolated, exact, and strongly measured. Do not retry simple BMM for active-prefix self-attention: job `49221520` showed it is slower than SDPA at bucket-like lengths (`L=64`, `96`, `128`), while q1 BMM remains justified for long unmasked cross-attention.
 
 Only count a speedup as equivalent when fixed-seed generated token IDs match the baseline for the same audio/config slice. Do not claim wins from changed precision, sampling policy, output policy, model quality, windowing/overlap, or generated-token behavior unless the run is explicitly labeled non-equivalent.
