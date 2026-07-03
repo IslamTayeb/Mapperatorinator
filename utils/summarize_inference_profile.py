@@ -916,6 +916,56 @@ def compare_profiles(
     return report
 
 
+def _parse_compare_labels(*, label: str, labels: str | None, strict_full_song: bool) -> list[str]:
+    if strict_full_song:
+        return ["main_generation", "timing_context"]
+    if labels is None:
+        return [label]
+    parsed = [item.strip() for item in labels.split(",") if item.strip()]
+    if not parsed:
+        raise ValueError("--labels must include at least one generation label")
+    return parsed
+
+
+def compare_profiles_for_labels(
+        baseline_path: Path,
+        candidate_path: Path,
+        *,
+        labels: list[str],
+        regression_tolerance_pct: float = 0.0,
+) -> dict[str, Any]:
+    reports = {}
+    for index, label in enumerate(labels):
+        if index:
+            print()
+            print("=" * 80)
+            print()
+        reports[label] = compare_profiles(
+            baseline_path,
+            candidate_path,
+            label=label,
+            regression_tolerance_pct=regression_tolerance_pct,
+        )
+    return {
+        "baseline_path": str(baseline_path),
+        "candidate_path": str(candidate_path),
+        "labels": labels,
+        "reports": reports,
+        "same_calculation_pass": all(
+            report.get("same_calculation", {}).get("pass", False)
+            for report in reports.values()
+        ),
+        "token_equivalence_pass": all(
+            report.get("token_equivalence", {}).get("pass", False)
+            for report in reports.values()
+        ),
+        "performance_pass": all(
+            report.get("performance", {}).get("pass", False)
+            for report in reports.values()
+        ),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Summarize Mapperatorinator inference profile JSON.")
     parser.add_argument("profile", type=Path, nargs="?", help="Path to a .profile.json file.")
@@ -941,6 +991,14 @@ def main() -> None:
         help="Aggregate scope for --compare-suite no-regression gating. Default: warmed_runs.",
     )
     parser.add_argument("--label", default="main_generation", help="Generation label to compare.")
+    parser.add_argument(
+        "--labels",
+        default=None,
+        help=(
+            "Comma-separated generation labels to compare in one command, e.g. "
+            "main_generation,timing_context."
+        ),
+    )
     parser.add_argument(
         "--regression-tolerance-pct",
         type=float,
@@ -1012,6 +1070,14 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--strict-full-song",
+        action="store_true",
+        help=(
+            "For --compare, shortcut for --strict --labels main_generation,timing_context. "
+            "Use for full-song promotion gates."
+        ),
+    )
+    parser.add_argument(
         "--json-output",
         type=Path,
         default=None,
@@ -1020,25 +1086,51 @@ def main() -> None:
     args = parser.parse_args()
     if args.compare and args.compare_suite:
         parser.error("use either --compare or --compare-suite, not both")
+    if args.strict_full_song and not args.compare:
+        parser.error("--strict-full-song requires --compare")
     if args.compare:
-        report = compare_profiles(
-            args.compare[0],
-            args.compare[1],
-            label=args.label,
-            regression_tolerance_pct=args.regression_tolerance_pct,
-        )
+        try:
+            labels = _parse_compare_labels(
+                label=args.label,
+                labels=args.labels,
+                strict_full_song=args.strict_full_song,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        if len(labels) == 1 and not args.labels and not args.strict_full_song:
+            report = compare_profiles(
+                args.compare[0],
+                args.compare[1],
+                label=labels[0],
+                regression_tolerance_pct=args.regression_tolerance_pct,
+            )
+        else:
+            report = compare_profiles_for_labels(
+                args.compare[0],
+                args.compare[1],
+                labels=labels,
+                regression_tolerance_pct=args.regression_tolerance_pct,
+            )
         if args.json_output is not None:
             args.json_output.parent.mkdir(parents=True, exist_ok=True)
             args.json_output.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
-        require_contract_match = args.require_contract_match or args.strict
-        require_token_equivalence = args.require_token_equivalence or args.strict
-        require_no_regression = args.require_no_regression or args.strict
-        failed = (
-            (require_contract_match and not report["same_calculation"].get("pass", False))
-            or (require_token_equivalence and not report["token_equivalence"].get("pass", False))
-            or (require_no_regression and not report["performance"].get("pass", False))
-        )
+        strict_compare = args.strict or args.strict_full_song
+        require_contract_match = args.require_contract_match or strict_compare
+        require_token_equivalence = args.require_token_equivalence or strict_compare
+        require_no_regression = args.require_no_regression or strict_compare
+        if "reports" in report:
+            failed = (
+                (require_contract_match and not report.get("same_calculation_pass", False))
+                or (require_token_equivalence and not report.get("token_equivalence_pass", False))
+                or (require_no_regression and not report.get("performance_pass", False))
+            )
+        else:
+            failed = (
+                (require_contract_match and not report["same_calculation"].get("pass", False))
+                or (require_token_equivalence and not report["token_equivalence"].get("pass", False))
+                or (require_no_regression and not report["performance"].get("pass", False))
+            )
         raise SystemExit(1 if failed else 0)
     elif args.compare_suite:
         report = compare_suite_manifests(

@@ -105,6 +105,17 @@ python inference.py --config-name profile_salvalai \
   inference_native_q1_self_attention=true
 ```
 
+For full-song candidate promotion, compare both main generation and timing context in one strict gate:
+
+```bash
+python utils/summarize_inference_profile.py \
+  --compare "$BASELINE/profile.json" "$CANDIDATE/profile.json" \
+  --strict-full-song \
+  --json-output "$RUN_DIR/compare-full-song.json"
+```
+
+`--strict-full-song` is equivalent to strict comparison for `main_generation` and `timing_context`. It should be the default full-song promotion command so timing-context regressions, token drift, total-stage wall regressions, and per-window regressions are not checked by hand after the fact. For one-token decoder gates, `utils/verify_one_token_decode.py` defaults to `--sequence-index 9`, the post-warmup smoke window used by the 500 tok/s runtime probes.
+
 For SALVALAI's `7,639` main tokens, `500 tok/s` implies about `15.278s` synchronized main-generation model time, a further `52.6%` reduction from the accepted native self-attention path (`32.217s`). Treat this as a runtime/kernel campaign, not a quick-tweak loop. Re-profile the accepted stack first, use untraced `profile_inference` for speed claims, and use Nsight/torch profiler only for diagnosis.
 
 The current DecodeSession runtime flags are default-off and accepted only for the simple single-song active-prefix graph + stateful + q1-BMM path:

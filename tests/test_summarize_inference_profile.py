@@ -80,6 +80,40 @@ def _profile(*, tokens: list[int], tok_s: float, model_s: float, wall_s: float, 
     }
 
 
+def _profile_with_timing(
+    *,
+    main_tokens: list[int],
+    timing_tokens: list[int],
+    main_tok_s: float,
+    timing_tok_s: float,
+    main_model_s: float,
+    timing_model_s: float,
+    main_wall_s: float,
+    timing_wall_s: float,
+):
+    profile = _profile(tokens=main_tokens, tok_s=main_tok_s, model_s=main_model_s, wall_s=main_wall_s)
+    profile["generation"].append({
+        "profile_label": "timing_context",
+        "mode": "sequential",
+        "context_type": "TIMING",
+        "sequence_index": 0,
+        "generated_tokens": len(timing_tokens),
+        "model_elapsed_seconds": timing_model_s,
+        "wall_seconds": timing_wall_s,
+        "tokens_per_second": timing_tok_s,
+        "generated_token_ids": timing_tokens,
+    })
+    profile["summary"]["generation_by_label"]["timing_context"] = {
+        "generated_tokens": len(timing_tokens),
+        "model_elapsed_seconds": timing_model_s,
+        "wall_seconds": timing_wall_s,
+        "tokens_per_second": timing_tok_s,
+        "records": 1,
+    }
+    profile["stages"][0]["wall_seconds"] = main_wall_s + timing_wall_s + 1.0
+    return profile
+
+
 def test_compare_profiles_passes_equivalent_non_regression(tmp_path):
     module = _load_module()
     baseline = tmp_path / "baseline.profile.json"
@@ -110,6 +144,82 @@ def test_compare_profiles_reports_token_and_performance_failures(tmp_path):
     assert not report["performance"]["metrics"]["tokens_per_second"]["pass"]
     assert not report["performance"]["metrics"]["model_elapsed_seconds"]["pass"]
     assert not report["performance"]["per_window"]["pass"]
+
+
+def test_compare_profiles_for_labels_passes_when_main_and_timing_pass(tmp_path):
+    module = _load_module()
+    baseline = tmp_path / "baseline.profile.json"
+    candidate = tmp_path / "candidate.profile.json"
+    baseline.write_text(module.json.dumps(_profile_with_timing(
+        main_tokens=[1, 2, 3],
+        timing_tokens=[8, 9],
+        main_tok_s=100,
+        timing_tok_s=50,
+        main_model_s=10,
+        timing_model_s=4,
+        main_wall_s=11,
+        timing_wall_s=5,
+    )))
+    candidate.write_text(module.json.dumps(_profile_with_timing(
+        main_tokens=[1, 2, 3],
+        timing_tokens=[8, 9],
+        main_tok_s=110,
+        timing_tok_s=60,
+        main_model_s=9,
+        timing_model_s=3,
+        main_wall_s=10,
+        timing_wall_s=4,
+    )))
+
+    report = module.compare_profiles_for_labels(
+        baseline,
+        candidate,
+        labels=["main_generation", "timing_context"],
+    )
+
+    assert report["same_calculation_pass"]
+    assert report["token_equivalence_pass"]
+    assert report["performance_pass"]
+    assert report["reports"]["main_generation"]["performance"]["pass"]
+    assert report["reports"]["timing_context"]["performance"]["pass"]
+
+
+def test_compare_profiles_for_labels_fails_when_timing_regresses(tmp_path):
+    module = _load_module()
+    baseline = tmp_path / "baseline.profile.json"
+    candidate = tmp_path / "candidate.profile.json"
+    baseline.write_text(module.json.dumps(_profile_with_timing(
+        main_tokens=[1, 2, 3],
+        timing_tokens=[8, 9],
+        main_tok_s=100,
+        timing_tok_s=50,
+        main_model_s=10,
+        timing_model_s=4,
+        main_wall_s=11,
+        timing_wall_s=5,
+    )))
+    candidate.write_text(module.json.dumps(_profile_with_timing(
+        main_tokens=[1, 2, 3],
+        timing_tokens=[8, 9],
+        main_tok_s=110,
+        timing_tok_s=25,
+        main_model_s=9,
+        timing_model_s=8,
+        main_wall_s=6,
+        timing_wall_s=9,
+    )))
+
+    report = module.compare_profiles_for_labels(
+        baseline,
+        candidate,
+        labels=["main_generation", "timing_context"],
+    )
+
+    assert report["same_calculation_pass"]
+    assert report["token_equivalence_pass"]
+    assert not report["performance_pass"]
+    assert report["reports"]["main_generation"]["performance"]["pass"]
+    assert not report["reports"]["timing_context"]["performance"]["pass"]
 
 
 def _suite_manifest(

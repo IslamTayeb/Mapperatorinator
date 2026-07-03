@@ -586,7 +586,7 @@ def main() -> None:
         description="Verify that a real static-cache q_len=1 decode step matches HF generate cached raw logits."
     )
     parser.add_argument("--config-name", default="profile_salvalai_smoke15")
-    parser.add_argument("--sequence-index", type=int, default=0)
+    parser.add_argument("--sequence-index", type=int, default=9)
     parser.add_argument("--probe-token-id", type=int, default=None)
     parser.add_argument("--atol", type=float, default=1e-4)
     parser.add_argument("--rtol", type=float, default=1e-4)
