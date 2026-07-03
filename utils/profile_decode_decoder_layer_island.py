@@ -104,6 +104,7 @@ def _norm_only(norm_module: torch.nn.Module, hidden_states: torch.Tensor) -> tor
 def _benchmark_capture(
         capture: DecoderLayerCapture,
         *,
+        native_q1_rope_cache_self_attention: bool,
         warmup: int,
         iters: int,
         atol: float,
@@ -114,6 +115,7 @@ def _benchmark_capture(
             active_prefix_self_attention_length=capture.active_prefix_length,
             q1_bmm_cross_attention=True,
             native_q1_self_attention=True,
+            native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
     ):
         variants: dict[str, tuple[Callable[[], torch.Tensor], torch.Tensor]] = {
             "repo_decoder_layer": (lambda: _layer_forward(capture), capture.output),
@@ -173,6 +175,7 @@ def _capture_decoder_layers(
         prepared_inputs: dict[str, Any],
         *,
         active_prefix_length: int,
+        native_q1_rope_cache_self_attention: bool,
         sdpa_backend: str | None,
 ) -> tuple[dict[str, DecoderLayerCapture], torch.Tensor]:
     captures: dict[str, DecoderLayerCapture] = {}
@@ -239,6 +242,7 @@ def _capture_decoder_layers(
                 active_prefix_self_attention_length=active_prefix_length,
                 q1_bmm_cross_attention=True,
                 native_q1_self_attention=True,
+                native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
         ):
             outputs = model(**prepared_inputs)
             logits = last_token_logits(outputs.logits)
@@ -256,6 +260,7 @@ def profile_decode_decoder_layer_island(
         sequence_index: int,
         active_prefix_bucket_size: int,
         active_prefix_decode_length: int | None,
+        native_q1_rope_cache_self_attention: bool,
         warmup: int,
         iters: int,
         atol: float,
@@ -303,6 +308,7 @@ def profile_decode_decoder_layer_island(
         "iters": iters,
         "active_prefix_bucket_size": active_prefix_bucket_size,
         "active_prefix_decode_length_override": active_prefix_decode_length,
+        "native_q1_rope_cache_self_attention": bool(native_q1_rope_cache_self_attention),
         "cuda_graph_replay": bool(cuda_graph_replay),
         "full_song_decode_steps": int(full_song_decode_steps),
         "full_song_main_tokens": int(full_song_main_tokens),
@@ -331,6 +337,7 @@ def profile_decode_decoder_layer_island(
                 sdpa_backend=args.profile_sdpa_backend,
                 q1_bmm_cross_attention=True,
                 native_q1_self_attention=True,
+                native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
             ):
         hf_cache = get_cache(model, batch_size=1, num_beams=1, cfg_scale=1.0)
         hf_generate_outputs = model.generate(
@@ -390,6 +397,7 @@ def profile_decode_decoder_layer_island(
             model,
             direct_result.prepared_inputs,
             active_prefix_length=active_prefix_length,
+            native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
             sdpa_backend=args.profile_sdpa_backend,
         )
 
@@ -406,6 +414,7 @@ def profile_decode_decoder_layer_island(
         representative = captures[sorted(names)[0]]
         benchmark = _benchmark_capture(
             representative,
+            native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
             warmup=warmup,
             iters=iters,
             atol=atol,
@@ -490,6 +499,7 @@ def main() -> None:
     parser.add_argument("--sequence-index", type=int, default=9)
     parser.add_argument("--active-prefix-bucket-size", type=int, default=64)
     parser.add_argument("--active-prefix-decode-length", type=int, default=None)
+    parser.add_argument("--native-q1-rope-cache-self-attention", action="store_true")
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", type=int, default=500)
     parser.add_argument("--atol", type=float, default=1e-4)
@@ -497,7 +507,7 @@ def main() -> None:
     parser.add_argument("--cuda-graph-replay", action="store_true")
     parser.add_argument("--full-song-decode-steps", type=int, default=7552)
     parser.add_argument("--full-song-main-tokens", type=int, default=7639)
-    parser.add_argument("--full-song-model-time-s", type=float, default=32.217)
+    parser.add_argument("--full-song-model-time-s", type=float, default=28.243)
     parser.add_argument("--report-path", type=Path, default=None)
     parser.add_argument("overrides", nargs="*", help="Hydra overrides, e.g. model_path=/path/to/model")
     cli_args = parser.parse_args()
@@ -509,6 +519,7 @@ def main() -> None:
         sequence_index=cli_args.sequence_index,
         active_prefix_bucket_size=cli_args.active_prefix_bucket_size,
         active_prefix_decode_length=cli_args.active_prefix_decode_length,
+        native_q1_rope_cache_self_attention=cli_args.native_q1_rope_cache_self_attention,
         warmup=cli_args.warmup,
         iters=cli_args.iters,
         atol=cli_args.atol,

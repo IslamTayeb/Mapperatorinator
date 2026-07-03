@@ -214,6 +214,7 @@ def _cuda_graph_replay_time_ms(
 def _benchmark_capture(
         capture: SelfAttentionIslandCapture,
         *,
+        native_q1_rope_cache_self_attention: bool,
         warmup: int,
         iters: int,
         atol: float,
@@ -223,6 +224,7 @@ def _benchmark_capture(
     with generation_profile_context(
             active_prefix_self_attention_length=capture.active_prefix_length,
             native_q1_self_attention=True,
+            native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
     ):
         reference = capture.output
         precomputed_query, precomputed_key, precomputed_value, precomputed_mask = _effective_self_attention_inputs(capture)
@@ -410,6 +412,7 @@ def profile_decode_self_attention_island(
         active_prefix_bucket_size: int,
         active_prefix_decode_length: int | None,
         q1_bmm_cross_attention: bool,
+        native_q1_rope_cache_self_attention: bool,
         warmup: int,
         iters: int,
         atol: float,
@@ -459,6 +462,7 @@ def profile_decode_self_attention_island(
         "active_prefix_bucket_size": active_prefix_bucket_size,
         "active_prefix_decode_length_override": active_prefix_decode_length,
         "q1_bmm_cross_attention": bool(q1_bmm_cross_attention),
+        "native_q1_rope_cache_self_attention": bool(native_q1_rope_cache_self_attention),
         "per_layer": bool(per_layer),
         "full_song_decode_steps": int(full_song_decode_steps),
         "full_song_main_tokens": int(full_song_main_tokens),
@@ -488,6 +492,7 @@ def profile_decode_self_attention_island(
                 sdpa_backend=args.profile_sdpa_backend,
                 q1_bmm_cross_attention=q1_bmm_cross_attention,
                 native_q1_self_attention=True,
+                native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
             ):
         hf_cache = get_cache(model, batch_size=1, num_beams=1, cfg_scale=1.0)
         hf_generate_outputs = model.generate(
@@ -565,6 +570,7 @@ def profile_decode_self_attention_island(
         representative = captures[sorted(names)[0]]
         benchmark = _benchmark_capture(
             representative,
+            native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
             warmup=warmup,
             iters=iters,
             atol=atol,
@@ -594,6 +600,7 @@ def profile_decode_self_attention_island(
                 "layer_idx": capture.layer_idx,
                 "results": _benchmark_capture(
                     capture,
+                    native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
                     warmup=warmup,
                     iters=iters,
                     atol=atol,
@@ -736,6 +743,7 @@ def main() -> None:
     parser.add_argument("--active-prefix-bucket-size", type=int, default=64)
     parser.add_argument("--active-prefix-decode-length", type=int, default=None)
     parser.add_argument("--q1-bmm-cross-attention", action="store_true")
+    parser.add_argument("--native-q1-rope-cache-self-attention", action="store_true")
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", type=int, default=500)
     parser.add_argument("--atol", type=float, default=1e-4)
@@ -761,7 +769,7 @@ def main() -> None:
     parser.add_argument(
         "--full-song-model-time-s",
         type=float,
-        default=32.217,
+        default=28.243,
         help="Accepted full-song model time used only for full-song ceiling projections.",
     )
     parser.add_argument("--report-path", type=Path, default=None)
@@ -776,6 +784,7 @@ def main() -> None:
         active_prefix_bucket_size=cli_args.active_prefix_bucket_size,
         active_prefix_decode_length=cli_args.active_prefix_decode_length,
         q1_bmm_cross_attention=cli_args.q1_bmm_cross_attention,
+        native_q1_rope_cache_self_attention=cli_args.native_q1_rope_cache_self_attention,
         warmup=cli_args.warmup,
         iters=cli_args.iters,
         atol=cli_args.atol,

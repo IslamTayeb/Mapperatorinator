@@ -200,6 +200,7 @@ def _capture_decoder_linears(
         active_prefix_length: int,
         q1_bmm_cross_attention: bool,
         native_q1_self_attention: bool,
+        native_q1_rope_cache_self_attention: bool,
         sdpa_backend: str | None,
 ) -> tuple[dict[str, LinearCapture], torch.Tensor]:
     captures: dict[str, LinearCapture] = {}
@@ -239,6 +240,7 @@ def _capture_decoder_linears(
                 active_prefix_self_attention_length=active_prefix_length,
                 q1_bmm_cross_attention=q1_bmm_cross_attention,
                 native_q1_self_attention=native_q1_self_attention,
+                native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
         ):
             outputs = model(**prepared_inputs)
             logits = last_token_logits(outputs.logits)
@@ -378,6 +380,7 @@ def profile_decode_linear_kernels(
         active_prefix_decode_length: int | None,
         q1_bmm_cross_attention: bool,
         native_q1_self_attention: bool,
+        native_q1_rope_cache_self_attention: bool,
         compile_mlp_variant: bool,
         cuda_graph_replay: bool,
         warmup: int,
@@ -426,6 +429,7 @@ def profile_decode_linear_kernels(
         "active_prefix_decode_length_override": active_prefix_decode_length,
         "q1_bmm_cross_attention": bool(q1_bmm_cross_attention),
         "native_q1_self_attention": bool(native_q1_self_attention),
+        "native_q1_rope_cache_self_attention": bool(native_q1_rope_cache_self_attention),
         "compile_mlp_variant": bool(compile_mlp_variant),
         "cuda_graph_replay": bool(cuda_graph_replay),
         "per_module": bool(per_module),
@@ -453,6 +457,7 @@ def profile_decode_linear_kernels(
                 sdpa_backend=args.profile_sdpa_backend,
                 q1_bmm_cross_attention=q1_bmm_cross_attention,
                 native_q1_self_attention=native_q1_self_attention,
+                native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
             ):
         hf_cache = get_cache(model, batch_size=1, num_beams=1, cfg_scale=1.0)
         hf_generate_outputs = model.generate(
@@ -514,6 +519,7 @@ def profile_decode_linear_kernels(
             active_prefix_length=active_prefix_length,
             q1_bmm_cross_attention=q1_bmm_cross_attention,
             native_q1_self_attention=native_q1_self_attention,
+            native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
             sdpa_backend=args.profile_sdpa_backend,
         )
 
@@ -636,6 +642,7 @@ def main() -> None:
     parser.add_argument("--active-prefix-decode-length", type=int, default=None)
     parser.add_argument("--q1-bmm-cross-attention", action="store_true")
     parser.add_argument("--native-q1-self-attention", action="store_true")
+    parser.add_argument("--native-q1-rope-cache-self-attention", action="store_true")
     parser.add_argument(
         "--compile-mlp-variant",
         action="store_true",
@@ -664,6 +671,7 @@ def main() -> None:
         active_prefix_decode_length=cli_args.active_prefix_decode_length,
         q1_bmm_cross_attention=cli_args.q1_bmm_cross_attention,
         native_q1_self_attention=cli_args.native_q1_self_attention,
+        native_q1_rope_cache_self_attention=cli_args.native_q1_rope_cache_self_attention,
         compile_mlp_variant=cli_args.compile_mlp_variant,
         cuda_graph_replay=cli_args.cuda_graph_replay,
         warmup=cli_args.warmup,
