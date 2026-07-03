@@ -69,6 +69,32 @@ def _cuda_event_time_ms(fn: Callable[[], torch.Tensor], *, warmup: int, iters: i
     return float(start.elapsed_time(end)) / max(iters, 1), output
 
 
+def _cuda_graph_replay_time_ms(
+        fn: Callable[[], torch.Tensor],
+        *,
+        warmup: int,
+        iters: int,
+) -> tuple[float, torch.Tensor]:
+    output = None
+    for _ in range(warmup):
+        output = fn()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = fn()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        graph.replay()
+    end.record()
+    torch.cuda.synchronize()
+    if output is None:
+        raise RuntimeError("CUDA graph benchmark did not execute")
+    return float(start.elapsed_time(end)) / max(iters, 1), output
+
+
 def _max_abs(reference: torch.Tensor, candidate: torch.Tensor) -> float:
     return float((reference.detach().to(torch.float32) - candidate.detach().to(torch.float32)).abs().max().item())
 
@@ -132,6 +158,7 @@ def _benchmark_variants(
         iters: int,
         atol: float,
         rtol: float,
+        cuda_graph_replay: bool,
 ) -> dict[str, dict[str, Any]]:
     results: dict[str, dict[str, Any]] = {}
     for name, fn in variants.items():
@@ -142,10 +169,27 @@ def _benchmark_variants(
             "max_abs": _max_abs(reference, output),
             "output_shape": list(output.shape),
         }
+        if cuda_graph_replay:
+            try:
+                graph_ms, graph_output = _cuda_graph_replay_time_ms(fn, warmup=warmup, iters=iters)
+                results[name]["cuda_graph_replay_ms_per_call"] = graph_ms
+                results[name]["cuda_graph_replay_allclose"] = _allclose(
+                    reference,
+                    graph_output,
+                    atol=atol,
+                    rtol=rtol,
+                )
+                results[name]["cuda_graph_replay_max_abs"] = _max_abs(reference, graph_output)
+            except Exception as exc:
+                results[name]["cuda_graph_replay_error"] = f"{type(exc).__name__}: {exc}"
     base_name = next(iter(variants))
     base_ms = results[base_name]["ms_per_call"]
     for result in results.values():
         result[f"speedup_vs_{base_name}"] = _safe_ratio(base_ms, float(result["ms_per_call"]))
+        base_graph_ms = results[base_name].get("cuda_graph_replay_ms_per_call")
+        result_graph_ms = result.get("cuda_graph_replay_ms_per_call")
+        if isinstance(base_graph_ms, float) and isinstance(result_graph_ms, float):
+            result[f"cuda_graph_replay_speedup_vs_{base_name}"] = _safe_ratio(base_graph_ms, result_graph_ms)
     return results
 
 
@@ -266,6 +310,7 @@ def _benchmark_mlp_variants(
         iters: int,
         atol: float,
         rtol: float,
+        cuda_graph_replay: bool,
 ) -> dict[str, dict[str, Any]]:
     x = fc1_capture.input
     fc1_weight = fc1_capture.weight
@@ -320,6 +365,7 @@ def _benchmark_mlp_variants(
         iters=iters,
         atol=atol,
         rtol=rtol,
+        cuda_graph_replay=cuda_graph_replay,
     )
 
 
@@ -333,6 +379,7 @@ def profile_decode_linear_kernels(
         q1_bmm_cross_attention: bool,
         native_q1_self_attention: bool,
         compile_mlp_variant: bool,
+        cuda_graph_replay: bool,
         warmup: int,
         iters: int,
         atol: float,
@@ -380,6 +427,7 @@ def profile_decode_linear_kernels(
         "q1_bmm_cross_attention": bool(q1_bmm_cross_attention),
         "native_q1_self_attention": bool(native_q1_self_attention),
         "compile_mlp_variant": bool(compile_mlp_variant),
+        "cuda_graph_replay": bool(cuda_graph_replay),
         "per_module": bool(per_module),
     }
     prompt = model_inputs["decoder_input_ids"]
@@ -509,6 +557,7 @@ def profile_decode_linear_kernels(
                 iters=iters,
                 atol=atol,
                 rtol=rtol,
+                cuda_graph_replay=cuda_graph_replay,
             ),
         }
 
@@ -524,6 +573,7 @@ def profile_decode_linear_kernels(
                     iters=iters,
                     atol=atol,
                     rtol=rtol,
+                    cuda_graph_replay=cuda_graph_replay,
                 ),
             }
 
@@ -548,6 +598,7 @@ def profile_decode_linear_kernels(
                 iters=iters,
                 atol=atol,
                 rtol=rtol,
+                cuda_graph_replay=cuda_graph_replay,
             ),
         }
 
@@ -590,6 +641,11 @@ def main() -> None:
         action="store_true",
         help="Also benchmark a diagnostic torch.compile(mode='reduce-overhead') MLP island variant.",
     )
+    parser.add_argument(
+        "--cuda-graph-replay",
+        action="store_true",
+        help="Also capture each linear/MLP diagnostic variant in a CUDA graph and benchmark replay time.",
+    )
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", type=int, default=500)
     parser.add_argument("--atol", type=float, default=1e-4)
@@ -609,6 +665,7 @@ def main() -> None:
         q1_bmm_cross_attention=cli_args.q1_bmm_cross_attention,
         native_q1_self_attention=cli_args.native_q1_self_attention,
         compile_mlp_variant=cli_args.compile_mlp_variant,
+        cuda_graph_replay=cli_args.cuda_graph_replay,
         warmup=cli_args.warmup,
         iters=cli_args.iters,
         atol=cli_args.atol,
