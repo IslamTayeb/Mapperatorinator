@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+from transformers.cache_utils import EncoderDecoderCache, StaticCache
 from transformers.modeling_outputs import BaseModelOutput
 
 from osuT5.osuT5.inference.cache_utils import MapperatorinatorCache, get_cache
@@ -385,3 +386,73 @@ def decode_one_token_raw_logits(
         cache_position=cache_position,
         prepared_inputs=prepared_inputs,
     )
+
+
+@torch.no_grad()
+def prepare_one_token_decode_inputs_fast(
+        model,
+        input_ids: torch.LongTensor,
+        model_kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    """Verifier-only fast decode input builder for the simple batch-1 cached path.
+
+    This mirrors VarWhisper.prepare_inputs_for_generation for post-prefill
+    one-token decode. It intentionally keeps the full static-cache 4D mask
+    construction for now, so verifier work can separate "can we prepare the
+    same tensors?" from later incremental-mask/runtime experiments.
+    """
+    past_key_values = model_kwargs.get("past_key_values")
+    cache_position = model_kwargs.get("cache_position")
+    decoder_attention_mask = model_kwargs.get("decoder_attention_mask")
+    use_cache = model_kwargs.get("use_cache")
+    encoder_outputs = model_kwargs.get("encoder_outputs")
+
+    if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+        raise ValueError("fast one-token decode input builder currently supports batch_size=1 only")
+    if past_key_values is None:
+        raise ValueError("fast one-token decode input builder requires past_key_values")
+    if not isinstance(cache_position, torch.Tensor):
+        raise ValueError("fast one-token decode input builder requires tensor cache_position")
+    if cache_position.numel() < 1:
+        raise ValueError("cache_position must contain at least one position")
+
+    decoder_input_ids = input_ids[:, -1:].contiguous()
+    next_cache_position = cache_position[-decoder_input_ids.shape[1]:]
+
+    decoder_position_ids = None
+    if decoder_attention_mask is not None:
+        if decoder_attention_mask.ndim != 2:
+            raise ValueError("fast one-token decode input builder expects a 2D decoder_attention_mask")
+        decoder_position_ids = (decoder_attention_mask.cumsum(-1) - 1).clamp(min=0)
+        decoder_position_ids = decoder_position_ids[:, -decoder_input_ids.shape[1]:]
+        decoder_position_ids = decoder_position_ids.clone(memory_format=torch.contiguous_format)
+
+    prepared_attention_mask = decoder_attention_mask
+    if (
+            isinstance(past_key_values, EncoderDecoderCache)
+            and (
+                isinstance(past_key_values.self_attention_cache, StaticCache)
+                or isinstance(past_key_values.cross_attention_cache, StaticCache)
+            )
+            and decoder_attention_mask is not None
+            and decoder_attention_mask.ndim == 2
+    ):
+        prepared_attention_mask = model.get_decoder()._prepare_4d_causal_attention_mask_with_cache_position(
+            decoder_attention_mask,
+            sequence_length=decoder_input_ids.shape[1],
+            target_length=past_key_values.self_attention_cache.get_max_cache_shape(),
+            dtype=model.proj_out.weight.dtype,
+            device=decoder_input_ids.device,
+            cache_position=next_cache_position,
+            batch_size=decoder_input_ids.shape[0],
+        )
+
+    return {
+        "encoder_outputs": encoder_outputs,
+        "past_key_values": past_key_values,
+        "decoder_input_ids": decoder_input_ids,
+        "use_cache": use_cache,
+        "decoder_attention_mask": prepared_attention_mask,
+        "decoder_position_ids": decoder_position_ids,
+        "cache_position": next_cache_position,
+    }
