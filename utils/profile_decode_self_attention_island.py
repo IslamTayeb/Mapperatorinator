@@ -135,6 +135,32 @@ def _module_forward(capture: SelfAttentionIslandCapture) -> torch.Tensor:
     )[0]
 
 
+def _cuda_graph_replay_time_ms(
+        fn: Callable[[], torch.Tensor],
+        *,
+        warmup: int,
+        iters: int,
+) -> tuple[float, torch.Tensor]:
+    output = None
+    for _ in range(warmup):
+        output = fn()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = fn()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        graph.replay()
+    end.record()
+    torch.cuda.synchronize()
+    if output is None:
+        raise RuntimeError("CUDA graph benchmark did not execute")
+    return float(start.elapsed_time(end)) / max(iters, 1), output
+
+
 def _benchmark_capture(
         capture: SelfAttentionIslandCapture,
         *,
@@ -142,6 +168,7 @@ def _benchmark_capture(
         iters: int,
         atol: float,
         rtol: float,
+        cuda_graph_replay: bool,
 ) -> dict[str, Any]:
     with generation_profile_context(
             active_prefix_self_attention_length=capture.active_prefix_length,
@@ -183,12 +210,26 @@ def _benchmark_capture(
                 "max_abs": _max_abs(expected, output),
                 "output_shape": list(output.shape),
             }
+            if cuda_graph_replay:
+                try:
+                    graph_ms, graph_output = _cuda_graph_replay_time_ms(fn, warmup=warmup, iters=iters)
+                    results[name]["cuda_graph_replay_ms_per_call"] = graph_ms
+                    results[name]["cuda_graph_replay_allclose"] = _allclose(
+                        expected,
+                        graph_output,
+                        atol=atol,
+                        rtol=rtol,
+                    )
+                    results[name]["cuda_graph_replay_max_abs"] = _max_abs(expected, graph_output)
+                except Exception as exc:
+                    results[name]["cuda_graph_replay_error"] = f"{type(exc).__name__}: {exc}"
 
     base_ms = results["repo_module_forward"]["ms_per_call"]
     for result in results.values():
         result["speedup_vs_repo_module_forward"] = _safe_ratio(base_ms, float(result["ms_per_call"]))
 
     full_ms = results["repo_module_forward"]["ms_per_call"]
+    full_graph_ms = results["repo_module_forward"].get("cuda_graph_replay_ms_per_call")
     attention_ms = results["native_attention_only"]["ms_per_call"]
     projection_ms = results["out_projection_only"]["ms_per_call"]
     pre_attention_ms = results["pre_attention_setup_only"]["ms_per_call"]
@@ -199,6 +240,20 @@ def _benchmark_capture(
         "out_projection_ms": projection_ms,
         "unexplained_vs_repo_ms": full_ms - (pre_attention_ms + attention_ms + projection_ms),
     }
+    if isinstance(full_graph_ms, float):
+        graph_component_sum = 0.0
+        graph_components: dict[str, float] = {}
+        for component_name in ("pre_attention_setup_only", "native_attention_only", "out_projection_only"):
+            component_ms = results[component_name].get("cuda_graph_replay_ms_per_call")
+            if isinstance(component_ms, float):
+                graph_components[component_name] = component_ms
+                graph_component_sum += component_ms
+        results["estimated_cuda_graph_component_sum"] = {
+            "ms_per_call": graph_component_sum,
+            "repo_module_cuda_graph_replay_ms": full_graph_ms,
+            "components": graph_components,
+            "unexplained_vs_repo_ms": full_graph_ms - graph_component_sum,
+        }
     return results
 
 
@@ -299,6 +354,7 @@ def profile_decode_self_attention_island(
         full_song_decode_steps: int,
         full_song_main_tokens: int,
         full_song_model_time_s: float,
+        cuda_graph_replay: bool,
 ) -> dict[str, Any]:
     if not torch.cuda.is_available():
         raise RuntimeError("Decode self-attention island profiling requires CUDA")
@@ -343,6 +399,7 @@ def profile_decode_self_attention_island(
         "full_song_decode_steps": int(full_song_decode_steps),
         "full_song_main_tokens": int(full_song_main_tokens),
         "full_song_model_time_s": float(full_song_model_time_s),
+        "cuda_graph_replay": bool(cuda_graph_replay),
     }
     prompt = model_inputs["decoder_input_ids"]
     prompt_mask = model_inputs["decoder_attention_mask"]
@@ -448,6 +505,7 @@ def profile_decode_self_attention_island(
             iters=iters,
             atol=atol,
             rtol=rtol,
+            cuda_graph_replay=cuda_graph_replay,
         )
         representative_results[signature] = benchmark
         signature_reports[signature] = {
@@ -476,6 +534,7 @@ def profile_decode_self_attention_island(
                     iters=iters,
                     atol=atol,
                     rtol=rtol,
+                    cuda_graph_replay=cuda_graph_replay,
                 ),
             }
 
@@ -484,7 +543,9 @@ def profile_decode_self_attention_island(
         member_count = int(report["member_count"])
         results = report["results"]
         repo_ms = float(results["repo_module_forward"]["ms_per_call"])
+        repo_graph_ms = results["repo_module_forward"].get("cuda_graph_replay_ms_per_call")
         manual_ms = float(results["manual_native_attention_island"]["ms_per_call"])
+        manual_graph_ms = results["manual_native_attention_island"].get("cuda_graph_replay_ms_per_call")
         pre_ms = float(results["pre_attention_setup_only"]["ms_per_call"])
         attention_ms = float(results["native_attention_only"]["ms_per_call"])
         out_ms = float(results["out_projection_only"]["ms_per_call"])
@@ -517,6 +578,30 @@ def profile_decode_self_attention_island(
                 else None
             ),
         }
+        if isinstance(repo_graph_ms, float):
+            repo_graph_seconds = repo_graph_ms * member_count * full_song_decode_steps / 1000.0
+            graph_projection_valid = repo_graph_seconds < full_song_model_time_s
+            graph_ideal_time_s = (
+                full_song_model_time_s - repo_graph_seconds
+                if graph_projection_valid
+                else None
+            )
+            projected_full_song[signature]["cuda_graph_repo_self_attention_island_s"] = repo_graph_seconds
+            projected_full_song[signature]["cuda_graph_repo_fraction_of_model_time"] = (
+                repo_graph_seconds / full_song_model_time_s
+            )
+            projected_full_song[signature]["cuda_graph_projection_valid"] = graph_projection_valid
+            projected_full_song[signature]["cuda_graph_ideal_free_island_tps"] = (
+                full_song_main_tokens / graph_ideal_time_s
+                if graph_ideal_time_s is not None and graph_ideal_time_s > 0
+                else None
+            )
+        if isinstance(repo_graph_ms, float) and isinstance(manual_graph_ms, float):
+            graph_delta_s = (repo_graph_ms - manual_graph_ms) * member_count * full_song_decode_steps / 1000.0
+            projected_full_song[signature]["cuda_graph_manual_native_island_delta_s"] = graph_delta_s
+            projected_full_song[signature]["cuda_graph_manual_native_island_delta_fraction_of_model_time"] = (
+                graph_delta_s / full_song_model_time_s
+            )
 
     return {
         "pass": bool(_allclose(direct_result.logits, replay_logits, atol=atol, rtol=rtol)),
@@ -555,6 +640,11 @@ def main() -> None:
     parser.add_argument("--rtol", type=float, default=1e-4)
     parser.add_argument("--per-layer", action="store_true")
     parser.add_argument(
+        "--cuda-graph-replay",
+        action="store_true",
+        help="Also capture each diagnostic variant in a CUDA graph and benchmark replay time.",
+    )
+    parser.add_argument(
         "--full-song-decode-steps",
         type=int,
         default=7552,
@@ -592,6 +682,7 @@ def main() -> None:
         full_song_decode_steps=cli_args.full_song_decode_steps,
         full_song_main_tokens=cli_args.full_song_main_tokens,
         full_song_model_time_s=cli_args.full_song_model_time_s,
+        cuda_graph_replay=cli_args.cuda_graph_replay,
     )
     result["metadata"]["config_name"] = cli_args.config_name
     result["wall_seconds"] = time.perf_counter() - start
