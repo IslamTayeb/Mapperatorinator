@@ -179,6 +179,9 @@ class Processor(object):
             mania_column_temperature=self.mania_column_temperature,
             taiko_hit_temperature=self.taiko_hit_temperature,
             sync_model_timing=self.profiler.enabled and self.profiler.sync_cuda,
+            profile_model_generate_cuda_ledger=bool(
+                getattr(self.args, "profile_model_generate_cuda_ledger", False)
+            ),
             profile_generation_detail_ranges=bool(getattr(self.args, "profile_generation_detail_ranges", False)),
             profile_active_prefix_decode_diagnostics=bool(
                 getattr(self.args, "profile_active_prefix_decode_diagnostics", False)
@@ -1508,6 +1511,7 @@ class Processor(object):
                 metadata.pop("output_tokens_per_sample", None),
             ),
             "precision": stats.get("precision", self.precision),
+            "profile_model_generate_cuda_ledger": stats.get("profile_model_generate_cuda_ledger"),
             "model_generate_cpu_elapsed_seconds": stats.get("model_generate_cpu_elapsed_seconds"),
             "model_generate_cuda_event_seconds": stats.get("model_generate_cuda_event_seconds"),
             "model_generate_host_gap_seconds": stats.get("model_generate_host_gap_seconds"),

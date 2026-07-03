@@ -453,6 +453,13 @@ def validate_reserved_runtime_flags(args: InferenceConfig):
             "inference_native_decode_kernels currently only has the explicitly selected "
             "inference_native_q1_self_attention experiment."
         )
+    if args.profile_model_generate_cuda_ledger:
+        if not args.profile_inference:
+            raise ValueError("profile_model_generate_cuda_ledger requires profile_inference=true.")
+        if not args.profile_sync_cuda:
+            raise ValueError("profile_model_generate_cuda_ledger requires profile_sync_cuda=true.")
+        if args.device != "cuda":
+            raise ValueError("profile_model_generate_cuda_ledger requires device=cuda.")
 
 
 def compile_args(args: InferenceConfig, verbose=True):
@@ -600,6 +607,7 @@ def generate(
         "inference_native_q1_rope_cache_self_attention": args.inference_native_q1_rope_cache_self_attention,
         "profile_record_token_ids": args.profile_record_token_ids,
         "profile_sync_cuda": args.profile_sync_cuda,
+        "profile_model_generate_cuda_ledger": args.profile_model_generate_cuda_ledger,
         "profile_torch_generation": args.profile_torch_generation,
         "profile_nvtx_generation_ranges": args.profile_nvtx_generation_ranges,
         "profile_generation_detail_ranges": args.profile_generation_detail_ranges,

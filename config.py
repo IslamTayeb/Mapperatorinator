@@ -91,6 +91,7 @@ class InferenceConfig:
     profile_inference: bool = False  # Write stage and generation timing profile JSON
     profile_output_path: Optional[str] = None  # Path to write profile JSON; defaults next to generated beatmap
     profile_sync_cuda: bool = True  # Synchronize CUDA around profiled regions for accurate timings
+    profile_model_generate_cuda_ledger: bool = False  # Record CUDA events around model.generate for runtime attribution
     profile_torch_generation: bool = False  # Write torch.profiler Chrome traces around selected model.generate calls
     profile_torch_output_dir: Optional[str] = None  # Directory for torch.profiler Chrome traces
     profile_torch_generation_limit: int = 3  # Maximum number of model.generate calls to trace

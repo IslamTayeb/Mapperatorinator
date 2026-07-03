@@ -856,14 +856,36 @@ This is default-off and only records diagnostics when `inference_active_prefix_d
 
 Use `python utils/summarize_active_prefix_diagnostics.py PROFILE.json --label main_generation --json-output active_diagnostics.json` to aggregate per-record active-prefix counters, CUDA-event timing totals, CUDA graph capture/replay counts, duplicate-capture ceiling by normalized graph shape, bucket usage, per-logits-processor wall time, and per-CUDA-event single-range ceilings without writing ad hoc parsers for every DCC run. The single-range ceiling answers "if this one measured range vanished, what is the fantasy tok/s?" and is useful for rejecting sub-5% kernel ideas. Do not add the ceilings together; CUDA-event ranges are nested/non-exclusive and diagnostic-only.
 
-Generation profile records also include a low-overhead `model.generate()` CUDA
-event ledger when synchronized CUDA model timing is active:
+For production `model.generate()` runtime attribution, add:
+
+```bash
+profile_model_generate_cuda_ledger=true
+```
+
+Generation profile records then include a low-overhead `model.generate()` CUDA
+event ledger when `profile_inference=true`, `profile_sync_cuda=true`, and
+`device=cuda`:
 `model_generate_cpu_elapsed_seconds`, `model_generate_cuda_event_seconds`, and
 `model_generate_host_gap_seconds`. Use these to reconcile the full-song
 production `model_elapsed_seconds` against queued CUDA work before choosing
 between a host/runtime-control project and broader decoder CUDA kernel work.
-These fields are diagnostic attribution; official throughput claims still use
-the synchronized `model_elapsed_seconds` recorded by `profile_inference`.
+This flag is default-off so normal throughput profiles stay comparable to
+retained baselines. These fields are diagnostic attribution; official
+throughput claims still use the synchronized `model_elapsed_seconds` recorded by
+`profile_inference`.
+
+DCC jobs `49234401` and `49234699` on RTX 2080 Ti, commit `a6309f8`, validated
+the ledger on full-song SALVALAI against the accepted fused/active baseline.
+The repeat run matched main generated tokens (`7,639 / 7,639`) and timing
+tokens (`821 / 821`). Main generation recorded `27.855s` synchronized model
+time, `27.848s` CUDA-event time, and only `7.2ms` host gap, while aggregate
+main throughput was noise-better than the retained `270.475 tok/s` baseline
+(`274.241 tok/s`). Timing-context aggregate was slightly slower
+(`101.988 -> 101.146 tok/s`) and strict per-window checks still failed on small
+noise, so the ledger is not a promoted performance change. The useful
+conclusion is target selection: current main-generation time is overwhelmingly
+queued CUDA/decoder work, not host-loop overhead. See
+`notes/2026-07-03-model-generate-cuda-ledger.md`.
 
 DCC validation job `49164750` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti, commit `c7ab3b8`, compared active512 15s smoke with and without `profile_active_prefix_decode_diagnostics=true`. The Slurm job exited `FAILED` because the final ad-hoc report snippet had a quoting bug, but both profiles and compare reports were written under `/work/imt11/Mapperatorinator/runs/active-prefix-diagnostics-smoke-49164750-c7ab3b8`. Main-generation token equivalence passed (`1,084 / 1,084`) and diagnostics changed aggregate main-generation throughput only `34.629 -> 34.623 tok/s` (`-0.02%`). Timing-context token equivalence also passed (`164 / 164`). Zero-tolerance per-window no-regression failed on sub-percent to about `1.3%` noise, so treat this as diagnostic validation rather than a throughput claim.
 

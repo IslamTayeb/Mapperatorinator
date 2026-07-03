@@ -196,6 +196,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     lookahead_time = generate_kwargs.pop('lookahead_time', 0.0)
     context_type = generate_kwargs.pop('context_type', None)
     sync_model_timing = bool(generate_kwargs.pop('sync_model_timing', False))
+    profile_model_generate_cuda_ledger = bool(generate_kwargs.pop('profile_model_generate_cuda_ledger', False))
     profile_generation_detail_ranges = bool(generate_kwargs.pop('profile_generation_detail_ranges', False))
     profile_active_prefix_decode_diagnostics = bool(generate_kwargs.pop('profile_active_prefix_decode_diagnostics', False))
     profile_sdpa_backend = generate_kwargs.pop('profile_sdpa_backend', None)
@@ -299,7 +300,11 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
             ):
         if sync_model_timing:
             _sync_cuda_for_model(model)
-            if torch.cuda.is_available() and getattr(getattr(model, "device", None), "type", None) == "cuda":
+            if (
+                profile_model_generate_cuda_ledger
+                and torch.cuda.is_available()
+                and getattr(getattr(model, "device", None), "type", None) == "cuda"
+            ):
                 generate_start_event = torch.cuda.Event(enable_timing=True)
                 generate_end_event = torch.cuda.Event(enable_timing=True)
         start_time = time.perf_counter()
@@ -348,7 +353,8 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         "cfg_scale": float(cfg_scale),
         "do_sample": bool(generate_kwargs.get("do_sample", False)),
         "sync_model_timing": sync_model_timing,
-        "model_generate_cpu_elapsed_seconds": elapsed_seconds,
+        "profile_model_generate_cuda_ledger": profile_model_generate_cuda_ledger,
+        "model_generate_cpu_elapsed_seconds": elapsed_seconds if profile_model_generate_cuda_ledger else None,
         "model_generate_cuda_event_seconds": generate_cuda_event_seconds,
         "model_generate_host_gap_seconds": (
             elapsed_seconds - generate_cuda_event_seconds
