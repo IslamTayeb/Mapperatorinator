@@ -339,6 +339,38 @@ python inference.py --config-name profile_salvalai \
   inference_stateful_monotonic_logits_processor=true
 ```
 
+Post-warmup0 attribution, DCC job `49204765`, commit `bb11d9f`:
+
+| run | main tokens | main model time | main tok/s | timing tok/s | token equivalence | note |
+| --- | ---: | ---: | ---: | ---: | --- | --- |
+| full default omission control | `7,639` | `51.979s` | `146.963` | `70.061` | PASS vs warmup0 | validates default `warmup=0`; not a new accepted baseline because total stage/timing context differed under fresh cache/load state |
+| full default diagnostic | `7,639` | `52.510s` | `145.476` | `75.020` | PASS vs control | diagnostic overhead about `1%` on main |
+
+Run dir: `/work/imt11/Mapperatorinator/runs/active-w0-nextdiag-49204765-bb11d9f`.
+
+The diagnostic counters ruled out several easy next targets:
+
+| counter | full diagnostic wall time |
+| --- | ---: |
+| `token_append_stop_wall_cpu_s` | `35.276s` |
+| `stopping_criteria_wall_cpu_s` | `34.826s` |
+| `logits_processor_wall_cpu_s` | `4.452s` |
+| `prepare_inputs_wall_cpu_s` | `3.874s` |
+| `decode_forward_wall_cpu_s` | `3.444s` |
+| `sampling_wall_cpu_s` | `1.167s` |
+| `compile_lookup_wall_cpu_s` | `0.0106s` |
+
+`compile_lookup_wall_cpu_s` is too small to optimize. The captured graph input shapes were already minimal (`decoder_input_ids`, `decoder_attention_mask`, `decoder_position_ids`, and `cache_position`), so pruning dead encoder/static inputs from graph replay is not target-sized. The seq9 torch-profiler trace showed `aten::_local_scalar_dense`/`aten::isin` around stopping, but the wall bucket overlaps required per-token synchronization/control; do not treat it as pure Python-loop overhead.
+
+Rejected simple active-prefix stopping specialization, DCC job `49204960`, dirty local patch on top of commit `bb11d9f`:
+
+| run | main tokens | main model time | main tok/s | timing tok/s | token equivalence | status |
+| --- | ---: | ---: | ---: | ---: | --- | --- |
+| active512 graph + stateful + warmup0 smoke baseline | `1,084` | `6.675s` | `162.401` | `47.556` | baseline | baseline |
+| simple stopping candidate | `1,084` | `6.433s` | `168.512` | `48.209` | PASS, `1,084 / 1,084` | rejected |
+
+Run dir: `/work/imt11/Mapperatorinator/runs/simple-stop-smoke-49204960-bb11d9f-simple-stop-dirty`. The 64-step direct-loop graph gate passed for generated tokens, raw logits, final RNG state, and stop reason. The candidate still improved main generation by only `+3.76%`, below the keep threshold for a custom stopping path, and the diagnostic run still reported `stopping_criteria_wall_cpu_s=4.265s` of `6.450s` main model time. The patch was reverted without full-song promotion. See `notes/2026-07-02-simple-stopping-scout.md`.
+
 Rejected delayed-capture variant, DCC job `49166715`, commit `f712b59`: setting `inference_active_prefix_decode_cuda_graph_min_decode_steps=16` remained token-equivalent on 15s smoke but failed per-window no-regression on 5/10 windows and reduced graph-path aggregate throughput versus immediate capture. Keep `min_decode_steps=1` as the default. Only revisit delayed capture if a future profiler trace shows graph capture itself has become the dominant cost and a better adaptive policy can avoid medium-window regressions.
 
 Rejected active-prefix mask fast path, DCC jobs `49158276` and `49158365` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti:
