@@ -109,7 +109,11 @@ def _safe_ratio(reference_ms: float, candidate_ms: float) -> float | None:
     return reference_ms / candidate_ms
 
 
-def _linear_variants(capture: LinearCapture) -> dict[str, Callable[[], torch.Tensor]]:
+def _linear_variants(
+        capture: LinearCapture,
+        *,
+        native_linear_variant: bool,
+) -> dict[str, Callable[[], torch.Tensor]]:
     x = capture.input
     weight = capture.weight
     bias = capture.bias
@@ -142,12 +146,32 @@ def _linear_variants(capture: LinearCapture) -> dict[str, Callable[[], torch.Ten
             output = output + bias
         return output.reshape(output_shape)
 
-    return {
+    variants: dict[str, Callable[[], torch.Tensor]] = {
         "functional_linear": module_linear,
         "matmul": matmul_linear,
         "addmm": addmm_linear,
         "mv": mv_linear,
     }
+    if native_linear_variant:
+        from osuT5.osuT5.inference.native_linear import native_one_token_linear, preload_native_linear
+
+        preload_native_linear()
+
+        def native_linear_bs128() -> torch.Tensor:
+            return native_one_token_linear(x, weight, bias, block_size=128)
+
+        def native_linear_bs256() -> torch.Tensor:
+            return native_one_token_linear(x, weight, bias, block_size=256)
+
+        def native_linear_bs512() -> torch.Tensor:
+            return native_one_token_linear(x, weight, bias, block_size=512)
+
+        variants.update({
+            "native_linear_bs128": native_linear_bs128,
+            "native_linear_bs256": native_linear_bs256,
+            "native_linear_bs512": native_linear_bs512,
+        })
+    return variants
 
 
 def _benchmark_variants(
@@ -382,6 +406,7 @@ def profile_decode_linear_kernels(
         native_q1_self_attention: bool,
         native_q1_rope_cache_self_attention: bool,
         compile_mlp_variant: bool,
+        native_linear_variant: bool,
         cuda_graph_replay: bool,
         warmup: int,
         iters: int,
@@ -431,6 +456,7 @@ def profile_decode_linear_kernels(
         "native_q1_self_attention": bool(native_q1_self_attention),
         "native_q1_rope_cache_self_attention": bool(native_q1_rope_cache_self_attention),
         "compile_mlp_variant": bool(compile_mlp_variant),
+        "native_linear_variant": bool(native_linear_variant),
         "cuda_graph_replay": bool(cuda_graph_replay),
         "per_module": bool(per_module),
     }
@@ -550,7 +576,7 @@ def profile_decode_linear_kernels(
 
     for signature, names in sorted(signature_members.items()):
         capture = captures[names[0]]
-        variants = _linear_variants(capture)
+        variants = _linear_variants(capture, native_linear_variant=native_linear_variant)
         unique_benchmarks[signature] = {
             "representative": names[0],
             "member_count": len(names),
@@ -574,7 +600,7 @@ def profile_decode_linear_kernels(
                 "signature": _signature_for_capture(capture),
                 "results": _benchmark_variants(
                     reference=capture.output,
-                    variants=_linear_variants(capture),
+                    variants=_linear_variants(capture, native_linear_variant=native_linear_variant),
                     warmup=warmup,
                     iters=iters,
                     atol=atol,
@@ -649,6 +675,11 @@ def main() -> None:
         help="Also benchmark a diagnostic torch.compile(mode='reduce-overhead') MLP island variant.",
     )
     parser.add_argument(
+        "--native-linear-variant",
+        action="store_true",
+        help="Also benchmark diagnostic native CUDA one-token linear kernels for captured Linear shapes.",
+    )
+    parser.add_argument(
         "--cuda-graph-replay",
         action="store_true",
         help="Also capture each linear/MLP diagnostic variant in a CUDA graph and benchmark replay time.",
@@ -673,6 +704,7 @@ def main() -> None:
         native_q1_self_attention=cli_args.native_q1_self_attention,
         native_q1_rope_cache_self_attention=cli_args.native_q1_rope_cache_self_attention,
         compile_mlp_variant=cli_args.compile_mlp_variant,
+        native_linear_variant=cli_args.native_linear_variant,
         cuda_graph_replay=cli_args.cuda_graph_replay,
         warmup=cli_args.warmup,
         iters=cli_args.iters,
