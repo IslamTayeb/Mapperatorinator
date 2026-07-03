@@ -147,6 +147,36 @@ def _mlp_residual_segment(capture: DecoderLayerCapture, after_cross_attn: torch.
     return residual + hidden_states
 
 
+def _mlp_input_norm_only(capture: DecoderLayerCapture, after_cross_attn: torch.Tensor) -> torch.Tensor:
+    return capture.module.final_layer_norm(after_cross_attn)
+
+
+def _mlp_fc1_only(capture: DecoderLayerCapture, mlp_input_norm: torch.Tensor) -> torch.Tensor:
+    return capture.module.fc1(mlp_input_norm)
+
+
+def _mlp_activation_only(capture: DecoderLayerCapture, mlp_fc1: torch.Tensor) -> torch.Tensor:
+    return capture.module.activation_fn(mlp_fc1)
+
+
+def _mlp_fc2_only(capture: DecoderLayerCapture, mlp_activation: torch.Tensor) -> torch.Tensor:
+    return capture.module.fc2(mlp_activation)
+
+
+def _mlp_residual_add_only(after_cross_attn: torch.Tensor, mlp_fc2: torch.Tensor) -> torch.Tensor:
+    return after_cross_attn + mlp_fc2
+
+
+def _mlp_fc2_residual_segment(
+        capture: DecoderLayerCapture,
+        after_cross_attn: torch.Tensor,
+        mlp_activation: torch.Tensor,
+) -> torch.Tensor:
+    hidden_states = capture.module.fc2(mlp_activation)
+    hidden_states = F.dropout(hidden_states, p=capture.module.dropout, training=capture.module.training)
+    return after_cross_attn + hidden_states
+
+
 def _manual_decoder_runtime_island(capture: DecoderLayerCapture) -> torch.Tensor:
     """Exact whole-layer callable used to size broad runtime-island work.
 
@@ -179,6 +209,10 @@ def _benchmark_capture(
     ):
         after_self_attn = _self_attn_residual_segment(capture).detach()
         after_cross_attn = _cross_attn_residual_segment(capture, after_self_attn).detach()
+        mlp_input_norm = _mlp_input_norm_only(capture, after_cross_attn).detach()
+        mlp_fc1 = _mlp_fc1_only(capture, mlp_input_norm).detach()
+        mlp_activation = _mlp_activation_only(capture, mlp_fc1).detach()
+        mlp_fc2 = _mlp_fc2_only(capture, mlp_activation).detach()
         variants: dict[str, tuple[Callable[[], torch.Tensor], torch.Tensor]] = {
             "repo_decoder_layer": (lambda: _layer_forward(capture), capture.output),
             "self_attn_residual_segment": (
@@ -191,6 +225,30 @@ def _benchmark_capture(
             ),
             "mlp_residual_segment": (
                 lambda: _mlp_residual_segment(capture, after_cross_attn),
+                capture.output,
+            ),
+            "mlp_input_norm_only": (
+                lambda: _mlp_input_norm_only(capture, after_cross_attn),
+                mlp_input_norm,
+            ),
+            "mlp_fc1_only": (
+                lambda: _mlp_fc1_only(capture, mlp_input_norm),
+                mlp_fc1,
+            ),
+            "mlp_activation_only": (
+                lambda: _mlp_activation_only(capture, mlp_fc1),
+                mlp_activation,
+            ),
+            "mlp_fc2_only": (
+                lambda: _mlp_fc2_only(capture, mlp_activation),
+                mlp_fc2,
+            ),
+            "mlp_residual_add_only": (
+                lambda: _mlp_residual_add_only(after_cross_attn, mlp_fc2),
+                capture.output,
+            ),
+            "mlp_fc2_residual_segment": (
+                lambda: _mlp_fc2_residual_segment(capture, after_cross_attn, mlp_activation),
                 capture.output,
             ),
         }
@@ -611,6 +669,12 @@ def profile_decode_decoder_layer_island(
                 "self_attn_norm_only",
                 "cross_attn_norm_only",
                 "mlp_norm_only",
+                "mlp_input_norm_only",
+                "mlp_fc1_only",
+                "mlp_activation_only",
+                "mlp_fc2_only",
+                "mlp_residual_add_only",
+                "mlp_fc2_residual_segment",
             )
             segment_seconds: dict[str, float] = {}
             for segment_name in segment_names:
@@ -631,6 +695,23 @@ def profile_decode_decoder_layer_island(
             projected_full_song[signature]["cuda_graph_residual_segment_unexplained_vs_layer_s"] = (
                 repo_graph_seconds - segment_sum_s
             )
+            mlp_component_sum_names = (
+                "mlp_input_norm_only",
+                "mlp_fc1_only",
+                "mlp_activation_only",
+                "mlp_fc2_only",
+                "mlp_residual_add_only",
+            )
+            mlp_component_sum_s = sum(segment_seconds.get(name, 0.0) for name in mlp_component_sum_names)
+            projected_full_song[signature]["cuda_graph_mlp_component_sum_s"] = mlp_component_sum_s
+            projected_full_song[signature]["cuda_graph_mlp_component_unexplained_vs_mlp_residual_s"] = (
+                segment_seconds.get("mlp_residual_segment", 0.0) - mlp_component_sum_s
+            )
+            mlp_fc2_residual_s = segment_seconds.get("mlp_fc2_residual_segment")
+            if mlp_fc2_residual_s is not None:
+                projected_full_song[signature]["cuda_graph_mlp_fc1_activation_prefix_s"] = (
+                    segment_seconds.get("mlp_residual_segment", 0.0) - mlp_fc2_residual_s
+                )
         compiled = benchmark.get("compiled_decoder_layer") or {}
         compiled_graph_ms = compiled.get("cuda_graph_replay_ms_per_call")
         if isinstance(compiled_graph_ms, float) and isinstance(repo_graph_ms, float):
