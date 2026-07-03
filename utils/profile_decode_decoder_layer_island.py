@@ -15,6 +15,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import torch
+import torch.nn.functional as F
 
 from inference import compile_args, load_model_with_server, setup_inference_environment
 from osuT5.osuT5.inference.cache_utils import get_cache
@@ -101,6 +102,51 @@ def _norm_only(norm_module: torch.nn.Module, hidden_states: torch.Tensor) -> tor
     return norm_module(hidden_states)
 
 
+def _self_attn_residual_segment(capture: DecoderLayerCapture) -> torch.Tensor:
+    residual = capture.hidden_states
+    hidden_states = capture.module.self_attn_layer_norm(capture.hidden_states)
+    self_attn_output = capture.module.self_attn(
+        hidden_states=hidden_states,
+        past_key_value=capture.past_key_value,
+        attention_mask=capture.attention_mask,
+        cache_position=capture.cache_position,
+        position_ids=capture.position_ids,
+        cu_seqlens=capture.cu_seqlens,
+        max_seqlen=capture.max_seqlen,
+        output_attentions=False,
+    )[0]
+    return residual + self_attn_output
+
+
+def _cross_attn_residual_segment(capture: DecoderLayerCapture, after_self_attn: torch.Tensor) -> torch.Tensor:
+    if capture.encoder_hidden_states is None:
+        return after_self_attn
+    residual = after_self_attn
+    hidden_states = capture.module.cross_attn_layer_norm(after_self_attn)
+    cross_attn_output = capture.module.cross_attn(
+        hidden_states=hidden_states,
+        key_value_states=capture.encoder_hidden_states,
+        past_key_value=capture.past_key_value,
+        position_ids=capture.position_ids,
+        cu_seqlens=capture.cu_seqlens,
+        max_seqlen=capture.max_seqlen,
+        cu_seqlens_k=capture.encoder_cu_seqlens,
+        max_seqlen_k=capture.encoder_max_seqlen,
+        output_attentions=False,
+    )[0]
+    return residual + cross_attn_output
+
+
+def _mlp_residual_segment(capture: DecoderLayerCapture, after_cross_attn: torch.Tensor) -> torch.Tensor:
+    residual = after_cross_attn
+    hidden_states = capture.module.final_layer_norm(after_cross_attn)
+    hidden_states = capture.module.activation_fn(capture.module.fc1(hidden_states))
+    hidden_states = F.dropout(hidden_states, p=capture.module.activation_dropout, training=capture.module.training)
+    hidden_states = capture.module.fc2(hidden_states)
+    hidden_states = F.dropout(hidden_states, p=capture.module.dropout, training=capture.module.training)
+    return residual + hidden_states
+
+
 def _benchmark_capture(
         capture: DecoderLayerCapture,
         *,
@@ -118,11 +164,21 @@ def _benchmark_capture(
             native_q1_self_attention=True,
             native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
     ):
+        after_self_attn = _self_attn_residual_segment(capture).detach()
+        after_cross_attn = _cross_attn_residual_segment(capture, after_self_attn).detach()
         variants: dict[str, tuple[Callable[[], torch.Tensor], torch.Tensor]] = {
             "repo_decoder_layer": (lambda: _layer_forward(capture), capture.output),
+            "self_attn_residual_segment": (
+                lambda: _self_attn_residual_segment(capture),
+                after_self_attn,
+            ),
             "self_attn_norm_only": (
                 lambda: _norm_only(capture.module.self_attn_layer_norm, capture.hidden_states),
                 _norm_only(capture.module.self_attn_layer_norm, capture.hidden_states).detach(),
+            ),
+            "mlp_residual_segment": (
+                lambda: _mlp_residual_segment(capture, after_cross_attn),
+                capture.output,
             ),
         }
         if capture.encoder_hidden_states is not None:
@@ -140,6 +196,10 @@ def _benchmark_capture(
             variants["cross_attn_norm_only"] = (
                 lambda: _norm_only(capture.module.cross_attn_layer_norm, after_self),
                 _norm_only(capture.module.cross_attn_layer_norm, after_self).detach(),
+            )
+            variants["cross_attn_residual_segment"] = (
+                lambda: _cross_attn_residual_segment(capture, after_self_attn),
+                after_cross_attn,
             )
         variants["mlp_norm_only"] = (
             lambda: _norm_only(capture.module.final_layer_norm, capture.output),
@@ -522,6 +582,33 @@ def profile_decode_decoder_layer_island(
                 full_song_main_tokens / graph_ideal_time_s
                 if graph_ideal_time_s is not None and graph_ideal_time_s > 0
                 else None
+            )
+            segment_names = (
+                "self_attn_residual_segment",
+                "cross_attn_residual_segment",
+                "mlp_residual_segment",
+                "self_attn_norm_only",
+                "cross_attn_norm_only",
+                "mlp_norm_only",
+            )
+            segment_seconds: dict[str, float] = {}
+            for segment_name in segment_names:
+                segment = benchmark.get(segment_name) or {}
+                segment_graph_ms = segment.get("cuda_graph_replay_ms_per_call")
+                if isinstance(segment_graph_ms, float):
+                    segment_seconds[segment_name] = (
+                        segment_graph_ms * member_count * full_song_decode_steps / 1000.0
+                    )
+            projected_full_song[signature]["cuda_graph_segment_seconds"] = segment_seconds
+            segment_sum_names = (
+                "self_attn_residual_segment",
+                "cross_attn_residual_segment",
+                "mlp_residual_segment",
+            )
+            segment_sum_s = sum(segment_seconds.get(name, 0.0) for name in segment_sum_names)
+            projected_full_song[signature]["cuda_graph_residual_segment_sum_s"] = segment_sum_s
+            projected_full_song[signature]["cuda_graph_residual_segment_unexplained_vs_layer_s"] = (
+                repo_graph_seconds - segment_sum_s
             )
         compiled = benchmark.get("compiled_decoder_layer") or {}
         compiled_graph_ms = compiled.get("cuda_graph_replay_ms_per_call")
