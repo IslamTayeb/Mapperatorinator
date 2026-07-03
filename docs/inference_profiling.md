@@ -80,7 +80,7 @@ The current RTX 2080/2080 Ti retained cold single-song baseline is SDPA plus `in
 - Stretch target: `150+ tok/s`.
 - Active long-range research target: `200 tok/s`.
 
-The first 100 tok/s loop ended below target by the documented stop condition because profiling showed no remaining plausible current-architecture quick win of `>=10%`. A renewed runtime pass found exact active-prefix and CUDA graph evidence, then job `49168188` added a stateful monotonic logits processor on top of that default-off path, job `49204568` reduced active-graph capture warmup to zero, and job `49206207` reduced the active graph bucket size. The current fastest accepted exact opt-in path reaches `155.578 tok/s` with fixed-seed token equivalence. Reaching `200 tok/s` from the retained `92.465 tok/s` conservative baseline requires cutting full-song synchronized main-generation model time from `82.615s` to about `38.195s`, a `53.8%` reduction. Reaching `200 tok/s` from the current fastest accepted exact opt-in path requires cutting `49.101s` to `38.195s`, removing another `10.906s` or `22.2%` of that path's model time.
+The first 100 tok/s loop ended below target by the documented stop condition because profiling showed no remaining plausible current-architecture quick win of `>=10%`. A renewed runtime pass found exact active-prefix and CUDA graph evidence, then job `49168188` added a stateful monotonic logits processor on top of that default-off path, job `49204568` reduced active-graph capture warmup to zero, job `49206207` reduced the active graph bucket size, and job `49213490` added q_len=1 BMM cross-attention for the simple fp32 active-graph path. The current fastest accepted exact opt-in path reaches `201.125 tok/s` with fixed-seed token equivalence. Reaching `200 tok/s` from the retained `92.465 tok/s` conservative baseline required cutting full-song synchronized main-generation model time from `82.615s` to about `38.195s`; the accepted q1 BMM opt-in path measured `37.981s`. The conservative cold default remains compile-only SDPA unless the user explicitly opts into the active-prefix graph stack.
 
 Only count a speedup as equivalent when fixed-seed generated token IDs match the baseline for the same audio/config slice. Do not claim wins from changed precision, sampling policy, output policy, model quality, windowing/overlap, or generated-token behavior unless the run is explicitly labeled non-equivalent.
 
@@ -399,8 +399,32 @@ python inference.py --config-name profile_salvalai \
   inference_active_prefix_decode_cuda_graph=true \
   inference_active_prefix_decode_cuda_graph_warmup=0 \
   inference_active_prefix_decode_cuda_graph_min_decode_steps=1 \
-  inference_stateful_monotonic_logits_processor=true
+  inference_stateful_monotonic_logits_processor=true \
+  inference_q1_bmm_cross_attention=true
 ```
+
+Accepted q_len=1 BMM cross-attention, DCC jobs `49212482`, `49212884`, `49213018`, `49213078`, and `49213490` on RTX 2080 Ti, commit `3af8d69`:
+
+| run | main tokens | main model time | main tok/s | timing tok/s | total timing+map stage | token equivalence | status |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| active64 graph + stateful control | `7,639` | `49.279s` | `155.014` | `75.652` | `65.200s` | baseline | control |
+| q1 BMM cross-attention candidate | `7,639` | `37.981s` | `201.125` | `84.160` | `52.638s` | PASS main and timing | fastest opt-in |
+
+Run dirs:
+
+- BMM attention microbench: `/work/imt11/Mapperatorinator/runs/attn-bmm-sm75-49212482`
+- One-token logits gate: `/work/imt11/Mapperatorinator/runs/q1bmm-logit-gate-49212884-3af8d69-len128`
+- Direct-loop token/logit/RNG gate: `/work/imt11/Mapperatorinator/runs/q1bmm-direct-gate-49213018-3af8d69`
+- 15s smoke: `/work/imt11/Mapperatorinator/runs/q1bmm-smoke15-49213078-3af8d69`
+- Full-song validation: `/work/imt11/Mapperatorinator/runs/q1bmm-full-49213490-3af8d69`
+
+The trigger was the active64 no-graph trace showing repeated unmasked cross-attention SDPA calls with Q shape `[1, 12, 1, 64]` and K/V shape `[1, 12, 1024, 64]`. The isolated SM75 microbench showed explicit fp32 `bmm -> softmax -> bmm` was much faster than SDPA for that exact q_len=1 cross-attention shape (`0.1486ms -> 0.0548ms`, `2.71x`, max abs `1.64e-7`). Longer q_len=1 lengths favored BMM even more (`L=2560`: `0.3643ms -> 0.0565ms`), while small lengths such as `64` and `96` favored SDPA; therefore the accepted production hook is cross-attention-only, not a broad self-attention replacement.
+
+Correctness gates passed before the speed claim. The one-token direct static-cache logits gate passed with matching top-k and `max_abs=4.196e-05`. The 64-token direct-loop gate passed generated-token identity, final RNG-state identity, logits allclose, and top-k equality with active-prefix bucket64 plus CUDA graph replay. The 15s smoke matched `1,084 / 1,084` main tokens and improved active64 graph main generation `168.853 -> 224.910 tok/s`; timing-context also improved `44.143 -> 48.686 tok/s`.
+
+Full-song validation reached the long-range `200 tok/s` target for this default-off exact opt-in path: active64 graph + stateful control `155.014 -> 201.125 tok/s` (`+29.7%`), main model time `49.279s -> 37.981s`, timing-context `75.652 -> 84.160 tok/s`, and total timing+map stage `65.200s -> 52.638s`. Fixed-seed generated token IDs matched for main (`7,639 / 7,639`) and timing (`821 / 821`).
+
+Strict zero-tolerance per-window gates still failed on tiny late one-token windows. Main generation failed `4 / 87` windows with only `4.4ms` total failed-window model overhead, versus `11.298s` aggregate main model-time savings. Timing failed `1 / 87` windows with `1.0ms` failed-window model overhead, versus `1.097s` aggregate timing model-time savings. Treat this as a scoped micro-regression, not a strict-pass result. Because the candidate is default-off, exact at the generated-token level, improves main/timing/total aggregates, and crosses the target, keep it as the fastest opt-in path. See `notes/2026-07-03-q1-bmm-cross-attention.md`.
 
 Post-bucket64 diagnostics, DCC jobs `49207288` and `49208036` on RTX 2080 Ti, commit `cf4f87e`:
 
