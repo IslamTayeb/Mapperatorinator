@@ -21,6 +21,14 @@ def test_summarize_active_prefix_diagnostics_aggregates_records():
                         "0:ConditionalTemperatureLogitsWarper": 3,
                         "1:MonotonicTimeShiftLogitsProcessor": 3,
                     },
+                    "cuda_event_ms": {
+                        "decode_forward.cuda_graph": 600.0,
+                        "prepare_inputs": 100.0,
+                    },
+                    "cuda_event_calls": {
+                        "decode_forward.cuda_graph": 3,
+                        "prepare_inputs": 3,
+                    },
                     "cuda_graph": {
                         "graphs": [
                             {
@@ -49,6 +57,12 @@ def test_summarize_active_prefix_diagnostics_aggregates_records():
                     },
                     "logits_processor_detail_calls": {
                         "0:ConditionalTemperatureLogitsWarper": 2,
+                    },
+                    "cuda_event_ms": {
+                        "decode_forward.cuda_graph": 400.0,
+                    },
+                    "cuda_event_calls": {
+                        "decode_forward.cuda_graph": 2,
                     },
                     "cuda_graph": {
                         "graphs": [
@@ -93,6 +107,17 @@ def test_summarize_active_prefix_diagnostics_aggregates_records():
     assert summary["wall_totals"]["decode_forward_wall_cpu_s"] == 1.0
     assert summary["processor_wall_cpu_s"]["0:ConditionalTemperatureLogitsWarper"] == 0.09
     assert summary["processor_calls"]["0:ConditionalTemperatureLogitsWarper"] == 5
+    assert summary["cuda_event_ms"]["decode_forward.cuda_graph"] == 1000.0
+    assert summary["cuda_event_calls"]["decode_forward.cuda_graph"] == 5
+    ceilings = summary["cuda_event_single_range_ceilings"]
+    assert ceilings[0]["name"] == "decode_forward.cuda_graph"
+    assert ceilings[0]["event_seconds"] == 1.0
+    assert ceilings[0]["calls"] == 5
+    assert ceilings[0]["model_time_pct"] == 40.0
+    assert ceilings[0]["above_5pct_keep_bar"] is True
+    assert round(ceilings[0]["estimated_tokens_per_second_if_removed"], 6) == round(5 / 1.5, 6)
+    assert ceilings[1]["name"] == "prepare_inputs"
+    assert ceilings[1]["above_5pct_keep_bar"] is False
     assert summary["bucket_lengths_seen_counts"] == {"512": 2, "1024": 1}
     assert summary["cuda_graph_totals"]["graphs"] == 3
     assert summary["cuda_graph_totals"]["decode_replays"] == 4

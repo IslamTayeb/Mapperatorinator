@@ -28,6 +28,51 @@ def _record_model_seconds(records: list[dict[str, Any]]) -> float:
     return sum(float(record.get("model_elapsed_seconds", 0.0) or 0.0) for record in records)
 
 
+def _event_single_range_ceilings(
+        *,
+        cuda_event_ms: dict[str, float],
+        cuda_event_calls: dict[str, int],
+        generated_tokens: int,
+        model_seconds: float,
+        decode_steps: int,
+) -> list[dict[str, Any]]:
+    ceilings: list[dict[str, Any]] = []
+    baseline_tps = generated_tokens / model_seconds if model_seconds > 0 else 0.0
+    keep_bar_seconds = model_seconds * 0.05
+    for name, milliseconds in cuda_event_ms.items():
+        event_seconds = float(milliseconds) / 1000.0
+        remaining_seconds = model_seconds - event_seconds
+        estimated_tps = (
+            generated_tokens / remaining_seconds
+            if generated_tokens > 0 and remaining_seconds > 0
+            else None
+        )
+        ceilings.append({
+            "name": name,
+            "event_seconds": event_seconds,
+            "event_ms": float(milliseconds),
+            "calls": int(cuda_event_calls.get(name, 0)),
+            "per_decode_step_us": (
+                float(milliseconds) * 1000.0 / decode_steps
+                if decode_steps > 0
+                else None
+            ),
+            "model_time_pct": (
+                event_seconds / model_seconds * 100.0
+                if model_seconds > 0
+                else 0.0
+            ),
+            "estimated_tokens_per_second_if_removed": estimated_tps,
+            "estimated_tokens_per_second_delta": (
+                estimated_tps - baseline_tps
+                if estimated_tps is not None
+                else None
+            ),
+            "above_5pct_keep_bar": event_seconds >= keep_bar_seconds if model_seconds > 0 else False,
+        })
+    return sorted(ceilings, key=lambda value: value["event_seconds"], reverse=True)
+
+
 def _normalized_graph_signature(graph: dict[str, Any]) -> tuple[Any, ...]:
     try:
         prefix = int(graph.get("active_prefix_length"))
@@ -191,6 +236,13 @@ def summarize_active_prefix_diagnostics(profile: dict[str, Any], *, label: str) 
             key: value * 1000.0 / decode_steps
             for key, value in sorted(cuda_event_ms.items())
         } if decode_steps > 0 else {},
+        "cuda_event_single_range_ceilings": _event_single_range_ceilings(
+            cuda_event_ms=cuda_event_ms,
+            cuda_event_calls=cuda_event_calls,
+            generated_tokens=generated_tokens,
+            model_seconds=model_seconds,
+            decode_steps=decode_steps,
+        ),
         "bucket_lengths_seen_counts": {
             str(key): value for key, value in sorted(bucket_lengths.items())
         },
@@ -261,6 +313,21 @@ def print_summary(summary: dict[str, Any], *, limit: int) -> None:
         per_decode_us = summary["cuda_event_weighted_per_decode_step_us"].get(key, 0.0)
         print(f"  {value:.3f}ms  {key}  {per_decode_us:.3f}us/decode-step  calls={calls}")
     if not summary["cuda_event_ms_ranked"]:
+        print("  n/a")
+    print()
+
+    print("CUDA Event Single-Range Ceilings")
+    for item in summary["cuda_event_single_range_ceilings"][:limit]:
+        estimated_tps = item["estimated_tokens_per_second_if_removed"]
+        estimated_tps_text = "n/a" if estimated_tps is None else f"{estimated_tps:.3f}"
+        print(
+            f"  {_fmt_seconds(item['event_seconds'])}  "
+            f"{item['model_time_pct']:.3f}% model  "
+            f"est_tok/s_if_removed={estimated_tps_text}  "
+            f"calls={item['calls']}  "
+            f"{item['name']}"
+        )
+    if not summary["cuda_event_single_range_ceilings"]:
         print("  n/a")
     print()
 
