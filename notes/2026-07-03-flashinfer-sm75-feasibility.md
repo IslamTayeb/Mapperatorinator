@@ -8,13 +8,15 @@ This was a backend feasibility probe only. It did not modify Mapperatorinator in
 
 ## Setup
 
-- Job: `49212042`
+- Main sweep job: `49212042`
+- H=12 fp32 confirmation job: `49212270`
 - Status: `COMPLETED`, exit `0:0`
 - Node/GPU: `dcc-core-ferc-s-z25-21`, RTX 2080 Ti
 - Driver/CUDA from `nvidia-smi`: driver `595.71.05`, CUDA `13.2`
 - PyTorch runtime: `2.10.0+cu128`, CUDA `12.8`
 - Run dir: `/work/imt11/Mapperatorinator/runs/flashinfer-sm75-light-49212042`
 - Report: `/work/imt11/Mapperatorinator/runs/flashinfer-sm75-light-49212042/report.json`
+- H=12 report: `/work/imt11/Mapperatorinator/runs/flashinfer-fp32-h12-49212270/report.json`
 - Isolated package target: `/work/imt11/Mapperatorinator/cache/flashinfer-target-0614-light-py310`
 - Installed only into the isolated target, not the main Mapperatorinator env:
   - `flashinfer-python==0.6.14`
@@ -28,15 +30,15 @@ Earlier package probes found two practical packaging hazards:
 
 ## Microbench Shape
 
-The probe matched the model-like q_len=1 attention shape used by the VarWhisper decoder:
+The active64 no-graph trace showed the real q_len=1 SDPA decoder shape is `[1, 12, 1, 64]` for Q and `[1, 12, kv_len, 64]` for K/V. The first broad sweep used `H=6`, which was an initial shape assumption; because the failure happens at dtype dispatch before kernel timing, job `49212270` repeated the decisive fp32 call with `H=12`.
 
-- heads: `6`
+- heads: `12` in the confirmation job
 - head dim: `64`
 - q shape for FlashInfer: `[H, D]`
 - K/V layout for FlashInfer: `HND`, `[H, kv_len, D]`
 - SDPA reference: q `[1, H, 1, D]`, K/V `[1, H, kv_len, D]`
-- KV lengths: `64`, `96`, `128`, `256`, `512`, `640`, `1024`, `2560`
-- Dtypes attempted: `torch.float32`, `torch.float16`
+- KV lengths in the broad sweep: `64`, `96`, `128`, `256`, `512`, `640`, `1024`, `2560`
+- Confirmation dtype/shape: `torch.float32`, `H=12`, `kv_len=64`
 
 ## Results
 
@@ -48,7 +50,7 @@ gpu: NVIDIA GeForce RTX 2080 Ti
 capability: [7, 5]
 ```
 
-All `torch.float32` `single_decode_with_kv_cache` calls failed before timing:
+All `torch.float32` `single_decode_with_kv_cache` calls failed before timing. The same error reproduced with the actual model head count in job `49212270`:
 
 ```text
 KeyError(torch.float32)
@@ -57,7 +59,7 @@ flashinfer/jit/attention/modules.py
 filename_safe_dtype_map[dtype_q]
 ```
 
-All `torch.float16` calls failed because the light target did not include `ninja` for JIT build:
+All broad-sweep `torch.float16` calls failed because the light target did not include `ninja` for JIT build:
 
 ```text
 FileNotFoundError: [Errno 2] No such file or directory: 'ninja'
