@@ -65,6 +65,7 @@ inference_active_prefix_decode_bucket_size: 128 # Active-prefix decode bucket le
 inference_active_prefix_decode_cuda_graph: false # Capture active-prefix one-token decode forwards with manual CUDA graphs
 inference_active_prefix_decode_cuda_graph_warmup: 0 # Warmup forwards before each active-prefix CUDA graph capture
 inference_active_prefix_decode_cuda_graph_min_decode_steps: 1 # First 1-based decode step eligible for graph capture
+inference_active_prefix_fast_prepare: false # Experimental post-prefill batch-1 fast input builder for active-prefix decode
 inference_stateful_monotonic_logits_processor: false # Experimental batch-1 stateful monotonic time-shift mask
 inference_q1_bmm_cross_attention: false # Experimental fp32 q_len=1 cross-attention via bmm/softmax/bmm
 inference_decode_session_runtime: false # Experimental single-song persistent DecodeSession graph/cache reuse; default-off and verifier-first

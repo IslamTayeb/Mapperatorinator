@@ -195,6 +195,7 @@ class Processor(object):
             active_prefix_decode_cuda_graph_min_decode_steps=int(
                 getattr(self.args, "inference_active_prefix_decode_cuda_graph_min_decode_steps", 1)
             ),
+            active_prefix_fast_prepare=bool(getattr(self.args, "inference_active_prefix_fast_prepare", False)),
             stateful_monotonic_logits_processor=bool(
                 getattr(self.args, "inference_stateful_monotonic_logits_processor", False)
             ),
@@ -213,6 +214,8 @@ class Processor(object):
             generate_kwargs2["decode_session_state"] = self.decode_session_state
         if generate_kwargs2["active_prefix_decode_cuda_graph"] and isinstance(self.model, InferenceClient):
             raise ValueError("inference_active_prefix_decode_cuda_graph requires use_server=false.")
+        if generate_kwargs2["active_prefix_fast_prepare"] and isinstance(self.model, InferenceClient):
+            raise ValueError("inference_active_prefix_fast_prepare requires use_server=false.")
 
         if isinstance(self.model, InferenceClient):
             response = self.model.generate(model_kwargs, generate_kwargs2)
@@ -1534,6 +1537,7 @@ class Processor(object):
             "active_prefix_decode_cuda_graph_min_decode_steps": stats.get(
                 "active_prefix_decode_cuda_graph_min_decode_steps"
             ),
+            "active_prefix_fast_prepare_enabled": stats.get("active_prefix_fast_prepare_enabled"),
             "use_server": isinstance(self.model, InferenceClient),
             "parallel": self.parallel,
         }

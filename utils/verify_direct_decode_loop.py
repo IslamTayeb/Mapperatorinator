@@ -22,7 +22,7 @@ from config import InferenceConfig
 from inference import compile_args, load_model_with_server, setup_inference_environment
 from osuT5.osuT5.inference.cache_utils import get_cache
 from osuT5.osuT5.inference.decode_loop import _bucketed_prefix_length, _max_cache_shape
-from osuT5.osuT5.inference.direct_decode import DecodeSession, SamplerState
+from osuT5.osuT5.inference.direct_decode import DecodeSession, SamplerState, prepare_one_token_decode_inputs_fast
 from osuT5.osuT5.inference.server import get_eos_token_id
 from osuT5.osuT5.runtime_profiling import active_prefix_self_attention_context, generation_profile_context
 from osuT5.osuT5.tokenizer import ContextType
@@ -318,6 +318,7 @@ def direct_decode_loop_generate(
         cuda_graph_diagnostics: dict[str, Any] | None = None,
         decode_session_runtime: bool = False,
         decode_session_metadata: dict[str, Any] | None = None,
+        fast_prepare_inputs: bool = False,
         tail_diagnostics: dict[str, Any] | None = None,
         **model_kwargs,
 ) -> torch.LongTensor:
@@ -393,7 +394,11 @@ def direct_decode_loop_generate(
     graph_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
     while model._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
         current_input_ids = sequence_buffer[:, :cur_len] if sequence_buffer is not None else input_ids
-        model_inputs = model.prepare_inputs_for_generation(current_input_ids, **model_kwargs)
+        model_inputs = (
+            prepare_one_token_decode_inputs_fast(model, current_input_ids, model_kwargs)
+            if fast_prepare_inputs and not is_prefill
+            else model.prepare_inputs_for_generation(current_input_ids, **model_kwargs)
+        )
         if is_prefill:
             outputs = model(**model_inputs, return_dict=True)
             is_prefill = False
@@ -540,6 +545,7 @@ def run_direct_decode_loop_gate(
         candidate_native_q1_self_attention: bool,
         candidate_native_q1_rope_cache_self_attention: bool,
         candidate_decode_session: bool,
+        candidate_fast_prepare: bool,
         tail_diagnostics: bool = False,
 ) -> dict[str, Any]:
     _assert_supported_probe(args)
@@ -603,6 +609,7 @@ def run_direct_decode_loop_gate(
         "candidate_native_q1_self_attention": bool(candidate_native_q1_self_attention),
         "candidate_native_q1_rope_cache_self_attention": bool(candidate_native_q1_rope_cache_self_attention),
         "candidate_decode_session": bool(candidate_decode_session),
+        "candidate_fast_prepare": bool(candidate_fast_prepare),
         "tail_diagnostics": bool(tail_diagnostics),
     }
 
@@ -705,6 +712,7 @@ def run_direct_decode_loop_gate(
                 cuda_graph_diagnostics=candidate_cuda_graph_diagnostics,
                 decode_session_runtime=candidate_decode_session,
                 decode_session_metadata=candidate_decode_session_metadata,
+                fast_prepare_inputs=candidate_fast_prepare,
                 tail_diagnostics=candidate_tail_diagnostics,
             ),
         )
@@ -830,6 +838,11 @@ def main() -> None:
         help="Wrap the candidate direct loop in the verifier-first DecodeSession state owner.",
     )
     parser.add_argument(
+        "--candidate-fast-prepare",
+        action="store_true",
+        help="Use the verified fast post-prefill one-token input builder in the candidate direct loop.",
+    )
+    parser.add_argument(
         "--tail-diagnostics",
         action="store_true",
         help="Record verifier-only candidate-loop CPU/CUDA timing for logits processors, sampling, and stop/append tail.",
@@ -860,6 +873,7 @@ def main() -> None:
         candidate_native_q1_self_attention=cli_args.candidate_native_q1_self_attention,
         candidate_native_q1_rope_cache_self_attention=cli_args.candidate_native_q1_rope_cache_self_attention,
         candidate_decode_session=cli_args.candidate_decode_session,
+        candidate_fast_prepare=cli_args.candidate_fast_prepare,
         tail_diagnostics=cli_args.tail_diagnostics,
     )
     result["metadata"]["config_name"] = cli_args.config_name
