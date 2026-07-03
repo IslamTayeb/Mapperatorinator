@@ -13,6 +13,20 @@ This pass tightened `inference.py` validation for active-prefix, stateful monoto
 
 The validation now runs after `compile_device_and_seed()` so `device=auto` and `attn_implementation=auto` are normalized before runtime-mode constraints check precision/backend/device compatibility. This matters because the accepted active-prefix CUDA graph/native q1 flags require an effective CUDA device plus `attn_implementation=sdpa`, and the user-facing defaults are `device=auto` and `attn_implementation=auto`.
 
+Guardrail validation:
+
+- Job: `49231914`
+- Commit: `12cfdf3`
+- Node/GPU: `dcc-core-ferc-s-z25-20`, RTX 2080 Ti, UUID `GPU-de50b870-b708-690d-74a4-6e855163a133`
+- Run dir: `/work/imt11/Mapperatorinator/runs/runtime-guardrails-49231914-12cfdf3`
+- Result: PASS
+- Checks:
+  - retained fast stack passes config validation on GPU with `attn_implementation=auto` normalized to `sdpa`
+  - `use_server=true` fails early with `inference_active_prefix_decode_loop requires use_server=false`
+  - `parallel=true` fails early with `inference_active_prefix_decode_loop currently supports sequential inference only`
+  - `inference_native_q1_rope_cache_self_attention=true` without native q1 self-attention fails early
+  - backed-out `inference_active_prefix_fast_prepare=true` fails as an unknown Hydra key
+
 ## Fast-Prepare Result
 
 Direct verifier gate:

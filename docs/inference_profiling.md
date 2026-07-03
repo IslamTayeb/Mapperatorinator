@@ -1467,6 +1467,8 @@ Treat `inference.py` and `osuT5/osuT5/inference/server.py:model_generate()` as t
 
 The current fastest exact opt-in stack is still single-song, batch-1, non-server, sequential-only: active-prefix bucket64 CUDA graph, stateful monotonic, q1 BMM cross-attention, DecodeSession graph/cache reuse, native q1 self-attention, and fused RoPE/cache self-attention. `inference.py` now validates these constraints before model load so unsupported combinations fail before reaching lower-level runtime code.
 
+DCC guardrail job `49231914` on RTX 2080 Ti, commit `12cfdf3`, validated the control-plane checks without running inference. The retained fast stack passed config validation on GPU with `attn_implementation=auto` normalized to `sdpa`. `use_server=true`, `parallel=true`, and missing native subflag dependencies failed early with `inference.py` validation errors. The backed-out `inference_active_prefix_fast_prepare=true` override failed as an unknown Hydra key.
+
 Existing throughput paths are separate:
 
 - `use_server=true` uses `InferenceServer` static IPC request batching. The server groups requests by identical generation kwargs, pads/collates model kwargs, calls `server.py:model_generate()`, then splits outputs and aggregates token counts.
