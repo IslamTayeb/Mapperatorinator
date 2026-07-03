@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Re-profile the accepted `216.173 tok/s` DecodeSession opt-in baseline before choosing the next 500 tok/s target. This is diagnostic only. Throughput claims still come from untraced `profile_inference`, not torch profiler or Nsight wall time.
+Re-profile the accepted `216.173 tok/s` DecodeSession opt-in baseline before choosing the next 500 tok/s target. This was diagnostic only and was later superseded by native q_len=1 self-attention job `49225493` at `237.111 tok/s`. Throughput claims still come from untraced `profile_inference`, not torch profiler or Nsight wall time.
 
 Current accepted opt-in stack:
 
@@ -154,7 +154,7 @@ These whole-smoke counts include timing generation, setup, and diagnostic overhe
 
 No optimization graduated from this diagnostic pass.
 
-Use the new `216.173 tok/s` DecodeSession opt-in path as the current exact single-song baseline. Do not chase more graph-cache reuse unless a fresh full-song diagnostic shows graph/capture/setup has grown again above `5%`.
+At the time of this diagnostic, use the new `216.173 tok/s` DecodeSession opt-in path as the exact single-song baseline. That baseline is now superseded by native q_len=1 self-attention job `49225493` at `237.111 tok/s`. Do not chase more graph-cache reuse unless a fresh full-song diagnostic shows graph/capture/setup has grown again above `5%`.
 
 Next plausible `>5%` exact work:
 

@@ -133,7 +133,7 @@ This is in the `5-10%` keep band: not enough to be a broad kernel breakthrough, 
 
 ## Next Work
 
-1. Re-profile the new `216.173 tok/s` opt-in baseline with Nsight/torch diagnostic ranges to see the post-DecodeSession kernel split.
+1. Historical next step: re-profile the new `216.173 tok/s` opt-in baseline with Nsight/torch diagnostic ranges to see the post-DecodeSession kernel split. This was done and later superseded by native q_len=1 self-attention job `49225493` at `237.111 tok/s`.
 2. Do not chase graph-cache reuse further unless a fresh diagnostic shows remaining capture/setup overhead above `5%`.
 3. Shift attention back to real decoder compute: one-token linear/MLP launch reduction, q_len=1 active-prefix self-attention/cache layout, or narrow C++/CUDA/CUTLASS kernels for measured hotspots.
 4. Preserve the same verifier ladder for future runtime changes: one-token logits, direct-loop token/logit/RNG, 15s smoke token equivalence, then full-song token equivalence and non-regression accounting.
