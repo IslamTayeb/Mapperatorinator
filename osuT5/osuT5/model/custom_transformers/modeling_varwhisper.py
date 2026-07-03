@@ -616,6 +616,19 @@ class VarWhisperAttention(nn.Module):
                                 past_key_value.update(key_states, value_states, self.layer_idx)
                         else:
                             past_key_value.update(key_states, value_states, self.layer_idx)
+                if profile_ranges:
+                    with profile_range(f"{range_prefix}.sdpa"):
+                        attn_outputs = attn_func(
+                            query=query_states,
+                            key=key_states,
+                            value=value_states,
+                        )
+                else:
+                    attn_outputs = attn_func(
+                        query=query_states,
+                        key=key_states,
+                        value=value_states,
+                    )
             else:
                 prefix_length = active_prefix_self_attention_length()
                 use_native_q1_rope_cache_self_attention = (
