@@ -194,7 +194,7 @@ def active_prefix_decode_generate(
         *,
         active_prefix_bucket_size: int = 128,
         cuda_graph_forward: bool = False,
-        cuda_graph_warmup: int = 3,
+        cuda_graph_warmup: int = 0,
         cuda_graph_min_decode_steps: int = 1,
         active_prefix_decode_diagnostics: dict[str, Any] | None = None,
         **model_kwargs,

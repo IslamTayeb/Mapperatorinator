@@ -80,7 +80,7 @@ The current RTX 2080/2080 Ti retained cold single-song baseline is SDPA plus `in
 - Stretch target: `150+ tok/s`.
 - Active long-range research target: `200 tok/s`.
 
-The first 100 tok/s loop ended below target by the documented stop condition because profiling showed no remaining plausible current-architecture quick win of `>=10%`. A renewed runtime pass found exact active-prefix and CUDA graph evidence, then job `49168188` added a stateful monotonic logits processor on top of that default-off path and reached `134.873 tok/s` with fixed-seed token equivalence and per-window non-regression. Reaching `200 tok/s` from the retained `92.465 tok/s` conservative baseline requires cutting full-song synchronized main-generation model time from `82.615s` to about `38.195s`, a `53.8%` reduction. Reaching `200 tok/s` from the current fastest accepted exact opt-in path requires cutting `56.639s` to `38.195s`, removing another `18.444s` or `32.6%` of that path's model time.
+The first 100 tok/s loop ended below target by the documented stop condition because profiling showed no remaining plausible current-architecture quick win of `>=10%`. A renewed runtime pass found exact active-prefix and CUDA graph evidence, then job `49168188` added a stateful monotonic logits processor on top of that default-off path and job `49204568` reduced active-graph capture warmup to zero. The current fastest accepted exact opt-in path reaches `146.602 tok/s` with fixed-seed token equivalence. Reaching `200 tok/s` from the retained `92.465 tok/s` conservative baseline requires cutting full-song synchronized main-generation model time from `82.615s` to about `38.195s`, a `53.8%` reduction. Reaching `200 tok/s` from the current fastest accepted exact opt-in path requires cutting `52.107s` to `38.195s`, removing another `13.912s` or `26.7%` of that path's model time.
 
 Only count a speedup as equivalent when fixed-seed generated token IDs match the baseline for the same audio/config slice. Do not claim wins from changed precision, sampling policy, output policy, model quality, windowing/overlap, or generated-token behavior unless the run is explicitly labeled non-equivalent.
 
@@ -269,6 +269,7 @@ python inference.py --config-name profile_salvalai \
   inference_active_prefix_decode_loop=true \
   inference_active_prefix_decode_bucket_size=512 \
   inference_active_prefix_decode_cuda_graph=true \
+  inference_active_prefix_decode_cuda_graph_warmup=0 \
   inference_active_prefix_decode_cuda_graph_min_decode_steps=1
 ```
 
@@ -298,11 +299,45 @@ python inference.py --config-name profile_salvalai \
   inference_active_prefix_decode_loop=true \
   inference_active_prefix_decode_bucket_size=512 \
   inference_active_prefix_decode_cuda_graph=true \
+  inference_active_prefix_decode_cuda_graph_warmup=0 \
   inference_active_prefix_decode_cuda_graph_min_decode_steps=1 \
   inference_stateful_monotonic_logits_processor=true
 ```
 
 Keep this path default-off and scoped to the active-prefix CUDA graph/simple batch-1 mode until fresh profiling validates broader modes. The older pre-graph stateful monotonic attempt stayed rejected for normal generation because it regressed smoke throughput; the new result was accepted only after active-graph diagnostics made the logits processor a target-sized cost.
+
+Active graph zero-warmup validation, DCC jobs `49204447` and `49204568` on RTX 2080 Ti, commit `f56f2f5`:
+
+| run | main tokens | main model time | main tok/s | timing tok/s | total timing+map stage | token equivalence | strict status |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| active512 graph + stateful, prior control job `49204317` | `7,639` | `55.230s` | `138.311` | `58.753` | `74.376s` | baseline | baseline |
+| active512 graph + stateful, isolated warmup3 job `49204568` | `7,639` | `55.732s` | `137.066` | `58.616` | `74.685s` | baseline | baseline |
+| active512 graph + stateful, isolated warmup0 job `49204568` | `7,639` | `52.107s` | `146.602` | `75.130` | `68.283s` | PASS, `7,639 / 7,639` | aggregate PASS, per-window micro-regression |
+
+Run dirs:
+
+- 15s warmup sweep: `/work/imt11/Mapperatorinator/runs/active-warmup-sweep-49204447-f56f2f5`
+- Full-song isolated validation: `/work/imt11/Mapperatorinator/runs/active-warmup0-full-isolated-49204568-f56f2f5`
+- Previous untraced control: `/work/imt11/Mapperatorinator/runs/stateful-bottleneck-49204317-94fcb31`
+
+The 15s smoke sweep compared active512 graph + stateful with `inference_active_prefix_decode_cuda_graph_warmup=3`, `1`, and `0` after a compile-only control. All active variants were exact against warmup3 and compile-only (`1,084 / 1,084` main tokens). Warmup0 was fastest on that smoke (`153.030 -> 162.401 tok/s`, `+6.1%` versus warmup3), so it promoted to full-song validation.
+
+The full-song isolated run used separate TorchInductor, Triton, CUDA, and HF cache directories for warmup0 and warmup3. Warmup0 improved main generation by `+7.0%` versus same-job warmup3 and `+6.0%` versus the previous untraced active512 graph + stateful control. Timing context also improved by `+28.2%` versus same-job warmup3 and `+27.9%` versus the previous control, with `821 / 821` timing tokens matching. Total timing+map profiled stage time improved `74.376s -> 68.283s` versus the previous control.
+
+Strict zero-tolerance per-window gates still failed on tiny late one-token windows: versus same-job warmup3, one map window regressed by `0.128ms` model time; versus the previous control, two map windows regressed by `0.126ms` and `0.487ms`, and one timing window regressed only in outer wall by `0.150ms` while model time improved. Treat these as scoped micro-regressions, not a strict-pass result. Because this is a simple default-off active-graph setting, exact, faster on main/timing/total aggregates, and strategically useful for the 200 tok/s runtime path, keep `inference_active_prefix_decode_cuda_graph_warmup=0` as the active graph default.
+
+Use:
+
+```bash
+python inference.py --config-name profile_salvalai \
+  inference_generation_compile=true \
+  inference_active_prefix_decode_loop=true \
+  inference_active_prefix_decode_bucket_size=512 \
+  inference_active_prefix_decode_cuda_graph=true \
+  inference_active_prefix_decode_cuda_graph_warmup=0 \
+  inference_active_prefix_decode_cuda_graph_min_decode_steps=1 \
+  inference_stateful_monotonic_logits_processor=true
+```
 
 Rejected delayed-capture variant, DCC job `49166715`, commit `f712b59`: setting `inference_active_prefix_decode_cuda_graph_min_decode_steps=16` remained token-equivalent on 15s smoke but failed per-window no-regression on 5/10 windows and reduced graph-path aggregate throughput versus immediate capture. Keep `min_decode_steps=1` as the default. Only revisit delayed capture if a future profiler trace shows graph capture itself has become the dominant cost and a better adaptive policy can avoid medium-window regressions.
 

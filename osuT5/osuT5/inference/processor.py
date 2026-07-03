@@ -189,7 +189,7 @@ class Processor(object):
                 getattr(self.args, "inference_active_prefix_decode_cuda_graph", False)
             ),
             active_prefix_decode_cuda_graph_warmup=int(
-                getattr(self.args, "inference_active_prefix_decode_cuda_graph_warmup", 3)
+                getattr(self.args, "inference_active_prefix_decode_cuda_graph_warmup", 0)
             ),
             active_prefix_decode_cuda_graph_min_decode_steps=int(
                 getattr(self.args, "inference_active_prefix_decode_cuda_graph_min_decode_steps", 1)

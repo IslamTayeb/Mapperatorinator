@@ -175,7 +175,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     active_prefix_decode_loop = bool(generate_kwargs.pop('active_prefix_decode_loop', False))
     active_prefix_decode_bucket_size = int(generate_kwargs.pop('active_prefix_decode_bucket_size', 128))
     active_prefix_decode_cuda_graph = bool(generate_kwargs.pop('active_prefix_decode_cuda_graph', False))
-    active_prefix_decode_cuda_graph_warmup = int(generate_kwargs.pop('active_prefix_decode_cuda_graph_warmup', 3))
+    active_prefix_decode_cuda_graph_warmup = int(generate_kwargs.pop('active_prefix_decode_cuda_graph_warmup', 0))
     active_prefix_decode_cuda_graph_min_decode_steps = int(
         generate_kwargs.pop('active_prefix_decode_cuda_graph_min_decode_steps', 1)
     )

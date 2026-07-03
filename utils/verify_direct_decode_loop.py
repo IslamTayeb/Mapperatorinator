@@ -233,7 +233,7 @@ def direct_decode_loop_generate(
         active_prefix_decode_length: int | None = None,
         active_prefix_bucket_size: int = 512,
         cuda_graph_forward: bool = False,
-        cuda_graph_warmup: int = 3,
+        cuda_graph_warmup: int = 0,
         cuda_graph_diagnostics: dict[str, Any] | None = None,
         **model_kwargs,
 ) -> torch.LongTensor:
@@ -624,7 +624,7 @@ def main() -> None:
     parser.add_argument(
         "--candidate-cuda-graph-warmup",
         type=int,
-        default=3,
+        default=0,
         help="Warmup forwards before candidate CUDA graph capture.",
     )
     parser.add_argument("--report-path", type=Path, default=None)
