@@ -147,11 +147,24 @@ def _mlp_residual_segment(capture: DecoderLayerCapture, after_cross_attn: torch.
     return residual + hidden_states
 
 
+def _manual_decoder_runtime_island(capture: DecoderLayerCapture) -> torch.Tensor:
+    """Exact whole-layer callable used to size broad runtime-island work.
+
+    This intentionally composes the same module calls as VarWhisperDecoderLayer
+    instead of adding a new optimized path. It calibrates the profiler and gives
+    future native/CUDA candidates a single verifier boundary to replace.
+    """
+    hidden_states = _self_attn_residual_segment(capture)
+    hidden_states = _cross_attn_residual_segment(capture, hidden_states)
+    return _mlp_residual_segment(capture, hidden_states)
+
+
 def _benchmark_capture(
         capture: DecoderLayerCapture,
         *,
         native_q1_rope_cache_self_attention: bool,
         compile_decoder_layer_variant: bool,
+        candidate_decoder_runtime_island: bool,
         warmup: int,
         iters: int,
         atol: float,
@@ -181,6 +194,11 @@ def _benchmark_capture(
                 capture.output,
             ),
         }
+        if candidate_decoder_runtime_island:
+            variants["manual_decoder_runtime_island"] = (
+                lambda: _manual_decoder_runtime_island(capture),
+                capture.output,
+            )
         if capture.encoder_hidden_states is not None:
             self_attn_output = capture.module.self_attn(
                 hidden_states=capture.module.self_attn_layer_norm(capture.hidden_states),
@@ -373,6 +391,7 @@ def profile_decode_decoder_layer_island(
         active_prefix_decode_length: int | None,
         native_q1_rope_cache_self_attention: bool,
         compile_decoder_layer_variant: bool,
+        candidate_decoder_runtime_island: bool,
         warmup: int,
         iters: int,
         atol: float,
@@ -422,6 +441,7 @@ def profile_decode_decoder_layer_island(
         "active_prefix_decode_length_override": active_prefix_decode_length,
         "native_q1_rope_cache_self_attention": bool(native_q1_rope_cache_self_attention),
         "compile_decoder_layer_variant": bool(compile_decoder_layer_variant),
+        "candidate_decoder_runtime_island": bool(candidate_decoder_runtime_island),
         "cuda_graph_replay": bool(cuda_graph_replay),
         "full_song_decode_steps": int(full_song_decode_steps),
         "full_song_main_tokens": int(full_song_main_tokens),
@@ -529,6 +549,7 @@ def profile_decode_decoder_layer_island(
             representative,
             native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
             compile_decoder_layer_variant=compile_decoder_layer_variant,
+            candidate_decoder_runtime_island=candidate_decoder_runtime_island,
             warmup=warmup,
             iters=iters,
             atol=atol,
@@ -628,6 +649,28 @@ def profile_decode_decoder_layer_island(
                 if projected_model_time_s > 0
                 else None
             )
+        candidate = benchmark.get("manual_decoder_runtime_island") or {}
+        candidate_graph_ms = candidate.get("cuda_graph_replay_ms_per_call")
+        if isinstance(candidate_graph_ms, float) and isinstance(repo_graph_ms, float):
+            candidate_graph_seconds = candidate_graph_ms * member_count * full_song_decode_steps / 1000.0
+            saved_seconds = repo_graph_seconds - candidate_graph_seconds
+            projected_model_time_s = full_song_model_time_s - saved_seconds
+            projected_full_song[signature]["cuda_graph_manual_decoder_runtime_island_s"] = (
+                candidate_graph_seconds
+            )
+            projected_full_song[signature]["cuda_graph_manual_decoder_runtime_island_saved_s"] = (
+                saved_seconds
+            )
+            projected_full_song[signature]["cuda_graph_manual_decoder_runtime_island_speedup"] = (
+                repo_graph_ms / candidate_graph_ms
+                if candidate_graph_ms > 0
+                else None
+            )
+            projected_full_song[signature]["cuda_graph_manual_decoder_runtime_island_projected_tps"] = (
+                full_song_main_tokens / projected_model_time_s
+                if projected_model_time_s > 0
+                else None
+            )
 
     return {
         "pass": bool(_allclose(direct_result.logits, replay_logits, atol=atol, rtol=rtol)),
@@ -664,6 +707,14 @@ def main() -> None:
         action="store_true",
         help="Also benchmark a diagnostic torch.compile(mode='reduce-overhead') decoder-layer island variant.",
     )
+    parser.add_argument(
+        "--candidate-decoder-runtime-island",
+        action="store_true",
+        help=(
+            "Also benchmark a verifier-only manual whole-layer runtime-island candidate. "
+            "This is diagnostic sizing only, not a production inference path."
+        ),
+    )
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", type=int, default=500)
     parser.add_argument("--atol", type=float, default=1e-4)
@@ -685,6 +736,7 @@ def main() -> None:
         active_prefix_decode_length=cli_args.active_prefix_decode_length,
         native_q1_rope_cache_self_attention=cli_args.native_q1_rope_cache_self_attention,
         compile_decoder_layer_variant=cli_args.compile_decoder_layer_variant,
+        candidate_decoder_runtime_island=cli_args.candidate_decoder_runtime_island,
         warmup=cli_args.warmup,
         iters=cli_args.iters,
         atol=cli_args.atol,
