@@ -1438,3 +1438,11 @@ size; it is diagnostic and must not be used as a throughput claim.
 Use `wall_seconds - model_elapsed_seconds` to spot server/IPC/queue overhead. Use token counts and `tokens_per_second` to separate model throughput problems from unusually long outputs. When `profile_sync_cuda=true`, profiling requests synchronized model timing inside `model_generate` so `model_elapsed_seconds` includes pending CUDA work. Do not use `wall_seconds` from records with `torch_profiled=true` as normal throughput; the profiler can inflate traced windows by orders of magnitude.
 
 Profile metadata also captures reproducibility context when profiling is enabled: seed, hostname, Slurm job id/partition, git commit/branch, torch/CUDA versions, CUDA device name/capability, and cache/temp environment paths. Report the profile path plus this metadata when accepting or rejecting an optimization.
+
+## Decoder-Layer Segment Diagnostics
+
+Use `utils/profile_decode_decoder_layer_island.py --cuda-graph-replay` for diagnostic target sizing before planning broad decoder-layer/native runtime work. It captures a real one-token decoder step, verifies logits replay, benchmarks the whole decoder layer, and can split the layer into self-attention residual, cross-attention residual, MLP residual, and norm-only diagnostic segments.
+
+DCC job `49231614` on RTX 2080 Ti, commit `ccfebec`, used the current fastest exact fused stack and passed logits replay with `max_abs=0.0`. It projected the whole decoder-layer CUDA graph replay cost at `15.961s` of the accepted `28.243s` full-song model time. The residual split was self-attention `7.001s`, cross-attention `3.320s`, MLP `4.248s`, and unexplained layer glue `1.392s`.
+
+These numbers are ceilings, not throughput claims. They show that `500 tok/s` cannot come from one small kernel in isolation: self-attention, cross-attention, and MLP are each target-sized, but the realistic path needs broad `DecodeSession`/decoder-layer runtime work that also reduces per-token control/synchronization overhead. See `notes/2026-07-03-decoder-layer-segment-probe.md`.
