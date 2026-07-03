@@ -300,6 +300,7 @@ def _ensure_model_server(args, *, auto_select_gamemode_model: bool, lora_path: s
         lora_path=lora_path,
         gamemode=args.gamemode,
         auto_select_gamemode_model=auto_select_gamemode_model,
+        generation_compile=args.inference_generation_compile,
     )
 
     with owned_server_clients_lock:

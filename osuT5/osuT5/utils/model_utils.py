@@ -303,7 +303,7 @@ def resolve_model_checkpoint_path(
 
 def load_model(ckpt_path: str | Path | None, t5_args: TrainConfig, device, precision: str = "fp32", attn_implementation: str = "sdpa",
                eval_mode: bool = True, pickle_module=None, gamemode: int | None = None,
-               auto_select_gamemode_model: bool = True):
+               auto_select_gamemode_model: bool = True, generation_compile: bool = False):
     model_loader, tokenizer_loader = load_model_loaders(
         ckpt_path,
         t5_args,
@@ -314,6 +314,7 @@ def load_model(ckpt_path: str | Path | None, t5_args: TrainConfig, device, preci
         pickle_module,
         gamemode=gamemode,
         auto_select_gamemode_model=auto_select_gamemode_model,
+        generation_compile=generation_compile,
     )
     return model_loader(), tokenizer_loader()
 
@@ -383,7 +384,6 @@ def load_model_loaders(
                 device_map=device,
                 subfolder=ckpt_subfolder,
             )
-            model.generation_config.disable_compile = not generation_compile
         else:
             model_state = torch.load(ckpt_path / "pytorch_model.bin", weights_only=True)
             model = _get_model(t5_args, tokenizer, dtype=dtype, attn_implementation=attn_implementation)
@@ -405,6 +405,13 @@ def load_model_loaders(
             model = PeftModel.from_pretrained(model, lora_path)
             model = model.merge_and_unload()
             print(f"Loaded LoRA weights from {lora_path}")
+
+        generation_config = getattr(model, "generation_config", None)
+        if generation_config is None:
+            if generation_compile:
+                raise ValueError("generation_compile=true requires a model.generation_config.")
+        else:
+            generation_config.disable_compile = not generation_compile
 
         if eval_mode:
             model.eval()

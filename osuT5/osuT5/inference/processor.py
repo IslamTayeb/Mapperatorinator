@@ -1517,11 +1517,15 @@ class Processor(object):
             "q1_bmm_cross_attention_enabled": stats.get("q1_bmm_cross_attention_enabled"),
             "native_q1_self_attention_requested": stats.get("native_q1_self_attention_requested"),
             "native_q1_self_attention_enabled": stats.get("native_q1_self_attention_enabled"),
+            "native_q1_self_attention_disabled_reason": stats.get("native_q1_self_attention_disabled_reason"),
             "native_q1_rope_cache_self_attention_requested": stats.get(
                 "native_q1_rope_cache_self_attention_requested"
             ),
             "native_q1_rope_cache_self_attention_enabled": stats.get(
                 "native_q1_rope_cache_self_attention_enabled"
+            ),
+            "native_q1_rope_cache_self_attention_disabled_reason": stats.get(
+                "native_q1_rope_cache_self_attention_disabled_reason"
             ),
             "decode_session_runtime_enabled": stats.get("decode_session_runtime_enabled"),
             "decode_session_cuda_graph_enabled": stats.get("decode_session_cuda_graph_enabled"),

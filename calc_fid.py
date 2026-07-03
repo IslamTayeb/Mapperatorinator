@@ -504,7 +504,8 @@ def generate_beatmaps(beatmap_paths, args: InferenceConfig, dataset_type, idx, l
                                               max_batch_size=args.max_batch_size, use_server=args.use_server,
                                               precision=args.precision, attn_implementation=args.attn_implementation,
                                               gamemode=args.gamemode,
-                                              auto_select_gamemode_model=args.auto_select_gamemode_model)
+                                              auto_select_gamemode_model=args.auto_select_gamemode_model,
+                                              generation_compile=args.inference_generation_compile)
 
     if args.compile:
         model.transformer.forward = torch.compile(model.transformer.forward, mode="reduce-overhead", fullgraph=True)

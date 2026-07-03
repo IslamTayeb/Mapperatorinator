@@ -1495,6 +1495,8 @@ The current fastest exact opt-in stack is still single-song, batch-1, non-server
 
 DCC guardrail job `49231914` on RTX 2080 Ti, commit `12cfdf3`, validated the control-plane checks without running inference. The retained fast stack passed config validation on GPU with `attn_implementation=auto` normalized to `sdpa`. `use_server=true`, `parallel=true`, and missing native subflag dependencies failed early with `inference.py` validation errors. The backed-out `inference_active_prefix_fast_prepare=true` override failed as an unknown Hydra key.
 
+Follow-up control-plane audit on commit `36403e6` found that the accepted fast path routes through the intended surfaces, but `inference_generation_compile` was not consistently forwarded outside the main `inference.py` entry point and local/custom checkpoint loads could leave `generation_config.disable_compile=True` even when compile was requested. Branch `experiment/control-plane-compile-routing` fixed this by applying `generation_compile` after every `load_model_loaders()` model-load path, forwarding it through `web-ui.py`, `mai_mod.py`, and `calc_fid.py`, and recording explicit native-q1 timing-context disable reasons in per-generation profile rows. Local verification used `py_compile`, diff checks, source-level routing checks, and the lightweight profile/summarizer pytest subset with plugin autoload disabled; run GPU/env validation before using this as performance evidence.
+
 Existing throughput paths are separate:
 
 - `use_server=true` uses `InferenceServer` static IPC request batching. The server groups requests by identical generation kwargs, pads/collates model kwargs, calls `server.py:model_generate()`, then splits outputs and aggregates token counts.

@@ -345,8 +345,18 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         "q1_bmm_cross_attention_enabled": q1_bmm_cross_attention,
         "native_q1_self_attention_requested": native_q1_self_attention_requested,
         "native_q1_self_attention_enabled": native_q1_self_attention,
+        "native_q1_self_attention_disabled_reason": (
+            "timing_context"
+            if native_q1_self_attention_requested and not native_q1_self_attention
+            else None
+        ),
         "native_q1_rope_cache_self_attention_requested": native_q1_rope_cache_self_attention_requested,
         "native_q1_rope_cache_self_attention_enabled": native_q1_rope_cache_self_attention,
+        "native_q1_rope_cache_self_attention_disabled_reason": (
+            "timing_context"
+            if native_q1_rope_cache_self_attention_requested and not native_q1_rope_cache_self_attention
+            else None
+        ),
         "decode_session_runtime_enabled": decode_session_state is not None,
         "decode_session_cuda_graph_enabled": bool(decode_session_cuda_graph),
         "decode_session_graph_count": (

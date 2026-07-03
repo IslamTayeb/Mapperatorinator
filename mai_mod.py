@@ -372,7 +372,8 @@ def main(args: MaiModConfig):
                                               precision=i_args.precision,
                                               attn_implementation=i_args.attn_implementation,
                                               gamemode=i_args.gamemode,
-                                              auto_select_gamemode_model=i_args.auto_select_gamemode_model)
+                                              auto_select_gamemode_model=i_args.auto_select_gamemode_model,
+                                              generation_compile=i_args.inference_generation_compile)
 
     generation_config, beatmap_config = get_config(i_args)
 
