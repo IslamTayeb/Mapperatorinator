@@ -426,6 +426,17 @@ Full-song validation reached the long-range `200 tok/s` target for this default-
 
 Strict zero-tolerance per-window gates still failed on tiny late one-token windows. Main generation failed `4 / 87` windows with only `4.4ms` total failed-window model overhead, versus `11.298s` aggregate main model-time savings. Timing failed `1 / 87` windows with `1.0ms` failed-window model overhead, versus `1.097s` aggregate timing model-time savings. Treat this as a scoped micro-regression, not a strict-pass result. Because the candidate is default-off, exact at the generated-token level, improves main/timing/total aggregates, and crosses the target, keep it as the fastest opt-in path. See `notes/2026-07-03-q1-bmm-cross-attention.md`.
 
+Five-song before/after validation, DCC jobs `49218365` through `49218368` on RTX 2080 Ti, commit `8a2de72`, compared original-repo-equivalent flags disabled against the current optimized opt-in stack on Lambada, PEGASUS, Ela ke Leitada, SALVALAI, and Nube Negra. Official TPS came from untraced `profile_inference`; each job also wrote 1s `nvidia-smi` telemetry and an Nsight Systems diagnostic report.
+
+| class | before main tok/s | after main tok/s | speedup | equivalence | note |
+| --- | ---: | ---: | ---: | --- | --- |
+| separate cold, five fresh processes | `64.802` | `195.545` | `+201.8%` | PASS, all five songs | cold single-song evidence |
+| together first run | `64.614` | `201.749` | `+212.2%` | PASS | first song in long-lived process |
+| together all runs | `60.541` | `194.791` | `+221.8%` | PASS | serial multi-song, two repeats |
+| together warmed runs | `56.834` | `194.116` | `+241.5%` | PASS | batch-adjacent evidence, not true batching |
+
+All five separate cold main-generation strict comparisons passed, and suite `all_runs`, `warmed_runs`, and `all_runs --gate-cold-run0` strict comparisons passed. Separate timing-context aggregate throughput improved on every song, but `timing/sequential/seq0` regressed for each song, so keep that as a scoped first-record timing caveat. See `notes/2026-07-03-five-song-before-after-profile.md`.
+
 Post-bucket64 diagnostics, DCC jobs `49207288` and `49208036` on RTX 2080 Ti, commit `cf4f87e`:
 
 | diagnostic run | main tokens | main model time | main tok/s | timing tok/s | note |
