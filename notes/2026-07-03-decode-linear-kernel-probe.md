@@ -110,3 +110,13 @@ If linear work remains the target, the next plausible experiments are:
 3. Separate q1 BMM and self-attention measurement before attributing remaining GEMM/FMA time to linears.
 
 The bigger 500 tok/s path still requires multiple wins. This probe rejects simple linear call-form cleanup and strengthens the case for either q_len=1 self-attention/cache-layout work or a deeper fused decoder-step runtime.
+
+## Follow-up Attempt: Eager Component Trace
+
+After the linear probe, job `49222680` attempted a diagnostic-only torch profile of `main_generation.seq9` with both `inference_generation_compile=false` and `inference_active_prefix_decode_cuda_graph=false`, while keeping active-prefix bucket64, stateful monotonic, and q1 BMM enabled. The goal was to expose attention/MLP child ranges that CUDA graph replay hides.
+
+Run root:
+
+`/work/imt11/Mapperatorinator/runs/postq1-eager-component-trace-20260703-024100-202d3d4`
+
+The job was canceled after `2m18s` with no profile artifact. It reached the selected traced seq9 window but torch-profiler overhead was too high for this broad eager path. Do not use this as timing evidence. If component attribution is still needed, build a lighter direct-step microprobe that captures real self-attention and q1 cross-attention tensors, instead of profiling a whole eager generate window.
