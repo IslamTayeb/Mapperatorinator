@@ -28,6 +28,49 @@ def _add_diagnostic_wall(diagnostics: dict[str, Any], key: str, seconds: float) 
     diagnostics[key] = float(diagnostics.get(key, 0.0)) + float(seconds)
 
 
+def _record_diagnostic_cuda_start() -> tuple[Any, Any] | tuple[None, None]:
+    if not torch.cuda.is_available():
+        return None, None
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
+    return start_event, end_event
+
+
+def _add_diagnostic_cuda_event(
+        diagnostics: dict[str, Any],
+        name: str,
+        start_event: Any,
+        end_event: Any,
+) -> None:
+    if start_event is None or end_event is None:
+        return
+    end_event.record()
+    diagnostics.setdefault("_cuda_events", []).append((name, start_event, end_event))
+
+
+def _finalize_active_prefix_diagnostics(diagnostics: dict[str, Any] | None) -> None:
+    if diagnostics is None:
+        return
+    events = diagnostics.pop("_cuda_events", [])
+    if events:
+        torch.cuda.synchronize()
+    cuda_event_ms = diagnostics.setdefault("cuda_event_ms", {})
+    cuda_event_calls = diagnostics.setdefault("cuda_event_calls", {})
+    for name, start_event, end_event in events:
+        cuda_event_ms[name] = float(cuda_event_ms.get(name, 0.0)) + float(start_event.elapsed_time(end_event))
+        cuda_event_calls[name] = int(cuda_event_calls.get(name, 0)) + 1
+
+    decode_steps = max(int(diagnostics.get("decode_steps", 0)), 1)
+    per_decode_step_us = diagnostics.setdefault("cuda_event_per_decode_step_us", {})
+    for name, milliseconds in cuda_event_ms.items():
+        per_decode_step_us[name] = float(milliseconds) * 1000.0 / decode_steps
+    diagnostics["cuda_event_note"] = (
+        "Diagnostic-only CUDA event timings; nested ranges are non-exclusive and include queued GPU work "
+        "between range entry/exit on the current stream."
+    )
+
+
 @contextmanager
 def _diagnostic_range(
         diagnostics: dict[str, Any] | None,
@@ -41,10 +84,12 @@ def _diagnostic_range(
         return
 
     start = time.perf_counter()
+    start_event, end_event = _record_diagnostic_cuda_start()
     with profile_range(f"active_prefix.{name}"):
         try:
             yield
         finally:
+            _add_diagnostic_cuda_event(diagnostics, name, start_event, end_event)
             elapsed = time.perf_counter() - start
             if wall_key is not None:
                 _add_diagnostic_wall(diagnostics, wall_key, elapsed)
@@ -302,102 +347,38 @@ def active_prefix_decode_generate(
     diagnostic_graph_cache: dict[tuple[Any, ...], dict[str, Any]] = (
         graph_cache if shared_graph_cache is None else {}
     )
-    while model._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
-        if active_prefix_decode_diagnostics is not None:
-            with _diagnostic_range(
-                    active_prefix_decode_diagnostics,
-                    "prepare_inputs",
-                    wall_key="prepare_inputs_wall_cpu_s",
-            ):
-                model_inputs = model.prepare_inputs_for_generation(input_ids, **model_kwargs)
-        else:
-            model_inputs = model.prepare_inputs_for_generation(input_ids, **model_kwargs)
-
-        if is_prefill:
+    try:
+        while model._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
             if active_prefix_decode_diagnostics is not None:
                 with _diagnostic_range(
                         active_prefix_decode_diagnostics,
-                        "prefill_forward",
-                        wall_key="prefill_forward_wall_cpu_s",
+                        "prepare_inputs",
+                        wall_key="prepare_inputs_wall_cpu_s",
                 ):
-                    outputs = model(**model_inputs, return_dict=True)
+                    model_inputs = model.prepare_inputs_for_generation(input_ids, **model_kwargs)
             else:
-                outputs = model(**model_inputs, return_dict=True)
-            is_prefill = False
-        else:
-            decode_steps += 1
-            prefix_length = _bucketed_prefix_length(cur_len, active_prefix_bucket_size, max_cache_len)
-            _record_decode_bucket(active_prefix_decode_diagnostics, prefix_length)
-            use_cuda_graph = cuda_graph_forward and decode_steps >= cuda_graph_min_decode_steps
-            if cuda_graph_forward and not use_cuda_graph:
-                with active_prefix_self_attention_context(prefix_length):
-                    outputs = model(**model_inputs, return_dict=True)
-            elif cuda_graph_forward:
+                model_inputs = model.prepare_inputs_for_generation(input_ids, **model_kwargs)
+
+            if is_prefill:
                 if active_prefix_decode_diagnostics is not None:
-                    first_decode = int(active_prefix_decode_diagnostics.get("decode_steps", 0)) == 1
-                    wall_key = (
-                        "first_decode_forward_wall_cpu_s"
-                        if first_decode
-                        else "steady_decode_forward_wall_cpu_s"
-                    )
-                    decode_context = _diagnostic_range(
-                        active_prefix_decode_diagnostics,
-                        "decode_forward.cuda_graph",
-                        wall_key=wall_key,
-                        aggregate_wall_key="decode_forward_wall_cpu_s",
-                    )
+                    with _diagnostic_range(
+                            active_prefix_decode_diagnostics,
+                            "prefill_forward",
+                            wall_key="prefill_forward_wall_cpu_s",
+                    ):
+                        outputs = model(**model_inputs, return_dict=True)
                 else:
-                    decode_context = _diagnostic_range(None, "decode_forward.cuda_graph")
-                with decode_context:
-                    graph_key = _cuda_graph_signature(prefix_length, model_inputs)
-                    graph_entry = graph_cache.get(graph_key)
-                    captured_this_record = False
-                    if graph_entry is None:
-                        graph_static_inputs = _clone_static_graph_inputs(model_inputs)
-                        graph, graph_outputs, capture_seconds = _capture_decode_cuda_graph(
-                            model,
-                            graph_static_inputs,
-                            active_prefix_length=prefix_length,
-                            warmup=cuda_graph_warmup,
-                        )
-                        graph_entry = {
-                            "graph": graph,
-                            "outputs": graph_outputs,
-                            "static_inputs": graph_static_inputs,
-                            "active_prefix_length": prefix_length,
-                            "capture_seconds": capture_seconds,
-                            "decode_replays": 0,
-                        }
-                        graph_cache[graph_key] = graph_entry
-                        captured_this_record = True
-                    else:
-                        _copy_static_graph_inputs(graph_entry["static_inputs"], model_inputs)
-                        graph_entry["graph"].replay()
-                    graph_entry["decode_replays"] = int(graph_entry["decode_replays"]) + 1
-                    diagnostic_graph_entry = diagnostic_graph_cache.get(graph_key)
-                    if diagnostic_graph_entry is None:
-                        diagnostic_graph_entry = {
-                            "graph": graph_entry["graph"],
-                            "outputs": graph_entry["outputs"],
-                            "static_inputs": graph_entry["static_inputs"],
-                            "active_prefix_length": graph_entry["active_prefix_length"],
-                            "capture_seconds": (
-                                graph_entry["capture_seconds"]
-                                if captured_this_record
-                                else 0.0
-                            ),
-                            "decode_replays": 0,
-                        }
-                        diagnostic_graph_cache[graph_key] = diagnostic_graph_entry
-                    diagnostic_graph_entry["decode_replays"] = int(diagnostic_graph_entry["decode_replays"]) + 1
-                    _update_cuda_graph_diagnostics(
-                        active_prefix_decode_diagnostics,
-                        warmup=cuda_graph_warmup,
-                        graph_cache=diagnostic_graph_cache,
-                    )
-                    outputs = graph_entry["outputs"]
+                    outputs = model(**model_inputs, return_dict=True)
+                is_prefill = False
             else:
-                with active_prefix_self_attention_context(prefix_length):
+                decode_steps += 1
+                prefix_length = _bucketed_prefix_length(cur_len, active_prefix_bucket_size, max_cache_len)
+                _record_decode_bucket(active_prefix_decode_diagnostics, prefix_length)
+                use_cuda_graph = cuda_graph_forward and decode_steps >= cuda_graph_min_decode_steps
+                if cuda_graph_forward and not use_cuda_graph:
+                    with active_prefix_self_attention_context(prefix_length):
+                        outputs = model(**model_inputs, return_dict=True)
+                elif cuda_graph_forward:
                     if active_prefix_decode_diagnostics is not None:
                         first_decode = int(active_prefix_decode_diagnostics.get("decode_steps", 0)) == 1
                         wall_key = (
@@ -405,134 +386,201 @@ def active_prefix_decode_generate(
                             if first_decode
                             else "steady_decode_forward_wall_cpu_s"
                         )
-                        with _diagnostic_range(
-                                active_prefix_decode_diagnostics,
-                                "decode_forward",
-                                wall_key=wall_key,
-                                aggregate_wall_key="decode_forward_wall_cpu_s",
-                        ):
-                            outputs = model_forward(**model_inputs, return_dict=True)
+                        decode_context = _diagnostic_range(
+                            active_prefix_decode_diagnostics,
+                            "decode_forward.cuda_graph",
+                            wall_key=wall_key,
+                            aggregate_wall_key="decode_forward_wall_cpu_s",
+                        )
                     else:
-                        outputs = model_forward(**model_inputs, return_dict=True)
+                        decode_context = _diagnostic_range(None, "decode_forward.cuda_graph")
+                    with decode_context:
+                        graph_key = _cuda_graph_signature(prefix_length, model_inputs)
+                        graph_entry = graph_cache.get(graph_key)
+                        captured_this_record = False
+                        if graph_entry is None:
+                            graph_static_inputs = _clone_static_graph_inputs(model_inputs)
+                            graph, graph_outputs, capture_seconds = _capture_decode_cuda_graph(
+                                model,
+                                graph_static_inputs,
+                                active_prefix_length=prefix_length,
+                                warmup=cuda_graph_warmup,
+                            )
+                            graph_entry = {
+                                "graph": graph,
+                                "outputs": graph_outputs,
+                                "static_inputs": graph_static_inputs,
+                                "active_prefix_length": prefix_length,
+                                "capture_seconds": capture_seconds,
+                                "decode_replays": 0,
+                            }
+                            graph_cache[graph_key] = graph_entry
+                            captured_this_record = True
+                        else:
+                            _copy_static_graph_inputs(graph_entry["static_inputs"], model_inputs)
+                            graph_entry["graph"].replay()
+                        graph_entry["decode_replays"] = int(graph_entry["decode_replays"]) + 1
+                        diagnostic_graph_entry = diagnostic_graph_cache.get(graph_key)
+                        if diagnostic_graph_entry is None:
+                            diagnostic_graph_entry = {
+                                "graph": graph_entry["graph"],
+                                "outputs": graph_entry["outputs"],
+                                "static_inputs": graph_entry["static_inputs"],
+                                "active_prefix_length": graph_entry["active_prefix_length"],
+                                "capture_seconds": (
+                                    graph_entry["capture_seconds"]
+                                    if captured_this_record
+                                    else 0.0
+                                ),
+                                "decode_replays": 0,
+                            }
+                            diagnostic_graph_cache[graph_key] = diagnostic_graph_entry
+                        diagnostic_graph_entry["decode_replays"] = int(diagnostic_graph_entry["decode_replays"]) + 1
+                        _update_cuda_graph_diagnostics(
+                            active_prefix_decode_diagnostics,
+                            warmup=cuda_graph_warmup,
+                            graph_cache=diagnostic_graph_cache,
+                        )
+                        outputs = graph_entry["outputs"]
+                else:
+                    with active_prefix_self_attention_context(prefix_length):
+                        if active_prefix_decode_diagnostics is not None:
+                            first_decode = int(active_prefix_decode_diagnostics.get("decode_steps", 0)) == 1
+                            wall_key = (
+                                "first_decode_forward_wall_cpu_s"
+                                if first_decode
+                                else "steady_decode_forward_wall_cpu_s"
+                            )
+                            with _diagnostic_range(
+                                    active_prefix_decode_diagnostics,
+                                    "decode_forward",
+                                    wall_key=wall_key,
+                                    aggregate_wall_key="decode_forward_wall_cpu_s",
+                            ):
+                                outputs = model_forward(**model_inputs, return_dict=True)
+                        else:
+                            outputs = model_forward(**model_inputs, return_dict=True)
 
-        if active_prefix_decode_diagnostics is not None:
-            with _diagnostic_range(
-                    active_prefix_decode_diagnostics,
-                    "update_model_kwargs",
-                    wall_key="update_kwargs_wall_cpu_s",
-            ):
+            if active_prefix_decode_diagnostics is not None:
+                with _diagnostic_range(
+                        active_prefix_decode_diagnostics,
+                        "update_model_kwargs",
+                        wall_key="update_kwargs_wall_cpu_s",
+                ):
+                    model_kwargs = model._update_model_kwargs_for_generation(
+                        outputs,
+                        model_kwargs,
+                        is_encoder_decoder=model.config.is_encoder_decoder,
+                    )
+            else:
                 model_kwargs = model._update_model_kwargs_for_generation(
                     outputs,
                     model_kwargs,
                     is_encoder_decoder=model.config.is_encoder_decoder,
                 )
-        else:
-            model_kwargs = model._update_model_kwargs_for_generation(
-                outputs,
-                model_kwargs,
-                is_encoder_decoder=model.config.is_encoder_decoder,
-            )
-        if stable_encoder_holder is not None:
-            encoder_outputs = model_kwargs.get("encoder_outputs")
-            if encoder_outputs is not None:
-                model_kwargs["encoder_outputs"] = _stable_encoder_outputs(stable_encoder_holder, encoder_outputs)
+            if stable_encoder_holder is not None:
+                encoder_outputs = model_kwargs.get("encoder_outputs")
+                if encoder_outputs is not None:
+                    model_kwargs["encoder_outputs"] = _stable_encoder_outputs(stable_encoder_holder, encoder_outputs)
 
-        if active_prefix_decode_diagnostics is not None:
-            with _diagnostic_range(
-                    active_prefix_decode_diagnostics,
-                    "logits_extract",
-                    wall_key="logits_extract_wall_cpu_s",
-            ):
-                next_token_logits = outputs.logits[:, -1, :].to(
-                    copy=True,
-                    dtype=torch.float32,
-                    device=input_ids.device,
-                )
-            with _diagnostic_range(
-                    active_prefix_decode_diagnostics,
-                    "logits_processor",
-                    wall_key="logits_processor_wall_cpu_s",
-            ):
-                next_token_scores = _apply_logits_processors_with_diagnostics(
-                    logits_processor,
-                    input_ids,
-                    next_token_logits,
-                    active_prefix_decode_diagnostics,
-                )
-        else:
-            next_token_logits = outputs.logits[:, -1, :].to(copy=True, dtype=torch.float32, device=input_ids.device)
-            next_token_scores = logits_processor(input_ids, next_token_logits)
-
-        if do_sample:
             if active_prefix_decode_diagnostics is not None:
                 with _diagnostic_range(
                         active_prefix_decode_diagnostics,
-                        "sampling.softmax",
-                        wall_key="softmax_wall_cpu_s",
-                        aggregate_wall_key="sampling_wall_cpu_s",
+                        "logits_extract",
+                        wall_key="logits_extract_wall_cpu_s",
                 ):
-                    probs = nn.functional.softmax(next_token_scores, dim=-1)
+                    next_token_logits = outputs.logits[:, -1, :].to(
+                        copy=True,
+                        dtype=torch.float32,
+                        device=input_ids.device,
+                    )
                 with _diagnostic_range(
                         active_prefix_decode_diagnostics,
-                        "sampling.multinomial",
-                        wall_key="multinomial_wall_cpu_s",
-                        aggregate_wall_key="sampling_wall_cpu_s",
+                        "logits_processor",
+                        wall_key="logits_processor_wall_cpu_s",
                 ):
+                    next_token_scores = _apply_logits_processors_with_diagnostics(
+                        logits_processor,
+                        input_ids,
+                        next_token_logits,
+                        active_prefix_decode_diagnostics,
+                    )
+            else:
+                next_token_logits = outputs.logits[:, -1, :].to(copy=True, dtype=torch.float32, device=input_ids.device)
+                next_token_scores = logits_processor(input_ids, next_token_logits)
+
+            if do_sample:
+                if active_prefix_decode_diagnostics is not None:
+                    with _diagnostic_range(
+                            active_prefix_decode_diagnostics,
+                            "sampling.softmax",
+                            wall_key="softmax_wall_cpu_s",
+                            aggregate_wall_key="sampling_wall_cpu_s",
+                    ):
+                        probs = nn.functional.softmax(next_token_scores, dim=-1)
+                    with _diagnostic_range(
+                            active_prefix_decode_diagnostics,
+                            "sampling.multinomial",
+                            wall_key="multinomial_wall_cpu_s",
+                            aggregate_wall_key="sampling_wall_cpu_s",
+                    ):
+                        next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+                else:
+                    probs = nn.functional.softmax(next_token_scores, dim=-1)
                     next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
             else:
-                probs = nn.functional.softmax(next_token_scores, dim=-1)
-                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
-        else:
-            if active_prefix_decode_diagnostics is not None:
-                with _diagnostic_range(
-                        active_prefix_decode_diagnostics,
-                        "sampling.argmax",
-                        wall_key="argmax_wall_cpu_s",
-                        aggregate_wall_key="sampling_wall_cpu_s",
-                ):
+                if active_prefix_decode_diagnostics is not None:
+                    with _diagnostic_range(
+                            active_prefix_decode_diagnostics,
+                            "sampling.argmax",
+                            wall_key="argmax_wall_cpu_s",
+                            aggregate_wall_key="sampling_wall_cpu_s",
+                    ):
+                        next_tokens = torch.argmax(next_token_scores, dim=-1)
+                else:
                     next_tokens = torch.argmax(next_token_scores, dim=-1)
-            else:
-                next_tokens = torch.argmax(next_token_scores, dim=-1)
 
-        if has_eos_stopping_criteria:
+            if has_eos_stopping_criteria:
+                if active_prefix_decode_diagnostics is not None:
+                    with _diagnostic_range(
+                            active_prefix_decode_diagnostics,
+                            "eos_mask",
+                            wall_key="eos_mask_wall_cpu_s",
+                    ):
+                        next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
+                else:
+                    next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
+
             if active_prefix_decode_diagnostics is not None:
                 with _diagnostic_range(
                         active_prefix_decode_diagnostics,
-                        "eos_mask",
-                        wall_key="eos_mask_wall_cpu_s",
+                        "append_token",
+                        wall_key="append_token_wall_cpu_s",
+                        aggregate_wall_key="token_append_stop_wall_cpu_s",
                 ):
-                    next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
+                    input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+                with _diagnostic_range(
+                        active_prefix_decode_diagnostics,
+                        "stopping_criteria",
+                        wall_key="stopping_criteria_wall_cpu_s",
+                        aggregate_wall_key="token_append_stop_wall_cpu_s",
+                ):
+                    unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, scores)
+                with _diagnostic_range(
+                        active_prefix_decode_diagnostics,
+                        "finished_check",
+                        wall_key="finished_check_wall_cpu_s",
+                        aggregate_wall_key="token_append_stop_wall_cpu_s",
+                ):
+                    this_peer_finished = unfinished_sequences.max() == 0
             else:
-                next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
-
-        if active_prefix_decode_diagnostics is not None:
-            with _diagnostic_range(
-                    active_prefix_decode_diagnostics,
-                    "append_token",
-                    wall_key="append_token_wall_cpu_s",
-                    aggregate_wall_key="token_append_stop_wall_cpu_s",
-            ):
                 input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
-            with _diagnostic_range(
-                    active_prefix_decode_diagnostics,
-                    "stopping_criteria",
-                    wall_key="stopping_criteria_wall_cpu_s",
-                    aggregate_wall_key="token_append_stop_wall_cpu_s",
-            ):
                 unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, scores)
-            with _diagnostic_range(
-                    active_prefix_decode_diagnostics,
-                    "finished_check",
-                    wall_key="finished_check_wall_cpu_s",
-                    aggregate_wall_key="token_append_stop_wall_cpu_s",
-            ):
                 this_peer_finished = unfinished_sequences.max() == 0
-        else:
-            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
-            unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, scores)
-            this_peer_finished = unfinished_sequences.max() == 0
-        cur_len += 1
+            cur_len += 1
 
-        del outputs
+            del outputs
+    finally:
+        _finalize_active_prefix_diagnostics(active_prefix_decode_diagnostics)
 
     return input_ids
