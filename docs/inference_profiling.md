@@ -78,9 +78,42 @@ The current RTX 2080/2080 Ti retained cold single-song baseline is SDPA plus `in
 - Starter success target: `100 tok/s` on a cold full-song run.
 - Strong first milestone: `120 tok/s` on a cold full-song run.
 - Stretch target: `150+ tok/s`.
-- Active long-range research target: `200 tok/s`.
+- Historical active long-range research target: `200 tok/s`, reached by the default-off exact opt-in stack below.
+- Current single-song research target: `500 tok/s`, same-calculation only, not batching or multi-process aggregate throughput.
 
 The first 100 tok/s loop ended below target by the documented stop condition because profiling showed no remaining plausible current-architecture quick win of `>=10%`. A renewed runtime pass found exact active-prefix and CUDA graph evidence, then job `49168188` added a stateful monotonic logits processor on top of that default-off path, job `49204568` reduced active-graph capture warmup to zero, job `49206207` reduced the active graph bucket size, and job `49213490` added q_len=1 BMM cross-attention for the simple fp32 active-graph path. The current fastest accepted exact opt-in path reaches `201.125 tok/s` with fixed-seed token equivalence. Reaching `200 tok/s` from the retained `92.465 tok/s` conservative baseline required cutting full-song synchronized main-generation model time from `82.615s` to about `38.195s`; the accepted q1 BMM opt-in path measured `37.981s`. The conservative cold default remains compile-only SDPA unless the user explicitly opts into the active-prefix graph stack.
+
+### 500 tok/s single-song campaign
+
+The post-200 campaign is explicitly about normal single-song inference speed on RTX 2080/2080 Ti. Do not count batching, multiple processes, multiple songs in parallel, precision changes, quantization, sampling-policy changes, RNG changes, output-policy changes, generated-token changes, or output-length changes as equivalent single-song speedups.
+
+Use the fastest exact opt-in path as the campaign baseline unless a new full-song exact-equivalent single-song run beats it:
+
+```bash
+python inference.py --config-name profile_salvalai \
+  inference_generation_compile=true \
+  inference_active_prefix_decode_loop=true \
+  inference_active_prefix_decode_bucket_size=64 \
+  inference_active_prefix_decode_cuda_graph=true \
+  inference_active_prefix_decode_cuda_graph_warmup=0 \
+  inference_active_prefix_decode_cuda_graph_min_decode_steps=1 \
+  inference_stateful_monotonic_logits_processor=true \
+  inference_q1_bmm_cross_attention=true
+```
+
+For SALVALAI's `7,639` main tokens, `500 tok/s` implies about `15.278s` synchronized main-generation model time, a further `59.8%` reduction from the accepted q1-BMM path (`37.981s`). Treat this as a runtime/kernel campaign, not a quick-tweak loop. Re-profile the accepted stack first, use untraced `profile_inference` for speed claims, and use Nsight/torch profiler only for diagnosis.
+
+The first campaign checkpoint adds default-off verifier infrastructure, not a speed claim:
+
+- `inference_decode_session_runtime=false`
+- `inference_decode_session_cuda_graph=false`
+- `inference_decode_session_chunk_size=1`
+- `inference_native_decode_kernels=false`
+- `utils/verify_one_token_decode.py --candidate-decode-session`
+
+`DecodeSession` lives in `osuT5.osuT5.inference.direct_decode` and currently delegates to the existing exact static-cache one-token helpers. Keep it verifier-first until generated-token identity, raw-logit/top-k equality, final RNG-state identity, and output/map behavior are proven across multiple sampled decode steps and windows.
+
+Prefer PyTorch built-ins first, then isolated C++/CUDA/CUTLASS/cuBLASLt kernels for measured dominant hotspots. Avoid Triton-first work unless there is no stable practical alternative and the path is default-off, isolated, exact, and strongly measured. Do not retry simple BMM for active-prefix self-attention: job `49221520` showed it is slower than SDPA at bucket-like lengths (`L=64`, `96`, `128`), while q1 BMM remains justified for long unmasked cross-attention.
 
 Only count a speedup as equivalent when fixed-seed generated token IDs match the baseline for the same audio/config slice. Do not claim wins from changed precision, sampling policy, output policy, model quality, windowing/overlap, or generated-token behavior unless the run is explicitly labeled non-equivalent.
 
@@ -707,17 +740,17 @@ Direct-step CUDA graph and attention ceiling results:
 
 Promote a change to a full-song SALVALAI run only when smoke results are stable, token IDs match, and the speedup is plausibly meaningful. For compile-like changes with one-time first-window costs, inspect post-warmup per-window throughput before rejecting a weak total smoke result. Keep changes that improve RTX 2080 full-song main-generation throughput by about 10% or more. Keep 5-10% wins only when they are simple and well-contained or strategically de-risk the custom runtime path. Remove 1-3% complexity by default.
 
-For the current 200 tok/s phase, stop the long-running optimization loop only when either the full-song RTX 2080/2080 Ti run reaches at least `200 tok/s` with identical fixed-seed tokens, or profiling across multiple exact-calculation optimization families shows no remaining plausible major exact-calculation path.
+Historical pre-q1-BMM 200 tok/s phase stop rule: stop the long-running optimization loop only when either the full-song RTX 2080/2080 Ti run reaches at least `200 tok/s` with identical fixed-seed tokens, or profiling across multiple exact-calculation optimization families shows no remaining plausible major exact-calculation path. This rule is now historical because job `49213490` reached `201.125 tok/s` on the default-off exact opt-in path; use the `500 tok/s single-song campaign` section for current work.
 
-Current status after active-prefix validation:
+Historical status after active-prefix validation, before q1-BMM cross-attention:
 
 - Retained cold single-song baseline: SDPA plus `inference_generation_compile=true`, active-prefix disabled. Full-song job `49113713` generated `7,639` main tokens in `82.615s`, `92.465 tok/s`, token equivalence PASS against the compile-disabled baseline. Same-commit paired job `49150185` measured compile-only at `92.998 tok/s`.
 - Current retained flags: `attn_implementation=sdpa`, `inference_generation_compile=true`, `inference_active_prefix_decode_loop=false`, `seed=12345`, `profile_record_token_ids=true`.
 - Active-prefix is an opt-in strategic candidate, not the retained cold baseline. Bucket `256` in job `49150185` looked like a large exact win (`92.998 -> 121.926 tok/s`), but later full-song runs showed order/warm-state sensitivity. Job `49151748` measured bucket `256` cold at `88.699 tok/s`, bucket `128` at `81.396 tok/s`, and bucket `512` warm at `108.313 tok/s`, all token-equivalent against bucket `256`.
 - Bucket `512` cold-first validation job `49152465` generated `7,639` main tokens in `78.108s`, `97.800 tok/s`, token equivalence PASS against a same-job compile-only run. That is only about `+5.8%` against the retained `92.465 tok/s` compile-only baseline and it still regressed the first main-generation window and timing/total stage against clean retained runs, so it stays default-off.
-- Reaching `200 tok/s` from the retained `92.465 tok/s` baseline requires reducing main-generation model time to `38.195s`, so about `44.420s` or `53.8%` of retained model time remains to remove.
+- At this checkpoint, reaching `200 tok/s` from the retained `92.465 tok/s` baseline required reducing main-generation model time to `38.195s`, so about `44.420s` or `53.8%` of retained model time remained to remove. The later q1-BMM path reached `37.981s`.
 
-For the 200 tok/s phase, rank the next experiments this way:
+For that historical 200 tok/s phase, the next experiments were ranked this way:
 
 1. Preflight exactness and measurement infrastructure: metadata contract checks, one-token raw-logits gate, detailed decoder-step ranges, and SDPA backend dispatch audits.
 2. Exact custom decode-loop prototype with CUDA graph discipline, gated to local batch-one static-cache generation first.
@@ -742,7 +775,9 @@ Post-warmup torch-profiler diagnostic for the 15s retained baseline:
 - Top CUDA self-time events were the compiled forward region and f32 memory-efficient attention on SM75: `Torch-Compiled Region: 0/2` `1.717s`, `fmha_cutlassF_f32_aligned_64x64_rf_sm75` `1.476s`.
 - Sampling/logits overhead was visible but not target-sized in this trace: `aten::sort` `234` calls, `7.601ms` CUDA total; `aten::_softmax` `468` calls, `1.759ms` self CUDA; `aten::cat` `542` calls, `1.433ms` self CUDA. Do not prioritize a fused sampler unless a future trace shows it has grown to at least `10%` of synchronized main-generation time.
 
-## Codex Goal Prompt
+## Historical 100 tok/s Goal Prompt
+
+Superseded by the 200 tok/s and then 500 tok/s campaigns. Keep this only as campaign history.
 
 ```text
 Optimize Mapperatorinator inference on RTX 2080/2080 Ti for same-calculation speedups only. Current baseline is roughly 65-78 tok/s; first success target is 100 tok/s main-generation throughput, strong milestone is 120 tok/s, and 150+ tok/s is stretch. Do not claim speedups from changed precision, sampling policy, output policy, model quality, windowing/overlap, or generated-token behavior unless explicitly labeled non-equivalent.
@@ -752,7 +787,9 @@ Use a profiling-first loop. Start with a middle-30-second song smoke slice, prov
 Scout improvement ideas with subagents and web research as useful, but accept only measured wins. Prioritize big wins in generation-loop structure, cache behavior, mask construction, logits processors, repeated small kernels, memory movement, and avoidable per-token setup. Keep changes that improve RTX 2080 full-song main-generation throughput by >=10%; keep 5-10% only if very simple; remove 1-3% complexity. Commit and push clean checkpoints for accepted wins, document why each win worked or failed in docs/inference_profiling.md, update AGENTS.md with durable conventions, write notes under notes/, and stop when the 100 tok/s goal is reached or profiling shows no remaining plausible >=10% exact-calculation improvement.
 ```
 
-## 200 tok/s Goal Prompt
+## Historical 200 tok/s Goal Prompt
+
+Superseded by the accepted `201.125 tok/s` exact opt-in path and the current 500 tok/s single-song campaign. Keep this only as campaign history.
 
 ```text
 Optimize Mapperatorinator inference toward 200 tok/s main-generation throughput on RTX 2080/2080 Ti, same-calculation only. Current retained baseline is SDPA + inference_generation_compile=true with active-prefix disabled: 7,639 full-song SALVALAI main tokens, 82.615s synchronized model time, 92.465 tok/s, fixed-seed token equivalence PASS against the compile-disabled full-song baseline.

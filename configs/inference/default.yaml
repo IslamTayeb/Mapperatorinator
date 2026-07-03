@@ -67,6 +67,10 @@ inference_active_prefix_decode_cuda_graph_warmup: 0 # Warmup forwards before eac
 inference_active_prefix_decode_cuda_graph_min_decode_steps: 1 # First 1-based decode step eligible for graph capture
 inference_stateful_monotonic_logits_processor: false # Experimental batch-1 stateful monotonic time-shift mask
 inference_q1_bmm_cross_attention: false # Experimental fp32 q_len=1 cross-attention via bmm/softmax/bmm
+inference_decode_session_runtime: false # Verifier-first single-song DecodeSession runtime scaffold; no production speed claim yet
+inference_decode_session_cuda_graph: false # Reserved for DecodeSession-owned CUDA graph replay after token/logit/RNG gates
+inference_decode_session_chunk_size: 1 # Reserved DecodeSession decode chunk size; chunking must preserve RNG/token identity
+inference_native_decode_kernels: false # Reserved default-off native C++/CUDA/CUTLASS decode-kernel experiments
 use_server: false        # Use server for optimized multiprocess inference (adds about 8% overhead)
 max_batch_size: 16       # Maximum batch size for inference
 profile_inference: false # Write stage and generation timing profile JSON

@@ -26,6 +26,139 @@ class OneTokenDecodeResult:
     prepared_inputs: dict[str, Any]
 
 
+@dataclass
+class EncoderState:
+    encoder_outputs: BaseModelOutput
+
+
+@dataclass
+class DecoderCacheState:
+    cache: MapperatorinatorCache
+    prompt_length: int
+    prefill_cache_position: torch.LongTensor
+    prefill_prepared_inputs: dict[str, Any]
+
+
+@dataclass
+class StaticInputBuffers:
+    prompt: torch.LongTensor
+    prompt_attention_mask: torch.Tensor
+    frames: torch.Tensor
+
+
+@dataclass
+class SamplerState:
+    logits_processor: Any | None = None
+    stopping_criteria: Any | None = None
+    rng_state: torch.Tensor | None = None
+
+
+@dataclass
+class GraphState:
+    graphs: dict[tuple[Any, ...], Any]
+
+
+@dataclass
+class DecodeSession:
+    """Verifier-first ABI for future single-song decode runtime work.
+
+    This wrapper intentionally delegates to the existing exact one-token helpers.
+    It gives runtime/kernel experiments stable ownership boundaries without
+    changing production inference behavior.
+    """
+
+    model: Any
+    encoder_state: EncoderState
+    cache_state: DecoderCacheState
+    static_inputs: StaticInputBuffers
+    condition_kwargs: dict[str, Any]
+    sampler_state: SamplerState
+    graph_state: GraphState
+
+    @classmethod
+    @torch.no_grad()
+    def prefill(
+            cls,
+            model,
+            *,
+            prompt: torch.LongTensor,
+            prompt_attention_mask: torch.Tensor,
+            frames: torch.Tensor,
+            condition_kwargs: dict[str, Any] | None = None,
+            active_prefix_self_attention: bool = False,
+    ) -> "DecodeSession":
+        condition_kwargs = condition_kwargs or {}
+        state = prefill_static_cache(
+            model,
+            prompt=prompt,
+            prompt_attention_mask=prompt_attention_mask,
+            frames=frames,
+            condition_kwargs=condition_kwargs,
+            active_prefix_self_attention=active_prefix_self_attention,
+        )
+        return cls(
+            model=model,
+            encoder_state=EncoderState(encoder_outputs=state.encoder_outputs),
+            cache_state=DecoderCacheState(
+                cache=state.cache,
+                prompt_length=state.prompt_length,
+                prefill_cache_position=state.prefill_cache_position,
+                prefill_prepared_inputs=state.prefill_prepared_inputs,
+            ),
+            static_inputs=StaticInputBuffers(
+                prompt=prompt,
+                prompt_attention_mask=prompt_attention_mask,
+                frames=frames,
+            ),
+            condition_kwargs=condition_kwargs,
+            sampler_state=SamplerState(),
+            graph_state=GraphState(graphs={}),
+        )
+
+    def _one_token_state(self) -> OneTokenDecodeState:
+        return OneTokenDecodeState(
+            cache=self.cache_state.cache,
+            encoder_outputs=self.encoder_state.encoder_outputs,
+            prompt_length=self.cache_state.prompt_length,
+            prefill_cache_position=self.cache_state.prefill_cache_position,
+            prefill_prepared_inputs=self.cache_state.prefill_prepared_inputs,
+        )
+
+    def one_token_state(self) -> OneTokenDecodeState:
+        return self._one_token_state()
+
+    @torch.no_grad()
+    def decode_one_token_raw_logits(
+            self,
+            *,
+            full_prefix: torch.LongTensor,
+            full_attention_mask: torch.Tensor,
+            cache_position: torch.LongTensor | None = None,
+            active_prefix_self_attention: bool = False,
+            active_prefix_self_attention_length: int | None = None,
+    ) -> OneTokenDecodeResult:
+        return decode_one_token_raw_logits(
+            self.model,
+            self._one_token_state(),
+            full_prefix=full_prefix,
+            full_attention_mask=full_attention_mask,
+            condition_kwargs=self.condition_kwargs,
+            cache_position=cache_position,
+            active_prefix_self_attention=active_prefix_self_attention,
+            active_prefix_self_attention_length=active_prefix_self_attention_length,
+        )
+
+    def metadata(self) -> dict[str, Any]:
+        return {
+            "prompt_length": int(self.cache_state.prompt_length),
+            "graph_count": len(self.graph_state.graphs),
+            "prefill_cache_position_shape": list(self.cache_state.prefill_cache_position.shape),
+            "prompt_shape": list(self.static_inputs.prompt.shape),
+            "prompt_attention_mask_shape": list(self.static_inputs.prompt_attention_mask.shape),
+            "frames_shape": list(self.static_inputs.frames.shape),
+        }
+
+
 def last_token_logits(logits: torch.Tensor) -> torch.Tensor:
     return logits[:, -1, :].detach().to(torch.float32)
 

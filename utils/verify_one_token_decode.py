@@ -29,6 +29,7 @@ from inference import (
 from osuT5.osuT5.inference import Postprocessor, Preprocessor, Processor
 from osuT5.osuT5.inference.cache_utils import get_cache
 from osuT5.osuT5.inference.direct_decode import (
+    DecodeSession,
     decode_one_token_raw_logits,
     last_token_logits as _last_token_logits,
     prefill_static_cache,
@@ -275,6 +276,7 @@ def run_one_token_gate(
         candidate_active_prefix_decode: bool | None = None,
         candidate_active_prefix_decode_length: int | None = None,
         candidate_q1_bmm_cross_attention: bool = False,
+        candidate_decode_session: bool = False,
 ) -> dict[str, Any]:
     _assert_supported_probe(args)
     if probe_token_id is not None:
@@ -344,6 +346,7 @@ def run_one_token_gate(
         "candidate_active_prefix_decode": active_prefix_decode,
         "candidate_active_prefix_decode_length": candidate_active_prefix_decode_length,
         "candidate_q1_bmm_cross_attention": bool(candidate_q1_bmm_cross_attention),
+        "candidate_decode_session": bool(candidate_decode_session),
     }
 
     prompt = model_inputs["decoder_input_ids"]
@@ -445,23 +448,42 @@ def run_one_token_gate(
                 sdpa_backend=args.profile_sdpa_backend,
                 q1_bmm_cross_attention=candidate_q1_bmm_cross_attention,
         ):
-            decode_state = prefill_static_cache(
-                model,
-                prompt=prompt,
-                prompt_attention_mask=prompt_mask,
-                frames=model_inputs["frames"],
-                condition_kwargs=condition_kwargs,
-                active_prefix_self_attention=active_prefix_prefill,
-            )
-            candidate_result = decode_one_token_raw_logits(
-                model,
-                decode_state,
-                full_prefix=full_prefix,
-                full_attention_mask=full_mask,
-                condition_kwargs=condition_kwargs,
-                active_prefix_self_attention=active_prefix_decode,
-                active_prefix_self_attention_length=candidate_active_prefix_decode_length,
-            )
+            decode_session_metadata = None
+            if candidate_decode_session:
+                decode_session = DecodeSession.prefill(
+                    model,
+                    prompt=prompt,
+                    prompt_attention_mask=prompt_mask,
+                    frames=model_inputs["frames"],
+                    condition_kwargs=condition_kwargs,
+                    active_prefix_self_attention=active_prefix_prefill,
+                )
+                candidate_result = decode_session.decode_one_token_raw_logits(
+                    full_prefix=full_prefix,
+                    full_attention_mask=full_mask,
+                    active_prefix_self_attention=active_prefix_decode,
+                    active_prefix_self_attention_length=candidate_active_prefix_decode_length,
+                )
+                decode_state = decode_session.one_token_state()
+                decode_session_metadata = decode_session.metadata()
+            else:
+                decode_state = prefill_static_cache(
+                    model,
+                    prompt=prompt,
+                    prompt_attention_mask=prompt_mask,
+                    frames=model_inputs["frames"],
+                    condition_kwargs=condition_kwargs,
+                    active_prefix_self_attention=active_prefix_prefill,
+                )
+                candidate_result = decode_one_token_raw_logits(
+                    model,
+                    decode_state,
+                    full_prefix=full_prefix,
+                    full_attention_mask=full_mask,
+                    condition_kwargs=condition_kwargs,
+                    active_prefix_self_attention=active_prefix_decode,
+                    active_prefix_self_attention_length=candidate_active_prefix_decode_length,
+                )
         candidate_inputs = candidate_result.prepared_inputs
         candidate_logits = candidate_result.logits
 
@@ -510,6 +532,7 @@ def run_one_token_gate(
         ),
         "prepared_prefill_shape": list(decode_state.prefill_prepared_inputs["decoder_input_ids"].shape),
         "prepared_candidate_shape": list(candidate_inputs["decoder_input_ids"].shape),
+        "decode_session": decode_session_metadata,
         "finite_allclose": comparison["finite_allclose"],
         "nonfinite_match": comparison["nonfinite_match"],
         "positive_inf_match": comparison["positive_inf_match"],
@@ -596,6 +619,11 @@ def main() -> None:
         action="store_true",
         help="Enable the experimental fp32 q_len=1 BMM cross-attention candidate for direct decode.",
     )
+    parser.add_argument(
+        "--candidate-decode-session",
+        action="store_true",
+        help="Route the direct candidate through the verifier-first DecodeSession ABI.",
+    )
     parser.add_argument("--report-path", type=Path, default=None)
     parser.add_argument("overrides", nargs="*", help="Hydra overrides, e.g. model_path=/path/to/model")
     cli_args = parser.parse_args()
@@ -622,6 +650,7 @@ def main() -> None:
         ),
         candidate_active_prefix_decode_length=cli_args.candidate_active_prefix_decode_length,
         candidate_q1_bmm_cross_attention=cli_args.candidate_q1_bmm_cross_attention,
+        candidate_decode_session=cli_args.candidate_decode_session,
     )
     result["metadata"]["config_name"] = cli_args.config_name
     result["wall_seconds"] = time.perf_counter() - start
