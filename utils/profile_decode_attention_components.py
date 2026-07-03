@@ -149,7 +149,8 @@ __global__ void q1_attention_kernel(
     }
 }
 
-torch::Tensor q1_attention(torch::Tensor q, torch::Tensor k, torch::Tensor v, c10::optional<torch::Tensor> mask) {
+template<int BLOCK_SIZE>
+torch::Tensor q1_attention_impl(torch::Tensor q, torch::Tensor k, torch::Tensor v, c10::optional<torch::Tensor> mask) {
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "q/k/v must be CUDA tensors");
     TORCH_CHECK(q.scalar_type() == torch::kFloat32, "q must be fp32");
     TORCH_CHECK(k.scalar_type() == torch::kFloat32, "k must be fp32");
@@ -177,12 +178,11 @@ torch::Tensor q1_attention(torch::Tensor q, torch::Tensor k, torch::Tensor v, c1
         has_mask = 1;
     }
 
-    constexpr int block_size = 128;
     dim3 grid(heads);
-    dim3 block(block_size);
-    size_t shared_bytes = static_cast<size_t>(kv_len + block_size) * sizeof(float);
+    dim3 block(BLOCK_SIZE);
+    size_t shared_bytes = static_cast<size_t>(kv_len + BLOCK_SIZE) * sizeof(float);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    q1_attention_kernel<block_size><<<grid, block, shared_bytes, stream>>>(
+    q1_attention_kernel<BLOCK_SIZE><<<grid, block, shared_bytes, stream>>>(
         q.data_ptr<float>(),
         k.data_ptr<float>(),
         v.data_ptr<float>(),
@@ -204,6 +204,23 @@ torch::Tensor q1_attention(torch::Tensor q, torch::Tensor k, torch::Tensor v, c1
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
+
+torch::Tensor q1_attention_block(torch::Tensor q, torch::Tensor k, torch::Tensor v, c10::optional<torch::Tensor> mask, int block_size) {
+    switch (block_size) {
+        case 64:
+            return q1_attention_impl<64>(q, k, v, mask);
+        case 128:
+            return q1_attention_impl<128>(q, k, v, mask);
+        case 256:
+            return q1_attention_impl<256>(q, k, v, mask);
+        default:
+            TORCH_CHECK(false, "unsupported q1 attention block size; expected 64, 128, or 256");
+    }
+}
+
+torch::Tensor q1_attention(torch::Tensor q, torch::Tensor k, torch::Tensor v, c10::optional<torch::Tensor> mask) {
+    return q1_attention_block(q, k, v, mask, 128);
+}
 """
 
     _NATIVE_Q1_ATTENTION = load_inline(
@@ -212,9 +229,11 @@ torch::Tensor q1_attention(torch::Tensor q, torch::Tensor k, torch::Tensor v, c1
             "#include <torch/extension.h>\n"
             "torch::Tensor q1_attention(torch::Tensor q, torch::Tensor k, torch::Tensor v, "
             "c10::optional<torch::Tensor> mask);\n"
+            "torch::Tensor q1_attention_block(torch::Tensor q, torch::Tensor k, torch::Tensor v, "
+            "c10::optional<torch::Tensor> mask, int block_size);\n"
         ),
         cuda_sources=cuda_source,
-        functions=["q1_attention"],
+        functions=["q1_attention", "q1_attention_block"],
         extra_cuda_cflags=["-O3"],
         verbose=False,
     )
@@ -319,7 +338,7 @@ def _output_transform_only(capture: AttentionCapture, attention_output: torch.Te
     return attention_output.transpose(1, 2).contiguous().view(capture.bs, -1, capture.dim)
 
 
-def _native_q1_attention_only(capture: AttentionCapture) -> torch.Tensor:
+def _native_q1_attention_only(capture: AttentionCapture, *, block_size: int | None = None) -> torch.Tensor:
     batch, _heads, q_len, _head_dim = capture.query.shape
     if batch != 1 or q_len != 1:
         raise ValueError(f"native q1 attention only supports batch=1 and q_len=1, got {list(capture.query.shape)}")
@@ -327,16 +346,24 @@ def _native_q1_attention_only(capture: AttentionCapture) -> torch.Tensor:
     mask = None
     if capture.attention_mask is not None:
         mask = capture.attention_mask.reshape(-1).to(dtype=torch.float32).contiguous()
-    return extension.q1_attention(
+    if block_size is None:
+        return extension.q1_attention(
+            capture.query,
+            capture.key,
+            capture.value,
+            mask,
+        )
+    return extension.q1_attention_block(
         capture.query,
         capture.key,
         capture.value,
         mask,
+        int(block_size),
     )
 
 
-def _native_q1_attention(capture: AttentionCapture) -> torch.Tensor:
-    return _output_transform_only(capture, _native_q1_attention_only(capture))
+def _native_q1_attention(capture: AttentionCapture, *, block_size: int | None = None) -> torch.Tensor:
+    return _output_transform_only(capture, _native_q1_attention_only(capture, block_size=block_size))
 
 
 def _q1_bmm(capture: AttentionCapture) -> torch.Tensor:
@@ -381,6 +408,7 @@ def _benchmark_attention_capture(
         atol: float,
         rtol: float,
         native_q1_attention: bool,
+        native_q1_block_sizes: tuple[int, ...],
 ) -> dict[str, Any]:
     reference = capture.output
     attention_reference = _reference_attention_only(capture)
@@ -401,6 +429,15 @@ def _benchmark_attention_capture(
                 lambda: _native_q1_attention_only(capture),
                 attention_reference,
             )
+            for block_size in native_q1_block_sizes:
+                variants[f"native_q1_attention_bs{block_size}"] = (
+                    lambda block_size=block_size: _native_q1_attention(capture, block_size=block_size),
+                    reference,
+                )
+                variants[f"native_q1_attention_bs{block_size}_only"] = (
+                    lambda block_size=block_size: _native_q1_attention_only(capture, block_size=block_size),
+                    attention_reference,
+                )
 
     results: dict[str, dict[str, Any]] = {}
     for name, (fn, expected) in variants.items():
@@ -503,6 +540,7 @@ def profile_decode_attention_components(
         active_prefix_decode_length: int | None,
         q1_bmm_cross_attention: bool,
         native_q1_attention: bool,
+        native_q1_block_sizes: tuple[int, ...],
         warmup: int,
         iters: int,
         atol: float,
@@ -548,6 +586,7 @@ def profile_decode_attention_components(
         "active_prefix_decode_length_override": active_prefix_decode_length,
         "q1_bmm_cross_attention": bool(q1_bmm_cross_attention),
         "native_q1_attention": bool(native_q1_attention),
+        "native_q1_block_sizes": list(native_q1_block_sizes),
     }
     prompt = model_inputs["decoder_input_ids"]
     prompt_mask = model_inputs["decoder_attention_mask"]
@@ -685,6 +724,7 @@ def profile_decode_attention_components(
                 atol=atol,
                 rtol=rtol,
                 native_q1_attention=native_q1_attention,
+                native_q1_block_sizes=native_q1_block_sizes,
             ),
         }
 
@@ -723,6 +763,14 @@ def main() -> None:
         action="store_true",
         help="Compile and benchmark a diagnostic native CUDA q_len=1 attention kernel. Diagnostic only.",
     )
+    parser.add_argument(
+        "--native-q1-block-sizes",
+        default="",
+        help=(
+            "Comma-separated diagnostic native q1 attention CUDA block sizes to benchmark, "
+            "currently limited to 64,128,256. Requires --native-q1-attention."
+        ),
+    )
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", type=int, default=500)
     parser.add_argument("--atol", type=float, default=1e-4)
@@ -733,6 +781,16 @@ def main() -> None:
 
     start = time.perf_counter()
     args = _load_args(cli_args.config_name, cli_args.overrides)
+    native_q1_block_sizes = tuple(
+        int(item)
+        for item in cli_args.native_q1_block_sizes.split(",")
+        if item.strip()
+    )
+    unsupported_block_sizes = sorted(set(native_q1_block_sizes) - {64, 128, 256})
+    if unsupported_block_sizes:
+        raise ValueError(f"unsupported native q1 block sizes: {unsupported_block_sizes}")
+    if native_q1_block_sizes and not cli_args.native_q1_attention:
+        raise ValueError("--native-q1-block-sizes requires --native-q1-attention")
     result = profile_decode_attention_components(
         args,
         sequence_index=cli_args.sequence_index,
@@ -740,6 +798,7 @@ def main() -> None:
         active_prefix_decode_length=cli_args.active_prefix_decode_length,
         q1_bmm_cross_attention=cli_args.q1_bmm_cross_attention,
         native_q1_attention=cli_args.native_q1_attention,
+        native_q1_block_sizes=native_q1_block_sizes,
         warmup=cli_args.warmup,
         iters=cli_args.iters,
         atol=cli_args.atol,
