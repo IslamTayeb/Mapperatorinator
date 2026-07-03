@@ -31,13 +31,11 @@ from transformers.utils import (
 from ...runtime_profiling import (
     active_prefix_self_attention_length,
     detail_ranges_enabled,
-    native_one_token_linear_enabled,
     native_q1_rope_cache_self_attention_enabled,
     native_q1_self_attention_enabled,
     profile_range,
     q1_bmm_cross_attention_enabled,
 )
-from ...inference.native_linear import native_one_token_linear_warp_group
 from ...inference.native_q1_attention import native_q1_attention, native_q1_rope_cache_attention
 from .configuration_varwhisper import VarWhisperConfig
 
@@ -51,28 +49,6 @@ else:
 
 
 logger = logging.get_logger(__name__)
-
-
-def _maybe_native_one_token_linear(linear: nn.Linear, hidden_states: torch.Tensor) -> torch.Tensor:
-    if (
-            native_one_token_linear_enabled()
-            and not linear.training
-            and hidden_states.dim() == 3
-            and hidden_states.shape[0] == 1
-            and hidden_states.shape[1] == 1
-            and hidden_states.is_cuda
-            and hidden_states.dtype == torch.float32
-            and linear.weight.is_cuda
-            and linear.weight.dtype == torch.float32
-            and (linear.bias is None or (linear.bias.is_cuda and linear.bias.dtype == torch.float32))
-    ):
-        return native_one_token_linear_warp_group(
-            hidden_states,
-            linear.weight,
-            linear.bias,
-            outputs_per_block=4,
-        )
-    return linear(hidden_states)
 
 
 class ApplyRotaryEmbUnpad(torch.autograd.Function):
@@ -614,15 +590,9 @@ class VarWhisperAttention(nn.Module):
             if self.is_cross_attention:
                 if profile_ranges:
                     with profile_range(f"{range_prefix}.q_proj"):
-                        query_states = _maybe_native_one_token_linear(
-                            self.Wq,
-                            hidden_states,
-                        ).view(bs, -1, self.num_heads, self.head_dim).transpose(1, 2)
+                        query_states = self.Wq(hidden_states).view(bs, -1, self.num_heads, self.head_dim).transpose(1, 2)
                 else:
-                    query_states = _maybe_native_one_token_linear(
-                        self.Wq,
-                        hidden_states,
-                    ).view(bs, -1, self.num_heads, self.head_dim).transpose(1, 2)
+                    query_states = self.Wq(hidden_states).view(bs, -1, self.num_heads, self.head_dim).transpose(1, 2)
 
                 if past_key_value and is_updated:
                     # reuse k,v, cross_attentions
@@ -677,15 +647,9 @@ class VarWhisperAttention(nn.Module):
                 if use_native_q1_rope_cache_self_attention:
                     if profile_ranges:
                         with profile_range(f"{range_prefix}.qkv_proj"):
-                            qkv = _maybe_native_one_token_linear(
-                                self.Wqkv,
-                                hidden_states,
-                            ).view(bs, -1, 3, self.num_heads, self.head_dim)
+                            qkv = self.Wqkv(hidden_states).view(bs, -1, 3, self.num_heads, self.head_dim)
                     else:
-                        qkv = _maybe_native_one_token_linear(
-                            self.Wqkv,
-                            hidden_states,
-                        ).view(bs, -1, 3, self.num_heads, self.head_dim)
+                        qkv = self.Wqkv(hidden_states).view(bs, -1, 3, self.num_heads, self.head_dim)
 
                     if profile_ranges:
                         with profile_range(f"{range_prefix}.rope"):
@@ -735,16 +699,10 @@ class VarWhisperAttention(nn.Module):
                 else:
                     if profile_ranges:
                         with profile_range(f"{range_prefix}.qkv_proj"):
-                            qkv = _maybe_native_one_token_linear(
-                                self.Wqkv,
-                                hidden_states,
-                            ).view(bs, -1, 3, self.num_heads, self.head_dim)
+                            qkv = self.Wqkv(hidden_states).view(bs, -1, 3, self.num_heads, self.head_dim)
                             query_states, key_states, value_states = qkv.transpose(1, 3).unbind(dim=2)
                     else:
-                        qkv = _maybe_native_one_token_linear(
-                            self.Wqkv,
-                            hidden_states,
-                        ).view(bs, -1, 3, self.num_heads, self.head_dim)
+                        qkv = self.Wqkv(hidden_states).view(bs, -1, 3, self.num_heads, self.head_dim)
                         query_states, key_states, value_states = qkv.transpose(1, 3).unbind(dim=2)
 
                     if profile_ranges:
@@ -781,9 +739,9 @@ class VarWhisperAttention(nn.Module):
         hidden_states, *rest = attn_outputs
         if profile_ranges:
             with profile_range(f"{range_prefix}.out_proj"):
-                hidden_states = self.out_drop(_maybe_native_one_token_linear(self.Wo, hidden_states))
+                hidden_states = self.out_drop(self.Wo(hidden_states))
         else:
-            hidden_states = self.out_drop(_maybe_native_one_token_linear(self.Wo, hidden_states))
+            hidden_states = self.out_drop(self.Wo(hidden_states))
 
         return hidden_states, *rest, past_key_value
 
@@ -989,9 +947,9 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
             hidden_states = self.final_layer_norm(hidden_states)
         if profile_ranges:
             with profile_range(f"{layer_name}.mlp.fc1"):
-                hidden_states = _maybe_native_one_token_linear(self.fc1, hidden_states)
+                hidden_states = self.fc1(hidden_states)
         else:
-            hidden_states = _maybe_native_one_token_linear(self.fc1, hidden_states)
+            hidden_states = self.fc1(hidden_states)
         if profile_ranges:
             with profile_range(f"{layer_name}.mlp.activation"):
                 hidden_states = self.activation_fn(hidden_states)
@@ -1000,9 +958,9 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
         hidden_states = nn.functional.dropout(hidden_states, p=self.activation_dropout, training=self.training)
         if profile_ranges:
             with profile_range(f"{layer_name}.mlp.fc2"):
-                hidden_states = _maybe_native_one_token_linear(self.fc2, hidden_states)
+                hidden_states = self.fc2(hidden_states)
         else:
-            hidden_states = _maybe_native_one_token_linear(self.fc2, hidden_states)
+            hidden_states = self.fc2(hidden_states)
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states
 
@@ -1698,9 +1656,9 @@ class VarWhisperForConditionalGeneration(WhisperGenerationMixin, VarWhisperPreTr
         )
         if detail_ranges_enabled():
             with profile_range("decoder.output_projection"):
-                lm_logits = _maybe_native_one_token_linear(self.proj_out, outputs[0])
+                lm_logits = self.proj_out(outputs[0])
         else:
-            lm_logits = _maybe_native_one_token_linear(self.proj_out, outputs[0])
+            lm_logits = self.proj_out(outputs[0])
 
         loss = None
         if labels is not None:

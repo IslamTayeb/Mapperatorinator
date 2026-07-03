@@ -73,7 +73,6 @@ inference_decode_session_chunk_size: 1 # Reserved DecodeSession decode chunk siz
 inference_native_decode_kernels: false # Reserved default-off native C++/CUDA/CUTLASS decode-kernel experiments
 inference_native_q1_self_attention: false # Experimental native fp32 q_len=1 active-prefix self-attention; requires DecodeSession graph path
 inference_native_q1_rope_cache_self_attention: false # Experimental fused RoPE/cache q_len=1 self-attention; requires native q1 self-attention
-inference_native_one_token_linear: false # Experimental native fp32 one-token decoder Linear kernels; default-off
 use_server: false        # Use server for optimized multiprocess inference (adds about 8% overhead)
 max_batch_size: 16       # Maximum batch size for inference
 profile_inference: false # Write stage and generation timing profile JSON
