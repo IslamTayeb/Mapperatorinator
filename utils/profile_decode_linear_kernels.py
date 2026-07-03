@@ -157,6 +157,12 @@ def _linear_variants(
 
         preload_native_linear()
 
+        def native_linear_bs32() -> torch.Tensor:
+            return native_one_token_linear(x, weight, bias, block_size=32)
+
+        def native_linear_bs64() -> torch.Tensor:
+            return native_one_token_linear(x, weight, bias, block_size=64)
+
         def native_linear_bs128() -> torch.Tensor:
             return native_one_token_linear(x, weight, bias, block_size=128)
 
@@ -167,6 +173,8 @@ def _linear_variants(
             return native_one_token_linear(x, weight, bias, block_size=512)
 
         variants.update({
+            "native_linear_bs32": native_linear_bs32,
+            "native_linear_bs64": native_linear_bs64,
             "native_linear_bs128": native_linear_bs128,
             "native_linear_bs256": native_linear_bs256,
             "native_linear_bs512": native_linear_bs512,

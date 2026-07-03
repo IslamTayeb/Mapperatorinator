@@ -62,6 +62,41 @@ __global__ void one_token_linear_kernel(
     }
 }
 
+__global__ void one_token_linear_warp_kernel(
+        const float* __restrict__ input,
+        const float* __restrict__ weight,
+        const float* __restrict__ bias,
+        float* __restrict__ output,
+        int rows,
+        int in_dim,
+        int out_dim,
+        int has_bias) {
+    int out_idx = blockIdx.x;
+    int row = blockIdx.y;
+    int lane = threadIdx.x;
+    if (out_idx >= out_dim || row >= rows) {
+        return;
+    }
+
+    const float* x = input + row * in_dim;
+    const float* w = weight + out_idx * in_dim;
+    float sum = 0.0f;
+    for (int idx = lane; idx < in_dim; idx += 32) {
+        sum += x[idx] * w[idx];
+    }
+
+    unsigned mask = 0xffffffffu;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(mask, sum, offset);
+    }
+    if (lane == 0) {
+        if (has_bias) {
+            sum += bias[out_idx];
+        }
+        output[row * out_dim + out_idx] = sum;
+    }
+}
+
 torch::Tensor one_token_linear(torch::Tensor input, torch::Tensor weight, c10::optional<torch::Tensor> bias, int64_t block_size) {
     TORCH_CHECK(input.is_cuda() && weight.is_cuda(), "input/weight must be CUDA tensors");
     TORCH_CHECK(input.scalar_type() == torch::kFloat32, "input must be fp32");
@@ -91,7 +126,15 @@ torch::Tensor one_token_linear(torch::Tensor input, torch::Tensor weight, c10::o
 
     dim3 grid(out_dim, rows);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    if (block_size == 128) {
+    if (block_size == 32) {
+        one_token_linear_warp_kernel<<<grid, 32, 0, stream>>>(
+            input.data_ptr<float>(), weight.data_ptr<float>(), bias_ptr, output.data_ptr<float>(),
+            rows, in_dim, out_dim, has_bias);
+    } else if (block_size == 64) {
+        one_token_linear_kernel<64><<<grid, 64, 0, stream>>>(
+            input.data_ptr<float>(), weight.data_ptr<float>(), bias_ptr, output.data_ptr<float>(),
+            rows, in_dim, out_dim, has_bias);
+    } else if (block_size == 128) {
         one_token_linear_kernel<128><<<grid, 128, 0, stream>>>(
             input.data_ptr<float>(), weight.data_ptr<float>(), bias_ptr, output.data_ptr<float>(),
             rows, in_dim, out_dim, has_bias);
@@ -104,7 +147,7 @@ torch::Tensor one_token_linear(torch::Tensor input, torch::Tensor weight, c10::o
             input.data_ptr<float>(), weight.data_ptr<float>(), bias_ptr, output.data_ptr<float>(),
             rows, in_dim, out_dim, has_bias);
     } else {
-        TORCH_CHECK(false, "unsupported native linear block size; expected 128, 256, or 512");
+        TORCH_CHECK(false, "unsupported native linear block size; expected 32, 64, 128, 256, or 512");
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
