@@ -160,6 +160,7 @@ class Processor(object):
         self.timeshift_bias = args.timeshift_bias
         self.types_first = args.train.data.types_first
         self.last_generation_stats: dict[str, float | int] | None = None
+        self.decode_session_state: dict[str, Any] | None = None
         self.profiler = profiler or InferenceProfiler()
 
     def model_generate(self, model_kwargs, **generate_kwargs: Any) -> Any:
@@ -198,7 +199,14 @@ class Processor(object):
                 getattr(self.args, "inference_stateful_monotonic_logits_processor", False)
             ),
             q1_bmm_cross_attention=bool(getattr(self.args, "inference_q1_bmm_cross_attention", False)),
+            decode_session_cuda_graph=bool(getattr(self.args, "inference_decode_session_cuda_graph", False)),
         )
+        if bool(getattr(self.args, "inference_decode_session_runtime", False)):
+            if isinstance(self.model, InferenceClient):
+                raise ValueError("inference_decode_session_runtime requires use_server=false.")
+            if self.decode_session_state is None:
+                self.decode_session_state = {}
+            generate_kwargs2["decode_session_state"] = self.decode_session_state
         if generate_kwargs2["active_prefix_decode_cuda_graph"] and isinstance(self.model, InferenceClient):
             raise ValueError("inference_active_prefix_decode_cuda_graph requires use_server=false.")
 
@@ -285,6 +293,7 @@ class Processor(object):
 
         generate_func = self.generate_parallel if self.parallel else self.generate_sequential
         self._reset_generation_stats()
+        self.decode_session_state = None
         if isinstance(self.model, InferenceClient):
             with self.model:
                 generate_func(**inputs)
@@ -357,6 +366,9 @@ class Processor(object):
         for i, context in enumerate(out_context):
             if context["finished"]:
                 continue
+
+            if bool(getattr(self.args, "inference_decode_session_runtime", False)):
+                self.decode_session_state = {}
 
             if verbose:
                 print(f"Generating {context['context_type'].value}")
@@ -1500,6 +1512,9 @@ class Processor(object):
             "profile_sdpa_backend": stats.get("profile_sdpa_backend"),
             "stateful_monotonic_logits_processor": stats.get("stateful_monotonic_logits_processor"),
             "q1_bmm_cross_attention_enabled": stats.get("q1_bmm_cross_attention_enabled"),
+            "decode_session_runtime_enabled": stats.get("decode_session_runtime_enabled"),
+            "decode_session_cuda_graph_enabled": stats.get("decode_session_cuda_graph_enabled"),
+            "decode_session_graph_count": stats.get("decode_session_graph_count"),
             "active_prefix_decode_loop_enabled": stats.get("active_prefix_decode_loop_enabled"),
             "active_prefix_decode_bucket_size": stats.get("active_prefix_decode_bucket_size"),
             "active_prefix_decode_cuda_graph_enabled": stats.get("active_prefix_decode_cuda_graph_enabled"),

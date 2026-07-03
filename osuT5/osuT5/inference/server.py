@@ -13,7 +13,7 @@ from ..event import EventType, ContextType
 from .logit_processors import ConditionalTemperatureLogitsWarper, get_beat_type_tokens, \
     get_mania_type_tokens, get_scroll_speed_tokens, TimeshiftBias, LookbackBiasLogitsWarper, \
     MonotonicTimeShiftLogitsProcessor
-from .cache_utils import get_cache
+from .cache_utils import MapperatorinatorCache, get_cache
 from .decode_loop import active_prefix_decode_generate
 from ..runtime_profiling import generation_profile_context
 from ..model import Mapperatorinator
@@ -149,6 +149,33 @@ def _sync_cuda_for_model(model) -> None:
         torch.cuda.synchronize(model.device)
 
 
+def _reset_mapperatorinator_cache(cache: MapperatorinatorCache) -> None:
+    cache.self_attention_cache.reset()
+    cache.cross_attention_cache.reset()
+    for layer_idx in list(cache.is_updated):
+        cache.is_updated[layer_idx] = False
+
+
+def _session_cache(
+        decode_session_state: dict | None,
+        model,
+        *,
+        batch_size: int,
+        num_beams: int,
+        cfg_scale: float,
+) -> MapperatorinatorCache:
+    if decode_session_state is None:
+        return get_cache(model, batch_size, num_beams, cfg_scale)
+
+    cache = decode_session_state.get("cache")
+    if cache is None:
+        cache = get_cache(model, batch_size, num_beams, cfg_scale)
+        decode_session_state["cache"] = cache
+    else:
+        _reset_mapperatorinator_cache(cache)
+    return cache
+
+
 @torch.no_grad()
 def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     # To device
@@ -183,6 +210,8 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         generate_kwargs.pop('stateful_monotonic_logits_processor', False)
     )
     q1_bmm_cross_attention = bool(generate_kwargs.pop('q1_bmm_cross_attention', False))
+    decode_session_state = generate_kwargs.pop('decode_session_state', None)
+    decode_session_cuda_graph = bool(generate_kwargs.pop('decode_session_cuda_graph', False))
     if context_type is not None:
         context_type = ContextType(context_type)  # Convert to ContextType enum
 
@@ -202,7 +231,13 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     )
 
     # Prepare cache
-    cache = get_cache(model, batch_size, generate_kwargs.get('num_beams', 1), cfg_scale)
+    cache = _session_cache(
+        decode_session_state,
+        model,
+        batch_size=batch_size,
+        num_beams=generate_kwargs.get('num_beams', 1),
+        cfg_scale=cfg_scale,
+    )
     pad_token_id = generate_kwargs.get('pad_token_id', getattr(tokenizer, 'pad_id', None))
     if active_prefix_decode_cuda_graph and not active_prefix_decode_loop:
         raise ValueError("active_prefix_decode_cuda_graph requires active_prefix_decode_loop.")
@@ -217,6 +252,13 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
             raise ValueError("active_prefix_decode_bucket_size must be positive.")
         if active_prefix_decode_cuda_graph_min_decode_steps <= 0:
             raise ValueError("active_prefix_decode_cuda_graph_min_decode_steps must be positive.")
+    if decode_session_state is not None:
+        if not active_prefix_decode_loop:
+            raise ValueError("decode_session_state requires active_prefix_decode_loop.")
+        if not active_prefix_decode_cuda_graph or not decode_session_cuda_graph:
+            raise ValueError("decode_session_state currently requires active-prefix CUDA graph replay.")
+        decode_session_state.setdefault("graph_cache", {})
+        decode_session_state.setdefault("stable_encoder_holder", {})
     active_prefix_decode_diagnostics = (
         {
             "enabled": True,
@@ -252,6 +294,16 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
                 cuda_graph_warmup=active_prefix_decode_cuda_graph_warmup,
                 cuda_graph_min_decode_steps=active_prefix_decode_cuda_graph_min_decode_steps,
                 active_prefix_decode_diagnostics=active_prefix_decode_diagnostics,
+                shared_graph_cache=(
+                    decode_session_state.get("graph_cache")
+                    if decode_session_state is not None and decode_session_cuda_graph
+                    else None
+                ),
+                stable_encoder_holder=(
+                    decode_session_state.get("stable_encoder_holder")
+                    if decode_session_state is not None and decode_session_cuda_graph
+                    else None
+                ),
             ) if active_prefix_decode_loop else None,
         )
         if sync_model_timing:
@@ -273,6 +325,13 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         "profile_sdpa_backend": profile_sdpa_backend,
         "stateful_monotonic_logits_processor": stateful_monotonic_logits_processor,
         "q1_bmm_cross_attention_enabled": q1_bmm_cross_attention,
+        "decode_session_runtime_enabled": decode_session_state is not None,
+        "decode_session_cuda_graph_enabled": bool(decode_session_cuda_graph),
+        "decode_session_graph_count": (
+            len(decode_session_state.get("graph_cache", {}))
+            if decode_session_state is not None
+            else None
+        ),
         "active_prefix_decode_loop_enabled": active_prefix_decode_loop,
         "active_prefix_decode_bucket_size": active_prefix_decode_bucket_size if active_prefix_decode_loop else None,
         "active_prefix_decode_cuda_graph_enabled": active_prefix_decode_cuda_graph if active_prefix_decode_loop else False,

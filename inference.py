@@ -359,16 +359,23 @@ def compile_derived_args(args: InferenceConfig):
 
 def validate_reserved_runtime_flags(args: InferenceConfig):
     if args.inference_decode_session_runtime:
-        raise NotImplementedError(
-            "inference_decode_session_runtime is reserved for verifier-first DecodeSession work and is not wired "
-            "into normal inference yet. Use utils/verify_one_token_decode.py --candidate-decode-session for the "
-            "current one-token verifier path."
-        )
+        if args.use_server:
+            raise ValueError("inference_decode_session_runtime requires use_server=false.")
+        if args.parallel:
+            raise ValueError("inference_decode_session_runtime currently supports sequential inference only.")
+        if args.cfg_scale != 1.0:
+            raise ValueError("inference_decode_session_runtime currently requires cfg_scale=1.0.")
+        if args.num_beams != 1:
+            raise ValueError("inference_decode_session_runtime currently requires num_beams=1.")
+        if not args.inference_active_prefix_decode_loop:
+            raise ValueError("inference_decode_session_runtime requires inference_active_prefix_decode_loop=true.")
+        if not args.inference_active_prefix_decode_cuda_graph:
+            raise ValueError("inference_decode_session_runtime requires inference_active_prefix_decode_cuda_graph=true.")
+        if not args.inference_decode_session_cuda_graph:
+            raise ValueError("inference_decode_session_runtime requires inference_decode_session_cuda_graph=true.")
     if args.inference_decode_session_cuda_graph:
-        raise NotImplementedError(
-            "inference_decode_session_cuda_graph is reserved until DecodeSession owns an exact generated-token/RNG "
-            "validated CUDA graph runtime."
-        )
+        if not args.inference_decode_session_runtime:
+            raise ValueError("inference_decode_session_cuda_graph requires inference_decode_session_runtime=true.")
     if args.inference_decode_session_chunk_size != 1:
         raise NotImplementedError(
             "inference_decode_session_chunk_size is reserved and must remain 1 until chunked DecodeSession "
