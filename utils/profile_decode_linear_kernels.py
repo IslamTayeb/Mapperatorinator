@@ -153,7 +153,11 @@ def _linear_variants(
         "mv": mv_linear,
     }
     if native_linear_variant:
-        from osuT5.osuT5.inference.native_linear import native_one_token_linear, preload_native_linear
+        from osuT5.osuT5.inference.native_linear import (
+            native_one_token_linear,
+            native_one_token_linear_warp_group,
+            preload_native_linear,
+        )
 
         preload_native_linear()
 
@@ -172,12 +176,24 @@ def _linear_variants(
         def native_linear_bs512() -> torch.Tensor:
             return native_one_token_linear(x, weight, bias, block_size=512)
 
+        def native_linear_warp2() -> torch.Tensor:
+            return native_one_token_linear_warp_group(x, weight, bias, outputs_per_block=2)
+
+        def native_linear_warp4() -> torch.Tensor:
+            return native_one_token_linear_warp_group(x, weight, bias, outputs_per_block=4)
+
+        def native_linear_warp8() -> torch.Tensor:
+            return native_one_token_linear_warp_group(x, weight, bias, outputs_per_block=8)
+
         variants.update({
             "native_linear_bs32": native_linear_bs32,
             "native_linear_bs64": native_linear_bs64,
             "native_linear_bs128": native_linear_bs128,
             "native_linear_bs256": native_linear_bs256,
             "native_linear_bs512": native_linear_bs512,
+            "native_linear_warp2": native_linear_warp2,
+            "native_linear_warp4": native_linear_warp4,
+            "native_linear_warp8": native_linear_warp8,
         })
     return variants
 

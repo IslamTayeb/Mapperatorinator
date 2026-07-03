@@ -97,6 +97,43 @@ __global__ void one_token_linear_warp_kernel(
     }
 }
 
+template<int OUTPUTS_PER_BLOCK>
+__global__ void one_token_linear_warp_group_kernel(
+        const float* __restrict__ input,
+        const float* __restrict__ weight,
+        const float* __restrict__ bias,
+        float* __restrict__ output,
+        int rows,
+        int in_dim,
+        int out_dim,
+        int has_bias) {
+    int row = blockIdx.y;
+    int warp_id = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    int out_idx = blockIdx.x * OUTPUTS_PER_BLOCK + warp_id;
+    if (warp_id >= OUTPUTS_PER_BLOCK || out_idx >= out_dim || row >= rows) {
+        return;
+    }
+
+    const float* x = input + row * in_dim;
+    const float* w = weight + out_idx * in_dim;
+    float sum = 0.0f;
+    for (int idx = lane; idx < in_dim; idx += 32) {
+        sum += x[idx] * w[idx];
+    }
+
+    unsigned mask = 0xffffffffu;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(mask, sum, offset);
+    }
+    if (lane == 0) {
+        if (has_bias) {
+            sum += bias[out_idx];
+        }
+        output[row * out_dim + out_idx] = sum;
+    }
+}
+
 torch::Tensor one_token_linear(torch::Tensor input, torch::Tensor weight, c10::optional<torch::Tensor> bias, int64_t block_size) {
     TORCH_CHECK(input.is_cuda() && weight.is_cuda(), "input/weight must be CUDA tensors");
     TORCH_CHECK(input.scalar_type() == torch::kFloat32, "input must be fp32");
@@ -152,6 +189,60 @@ torch::Tensor one_token_linear(torch::Tensor input, torch::Tensor weight, c10::o
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
+
+torch::Tensor one_token_linear_warp_group(
+        torch::Tensor input,
+        torch::Tensor weight,
+        c10::optional<torch::Tensor> bias,
+        int64_t outputs_per_block) {
+    TORCH_CHECK(input.is_cuda() && weight.is_cuda(), "input/weight must be CUDA tensors");
+    TORCH_CHECK(input.scalar_type() == torch::kFloat32, "input must be fp32");
+    TORCH_CHECK(weight.scalar_type() == torch::kFloat32, "weight must be fp32");
+    TORCH_CHECK(input.dim() == 2, "input must have shape [rows, in_dim]");
+    TORCH_CHECK(weight.dim() == 2, "weight must have shape [out_dim, in_dim]");
+    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
+    TORCH_CHECK(input.size(1) == weight.size(1), "input/weight in_dim mismatch");
+
+    const int rows = static_cast<int>(input.size(0));
+    const int in_dim = static_cast<int>(input.size(1));
+    const int out_dim = static_cast<int>(weight.size(0));
+    auto output = torch::empty({rows, out_dim}, input.options());
+
+    const float* bias_ptr = nullptr;
+    int has_bias = 0;
+    torch::Tensor bias_contiguous;
+    if (bias.has_value()) {
+        bias_contiguous = bias.value().contiguous();
+        TORCH_CHECK(bias_contiguous.is_cuda(), "bias must be CUDA");
+        TORCH_CHECK(bias_contiguous.scalar_type() == torch::kFloat32, "bias must be fp32");
+        TORCH_CHECK(bias_contiguous.numel() == out_dim, "bias/out_dim mismatch");
+        bias_ptr = bias_contiguous.data_ptr<float>();
+        has_bias = 1;
+    }
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    if (outputs_per_block == 2) {
+        dim3 grid((out_dim + 1) / 2, rows);
+        one_token_linear_warp_group_kernel<2><<<grid, 64, 0, stream>>>(
+            input.data_ptr<float>(), weight.data_ptr<float>(), bias_ptr, output.data_ptr<float>(),
+            rows, in_dim, out_dim, has_bias);
+    } else if (outputs_per_block == 4) {
+        dim3 grid((out_dim + 3) / 4, rows);
+        one_token_linear_warp_group_kernel<4><<<grid, 128, 0, stream>>>(
+            input.data_ptr<float>(), weight.data_ptr<float>(), bias_ptr, output.data_ptr<float>(),
+            rows, in_dim, out_dim, has_bias);
+    } else if (outputs_per_block == 8) {
+        dim3 grid((out_dim + 7) / 8, rows);
+        one_token_linear_warp_group_kernel<8><<<grid, 256, 0, stream>>>(
+            input.data_ptr<float>(), weight.data_ptr<float>(), bias_ptr, output.data_ptr<float>(),
+            rows, in_dim, out_dim, has_bias);
+    } else {
+        TORCH_CHECK(false, "unsupported outputs_per_block; expected 2, 4, or 8");
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
 """
 
     _NATIVE_LINEAR = load_inline(
@@ -160,9 +251,11 @@ torch::Tensor one_token_linear(torch::Tensor input, torch::Tensor weight, c10::o
             "#include <torch/extension.h>\n"
             "torch::Tensor one_token_linear(torch::Tensor input, torch::Tensor weight, "
             "c10::optional<torch::Tensor> bias, int64_t block_size);\n"
+            "torch::Tensor one_token_linear_warp_group(torch::Tensor input, torch::Tensor weight, "
+            "c10::optional<torch::Tensor> bias, int64_t outputs_per_block);\n"
         ),
         cuda_sources=cuda_source,
-        functions=["one_token_linear"],
+        functions=["one_token_linear", "one_token_linear_warp_group"],
         extra_cuda_cflags=["-O3"],
         verbose=False,
     )
@@ -185,4 +278,24 @@ def native_one_token_linear(
     input_2d = input.reshape(-1, input.shape[-1]).contiguous()
     weight_contiguous = weight.contiguous()
     output = extension.one_token_linear(input_2d, weight_contiguous, bias, int(block_size))
+    return output.reshape(output_shape)
+
+
+def native_one_token_linear_warp_group(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        *,
+        outputs_per_block: int,
+) -> torch.Tensor:
+    extension = _load_native_linear()
+    output_shape = (*input.shape[:-1], weight.shape[0])
+    input_2d = input.reshape(-1, input.shape[-1]).contiguous()
+    weight_contiguous = weight.contiguous()
+    output = extension.one_token_linear_warp_group(
+        input_2d,
+        weight_contiguous,
+        bias,
+        int(outputs_per_block),
+    )
     return output.reshape(output_shape)
