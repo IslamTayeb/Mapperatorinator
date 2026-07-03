@@ -119,6 +119,25 @@ This pass removes several tempting but weak targets:
 
 The remaining path toward `500 tok/s` is therefore not a cleanup pass. With `32.217s` current model time and `15.278s` needed for `500 tok/s`, the model needs to save about `16.94s`. If all non-layer time stayed fixed, decoder-layer time would need to drop from `18.918s` to about `1.979s`, an `~89.5%` decoder-layer reduction. Even if some outside time is also improved, the main lever has to be broad decoder-layer/native runtime work, not isolated linears, final projection, sampling, or graph-cache bookkeeping.
 
+## Weighted Self-Attention Split
+
+Follow-up DCC job `49229477` on commit `5ceffa3` ran `utils/profile_decode_self_attention_island.py --cuda-graph-replay` across the same active-prefix buckets:
+
+- Run dir: `/work/imt11/Mapperatorinator/runs/self-attn-buckets-20260703-074301-5ceffa3`
+- Result: every bucket PASS, `logits_replay_max_abs=0.0`
+
+Weighted graph-replay totals:
+
+| self-attention component | weighted full-song seconds | model-time share |
+| --- | ---: | ---: |
+| repo self-attention module | `8.806s` | `27.3%` |
+| manual native island | `8.826s` | `27.4%` |
+| pre-attention setup only | `4.378s` | `13.6%` |
+| native q1 attention only | `3.075s` | `9.5%` |
+| output projection only | `0.630s` | `2.0%` |
+
+The repo module and manual native island are essentially tied, so the Python/manual decomposition is not itself an optimization. The important split is that qkv/RoPE/cache/setup remains larger than the native attention kernel. Freeing the entire weighted self-attention module would raise the accepted baseline only to about `326 tok/s`; it is a good target, but not sufficient for `500 tok/s` alone.
+
 ## Decision
 
 Use `utils/profile_decode_full_forward_island.py` plus bucket weighting before any future broad runtime/kernel rewrite. The next implementation-class project should target a large decoder-layer island or multi-layer decoder stack with stable C++/CUDA/CUTLASS/cuBLASLt work, and it should show an exclusive projected saving of at least `1.6s`, preferably several seconds, before production integration.
@@ -135,4 +154,5 @@ Do not start standalone work on:
 
 - Local syntax check passed for `utils/profile_decode_full_forward_island.py`.
 - DCC jobs `49229391` and `49229433` completed successfully.
+- DCC job `49229477` completed successfully.
 - All captured bucket probes had exact replay logits (`max_abs=0.0`).
