@@ -105,6 +105,7 @@ def _benchmark_capture(
         capture: DecoderLayerCapture,
         *,
         native_q1_rope_cache_self_attention: bool,
+        compile_decoder_layer_variant: bool,
         warmup: int,
         iters: int,
         atol: float,
@@ -167,6 +168,56 @@ def _benchmark_capture(
                     results[name]["cuda_graph_replay_max_abs"] = _max_abs(expected, graph_output)
                 except Exception as exc:
                     results[name]["cuda_graph_replay_error"] = f"{type(exc).__name__}: {exc}"
+        if compile_decoder_layer_variant:
+            compiled_module = torch.compile(capture.module, mode="reduce-overhead")
+
+            def compiled_layer_forward() -> torch.Tensor:
+                return compiled_module(
+                    hidden_states=capture.hidden_states,
+                    attention_mask=capture.attention_mask,
+                    encoder_hidden_states=capture.encoder_hidden_states,
+                    past_key_value=capture.past_key_value,
+                    cache_position=capture.cache_position,
+                    position_ids=capture.position_ids,
+                    cu_seqlens=capture.cu_seqlens,
+                    max_seqlen=capture.max_seqlen,
+                    encoder_cu_seqlens=capture.encoder_cu_seqlens,
+                    encoder_max_seqlen=capture.encoder_max_seqlen,
+                    output_attentions=False,
+                )[0]
+
+            try:
+                ms, output = _cuda_event_time_ms(compiled_layer_forward, warmup=warmup, iters=iters)
+                results["compiled_decoder_layer"] = {
+                    "ms_per_call": ms,
+                    "allclose": _allclose(capture.output, output, atol=atol, rtol=rtol),
+                    "max_abs": _max_abs(capture.output, output),
+                    "output_shape": list(output.shape),
+                }
+                if cuda_graph_replay:
+                    try:
+                        graph_ms, graph_output = _cuda_graph_replay_time_ms(
+                            compiled_layer_forward,
+                            warmup=warmup,
+                            iters=iters,
+                        )
+                        results["compiled_decoder_layer"]["cuda_graph_replay_ms_per_call"] = graph_ms
+                        results["compiled_decoder_layer"]["cuda_graph_replay_allclose"] = _allclose(
+                            capture.output,
+                            graph_output,
+                            atol=atol,
+                            rtol=rtol,
+                        )
+                        results["compiled_decoder_layer"]["cuda_graph_replay_max_abs"] = _max_abs(
+                            capture.output,
+                            graph_output,
+                        )
+                    except Exception as exc:
+                        results["compiled_decoder_layer"]["cuda_graph_replay_error"] = (
+                            f"{type(exc).__name__}: {exc}"
+                        )
+            except Exception as exc:
+                results["compiled_decoder_layer"] = {"error": f"{type(exc).__name__}: {exc}"}
     return results
 
 
@@ -261,6 +312,7 @@ def profile_decode_decoder_layer_island(
         active_prefix_bucket_size: int,
         active_prefix_decode_length: int | None,
         native_q1_rope_cache_self_attention: bool,
+        compile_decoder_layer_variant: bool,
         warmup: int,
         iters: int,
         atol: float,
@@ -309,6 +361,7 @@ def profile_decode_decoder_layer_island(
         "active_prefix_bucket_size": active_prefix_bucket_size,
         "active_prefix_decode_length_override": active_prefix_decode_length,
         "native_q1_rope_cache_self_attention": bool(native_q1_rope_cache_self_attention),
+        "compile_decoder_layer_variant": bool(compile_decoder_layer_variant),
         "cuda_graph_replay": bool(cuda_graph_replay),
         "full_song_decode_steps": int(full_song_decode_steps),
         "full_song_main_tokens": int(full_song_main_tokens),
@@ -415,6 +468,7 @@ def profile_decode_decoder_layer_island(
         benchmark = _benchmark_capture(
             representative,
             native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
+            compile_decoder_layer_variant=compile_decoder_layer_variant,
             warmup=warmup,
             iters=iters,
             atol=atol,
@@ -469,6 +523,24 @@ def profile_decode_decoder_layer_island(
                 if graph_ideal_time_s is not None and graph_ideal_time_s > 0
                 else None
             )
+        compiled = benchmark.get("compiled_decoder_layer") or {}
+        compiled_graph_ms = compiled.get("cuda_graph_replay_ms_per_call")
+        if isinstance(compiled_graph_ms, float) and isinstance(repo_graph_ms, float):
+            compiled_graph_seconds = compiled_graph_ms * member_count * full_song_decode_steps / 1000.0
+            saved_seconds = repo_graph_seconds - compiled_graph_seconds
+            projected_model_time_s = full_song_model_time_s - saved_seconds
+            projected_full_song[signature]["cuda_graph_compiled_decoder_layer_s"] = compiled_graph_seconds
+            projected_full_song[signature]["cuda_graph_compiled_saved_s"] = saved_seconds
+            projected_full_song[signature]["cuda_graph_compiled_speedup"] = (
+                repo_graph_ms / compiled_graph_ms
+                if compiled_graph_ms > 0
+                else None
+            )
+            projected_full_song[signature]["cuda_graph_compiled_projected_tps"] = (
+                full_song_main_tokens / projected_model_time_s
+                if projected_model_time_s > 0
+                else None
+            )
 
     return {
         "pass": bool(_allclose(direct_result.logits, replay_logits, atol=atol, rtol=rtol)),
@@ -500,6 +572,11 @@ def main() -> None:
     parser.add_argument("--active-prefix-bucket-size", type=int, default=64)
     parser.add_argument("--active-prefix-decode-length", type=int, default=None)
     parser.add_argument("--native-q1-rope-cache-self-attention", action="store_true")
+    parser.add_argument(
+        "--compile-decoder-layer-variant",
+        action="store_true",
+        help="Also benchmark a diagnostic torch.compile(mode='reduce-overhead') decoder-layer island variant.",
+    )
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", type=int, default=500)
     parser.add_argument("--atol", type=float, default=1e-4)
@@ -520,6 +597,7 @@ def main() -> None:
         active_prefix_bucket_size=cli_args.active_prefix_bucket_size,
         active_prefix_decode_length=cli_args.active_prefix_decode_length,
         native_q1_rope_cache_self_attention=cli_args.native_q1_rope_cache_self_attention,
+        compile_decoder_layer_variant=cli_args.compile_decoder_layer_variant,
         warmup=cli_args.warmup,
         iters=cli_args.iters,
         atol=cli_args.atol,
