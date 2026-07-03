@@ -27,6 +27,10 @@ def test_summarize_active_prefix_diagnostics_aggregates_records():
                                 "active_prefix_length": 512,
                                 "capture_seconds": 0.1,
                                 "decode_replays": 2,
+                                "static_input_shapes": {
+                                    "decoder_input_ids": [1, 1],
+                                    "cache_position": [1],
+                                },
                             }
                         ]
                     },
@@ -52,11 +56,19 @@ def test_summarize_active_prefix_diagnostics_aggregates_records():
                                 "active_prefix_length": 512,
                                 "capture_seconds": 0.2,
                                 "decode_replays": 1,
+                                "static_input_shapes": {
+                                    "decoder_input_ids": [1, 1],
+                                    "cache_position": [1],
+                                },
                             },
                             {
                                 "active_prefix_length": 1024,
                                 "capture_seconds": 0.3,
                                 "decode_replays": 1,
+                                "static_input_shapes": {
+                                    "decoder_input_ids": [1, 1],
+                                    "cache_position": [1],
+                                },
                             },
                         ]
                     },
@@ -86,3 +98,13 @@ def test_summarize_active_prefix_diagnostics_aggregates_records():
     assert summary["cuda_graph_totals"]["decode_replays"] == 4
     assert summary["cuda_graph_by_prefix"]["512"]["graphs"] == 2
     assert summary["cuda_graph_by_prefix"]["1024"]["capture_seconds"] == 0.3
+    duplicate = summary["cuda_graph_duplicate_capture_ceiling"]
+    assert duplicate["normalized_graphs"] == 2
+    assert duplicate["graph_captures"] == 3
+    assert duplicate["duplicate_graph_captures"] == 1
+    assert round(duplicate["duplicate_capture_seconds"], 6) == 0.2
+    assert round(duplicate["duplicate_capture_model_pct"], 6) == 8.0
+    assert round(duplicate["estimated_tokens_per_second_without_duplicate_capture"], 6) == round(5 / 2.3, 6)
+    assert duplicate["by_prefix"]["512"]["normalized_graphs"] == 1
+    assert duplicate["by_prefix"]["512"]["duplicate_graphs"] == 1
+    assert round(duplicate["by_prefix"]["512"]["duplicate_capture_seconds"], 6) == 0.2

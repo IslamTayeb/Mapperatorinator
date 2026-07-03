@@ -56,7 +56,26 @@ CUDA graph diagnostics:
 | decode replays | `7,552` |
 | bucket transitions | `115` |
 
-The graph cache is local to each `active_prefix_decode_generate()` call in `osuT5/osuT5/inference/decode_loop.py`, so graph captures are repeated across generation windows. Bucket64 wins despite that capture tax because it reduces padded active-prefix attention work. A persistent graph/cache runtime could theoretically reclaim up to about `3.3s` full-song capture time, but it is not a small patch: the captured graph currently closes over per-window cache and encoder-output objects, so reuse across windows would require stable cache/encoder buffers and exact copying/priming discipline.
+Normalizing graph captures by active-prefix length and static input tensor shapes reduces the `198` captures to only `11` graph shapes:
+
+| metric | value |
+| --- | ---: |
+| normalized graph shapes | `11` |
+| first-capture floor | `0.175s` |
+| duplicate-capture ceiling | `3.153s` |
+| duplicate capture share of main model time | `6.446%` |
+| estimated tok/s without duplicate capture | `166.931` |
+
+Largest duplicate-capture buckets:
+
+| prefix | duplicate captures | duplicate capture time |
+| ---: | ---: | ---: |
+| `640` | `63` | `1.075s` |
+| `576` | `50` | `0.885s` |
+| `704` | `35` | `0.592s` |
+| `512` | `18` | `0.315s` |
+
+The graph cache is local to each `active_prefix_decode_generate()` call in `osuT5/osuT5/inference/decode_loop.py`, so graph captures are repeated across generation windows. Bucket64 wins despite that capture tax because it reduces padded active-prefix attention work. A persistent graph/cache runtime could theoretically reclaim up to about `3.15s` full-song capture time, but it is not a small patch and is not enough by itself to reach `200 tok/s`: the captured graph currently closes over per-window cache and encoder-output objects, so reuse across windows would require stable cache/encoder buffers and exact copying/priming discipline.
 
 ## Torch Seq66 Trace
 

@@ -28,6 +28,22 @@ def _record_model_seconds(records: list[dict[str, Any]]) -> float:
     return sum(float(record.get("model_elapsed_seconds", 0.0) or 0.0) for record in records)
 
 
+def _normalized_graph_signature(graph: dict[str, Any]) -> tuple[Any, ...]:
+    try:
+        prefix = int(graph.get("active_prefix_length"))
+    except (TypeError, ValueError):
+        prefix = None
+    shapes = graph.get("static_input_shapes") or {}
+    normalized_shapes = []
+    for key, value in shapes.items():
+        try:
+            shape = tuple(int(dim) for dim in value)
+        except (TypeError, ValueError):
+            shape = tuple(value) if isinstance(value, (list, tuple)) else (str(value),)
+        normalized_shapes.append((str(key), shape))
+    return prefix, tuple(sorted(normalized_shapes))
+
+
 def summarize_active_prefix_diagnostics(profile: dict[str, Any], *, label: str) -> dict[str, Any]:
     records = _records_for_label(profile, label)
     records_with_diagnostics = [
@@ -51,6 +67,15 @@ def summarize_active_prefix_diagnostics(profile: dict[str, Any], *, label: str) 
         "capture_seconds": 0.0,
         "decode_replays": 0,
     }
+    normalized_graphs: dict[tuple[Any, ...], dict[str, float | int | Any]] = defaultdict(
+        lambda: {
+            "prefix": None,
+            "graphs": 0,
+            "capture_seconds": 0.0,
+            "min_capture_seconds": None,
+            "decode_replays": 0,
+        }
+    )
 
     for record in records_with_diagnostics:
         diagnostics = record.get("active_prefix_decode_diagnostics") or {}
@@ -88,9 +113,53 @@ def summarize_active_prefix_diagnostics(profile: dict[str, Any], *, label: str) 
             cuda_graph_totals["graphs"] += 1
             cuda_graph_totals["capture_seconds"] += capture_seconds
             cuda_graph_totals["decode_replays"] += decode_replays
+            normalized_key = _normalized_graph_signature(graph)
+            normalized = normalized_graphs[normalized_key]
+            normalized["prefix"] = prefix
+            normalized["graphs"] = int(normalized["graphs"]) + 1
+            normalized["capture_seconds"] = float(normalized["capture_seconds"]) + capture_seconds
+            normalized["decode_replays"] = int(normalized["decode_replays"]) + decode_replays
+            current_min = normalized["min_capture_seconds"]
+            if current_min is None or capture_seconds < float(current_min):
+                normalized["min_capture_seconds"] = capture_seconds
 
     generated_tokens = _record_tokens(records)
     model_seconds = _record_model_seconds(records)
+    first_capture_seconds = sum(
+        float(value["min_capture_seconds"] or 0.0)
+        for value in normalized_graphs.values()
+    )
+    duplicate_capture_seconds = max(float(cuda_graph_totals["capture_seconds"]) - first_capture_seconds, 0.0)
+    model_seconds_without_duplicate_capture = model_seconds - duplicate_capture_seconds
+    duplicate_by_prefix: dict[int, dict[str, float | int]] = defaultdict(
+        lambda: {
+            "normalized_graphs": 0,
+            "graphs": 0,
+            "duplicate_graphs": 0,
+            "capture_seconds": 0.0,
+            "first_capture_seconds": 0.0,
+            "duplicate_capture_seconds": 0.0,
+            "decode_replays": 0,
+        }
+    )
+    for value in normalized_graphs.values():
+        prefix = value.get("prefix")
+        if prefix is None:
+            continue
+        bucket = duplicate_by_prefix[int(prefix)]
+        graphs = int(value["graphs"])
+        capture_seconds = float(value["capture_seconds"])
+        first_seconds = float(value["min_capture_seconds"] or 0.0)
+        bucket["normalized_graphs"] = int(bucket["normalized_graphs"]) + 1
+        bucket["graphs"] = int(bucket["graphs"]) + graphs
+        bucket["duplicate_graphs"] = int(bucket["duplicate_graphs"]) + max(graphs - 1, 0)
+        bucket["capture_seconds"] = float(bucket["capture_seconds"]) + capture_seconds
+        bucket["first_capture_seconds"] = float(bucket["first_capture_seconds"]) + first_seconds
+        bucket["duplicate_capture_seconds"] = (
+            float(bucket["duplicate_capture_seconds"]) + max(capture_seconds - first_seconds, 0.0)
+        )
+        bucket["decode_replays"] = int(bucket["decode_replays"]) + int(value["decode_replays"])
+
     return {
         "label": label,
         "records": len(records),
@@ -110,6 +179,25 @@ def summarize_active_prefix_diagnostics(profile: dict[str, Any], *, label: str) 
         "cuda_graph_totals": cuda_graph_totals,
         "cuda_graph_by_prefix": {
             str(key): value for key, value in sorted(cuda_graph_by_prefix.items())
+        },
+        "cuda_graph_duplicate_capture_ceiling": {
+            "normalized_graphs": len(normalized_graphs),
+            "graph_captures": int(cuda_graph_totals["graphs"]),
+            "duplicate_graph_captures": max(int(cuda_graph_totals["graphs"]) - len(normalized_graphs), 0),
+            "capture_seconds": float(cuda_graph_totals["capture_seconds"]),
+            "first_capture_seconds": first_capture_seconds,
+            "duplicate_capture_seconds": duplicate_capture_seconds,
+            "duplicate_capture_model_pct": (
+                duplicate_capture_seconds / model_seconds * 100.0 if model_seconds > 0 else 0.0
+            ),
+            "estimated_tokens_per_second_without_duplicate_capture": (
+                generated_tokens / model_seconds_without_duplicate_capture
+                if model_seconds_without_duplicate_capture > 0
+                else 0.0
+            ),
+            "by_prefix": {
+                str(key): value for key, value in sorted(duplicate_by_prefix.items())
+            },
         },
     }
 
@@ -155,6 +243,19 @@ def print_summary(summary: dict[str, Any], *, limit: int) -> None:
     print(f"  graphs: {cuda_graph_totals['graphs']}")
     print(f"  capture_seconds: {_fmt_seconds(cuda_graph_totals['capture_seconds'])}")
     print(f"  decode_replays: {cuda_graph_totals['decode_replays']}")
+    print()
+
+    duplicate = summary["cuda_graph_duplicate_capture_ceiling"]
+    print("CUDA Graph Duplicate Capture Ceiling")
+    print(f"  normalized_graphs: {duplicate['normalized_graphs']}")
+    print(f"  graph_captures: {duplicate['graph_captures']}")
+    print(f"  duplicate_graph_captures: {duplicate['duplicate_graph_captures']}")
+    print(f"  duplicate_capture_seconds: {_fmt_seconds(duplicate['duplicate_capture_seconds'])}")
+    print(f"  duplicate_capture_model_pct: {duplicate['duplicate_capture_model_pct']:.3f}%")
+    print(
+        "  estimated_tok/s_without_duplicate_capture: "
+        f"{duplicate['estimated_tokens_per_second_without_duplicate_capture']:.3f}"
+    )
     print()
 
     print("CUDA Graphs By Prefix")
