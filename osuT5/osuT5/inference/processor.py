@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -11,6 +12,7 @@ from slider import Beatmap, TimingPoint
 from tqdm import tqdm
 
 from config import InferenceConfig
+from .profiler import InferenceProfiler
 from .server import InferenceClient, model_generate, model_forward
 from ..dataset.osu_parser import OsuParser
 from ..dataset.data_utils import (update_event_times, remove_events_of_type, get_hold_note_ratio,
@@ -68,7 +70,14 @@ def generation_config_from_beatmap(beatmap: Beatmap, beatmap_path, tokenizer: Op
 
 
 class Processor(object):
-    def __init__(self, args: InferenceConfig, model: Mapperatorinator | InferenceClient, tokenizer: Tokenizer, cfg_scale: float = None):
+    def __init__(
+            self,
+            args: InferenceConfig,
+            model: Mapperatorinator | InferenceClient,
+            tokenizer: Tokenizer,
+            cfg_scale: float = None,
+            profiler: InferenceProfiler | None = None,
+    ):
         """Model inference stage that processes sequences."""
         self.device = args.device
         self.precision = args.precision
@@ -151,6 +160,8 @@ class Processor(object):
         self.timeshift_bias = args.timeshift_bias
         self.types_first = args.train.data.types_first
         self.last_generation_stats: dict[str, float | int] | None = None
+        self.decode_session_state: dict[str, Any] | None = None
+        self.profiler = profiler or InferenceProfiler()
 
     def model_generate(self, model_kwargs, **generate_kwargs: Any) -> Any:
         generate_kwargs2 = generate_kwargs | dict(
@@ -167,8 +178,41 @@ class Processor(object):
             timing_temperature=self.timing_temperature,
             mania_column_temperature=self.mania_column_temperature,
             taiko_hit_temperature=self.taiko_hit_temperature,
+            sync_model_timing=self.profiler.enabled and self.profiler.sync_cuda,
+            profile_generation_detail_ranges=bool(getattr(self.args, "profile_generation_detail_ranges", False)),
+            profile_active_prefix_decode_diagnostics=bool(
+                getattr(self.args, "profile_active_prefix_decode_diagnostics", False)
+            ),
+            profile_sdpa_backend=getattr(self.args, "profile_sdpa_backend", None),
+            active_prefix_decode_loop=bool(getattr(self.args, "inference_active_prefix_decode_loop", False)),
+            active_prefix_decode_bucket_size=int(getattr(self.args, "inference_active_prefix_decode_bucket_size", 128)),
+            active_prefix_decode_cuda_graph=bool(
+                getattr(self.args, "inference_active_prefix_decode_cuda_graph", False)
+            ),
+            active_prefix_decode_cuda_graph_warmup=int(
+                getattr(self.args, "inference_active_prefix_decode_cuda_graph_warmup", 0)
+            ),
+            active_prefix_decode_cuda_graph_min_decode_steps=int(
+                getattr(self.args, "inference_active_prefix_decode_cuda_graph_min_decode_steps", 1)
+            ),
+            stateful_monotonic_logits_processor=bool(
+                getattr(self.args, "inference_stateful_monotonic_logits_processor", False)
+            ),
+            q1_bmm_cross_attention=bool(getattr(self.args, "inference_q1_bmm_cross_attention", False)),
+            native_q1_self_attention=bool(getattr(self.args, "inference_native_q1_self_attention", False)),
+            native_q1_rope_cache_self_attention=bool(
+                getattr(self.args, "inference_native_q1_rope_cache_self_attention", False)
+            ),
+            decode_session_cuda_graph=bool(getattr(self.args, "inference_decode_session_cuda_graph", False)),
         )
-
+        if bool(getattr(self.args, "inference_decode_session_runtime", False)):
+            if isinstance(self.model, InferenceClient):
+                raise ValueError("inference_decode_session_runtime requires use_server=false.")
+            if self.decode_session_state is None:
+                self.decode_session_state = {}
+            generate_kwargs2["decode_session_state"] = self.decode_session_state
+        if generate_kwargs2["active_prefix_decode_cuda_graph"] and isinstance(self.model, InferenceClient):
+            raise ValueError("inference_active_prefix_decode_cuda_graph requires use_server=false.")
         if isinstance(self.model, InferenceClient):
             response = self.model.generate(model_kwargs, generate_kwargs2)
             return response, getattr(self.model, "last_generation_stats", None)
@@ -196,6 +240,7 @@ class Processor(object):
             beatmap_path: Optional[str] = None,
             extra_in_context: Optional[dict[ContextType, tuple[list[Event], list[int]] | tuple[list[Event], list[int], torch.Tensor] | list[TimingPoint]]] = None,
             verbose: bool = True,
+            profile_label: str | None = None,
     ) -> list[tuple[list[Event], list[int]]]:
         """Generate a list of Event object lists and their timestamps given source sequences.
 
@@ -218,6 +263,7 @@ class Processor(object):
             extra_in_context=extra_in_context,
             gamemode=generation_config.gamemode,
         )
+        profile_label = profile_label or "+".join(context.value for context in gen_out_context)
 
         model_kwargs = self._get_model_cond_kwargs(generation_config)
         song_length = sequences[2]
@@ -245,10 +291,12 @@ class Processor(object):
             model_kwargs=model_kwargs,
             req_special_tokens=req_special_tokens,
             verbose=verbose,
+            profile_label=profile_label,
         )
 
         generate_func = self.generate_parallel if self.parallel else self.generate_sequential
         self._reset_generation_stats()
+        self.decode_session_state = None
         if isinstance(self.model, InferenceClient):
             with self.model:
                 generate_func(**inputs)
@@ -314,12 +362,16 @@ class Processor(object):
             model_kwargs: dict[str, Any],
             req_special_tokens: list[str],
             verbose: bool = True,
+            profile_label: str | None = None,
     ):
         song_length = sequences[2]
 
         for i, context in enumerate(out_context):
             if context["finished"]:
                 continue
+
+            if bool(getattr(self.args, "inference_decode_session_runtime", False)):
+                self.decode_session_state = {}
 
             if verbose:
                 print(f"Generating {context['context_type'].value}")
@@ -334,12 +386,14 @@ class Processor(object):
                 frame_time = frame_time.item()
 
                 # Get relevant tokens for current frame
+                prompt_start = time.perf_counter()
                 cond_prompt, uncond_prompt = self.get_prompts(
                     self.prepare_context_sequences(in_context, frame_time, False, req_special_tokens),
                     self.prepare_context_sequences(out_context[:i + 1], frame_time, True, req_special_tokens),
                 )
 
                 [prompt, uncond_prompt], max_len = self.pad_prompts([cond_prompt, uncond_prompt])
+                prompt_wall_seconds = time.perf_counter() - prompt_start
 
                 # Prepare additional model kwargs
                 if self.do_song_position_embed:
@@ -347,24 +401,55 @@ class Processor(object):
                     global_pos_end = (frame_time + self.miliseconds_per_sequence) / song_length
                     model_kwargs["song_position"] = torch.tensor([global_pos_start, global_pos_end], dtype=torch.float32).unsqueeze(0)
 
-                result, generation_stats = self.model_generate(
-                    model_kwargs | dict(
-                        inputs=frames,
-                        decoder_input_ids=prompt,
-                        decoder_attention_mask=prompt.ne(self.tokenizer.pad_id),
-                        negative_prompt=uncond_prompt,
-                        negative_prompt_attention_mask=uncond_prompt.ne(self.tokenizer.pad_id) if uncond_prompt is not None else None,
-                    ),
-                    lookback_time=self.lookback_time if trim_lookback else 0,
-                    lookahead_time=self.lookahead_time if trim_lookahead else 0,
-                    context_type=context["context_type"].value,
-                )
+                self.profiler.sync()
+                generation_start = time.perf_counter()
+                with self.profiler.torch_generation_trace(
+                    f"generation.{profile_label or context['context_type'].value}.seq{sequence_index}",
+                    profile_label=profile_label,
+                    mode="sequential",
+                    context_type=context["context_type"],
+                    sequence_index=sequence_index,
+                    frame_time_ms=frame_time,
+                ):
+                    result, generation_stats = self.model_generate(
+                        model_kwargs | dict(
+                            inputs=frames,
+                            decoder_input_ids=prompt,
+                            decoder_attention_mask=prompt.ne(self.tokenizer.pad_id),
+                            negative_prompt=uncond_prompt,
+                            negative_prompt_attention_mask=uncond_prompt.ne(self.tokenizer.pad_id) if uncond_prompt is not None else None,
+                        ),
+                        lookback_time=self.lookback_time if trim_lookback else 0,
+                        lookahead_time=self.lookahead_time if trim_lookahead else 0,
+                        context_type=context["context_type"].value,
+                    )
+                self.profiler.sync()
+                model_wall_seconds = time.perf_counter() - generation_start
                 self._record_generation_stats(generation_stats)
                 if verbose:
                     self._update_tokens_per_second_meter(iterator, tokens_per_second_meter, generation_stats)
 
                 # Only support batch size 1
                 predicted_tokens = result[0, max_len:].cpu()
+                generated_token_ids = None
+                if self.args.profile_record_token_ids:
+                    generated_token_ids = self._generated_token_ids(result[0], prompt[0])
+                self._record_generation_profile(
+                    profile_label=profile_label,
+                    mode="sequential",
+                    context_type=context["context_type"],
+                    sequence_index=sequence_index,
+                    frame_time_ms=frame_time,
+                    prompt_wall_seconds=prompt_wall_seconds,
+                    wall_seconds=model_wall_seconds,
+                    prompt_tokens_per_sample=[int(prompt.ne(self.tokenizer.pad_id).sum().item())],
+                    output_tokens_per_sample=[int(result[0].ne(self.tokenizer.pad_id).sum().item())],
+                    generated_tokens_per_sample=[int(predicted_tokens.ne(self.tokenizer.pad_id).sum().item())],
+                    generated_token_ids=generated_token_ids,
+                    stats=generation_stats,
+                    trim_lookback=trim_lookback,
+                    trim_lookahead=trim_lookahead,
+                )
                 self.add_predicted_tokens_to_context(context, predicted_tokens, frame_time, trim_lookback, trim_lookahead)
 
     def generate_parallel(
@@ -376,6 +461,7 @@ class Processor(object):
             model_kwargs: dict[str, Any],
             req_special_tokens: list[str],
             verbose: bool = True,
+            profile_label: str | None = None,
     ):
         # Get relevant inputs
         frames = self.prepare_frames(sequences[0])
@@ -397,6 +483,8 @@ class Processor(object):
             frames,
             model_kwargses,
             verbose,
+            profile_label=profile_label,
+            context_type=out_context[0]["context_type"] if out_context else None,
         )
 
         sequence_index = 0
@@ -702,8 +790,12 @@ class Processor(object):
             frames: torch.Tensor,
             model_kwargses: list[dict[str, torch.Tensor]],
             verbose: bool = True,
+            profile_label: str | None = None,
+            context_type: ContextType | None = None,
     ):
+        prompt_stack_start = time.perf_counter()
         cond_prompt, uncond_prompt, max_len = self.stack_prompts(cond_prompts, uncond_prompts)
+        prompt_stack_wall_seconds = time.perf_counter() - prompt_stack_start
 
         # Split prompts and uncond_prompt into batches
         max_batch_size = max(1, self.max_batch_size // self.num_beams // (2 if self.cfg_scale > 1 else 1))
@@ -722,22 +814,55 @@ class Processor(object):
                                   model_kwarg_keys}
 
             # Start generation
-            result = generate_func(
-                model_kwargs_batch | dict(
-                    inputs=frames_batch,
-                    decoder_input_ids=cond_prompt_batch,
-                    decoder_attention_mask=cond_prompt_batch.ne(self.tokenizer.pad_id),
-                    negative_prompt=uncond_prompt_batch,
-                    negative_prompt_attention_mask=uncond_prompt_batch.ne(
-                        self.tokenizer.pad_id) if uncond_prompt_batch is not None else None,
-                ),
-            )
+            self.profiler.sync()
+            generation_start = time.perf_counter()
+            with self.profiler.torch_generation_trace(
+                f"generation.{profile_label or context_type or 'parallel'}.batch{i}",
+                profile_label=profile_label,
+                mode="parallel",
+                context_type=context_type,
+                batch_start_index=i,
+                batch_size=int(frames_batch.shape[0]),
+            ):
+                result = generate_func(
+                    model_kwargs_batch | dict(
+                        inputs=frames_batch,
+                        decoder_input_ids=cond_prompt_batch,
+                        decoder_attention_mask=cond_prompt_batch.ne(self.tokenizer.pad_id),
+                        negative_prompt=uncond_prompt_batch,
+                        negative_prompt_attention_mask=uncond_prompt_batch.ne(
+                            self.tokenizer.pad_id) if uncond_prompt_batch is not None else None,
+                    ),
+                )
+            self.profiler.sync()
+            model_wall_seconds = time.perf_counter() - generation_start
 
             generation_stats = None
             if isinstance(result, tuple) and len(result) == 2:
                 result, generation_stats = result
 
             self._record_generation_stats(generation_stats)
+            generated_token_ids_per_sample = None
+            if self.args.profile_record_token_ids:
+                maybe_generated_token_ids = [
+                    self._generated_token_ids(row, prompt)
+                    for row, prompt in zip(result, cond_prompt_batch)
+                ]
+                if all(tokens is not None for tokens in maybe_generated_token_ids):
+                    generated_token_ids_per_sample = maybe_generated_token_ids
+            self._record_generation_profile(
+                profile_label=profile_label,
+                mode="parallel",
+                context_type=context_type,
+                batch_start_index=i,
+                batch_size=int(frames_batch.shape[0]),
+                prompt_wall_seconds=prompt_stack_wall_seconds if i == 0 else 0.0,
+                wall_seconds=model_wall_seconds,
+                prompt_tokens_per_sample=cond_prompt_batch.ne(self.tokenizer.pad_id).sum(dim=-1).tolist(),
+                output_tokens_per_sample=result.ne(self.tokenizer.pad_id).sum(dim=-1).tolist(),
+                generated_token_ids_per_sample=generated_token_ids_per_sample,
+                stats=generation_stats,
+            )
             if verbose:
                 self._update_tokens_per_second_meter(iterator, tokens_per_second_meter, generation_stats)
 
@@ -1343,6 +1468,93 @@ class Processor(object):
         total_elapsed = float(self.last_generation_stats["elapsed_seconds"])
         total_tokens = int(self.last_generation_stats["generated_tokens"])
         self.last_generation_stats["tokens_per_second"] = total_tokens / total_elapsed if total_elapsed > 0 else 0.0
+
+    def _record_generation_profile(
+            self,
+            *,
+            profile_label: str | None,
+            mode: str,
+            context_type: ContextType | str | None,
+            wall_seconds: float,
+            stats: Any,
+            **metadata: Any,
+    ) -> None:
+        if not self.profiler.enabled:
+            return
+
+        stats = stats if isinstance(stats, dict) else {}
+        generated_tokens = int(stats.get("generated_tokens") or sum(metadata.get("generated_tokens_per_sample", [])))
+        model_elapsed_seconds = float(stats.get("elapsed_seconds", 0.0) or 0.0)
+        record = {
+            "profile_label": profile_label,
+            "mode": mode,
+            "context_type": context_type.value if isinstance(context_type, ContextType) else context_type,
+            "wall_seconds": wall_seconds,
+            "model_elapsed_seconds": model_elapsed_seconds,
+            "tokens_per_second": stats.get("tokens_per_second"),
+            "generated_tokens": generated_tokens,
+            "generated_tokens_per_sample": stats.get(
+                "generated_tokens_per_sample",
+                metadata.pop("generated_tokens_per_sample", None),
+            ),
+            "prompt_tokens": stats.get("prompt_tokens"),
+            "prompt_tokens_per_sample": stats.get(
+                "prompt_tokens_per_sample",
+                metadata.pop("prompt_tokens_per_sample", None),
+            ),
+            "output_tokens": stats.get("output_tokens"),
+            "output_tokens_per_sample": stats.get(
+                "output_tokens_per_sample",
+                metadata.pop("output_tokens_per_sample", None),
+            ),
+            "precision": stats.get("precision", self.precision),
+            "generation_compile_enabled": stats.get("generation_compile_enabled"),
+            "profile_generation_detail_ranges": stats.get("profile_generation_detail_ranges"),
+            "profile_active_prefix_decode_diagnostics": stats.get("profile_active_prefix_decode_diagnostics"),
+            "active_prefix_decode_diagnostics": stats.get("active_prefix_decode_diagnostics"),
+            "profile_sdpa_backend": stats.get("profile_sdpa_backend"),
+            "stateful_monotonic_logits_processor": stats.get("stateful_monotonic_logits_processor"),
+            "q1_bmm_cross_attention_enabled": stats.get("q1_bmm_cross_attention_enabled"),
+            "native_q1_self_attention_requested": stats.get("native_q1_self_attention_requested"),
+            "native_q1_self_attention_enabled": stats.get("native_q1_self_attention_enabled"),
+            "native_q1_rope_cache_self_attention_requested": stats.get(
+                "native_q1_rope_cache_self_attention_requested"
+            ),
+            "native_q1_rope_cache_self_attention_enabled": stats.get(
+                "native_q1_rope_cache_self_attention_enabled"
+            ),
+            "decode_session_runtime_enabled": stats.get("decode_session_runtime_enabled"),
+            "decode_session_cuda_graph_enabled": stats.get("decode_session_cuda_graph_enabled"),
+            "decode_session_graph_count": stats.get("decode_session_graph_count"),
+            "active_prefix_decode_loop_enabled": stats.get("active_prefix_decode_loop_enabled"),
+            "active_prefix_decode_bucket_size": stats.get("active_prefix_decode_bucket_size"),
+            "active_prefix_decode_cuda_graph_enabled": stats.get("active_prefix_decode_cuda_graph_enabled"),
+            "active_prefix_decode_cuda_graph_warmup": stats.get("active_prefix_decode_cuda_graph_warmup"),
+            "active_prefix_decode_cuda_graph_min_decode_steps": stats.get(
+                "active_prefix_decode_cuda_graph_min_decode_steps"
+            ),
+            "use_server": isinstance(self.model, InferenceClient),
+            "parallel": self.parallel,
+        }
+        torch_trace = self.profiler.pop_torch_generation_trace()
+        if torch_trace is None:
+            record["torch_profiled"] = False
+        else:
+            record.update({
+                "torch_profiled": True,
+                "torch_trace_index": torch_trace.get("trace_index"),
+                "torch_trace_path": torch_trace.get("trace_path"),
+                "torch_trace_wall_seconds": torch_trace.get("wall_seconds"),
+            })
+        record.update(metadata)
+        self.profiler.record_generation(**record)
+
+    def _generated_token_ids(self, output: torch.Tensor, prompt: torch.Tensor) -> list[int] | None:
+        if torch.is_floating_point(output):
+            return None
+        output_ids = output[output.ne(self.tokenizer.pad_id)]
+        prompt_len = int(prompt.ne(self.tokenizer.pad_id).sum().item())
+        return [int(token) for token in output_ids[prompt_len:].tolist()]
 
     @staticmethod
     def _create_tokens_per_second_meter(alpha: float = 0.1) -> dict[str, float | None]:

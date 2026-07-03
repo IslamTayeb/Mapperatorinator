@@ -4,6 +4,7 @@ import time
 import threading
 import traceback
 import torch
+from functools import partial
 from multiprocessing.connection import Listener, Client
 
 from transformers import LogitsProcessorList, ClassifierFreeGuidanceLogitsProcessor, TemperatureLogitsWarper
@@ -12,7 +13,9 @@ from ..event import EventType, ContextType
 from .logit_processors import ConditionalTemperatureLogitsWarper, get_beat_type_tokens, \
     get_mania_type_tokens, get_scroll_speed_tokens, TimeshiftBias, LookbackBiasLogitsWarper, \
     MonotonicTimeShiftLogitsProcessor
-from .cache_utils import get_cache
+from .cache_utils import MapperatorinatorCache, get_cache
+from .decode_loop import active_prefix_decode_generate
+from ..runtime_profiling import generation_profile_context
 from ..model import Mapperatorinator
 from ..tokenizer import Tokenizer
 
@@ -54,14 +57,21 @@ def _build_generation_stats(
         elapsed_seconds: float,
 ) -> dict:
     prompt_token_counts = _prompt_token_counts(model_kwargs, pad_token_id)
-    generated_token_counts = _output_token_counts(result, pad_token_id)
+    output_token_counts = _output_token_counts(result, pad_token_id).cpu()
+    generated_token_counts = output_token_counts.clone()
     if prompt_token_counts is not None:
         generated_token_counts = torch.clamp(generated_token_counts - prompt_token_counts, min=0)
 
     generated_tokens = int(generated_token_counts.sum().item())
     tokens_per_second = generated_tokens / elapsed_seconds if elapsed_seconds > 0 else 0.0
+    prompt_tokens = int(prompt_token_counts.sum().item()) if prompt_token_counts is not None else None
 
     return {
+        "batch_size": int(result.shape[0]),
+        "prompt_tokens": prompt_tokens,
+        "prompt_tokens_per_sample": prompt_token_counts.tolist() if prompt_token_counts is not None else None,
+        "output_tokens": int(output_token_counts.sum().item()),
+        "output_tokens_per_sample": output_token_counts.tolist(),
         "generated_tokens": generated_tokens,
         "generated_tokens_per_sample": generated_token_counts.tolist(),
         "elapsed_seconds": float(elapsed_seconds),
@@ -80,34 +90,32 @@ def get_eos_token_id(tokenizer, lookback_time: float = 0, lookahead_time: float 
     return eos_token_id
 
 
-@torch.no_grad()
-def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
-    # To device
-    model_kwargs = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v for k, v in model_kwargs.items()}
-    model_kwargs = {k: v.to(model.dtype) if k != "inputs" and isinstance(v, torch.Tensor) and v.dtype == torch.float32 else v for k, v in model_kwargs.items()}
-    batch_size = model_kwargs['inputs'].shape[0]
-    # print(f"[Model Generate] Batch size: {batch_size}, Model device: {model.device}")
+def build_logits_processor_list(
+        tokenizer,
+        *,
+        cfg_scale: float = 1.0,
+        timeshift_bias: float = 0.0,
+        types_first: bool = False,
+        temperature: float = 1.0,
+        timing_temperature: float | None = None,
+        mania_column_temperature: float | None = None,
+        taiko_hit_temperature: float | None = None,
+        lookback_time: float = 0.0,
+        device=None,
+        stateful_monotonic: bool = False,
+) -> LogitsProcessorList:
+    timing_temperature = temperature if timing_temperature is None else timing_temperature
+    mania_column_temperature = temperature if mania_column_temperature is None else mania_column_temperature
+    taiko_hit_temperature = temperature if taiko_hit_temperature is None else taiko_hit_temperature
+    device = device if device is not None else getattr(tokenizer, "device", None)
 
-    precision = generate_kwargs.pop('precision', 'fp32')
-    cfg_scale = generate_kwargs.pop('cfg_scale', 1.0)
-    timeshift_bias = generate_kwargs.pop('timeshift_bias', 0)
-    types_first = generate_kwargs.pop('types_first', False)
-    temperature = generate_kwargs.pop('temperature', 1.0)
-    timing_temperature = generate_kwargs.pop('timing_temperature', temperature)
-    mania_column_temperature = generate_kwargs.pop('mania_column_temperature', temperature)
-    taiko_hit_temperature = generate_kwargs.pop('taiko_hit_temperature', temperature)
-    lookback_time = generate_kwargs.pop('lookback_time', 0.0)
-    lookahead_time = generate_kwargs.pop('lookahead_time', 0.0)
-    context_type = generate_kwargs.pop('context_type', None)
-    if context_type is not None:
-        context_type = ContextType(context_type)  # Convert to ContextType enum
-
-    # Create the logits processors
     logits_processor_list = LogitsProcessorList()
     if cfg_scale > 1.0:
         logits_processor_list.append(ClassifierFreeGuidanceLogitsProcessor(cfg_scale))
 
-    logits_processor_list.append(MonotonicTimeShiftLogitsProcessor(tokenizer))
+    logits_processor_list.append(
+        MonotonicTimeShiftLogitsProcessor(tokenizer, stateful_batch1=stateful_monotonic)
+    )
 
     if timeshift_bias != 0:
         logits_processor_list.append(
@@ -131,14 +139,164 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     else:
         logits_processor_list.append(TemperatureLogitsWarper(temperature))
     if lookback_time > 0:
-        logits_processor_list.append(LookbackBiasLogitsWarper(lookback_time, tokenizer, types_first, model.device))
+        logits_processor_list.append(LookbackBiasLogitsWarper(lookback_time, tokenizer, types_first, device))
+
+    return logits_processor_list
+
+
+def _sync_cuda_for_model(model) -> None:
+    if torch.cuda.is_available() and getattr(getattr(model, "device", None), "type", None) == "cuda":
+        torch.cuda.synchronize(model.device)
+
+
+def _reset_mapperatorinator_cache(cache: MapperatorinatorCache) -> None:
+    cache.self_attention_cache.reset()
+    cache.cross_attention_cache.reset()
+    for layer_idx in list(cache.is_updated):
+        cache.is_updated[layer_idx] = False
+
+
+def _session_cache(
+        decode_session_state: dict | None,
+        model,
+        *,
+        batch_size: int,
+        num_beams: int,
+        cfg_scale: float,
+) -> MapperatorinatorCache:
+    if decode_session_state is None:
+        return get_cache(model, batch_size, num_beams, cfg_scale)
+
+    cache = decode_session_state.get("cache")
+    if cache is None:
+        cache = get_cache(model, batch_size, num_beams, cfg_scale)
+        decode_session_state["cache"] = cache
+    else:
+        _reset_mapperatorinator_cache(cache)
+    return cache
+
+
+@torch.no_grad()
+def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
+    # To device
+    model_kwargs = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v for k, v in model_kwargs.items()}
+    model_kwargs = {k: v.to(model.dtype) if k != "inputs" and isinstance(v, torch.Tensor) and v.dtype == torch.float32 else v for k, v in model_kwargs.items()}
+    batch_size = model_kwargs['inputs'].shape[0]
+    # print(f"[Model Generate] Batch size: {batch_size}, Model device: {model.device}")
+
+    precision = generate_kwargs.pop('precision', 'fp32')
+    cfg_scale = generate_kwargs.pop('cfg_scale', 1.0)
+    timeshift_bias = generate_kwargs.pop('timeshift_bias', 0)
+    types_first = generate_kwargs.pop('types_first', False)
+    temperature = generate_kwargs.pop('temperature', 1.0)
+    timing_temperature = generate_kwargs.pop('timing_temperature', temperature)
+    mania_column_temperature = generate_kwargs.pop('mania_column_temperature', temperature)
+    taiko_hit_temperature = generate_kwargs.pop('taiko_hit_temperature', temperature)
+    lookback_time = generate_kwargs.pop('lookback_time', 0.0)
+    lookahead_time = generate_kwargs.pop('lookahead_time', 0.0)
+    context_type = generate_kwargs.pop('context_type', None)
+    sync_model_timing = bool(generate_kwargs.pop('sync_model_timing', False))
+    profile_generation_detail_ranges = bool(generate_kwargs.pop('profile_generation_detail_ranges', False))
+    profile_active_prefix_decode_diagnostics = bool(generate_kwargs.pop('profile_active_prefix_decode_diagnostics', False))
+    profile_sdpa_backend = generate_kwargs.pop('profile_sdpa_backend', None)
+    active_prefix_decode_loop = bool(generate_kwargs.pop('active_prefix_decode_loop', False))
+    active_prefix_decode_bucket_size = int(generate_kwargs.pop('active_prefix_decode_bucket_size', 128))
+    active_prefix_decode_cuda_graph = bool(generate_kwargs.pop('active_prefix_decode_cuda_graph', False))
+    active_prefix_decode_cuda_graph_warmup = int(generate_kwargs.pop('active_prefix_decode_cuda_graph_warmup', 0))
+    active_prefix_decode_cuda_graph_min_decode_steps = int(
+        generate_kwargs.pop('active_prefix_decode_cuda_graph_min_decode_steps', 1)
+    )
+    stateful_monotonic_logits_processor = bool(
+        generate_kwargs.pop('stateful_monotonic_logits_processor', False)
+    )
+    q1_bmm_cross_attention = bool(generate_kwargs.pop('q1_bmm_cross_attention', False))
+    native_q1_self_attention_requested = bool(generate_kwargs.pop('native_q1_self_attention', False))
+    native_q1_rope_cache_self_attention_requested = bool(
+        generate_kwargs.pop('native_q1_rope_cache_self_attention', False)
+    )
+    decode_session_state = generate_kwargs.pop('decode_session_state', None)
+    decode_session_cuda_graph = bool(generate_kwargs.pop('decode_session_cuda_graph', False))
+    if context_type is not None:
+        context_type = ContextType(context_type)  # Convert to ContextType enum
+    if native_q1_rope_cache_self_attention_requested and not native_q1_self_attention_requested:
+        raise ValueError("native_q1_rope_cache_self_attention requires native_q1_self_attention.")
+    if native_q1_rope_cache_self_attention_requested and not active_prefix_decode_loop:
+        raise ValueError("native_q1_rope_cache_self_attention requires active_prefix_decode_loop.")
+    native_q1_self_attention = (
+        native_q1_self_attention_requested
+        and context_type != ContextType.TIMING
+    )
+    native_q1_rope_cache_self_attention = (
+        native_q1_rope_cache_self_attention_requested
+        and native_q1_self_attention
+    )
+
+    # Create the logits processors
+    logits_processor_list = build_logits_processor_list(
+        tokenizer,
+        cfg_scale=cfg_scale,
+        timeshift_bias=timeshift_bias,
+        types_first=types_first,
+        temperature=temperature,
+        timing_temperature=timing_temperature,
+        mania_column_temperature=mania_column_temperature,
+        taiko_hit_temperature=taiko_hit_temperature,
+        lookback_time=lookback_time,
+        device=model.device,
+        stateful_monotonic=stateful_monotonic_logits_processor,
+    )
 
     # Prepare cache
-    cache = get_cache(model, batch_size, generate_kwargs.get('num_beams', 1), cfg_scale)
+    cache = _session_cache(
+        decode_session_state,
+        model,
+        batch_size=batch_size,
+        num_beams=generate_kwargs.get('num_beams', 1),
+        cfg_scale=cfg_scale,
+    )
     pad_token_id = generate_kwargs.get('pad_token_id', getattr(tokenizer, 'pad_id', None))
+    if active_prefix_decode_cuda_graph and not active_prefix_decode_loop:
+        raise ValueError("active_prefix_decode_cuda_graph requires active_prefix_decode_loop.")
+    if active_prefix_decode_loop:
+        if batch_size != 1:
+            raise ValueError("active_prefix_decode_loop currently supports batch_size=1 only.")
+        if cfg_scale != 1.0:
+            raise ValueError("active_prefix_decode_loop currently does not support classifier-free guidance.")
+        if int(generate_kwargs.get('num_beams', 1)) != 1:
+            raise ValueError("active_prefix_decode_loop currently supports num_beams=1 only.")
+        if active_prefix_decode_bucket_size <= 0:
+            raise ValueError("active_prefix_decode_bucket_size must be positive.")
+        if active_prefix_decode_cuda_graph_min_decode_steps <= 0:
+            raise ValueError("active_prefix_decode_cuda_graph_min_decode_steps must be positive.")
+    if decode_session_state is not None:
+        if not active_prefix_decode_loop:
+            raise ValueError("decode_session_state requires active_prefix_decode_loop.")
+        if not active_prefix_decode_cuda_graph or not decode_session_cuda_graph:
+            raise ValueError("decode_session_state currently requires active-prefix CUDA graph replay.")
+        decode_session_state.setdefault("graph_cache", {})
+        decode_session_state.setdefault("stable_encoder_holder", {})
+    active_prefix_decode_diagnostics = (
+        {
+            "enabled": True,
+            "decode_steps": 0,
+            "bucket_lengths_seen": [],
+            "bucket_transition_count": 0,
+        }
+        if active_prefix_decode_loop and profile_active_prefix_decode_diagnostics
+        else None
+    )
 
     # Perform batched generation
-    with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16, enabled=precision == 'amp'):
+    with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16, enabled=precision == 'amp'), \
+            generation_profile_context(
+                detail_ranges=profile_generation_detail_ranges,
+                sdpa_backend=profile_sdpa_backend,
+                q1_bmm_cross_attention=q1_bmm_cross_attention,
+                native_q1_self_attention=native_q1_self_attention,
+                native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
+            ):
+        if sync_model_timing:
+            _sync_cuda_for_model(model)
         start_time = time.perf_counter()
         result = model.generate(
             **model_kwargs,
@@ -147,11 +305,67 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
             past_key_values=cache,
             logits_processor=logits_processor_list,
             eos_token_id=get_eos_token_id(tokenizer, lookback_time=lookback_time, lookahead_time=lookahead_time, context_type=context_type),
+            custom_generate=partial(
+                active_prefix_decode_generate,
+                active_prefix_bucket_size=active_prefix_decode_bucket_size,
+                cuda_graph_forward=active_prefix_decode_cuda_graph,
+                cuda_graph_warmup=active_prefix_decode_cuda_graph_warmup,
+                cuda_graph_min_decode_steps=active_prefix_decode_cuda_graph_min_decode_steps,
+                active_prefix_decode_diagnostics=active_prefix_decode_diagnostics,
+                shared_graph_cache=(
+                    decode_session_state.get("graph_cache")
+                    if decode_session_state is not None and decode_session_cuda_graph
+                    else None
+                ),
+                stable_encoder_holder=(
+                    decode_session_state.get("stable_encoder_holder")
+                    if decode_session_state is not None and decode_session_cuda_graph
+                    else None
+                ),
+            ) if active_prefix_decode_loop else None,
         )
+        if sync_model_timing:
+            _sync_cuda_for_model(model)
         elapsed_seconds = time.perf_counter() - start_time
 
     result = result.cpu()
     stats = _build_generation_stats(result, model_kwargs, pad_token_id, elapsed_seconds)
+    stats.update({
+        "precision": precision,
+        "context_type": context_type.value if context_type is not None else None,
+        "num_beams": int(generate_kwargs.get("num_beams", 1)),
+        "cfg_scale": float(cfg_scale),
+        "do_sample": bool(generate_kwargs.get("do_sample", False)),
+        "sync_model_timing": sync_model_timing,
+        "generation_compile_enabled": not bool(getattr(getattr(model, "generation_config", None), "disable_compile", True)),
+        "profile_generation_detail_ranges": profile_generation_detail_ranges,
+        "profile_active_prefix_decode_diagnostics": profile_active_prefix_decode_diagnostics,
+        "profile_sdpa_backend": profile_sdpa_backend,
+        "stateful_monotonic_logits_processor": stateful_monotonic_logits_processor,
+        "q1_bmm_cross_attention_enabled": q1_bmm_cross_attention,
+        "native_q1_self_attention_requested": native_q1_self_attention_requested,
+        "native_q1_self_attention_enabled": native_q1_self_attention,
+        "native_q1_rope_cache_self_attention_requested": native_q1_rope_cache_self_attention_requested,
+        "native_q1_rope_cache_self_attention_enabled": native_q1_rope_cache_self_attention,
+        "decode_session_runtime_enabled": decode_session_state is not None,
+        "decode_session_cuda_graph_enabled": bool(decode_session_cuda_graph),
+        "decode_session_graph_count": (
+            len(decode_session_state.get("graph_cache", {}))
+            if decode_session_state is not None
+            else None
+        ),
+        "active_prefix_decode_loop_enabled": active_prefix_decode_loop,
+        "active_prefix_decode_bucket_size": active_prefix_decode_bucket_size if active_prefix_decode_loop else None,
+        "active_prefix_decode_cuda_graph_enabled": active_prefix_decode_cuda_graph if active_prefix_decode_loop else False,
+        "active_prefix_decode_cuda_graph_warmup": (
+            active_prefix_decode_cuda_graph_warmup if active_prefix_decode_cuda_graph else None
+        ),
+        "active_prefix_decode_cuda_graph_min_decode_steps": (
+            active_prefix_decode_cuda_graph_min_decode_steps if active_prefix_decode_cuda_graph else None
+        ),
+    })
+    if active_prefix_decode_diagnostics is not None:
+        stats["active_prefix_decode_diagnostics"] = active_prefix_decode_diagnostics
 
     return result, stats
 
@@ -310,6 +524,11 @@ class InferenceServer:
                         'event': response_event,
                         'result': None,
                         'generated_tokens': 0,
+                        'prompt_tokens': 0,
+                        'output_tokens': 0,
+                        'generated_tokens_per_sample': [],
+                        'prompt_tokens_per_sample': [],
+                        'output_tokens_per_sample': [],
                         'elapsed_seconds': 0.0,
                     }
 
@@ -383,17 +602,27 @@ class InferenceServer:
 
                 outputs, stats = model_generate(self.model, self.tokenizer, model_kwargs, generate_kwargs)
                 generated_tokens_per_sample = stats.get('generated_tokens_per_sample', [])
+                prompt_tokens_per_sample = stats.get('prompt_tokens_per_sample') or []
+                output_tokens_per_sample = stats.get('output_tokens_per_sample', [])
 
                 # Split and dispatch results
                 batch_i = 0
                 for i, (_, request, work_done) in enumerate(batch_requests):
                     padding = paddings[i]
                     out = outputs[batch_i:batch_i + work_done, padding:]  # Remove padding from the left
-                    request_generated_tokens = sum(generated_tokens_per_sample[batch_i:batch_i + work_done])
+                    request_generated_counts = generated_tokens_per_sample[batch_i:batch_i + work_done]
+                    request_prompt_counts = prompt_tokens_per_sample[batch_i:batch_i + work_done]
+                    request_output_counts = output_tokens_per_sample[batch_i:batch_i + work_done]
+                    request_generated_tokens = sum(request_generated_counts)
                     batch_i += work_done
                     request['result'] = out if request['result'] is None else torch.cat((request['result'], out), dim=0)
                     request['work_done'] += work_done
                     request['generated_tokens'] += request_generated_tokens
+                    request['prompt_tokens'] += sum(request_prompt_counts)
+                    request['output_tokens'] += sum(request_output_counts)
+                    request['generated_tokens_per_sample'].extend(request_generated_counts)
+                    request['prompt_tokens_per_sample'].extend(request_prompt_counts)
+                    request['output_tokens_per_sample'].extend(request_output_counts)
                     request['elapsed_seconds'] += stats.get('elapsed_seconds', 0.0)
                     if request['work_done'] >= request['total_work']:
                         # All work done for this record, signal completion
@@ -402,9 +631,20 @@ class InferenceServer:
                         request['result'] = {
                             'output': request['result'],
                             'stats': {
+                                'batch_size': request['total_work'],
+                                'prompt_tokens': request['prompt_tokens'],
+                                'prompt_tokens_per_sample': request['prompt_tokens_per_sample'],
+                                'output_tokens': request['output_tokens'],
+                                'output_tokens_per_sample': request['output_tokens_per_sample'],
                                 'generated_tokens': generated_tokens,
+                                'generated_tokens_per_sample': request['generated_tokens_per_sample'],
                                 'elapsed_seconds': elapsed_seconds,
                                 'tokens_per_second': generated_tokens / elapsed_seconds if elapsed_seconds > 0 else 0.0,
+                                'precision': stats.get('precision'),
+                                'context_type': stats.get('context_type'),
+                                'num_beams': stats.get('num_beams'),
+                                'cfg_scale': stats.get('cfg_scale'),
+                                'do_sample': stats.get('do_sample'),
                             },
                         }
                         request['event'].set()

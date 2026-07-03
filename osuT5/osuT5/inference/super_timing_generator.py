@@ -5,6 +5,7 @@ from scipy.signal import find_peaks
 from tqdm import tqdm
 
 from config import InferenceConfig
+from .profiler import InferenceProfiler
 from ..dataset.data_utils import get_groups, BEAT_TYPES
 from ..tokenizer import ContextType, EventType, Event
 from .preprocessor import Preprocessor
@@ -18,11 +19,12 @@ class SuperTimingGenerator:
             args: InferenceConfig,
             model,
             tokenizer,
+            profiler: InferenceProfiler | None = None,
     ):
         self.args = args
         self.model = model
         self.preprocessor = Preprocessor(args, parallel=True)
-        self.processor = Processor(args, model, tokenizer, cfg_scale=args.timer_cfg_scale)
+        self.processor = Processor(args, model, tokenizer, cfg_scale=args.timer_cfg_scale, profiler=profiler)
         self.processor.do_sample = False
         self.processor.parallel = True
         self.processor.num_beams = args.timer_num_beams
@@ -70,6 +72,7 @@ class SuperTimingGenerator:
                 in_context=[ContextType.NONE],
                 out_context=[ContextType.MAP] if self.args.train.data.add_timing else [ContextType.TIMING],
                 verbose=False,
+                profile_label="super_timing",
             )[0]
             if verbose:
                 self.processor._update_tokens_per_second_meter(iterator, tokens_per_second_meter, self.processor.last_generation_stats)

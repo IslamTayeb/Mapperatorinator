@@ -28,6 +28,15 @@ from transformers.utils import (
     logging,
 )
 
+from ...runtime_profiling import (
+    active_prefix_self_attention_length,
+    detail_ranges_enabled,
+    native_q1_rope_cache_self_attention_enabled,
+    native_q1_self_attention_enabled,
+    profile_range,
+    q1_bmm_cross_attention_enabled,
+)
+from ...inference.native_q1_attention import native_q1_attention, native_q1_rope_cache_attention
 from .configuration_varwhisper import VarWhisperConfig
 
 if is_flash_attn_2_available():
@@ -355,17 +364,62 @@ def sdpa_attention_forward(
     if local_attention != (-1, -1):
         attention_mask = sliding_window_mask
 
-    attn_output = (
-        F.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            dropout_p=module.attention_dropout if module.training else 0.0,
-            attn_mask=attention_mask,
-        )
-        .transpose(1, 2)
-        .contiguous()
+    if not module.is_cross_attention:
+        prefix_length = active_prefix_self_attention_length()
+        if prefix_length is not None and prefix_length > 0 and key.shape[-2] > prefix_length:
+            key = key[:, :, :prefix_length, :]
+            value = value[:, :, :prefix_length, :]
+            if isinstance(attention_mask, torch.Tensor) and attention_mask.shape[-1] > prefix_length:
+                attention_mask = attention_mask[..., :prefix_length]
+
+    use_q1_bmm_cross_attention = (
+        q1_bmm_cross_attention_enabled()
+        and module.is_cross_attention
+        and not module.training
+        and query.dtype == torch.float32
+        and key.dtype == torch.float32
+        and value.dtype == torch.float32
+        and attention_mask is None
+        and query.shape[0] == 1
+        and query.shape[-2] == 1
+        and key.shape[0] == 1
+        and value.shape[0] == 1
     )
+    use_native_q1_self_attention = (
+        native_q1_self_attention_enabled()
+        and not module.is_cross_attention
+        and not module.training
+        and query.dtype == torch.float32
+        and key.dtype == torch.float32
+        and value.dtype == torch.float32
+        and query.shape[0] == 1
+        and query.shape[-2] == 1
+        and key.shape[0] == 1
+        and value.shape[0] == 1
+    )
+    if use_native_q1_self_attention:
+        attn_output = native_q1_attention(query, key, value, attention_mask).transpose(1, 2).contiguous()
+    elif use_q1_bmm_cross_attention:
+        num_heads = query.shape[1]
+        head_dim = query.shape[-1]
+        q = query.reshape(num_heads, 1, head_dim)
+        k = key.reshape(num_heads, -1, head_dim)
+        v = value.reshape(num_heads, -1, head_dim)
+        scores = torch.bmm(q, k.transpose(1, 2)) * (head_dim ** -0.5)
+        attn_output = torch.bmm(torch.softmax(scores, dim=-1), v).view(1, num_heads, 1, head_dim)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+    else:
+        attn_output = (
+            F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                dropout_p=module.attention_dropout if module.training else 0.0,
+                attn_mask=attention_mask,
+            )
+            .transpose(1, 2)
+            .contiguous()
+        )
     attn_output = attn_output.view(bs, -1, dim)
     return (attn_output,)
 
@@ -458,6 +512,9 @@ class VarWhisperAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:
         bs = hidden_states.shape[0]
         is_varlen = cu_seqlens is not None
+        attn_kind = "cross" if self.is_cross_attention else "self"
+        range_prefix = f"attention.layer{self.layer_idx}.{attn_kind}"
+        profile_ranges = detail_ranges_enabled()
 
         attn_func = partial(
             VARWHISPER_ATTENTION_FUNCTION[self.config._attn_implementation],
@@ -531,37 +588,160 @@ class VarWhisperAttention(nn.Module):
                     attn_outputs = attn_func(qkv=qkv)
         else:
             if self.is_cross_attention:
-                query_states = self.Wq(hidden_states).view(bs, -1, self.num_heads, self.head_dim).transpose(1, 2)
+                if profile_ranges:
+                    with profile_range(f"{range_prefix}.q_proj"):
+                        query_states = self.Wq(hidden_states).view(bs, -1, self.num_heads, self.head_dim).transpose(1, 2)
+                else:
+                    query_states = self.Wq(hidden_states).view(bs, -1, self.num_heads, self.head_dim).transpose(1, 2)
 
                 if past_key_value and is_updated:
                     # reuse k,v, cross_attentions
-                    key_states, value_states = past_key_value[self.layer_idx]
+                    if profile_ranges:
+                        with profile_range(f"{range_prefix}.cache_reuse"):
+                            key_states, value_states = past_key_value[self.layer_idx]
+                    else:
+                        key_states, value_states = past_key_value[self.layer_idx]
                 else:
-                    kv = self.Wkv(key_value_states).view(bs, -1, 2, self.num_heads, self.head_dim)
-                    key_states, value_states = kv.transpose(1, 3).unbind(dim=2)
+                    if profile_ranges:
+                        with profile_range(f"{range_prefix}.kv_proj"):
+                            kv = self.Wkv(key_value_states).view(bs, -1, 2, self.num_heads, self.head_dim)
+                            key_states, value_states = kv.transpose(1, 3).unbind(dim=2)
+                    else:
+                        kv = self.Wkv(key_value_states).view(bs, -1, 2, self.num_heads, self.head_dim)
+                        key_states, value_states = kv.transpose(1, 3).unbind(dim=2)
 
                     if past_key_value is not None:
-                        past_key_value.update(key_states, value_states, self.layer_idx)
+                        if profile_ranges:
+                            with profile_range(f"{range_prefix}.cache_update"):
+                                past_key_value.update(key_states, value_states, self.layer_idx)
+                        else:
+                            past_key_value.update(key_states, value_states, self.layer_idx)
+                if profile_ranges:
+                    with profile_range(f"{range_prefix}.sdpa"):
+                        attn_outputs = attn_func(
+                            query=query_states,
+                            key=key_states,
+                            value=value_states,
+                        )
+                else:
+                    attn_outputs = attn_func(
+                        query=query_states,
+                        key=key_states,
+                        value=value_states,
+                    )
             else:
-                qkv = self.Wqkv(hidden_states).view(bs, -1, 3, self.num_heads, self.head_dim)
-                query_states, key_states, value_states = qkv.transpose(1, 3).unbind(dim=2)
+                prefix_length = active_prefix_self_attention_length()
+                use_native_q1_rope_cache_self_attention = (
+                    native_q1_rope_cache_self_attention_enabled()
+                    and not is_varlen
+                    and not self.training
+                    and hidden_states.dtype == torch.float32
+                    and hidden_states.shape[0] == 1
+                    and hidden_states.shape[1] == 1
+                    and isinstance(past_key_value, StaticCache)
+                    and isinstance(cache_position, torch.Tensor)
+                    and isinstance(position_ids, torch.Tensor)
+                    and prefix_length is not None
+                    and prefix_length > 0
+                )
+                if use_native_q1_rope_cache_self_attention:
+                    if profile_ranges:
+                        with profile_range(f"{range_prefix}.qkv_proj"):
+                            qkv = self.Wqkv(hidden_states).view(bs, -1, 3, self.num_heads, self.head_dim)
+                    else:
+                        qkv = self.Wqkv(hidden_states).view(bs, -1, 3, self.num_heads, self.head_dim)
 
-                cos, sin = self.rotary_emb(query_states, position_ids=position_ids)
-                query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+                    if profile_ranges:
+                        with profile_range(f"{range_prefix}.rope"):
+                            cos, sin = self.rotary_emb(qkv, position_ids=position_ids)
+                    else:
+                        cos, sin = self.rotary_emb(qkv, position_ids=position_ids)
 
-                if past_key_value is not None:
-                    # sin and cos are specific to RoPE models; cache_position needed for the static cache
-                    cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-                    key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+                    cache_layer = past_key_value.layers[self.layer_idx]
+                    if not getattr(cache_layer, "is_initialized", False):
+                        raise RuntimeError("native q1 RoPE/cache self-attention requires an initialized StaticCache")
+                    attention_mask_for_native = (
+                        kwargs.get("sliding_window_mask")
+                        if self.local_attention != (-1, -1)
+                        else kwargs.get("attention_mask")
+                    )
+                    if (
+                            isinstance(attention_mask_for_native, torch.Tensor)
+                            and attention_mask_for_native.shape[-1] > prefix_length
+                    ):
+                        attention_mask_for_native = attention_mask_for_native[..., :prefix_length]
+                    if profile_ranges:
+                        with profile_range(f"{range_prefix}.rope_cache_native_q1"):
+                            hidden_states = native_q1_rope_cache_attention(
+                                qkv,
+                                cache_layer.keys,
+                                cache_layer.values,
+                                cos,
+                                sin,
+                                cache_position,
+                                attention_mask_for_native,
+                                int(prefix_length),
+                            )
+                    else:
+                        hidden_states = native_q1_rope_cache_attention(
+                            qkv,
+                            cache_layer.keys,
+                            cache_layer.values,
+                            cos,
+                            sin,
+                            cache_position,
+                            attention_mask_for_native,
+                            int(prefix_length),
+                        )
+                    hidden_states = hidden_states.transpose(1, 2).contiguous()
+                    hidden_states = hidden_states.view(bs, -1, self.all_head_size)
+                    attn_outputs = (hidden_states,)
+                else:
+                    if profile_ranges:
+                        with profile_range(f"{range_prefix}.qkv_proj"):
+                            qkv = self.Wqkv(hidden_states).view(bs, -1, 3, self.num_heads, self.head_dim)
+                            query_states, key_states, value_states = qkv.transpose(1, 3).unbind(dim=2)
+                    else:
+                        qkv = self.Wqkv(hidden_states).view(bs, -1, 3, self.num_heads, self.head_dim)
+                        query_states, key_states, value_states = qkv.transpose(1, 3).unbind(dim=2)
 
-            attn_outputs = attn_func(
-                query=query_states,
-                key=key_states,
-                value=value_states,
-            )
+                    if profile_ranges:
+                        with profile_range(f"{range_prefix}.rope"):
+                            cos, sin = self.rotary_emb(query_states, position_ids=position_ids)
+                            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+                    else:
+                        cos, sin = self.rotary_emb(query_states, position_ids=position_ids)
+                        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+                    if past_key_value is not None:
+                        # sin and cos are specific to RoPE models; cache_position needed for the static cache
+                        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                        if profile_ranges:
+                            with profile_range(f"{range_prefix}.cache_update"):
+                                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+                        else:
+                            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+                    if profile_ranges:
+                        with profile_range(f"{range_prefix}.sdpa"):
+                            attn_outputs = attn_func(
+                                query=query_states,
+                                key=key_states,
+                                value=value_states,
+                            )
+                    else:
+                        attn_outputs = attn_func(
+                            query=query_states,
+                            key=key_states,
+                            value=value_states,
+                        )
 
         hidden_states, *rest = attn_outputs
-        hidden_states = self.out_drop(self.Wo(hidden_states))
+        if profile_ranges:
+            with profile_range(f"{range_prefix}.out_proj"):
+                hidden_states = self.out_drop(self.Wo(hidden_states))
+        else:
+            hidden_states = self.out_drop(self.Wo(hidden_states))
 
         return hidden_states, *rest, past_key_value
 
@@ -686,19 +866,38 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
                 returned tensors for more detail.
         """
         residual = hidden_states
-        hidden_states = self.self_attn_layer_norm(hidden_states)
+        layer_name = f"decoder.layer{self.self_attn.layer_idx}"
+        profile_ranges = detail_ranges_enabled()
+        if profile_ranges:
+            with profile_range(f"{layer_name}.self_attn_norm"):
+                hidden_states = self.self_attn_layer_norm(hidden_states)
+        else:
+            hidden_states = self.self_attn_layer_norm(hidden_states)
 
         # Self Attention
-        self_attn_outputs = self.self_attn(
-            hidden_states=hidden_states,
-            past_key_value=past_key_value,
-            attention_mask=attention_mask,
-            cache_position=cache_position,
-            position_ids=position_ids,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            output_attentions=output_attentions
-        )
+        if profile_ranges:
+            with profile_range(f"{layer_name}.self_attn"):
+                self_attn_outputs = self.self_attn(
+                    hidden_states=hidden_states,
+                    past_key_value=past_key_value,
+                    attention_mask=attention_mask,
+                    cache_position=cache_position,
+                    position_ids=position_ids,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    output_attentions=output_attentions
+                )
+        else:
+            self_attn_outputs = self.self_attn(
+                hidden_states=hidden_states,
+                past_key_value=past_key_value,
+                attention_mask=attention_mask,
+                cache_position=cache_position,
+                position_ids=position_ids,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                output_attentions=output_attentions
+            )
         hidden_states = self_attn_outputs[0]
         hidden_states = residual + hidden_states
 
@@ -706,27 +905,62 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
         cross_attn_outputs = ()
         if encoder_hidden_states is not None:
             residual = hidden_states
-            hidden_states = self.cross_attn_layer_norm(hidden_states)
-            cross_attn_outputs = self.cross_attn(
-                hidden_states=hidden_states,
-                key_value_states=encoder_hidden_states,
-                past_key_value=past_key_value,
-                position_ids=position_ids,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                cu_seqlens_k=encoder_cu_seqlens,
-                max_seqlen_k=encoder_max_seqlen,
-                output_attentions=output_attentions
-            )
+            if profile_ranges:
+                with profile_range(f"{layer_name}.cross_attn_norm"):
+                    hidden_states = self.cross_attn_layer_norm(hidden_states)
+            else:
+                hidden_states = self.cross_attn_layer_norm(hidden_states)
+            if profile_ranges:
+                with profile_range(f"{layer_name}.cross_attn"):
+                    cross_attn_outputs = self.cross_attn(
+                        hidden_states=hidden_states,
+                        key_value_states=encoder_hidden_states,
+                        past_key_value=past_key_value,
+                        position_ids=position_ids,
+                        cu_seqlens=cu_seqlens,
+                        max_seqlen=max_seqlen,
+                        cu_seqlens_k=encoder_cu_seqlens,
+                        max_seqlen_k=encoder_max_seqlen,
+                        output_attentions=output_attentions
+                    )
+            else:
+                cross_attn_outputs = self.cross_attn(
+                    hidden_states=hidden_states,
+                    key_value_states=encoder_hidden_states,
+                    past_key_value=past_key_value,
+                    position_ids=position_ids,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    cu_seqlens_k=encoder_cu_seqlens,
+                    max_seqlen_k=encoder_max_seqlen,
+                    output_attentions=output_attentions
+                )
             hidden_states = cross_attn_outputs[0]
             hidden_states = residual + hidden_states
 
         # Fully Connected
         residual = hidden_states
-        hidden_states = self.final_layer_norm(hidden_states)
-        hidden_states = self.activation_fn(self.fc1(hidden_states))
+        if profile_ranges:
+            with profile_range(f"{layer_name}.mlp_norm"):
+                hidden_states = self.final_layer_norm(hidden_states)
+        else:
+            hidden_states = self.final_layer_norm(hidden_states)
+        if profile_ranges:
+            with profile_range(f"{layer_name}.mlp.fc1"):
+                hidden_states = self.fc1(hidden_states)
+        else:
+            hidden_states = self.fc1(hidden_states)
+        if profile_ranges:
+            with profile_range(f"{layer_name}.mlp.activation"):
+                hidden_states = self.activation_fn(hidden_states)
+        else:
+            hidden_states = self.activation_fn(hidden_states)
         hidden_states = nn.functional.dropout(hidden_states, p=self.activation_dropout, training=self.training)
-        hidden_states = self.fc2(hidden_states)
+        if profile_ranges:
+            with profile_range(f"{layer_name}.mlp.fc2"):
+                hidden_states = self.fc2(hidden_states)
+        else:
+            hidden_states = self.fc2(hidden_states)
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states
 
@@ -841,7 +1075,11 @@ class VarWhisperEncoder(VarWhisperPreTrainedModel):
             if output_attentions:
                 all_attentions = all_attentions + (layer_outputs[1],)
 
-        hidden_states = self.layer_norm(hidden_states)
+        if detail_ranges_enabled():
+            with profile_range("encoder.final_norm"):
+                hidden_states = self.layer_norm(hidden_states)
+        else:
+            hidden_states = self.layer_norm(hidden_states)
         if output_hidden_states:
             encoder_states = encoder_states + (hidden_states,)
 
@@ -1100,7 +1338,11 @@ class VarWhisperDecoder(VarWhisperPreTrainedModel):
                 if encoder_hidden_states is not None:
                     all_cross_attentions += (layer_outputs[2],)
 
-        hidden_states = self.layer_norm(hidden_states)
+        if detail_ranges_enabled():
+            with profile_range("decoder.final_norm"):
+                hidden_states = self.layer_norm(hidden_states)
+        else:
+            hidden_states = self.layer_norm(hidden_states)
         # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -1412,7 +1654,11 @@ class VarWhisperForConditionalGeneration(WhisperGenerationMixin, VarWhisperPreTr
             return_dict=return_dict,
             cache_position=cache_position,
         )
-        lm_logits = self.proj_out(outputs[0])
+        if detail_ranges_enabled():
+            with profile_range("decoder.output_projection"):
+                lm_logits = self.proj_out(outputs[0])
+        else:
+            lm_logits = self.proj_out(outputs[0])
 
         loss = None
         if labels is not None:

@@ -72,8 +72,38 @@ class InferenceConfig:
     timer_bpm_threshold: float = 0.7  # Threshold requirement for BPM change in timer, higher values will result in less BPM changes
     timer_cfg_scale: float = 1.0  # Scale of classifier-free guidance for timer
     timer_iterations: int = 20  # Number of iterations for timer
+    inference_generation_compile: bool = False  # Enable Transformers generation compile path for profiling/scouting
+    inference_active_prefix_decode_loop: bool = False  # Experimental batch-1 decode loop with bucketed active-prefix self-attention
+    inference_active_prefix_decode_bucket_size: int = 128  # Active-prefix decode bucket length for reusable graph shapes
+    inference_active_prefix_decode_cuda_graph: bool = False  # Capture active-prefix one-token decode forwards with manual CUDA graphs
+    inference_active_prefix_decode_cuda_graph_warmup: int = 0  # Warmup forwards before each active-prefix CUDA graph capture
+    inference_active_prefix_decode_cuda_graph_min_decode_steps: int = 1  # First 1-based decode step eligible for graph capture
+    inference_stateful_monotonic_logits_processor: bool = False  # Experimental batch-1 stateful monotonic time-shift mask
+    inference_q1_bmm_cross_attention: bool = False  # Experimental fp32 q_len=1 cross-attention via bmm/softmax/bmm
+    inference_decode_session_runtime: bool = False  # Verifier-first single-song DecodeSession runtime scaffold
+    inference_decode_session_cuda_graph: bool = False  # Reserved for DecodeSession-owned CUDA graph replay
+    inference_decode_session_chunk_size: int = 1  # Reserved DecodeSession decode chunk size
+    inference_native_decode_kernels: bool = False  # Reserved default-off native C++/CUDA/CUTLASS decode-kernel experiments
+    inference_native_q1_self_attention: bool = False  # Experimental native fp32 q_len=1 active-prefix self-attention
+    inference_native_q1_rope_cache_self_attention: bool = False  # Experimental fused RoPE/cache q_len=1 self-attention
     use_server: bool = True  # Use server for optimized multiprocess inference
     max_batch_size: int = 16  # Maximum batch size for inference (only used for parallel sampling or super timing)
+    profile_inference: bool = False  # Write stage and generation timing profile JSON
+    profile_output_path: Optional[str] = None  # Path to write profile JSON; defaults next to generated beatmap
+    profile_sync_cuda: bool = True  # Synchronize CUDA around profiled regions for accurate timings
+    profile_torch_generation: bool = False  # Write torch.profiler Chrome traces around selected model.generate calls
+    profile_torch_output_dir: Optional[str] = None  # Directory for torch.profiler Chrome traces
+    profile_torch_generation_limit: int = 3  # Maximum number of model.generate calls to trace
+    profile_torch_generation_label_filter: Optional[str] = None  # Only trace generation ranges whose name contains this text
+    profile_torch_record_shapes: bool = True  # Record tensor shapes in torch.profiler traces
+    profile_torch_profile_memory: bool = True  # Record memory events in torch.profiler traces
+    profile_torch_with_stack: bool = False  # Record Python stacks in torch.profiler traces
+    profile_torch_event_limit: int = 50  # Maximum torch profiler key-average events to store in profile JSON
+    profile_nvtx_generation_ranges: bool = False  # Add top-level NVTX ranges for generation windows without torch.profiler
+    profile_record_token_ids: bool = False  # Record generated token IDs in profile JSON for fixed-seed equivalence checks
+    profile_generation_detail_ranges: bool = False  # Add detailed NVTX/torch profiler ranges inside generation
+    profile_active_prefix_decode_diagnostics: bool = False  # Record active-prefix decode-loop diagnostic counters
+    profile_sdpa_backend: Optional[str] = None  # Force one PyTorch SDPA backend for profiling (flash/efficient/math/cudnn)
     resnap_events: bool = True  # Resnap notes to the timing after generation
     snap_near_perfect_overlaps: bool = True  # Snap nearly overlapping positions to each other
 

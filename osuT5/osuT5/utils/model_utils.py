@@ -329,6 +329,7 @@ def load_model_loaders(
         lora_path=None,
         gamemode: int | None = None,
         auto_select_gamemode_model: bool = True,
+        generation_compile: bool = False,
 ):
     if not ckpt_path:
         if eval_mode:
@@ -382,7 +383,7 @@ def load_model_loaders(
                 device_map=device,
                 subfolder=ckpt_subfolder,
             )
-            model.generation_config.disable_compile = True
+            model.generation_config.disable_compile = not generation_compile
         else:
             model_state = torch.load(ckpt_path / "pytorch_model.bin", weights_only=True)
             model = _get_model(t5_args, tokenizer, dtype=dtype, attn_implementation=attn_implementation)

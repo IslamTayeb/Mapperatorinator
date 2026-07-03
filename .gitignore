@@ -11,3 +11,7 @@ test_inference_mai_mod.py
 *.lck
 .env
 .vscode
+*.profile.json
+*.trace.json
+attention_kernel_profile*.json
+attention_kernel_profile*.txt
