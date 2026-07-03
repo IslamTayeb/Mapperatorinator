@@ -4,7 +4,7 @@
 
 Measure the actual one-token decoder attention tensors after the accepted q1 BMM cross-attention stack, before adding any more attention branches or native kernels.
 
-Current campaign baseline remains DCC job `49213490`: active-prefix bucket64, CUDA graph warmup0, stateful monotonic logits processor, q_len=1 BMM cross-attention, `7,639` SALVALAI main tokens, `37.981s` model time, `201.125 tok/s`, token equivalence PASS.
+Campaign baseline at the time was DCC job `49213490`: active-prefix bucket64, CUDA graph warmup0, stateful monotonic logits processor, q_len=1 BMM cross-attention, `7,639` SALVALAI main tokens, `37.981s` model time, `201.125 tok/s`, token equivalence PASS. This was later superseded by persistent DecodeSession runtime job `49223294`: `35.337s`, `216.173 tok/s`, main/timing token equivalence PASS.
 
 ## Utility
 
@@ -93,4 +93,3 @@ Future attention work should move beyond simple PyTorch `bmm` substitutions:
 1. Persistent/bufferized `DecodeSession` graph/cache/encoder reuse, because it can remove repeated capture/runtime costs and creates the stable buffers needed for larger native kernels.
 2. A narrow native/CUTLASS/CUDA q_len=1 active-prefix self-attention kernel only if it improves the `128..640` production buckets, not just the long tail.
 3. Fused decoder-block or scheduler work that reduces launches across attention, linears, layernorm, and elementwise operations together.
-

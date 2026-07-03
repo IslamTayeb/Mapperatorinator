@@ -4,7 +4,7 @@
 
 Freshly re-profile the accepted exact opt-in stack before starting deeper 500 tok/s work. This pass is measurement only. It does not introduce or claim a speedup.
 
-Current campaign baseline:
+Historical campaign baseline at the time of this profiling pass:
 
 - `inference_generation_compile=true`
 - `inference_active_prefix_decode_loop=true`
@@ -15,7 +15,7 @@ Current campaign baseline:
 - `inference_stateful_monotonic_logits_processor=true`
 - `inference_q1_bmm_cross_attention=true`
 
-Reference accepted full-song result remains DCC job `49213490`, commit `3af8d69`: `7,639` main tokens, `37.981s` model time, `201.125 tok/s`, main/timing token equivalence PASS.
+Reference accepted full-song result at the time was DCC job `49213490`, commit `3af8d69`: `7,639` main tokens, `37.981s` model time, `201.125 tok/s`, main/timing token equivalence PASS. This was later superseded by persistent DecodeSession runtime job `49223294`: `35.337s`, `216.173 tok/s`, main/timing token equivalence PASS.
 
 ## Jobs
 
@@ -55,7 +55,7 @@ Strict compare path: `throughput/compare-main-vs-q1bmm.txt`.
 
 Interpretation:
 
-- No speed win. Keep `201.125 tok/s` from job `49213490` as the campaign baseline.
+- No speed win in this profiling pass. It kept `201.125 tok/s` from job `49213490` as the campaign baseline at the time; that baseline is now superseded by DecodeSession job `49223294`.
 - The current commit still reproduces the optimized path in the `~200 tok/s` range with exact main-token identity.
 - The Slurm job failure is from the strict comparison command returning nonzero after the valid profile was written. It is not an inference failure.
 - Future total-stage comparison jobs should not isolate Hugging Face/model caches unless the claim explicitly includes first-download/model-cache cold cost. Isolate compiler/CUDA caches for cold compile checks, but avoid invalidating model-download/load caches when comparing normal inference stage wall time.
@@ -124,7 +124,7 @@ Nsight MemOps were dominated by Host-to-Device time over the whole smoke; do not
 
 ## Decision
 
-No optimization graduated from this pass. Keep the current exact opt-in baseline at `201.125 tok/s`.
+No optimization graduated from this pass. It kept the then-current exact opt-in baseline at `201.125 tok/s`; persistent DecodeSession graph/cache reuse later graduated at `216.173 tok/s`.
 
 The next plausible 500 tok/s work should target:
 

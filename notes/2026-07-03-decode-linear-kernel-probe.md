@@ -4,7 +4,7 @@
 
 Measure the actual one-token decoder `nn.Linear` shapes after the accepted q1 BMM opt-in stack, before starting native kernel work. This is a diagnostic microbenchmark only. It does not claim an inference speedup.
 
-Current campaign baseline remains DCC job `49213490`: active-prefix bucket64, CUDA graph warmup0, stateful monotonic logits processor, q_len=1 BMM cross-attention, `7,639` SALVALAI main tokens, `37.981s` model time, `201.125 tok/s`, token equivalence PASS.
+Campaign baseline at the time was DCC job `49213490`: active-prefix bucket64, CUDA graph warmup0, stateful monotonic logits processor, q_len=1 BMM cross-attention, `7,639` SALVALAI main tokens, `37.981s` model time, `201.125 tok/s`, token equivalence PASS. This was later superseded by persistent DecodeSession runtime job `49223294`: `35.337s`, `216.173 tok/s`, main/timing token equivalence PASS.
 
 ## Utility
 

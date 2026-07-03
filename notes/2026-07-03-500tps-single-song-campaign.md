@@ -18,27 +18,29 @@ Use the current fastest exact opt-in path as the campaign baseline unless a new 
 - `inference_active_prefix_decode_cuda_graph_min_decode_steps=1`
 - `inference_stateful_monotonic_logits_processor=true`
 - `inference_q1_bmm_cross_attention=true`
+- `inference_decode_session_runtime=true`
+- `inference_decode_session_cuda_graph=true`
 
-DCC job `49213490` on RTX 2080 Ti validated this stack on full-song SALVALAI:
+DCC job `49223294` on RTX 2080 Ti validated the current fastest stack on full-song SALVALAI:
 
 | metric | value |
 | --- | ---: |
 | main tokens | `7,639` |
-| synchronized model time | `37.981s` |
-| throughput | `201.125 tok/s` |
-| timing throughput | `84.160 tok/s` |
-| total timing+map stage | `52.638s` |
+| synchronized model time | `35.337s` |
+| throughput | `216.173 tok/s` |
+| timing throughput | `100.553 tok/s` |
+| total timing+map stage | `48.493s` |
 | equivalence | PASS main and timing tokens |
 
-The `500 tok/s` target for the same `7,639` tokens implies `15.278s` main-generation model time, a further `59.8%` reduction from the accepted opt-in path.
+The `500 tok/s` target for the same `7,639` tokens implies `15.278s` main-generation model time, a further `56.8%` reduction from the accepted opt-in path.
 
 ## Campaign Direction
 
 The next work should be a decoder-runtime and measured-kernel campaign, not a flag sweep.
 
-1. Re-profile the accepted q1 BMM path first. Use untraced `profile_inference` for speed claims and Nsight/torch profiler only for diagnosis.
-2. Build verifier-first `DecodeSession` infrastructure before broad kernel work. It should own stable encoder buffers, static input buffers, static cache state, active-prefix metadata, CUDA graph state, generated-token buffers, sampler/logits-processor state, EOS/stopping state, and an RNG ledger.
-3. Keep `DecodeSession` default-off and verifier-only until generated-token identity, raw-logit/top-k equality, final RNG-state identity, and output behavior are proven across multiple sampled decode steps and windows.
+1. Re-profile the accepted DecodeSession path first. Use untraced `profile_inference` for speed claims and Nsight/torch profiler only for diagnosis.
+2. Keep future `DecodeSession` expansions verifier-first before broad kernel work. It should own stable encoder buffers, static input buffers, static cache state, active-prefix metadata, CUDA graph state, generated-token buffers, sampler/logits-processor state, EOS/stopping state, and an RNG ledger.
+3. Keep `DecodeSession` default-off, and require generated-token identity, raw-logit/top-k equality, final RNG-state identity, and output behavior before broadening beyond the accepted simple single-song path.
 4. Prefer stable PyTorch built-ins first, then isolated C++/CUDA/CUTLASS/cuBLASLt kernels if profiling predicts a meaningful `>5%` full-song single-song gain.
 5. Avoid Triton-first work. Use Triton only if no stable alternative exists and the path is default-off, isolated, and strongly measured.
 
@@ -86,16 +88,16 @@ Acceptance gates:
 
 ## Initial Implementation Checkpoint
 
-This checkpoint adds default-off campaign flags and a verifier-first `DecodeSession` wrapper around the existing exact one-token prefill/decode helpers. It is not a speed win and must not be reported as one.
+This original checkpoint added default-off campaign flags and a verifier-first `DecodeSession` wrapper around the existing exact one-token prefill/decode helpers. It was not a speed win by itself.
 
-Normal inference fails loudly if a reserved DecodeSession/native-kernel flag is enabled before implementation. Use `utils/verify_one_token_decode.py --candidate-decode-session` for the current one-token verifier path instead of setting `inference_decode_session_runtime=true`.
+Follow-up job `49223294` accepted `inference_decode_session_runtime=true` plus `inference_decode_session_cuda_graph=true` as a default-off production opt-in for the simple active-prefix graph + stateful + q1-BMM path. Native kernels and chunked DecodeSession remain reserved.
 
 ## Codex `/goal` Prompt
 
 ```text
 /goal Optimize Mapperatorinator single-song inference speed toward 500 tok/s main-generation throughput on RTX 2080/2080 Ti, same-calculation only. This is not a batching, multi-process, or multi-song aggregate-throughput goal. The objective is faster normal single-song inference while preserving the same generated map for the same settings and seed.
 
-Current fastest exact opt-in baseline is active-prefix bucket64 CUDA graph + warmup0 + stateful monotonic logits processor + q_len=1 BMM cross-attention: full-song SALVALAI 7,639 main tokens, 37.981s synchronized model time, 201.125 tok/s, fixed-seed token equivalence PASS for main and timing. Keep this as the campaign baseline unless a new full-song exact-equivalent single-song run beats it.
+Current fastest exact opt-in baseline is active-prefix bucket64 CUDA graph + warmup0 + stateful monotonic logits processor + q_len=1 BMM cross-attention + persistent DecodeSession graph/cache reuse: full-song SALVALAI 7,639 main tokens, 35.337s synchronized model time, 216.173 tok/s, fixed-seed token equivalence PASS for main and timing. Keep this as the campaign baseline unless a new full-song exact-equivalent single-song run beats it.
 
 Do not claim wins from batching, multiple processes, multiple songs in parallel, changed precision, quantization, sampling policy, RNG behavior, output policy, model quality, windowing/overlap, generated-token behavior, output length, or non-equivalent generated maps unless explicitly labeled non-equivalent. Same settings and same seed should generate the same token IDs and same output behavior.
 
@@ -103,7 +105,7 @@ Use a profiling-first loop. Start with fresh post-q1 profiling of the accepted o
 
 Prioritize stable runtime and kernel work over framework churn. Prefer PyTorch built-ins first, then isolated C++/CUDA/CUTLASS/cuBLASLt kernels if profiling predicts a meaningful >5% full-song single-song gain. Avoid Triton-first work because maintainability/longevity matters; use Triton only if no stable alternative exists and the path is default-off, isolated, and strongly measured. Do not prioritize FlashInfer fp32 SM75, FA2 reruns, TensorRT-RTX FP32 Turing, sampling fusion, or bucket sweeps unless new profiling overturns prior evidence.
 
-Build a reusable default-off DecodeSession runtime before broad kernel work: stable encoder buffers, static input buffers, static cache state, active-prefix metadata, CUDA graph state, generated-token buffers, sampler/logits processor state, EOS/stopping state, and RNG ledger. Keep it verifier-only until exact generated-token, raw-logit/top-k, final RNG-state, and output behavior are proven across multiple sampled decode steps and windows.
+Build future DecodeSession runtime expansions before broad kernel work: stable encoder buffers, static input buffers, static cache state, active-prefix metadata, CUDA graph state, generated-token buffers, sampler/logits processor state, EOS/stopping state, and RNG ledger. Keep expansions verifier-first until exact generated-token, raw-logit/top-k, final RNG-state, and output behavior are proven across multiple sampled decode steps and windows.
 
 After fresh profiling, pursue isolated native kernel work only for measured hotspots: one-token linear/MLP/projection work, q_len=1 active-prefix self-attention, or fused q1 cross-attention if q1 BMM remains target-sized. Do not retry simple BMM for active-prefix self-attention: the SM75 probe showed BMM is slower than SDPA at bucket64/96/128.
 
