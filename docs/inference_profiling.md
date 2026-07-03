@@ -402,6 +402,31 @@ python inference.py --config-name profile_salvalai \
   inference_stateful_monotonic_logits_processor=true
 ```
 
+Post-bucket64 diagnostics, DCC jobs `49207288` and `49208036` on RTX 2080 Ti, commit `cf4f87e`:
+
+| diagnostic run | main tokens | main model time | main tok/s | timing tok/s | note |
+| --- | ---: | ---: | ---: | ---: | --- |
+| active64 diagnostic full song | `7,639` | `48.914s` | `156.171` | `75.903` | close to accepted active64 throughput |
+| active64 seq66 torch profile | `7,639` | `53.156s` | `143.709` | `63.175` | diagnostic only; torch profiler overhead |
+
+Run dir: `/work/imt11/Mapperatorinator/runs/active64-nextdiag-49207288-cf4f87e`. The diagnostic full-song run showed:
+
+| counter | wall time |
+| --- | ---: |
+| `token_append_stop_wall_cpu_s` | `30.269s` |
+| `stopping_criteria_wall_cpu_s` | `29.823s` |
+| `decode_forward_wall_cpu_s` | `4.990s` |
+| `logits_processor_wall_cpu_s` | `4.426s` |
+| `prepare_inputs_wall_cpu_s` | `3.848s` |
+| `sampling_wall_cpu_s` | `1.156s` |
+| `compile_lookup_wall_cpu_s` | `0.010s` |
+
+CUDA graph diagnostics reported `198` captured graphs, `3.328s` total capture time, `7,552` decode replays, and `115` bucket transitions. This capture tax is now a real target-sized cost. The current `graph_cache` is local to each `active_prefix_decode_generate()` call, so captures repeat across generation windows; however, replay also closes over per-window cache and encoder-output objects, so persistent cross-window graph reuse requires a bufferized direct runtime rather than a small dictionary hoist.
+
+The seq66 trace again showed no single embarrassing small-kernel cleanup. Fused attention and one-token linear/GEMV-heavy decoder work dominate CUDA time: `mapperatorinator.active_prefix.decode_forward.cuda_graph` had `694.950ms` self CUDA, the SM75 FMHA kernel had `379.462ms` self CUDA, and GEMV/GEMM families contributed tens of milliseconds each in that one traced window. CPU-side `stopping_criteria` and `cudaStreamSynchronize` remain synchronization/control symptoms, consistent with the rejected simple stopping specialization.
+
+Tiny-bucket smoke job `49208036`, run dir `/work/imt11/Mapperatorinator/runs/active-tiny-bucket-sweep-49208036-cf4f87e`, tested buckets `16`, `32`, `48`, `80`, and `96` against bucket64. All were token-equivalent on the 15s smoke, but none deserved full-song promotion: bucket16/32/48 regressed main generation, bucket80 was flat, and bucket96 improved smoke main by only `+0.7%`. Keep bucket64 as the current full-song opt-in bucket. See `notes/2026-07-02-active64-post-bucket-diagnostics.md`.
+
 Rejected delayed-capture variant, DCC job `49166715`, commit `f712b59`: setting `inference_active_prefix_decode_cuda_graph_min_decode_steps=16` remained token-equivalent on 15s smoke but failed per-window no-regression on 5/10 windows and reduced graph-path aggregate throughput versus immediate capture. Keep `min_decode_steps=1` as the default. Only revisit delayed capture if a future profiler trace shows graph capture itself has become the dominant cost and a better adaptive policy can avoid medium-window regressions.
 
 Rejected active-prefix mask fast path, DCC jobs `49158276` and `49158365` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti:
