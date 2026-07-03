@@ -11,7 +11,7 @@ The current accepted fast path should remain integrated through the existing inf
 
 This pass tightened `inference.py` validation for active-prefix, stateful monotonic, q1 BMM, DecodeSession, native q1 self-attention, and fused RoPE/cache self-attention. It also added missing profile metadata for `inference_native_q1_rope_cache_self_attention`.
 
-The validation now runs after `compile_device_and_seed()` so `device=auto` and `attn_implementation=auto` are normalized before runtime-mode constraints check precision/backend/device compatibility. This matters because the accepted native q1 flags require effective `attn_implementation=sdpa`, and the user-facing default is `auto`.
+The validation now runs after `compile_device_and_seed()` so `device=auto` and `attn_implementation=auto` are normalized before runtime-mode constraints check precision/backend/device compatibility. This matters because the accepted active-prefix CUDA graph/native q1 flags require an effective CUDA device plus `attn_implementation=sdpa`, and the user-facing defaults are `device=auto` and `attn_implementation=auto`.
 
 ## Fast-Prepare Result
 

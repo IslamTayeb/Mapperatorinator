@@ -377,6 +377,8 @@ def validate_reserved_runtime_flags(args: InferenceConfig):
     if args.inference_active_prefix_decode_cuda_graph:
         if not args.inference_active_prefix_decode_loop:
             raise ValueError("inference_active_prefix_decode_cuda_graph requires inference_active_prefix_decode_loop=true.")
+        if args.device != "cuda":
+            raise ValueError("inference_active_prefix_decode_cuda_graph requires device=cuda.")
         require_simple_sequential("inference_active_prefix_decode_cuda_graph")
     if args.inference_stateful_monotonic_logits_processor:
         require_simple_sequential("inference_stateful_monotonic_logits_processor")
@@ -417,6 +419,8 @@ def validate_reserved_runtime_flags(args: InferenceConfig):
     if args.inference_native_q1_self_attention:
         if not args.inference_native_decode_kernels:
             raise ValueError("inference_native_q1_self_attention requires inference_native_decode_kernels=true.")
+        if args.device != "cuda":
+            raise ValueError("inference_native_q1_self_attention requires device=cuda.")
         if args.precision != "fp32":
             raise ValueError("inference_native_q1_self_attention currently requires precision=fp32.")
         if args.attn_implementation != "sdpa":
