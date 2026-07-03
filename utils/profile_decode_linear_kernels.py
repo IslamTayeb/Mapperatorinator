@@ -224,7 +224,7 @@ def _operation_kind(name: str) -> str:
 def _find_layer_mlp_inputs(captures: dict[str, LinearCapture]) -> dict[str, tuple[LinearCapture, LinearCapture]]:
     by_layer: dict[str, dict[str, LinearCapture]] = defaultdict(dict)
     for name, capture in captures.items():
-        match = re.search(r"(^|\\.)model\\.decoder\\.layers\\.(\\d+)\\.(fc1|fc2)$", name)
+        match = re.search(r"(^|\.)model\.decoder\.layers\.(\d+)\.(fc1|fc2)$", name)
         if match is None:
             continue
         layer_key = f"decoder.layers.{match.group(2)}"
@@ -239,7 +239,7 @@ def _find_layer_mlp_inputs(captures: dict[str, LinearCapture]) -> dict[str, tupl
 def _find_decoder_layer_modules(model) -> dict[int, torch.nn.Module]:
     layers: dict[int, torch.nn.Module] = {}
     for name, module in model.named_modules():
-        match = re.search(r"(^|\\.)model\\.decoder\\.layers\\.(\\d+)$", name)
+        match = re.search(r"(^|\.)model\.decoder\.layers\.(\d+)$", name)
         if match is None:
             continue
         if hasattr(module, "activation_fn") and hasattr(module, "fc1") and hasattr(module, "fc2"):
