@@ -124,9 +124,14 @@ def summarize(path: Path, *, limit: int) -> None:
             tokens = values.get("generated_tokens", 0)
             tok_s = values.get("tokens_per_second", 0.0)
             records = values.get("records", 0)
+            cuda_event = values.get("model_generate_cuda_event_seconds")
+            host_gap = values.get("model_generate_host_gap_seconds")
+            ledger_text = ""
+            if isinstance(cuda_event, (int, float)) and isinstance(host_gap, (int, float)):
+                ledger_text = f", generate_cuda={_fmt_seconds(cuda_event)}, host_gap={_fmt_seconds(host_gap)}"
             print(
                 f"  {context}: model={_fmt_seconds(elapsed)}, wall={_fmt_seconds(wall)}, "
-                f"tokens={tokens}, tok/s={tok_s:.1f}, records={records}"
+                f"tokens={tokens}, tok/s={tok_s:.1f}, records={records}{ledger_text}"
             )
 
 

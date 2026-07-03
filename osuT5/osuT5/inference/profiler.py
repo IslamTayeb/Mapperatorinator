@@ -306,13 +306,34 @@ class InferenceProfiler:
             "wall_seconds": 0.0,
             "model_elapsed_seconds": 0.0,
             "generated_tokens": 0,
+            "model_generate_cpu_elapsed_seconds": 0.0,
+            "model_generate_cuda_event_seconds": 0.0,
+            "model_generate_host_gap_seconds": 0.0,
+            "model_generate_records_with_cuda_event": 0,
         })
         summary["records"] += 1
         summary["wall_seconds"] += float(record.get("wall_seconds", 0.0) or 0.0)
         summary["model_elapsed_seconds"] += float(record.get("model_elapsed_seconds", 0.0) or 0.0)
         summary["generated_tokens"] += int(record.get("generated_tokens", 0) or 0)
+        if isinstance(record.get("model_generate_cpu_elapsed_seconds"), (int, float)):
+            summary["model_generate_cpu_elapsed_seconds"] += float(record["model_generate_cpu_elapsed_seconds"])
+        if isinstance(record.get("model_generate_cuda_event_seconds"), (int, float)):
+            summary["model_generate_cuda_event_seconds"] += float(record["model_generate_cuda_event_seconds"])
+            summary["model_generate_records_with_cuda_event"] += 1
+        if isinstance(record.get("model_generate_host_gap_seconds"), (int, float)):
+            summary["model_generate_host_gap_seconds"] += float(record["model_generate_host_gap_seconds"])
         model_elapsed = summary["model_elapsed_seconds"]
         summary["tokens_per_second"] = summary["generated_tokens"] / model_elapsed if model_elapsed > 0 else 0.0
+        summary["model_generate_cuda_event_fraction"] = (
+            summary["model_generate_cuda_event_seconds"] / model_elapsed
+            if model_elapsed > 0 and summary["model_generate_records_with_cuda_event"] > 0
+            else None
+        )
+        summary["model_generate_host_gap_fraction"] = (
+            summary["model_generate_host_gap_seconds"] / model_elapsed
+            if model_elapsed > 0 and summary["model_generate_records_with_cuda_event"] > 0
+            else None
+        )
 
     @classmethod
     def _to_jsonable(cls, value: Any) -> Any:

@@ -287,6 +287,8 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     )
 
     # Perform batched generation
+    generate_start_event = generate_end_event = None
+    generate_cuda_event_seconds = None
     with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16, enabled=precision == 'amp'), \
             generation_profile_context(
                 detail_ranges=profile_generation_detail_ranges,
@@ -297,7 +299,12 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
             ):
         if sync_model_timing:
             _sync_cuda_for_model(model)
+            if torch.cuda.is_available() and getattr(getattr(model, "device", None), "type", None) == "cuda":
+                generate_start_event = torch.cuda.Event(enable_timing=True)
+                generate_end_event = torch.cuda.Event(enable_timing=True)
         start_time = time.perf_counter()
+        if generate_start_event is not None:
+            generate_start_event.record()
         result = model.generate(
             **model_kwargs,
             **generate_kwargs,
@@ -324,9 +331,13 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
                 ),
             ) if active_prefix_decode_loop else None,
         )
+        if generate_end_event is not None:
+            generate_end_event.record()
         if sync_model_timing:
             _sync_cuda_for_model(model)
         elapsed_seconds = time.perf_counter() - start_time
+        if generate_start_event is not None and generate_end_event is not None:
+            generate_cuda_event_seconds = float(generate_start_event.elapsed_time(generate_end_event)) / 1000.0
 
     result = result.cpu()
     stats = _build_generation_stats(result, model_kwargs, pad_token_id, elapsed_seconds)
@@ -337,6 +348,13 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         "cfg_scale": float(cfg_scale),
         "do_sample": bool(generate_kwargs.get("do_sample", False)),
         "sync_model_timing": sync_model_timing,
+        "model_generate_cpu_elapsed_seconds": elapsed_seconds,
+        "model_generate_cuda_event_seconds": generate_cuda_event_seconds,
+        "model_generate_host_gap_seconds": (
+            elapsed_seconds - generate_cuda_event_seconds
+            if generate_cuda_event_seconds is not None
+            else None
+        ),
         "generation_compile_enabled": not bool(getattr(getattr(model, "generation_config", None), "disable_compile", True)),
         "profile_generation_detail_ranges": profile_generation_detail_ranges,
         "profile_active_prefix_decode_diagnostics": profile_active_prefix_decode_diagnostics,
