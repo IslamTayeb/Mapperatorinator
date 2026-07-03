@@ -13,7 +13,16 @@ def _load_module():
     return module
 
 
-def _profile(*, tokens: list[int], tok_s: float, model_s: float, wall_s: float, seed: int = 12345):
+def _profile(
+    *,
+    tokens: list[int],
+    tok_s: float,
+    model_s: float,
+    wall_s: float,
+    seed: int = 12345,
+    result_sha256: str = "same-output",
+    result_size_bytes: int = 1234,
+):
     metadata = {
         key: "same"
         for key in [
@@ -44,6 +53,8 @@ def _profile(*, tokens: list[int], tok_s: float, model_s: float, wall_s: float, 
         "start_time": 71000,
         "end_time": 86000,
         "profile_record_token_ids": True,
+        "result_file_sha256": result_sha256,
+        "result_file_size_bytes": result_size_bytes,
     })
     return {
         "metadata": metadata,
@@ -125,6 +136,7 @@ def test_compare_profiles_passes_equivalent_non_regression(tmp_path):
 
     assert report["same_calculation"]["pass"]
     assert report["token_equivalence"]["pass"]
+    assert report["output_artifact"]["pass"]
     assert report["performance"]["pass"]
 
 
@@ -144,6 +156,33 @@ def test_compare_profiles_reports_token_and_performance_failures(tmp_path):
     assert not report["performance"]["metrics"]["tokens_per_second"]["pass"]
     assert not report["performance"]["metrics"]["model_elapsed_seconds"]["pass"]
     assert not report["performance"]["per_window"]["pass"]
+
+
+def test_compare_profiles_reports_output_artifact_mismatch(tmp_path):
+    module = _load_module()
+    baseline = tmp_path / "baseline.profile.json"
+    candidate = tmp_path / "candidate.profile.json"
+    baseline.write_text(module.json.dumps(_profile(
+        tokens=[1, 2, 3],
+        tok_s=100,
+        model_s=10,
+        wall_s=11,
+        result_sha256="baseline-output",
+        result_size_bytes=1234,
+    )))
+    candidate.write_text(module.json.dumps(_profile(
+        tokens=[1, 2, 3],
+        tok_s=110,
+        model_s=9,
+        wall_s=10,
+        result_sha256="candidate-output",
+        result_size_bytes=1235,
+    )))
+
+    report = module.compare_profiles(baseline, candidate, label="main_generation")
+
+    assert not report["output_artifact"]["pass"]
+    assert report["output_artifact"]["status"] == "FAIL"
 
 
 def test_compare_profiles_for_labels_passes_when_main_and_timing_pass(tmp_path):
@@ -179,6 +218,7 @@ def test_compare_profiles_for_labels_passes_when_main_and_timing_pass(tmp_path):
 
     assert report["same_calculation_pass"]
     assert report["token_equivalence_pass"]
+    assert report["output_artifact_pass"]
     assert report["performance_pass"]
     assert report["reports"]["main_generation"]["performance"]["pass"]
     assert report["reports"]["timing_context"]["performance"]["pass"]
@@ -246,6 +286,8 @@ def _suite_manifest(
             "main_tokens_per_second": 50.0,
             "main_token_count": 100,
             "main_token_sha256": f"hash-cold-{hash_suffix}",
+            "result_file_sha256": f"result-cold-{hash_suffix}",
+            "result_file_size_bytes": 1000,
             "main_first_record": {
                 "records": 1,
                 "generated_tokens": 50,
@@ -280,6 +322,8 @@ def _suite_manifest(
             "main_tokens_per_second": warmed_tok_s,
             "main_token_count": 120,
             "main_token_sha256": f"hash-warm-{hash_suffix}",
+            "result_file_sha256": f"result-warm-{hash_suffix}",
+            "result_file_size_bytes": 1200,
             "main_first_record": {
                 "records": 1,
                 "generated_tokens": 40,
@@ -369,6 +413,7 @@ def test_compare_suite_manifests_passes_warmed_non_regression(tmp_path):
     assert report["shape"]["pass"]
     assert report["scope_availability"]["pass"]
     assert report["token_equivalence"]["pass"]
+    assert report["output_artifact_equivalence"]["pass"]
     assert report["performance"]["pass"]
     assert report["segments"]["first_records"]["pass"]
     assert report["segments"]["remaining_records"]["pass"]
@@ -388,6 +433,8 @@ def test_compare_suite_manifests_reports_hash_and_warmed_regressions(tmp_path):
     assert report["shape"]["pass"]
     assert not report["token_equivalence"]["pass"]
     assert report["token_equivalence"]["mismatches"]
+    assert not report["output_artifact_equivalence"]["pass"]
+    assert report["output_artifact_equivalence"]["mismatches"]
     assert not report["performance"]["pass"]
     assert not report["performance"]["metrics"]["tokens_per_second"]["pass"]
 
@@ -427,6 +474,8 @@ def _serial_suite_manifest(*, song1_tok_s: float = 100.0, song2_tok_s: float = 1
             "main_tokens_per_second": tok_s,
             "main_token_count": 100,
             "main_token_sha256": f"hash-song{song_index}",
+            "result_file_sha256": f"result-song{song_index}",
+            "result_file_size_bytes": 1000 + song_index,
             "main_first_record": {
                 "records": 1,
                 "generated_tokens": 50,

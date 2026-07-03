@@ -80,6 +80,8 @@ def summarize(path: Path, *, limit: int) -> None:
         for key in [
             "audio_path",
             "result_path",
+            "result_file_sha256",
+            "result_file_size_bytes",
             "device",
             "precision",
             "attn_implementation",
@@ -401,6 +403,55 @@ def _compare_suite_token_hashes(baseline: dict[str, Any], candidate: dict[str, A
     }
 
 
+def _compare_suite_output_hashes(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    baseline_runs = baseline.get("runs", [])
+    candidate_runs = candidate.get("runs", [])
+    paired = min(len(baseline_runs), len(candidate_runs))
+    mismatches = []
+    missing = []
+    for index in range(paired):
+        baseline_run = baseline_runs[index]
+        candidate_run = candidate_runs[index]
+        baseline_hash = baseline_run.get("result_file_sha256")
+        candidate_hash = candidate_run.get("result_file_sha256")
+        if baseline_hash is None or candidate_hash is None:
+            missing.append(_suite_run_key(baseline_run, index))
+            continue
+        if (
+                baseline_hash != candidate_hash
+                or baseline_run.get("result_file_size_bytes") != candidate_run.get("result_file_size_bytes")
+        ):
+            mismatches.append({
+                "index": index,
+                "baseline_key": _suite_run_key(baseline_run, index),
+                "candidate_key": _suite_run_key(candidate_run, index),
+                "baseline_hash": baseline_hash,
+                "candidate_hash": candidate_hash,
+                "baseline_size_bytes": baseline_run.get("result_file_size_bytes"),
+                "candidate_size_bytes": candidate_run.get("result_file_size_bytes"),
+            })
+    passed = len(mismatches) == 0 and len(missing) == 0 and len(baseline_runs) == len(candidate_runs)
+    print("Suite output artifact equivalence")
+    if passed:
+        print(f"  PASS ({paired} paired runs)")
+    else:
+        print(f"  FAIL (paired={paired}, mismatches={len(mismatches)}, missing={len(missing)})")
+        for mismatch in mismatches[:5]:
+            print(
+                f"  {mismatch['baseline_key']} -> {mismatch['candidate_key']}: "
+                f"baseline_hash={mismatch['baseline_hash']}, candidate_hash={mismatch['candidate_hash']}"
+            )
+        if missing:
+            print(f"  missing_output_hashes: {', '.join(missing[:5])}")
+    print()
+    return {
+        "pass": passed,
+        "paired_runs": paired,
+        "mismatches": mismatches,
+        "missing": missing,
+    }
+
+
 def _compare_suite_metric_block(
         baseline_block: dict[str, Any],
         candidate_block: dict[str, Any],
@@ -584,6 +635,7 @@ def compare_suite_manifests(
         "shape": {},
         "scope_availability": {},
         "token_equivalence": {},
+        "output_artifact_equivalence": {},
         "performance": {},
         "timing_context": {},
         "segments": {},
@@ -599,6 +651,7 @@ def compare_suite_manifests(
     report["shape"] = _compare_suite_shape(baseline, candidate)
     report["scope_availability"] = _compare_suite_scope_availability(baseline, candidate, scope=scope)
     report["token_equivalence"] = _compare_suite_token_hashes(baseline, candidate)
+    report["output_artifact_equivalence"] = _compare_suite_output_hashes(baseline, candidate)
     report["performance"] = _compare_suite_metric_block(
         baseline_block,
         candidate_block,
@@ -690,6 +743,46 @@ def _compare_contract_metadata(baseline: dict[str, Any], candidate: dict[str, An
             for key, baseline_value, candidate_value in mismatches
         ],
         "missing_keys": missing,
+    }
+
+
+def _compare_output_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    baseline_metadata = baseline.get("metadata", {})
+    candidate_metadata = candidate.get("metadata", {})
+    baseline_hash = baseline_metadata.get("result_file_sha256")
+    candidate_hash = candidate_metadata.get("result_file_sha256")
+    baseline_size = baseline_metadata.get("result_file_size_bytes")
+    candidate_size = candidate_metadata.get("result_file_size_bytes")
+    missing = [
+        key
+        for key, value in {
+            "baseline.result_file_sha256": baseline_hash,
+            "candidate.result_file_sha256": candidate_hash,
+            "baseline.result_file_size_bytes": baseline_size,
+            "candidate.result_file_size_bytes": candidate_size,
+        }.items()
+        if value is None
+    ]
+    passed = not missing and baseline_hash == candidate_hash and baseline_size == candidate_size
+    print("Output artifact equivalence")
+    if passed:
+        print(f"  PASS sha256={baseline_hash}, size_bytes={baseline_size}")
+    elif missing:
+        print("  NOT CHECKED")
+        print(f"  missing_keys: {', '.join(missing)}")
+    else:
+        print("  FAIL")
+        print(f"  baseline_sha256={baseline_hash}, candidate_sha256={candidate_hash}")
+        print(f"  baseline_size_bytes={baseline_size}, candidate_size_bytes={candidate_size}")
+    print()
+    return {
+        "pass": passed,
+        "status": "PASS" if passed else ("not_checked" if missing else "FAIL"),
+        "missing_keys": missing,
+        "baseline_sha256": baseline_hash,
+        "candidate_sha256": candidate_hash,
+        "baseline_size_bytes": baseline_size,
+        "candidate_size_bytes": candidate_size,
     }
 
 
@@ -809,6 +902,10 @@ def compare_profiles(
             "candidate_len": None,
             "first_mismatch": None,
         },
+        "output_artifact": {
+            "status": "not_checked",
+            "pass": False,
+        },
     }
 
     print(f"Baseline:  {baseline_path}")
@@ -817,6 +914,7 @@ def compare_profiles(
     print()
 
     report["same_calculation"] = _compare_contract_metadata(baseline, candidate)
+    report["output_artifact"] = _compare_output_artifacts(baseline, candidate)
 
     if not baseline_summary or not candidate_summary:
         print("Missing generation summary for requested label.")
@@ -959,6 +1057,10 @@ def compare_profiles_for_labels(
             report.get("token_equivalence", {}).get("pass", False)
             for report in reports.values()
         ),
+        "output_artifact_pass": all(
+            report.get("output_artifact", {}).get("pass", False)
+            for report in reports.values()
+        ),
         "performance_pass": all(
             report.get("performance", {}).get("pass", False)
             for report in reports.values()
@@ -1014,6 +1116,11 @@ def main() -> None:
         "--require-token-equivalence",
         action="store_true",
         help="Exit nonzero unless generated token IDs are present and exactly match.",
+    )
+    parser.add_argument(
+        "--require-output-equivalence",
+        action="store_true",
+        help="Exit nonzero unless generated output artifact hashes are present and exactly match.",
     )
     parser.add_argument(
         "--require-no-regression",
@@ -1074,7 +1181,7 @@ def main() -> None:
         action="store_true",
         help=(
             "For --compare, shortcut for --strict --labels main_generation,timing_context. "
-            "Use for full-song promotion gates."
+            "Also requires generated output artifact hash equivalence. Use for full-song promotion gates."
         ),
     )
     parser.add_argument(
@@ -1118,17 +1225,20 @@ def main() -> None:
         strict_compare = args.strict or args.strict_full_song
         require_contract_match = args.require_contract_match or strict_compare
         require_token_equivalence = args.require_token_equivalence or strict_compare
+        require_output_equivalence = args.require_output_equivalence or args.strict_full_song
         require_no_regression = args.require_no_regression or strict_compare
         if "reports" in report:
             failed = (
                 (require_contract_match and not report.get("same_calculation_pass", False))
                 or (require_token_equivalence and not report.get("token_equivalence_pass", False))
+                or (require_output_equivalence and not report.get("output_artifact_pass", False))
                 or (require_no_regression and not report.get("performance_pass", False))
             )
         else:
             failed = (
                 (require_contract_match and not report["same_calculation"].get("pass", False))
                 or (require_token_equivalence and not report["token_equivalence"].get("pass", False))
+                or (require_output_equivalence and not report["output_artifact"].get("pass", False))
                 or (require_no_regression and not report["performance"].get("pass", False))
             )
         raise SystemExit(1 if failed else 0)
@@ -1145,6 +1255,7 @@ def main() -> None:
 
         require_contract_match = args.require_contract_match or args.strict
         require_token_equivalence = args.require_token_equivalence or args.strict
+        require_output_equivalence = args.require_output_equivalence
         require_no_regression = args.require_no_regression or args.strict
         require_segment_no_regression = args.require_suite_segment_no_regression or args.strict
         require_timing_no_regression = args.require_suite_timing_no_regression or args.strict
@@ -1152,6 +1263,10 @@ def main() -> None:
             ((require_contract_match or args.require_mode_contract) and not report["shape"].get("pass", False))
             or (args.strict and not report["scope_availability"].get("pass", False))
             or (require_token_equivalence and not report["token_equivalence"].get("pass", False))
+            or (
+                require_output_equivalence
+                and not report["output_artifact_equivalence"].get("pass", False)
+            )
             or (require_no_regression and not report["performance"].get("pass", False))
             or (
                 require_segment_no_regression

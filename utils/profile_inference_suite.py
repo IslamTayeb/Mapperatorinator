@@ -23,6 +23,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from inference import (  # noqa: E402
     compile_args,
+    file_artifact_metadata,
     generate,
     get_default_logger,
     get_config,
@@ -526,6 +527,12 @@ def main() -> None:
         timing_summary = _summary_for_label(profile, "timing_context")
         main_record_breakdown = first_record_breakdown(profile, "main_generation")
         profile_metadata = profile.get("metadata", {})
+        result_file_sha256 = profile_metadata.get("result_file_sha256")
+        result_file_size_bytes = profile_metadata.get("result_file_size_bytes")
+        if result_file_sha256 is None and result_path is not None and Path(result_path).is_file():
+            result_metadata = file_artifact_metadata(result_path)
+            result_file_sha256 = result_metadata.get("result_file_sha256")
+            result_file_size_bytes = result_metadata.get("result_file_size_bytes")
         tokens = _flatten_token_ids(profile, "main_generation")
         token_sha256 = _token_sha256(tokens)
         if song_index not in baseline_tokens_by_song:
@@ -549,6 +556,8 @@ def main() -> None:
             "end_time": run_args.end_time,
             "seed": run_args.seed,
             "result_path": str(result_path),
+            "result_file_sha256": result_file_sha256,
+            "result_file_size_bytes": result_file_size_bytes,
             "profile_path": str(profile_path),
             "sequence_count": profile_metadata.get("sequence_count"),
             "song_length_ms": profile_metadata.get("song_length_ms"),

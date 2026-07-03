@@ -7,6 +7,7 @@ import sys
 
 import utils.excepthook  # noqa
 import uuid
+import hashlib
 from functools import reduce
 from pathlib import Path
 import random
@@ -84,6 +85,19 @@ def get_profile_runtime_metadata() -> dict:
         metadata[key] = result.stdout.strip()
 
     return metadata
+
+
+def file_artifact_metadata(path: str | Path, *, prefix: str = "result_file") -> dict:
+    path = Path(path)
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {
+        f"{prefix}_path": str(path),
+        f"{prefix}_size_bytes": path.stat().st_size,
+        f"{prefix}_sha256": digest.hexdigest(),
+    }
 
 
 def assert_package_version(package_name: str, required_version: str):
@@ -755,7 +769,10 @@ def generate(
         if verbose:
             logger.info(f"Generated beatmap saved to {result_path}")
 
-    profiler.set_metadata(result_path=result_path)
+    result_metadata = {"result_path": result_path}
+    if profiler.enabled:
+        result_metadata.update(file_artifact_metadata(result_path))
+    profiler.set_metadata(**result_metadata)
     profile_path = profiler.write(args.profile_output_path or profiler.default_output_path(result_path))
     if verbose and profile_path is not None:
         logger.info(f"Inference profile saved to {profile_path}")

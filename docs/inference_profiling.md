@@ -115,7 +115,7 @@ python utils/summarize_inference_profile.py \
   --json-output "$RUN_DIR/compare-full-song.json"
 ```
 
-`--strict-full-song` is equivalent to strict comparison for `main_generation` and `timing_context`. It should be the default full-song promotion command so timing-context regressions, token drift, total-stage wall regressions, and per-window regressions are not checked by hand after the fact. For one-token decoder gates, `utils/verify_one_token_decode.py` defaults to `--sequence-index 9`, the post-warmup smoke window used by the 500 tok/s runtime probes.
+`--strict-full-song` is equivalent to strict comparison for `main_generation` and `timing_context`, plus generated output artifact hash equivalence. `profile_inference` writes `result_file_sha256` and `result_file_size_bytes` after the output artifact is written, so full-song promotion should fail if token IDs match but the final `.osu` bytes differ. It should be the default full-song promotion command so timing-context regressions, token drift, output-byte drift, total-stage wall regressions, and per-window regressions are not checked by hand after the fact. For one-token decoder gates, `utils/verify_one_token_decode.py` defaults to `--sequence-index 9`, the post-warmup smoke window used by the 500 tok/s runtime probes.
 
 For SALVALAI's `7,639` main tokens, `500 tok/s` implies about `15.278s` synchronized main-generation model time, a further `45.9%` reduction from the accepted fused RoPE/cache self-attention path (`28.243s`). Treat this as a runtime/kernel campaign, not a quick-tweak loop. Re-profile the accepted stack first, use untraced `profile_inference` for speed claims, and use Nsight/torch profiler only for diagnosis.
 
@@ -762,7 +762,9 @@ python utils/summarize_inference_profile.py \
   --json-output "$WORK/runs/profile-compare-${SLURM_JOB_ID}.json"
 ```
 
-`--strict` exits nonzero when same-calculation metadata differs, generated token IDs are missing or different, generated-token or record counts change, aggregate throughput/model/wall/stage time regresses, or any selected-label per-window record regresses. For full-song promotion, prefer `--strict-full-song`; it runs strict checks for both `main_generation` and `timing_context` in one report.
+`--strict` exits nonzero when same-calculation metadata differs, generated token IDs are missing or different, generated-token or record counts change, aggregate throughput/model/wall/stage time regresses, or any selected-label per-window record regresses. For full-song promotion, prefer `--strict-full-song`; it runs strict checks for both `main_generation` and `timing_context` in one report and requires matching `result_file_sha256`/`result_file_size_bytes`.
+
+`utils/profile_inference_suite.py` copies output artifact hashes into `suite_manifest.json` for each run. Suite comparisons always report `output_artifact_equivalence`; add `--require-output-equivalence` when a warmed-repeat, serial multi-song, server, or future batch-throughput claim also requires byte-identical outputs.
 
 `utils/summarize_inference_profile.py --compare` reported token equivalence PASS for all `1,084` generated main-token IDs. This short slice is warmup-sensitive: the retained compile baseline is `+65.5%` over compile-disabled overall, while post-warmup map windows are mostly around `94-105 tok/s`.
 
