@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import sys
@@ -316,6 +317,157 @@ def _finalize_tail_diagnostics(diagnostics: dict[str, Any] | None, *, generated_
     diagnostics["per_token_us"] = per_token_us
 
 
+def _cuda_event_elapsed_ms(fn, *, warmup: int, iters: int) -> float:
+    for _ in range(max(int(warmup), 0)):
+        fn()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(max(int(iters), 1)):
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+    return float(start.elapsed_time(end)) / max(int(iters), 1)
+
+
+def _tail_graph_token_ids(tensor: torch.Tensor) -> list[int]:
+    return [int(item) for item in tensor.detach().cpu().reshape(-1).tolist()]
+
+
+def _run_one_step_tail_graph_ceiling(
+        *,
+        input_ids: torch.LongTensor,
+        raw_logits: torch.FloatTensor,
+        logits_processor,
+        stopping_criteria,
+        do_sample: bool,
+        has_eos_stopping_criteria: bool,
+        pad_token_id: torch.Tensor,
+        unfinished_sequences: torch.LongTensor,
+        warmup: int,
+        iters: int,
+) -> dict[str, Any]:
+    if not torch.cuda.is_available() or input_ids.device.type != "cuda":
+        raise RuntimeError("tail graph ceiling requires CUDA tensors")
+    if input_ids.shape[0] != 1 or raw_logits.shape[0] != 1:
+        raise RuntimeError("tail graph ceiling currently supports batch=1")
+
+    static_input_ids = input_ids.detach().clone(memory_format=torch.contiguous_format)
+    static_raw_logits = raw_logits.detach().clone(memory_format=torch.contiguous_format)
+    static_unfinished = unfinished_sequences.detach().clone(memory_format=torch.contiguous_format)
+    static_pad = pad_token_id.detach().clone(memory_format=torch.contiguous_format)
+    eager_processors = copy.deepcopy(logits_processor)
+    graph_processors = copy.deepcopy(logits_processor)
+    eager_stopping = copy.deepcopy(stopping_criteria)
+    graph_stopping = copy.deepcopy(stopping_criteria)
+
+    def tail_fn(processors, criteria):
+        scores = static_raw_logits.clone(memory_format=torch.contiguous_format)
+        next_token_scores = processors(static_input_ids, scores)
+        if do_sample:
+            probs = nn.functional.softmax(next_token_scores, dim=-1)
+            next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+        else:
+            next_tokens = torch.argmax(next_token_scores, dim=-1)
+        if has_eos_stopping_criteria:
+            next_tokens = next_tokens * static_unfinished + static_pad * (1 - static_unfinished)
+        output_ids = torch.cat([static_input_ids, next_tokens[:, None]], dim=-1)
+        next_unfinished = static_unfinished & ~criteria(output_ids, None)
+        finished = next_unfinished.max()
+        return next_tokens, output_ids, next_unfinished, finished
+
+    start_rng_state = _rng_state()
+    _set_rng_state(start_rng_state)
+    eager_next, eager_output, eager_unfinished, eager_finished = tail_fn(eager_processors, eager_stopping)
+    eager_final_rng = _rng_state()
+    eager_next_after = [
+        int(torch.multinomial(torch.ones_like(static_raw_logits), num_samples=1).item())
+        for _ in range(8)
+    ]
+
+    _set_rng_state(start_rng_state)
+    capture_start_rng = _rng_state()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_next, graph_output, graph_unfinished, graph_finished = tail_fn(graph_processors, graph_stopping)
+    _set_rng_state(capture_start_rng)
+    graph.replay()
+    torch.cuda.synchronize()
+    graph_final_rng = _rng_state()
+    graph_next_after = [
+        int(torch.multinomial(torch.ones_like(static_raw_logits), num_samples=1).item())
+        for _ in range(8)
+    ]
+
+    correctness = {
+        "next_token_match": bool(torch.equal(eager_next, graph_next)),
+        "output_ids_match": bool(torch.equal(eager_output, graph_output)),
+        "unfinished_match": bool(torch.equal(eager_unfinished, graph_unfinished)),
+        "finished_match": bool(torch.equal(eager_finished, graph_finished)),
+        "final_rng_match": _rng_states_equal(eager_final_rng, graph_final_rng),
+        "next_eager_sample_match": eager_next_after == graph_next_after,
+        "eager_next_tokens": _tail_graph_token_ids(eager_next),
+        "graph_next_tokens": _tail_graph_token_ids(graph_next),
+        "eager_next_samples_after": eager_next_after,
+        "graph_next_samples_after": graph_next_after,
+    }
+
+    _set_rng_state(start_rng_state)
+    eager_timing_processors = copy.deepcopy(logits_processor)
+    eager_timing_stopping = copy.deepcopy(stopping_criteria)
+    eager_ms = _cuda_event_elapsed_ms(
+        lambda: tail_fn(eager_timing_processors, eager_timing_stopping),
+        warmup=warmup,
+        iters=iters,
+    )
+
+    _set_rng_state(start_rng_state)
+    graph_timing_processors = copy.deepcopy(logits_processor)
+    graph_timing_stopping = copy.deepcopy(stopping_criteria)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_timing_outputs = tail_fn(graph_timing_processors, graph_timing_stopping)
+    _set_rng_state(start_rng_state)
+    graph.replay()
+    torch.cuda.synchronize()
+    graph_ms = _cuda_event_elapsed_ms(graph.replay, warmup=warmup, iters=iters)
+    _ = graph_timing_outputs
+
+    _set_rng_state(start_rng_state)
+    return {
+        "enabled": True,
+        "pass": all(
+            bool(correctness[key])
+            for key in (
+                "next_token_match",
+                "output_ids_match",
+                "unfinished_match",
+                "finished_match",
+                "final_rng_match",
+                "next_eager_sample_match",
+            )
+        ),
+        "do_sample": bool(do_sample),
+        "input_shape": list(static_input_ids.shape),
+        "logits_shape": list(static_raw_logits.shape),
+        "processor_classes": [processor.__class__.__name__ for processor in logits_processor],
+        "stopping_classes": [criteria.__class__.__name__ for criteria in stopping_criteria],
+        "warmup": int(warmup),
+        "iters": int(iters),
+        "eager_ms_per_call": float(eager_ms),
+        "graph_ms_per_replay": float(graph_ms),
+        "speedup": float(eager_ms / graph_ms) if graph_ms > 0 else None,
+        "saved_us_per_token": float((eager_ms - graph_ms) * 1000.0),
+        "projected_full_song_saved_s_7639": float((eager_ms - graph_ms) * 7639.0 / 1000.0),
+        "correctness": correctness,
+        "note": (
+            "Verifier-only one-step tail graph ceiling. This does not solve multi-step EOS/control "
+            "or production integration by itself."
+        ),
+    }
+
+
 @torch.no_grad()
 def direct_decode_loop_generate(
         model,
@@ -337,6 +489,10 @@ def direct_decode_loop_generate(
         decode_session_metadata: dict[str, Any] | None = None,
         fast_prepare_inputs: bool = False,
         tail_diagnostics: dict[str, Any] | None = None,
+        tail_graph_ceiling: dict[str, Any] | None = None,
+        tail_graph_step_index: int = 0,
+        tail_graph_warmup: int = 50,
+        tail_graph_iters: int = 500,
         **model_kwargs,
 ) -> torch.LongTensor:
     """Verification-only direct cached decode loop used by utils/verify_direct_decode_loop.py."""
@@ -409,6 +565,7 @@ def direct_decode_loop_generate(
     is_prefill = True
     scores = None
     graph_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
+    tail_graph_capture: dict[str, Any] | None = None
     while model._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
         current_input_ids = sequence_buffer[:, :cur_len] if sequence_buffer is not None else input_ids
         model_inputs = (
@@ -474,6 +631,24 @@ def direct_decode_loop_generate(
         handle = _tail_begin(tail_diagnostics, "logits_extract")
         next_token_logits = outputs.logits[:, -1, :].to(copy=True, dtype=torch.float32, device=input_ids.device)
         _tail_end(tail_diagnostics, handle)
+        generated_so_far = int(cur_len) - initial_len
+        if (
+                tail_graph_ceiling is not None
+                and tail_graph_capture is None
+                and generated_so_far == int(tail_graph_step_index)
+        ):
+            tail_graph_capture = {
+                "input_ids": current_input_ids.detach().clone(memory_format=torch.contiguous_format),
+                "raw_logits": next_token_logits.detach().clone(memory_format=torch.contiguous_format),
+                "logits_processor": copy.deepcopy(logits_processor),
+                "stopping_criteria": copy.deepcopy(stopping_criteria),
+                "do_sample": bool(do_sample),
+                "has_eos_stopping_criteria": bool(has_eos_stopping_criteria),
+                "pad_token_id": pad_token_id.detach().clone(memory_format=torch.contiguous_format),
+                "unfinished_sequences": unfinished_sequences.detach().clone(memory_format=torch.contiguous_format),
+                "generated_so_far": int(generated_so_far),
+                "cur_len": int(cur_len),
+            }
 
         if tail_diagnostics is not None:
             handle = _tail_begin(tail_diagnostics, "logits_processor.total")
@@ -532,10 +707,62 @@ def direct_decode_loop_generate(
         if decode_session is not None and decode_session_metadata is not None:
             decode_session_metadata.update(decode_session.metadata())
         _finalize_tail_diagnostics(tail_diagnostics, generated_tokens=generated_tokens)
+        if tail_graph_ceiling is not None:
+            if tail_graph_capture is None:
+                tail_graph_ceiling.update({
+                    "enabled": True,
+                    "pass": False,
+                    "error": f"did not reach tail graph step index {int(tail_graph_step_index)}",
+                })
+            else:
+                final_rng_state = _rng_state()
+                tail_graph_ceiling.update(tail_graph_capture)
+                tail_graph_ceiling.update(_run_one_step_tail_graph_ceiling(
+                    input_ids=tail_graph_capture["input_ids"],
+                    raw_logits=tail_graph_capture["raw_logits"],
+                    logits_processor=tail_graph_capture["logits_processor"],
+                    stopping_criteria=tail_graph_capture["stopping_criteria"],
+                    do_sample=tail_graph_capture["do_sample"],
+                    has_eos_stopping_criteria=tail_graph_capture["has_eos_stopping_criteria"],
+                    pad_token_id=tail_graph_capture["pad_token_id"],
+                    unfinished_sequences=tail_graph_capture["unfinished_sequences"],
+                    warmup=tail_graph_warmup,
+                    iters=tail_graph_iters,
+                ))
+                _set_rng_state(final_rng_state)
+                for key in ("input_ids", "raw_logits", "logits_processor", "stopping_criteria",
+                            "pad_token_id", "unfinished_sequences"):
+                    tail_graph_ceiling.pop(key, None)
         return output
     if decode_session is not None and decode_session_metadata is not None:
         decode_session_metadata.update(decode_session.metadata())
     _finalize_tail_diagnostics(tail_diagnostics, generated_tokens=generated_tokens)
+    if tail_graph_ceiling is not None:
+        if tail_graph_capture is None:
+            tail_graph_ceiling.update({
+                "enabled": True,
+                "pass": False,
+                "error": f"did not reach tail graph step index {int(tail_graph_step_index)}",
+            })
+        else:
+            final_rng_state = _rng_state()
+            tail_graph_ceiling.update(tail_graph_capture)
+            tail_graph_ceiling.update(_run_one_step_tail_graph_ceiling(
+                input_ids=tail_graph_capture["input_ids"],
+                raw_logits=tail_graph_capture["raw_logits"],
+                logits_processor=tail_graph_capture["logits_processor"],
+                stopping_criteria=tail_graph_capture["stopping_criteria"],
+                do_sample=tail_graph_capture["do_sample"],
+                has_eos_stopping_criteria=tail_graph_capture["has_eos_stopping_criteria"],
+                pad_token_id=tail_graph_capture["pad_token_id"],
+                unfinished_sequences=tail_graph_capture["unfinished_sequences"],
+                warmup=tail_graph_warmup,
+                iters=tail_graph_iters,
+            ))
+            _set_rng_state(final_rng_state)
+            for key in ("input_ids", "raw_logits", "logits_processor", "stopping_criteria",
+                        "pad_token_id", "unfinished_sequences"):
+                tail_graph_ceiling.pop(key, None)
     return input_ids
 
 
@@ -712,6 +939,10 @@ def run_direct_decode_loop_gate(
         fixed_k_tail_graph_audit: bool = False,
         tail_graph_k: int = 4,
         tail_diagnostics: bool = False,
+        tail_graph_ceiling: bool = False,
+        tail_graph_step_index: int = 0,
+        tail_graph_warmup: int = 50,
+        tail_graph_iters: int = 500,
 ) -> dict[str, Any]:
     _assert_supported_probe(args)
     if max_new_tokens <= 0:
@@ -779,6 +1010,10 @@ def run_direct_decode_loop_gate(
         "fixed_k_tail_graph_audit": bool(fixed_k_tail_graph_audit),
         "tail_graph_k": int(tail_graph_k),
         "tail_diagnostics": bool(tail_diagnostics),
+        "tail_graph_ceiling": bool(tail_graph_ceiling),
+        "tail_graph_step_index": int(tail_graph_step_index),
+        "tail_graph_warmup": int(tail_graph_warmup),
+        "tail_graph_iters": int(tail_graph_iters),
     }
 
     prompt = model_inputs["decoder_input_ids"]
@@ -869,6 +1104,14 @@ def run_direct_decode_loop_gate(
         if tail_diagnostics
         else None
     )
+    candidate_tail_graph_ceiling: dict[str, Any] | None = (
+        {
+            "enabled": True,
+            "note": "Verifier-only one-step tail CUDA graph ceiling; not an inference throughput claim.",
+        }
+        if tail_graph_ceiling
+        else None
+    )
 
     with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16, enabled=args.precision == "amp"), \
             generation_profile_context(
@@ -905,6 +1148,10 @@ def run_direct_decode_loop_gate(
                 decode_session_metadata=candidate_decode_session_metadata,
                 fast_prepare_inputs=candidate_fast_prepare,
                 tail_diagnostics=candidate_tail_diagnostics,
+                tail_graph_ceiling=candidate_tail_graph_ceiling,
+                tail_graph_step_index=tail_graph_step_index,
+                tail_graph_warmup=tail_graph_warmup,
+                tail_graph_iters=tail_graph_iters,
             ),
         )
         candidate_end_rng_state = _rng_state()
@@ -963,6 +1210,11 @@ def run_direct_decode_loop_gate(
         pass_result = pass_result and bool(force_eos_direct_loop["pass"])
     if fixed_k_tail_graph_audit:
         pass_result = pass_result and bool(fixed_k_tail_graph_report["pass"])
+    if tail_graph_ceiling:
+        pass_result = pass_result and bool(
+            candidate_tail_graph_ceiling is not None
+            and candidate_tail_graph_ceiling.get("pass")
+        )
 
     return {
         "pass": pass_result,
@@ -993,6 +1245,7 @@ def run_direct_decode_loop_gate(
             else None
         ),
         "candidate_tail_diagnostics": candidate_tail_diagnostics,
+        "candidate_tail_graph_ceiling": candidate_tail_graph_ceiling,
         "force_eos_direct_loop": force_eos_direct_loop,
         "fixed_k_tail_graph_audit": fixed_k_tail_graph_report,
         "metadata": metadata,
@@ -1088,6 +1341,32 @@ def main() -> None:
         help="Fixed K for --fixed-k-tail-graph-audit.",
     )
     parser.add_argument(
+        "--tail-graph-ceiling",
+        action="store_true",
+        help=(
+            "Verifier-only: capture one exact logits-processor/sampling/stop/append tail step "
+            "inside a CUDA graph and report the replay ceiling."
+        ),
+    )
+    parser.add_argument(
+        "--tail-graph-step-index",
+        type=int,
+        default=0,
+        help="Generated-token index to capture for --tail-graph-ceiling.",
+    )
+    parser.add_argument(
+        "--tail-graph-warmup",
+        type=int,
+        default=50,
+        help="CUDA event warmup iterations for --tail-graph-ceiling timing.",
+    )
+    parser.add_argument(
+        "--tail-graph-iters",
+        type=int,
+        default=500,
+        help="CUDA event measured iterations for --tail-graph-ceiling timing.",
+    )
+    parser.add_argument(
         "--tail-diagnostics",
         action="store_true",
         help="Record verifier-only candidate-loop CPU/CUDA timing for logits processors, sampling, and stop/append tail.",
@@ -1122,6 +1401,10 @@ def main() -> None:
         force_eos_at_generated_token=cli_args.force_eos_at_generated_token,
         fixed_k_tail_graph_audit=cli_args.fixed_k_tail_graph_audit,
         tail_graph_k=cli_args.tail_graph_k,
+        tail_graph_ceiling=cli_args.tail_graph_ceiling,
+        tail_graph_step_index=cli_args.tail_graph_step_index,
+        tail_graph_warmup=cli_args.tail_graph_warmup,
+        tail_graph_iters=cli_args.tail_graph_iters,
         tail_diagnostics=cli_args.tail_diagnostics,
     )
     result["metadata"]["config_name"] = cli_args.config_name
