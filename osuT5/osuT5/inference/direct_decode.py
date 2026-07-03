@@ -39,6 +39,7 @@ class DecoderCacheState:
     prefill_cache_position: torch.LongTensor | None
     prefill_prepared_inputs: dict[str, Any]
     prefill_logits: torch.Tensor | None = None
+    current_cache_position: torch.LongTensor | None = None
 
 
 @dataclass
@@ -53,6 +54,7 @@ class SamplerState:
     logits_processor: Any | None = None
     stopping_criteria: Any | None = None
     rng_state: torch.Tensor | None = None
+    cuda_rng_state: list[torch.Tensor] | None = None
 
 
 @dataclass
@@ -62,7 +64,6 @@ class GraphState:
 
 @dataclass
 class GeneratedTokenState:
-    token_ids: list[int] = field(default_factory=list)
     output_shape: list[int] | None = None
     generated_steps: int = 0
 
@@ -125,6 +126,7 @@ class DecodeSession:
                 prefill_cache_position=state.prefill_cache_position,
                 prefill_prepared_inputs=state.prefill_prepared_inputs,
                 prefill_logits=state.prefill_logits,
+                current_cache_position=state.prefill_cache_position,
             ),
             static_inputs=StaticInputBuffers(
                 prompt=prompt,
@@ -165,6 +167,7 @@ class DecodeSession:
                 prompt_length=int(prompt.shape[-1]),
                 prefill_cache_position=cache_position if isinstance(cache_position, torch.Tensor) else None,
                 prefill_prepared_inputs={},
+                current_cache_position=cache_position if isinstance(cache_position, torch.Tensor) else None,
             ),
             static_inputs=StaticInputBuffers(
                 prompt=prompt,
@@ -227,7 +230,6 @@ class DecodeSession:
         )
 
     def record_generated_token(self, next_tokens: torch.LongTensor, output: torch.LongTensor) -> None:
-        self.generated_state.token_ids.extend(int(item) for item in next_tokens.detach().flatten().tolist())
         self.generated_state.output_shape = list(output.shape)
         self.generated_state.generated_steps += int(next_tokens.numel())
         if self.loop_state is not None:
@@ -239,7 +241,7 @@ class DecodeSession:
             self.loop_state.model_kwargs = model_kwargs
             cache_position = model_kwargs.get("cache_position")
             if isinstance(cache_position, torch.Tensor):
-                self.cache_state.prefill_cache_position = cache_position
+                self.cache_state.current_cache_position = cache_position
             self.cache_state.cache = model_kwargs.get("past_key_values", self.cache_state.cache)
             encoder_outputs = model_kwargs.get("encoder_outputs")
             if encoder_outputs is not None:
@@ -255,6 +257,11 @@ class DecodeSession:
                 if isinstance(self.cache_state.prefill_cache_position, torch.Tensor)
                 else None
             ),
+            "current_cache_position_shape": (
+                list(self.cache_state.current_cache_position.shape)
+                if isinstance(self.cache_state.current_cache_position, torch.Tensor)
+                else None
+            ),
             "prompt_shape": list(self.static_inputs.prompt.shape),
             "prompt_attention_mask_shape": (
                 list(self.static_inputs.prompt_attention_mask.shape)
@@ -267,8 +274,22 @@ class DecodeSession:
                 else None
             ),
             "generated_steps": int(self.generated_state.generated_steps),
-            "generated_token_count": len(self.generated_state.token_ids),
+            "generated_token_count": int(self.generated_state.generated_steps),
             "output_shape": self.generated_state.output_shape,
+            "sampler_state": {
+                "has_logits_processor": self.sampler_state.logits_processor is not None,
+                "has_stopping_criteria": self.sampler_state.stopping_criteria is not None,
+                "rng_state_shape": (
+                    list(self.sampler_state.rng_state.shape)
+                    if isinstance(self.sampler_state.rng_state, torch.Tensor)
+                    else None
+                ),
+                "cuda_rng_state_count": (
+                    len(self.sampler_state.cuda_rng_state)
+                    if self.sampler_state.cuda_rng_state is not None
+                    else 0
+                ),
+            },
             "loop_state": (
                 {
                     "cur_len": int(loop_state.cur_len),
@@ -284,7 +305,7 @@ class DecodeSession:
 
 
 def last_token_logits(logits: torch.Tensor) -> torch.Tensor:
-    return logits[:, -1, :].detach().to(torch.float32)
+    return logits[:, -1, :].detach().to(dtype=torch.float32, copy=True)
 
 
 @torch.no_grad()

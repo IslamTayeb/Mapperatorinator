@@ -290,6 +290,7 @@ def direct_decode_loop_generate(
                 logits_processor=logits_processor,
                 stopping_criteria=stopping_criteria,
                 rng_state=torch.random.get_rng_state(),
+                cuda_rng_state=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
             ),
         )
         if decode_session_runtime
