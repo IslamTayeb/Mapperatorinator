@@ -1446,3 +1446,9 @@ Use `utils/profile_decode_decoder_layer_island.py --cuda-graph-replay` for diagn
 DCC job `49231614` on RTX 2080 Ti, commit `ccfebec`, used the current fastest exact fused stack and passed logits replay with `max_abs=0.0`. It projected the whole decoder-layer CUDA graph replay cost at `15.961s` of the accepted `28.243s` full-song model time. The residual split was self-attention `7.001s`, cross-attention `3.320s`, MLP `4.248s`, and unexplained layer glue `1.392s`.
 
 These numbers are ceilings, not throughput claims. They show that `500 tok/s` cannot come from one small kernel in isolation: self-attention, cross-attention, and MLP are each target-sized, but the realistic path needs broad `DecodeSession`/decoder-layer runtime work that also reduces per-token control/synchronization overhead. See `notes/2026-07-03-decoder-layer-segment-probe.md`.
+
+## CUDA Graph Sampling RNG Diagnostics
+
+Before graphing any sampling/tail work, verify token sequence and final RNG state. DCC jobs `49231654` and `49231667` showed that one-token CUDA graph replay of `torch.multinomial(probs, 1)` matches eager sampling on the RTX 2080 Ti stack for the default CUDA generator: sampled token sequence, final CUDA RNG state, and the next eager sample all matched. Explicit CUDA generators must be registered with `CUDAGraph.register_generator_state` before capture.
+
+This only clears one-token graph replay. Fixed multi-token graph blocks are not automatically equivalent: if a graph samples after an EOS/stopping point where HF eager generation would have stopped, final RNG state diverges unless exact rollback or true device-side early exit is implemented and verified. See `notes/2026-07-03-cudagraph-multinomial-rng-probe.md`.
