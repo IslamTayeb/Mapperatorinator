@@ -1452,3 +1452,9 @@ These numbers are ceilings, not throughput claims. They show that `500 tok/s` ca
 Before graphing any sampling/tail work, verify token sequence and final RNG state. DCC jobs `49231654` and `49231667` showed that one-token CUDA graph replay of `torch.multinomial(probs, 1)` matches eager sampling on the RTX 2080 Ti stack for the default CUDA generator: sampled token sequence, final CUDA RNG state, and the next eager sample all matched. Explicit CUDA generators must be registered with `CUDAGraph.register_generator_state` before capture.
 
 This only clears one-token graph replay. Fixed multi-token graph blocks are not automatically equivalent: if a graph samples after an EOS/stopping point where HF eager generation would have stopped, final RNG state diverges unless exact rollback or true device-side early exit is implemented and verified. See `notes/2026-07-03-cudagraph-multinomial-rng-probe.md`.
+
+## Decode Prepare Oracle
+
+Use `utils/verify_decode_prepare_oracle.py` before replacing `prepare_inputs_for_generation` in any decode runtime path. The verifier drives the real model with the HF-prepared inputs while comparing a conservative fast post-prefill one-token builder against HF's prepared tensors at every checked decode step.
+
+DCC job `49231765` on RTX 2080 Ti, commit `8cb1fd6`, passed on `profile_salvalai_smoke15` seq9 for `31` checked post-prefill decode steps. The fast builder matched HF for `decoder_input_ids`, `decoder_position_ids`, `cache_position`, full static-cache `decoder_attention_mask`, `frames`, `past_key_values` identity, `encoder_outputs` identity, and `use_cache`. Diagnostic CPU wall was `16.127ms` for HF prepare vs `9.144ms` for the fast builder over the verifier. Treat this as target sizing only; production use still needs direct-loop token/logit/RNG gates, 15s smoke token equivalence, and full-song untraced throughput. See `notes/2026-07-03-decode-prepare-oracle.md`.
