@@ -17,7 +17,7 @@ if str(REPO_ROOT) not in sys.path:
 import torch
 import transformers
 from torch import nn
-from transformers import LogitsProcessor
+from transformers import LogitsProcessor, LogitsProcessorList
 
 from config import InferenceConfig
 from inference import compile_args, load_model_with_server, setup_inference_environment
@@ -335,6 +335,17 @@ def _tail_graph_token_ids(tensor: torch.Tensor) -> list[int]:
     return [int(item) for item in tensor.detach().cpu().reshape(-1).tolist()]
 
 
+def _clone_production_tail_processors(logits_processor) -> tuple[LogitsProcessorList, list[str]]:
+    excluded_classes: list[str] = []
+    cloned_processors = LogitsProcessorList()
+    for processor in logits_processor:
+        if isinstance(processor, _CaptureRawLogitsProcessor):
+            excluded_classes.append(processor.__class__.__name__)
+            continue
+        cloned_processors.append(copy.deepcopy(processor))
+    return cloned_processors, excluded_classes
+
+
 def _run_one_step_tail_graph_ceiling(
         *,
         input_ids: torch.LongTensor,
@@ -357,8 +368,8 @@ def _run_one_step_tail_graph_ceiling(
     static_raw_logits = raw_logits.detach().clone(memory_format=torch.contiguous_format)
     static_unfinished = unfinished_sequences.detach().clone(memory_format=torch.contiguous_format)
     static_pad = pad_token_id.detach().clone(memory_format=torch.contiguous_format)
-    eager_processors = copy.deepcopy(logits_processor)
-    graph_processors = copy.deepcopy(logits_processor)
+    eager_processors, excluded_processor_classes = _clone_production_tail_processors(logits_processor)
+    graph_processors, _ = _clone_production_tail_processors(logits_processor)
     eager_stopping = copy.deepcopy(stopping_criteria)
     graph_stopping = copy.deepcopy(stopping_criteria)
 
@@ -414,7 +425,7 @@ def _run_one_step_tail_graph_ceiling(
     }
 
     _set_rng_state(start_rng_state)
-    eager_timing_processors = copy.deepcopy(logits_processor)
+    eager_timing_processors, _ = _clone_production_tail_processors(logits_processor)
     eager_timing_stopping = copy.deepcopy(stopping_criteria)
     eager_ms = _cuda_event_elapsed_ms(
         lambda: tail_fn(eager_timing_processors, eager_timing_stopping),
@@ -423,7 +434,7 @@ def _run_one_step_tail_graph_ceiling(
     )
 
     _set_rng_state(start_rng_state)
-    graph_timing_processors = copy.deepcopy(logits_processor)
+    graph_timing_processors, _ = _clone_production_tail_processors(logits_processor)
     graph_timing_stopping = copy.deepcopy(stopping_criteria)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -451,7 +462,8 @@ def _run_one_step_tail_graph_ceiling(
         "do_sample": bool(do_sample),
         "input_shape": list(static_input_ids.shape),
         "logits_shape": list(static_raw_logits.shape),
-        "processor_classes": [processor.__class__.__name__ for processor in logits_processor],
+        "processor_classes": [processor.__class__.__name__ for processor in eager_processors],
+        "excluded_verifier_processor_classes": excluded_processor_classes,
         "stopping_classes": [criteria.__class__.__name__ for criteria in stopping_criteria],
         "warmup": int(warmup),
         "iters": int(iters),
@@ -462,8 +474,9 @@ def _run_one_step_tail_graph_ceiling(
         "projected_full_song_saved_s_7639": float((eager_ms - graph_ms) * 7639.0 / 1000.0),
         "correctness": correctness,
         "note": (
-            "Verifier-only one-step tail graph ceiling. This does not solve multi-step EOS/control "
-            "or production integration by itself."
+            "Verifier-only one-step tail graph ceiling. The verifier raw-logit capture hook is "
+            "excluded from timing. This does not solve multi-step EOS/control or production "
+            "integration by itself."
         ),
     }
 
