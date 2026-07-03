@@ -1467,6 +1467,8 @@ Before graphing any sampling/tail work, verify token sequence and final RNG stat
 
 This only clears one-token graph replay. Fixed multi-token graph blocks are not automatically equivalent: if a graph samples after an EOS/stopping point where HF eager generation would have stopped, final RNG state diverges unless exact rollback or true device-side early exit is implemented and verified. See `notes/2026-07-03-cudagraph-multinomial-rng-probe.md`.
 
+DCC job `49232592` on RTX 2080 Ti, commit `11fd14c`, added that forced-EOS verifier. `utils/verify_direct_decode_loop.py --force-eos-at-generated-token 2 --fixed-k-tail-graph-audit --tail-graph-k 4` passed the normal forced-EOS direct-loop token/logit/RNG gate, proved no-EOS fixed-K graph replay can match eager samples/final RNG/next eager samples, and showed the naive forced-EOS block problem: the graph output prefix through EOS matched, but final CUDA RNG diverged because graph replay consumed extra samples after the eager stop point. Keep this as verifier infrastructure only; any future fixed-K tail graph needs exact rollback or true device-side early exit before it can be equivalent. See `notes/2026-07-03-fixed-k-tail-graph-audit.md`.
+
 ## Decode Prepare Oracle
 
 Use `utils/verify_decode_prepare_oracle.py` before replacing `prepare_inputs_for_generation` in any decode runtime path. The verifier drives the real model with the HF-prepared inputs while comparing a conservative fast post-prefill one-token builder against HF's prepared tensors at every checked decode step.
