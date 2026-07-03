@@ -369,8 +369,11 @@ def active_prefix_decode_generate(
         active_prefix_decode_diagnostics["_record_cuda_events"] = (
             input_ids.device.type == "cuda" and torch.cuda.is_available()
         )
-    loop_start_wall = time.perf_counter()
-    loop_start_event, loop_end_event = _maybe_record_diagnostic_cuda_start(active_prefix_decode_diagnostics)
+    loop_start_wall = None
+    loop_start_event = loop_end_event = None
+    if active_prefix_decode_diagnostics is not None:
+        loop_start_wall = time.perf_counter()
+        loop_start_event, loop_end_event = _maybe_record_diagnostic_cuda_start(active_prefix_decode_diagnostics)
 
     this_peer_finished = False
     unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
@@ -683,7 +686,7 @@ def active_prefix_decode_generate(
     finally:
         if active_prefix_decode_diagnostics is not None:
             active_prefix_decode_diagnostics["loop_total_wall_cpu_s"] = (
-                time.perf_counter() - loop_start_wall
+                time.perf_counter() - float(loop_start_wall)
             )
             _add_diagnostic_cuda_event(
                 active_prefix_decode_diagnostics,
