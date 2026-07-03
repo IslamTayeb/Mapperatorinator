@@ -200,6 +200,9 @@ class Processor(object):
             ),
             q1_bmm_cross_attention=bool(getattr(self.args, "inference_q1_bmm_cross_attention", False)),
             native_q1_self_attention=bool(getattr(self.args, "inference_native_q1_self_attention", False)),
+            native_q1_rope_cache_self_attention=bool(
+                getattr(self.args, "inference_native_q1_rope_cache_self_attention", False)
+            ),
             decode_session_cuda_graph=bool(getattr(self.args, "inference_decode_session_cuda_graph", False)),
         )
         if bool(getattr(self.args, "inference_decode_session_runtime", False)):
@@ -1515,6 +1518,12 @@ class Processor(object):
             "q1_bmm_cross_attention_enabled": stats.get("q1_bmm_cross_attention_enabled"),
             "native_q1_self_attention_requested": stats.get("native_q1_self_attention_requested"),
             "native_q1_self_attention_enabled": stats.get("native_q1_self_attention_enabled"),
+            "native_q1_rope_cache_self_attention_requested": stats.get(
+                "native_q1_rope_cache_self_attention_requested"
+            ),
+            "native_q1_rope_cache_self_attention_enabled": stats.get(
+                "native_q1_rope_cache_self_attention_enabled"
+            ),
             "decode_session_runtime_enabled": stats.get("decode_session_runtime_enabled"),
             "decode_session_cuda_graph_enabled": stats.get("decode_session_cuda_graph_enabled"),
             "decode_session_graph_count": stats.get("decode_session_graph_count"),

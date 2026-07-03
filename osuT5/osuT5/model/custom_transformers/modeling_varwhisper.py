@@ -31,11 +31,12 @@ from transformers.utils import (
 from ...runtime_profiling import (
     active_prefix_self_attention_length,
     detail_ranges_enabled,
+    native_q1_rope_cache_self_attention_enabled,
     native_q1_self_attention_enabled,
     profile_range,
     q1_bmm_cross_attention_enabled,
 )
-from ...inference.native_q1_attention import native_q1_attention
+from ...inference.native_q1_attention import native_q1_attention, native_q1_rope_cache_attention
 from .configuration_varwhisper import VarWhisperConfig
 
 if is_flash_attn_2_available():
@@ -616,44 +617,107 @@ class VarWhisperAttention(nn.Module):
                         else:
                             past_key_value.update(key_states, value_states, self.layer_idx)
             else:
-                if profile_ranges:
-                    with profile_range(f"{range_prefix}.qkv_proj"):
+                prefix_length = active_prefix_self_attention_length()
+                use_native_q1_rope_cache_self_attention = (
+                    native_q1_rope_cache_self_attention_enabled()
+                    and not is_varlen
+                    and not self.training
+                    and hidden_states.dtype == torch.float32
+                    and hidden_states.shape[0] == 1
+                    and hidden_states.shape[1] == 1
+                    and isinstance(past_key_value, StaticCache)
+                    and isinstance(cache_position, torch.Tensor)
+                    and isinstance(position_ids, torch.Tensor)
+                    and prefix_length is not None
+                    and prefix_length > 0
+                )
+                if use_native_q1_rope_cache_self_attention:
+                    if profile_ranges:
+                        with profile_range(f"{range_prefix}.qkv_proj"):
+                            qkv = self.Wqkv(hidden_states).view(bs, -1, 3, self.num_heads, self.head_dim)
+                    else:
+                        qkv = self.Wqkv(hidden_states).view(bs, -1, 3, self.num_heads, self.head_dim)
+
+                    if profile_ranges:
+                        with profile_range(f"{range_prefix}.rope"):
+                            cos, sin = self.rotary_emb(qkv, position_ids=position_ids)
+                    else:
+                        cos, sin = self.rotary_emb(qkv, position_ids=position_ids)
+
+                    cache_layer = past_key_value.layers[self.layer_idx]
+                    if not getattr(cache_layer, "is_initialized", False):
+                        raise RuntimeError("native q1 RoPE/cache self-attention requires an initialized StaticCache")
+                    attention_mask_for_native = attention_mask
+                    if (
+                            isinstance(attention_mask_for_native, torch.Tensor)
+                            and attention_mask_for_native.shape[-1] > prefix_length
+                    ):
+                        attention_mask_for_native = attention_mask_for_native[..., :prefix_length]
+                    if profile_ranges:
+                        with profile_range(f"{range_prefix}.rope_cache_native_q1"):
+                            hidden_states = native_q1_rope_cache_attention(
+                                qkv,
+                                cache_layer.keys,
+                                cache_layer.values,
+                                cos,
+                                sin,
+                                cache_position,
+                                attention_mask_for_native,
+                                int(prefix_length),
+                            )
+                    else:
+                        hidden_states = native_q1_rope_cache_attention(
+                            qkv,
+                            cache_layer.keys,
+                            cache_layer.values,
+                            cos,
+                            sin,
+                            cache_position,
+                            attention_mask_for_native,
+                            int(prefix_length),
+                        )
+                    hidden_states = hidden_states.transpose(1, 2).contiguous()
+                    hidden_states = hidden_states.view(bs, -1, self.all_head_size)
+                    attn_outputs = (hidden_states,)
+                else:
+                    if profile_ranges:
+                        with profile_range(f"{range_prefix}.qkv_proj"):
+                            qkv = self.Wqkv(hidden_states).view(bs, -1, 3, self.num_heads, self.head_dim)
+                            query_states, key_states, value_states = qkv.transpose(1, 3).unbind(dim=2)
+                    else:
                         qkv = self.Wqkv(hidden_states).view(bs, -1, 3, self.num_heads, self.head_dim)
                         query_states, key_states, value_states = qkv.transpose(1, 3).unbind(dim=2)
-                else:
-                    qkv = self.Wqkv(hidden_states).view(bs, -1, 3, self.num_heads, self.head_dim)
-                    query_states, key_states, value_states = qkv.transpose(1, 3).unbind(dim=2)
 
-                if profile_ranges:
-                    with profile_range(f"{range_prefix}.rope"):
+                    if profile_ranges:
+                        with profile_range(f"{range_prefix}.rope"):
+                            cos, sin = self.rotary_emb(query_states, position_ids=position_ids)
+                            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+                    else:
                         cos, sin = self.rotary_emb(query_states, position_ids=position_ids)
                         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-                else:
-                    cos, sin = self.rotary_emb(query_states, position_ids=position_ids)
-                    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-                if past_key_value is not None:
-                    # sin and cos are specific to RoPE models; cache_position needed for the static cache
-                    cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-                    if profile_ranges:
-                        with profile_range(f"{range_prefix}.cache_update"):
+                    if past_key_value is not None:
+                        # sin and cos are specific to RoPE models; cache_position needed for the static cache
+                        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                        if profile_ranges:
+                            with profile_range(f"{range_prefix}.cache_update"):
+                                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+                        else:
                             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-                    else:
-                        key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-            if profile_ranges:
-                with profile_range(f"{range_prefix}.sdpa"):
-                    attn_outputs = attn_func(
-                        query=query_states,
-                        key=key_states,
-                        value=value_states,
-                    )
-            else:
-                attn_outputs = attn_func(
-                    query=query_states,
-                    key=key_states,
-                    value=value_states,
-                )
+                    if profile_ranges:
+                        with profile_range(f"{range_prefix}.sdpa"):
+                            attn_outputs = attn_func(
+                                query=query_states,
+                                key=key_states,
+                                value=value_states,
+                            )
+                    else:
+                        attn_outputs = attn_func(
+                            query=query_states,
+                            key=key_states,
+                            value=value_states,
+                        )
 
         hidden_states, *rest = attn_outputs
         if profile_ranges:

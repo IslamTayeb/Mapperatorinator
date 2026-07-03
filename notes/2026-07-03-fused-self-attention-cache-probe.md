@@ -77,3 +77,35 @@ Prefix `640` CUDA graph replay timings:
 | output projection only | `0.007253` |
 
 This single bucket is not a full-song projection, but it is promising enough for the weighted active-prefix sweep. The key signal is that the production-shaped fused island was faster, while the post-`Wqkv` attention-only kernel was essentially tied with the old native attention-only kernel. That suggests any real win comes from replacing setup/cache/layout work around the existing attention, not from the attention math alone.
+
+Weighted active-prefix sweep:
+
+- DCC job: `49229681`
+- Commit: `ddd75f9`
+- Slurm state: `FAILED` only because the post-run reducer had a shell quoting bug.
+- Valid run dir: `/work/imt11/Mapperatorinator/runs/fused-self-attn-buckets-49229681-ddd75f9`
+- Summary: `/work/imt11/Mapperatorinator/runs/fused-self-attn-buckets-49229681-ddd75f9/summary.json`
+- Active-prefix lengths: `128,192,256,320,384,448,512,576,640,704,768`
+- Result: all captured variants PASS, all graph-replay variants PASS, logits replay exact.
+
+Weighted CUDA graph replay totals over the full-song active64 replay distribution:
+
+| variant | weighted seconds |
+| --- | ---: |
+| repo self-attention module | `9.104s` |
+| manual native attention island | `9.118s` |
+| fused RoPE/cache attention island | `6.599s` |
+| pre-attention setup only | `4.485s` |
+| native attention only | `3.167s` |
+| fused post-`Wqkv` attention only | `3.185s` |
+| output projection only | `0.637s` |
+
+Projected savings:
+
+| comparison | projected seconds | model-time share |
+| --- | ---: | ---: |
+| repo module -> fused island | `2.505s` | `7.77%` |
+| manual native island -> fused island | `2.518s` | `7.82%` |
+| native attention only -> fused post-`Wqkv` attention only | `-0.018s` | `-0.06%` |
+
+The weighted probe clears the `>5%` strategic threshold but not the `>=10%` automatic keep threshold. It is worth one production-candidate attempt because the diagnostic kernel is narrow, fp32, batch1, default-off, and directly targets the largest remaining self-attention setup/cache/layout bucket. If production verification does not preserve token identity or loses most of the projected `2.5s`, revert or leave it diagnostic-only.

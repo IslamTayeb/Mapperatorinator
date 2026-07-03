@@ -211,13 +211,24 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     )
     q1_bmm_cross_attention = bool(generate_kwargs.pop('q1_bmm_cross_attention', False))
     native_q1_self_attention_requested = bool(generate_kwargs.pop('native_q1_self_attention', False))
+    native_q1_rope_cache_self_attention_requested = bool(
+        generate_kwargs.pop('native_q1_rope_cache_self_attention', False)
+    )
     decode_session_state = generate_kwargs.pop('decode_session_state', None)
     decode_session_cuda_graph = bool(generate_kwargs.pop('decode_session_cuda_graph', False))
     if context_type is not None:
         context_type = ContextType(context_type)  # Convert to ContextType enum
+    if native_q1_rope_cache_self_attention_requested and not native_q1_self_attention_requested:
+        raise ValueError("native_q1_rope_cache_self_attention requires native_q1_self_attention.")
+    if native_q1_rope_cache_self_attention_requested and not active_prefix_decode_loop:
+        raise ValueError("native_q1_rope_cache_self_attention requires active_prefix_decode_loop.")
     native_q1_self_attention = (
         native_q1_self_attention_requested
         and context_type != ContextType.TIMING
+    )
+    native_q1_rope_cache_self_attention = (
+        native_q1_rope_cache_self_attention_requested
+        and native_q1_self_attention
     )
 
     # Create the logits processors
@@ -282,6 +293,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
                 sdpa_backend=profile_sdpa_backend,
                 q1_bmm_cross_attention=q1_bmm_cross_attention,
                 native_q1_self_attention=native_q1_self_attention,
+                native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
             ):
         if sync_model_timing:
             _sync_cuda_for_model(model)
@@ -333,6 +345,8 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         "q1_bmm_cross_attention_enabled": q1_bmm_cross_attention,
         "native_q1_self_attention_requested": native_q1_self_attention_requested,
         "native_q1_self_attention_enabled": native_q1_self_attention,
+        "native_q1_rope_cache_self_attention_requested": native_q1_rope_cache_self_attention_requested,
+        "native_q1_rope_cache_self_attention_enabled": native_q1_rope_cache_self_attention,
         "decode_session_runtime_enabled": decode_session_state is not None,
         "decode_session_cuda_graph_enabled": bool(decode_session_cuda_graph),
         "decode_session_graph_count": (
