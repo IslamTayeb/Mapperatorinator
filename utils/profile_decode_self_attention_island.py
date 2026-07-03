@@ -403,7 +403,6 @@ def profile_decode_self_attention_island(
             cache_position=cache_position,
             active_prefix_self_attention=True,
             active_prefix_self_attention_length=active_prefix_length,
-            native_q1_self_attention=True,
         )
         captures, replay_logits = _capture_self_attention_islands(
             model,
