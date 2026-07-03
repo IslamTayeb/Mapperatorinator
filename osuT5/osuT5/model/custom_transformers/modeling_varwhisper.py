@@ -660,7 +660,11 @@ class VarWhisperAttention(nn.Module):
                     cache_layer = past_key_value.layers[self.layer_idx]
                     if not getattr(cache_layer, "is_initialized", False):
                         raise RuntimeError("native q1 RoPE/cache self-attention requires an initialized StaticCache")
-                    attention_mask_for_native = attention_mask
+                    attention_mask_for_native = (
+                        kwargs.get("sliding_window_mask")
+                        if self.local_attention != (-1, -1)
+                        else kwargs.get("attention_mask")
+                    )
                     if (
                             isinstance(attention_mask_for_native, torch.Tensor)
                             and attention_mask_for_native.shape[-1] > prefix_length
