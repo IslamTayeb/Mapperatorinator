@@ -71,6 +71,7 @@ inference_decode_session_runtime: false # Experimental single-song persistent De
 inference_decode_session_cuda_graph: false # Experimental DecodeSession-owned CUDA graph replay; requires inference_decode_session_runtime=true
 inference_decode_session_chunk_size: 1 # Reserved DecodeSession decode chunk size; chunking must preserve RNG/token identity
 inference_native_decode_kernels: false # Reserved default-off native C++/CUDA/CUTLASS decode-kernel experiments
+inference_native_q1_self_attention: false # Experimental native fp32 q_len=1 active-prefix self-attention
 use_server: false        # Use server for optimized multiprocess inference (adds about 8% overhead)
 max_batch_size: 16       # Maximum batch size for inference
 profile_inference: false # Write stage and generation timing profile JSON

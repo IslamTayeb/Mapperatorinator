@@ -199,6 +199,7 @@ class Processor(object):
                 getattr(self.args, "inference_stateful_monotonic_logits_processor", False)
             ),
             q1_bmm_cross_attention=bool(getattr(self.args, "inference_q1_bmm_cross_attention", False)),
+            native_q1_self_attention=bool(getattr(self.args, "inference_native_q1_self_attention", False)),
             decode_session_cuda_graph=bool(getattr(self.args, "inference_decode_session_cuda_graph", False)),
         )
         if bool(getattr(self.args, "inference_decode_session_runtime", False)):
@@ -1512,6 +1513,7 @@ class Processor(object):
             "profile_sdpa_backend": stats.get("profile_sdpa_backend"),
             "stateful_monotonic_logits_processor": stats.get("stateful_monotonic_logits_processor"),
             "q1_bmm_cross_attention_enabled": stats.get("q1_bmm_cross_attention_enabled"),
+            "native_q1_self_attention_enabled": stats.get("native_q1_self_attention_enabled"),
             "decode_session_runtime_enabled": stats.get("decode_session_runtime_enabled"),
             "decode_session_cuda_graph_enabled": stats.get("decode_session_cuda_graph_enabled"),
             "decode_session_graph_count": stats.get("decode_session_graph_count"),

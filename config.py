@@ -84,6 +84,7 @@ class InferenceConfig:
     inference_decode_session_cuda_graph: bool = False  # Reserved for DecodeSession-owned CUDA graph replay
     inference_decode_session_chunk_size: int = 1  # Reserved DecodeSession decode chunk size
     inference_native_decode_kernels: bool = False  # Reserved default-off native C++/CUDA/CUTLASS decode-kernel experiments
+    inference_native_q1_self_attention: bool = False  # Experimental native fp32 q_len=1 active-prefix self-attention
     use_server: bool = True  # Use server for optimized multiprocess inference
     max_batch_size: int = 16  # Maximum batch size for inference (only used for parallel sampling or super timing)
     profile_inference: bool = False  # Write stage and generation timing profile JSON

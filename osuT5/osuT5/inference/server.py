@@ -210,6 +210,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         generate_kwargs.pop('stateful_monotonic_logits_processor', False)
     )
     q1_bmm_cross_attention = bool(generate_kwargs.pop('q1_bmm_cross_attention', False))
+    native_q1_self_attention = bool(generate_kwargs.pop('native_q1_self_attention', False))
     decode_session_state = generate_kwargs.pop('decode_session_state', None)
     decode_session_cuda_graph = bool(generate_kwargs.pop('decode_session_cuda_graph', False))
     if context_type is not None:
@@ -276,6 +277,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
                 detail_ranges=profile_generation_detail_ranges,
                 sdpa_backend=profile_sdpa_backend,
                 q1_bmm_cross_attention=q1_bmm_cross_attention,
+                native_q1_self_attention=native_q1_self_attention,
             ):
         if sync_model_timing:
             _sync_cuda_for_model(model)
@@ -325,6 +327,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         "profile_sdpa_backend": profile_sdpa_backend,
         "stateful_monotonic_logits_processor": stateful_monotonic_logits_processor,
         "q1_bmm_cross_attention_enabled": q1_bmm_cross_attention,
+        "native_q1_self_attention_enabled": native_q1_self_attention,
         "decode_session_runtime_enabled": decode_session_state is not None,
         "decode_session_cuda_graph_enabled": bool(decode_session_cuda_graph),
         "decode_session_graph_count": (

@@ -31,9 +31,11 @@ from transformers.utils import (
 from ...runtime_profiling import (
     active_prefix_self_attention_length,
     detail_ranges_enabled,
+    native_q1_self_attention_enabled,
     profile_range,
     q1_bmm_cross_attention_enabled,
 )
+from ...inference.native_q1_attention import native_q1_attention
 from .configuration_varwhisper import VarWhisperConfig
 
 if is_flash_attn_2_available():
@@ -382,7 +384,21 @@ def sdpa_attention_forward(
         and key.shape[0] == 1
         and value.shape[0] == 1
     )
-    if use_q1_bmm_cross_attention:
+    use_native_q1_self_attention = (
+        native_q1_self_attention_enabled()
+        and not module.is_cross_attention
+        and not module.training
+        and query.dtype == torch.float32
+        and key.dtype == torch.float32
+        and value.dtype == torch.float32
+        and query.shape[0] == 1
+        and query.shape[-2] == 1
+        and key.shape[0] == 1
+        and value.shape[0] == 1
+    )
+    if use_native_q1_self_attention:
+        attn_output = native_q1_attention(query, key, value, attention_mask).transpose(1, 2).contiguous()
+    elif use_q1_bmm_cross_attention:
         num_heads = query.shape[1]
         head_dim = query.shape[-1]
         q = query.reshape(num_heads, 1, head_dim)

@@ -381,10 +381,29 @@ def validate_reserved_runtime_flags(args: InferenceConfig):
             "inference_decode_session_chunk_size is reserved and must remain 1 until chunked DecodeSession "
             "generation preserves exact RNG/token behavior."
         )
-    if args.inference_native_decode_kernels:
+    if args.inference_native_q1_self_attention:
+        if not args.inference_native_decode_kernels:
+            raise ValueError("inference_native_q1_self_attention requires inference_native_decode_kernels=true.")
+        if args.precision != "fp32":
+            raise ValueError("inference_native_q1_self_attention currently requires precision=fp32.")
+        if args.attn_implementation != "sdpa":
+            raise ValueError("inference_native_q1_self_attention currently requires attn_implementation=sdpa.")
+        if args.use_server:
+            raise ValueError("inference_native_q1_self_attention requires use_server=false.")
+        if args.parallel:
+            raise ValueError("inference_native_q1_self_attention currently supports sequential inference only.")
+        if args.cfg_scale != 1.0:
+            raise ValueError("inference_native_q1_self_attention currently requires cfg_scale=1.0.")
+        if args.num_beams != 1:
+            raise ValueError("inference_native_q1_self_attention currently requires num_beams=1.")
+        if not args.inference_active_prefix_decode_loop:
+            raise ValueError("inference_native_q1_self_attention requires inference_active_prefix_decode_loop=true.")
+        if not args.inference_active_prefix_decode_cuda_graph:
+            raise ValueError("inference_native_q1_self_attention requires inference_active_prefix_decode_cuda_graph=true.")
+    elif args.inference_native_decode_kernels:
         raise NotImplementedError(
-            "inference_native_decode_kernels is reserved for isolated C++/CUDA/CUTLASS experiments after profiler "
-            "evidence selects a hotspot."
+            "inference_native_decode_kernels currently only has the explicitly selected "
+            "inference_native_q1_self_attention experiment."
         )
 
 
@@ -529,6 +548,7 @@ def generate(
         "inference_decode_session_cuda_graph": args.inference_decode_session_cuda_graph,
         "inference_decode_session_chunk_size": args.inference_decode_session_chunk_size,
         "inference_native_decode_kernels": args.inference_native_decode_kernels,
+        "inference_native_q1_self_attention": args.inference_native_q1_self_attention,
         "profile_record_token_ids": args.profile_record_token_ids,
         "profile_sync_cuda": args.profile_sync_cuda,
         "profile_torch_generation": args.profile_torch_generation,

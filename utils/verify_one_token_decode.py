@@ -276,6 +276,7 @@ def run_one_token_gate(
         candidate_active_prefix_decode: bool | None = None,
         candidate_active_prefix_decode_length: int | None = None,
         candidate_q1_bmm_cross_attention: bool = False,
+        candidate_native_q1_self_attention: bool = False,
         candidate_decode_session: bool = False,
 ) -> dict[str, Any]:
     _assert_supported_probe(args)
@@ -346,6 +347,7 @@ def run_one_token_gate(
         "candidate_active_prefix_decode": active_prefix_decode,
         "candidate_active_prefix_decode_length": candidate_active_prefix_decode_length,
         "candidate_q1_bmm_cross_attention": bool(candidate_q1_bmm_cross_attention),
+        "candidate_native_q1_self_attention": bool(candidate_native_q1_self_attention),
         "candidate_decode_session": bool(candidate_decode_session),
     }
 
@@ -447,6 +449,7 @@ def run_one_token_gate(
         with generation_profile_context(
                 sdpa_backend=args.profile_sdpa_backend,
                 q1_bmm_cross_attention=candidate_q1_bmm_cross_attention,
+                native_q1_self_attention=candidate_native_q1_self_attention,
         ):
             decode_session_metadata = None
             if candidate_decode_session:
@@ -620,6 +623,11 @@ def main() -> None:
         help="Enable the experimental fp32 q_len=1 BMM cross-attention candidate for direct decode.",
     )
     parser.add_argument(
+        "--candidate-native-q1-self-attention",
+        action="store_true",
+        help="Enable the experimental native fp32 q_len=1 self-attention candidate for direct decode.",
+    )
+    parser.add_argument(
         "--candidate-decode-session",
         action="store_true",
         help="Route the direct candidate through the verifier-first DecodeSession ABI.",
@@ -650,6 +658,7 @@ def main() -> None:
         ),
         candidate_active_prefix_decode_length=cli_args.candidate_active_prefix_decode_length,
         candidate_q1_bmm_cross_attention=cli_args.candidate_q1_bmm_cross_attention,
+        candidate_native_q1_self_attention=cli_args.candidate_native_q1_self_attention,
         candidate_decode_session=cli_args.candidate_decode_session,
     )
     result["metadata"]["config_name"] = cli_args.config_name

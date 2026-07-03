@@ -10,6 +10,7 @@ from torch.profiler import record_function
 _DETAIL_RANGES_ENABLED = False
 _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH: int | None = None
 _Q1_BMM_CROSS_ATTENTION_ENABLED = False
+_NATIVE_Q1_SELF_ATTENTION_ENABLED = False
 
 _SDPA_BACKEND_ALIASES = {
     "flash": "FLASH_ATTENTION",
@@ -36,6 +37,10 @@ def q1_bmm_cross_attention_enabled() -> bool:
     return _Q1_BMM_CROSS_ATTENTION_ENABLED
 
 
+def native_q1_self_attention_enabled() -> bool:
+    return _NATIVE_Q1_SELF_ATTENTION_ENABLED
+
+
 @contextmanager
 def generation_profile_context(
         *,
@@ -43,23 +48,32 @@ def generation_profile_context(
         sdpa_backend: str | None = None,
         active_prefix_self_attention_length: int | None = None,
         q1_bmm_cross_attention: bool = False,
+        native_q1_self_attention: bool = False,
 ) -> Iterator[None]:
     """Temporarily enable opt-in generation profiling controls."""
-    global _DETAIL_RANGES_ENABLED, _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH, _Q1_BMM_CROSS_ATTENTION_ENABLED
+    global _DETAIL_RANGES_ENABLED, _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH
+    global _Q1_BMM_CROSS_ATTENTION_ENABLED, _NATIVE_Q1_SELF_ATTENTION_ENABLED
 
     previous_detail_ranges = _DETAIL_RANGES_ENABLED
     previous_active_prefix_length = _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH
     previous_q1_bmm_cross_attention = _Q1_BMM_CROSS_ATTENTION_ENABLED
+    previous_native_q1_self_attention = _NATIVE_Q1_SELF_ATTENTION_ENABLED
     _DETAIL_RANGES_ENABLED = bool(detail_ranges)
     _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH = active_prefix_self_attention_length
     _Q1_BMM_CROSS_ATTENTION_ENABLED = bool(q1_bmm_cross_attention)
+    _NATIVE_Q1_SELF_ATTENTION_ENABLED = bool(native_q1_self_attention)
     try:
+        if native_q1_self_attention:
+            from osuT5.osuT5.inference.native_q1_attention import preload_native_q1_attention
+
+            preload_native_q1_attention()
         with sdpa_backend_context(sdpa_backend):
             yield
     finally:
         _DETAIL_RANGES_ENABLED = previous_detail_ranges
         _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH = previous_active_prefix_length
         _Q1_BMM_CROSS_ATTENTION_ENABLED = previous_q1_bmm_cross_attention
+        _NATIVE_Q1_SELF_ATTENTION_ENABLED = previous_native_q1_self_attention
 
 
 @contextmanager

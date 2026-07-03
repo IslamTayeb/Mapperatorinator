@@ -422,6 +422,7 @@ def run_direct_decode_loop_gate(
         candidate_cuda_graph_forward: bool,
         candidate_cuda_graph_warmup: int,
         candidate_q1_bmm_cross_attention: bool,
+        candidate_native_q1_self_attention: bool,
         candidate_decode_session: bool,
 ) -> dict[str, Any]:
     _assert_supported_probe(args)
@@ -482,6 +483,7 @@ def run_direct_decode_loop_gate(
         "candidate_cuda_graph_forward": bool(candidate_cuda_graph_forward),
         "candidate_cuda_graph_warmup": int(candidate_cuda_graph_warmup),
         "candidate_q1_bmm_cross_attention": bool(candidate_q1_bmm_cross_attention),
+        "candidate_native_q1_self_attention": bool(candidate_native_q1_self_attention),
         "candidate_decode_session": bool(candidate_decode_session),
     }
 
@@ -544,6 +546,7 @@ def run_direct_decode_loop_gate(
             generation_profile_context(
                 sdpa_backend=args.profile_sdpa_backend,
                 q1_bmm_cross_attention=candidate_q1_bmm_cross_attention,
+                native_q1_self_attention=candidate_native_q1_self_attention,
             ):
         candidate_cache = get_cache(model, batch_size=1, num_beams=1, cfg_scale=1.0)
         candidate_output = model.generate(
@@ -679,6 +682,11 @@ def main() -> None:
         help="Enable the experimental fp32 q_len=1 BMM cross-attention candidate for the direct loop.",
     )
     parser.add_argument(
+        "--candidate-native-q1-self-attention",
+        action="store_true",
+        help="Enable the experimental native fp32 q_len=1 self-attention candidate for the direct loop.",
+    )
+    parser.add_argument(
         "--candidate-decode-session",
         action="store_true",
         help="Wrap the candidate direct loop in the verifier-first DecodeSession state owner.",
@@ -706,6 +714,7 @@ def main() -> None:
         candidate_cuda_graph_forward=cli_args.candidate_cuda_graph_forward,
         candidate_cuda_graph_warmup=cli_args.candidate_cuda_graph_warmup,
         candidate_q1_bmm_cross_attention=cli_args.candidate_q1_bmm_cross_attention,
+        candidate_native_q1_self_attention=cli_args.candidate_native_q1_self_attention,
         candidate_decode_session=cli_args.candidate_decode_session,
     )
     result["metadata"]["config_name"] = cli_args.config_name
