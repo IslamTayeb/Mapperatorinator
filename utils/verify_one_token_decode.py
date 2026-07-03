@@ -274,6 +274,7 @@ def run_one_token_gate(
         candidate_active_prefix_prefill: bool | None = None,
         candidate_active_prefix_decode: bool | None = None,
         candidate_active_prefix_decode_length: int | None = None,
+        candidate_q1_bmm_cross_attention: bool = False,
 ) -> dict[str, Any]:
     _assert_supported_probe(args)
     if probe_token_id is not None:
@@ -342,6 +343,7 @@ def run_one_token_gate(
         "candidate_active_prefix_prefill": active_prefix_prefill,
         "candidate_active_prefix_decode": active_prefix_decode,
         "candidate_active_prefix_decode_length": candidate_active_prefix_decode_length,
+        "candidate_q1_bmm_cross_attention": bool(candidate_q1_bmm_cross_attention),
     }
 
     prompt = model_inputs["decoder_input_ids"]
@@ -439,23 +441,27 @@ def run_one_token_gate(
             )
             no_cache_reference_logits = _last_token_logits(reference_outputs.logits)
 
-        decode_state = prefill_static_cache(
-            model,
-            prompt=prompt,
-            prompt_attention_mask=prompt_mask,
-            frames=model_inputs["frames"],
-            condition_kwargs=condition_kwargs,
-            active_prefix_self_attention=active_prefix_prefill,
-        )
-        candidate_result = decode_one_token_raw_logits(
-            model,
-            decode_state,
-            full_prefix=full_prefix,
-            full_attention_mask=full_mask,
-            condition_kwargs=condition_kwargs,
-            active_prefix_self_attention=active_prefix_decode,
-            active_prefix_self_attention_length=candidate_active_prefix_decode_length,
-        )
+        with generation_profile_context(
+                sdpa_backend=args.profile_sdpa_backend,
+                q1_bmm_cross_attention=candidate_q1_bmm_cross_attention,
+        ):
+            decode_state = prefill_static_cache(
+                model,
+                prompt=prompt,
+                prompt_attention_mask=prompt_mask,
+                frames=model_inputs["frames"],
+                condition_kwargs=condition_kwargs,
+                active_prefix_self_attention=active_prefix_prefill,
+            )
+            candidate_result = decode_one_token_raw_logits(
+                model,
+                decode_state,
+                full_prefix=full_prefix,
+                full_attention_mask=full_mask,
+                condition_kwargs=condition_kwargs,
+                active_prefix_self_attention=active_prefix_decode,
+                active_prefix_self_attention_length=candidate_active_prefix_decode_length,
+            )
         candidate_inputs = candidate_result.prepared_inputs
         candidate_logits = candidate_result.logits
 
@@ -585,6 +591,11 @@ def main() -> None:
         default=None,
         help="Use this fixed active-prefix K/V length during candidate decode, e.g. a graph-reusable bucket.",
     )
+    parser.add_argument(
+        "--candidate-q1-bmm-cross-attention",
+        action="store_true",
+        help="Enable the experimental fp32 q_len=1 BMM cross-attention candidate for direct decode.",
+    )
     parser.add_argument("--report-path", type=Path, default=None)
     parser.add_argument("overrides", nargs="*", help="Hydra overrides, e.g. model_path=/path/to/model")
     cli_args = parser.parse_args()
@@ -610,6 +621,7 @@ def main() -> None:
             or cli_args.candidate_active_prefix_decode_length is not None
         ),
         candidate_active_prefix_decode_length=cli_args.candidate_active_prefix_decode_length,
+        candidate_q1_bmm_cross_attention=cli_args.candidate_q1_bmm_cross_attention,
     )
     result["metadata"]["config_name"] = cli_args.config_name
     result["wall_seconds"] = time.perf_counter() - start

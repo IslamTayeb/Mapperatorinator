@@ -28,7 +28,12 @@ from transformers.utils import (
     logging,
 )
 
-from ...runtime_profiling import active_prefix_self_attention_length, detail_ranges_enabled, profile_range
+from ...runtime_profiling import (
+    active_prefix_self_attention_length,
+    detail_ranges_enabled,
+    profile_range,
+    q1_bmm_cross_attention_enabled,
+)
 from .configuration_varwhisper import VarWhisperConfig
 
 if is_flash_attn_2_available():
@@ -364,17 +369,40 @@ def sdpa_attention_forward(
             if isinstance(attention_mask, torch.Tensor) and attention_mask.shape[-1] > prefix_length:
                 attention_mask = attention_mask[..., :prefix_length]
 
-    attn_output = (
-        F.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            dropout_p=module.attention_dropout if module.training else 0.0,
-            attn_mask=attention_mask,
-        )
-        .transpose(1, 2)
-        .contiguous()
+    use_q1_bmm_cross_attention = (
+        q1_bmm_cross_attention_enabled()
+        and module.is_cross_attention
+        and not module.training
+        and query.dtype == torch.float32
+        and key.dtype == torch.float32
+        and value.dtype == torch.float32
+        and attention_mask is None
+        and query.shape[0] == 1
+        and query.shape[-2] == 1
+        and key.shape[0] == 1
+        and value.shape[0] == 1
     )
+    if use_q1_bmm_cross_attention:
+        num_heads = query.shape[1]
+        head_dim = query.shape[-1]
+        q = query.reshape(num_heads, 1, head_dim)
+        k = key.reshape(num_heads, -1, head_dim)
+        v = value.reshape(num_heads, -1, head_dim)
+        scores = torch.bmm(q, k.transpose(1, 2)) * (head_dim ** -0.5)
+        attn_output = torch.bmm(torch.softmax(scores, dim=-1), v).view(1, num_heads, 1, head_dim)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+    else:
+        attn_output = (
+            F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                dropout_p=module.attention_dropout if module.training else 0.0,
+                attn_mask=attention_mask,
+            )
+            .transpose(1, 2)
+            .contiguous()
+        )
     attn_output = attn_output.view(bs, -1, dim)
     return (attn_output,)
 

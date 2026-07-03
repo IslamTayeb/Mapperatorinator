@@ -197,6 +197,7 @@ class Processor(object):
             stateful_monotonic_logits_processor=bool(
                 getattr(self.args, "inference_stateful_monotonic_logits_processor", False)
             ),
+            q1_bmm_cross_attention=bool(getattr(self.args, "inference_q1_bmm_cross_attention", False)),
         )
         if generate_kwargs2["active_prefix_decode_cuda_graph"] and isinstance(self.model, InferenceClient):
             raise ValueError("inference_active_prefix_decode_cuda_graph requires use_server=false.")
@@ -1498,6 +1499,7 @@ class Processor(object):
             "active_prefix_decode_diagnostics": stats.get("active_prefix_decode_diagnostics"),
             "profile_sdpa_backend": stats.get("profile_sdpa_backend"),
             "stateful_monotonic_logits_processor": stats.get("stateful_monotonic_logits_processor"),
+            "q1_bmm_cross_attention_enabled": stats.get("q1_bmm_cross_attention_enabled"),
             "active_prefix_decode_loop_enabled": stats.get("active_prefix_decode_loop_enabled"),
             "active_prefix_decode_bucket_size": stats.get("active_prefix_decode_bucket_size"),
             "active_prefix_decode_cuda_graph_enabled": stats.get("active_prefix_decode_cuda_graph_enabled"),

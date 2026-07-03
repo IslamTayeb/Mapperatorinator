@@ -182,6 +182,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     stateful_monotonic_logits_processor = bool(
         generate_kwargs.pop('stateful_monotonic_logits_processor', False)
     )
+    q1_bmm_cross_attention = bool(generate_kwargs.pop('q1_bmm_cross_attention', False))
     if context_type is not None:
         context_type = ContextType(context_type)  # Convert to ContextType enum
 
@@ -232,6 +233,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
             generation_profile_context(
                 detail_ranges=profile_generation_detail_ranges,
                 sdpa_backend=profile_sdpa_backend,
+                q1_bmm_cross_attention=q1_bmm_cross_attention,
             ):
         if sync_model_timing:
             _sync_cuda_for_model(model)
@@ -270,6 +272,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         "profile_active_prefix_decode_diagnostics": profile_active_prefix_decode_diagnostics,
         "profile_sdpa_backend": profile_sdpa_backend,
         "stateful_monotonic_logits_processor": stateful_monotonic_logits_processor,
+        "q1_bmm_cross_attention_enabled": q1_bmm_cross_attention,
         "active_prefix_decode_loop_enabled": active_prefix_decode_loop,
         "active_prefix_decode_bucket_size": active_prefix_decode_bucket_size if active_prefix_decode_loop else None,
         "active_prefix_decode_cuda_graph_enabled": active_prefix_decode_cuda_graph if active_prefix_decode_loop else False,

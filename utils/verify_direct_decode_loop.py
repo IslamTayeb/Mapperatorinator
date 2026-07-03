@@ -390,6 +390,7 @@ def run_direct_decode_loop_gate(
         candidate_active_prefix_decode_bucket_size: int,
         candidate_cuda_graph_forward: bool,
         candidate_cuda_graph_warmup: int,
+        candidate_q1_bmm_cross_attention: bool,
 ) -> dict[str, Any]:
     _assert_supported_probe(args)
     if max_new_tokens <= 0:
@@ -448,6 +449,7 @@ def run_direct_decode_loop_gate(
         "candidate_active_prefix_decode_bucket_size": candidate_active_prefix_decode_bucket_size,
         "candidate_cuda_graph_forward": bool(candidate_cuda_graph_forward),
         "candidate_cuda_graph_warmup": int(candidate_cuda_graph_warmup),
+        "candidate_q1_bmm_cross_attention": bool(candidate_q1_bmm_cross_attention),
     }
 
     prompt = model_inputs["decoder_input_ids"]
@@ -505,7 +507,10 @@ def run_direct_decode_loop_gate(
     candidate_cuda_graph_diagnostics: dict[str, Any] = {}
 
     with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16, enabled=args.precision == "amp"), \
-            generation_profile_context(sdpa_backend=args.profile_sdpa_backend):
+            generation_profile_context(
+                sdpa_backend=args.profile_sdpa_backend,
+                q1_bmm_cross_attention=candidate_q1_bmm_cross_attention,
+            ):
         candidate_cache = get_cache(model, batch_size=1, num_beams=1, cfg_scale=1.0)
         candidate_output = model.generate(
             inputs=model_inputs["frames"],
@@ -627,6 +632,11 @@ def main() -> None:
         default=0,
         help="Warmup forwards before candidate CUDA graph capture.",
     )
+    parser.add_argument(
+        "--candidate-q1-bmm-cross-attention",
+        action="store_true",
+        help="Enable the experimental fp32 q_len=1 BMM cross-attention candidate for the direct loop.",
+    )
     parser.add_argument("--report-path", type=Path, default=None)
     parser.add_argument("overrides", nargs="*", help="Hydra overrides, e.g. model_path=/path/to/model")
     cli_args = parser.parse_args()
@@ -649,6 +659,7 @@ def main() -> None:
         candidate_active_prefix_decode_bucket_size=cli_args.candidate_active_prefix_decode_bucket_size,
         candidate_cuda_graph_forward=cli_args.candidate_cuda_graph_forward,
         candidate_cuda_graph_warmup=cli_args.candidate_cuda_graph_warmup,
+        candidate_q1_bmm_cross_attention=cli_args.candidate_q1_bmm_cross_attention,
     )
     result["metadata"]["config_name"] = cli_args.config_name
     result["wall_seconds"] = time.perf_counter() - start
