@@ -441,7 +441,7 @@ def prepare_one_token_decode_inputs_fast(
             decoder_attention_mask,
             sequence_length=decoder_input_ids.shape[1],
             target_length=past_key_values.self_attention_cache.get_max_cache_shape(),
-            dtype=model.proj_out.weight.dtype,
+            dtype=model.get_output_embeddings().weight.dtype,
             device=decoder_input_ids.device,
             cache_position=next_cache_position,
             batch_size=decoder_input_ids.shape[0],
