@@ -492,6 +492,7 @@ def generate(
             args.inference_active_prefix_decode_cuda_graph_min_decode_steps
         ),
         "inference_stateful_monotonic_logits_processor": args.inference_stateful_monotonic_logits_processor,
+        "inference_q1_bmm_cross_attention": args.inference_q1_bmm_cross_attention,
         "profile_record_token_ids": args.profile_record_token_ids,
         "profile_sync_cuda": args.profile_sync_cuda,
         "profile_torch_generation": args.profile_torch_generation,
