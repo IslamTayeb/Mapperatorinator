@@ -219,6 +219,86 @@ def _update_cuda_graph_diagnostics(
         })
 
 
+def _tail_begin(diagnostics: dict[str, Any] | None, name: str) -> tuple[str, float, Any, Any] | None:
+    if diagnostics is None:
+        return None
+    start_event = end_event = None
+    if torch.cuda.is_available():
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+    return name, time.perf_counter(), start_event, end_event
+
+
+def _tail_end(diagnostics: dict[str, Any] | None, handle: tuple[str, float, Any, Any] | None) -> None:
+    if diagnostics is None or handle is None:
+        return
+    name, start_cpu, start_event, end_event = handle
+    if end_event is not None:
+        end_event.record()
+        diagnostics.setdefault("_cuda_events", []).append((name, start_event, end_event))
+    elapsed = time.perf_counter() - start_cpu
+    cpu_totals = diagnostics.setdefault("cpu_wall_s", {})
+    calls = diagnostics.setdefault("calls", {})
+    cpu_totals[name] = float(cpu_totals.get(name, 0.0)) + float(elapsed)
+    calls[name] = int(calls.get(name, 0)) + 1
+
+
+def _record_tail_shape(
+        diagnostics: dict[str, Any] | None,
+        input_ids: torch.LongTensor,
+        scores: torch.Tensor,
+) -> None:
+    if diagnostics is None:
+        return
+    shape_counts = diagnostics.setdefault("shape_counts", {})
+    input_len = int(input_ids.shape[-1])
+    shape_counts["vocab_size"] = int(scores.shape[-1])
+    shape_counts["input_len_min"] = min(int(shape_counts.get("input_len_min", input_len)), input_len)
+    shape_counts["input_len_max"] = max(int(shape_counts.get("input_len_max", input_len)), input_len)
+    shape_counts["steps"] = int(shape_counts.get("steps", 0)) + 1
+
+
+def _apply_logits_processor_with_tail_diagnostics(
+        logits_processor,
+        input_ids: torch.LongTensor,
+        scores: torch.FloatTensor,
+        diagnostics: dict[str, Any],
+) -> torch.FloatTensor:
+    processor_classes = diagnostics.setdefault("processor_classes", [])
+    for index, processor in enumerate(logits_processor):
+        processor_name = f"{index}:{processor.__class__.__name__}"
+        if len(processor_classes) <= index:
+            processor_classes.append(processor_name)
+        handle = _tail_begin(diagnostics, f"logits_processor.{processor_name}")
+        scores = processor(input_ids, scores)
+        _tail_end(diagnostics, handle)
+    return scores
+
+
+def _finalize_tail_diagnostics(diagnostics: dict[str, Any] | None, *, generated_tokens: int) -> None:
+    if diagnostics is None:
+        return
+    events = diagnostics.pop("_cuda_events", [])
+    if events:
+        torch.cuda.synchronize()
+    cuda_totals: dict[str, float] = diagnostics.setdefault("cuda_event_ms", {})
+    for name, start_event, end_event in events:
+        cuda_totals[name] = float(cuda_totals.get(name, 0.0)) + float(start_event.elapsed_time(end_event))
+
+    diagnostics["generated_tokens"] = int(generated_tokens)
+    per_token_us: dict[str, dict[str, float]] = {}
+    for name, seconds in diagnostics.get("cpu_wall_s", {}).items():
+        per_token_us.setdefault(name, {})["cpu_wall_us"] = (
+            float(seconds) * 1_000_000.0 / max(int(generated_tokens), 1)
+        )
+    for name, milliseconds in diagnostics.get("cuda_event_ms", {}).items():
+        per_token_us.setdefault(name, {})["cuda_event_us"] = (
+            float(milliseconds) * 1_000.0 / max(int(generated_tokens), 1)
+        )
+    diagnostics["per_token_us"] = per_token_us
+
+
 @torch.no_grad()
 def direct_decode_loop_generate(
         model,
@@ -238,6 +318,7 @@ def direct_decode_loop_generate(
         cuda_graph_diagnostics: dict[str, Any] | None = None,
         decode_session_runtime: bool = False,
         decode_session_metadata: dict[str, Any] | None = None,
+        tail_diagnostics: dict[str, Any] | None = None,
         **model_kwargs,
 ) -> torch.LongTensor:
     """Verification-only direct cached decode loop used by utils/verify_direct_decode_loop.py."""
@@ -258,6 +339,7 @@ def direct_decode_loop_generate(
         raise ValueError("direct_decode_loop_generate does not support prefill_chunk_size")
 
     batch_size, cur_len = input_ids.shape[:2]
+    initial_len = int(cur_len)
     if batch_size != 1:
         raise ValueError("direct_decode_loop_generate currently supports batch_size=1 only")
     if cuda_graph_forward and not torch.cuda.is_available():
@@ -366,39 +448,72 @@ def direct_decode_loop_generate(
         if decode_session is not None:
             decode_session.update_loop_model_kwargs(model_kwargs)
 
+        _record_tail_shape(tail_diagnostics, current_input_ids, outputs.logits[:, -1, :])
+        handle = _tail_begin(tail_diagnostics, "logits_extract")
         next_token_logits = outputs.logits[:, -1, :].to(copy=True, dtype=torch.float32, device=input_ids.device)
-        next_token_scores = logits_processor(current_input_ids, next_token_logits)
+        _tail_end(tail_diagnostics, handle)
+
+        if tail_diagnostics is not None:
+            handle = _tail_begin(tail_diagnostics, "logits_processor.total")
+            next_token_scores = _apply_logits_processor_with_tail_diagnostics(
+                logits_processor,
+                current_input_ids,
+                next_token_logits,
+                tail_diagnostics,
+            )
+            _tail_end(tail_diagnostics, handle)
+        else:
+            next_token_scores = logits_processor(current_input_ids, next_token_logits)
 
         if do_sample:
+            handle = _tail_begin(tail_diagnostics, "sampling.softmax")
             probs = nn.functional.softmax(next_token_scores, dim=-1)
+            _tail_end(tail_diagnostics, handle)
+            handle = _tail_begin(tail_diagnostics, "sampling.multinomial")
             next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+            _tail_end(tail_diagnostics, handle)
         else:
+            handle = _tail_begin(tail_diagnostics, "sampling.argmax")
             next_tokens = torch.argmax(next_token_scores, dim=-1)
+            _tail_end(tail_diagnostics, handle)
 
         if has_eos_stopping_criteria:
+            handle = _tail_begin(tail_diagnostics, "eos_mask")
             next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
+            _tail_end(tail_diagnostics, handle)
 
         if sequence_buffer is None:
+            handle = _tail_begin(tail_diagnostics, "append_token.cat")
             input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            _tail_end(tail_diagnostics, handle)
         else:
+            handle = _tail_begin(tail_diagnostics, "append_token.buffer_copy")
             sequence_buffer[:, cur_len].copy_(next_tokens)
             input_ids = sequence_buffer[:, :cur_len + 1]
+            _tail_end(tail_diagnostics, handle)
         if decode_session is not None:
             decode_session.record_generated_token(next_tokens, input_ids)
 
+        handle = _tail_begin(tail_diagnostics, "stopping_criteria")
         unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, scores)
+        _tail_end(tail_diagnostics, handle)
+        handle = _tail_begin(tail_diagnostics, "finished_check")
         this_peer_finished = unfinished_sequences.max() == 0
+        _tail_end(tail_diagnostics, handle)
         cur_len += 1
 
         del outputs
 
+    generated_tokens = int(cur_len) - initial_len
     if sequence_buffer is not None:
         output = sequence_buffer[:, :cur_len].clone(memory_format=torch.contiguous_format)
         if decode_session is not None and decode_session_metadata is not None:
             decode_session_metadata.update(decode_session.metadata())
+        _finalize_tail_diagnostics(tail_diagnostics, generated_tokens=generated_tokens)
         return output
     if decode_session is not None and decode_session_metadata is not None:
         decode_session_metadata.update(decode_session.metadata())
+    _finalize_tail_diagnostics(tail_diagnostics, generated_tokens=generated_tokens)
     return input_ids
 
 
@@ -424,6 +539,7 @@ def run_direct_decode_loop_gate(
         candidate_q1_bmm_cross_attention: bool,
         candidate_native_q1_self_attention: bool,
         candidate_decode_session: bool,
+        tail_diagnostics: bool = False,
 ) -> dict[str, Any]:
     _assert_supported_probe(args)
     if max_new_tokens <= 0:
@@ -485,6 +601,7 @@ def run_direct_decode_loop_gate(
         "candidate_q1_bmm_cross_attention": bool(candidate_q1_bmm_cross_attention),
         "candidate_native_q1_self_attention": bool(candidate_native_q1_self_attention),
         "candidate_decode_session": bool(candidate_decode_session),
+        "tail_diagnostics": bool(tail_diagnostics),
     }
 
     prompt = model_inputs["decoder_input_ids"]
@@ -541,6 +658,17 @@ def run_direct_decode_loop_gate(
     candidate_processors.insert(0, _CaptureRawLogitsProcessor(candidate_captures))
     candidate_cuda_graph_diagnostics: dict[str, Any] = {}
     candidate_decode_session_metadata: dict[str, Any] = {}
+    candidate_tail_diagnostics: dict[str, Any] | None = (
+        {
+            "enabled": True,
+            "note": (
+                "Verifier-only candidate-loop tail diagnostics; not an inference throughput claim. "
+                "Processor 0 is the raw-logit capture hook inserted by this verifier."
+            ),
+        }
+        if tail_diagnostics
+        else None
+    )
 
     with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16, enabled=args.precision == "amp"), \
             generation_profile_context(
@@ -574,6 +702,7 @@ def run_direct_decode_loop_gate(
                 cuda_graph_diagnostics=candidate_cuda_graph_diagnostics,
                 decode_session_runtime=candidate_decode_session,
                 decode_session_metadata=candidate_decode_session_metadata,
+                tail_diagnostics=candidate_tail_diagnostics,
             ),
         )
         candidate_end_rng_state = _rng_state()
@@ -629,6 +758,7 @@ def run_direct_decode_loop_gate(
             if candidate_decode_session
             else None
         ),
+        "candidate_tail_diagnostics": candidate_tail_diagnostics,
         "metadata": metadata,
     }
 
@@ -691,6 +821,11 @@ def main() -> None:
         action="store_true",
         help="Wrap the candidate direct loop in the verifier-first DecodeSession state owner.",
     )
+    parser.add_argument(
+        "--tail-diagnostics",
+        action="store_true",
+        help="Record verifier-only candidate-loop CPU/CUDA timing for logits processors, sampling, and stop/append tail.",
+    )
     parser.add_argument("--report-path", type=Path, default=None)
     parser.add_argument("overrides", nargs="*", help="Hydra overrides, e.g. model_path=/path/to/model")
     cli_args = parser.parse_args()
@@ -716,6 +851,7 @@ def main() -> None:
         candidate_q1_bmm_cross_attention=cli_args.candidate_q1_bmm_cross_attention,
         candidate_native_q1_self_attention=cli_args.candidate_native_q1_self_attention,
         candidate_decode_session=cli_args.candidate_decode_session,
+        tail_diagnostics=cli_args.tail_diagnostics,
     )
     result["metadata"]["config_name"] = cli_args.config_name
     result["wall_seconds"] = time.perf_counter() - start

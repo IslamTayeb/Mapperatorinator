@@ -249,6 +249,7 @@ def _build_generation_logits_processors(args: InferenceConfig, tokenizer, device
         taiko_hit_temperature=args.taiko_hit_temperature,
         lookback_time=lookback_time,
         device=device,
+        stateful_monotonic=bool(getattr(args, "inference_stateful_monotonic_logits_processor", False)),
     )
 
 
