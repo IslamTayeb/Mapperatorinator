@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from collections import defaultdict
@@ -154,7 +155,10 @@ def _capture_decoder_linears(model, prepared_inputs: dict[str, Any], *, active_p
 
     def should_capture(name: str, module: torch.nn.Module) -> bool:
         return isinstance(module, torch.nn.Linear) and (
-            name == "proj_out" or name.startswith("model.decoder.layers.")
+            name == "proj_out"
+            or name.endswith(".proj_out")
+            or name.startswith("model.decoder.layers.")
+            or ".model.decoder.layers." in name
         )
 
     def hook_for(name: str):
@@ -200,7 +204,7 @@ def _signature_for_capture(capture: LinearCapture) -> str:
 
 
 def _operation_kind(name: str) -> str:
-    if name == "proj_out":
+    if name == "proj_out" or name.endswith(".proj_out"):
         return "decoder.output_projection"
     if ".self_attn.Wqkv" in name:
         return "decoder.self_attn.qkv"
@@ -220,17 +224,27 @@ def _operation_kind(name: str) -> str:
 def _find_layer_mlp_inputs(captures: dict[str, LinearCapture]) -> dict[str, tuple[LinearCapture, LinearCapture]]:
     by_layer: dict[str, dict[str, LinearCapture]] = defaultdict(dict)
     for name, capture in captures.items():
-        parts = name.split(".")
-        if len(parts) < 5 or parts[0] != "model" or parts[1] != "decoder" or parts[2] != "layers":
+        match = re.search(r"(^|\\.)model\\.decoder\\.layers\\.(\\d+)\\.(fc1|fc2)$", name)
+        if match is None:
             continue
-        layer_key = ".".join(parts[:4])
-        if parts[-1] in {"fc1", "fc2"}:
-            by_layer[layer_key][parts[-1]] = capture
+        layer_key = f"decoder.layers.{match.group(2)}"
+        by_layer[layer_key][match.group(3)] = capture
     return {
         layer: (items["fc1"], items["fc2"])
         for layer, items in by_layer.items()
         if "fc1" in items and "fc2" in items
     }
+
+
+def _find_decoder_layer_modules(model) -> dict[int, torch.nn.Module]:
+    layers: dict[int, torch.nn.Module] = {}
+    for name, module in model.named_modules():
+        match = re.search(r"(^|\\.)model\\.decoder\\.layers\\.(\\d+)$", name)
+        if match is None:
+            continue
+        if hasattr(module, "activation_fn") and hasattr(module, "fc1") and hasattr(module, "fc2"):
+            layers[int(match.group(2))] = module
+    return layers
 
 
 def _benchmark_mlp_variants(
@@ -493,11 +507,13 @@ def profile_decode_linear_kernels(
 
     mlp_benchmarks: dict[str, dict[str, Any]] = {}
     mlp_inputs = _find_layer_mlp_inputs(captures)
-    decoder_layers = model.model.decoder.layers
+    decoder_layers = _find_decoder_layer_modules(model)
     for layer_key, (fc1_capture, fc2_capture) in sorted(mlp_inputs.items()):
         if mlp_benchmarks:
             break
         layer_index = int(layer_key.split(".")[-1])
+        if layer_index not in decoder_layers:
+            raise RuntimeError(f"captured MLP inputs for decoder layer {layer_index}, but could not find that layer module")
         mlp_benchmarks[layer_key] = {
             "fc1_signature": _signature_for_capture(fc1_capture),
             "fc2_signature": _signature_for_capture(fc2_capture),
