@@ -149,7 +149,15 @@ def _benchmark_variants(
     return results
 
 
-def _capture_decoder_linears(model, prepared_inputs: dict[str, Any], *, active_prefix_length: int, q1_bmm_cross_attention: bool, sdpa_backend: str | None) -> tuple[dict[str, LinearCapture], torch.Tensor]:
+def _capture_decoder_linears(
+        model,
+        prepared_inputs: dict[str, Any],
+        *,
+        active_prefix_length: int,
+        q1_bmm_cross_attention: bool,
+        native_q1_self_attention: bool,
+        sdpa_backend: str | None,
+) -> tuple[dict[str, LinearCapture], torch.Tensor]:
     captures: dict[str, LinearCapture] = {}
     handles = []
 
@@ -186,6 +194,7 @@ def _capture_decoder_linears(model, prepared_inputs: dict[str, Any], *, active_p
                 sdpa_backend=sdpa_backend,
                 active_prefix_self_attention_length=active_prefix_length,
                 q1_bmm_cross_attention=q1_bmm_cross_attention,
+                native_q1_self_attention=native_q1_self_attention,
         ):
             outputs = model(**prepared_inputs)
             logits = last_token_logits(outputs.logits)
@@ -315,6 +324,7 @@ def profile_decode_linear_kernels(
         active_prefix_bucket_size: int,
         active_prefix_decode_length: int | None,
         q1_bmm_cross_attention: bool,
+        native_q1_self_attention: bool,
         warmup: int,
         iters: int,
         atol: float,
@@ -360,6 +370,7 @@ def profile_decode_linear_kernels(
         "active_prefix_bucket_size": active_prefix_bucket_size,
         "active_prefix_decode_length_override": active_prefix_decode_length,
         "q1_bmm_cross_attention": bool(q1_bmm_cross_attention),
+        "native_q1_self_attention": bool(native_q1_self_attention),
         "per_module": bool(per_module),
     }
     prompt = model_inputs["decoder_input_ids"]
@@ -384,6 +395,7 @@ def profile_decode_linear_kernels(
             generation_profile_context(
                 sdpa_backend=args.profile_sdpa_backend,
                 q1_bmm_cross_attention=q1_bmm_cross_attention,
+                native_q1_self_attention=native_q1_self_attention,
             ):
         hf_cache = get_cache(model, batch_size=1, num_beams=1, cfg_scale=1.0)
         hf_generate_outputs = model.generate(
@@ -444,6 +456,7 @@ def profile_decode_linear_kernels(
             direct_result.prepared_inputs,
             active_prefix_length=active_prefix_length,
             q1_bmm_cross_attention=q1_bmm_cross_attention,
+            native_q1_self_attention=native_q1_self_attention,
             sdpa_backend=args.profile_sdpa_backend,
         )
 
@@ -561,6 +574,7 @@ def main() -> None:
     parser.add_argument("--active-prefix-bucket-size", type=int, default=64)
     parser.add_argument("--active-prefix-decode-length", type=int, default=None)
     parser.add_argument("--q1-bmm-cross-attention", action="store_true")
+    parser.add_argument("--native-q1-self-attention", action="store_true")
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", type=int, default=500)
     parser.add_argument("--atol", type=float, default=1e-4)
@@ -578,6 +592,7 @@ def main() -> None:
         active_prefix_bucket_size=cli_args.active_prefix_bucket_size,
         active_prefix_decode_length=cli_args.active_prefix_decode_length,
         q1_bmm_cross_attention=cli_args.q1_bmm_cross_attention,
+        native_q1_self_attention=cli_args.native_q1_self_attention,
         warmup=cli_args.warmup,
         iters=cli_args.iters,
         atol=cli_args.atol,
