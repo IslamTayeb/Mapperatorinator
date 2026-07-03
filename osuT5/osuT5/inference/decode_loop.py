@@ -37,6 +37,12 @@ def _record_diagnostic_cuda_start(diagnostics: dict[str, Any]) -> tuple[Any, Any
     return start_event, end_event
 
 
+def _maybe_record_diagnostic_cuda_start(diagnostics: dict[str, Any] | None) -> tuple[Any, Any] | tuple[None, None]:
+    if diagnostics is None:
+        return None, None
+    return _record_diagnostic_cuda_start(diagnostics)
+
+
 def _add_diagnostic_cuda_event(
         diagnostics: dict[str, Any],
         name: str,
@@ -65,6 +71,51 @@ def _finalize_active_prefix_diagnostics(diagnostics: dict[str, Any] | None) -> N
     per_decode_step_us = diagnostics.setdefault("cuda_event_per_decode_step_us", {})
     for name, milliseconds in cuda_event_ms.items():
         per_decode_step_us[name] = float(milliseconds) * 1000.0 / decode_steps
+    child_wall_keys = (
+        "prepare_inputs_wall_cpu_s",
+        "prefill_forward_wall_cpu_s",
+        "decode_forward_wall_cpu_s",
+        "update_kwargs_wall_cpu_s",
+        "logits_extract_wall_cpu_s",
+        "logits_processor_wall_cpu_s",
+        "sampling_wall_cpu_s",
+        "eos_mask_wall_cpu_s",
+        "append_token_wall_cpu_s",
+        "stopping_criteria_wall_cpu_s",
+        "finished_check_wall_cpu_s",
+        "cache_position_wall_cpu_s",
+        "max_cache_shape_wall_cpu_s",
+        "compile_lookup_wall_cpu_s",
+        "graph_signature_lookup_wall_cpu_s",
+        "graph_capture_wall_cpu_s",
+        "graph_input_copy_wall_cpu_s",
+        "graph_replay_wall_cpu_s",
+    )
+    child_wall_total = sum(float(diagnostics.get(key, 0.0) or 0.0) for key in child_wall_keys)
+    diagnostics["diagnostic_child_wall_cpu_s"] = float(child_wall_total)
+    loop_wall = diagnostics.get("loop_total_wall_cpu_s")
+    if isinstance(loop_wall, (float, int)):
+        diagnostics["diagnostic_unattributed_loop_wall_cpu_s"] = float(loop_wall) - float(child_wall_total)
+        diagnostics["diagnostic_child_wall_fraction_of_loop"] = (
+            float(child_wall_total) / float(loop_wall)
+            if float(loop_wall) > 0
+            else None
+        )
+    loop_cuda_ms = cuda_event_ms.get("loop_total")
+    decode_cuda_ms = cuda_event_ms.get("decode_forward.cuda_graph") or cuda_event_ms.get("decode_forward")
+    if isinstance(loop_cuda_ms, (float, int)) and isinstance(decode_cuda_ms, (float, int)):
+        diagnostics["diagnostic_decode_forward_fraction_of_loop_cuda"] = (
+            float(decode_cuda_ms) / float(loop_cuda_ms)
+            if float(loop_cuda_ms) > 0
+            else None
+        )
+    graph_replay_ms = cuda_event_ms.get("graph.replay")
+    if isinstance(loop_cuda_ms, (float, int)) and isinstance(graph_replay_ms, (float, int)):
+        diagnostics["diagnostic_graph_replay_fraction_of_loop_cuda"] = (
+            float(graph_replay_ms) / float(loop_cuda_ms)
+            if float(loop_cuda_ms) > 0
+            else None
+        )
     diagnostics["cuda_event_note"] = (
         "Diagnostic-only CUDA event timings; nested ranges are non-exclusive and include queued GPU work "
         "between range entry/exit on the current stream."
@@ -153,6 +204,24 @@ def _copy_static_graph_inputs(static_inputs: dict[str, Any], model_inputs: dict[
         if static_value.dtype != value.dtype:
             raise RuntimeError(f"CUDA graph input {key} dtype changed from {static_value.dtype} to {value.dtype}")
         static_value.copy_(value)
+
+
+def _record_static_input_copy_bytes(
+        diagnostics: dict[str, Any] | None,
+        static_inputs: dict[str, Any],
+        model_inputs: dict[str, Any],
+) -> None:
+    if diagnostics is None:
+        return
+    bytes_by_key = diagnostics.setdefault("static_input_copy_bytes_by_key", {})
+    calls_by_key = diagnostics.setdefault("static_input_copy_calls_by_key", {})
+    for key, static_value in static_inputs.items():
+        value = model_inputs.get(key)
+        if not isinstance(static_value, torch.Tensor) or not isinstance(value, torch.Tensor):
+            continue
+        copied_bytes = int(value.numel() * value.element_size())
+        bytes_by_key[key] = int(bytes_by_key.get(key, 0)) + copied_bytes
+        calls_by_key[key] = int(calls_by_key.get(key, 0)) + 1
 
 
 def _stable_encoder_outputs(
@@ -300,6 +369,8 @@ def active_prefix_decode_generate(
         active_prefix_decode_diagnostics["_record_cuda_events"] = (
             input_ids.device.type == "cuda" and torch.cuda.is_available()
         )
+    loop_start_wall = time.perf_counter()
+    loop_start_event, loop_end_event = _maybe_record_diagnostic_cuda_start(active_prefix_decode_diagnostics)
 
     this_peer_finished = False
     unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
@@ -399,17 +470,27 @@ def active_prefix_decode_generate(
                     else:
                         decode_context = _diagnostic_range(None, "decode_forward.cuda_graph")
                     with decode_context:
-                        graph_key = _cuda_graph_signature(prefix_length, model_inputs)
-                        graph_entry = graph_cache.get(graph_key)
+                        with _diagnostic_range(
+                                active_prefix_decode_diagnostics,
+                                "graph.signature_lookup",
+                                wall_key="graph_signature_lookup_wall_cpu_s",
+                        ):
+                            graph_key = _cuda_graph_signature(prefix_length, model_inputs)
+                            graph_entry = graph_cache.get(graph_key)
                         captured_this_record = False
                         if graph_entry is None:
                             graph_static_inputs = _clone_static_graph_inputs(model_inputs)
-                            graph, graph_outputs, capture_seconds = _capture_decode_cuda_graph(
-                                model,
-                                graph_static_inputs,
-                                active_prefix_length=prefix_length,
-                                warmup=cuda_graph_warmup,
-                            )
+                            with _diagnostic_range(
+                                    active_prefix_decode_diagnostics,
+                                    "graph.capture",
+                                    wall_key="graph_capture_wall_cpu_s",
+                            ):
+                                graph, graph_outputs, capture_seconds = _capture_decode_cuda_graph(
+                                    model,
+                                    graph_static_inputs,
+                                    active_prefix_length=prefix_length,
+                                    warmup=cuda_graph_warmup,
+                                )
                             graph_entry = {
                                 "graph": graph,
                                 "outputs": graph_outputs,
@@ -421,8 +502,23 @@ def active_prefix_decode_generate(
                             graph_cache[graph_key] = graph_entry
                             captured_this_record = True
                         else:
-                            _copy_static_graph_inputs(graph_entry["static_inputs"], model_inputs)
-                            graph_entry["graph"].replay()
+                            _record_static_input_copy_bytes(
+                                active_prefix_decode_diagnostics,
+                                graph_entry["static_inputs"],
+                                model_inputs,
+                            )
+                            with _diagnostic_range(
+                                    active_prefix_decode_diagnostics,
+                                    "graph.input_copy",
+                                    wall_key="graph_input_copy_wall_cpu_s",
+                            ):
+                                _copy_static_graph_inputs(graph_entry["static_inputs"], model_inputs)
+                            with _diagnostic_range(
+                                    active_prefix_decode_diagnostics,
+                                    "graph.replay",
+                                    wall_key="graph_replay_wall_cpu_s",
+                            ):
+                                graph_entry["graph"].replay()
                         graph_entry["decode_replays"] = int(graph_entry["decode_replays"]) + 1
                         diagnostic_graph_entry = diagnostic_graph_cache.get(graph_key)
                         if diagnostic_graph_entry is None:
@@ -585,6 +681,16 @@ def active_prefix_decode_generate(
 
             del outputs
     finally:
+        if active_prefix_decode_diagnostics is not None:
+            active_prefix_decode_diagnostics["loop_total_wall_cpu_s"] = (
+                time.perf_counter() - loop_start_wall
+            )
+            _add_diagnostic_cuda_event(
+                active_prefix_decode_diagnostics,
+                "loop_total",
+                loop_start_event,
+                loop_end_event,
+            )
         _finalize_active_prefix_diagnostics(active_prefix_decode_diagnostics)
 
     return input_ids
