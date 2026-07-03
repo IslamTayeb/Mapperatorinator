@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -17,6 +17,7 @@ class OneTokenDecodeState:
     prompt_length: int
     prefill_cache_position: torch.LongTensor
     prefill_prepared_inputs: dict[str, Any]
+    prefill_logits: torch.Tensor | None = None
 
 
 @dataclass
@@ -28,22 +29,23 @@ class OneTokenDecodeResult:
 
 @dataclass
 class EncoderState:
-    encoder_outputs: BaseModelOutput
+    encoder_outputs: BaseModelOutput | None
 
 
 @dataclass
 class DecoderCacheState:
-    cache: MapperatorinatorCache
+    cache: MapperatorinatorCache | None
     prompt_length: int
-    prefill_cache_position: torch.LongTensor
+    prefill_cache_position: torch.LongTensor | None
     prefill_prepared_inputs: dict[str, Any]
+    prefill_logits: torch.Tensor | None = None
 
 
 @dataclass
 class StaticInputBuffers:
     prompt: torch.LongTensor
-    prompt_attention_mask: torch.Tensor
-    frames: torch.Tensor
+    prompt_attention_mask: torch.Tensor | None
+    frames: torch.Tensor | None
 
 
 @dataclass
@@ -56,6 +58,22 @@ class SamplerState:
 @dataclass
 class GraphState:
     graphs: dict[tuple[Any, ...], Any]
+
+
+@dataclass
+class GeneratedTokenState:
+    token_ids: list[int] = field(default_factory=list)
+    output_shape: list[int] | None = None
+    generated_steps: int = 0
+
+
+@dataclass
+class DecodeLoopState:
+    model_kwargs: dict[str, Any]
+    cur_len: int
+    max_cache_len: int | None
+    sequence_buffer_shape: list[int] | None = None
+    generated_steps: int = 0
 
 
 @dataclass
@@ -74,6 +92,8 @@ class DecodeSession:
     condition_kwargs: dict[str, Any]
     sampler_state: SamplerState
     graph_state: GraphState
+    generated_state: GeneratedTokenState = field(default_factory=GeneratedTokenState)
+    loop_state: DecodeLoopState | None = None
 
     @classmethod
     @torch.no_grad()
@@ -104,6 +124,7 @@ class DecodeSession:
                 prompt_length=state.prompt_length,
                 prefill_cache_position=state.prefill_cache_position,
                 prefill_prepared_inputs=state.prefill_prepared_inputs,
+                prefill_logits=state.prefill_logits,
             ),
             static_inputs=StaticInputBuffers(
                 prompt=prompt,
@@ -115,13 +136,70 @@ class DecodeSession:
             graph_state=GraphState(graphs={}),
         )
 
+    @classmethod
+    def for_generation_loop(
+            cls,
+            model,
+            *,
+            prompt: torch.LongTensor,
+            prompt_attention_mask: torch.Tensor | None,
+            frames: torch.Tensor | None,
+            model_kwargs: dict[str, Any],
+            max_cache_len: int | None,
+            sequence_buffer: torch.Tensor | None = None,
+            condition_kwargs: dict[str, Any] | None = None,
+            sampler_state: SamplerState | None = None,
+    ) -> "DecodeSession":
+        """Create a verifier-only session wrapper around an HF-style decode loop.
+
+        This path intentionally does not change computation. It gives the direct
+        loop verifier a stable state owner before future runtime work moves
+        individual operations behind the session boundary.
+        """
+        cache_position = model_kwargs.get("cache_position")
+        return cls(
+            model=model,
+            encoder_state=EncoderState(encoder_outputs=model_kwargs.get("encoder_outputs")),
+            cache_state=DecoderCacheState(
+                cache=model_kwargs.get("past_key_values"),
+                prompt_length=int(prompt.shape[-1]),
+                prefill_cache_position=cache_position if isinstance(cache_position, torch.Tensor) else None,
+                prefill_prepared_inputs={},
+            ),
+            static_inputs=StaticInputBuffers(
+                prompt=prompt,
+                prompt_attention_mask=prompt_attention_mask,
+                frames=frames,
+            ),
+            condition_kwargs=condition_kwargs or {},
+            sampler_state=sampler_state or SamplerState(),
+            graph_state=GraphState(graphs={}),
+            loop_state=DecodeLoopState(
+                model_kwargs=model_kwargs,
+                cur_len=int(prompt.shape[-1]),
+                max_cache_len=max_cache_len,
+                sequence_buffer_shape=(
+                    list(sequence_buffer.shape)
+                    if isinstance(sequence_buffer, torch.Tensor)
+                    else None
+                ),
+            ),
+        )
+
     def _one_token_state(self) -> OneTokenDecodeState:
+        if self.cache_state.cache is None:
+            raise RuntimeError("DecodeSession does not own a static cache for one-token decode")
+        if self.encoder_state.encoder_outputs is None:
+            raise RuntimeError("DecodeSession does not own encoder outputs for one-token decode")
+        if self.cache_state.prefill_cache_position is None:
+            raise RuntimeError("DecodeSession does not own a prefill cache position")
         return OneTokenDecodeState(
             cache=self.cache_state.cache,
             encoder_outputs=self.encoder_state.encoder_outputs,
             prompt_length=self.cache_state.prompt_length,
             prefill_cache_position=self.cache_state.prefill_cache_position,
             prefill_prepared_inputs=self.cache_state.prefill_prepared_inputs,
+            prefill_logits=self.cache_state.prefill_logits,
         )
 
     def one_token_state(self) -> OneTokenDecodeState:
@@ -148,14 +226,60 @@ class DecodeSession:
             active_prefix_self_attention_length=active_prefix_self_attention_length,
         )
 
+    def record_generated_token(self, next_tokens: torch.LongTensor, output: torch.LongTensor) -> None:
+        self.generated_state.token_ids.extend(int(item) for item in next_tokens.detach().flatten().tolist())
+        self.generated_state.output_shape = list(output.shape)
+        self.generated_state.generated_steps += int(next_tokens.numel())
+        if self.loop_state is not None:
+            self.loop_state.generated_steps += int(next_tokens.numel())
+            self.loop_state.cur_len = int(output.shape[-1])
+
+    def update_loop_model_kwargs(self, model_kwargs: dict[str, Any]) -> None:
+        if self.loop_state is not None:
+            self.loop_state.model_kwargs = model_kwargs
+            cache_position = model_kwargs.get("cache_position")
+            if isinstance(cache_position, torch.Tensor):
+                self.cache_state.prefill_cache_position = cache_position
+            self.cache_state.cache = model_kwargs.get("past_key_values", self.cache_state.cache)
+            encoder_outputs = model_kwargs.get("encoder_outputs")
+            if encoder_outputs is not None:
+                self.encoder_state.encoder_outputs = encoder_outputs
+
     def metadata(self) -> dict[str, Any]:
+        loop_state = self.loop_state
         return {
             "prompt_length": int(self.cache_state.prompt_length),
             "graph_count": len(self.graph_state.graphs),
-            "prefill_cache_position_shape": list(self.cache_state.prefill_cache_position.shape),
+            "prefill_cache_position_shape": (
+                list(self.cache_state.prefill_cache_position.shape)
+                if isinstance(self.cache_state.prefill_cache_position, torch.Tensor)
+                else None
+            ),
             "prompt_shape": list(self.static_inputs.prompt.shape),
-            "prompt_attention_mask_shape": list(self.static_inputs.prompt_attention_mask.shape),
-            "frames_shape": list(self.static_inputs.frames.shape),
+            "prompt_attention_mask_shape": (
+                list(self.static_inputs.prompt_attention_mask.shape)
+                if isinstance(self.static_inputs.prompt_attention_mask, torch.Tensor)
+                else None
+            ),
+            "frames_shape": (
+                list(self.static_inputs.frames.shape)
+                if isinstance(self.static_inputs.frames, torch.Tensor)
+                else None
+            ),
+            "generated_steps": int(self.generated_state.generated_steps),
+            "generated_token_count": len(self.generated_state.token_ids),
+            "output_shape": self.generated_state.output_shape,
+            "loop_state": (
+                {
+                    "cur_len": int(loop_state.cur_len),
+                    "max_cache_len": loop_state.max_cache_len,
+                    "sequence_buffer_shape": loop_state.sequence_buffer_shape,
+                    "generated_steps": int(loop_state.generated_steps),
+                    "model_kwargs_keys": sorted(loop_state.model_kwargs.keys()),
+                }
+                if loop_state is not None
+                else None
+            ),
         }
 
 
@@ -197,6 +321,7 @@ def prefill_static_cache(
         prompt_length=prompt_length,
         prefill_cache_position=cache_position,
         prefill_prepared_inputs=prepared_inputs,
+        prefill_logits=last_token_logits(outputs.logits),
     )
 
 

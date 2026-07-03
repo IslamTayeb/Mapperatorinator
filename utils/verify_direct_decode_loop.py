@@ -22,6 +22,7 @@ from config import InferenceConfig
 from inference import compile_args, load_model_with_server, setup_inference_environment
 from osuT5.osuT5.inference.cache_utils import get_cache
 from osuT5.osuT5.inference.decode_loop import _bucketed_prefix_length, _max_cache_shape
+from osuT5.osuT5.inference.direct_decode import DecodeSession, SamplerState
 from osuT5.osuT5.inference.server import get_eos_token_id
 from osuT5.osuT5.runtime_profiling import active_prefix_self_attention_context, generation_profile_context
 from osuT5.osuT5.tokenizer import ContextType
@@ -235,6 +236,8 @@ def direct_decode_loop_generate(
         cuda_graph_forward: bool = False,
         cuda_graph_warmup: int = 0,
         cuda_graph_diagnostics: dict[str, Any] | None = None,
+        decode_session_runtime: bool = False,
+        decode_session_metadata: dict[str, Any] | None = None,
         **model_kwargs,
 ) -> torch.LongTensor:
     """Verification-only direct cached decode loop used by utils/verify_direct_decode_loop.py."""
@@ -274,6 +277,24 @@ def direct_decode_loop_generate(
     unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
     model_kwargs = model._get_initial_cache_position(cur_len, input_ids.device, model_kwargs)
     max_cache_len = _max_cache_shape(model_kwargs, generation_config)
+    decode_session = (
+        DecodeSession.for_generation_loop(
+            model,
+            prompt=input_ids,
+            prompt_attention_mask=model_kwargs.get("decoder_attention_mask"),
+            frames=model_kwargs.get("frames"),
+            model_kwargs=model_kwargs,
+            max_cache_len=max_cache_len,
+            sequence_buffer=sequence_buffer,
+            sampler_state=SamplerState(
+                logits_processor=logits_processor,
+                stopping_criteria=stopping_criteria,
+                rng_state=torch.random.get_rng_state(),
+            ),
+        )
+        if decode_session_runtime
+        else None
+    )
 
     model_forward = model.__call__
     if model._valid_auto_compile_criteria(model_kwargs, generation_config):
@@ -341,6 +362,8 @@ def direct_decode_loop_generate(
             model_kwargs,
             is_encoder_decoder=model.config.is_encoder_decoder,
         )
+        if decode_session is not None:
+            decode_session.update_loop_model_kwargs(model_kwargs)
 
         next_token_logits = outputs.logits[:, -1, :].to(copy=True, dtype=torch.float32, device=input_ids.device)
         next_token_scores = logits_processor(current_input_ids, next_token_logits)
@@ -359,6 +382,8 @@ def direct_decode_loop_generate(
         else:
             sequence_buffer[:, cur_len].copy_(next_tokens)
             input_ids = sequence_buffer[:, :cur_len + 1]
+        if decode_session is not None:
+            decode_session.record_generated_token(next_tokens, input_ids)
 
         unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, scores)
         this_peer_finished = unfinished_sequences.max() == 0
@@ -367,7 +392,12 @@ def direct_decode_loop_generate(
         del outputs
 
     if sequence_buffer is not None:
-        return sequence_buffer[:, :cur_len].clone(memory_format=torch.contiguous_format)
+        output = sequence_buffer[:, :cur_len].clone(memory_format=torch.contiguous_format)
+        if decode_session is not None and decode_session_metadata is not None:
+            decode_session_metadata.update(decode_session.metadata())
+        return output
+    if decode_session is not None and decode_session_metadata is not None:
+        decode_session_metadata.update(decode_session.metadata())
     return input_ids
 
 
@@ -391,6 +421,7 @@ def run_direct_decode_loop_gate(
         candidate_cuda_graph_forward: bool,
         candidate_cuda_graph_warmup: int,
         candidate_q1_bmm_cross_attention: bool,
+        candidate_decode_session: bool,
 ) -> dict[str, Any]:
     _assert_supported_probe(args)
     if max_new_tokens <= 0:
@@ -450,6 +481,7 @@ def run_direct_decode_loop_gate(
         "candidate_cuda_graph_forward": bool(candidate_cuda_graph_forward),
         "candidate_cuda_graph_warmup": int(candidate_cuda_graph_warmup),
         "candidate_q1_bmm_cross_attention": bool(candidate_q1_bmm_cross_attention),
+        "candidate_decode_session": bool(candidate_decode_session),
     }
 
     prompt = model_inputs["decoder_input_ids"]
@@ -505,6 +537,7 @@ def run_direct_decode_loop_gate(
     )
     candidate_processors.insert(0, _CaptureRawLogitsProcessor(candidate_captures))
     candidate_cuda_graph_diagnostics: dict[str, Any] = {}
+    candidate_decode_session_metadata: dict[str, Any] = {}
 
     with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16, enabled=args.precision == "amp"), \
             generation_profile_context(
@@ -535,6 +568,8 @@ def run_direct_decode_loop_gate(
                 cuda_graph_forward=candidate_cuda_graph_forward,
                 cuda_graph_warmup=candidate_cuda_graph_warmup,
                 cuda_graph_diagnostics=candidate_cuda_graph_diagnostics,
+                decode_session_runtime=candidate_decode_session,
+                decode_session_metadata=candidate_decode_session_metadata,
             ),
         )
         candidate_end_rng_state = _rng_state()
@@ -583,6 +618,11 @@ def run_direct_decode_loop_gate(
         "candidate_cuda_graph_diagnostics": (
             candidate_cuda_graph_diagnostics
             if candidate_cuda_graph_forward
+            else None
+        ),
+        "candidate_decode_session": (
+            candidate_decode_session_metadata
+            if candidate_decode_session
             else None
         ),
         "metadata": metadata,
@@ -637,6 +677,11 @@ def main() -> None:
         action="store_true",
         help="Enable the experimental fp32 q_len=1 BMM cross-attention candidate for the direct loop.",
     )
+    parser.add_argument(
+        "--candidate-decode-session",
+        action="store_true",
+        help="Wrap the candidate direct loop in the verifier-first DecodeSession state owner.",
+    )
     parser.add_argument("--report-path", type=Path, default=None)
     parser.add_argument("overrides", nargs="*", help="Hydra overrides, e.g. model_path=/path/to/model")
     cli_args = parser.parse_args()
@@ -660,6 +705,7 @@ def main() -> None:
         candidate_cuda_graph_forward=cli_args.candidate_cuda_graph_forward,
         candidate_cuda_graph_warmup=cli_args.candidate_cuda_graph_warmup,
         candidate_q1_bmm_cross_attention=cli_args.candidate_q1_bmm_cross_attention,
+        candidate_decode_session=cli_args.candidate_decode_session,
     )
     result["metadata"]["config_name"] = cli_args.config_name
     result["wall_seconds"] = time.perf_counter() - start
