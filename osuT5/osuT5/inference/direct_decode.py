@@ -447,7 +447,7 @@ def prepare_one_token_decode_inputs_fast(
             batch_size=decoder_input_ids.shape[0],
         )
 
-    return {
+    fast_inputs = {
         "encoder_outputs": encoder_outputs,
         "past_key_values": past_key_values,
         "decoder_input_ids": decoder_input_ids,
@@ -456,3 +456,7 @@ def prepare_one_token_decode_inputs_fast(
         "decoder_position_ids": decoder_position_ids,
         "cache_position": next_cache_position,
     }
+    for key, value in model_kwargs.items():
+        if key not in fast_inputs:
+            fast_inputs[key] = value
+    return fast_inputs

@@ -188,6 +188,7 @@ def verify_decode_prepare_oracle(
     cache = get_cache(model, batch_size=1, num_beams=1, cfg_scale=1.0)
     model_kwargs: dict[str, Any] = {
         **condition_kwargs,
+        "frames": model_inputs["frames"],
         "decoder_attention_mask": prompt_mask,
         "past_key_values": cache,
         "use_cache": True,
@@ -215,8 +216,6 @@ def verify_decode_prepare_oracle(
             start = time.perf_counter()
             reference_inputs = model.prepare_inputs_for_generation(input_ids, **model_kwargs)
             prepare_reference_wall_s += time.perf_counter() - start
-            if step_index == 0 and reference_inputs.get("encoder_outputs") is None:
-                reference_inputs["input_features"] = model_inputs["frames"]
 
             comparison = None
             candidate_error = None
