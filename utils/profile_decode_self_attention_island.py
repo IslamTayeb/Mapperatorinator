@@ -279,6 +279,7 @@ def profile_decode_self_attention_island(
         rtol: float,
         per_layer: bool,
         full_song_decode_steps: int,
+        full_song_main_tokens: int,
         full_song_model_time_s: float,
 ) -> dict[str, Any]:
     if not torch.cuda.is_available():
@@ -322,6 +323,7 @@ def profile_decode_self_attention_island(
         "q1_bmm_cross_attention": bool(q1_bmm_cross_attention),
         "per_layer": bool(per_layer),
         "full_song_decode_steps": int(full_song_decode_steps),
+        "full_song_main_tokens": int(full_song_main_tokens),
         "full_song_model_time_s": float(full_song_model_time_s),
     }
     prompt = model_inputs["decoder_input_ids"]
@@ -478,6 +480,7 @@ def profile_decode_self_attention_island(
         projected_full_song[signature] = {
             "member_count": member_count,
             "decode_steps": int(full_song_decode_steps),
+            "main_tokens": int(full_song_main_tokens),
             "repo_self_attention_island_s": repo_seconds,
             "repo_self_attention_island_fraction_of_model_time": repo_seconds / full_song_model_time_s,
             "manual_native_island_delta_s": manual_delta_s,
@@ -485,7 +488,7 @@ def profile_decode_self_attention_island(
             "pre_attention_setup_ceiling_s": pre_attention_ceiling_s,
             "native_attention_ceiling_s": native_attention_ceiling_s,
             "out_projection_ceiling_s": out_projection_ceiling_s,
-            "ideal_free_island_tps": full_song_decode_steps / ideal_free_island_time_s,
+            "ideal_free_island_tps": full_song_main_tokens / ideal_free_island_time_s,
         }
 
     return {
@@ -531,6 +534,12 @@ def main() -> None:
         help="Decode replay count used only for full-song ceiling projections.",
     )
     parser.add_argument(
+        "--full-song-main-tokens",
+        type=int,
+        default=7639,
+        help="Generated main token count used only for full-song TPS ceiling projections.",
+    )
+    parser.add_argument(
         "--full-song-model-time-s",
         type=float,
         default=32.217,
@@ -554,6 +563,7 @@ def main() -> None:
         rtol=cli_args.rtol,
         per_layer=cli_args.per_layer,
         full_song_decode_steps=cli_args.full_song_decode_steps,
+        full_song_main_tokens=cli_args.full_song_main_tokens,
         full_song_model_time_s=cli_args.full_song_model_time_s,
     )
     result["metadata"]["config_name"] = cli_args.config_name
