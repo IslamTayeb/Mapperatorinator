@@ -46,6 +46,23 @@ class _CaptureRawLogitsProcessor(LogitsProcessor):
         return scores
 
 
+class _ForceEosAtGeneratedStepProcessor(LogitsProcessor):
+    def __init__(self, *, prompt_len: int, generated_step: int, eos_token_id: int):
+        if generated_step <= 0:
+            raise ValueError("generated_step must be positive")
+        self.prompt_len = int(prompt_len)
+        self.generated_step = int(generated_step)
+        self.eos_token_id = int(eos_token_id)
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.Tensor:
+        next_generated_step = int(input_ids.shape[-1]) - self.prompt_len + 1
+        if next_generated_step != self.generated_step:
+            return scores
+        forced_scores = torch.full_like(scores, -torch.inf)
+        forced_scores[:, self.eos_token_id] = 0.0
+        return forced_scores
+
+
 def _rng_state() -> tuple[torch.Tensor, list[torch.Tensor] | None]:
     cpu_state = torch.random.get_rng_state()
     cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
@@ -526,6 +543,151 @@ def _generated_token_ids(output: torch.Tensor, prompt_len: int) -> list[int]:
     return [int(item) for item in output[0, prompt_len:].tolist()]
 
 
+def _sample_multinomial_sequence(
+        probs_by_step: list[torch.Tensor],
+        *,
+        next_sample_count: int = 16,
+) -> tuple[list[int], tuple[torch.Tensor, list[torch.Tensor] | None], list[int]]:
+    samples = [
+        int(torch.multinomial(probs, num_samples=1).item())
+        for probs in probs_by_step
+    ]
+    final_state = _rng_state()
+    next_samples = [
+        int(torch.multinomial(probs_by_step[-1], num_samples=1).item())
+        for _ in range(next_sample_count)
+    ]
+    return samples, final_state, next_samples
+
+
+def _sample_multinomial_sequence_cuda_graph(
+        probs_by_step: list[torch.Tensor],
+        *,
+        next_sample_count: int = 16,
+) -> tuple[list[int], tuple[torch.Tensor, list[torch.Tensor] | None], list[int]]:
+    if not torch.cuda.is_available():
+        raise RuntimeError("fixed-K tail graph audit requires CUDA")
+    if not probs_by_step:
+        raise ValueError("probs_by_step must not be empty")
+    if any(probs.device.type != "cuda" for probs in probs_by_step):
+        raise ValueError("all probs tensors must be CUDA tensors")
+
+    outputs = torch.empty((len(probs_by_step), 1), dtype=torch.long, device=probs_by_step[0].device)
+    capture_start_state = _rng_state()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for index, probs in enumerate(probs_by_step):
+            outputs[index].copy_(torch.multinomial(probs, num_samples=1).reshape(1))
+    _set_rng_state(capture_start_state)
+    graph.replay()
+    torch.cuda.synchronize()
+    samples = [int(item) for item in outputs.detach().cpu().view(-1).tolist()]
+    final_state = _rng_state()
+    next_samples = [
+        int(torch.multinomial(probs_by_step[-1], num_samples=1).item())
+        for _ in range(next_sample_count)
+    ]
+    return samples, final_state, next_samples
+
+
+def _run_fixed_k_tail_graph_audit(
+        *,
+        device: torch.device,
+        tail_graph_k: int,
+        force_eos_at_generated_token: int,
+        eos_token_id: int,
+) -> dict[str, Any]:
+    if not torch.cuda.is_available() or device.type != "cuda":
+        raise RuntimeError("fixed-K tail graph audit requires a CUDA device")
+    if tail_graph_k <= 1:
+        raise ValueError("tail_graph_k must be greater than 1")
+    if force_eos_at_generated_token <= 0 or force_eos_at_generated_token >= tail_graph_k:
+        raise ValueError("force_eos_at_generated_token must satisfy 1 <= N < tail_graph_k")
+
+    vocab_size = max(int(eos_token_id) + 1, 512)
+    logits = torch.linspace(-3.0, 3.0, steps=vocab_size, dtype=torch.float32, device=device).unsqueeze(0)
+    probs = torch.softmax(logits, dim=-1)
+    eos_probs = torch.zeros_like(probs)
+    eos_probs[:, int(eos_token_id)] = 1.0
+    next_sample_count = 16
+
+    no_eos_steps = [probs for _ in range(tail_graph_k)]
+    start_state = _rng_state()
+    _set_rng_state(start_state)
+    eager_samples, eager_state, eager_next = _sample_multinomial_sequence(
+        no_eos_steps,
+        next_sample_count=next_sample_count,
+    )
+    _set_rng_state(start_state)
+    graph_samples, graph_state, graph_next = _sample_multinomial_sequence_cuda_graph(
+        no_eos_steps,
+        next_sample_count=next_sample_count,
+    )
+    no_eos_block = {
+        "sequence_match": eager_samples == graph_samples,
+        "final_rng_match": _rng_states_equal(eager_state, graph_state),
+        "next_eager_sample_match": eager_next == graph_next,
+        "graph_draw_count": int(tail_graph_k),
+        "eager_draw_count": int(tail_graph_k),
+        "eager_samples": eager_samples,
+        "graph_samples": graph_samples,
+        "eager_next_samples": eager_next,
+        "graph_next_samples": graph_next,
+    }
+
+    forced_steps = [
+        eos_probs if index == force_eos_at_generated_token - 1 else probs
+        for index in range(tail_graph_k)
+    ]
+    eager_forced_steps = forced_steps[:force_eos_at_generated_token]
+    start_state = _rng_state()
+    _set_rng_state(start_state)
+    eager_forced, eager_forced_state, eager_forced_next = _sample_multinomial_sequence(
+        eager_forced_steps,
+        next_sample_count=next_sample_count,
+    )
+    _set_rng_state(start_state)
+    graph_forced, graph_forced_state, graph_forced_next = _sample_multinomial_sequence_cuda_graph(
+        forced_steps,
+        next_sample_count=next_sample_count,
+    )
+    graph_forced_prefix = graph_forced[:force_eos_at_generated_token]
+    final_rng_match = _rng_states_equal(eager_forced_state, graph_forced_state)
+    forced_eos_naive_block = {
+        "output_prefix_through_eos_match": eager_forced == graph_forced_prefix,
+        "expected_rng_divergence_detected": not final_rng_match,
+        "final_rng_match": final_rng_match,
+        "next_eager_sample_match": eager_forced_next == graph_forced_next,
+        "graph_draw_count": int(tail_graph_k),
+        "eager_draw_count": int(force_eos_at_generated_token),
+        "forced_eos_token_id": int(eos_token_id),
+        "eager_samples_through_eos": eager_forced,
+        "graph_samples": graph_forced,
+        "eager_next_samples": eager_forced_next,
+        "graph_next_samples": graph_forced_next,
+    }
+
+    return {
+        "enabled": True,
+        "tail_graph_k": int(tail_graph_k),
+        "force_eos_at_generated_token": int(force_eos_at_generated_token),
+        "forced_eos_token_id": int(eos_token_id),
+        "no_eos_block": no_eos_block,
+        "forced_eos_naive_block": forced_eos_naive_block,
+        "pass": (
+            bool(no_eos_block["sequence_match"])
+            and bool(no_eos_block["final_rng_match"])
+            and bool(no_eos_block["next_eager_sample_match"])
+            and bool(forced_eos_naive_block["output_prefix_through_eos_match"])
+            and bool(forced_eos_naive_block["expected_rng_divergence_detected"])
+        ),
+        "note": (
+            "Verifier-only audit. The forced-EOS naive fixed-K block is expected to diverge "
+            "in final RNG state because it samples after eager generation would stop."
+        ),
+    }
+
+
 @torch.no_grad()
 def run_direct_decode_loop_gate(
         args: InferenceConfig,
@@ -546,6 +708,9 @@ def run_direct_decode_loop_gate(
         candidate_native_q1_rope_cache_self_attention: bool,
         candidate_decode_session: bool,
         candidate_fast_prepare: bool,
+        force_eos_at_generated_token: int | None = None,
+        fixed_k_tail_graph_audit: bool = False,
+        tail_graph_k: int = 4,
         tail_diagnostics: bool = False,
 ) -> dict[str, Any]:
     _assert_supported_probe(args)
@@ -610,6 +775,9 @@ def run_direct_decode_loop_gate(
         "candidate_native_q1_rope_cache_self_attention": bool(candidate_native_q1_rope_cache_self_attention),
         "candidate_decode_session": bool(candidate_decode_session),
         "candidate_fast_prepare": bool(candidate_fast_prepare),
+        "force_eos_at_generated_token": force_eos_at_generated_token,
+        "fixed_k_tail_graph_audit": bool(fixed_k_tail_graph_audit),
+        "tail_graph_k": int(tail_graph_k),
         "tail_diagnostics": bool(tail_diagnostics),
     }
 
@@ -625,6 +793,11 @@ def run_direct_decode_loop_gate(
         context_type=context_type,
     )
     metadata["eos_token_ids"] = [int(item) for item in eos_token_ids]
+    forced_eos_token_id = int(metadata["eos_token_ids"][0])
+    if fixed_k_tail_graph_audit and force_eos_at_generated_token is None:
+        raise ValueError("--fixed-k-tail-graph-audit requires --force-eos-at-generated-token")
+    if force_eos_at_generated_token is not None and force_eos_at_generated_token <= 0:
+        raise ValueError("--force-eos-at-generated-token must be positive")
 
     rng_state = _rng_state()
     reference_captures: list[torch.Tensor] = []
@@ -635,6 +808,15 @@ def run_direct_decode_loop_gate(
         lookback_time=float(metadata["lookback_time"]),
     )
     reference_processors.insert(0, _CaptureRawLogitsProcessor(reference_captures))
+    if force_eos_at_generated_token is not None:
+        reference_processors.insert(
+            1,
+            _ForceEosAtGeneratedStepProcessor(
+                prompt_len=prompt_len,
+                generated_step=int(force_eos_at_generated_token),
+                eos_token_id=forced_eos_token_id,
+            ),
+        )
 
     with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16, enabled=args.precision == "amp"), \
             generation_profile_context(sdpa_backend=args.profile_sdpa_backend):
@@ -665,6 +847,15 @@ def run_direct_decode_loop_gate(
         lookback_time=float(metadata["lookback_time"]),
     )
     candidate_processors.insert(0, _CaptureRawLogitsProcessor(candidate_captures))
+    if force_eos_at_generated_token is not None:
+        candidate_processors.insert(
+            1,
+            _ForceEosAtGeneratedStepProcessor(
+                prompt_len=prompt_len,
+                generated_step=int(force_eos_at_generated_token),
+                eos_token_id=forced_eos_token_id,
+            ),
+        )
     candidate_cuda_graph_diagnostics: dict[str, Any] = {}
     candidate_decode_session_metadata: dict[str, Any] = {}
     candidate_tail_diagnostics: dict[str, Any] | None = (
@@ -740,9 +931,41 @@ def run_direct_decode_loop_gate(
         and logits_allclose
         and logits_topk_match
     )
+    force_eos_direct_loop = {
+        "enabled": force_eos_at_generated_token is not None,
+        "force_eos_at_generated_token": force_eos_at_generated_token,
+        "forced_eos_token_id": forced_eos_token_id if force_eos_at_generated_token is not None else None,
+        "reference_stop_reason": reference_stop_reason,
+        "candidate_stop_reason": candidate_stop_reason,
+        "token_match": token_match,
+        "logits_pass": logits_pass,
+        "rng_match": rng_match,
+        "pass": (
+            token_match
+            and logits_pass
+            and rng_match
+            and reference_stop_reason == "eos"
+            and candidate_stop_reason == "eos"
+        ) if force_eos_at_generated_token is not None else None,
+    }
+    fixed_k_tail_graph_report = (
+        _run_fixed_k_tail_graph_audit(
+            device=model.device,
+            tail_graph_k=tail_graph_k,
+            force_eos_at_generated_token=int(force_eos_at_generated_token),
+            eos_token_id=forced_eos_token_id,
+        )
+        if fixed_k_tail_graph_audit
+        else {"enabled": False}
+    )
+    pass_result = token_match and logits_pass and rng_match
+    if force_eos_at_generated_token is not None:
+        pass_result = pass_result and bool(force_eos_direct_loop["pass"])
+    if fixed_k_tail_graph_audit:
+        pass_result = pass_result and bool(fixed_k_tail_graph_report["pass"])
 
     return {
-        "pass": token_match and logits_pass and rng_match,
+        "pass": pass_result,
         "token_match": token_match,
         "rng_match": rng_match,
         "logits_pass": logits_pass,
@@ -770,6 +993,8 @@ def run_direct_decode_loop_gate(
             else None
         ),
         "candidate_tail_diagnostics": candidate_tail_diagnostics,
+        "force_eos_direct_loop": force_eos_direct_loop,
+        "fixed_k_tail_graph_audit": fixed_k_tail_graph_report,
         "metadata": metadata,
     }
 
@@ -843,6 +1068,26 @@ def main() -> None:
         help="Use the verified fast post-prefill one-token input builder in the candidate direct loop.",
     )
     parser.add_argument(
+        "--force-eos-at-generated-token",
+        type=int,
+        default=None,
+        help="Verifier-only: force EOS at the Nth generated token after raw-logit capture.",
+    )
+    parser.add_argument(
+        "--fixed-k-tail-graph-audit",
+        action="store_true",
+        help=(
+            "Verifier-only: audit fixed-K CUDA graph multinomial exactness and demonstrate "
+            "naive RNG divergence when EOS occurs before K."
+        ),
+    )
+    parser.add_argument(
+        "--tail-graph-k",
+        type=int,
+        default=4,
+        help="Fixed K for --fixed-k-tail-graph-audit.",
+    )
+    parser.add_argument(
         "--tail-diagnostics",
         action="store_true",
         help="Record verifier-only candidate-loop CPU/CUDA timing for logits processors, sampling, and stop/append tail.",
@@ -874,6 +1119,9 @@ def main() -> None:
         candidate_native_q1_rope_cache_self_attention=cli_args.candidate_native_q1_rope_cache_self_attention,
         candidate_decode_session=cli_args.candidate_decode_session,
         candidate_fast_prepare=cli_args.candidate_fast_prepare,
+        force_eos_at_generated_token=cli_args.force_eos_at_generated_token,
+        fixed_k_tail_graph_audit=cli_args.fixed_k_tail_graph_audit,
+        tail_graph_k=cli_args.tail_graph_k,
         tail_diagnostics=cli_args.tail_diagnostics,
     )
     result["metadata"]["config_name"] = cli_args.config_name
