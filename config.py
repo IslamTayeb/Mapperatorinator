@@ -80,6 +80,10 @@ class InferenceConfig:
     inference_active_prefix_decode_cuda_graph_min_decode_steps: int = 1  # First 1-based decode step eligible for graph capture
     inference_stateful_monotonic_logits_processor: bool = False  # Experimental batch-1 stateful monotonic time-shift mask
     inference_q1_bmm_cross_attention: bool = False  # Experimental fp32 q_len=1 cross-attention via bmm/softmax/bmm
+    inference_decode_session_runtime: bool = False  # Verifier-first single-song DecodeSession runtime scaffold
+    inference_decode_session_cuda_graph: bool = False  # Reserved for DecodeSession-owned CUDA graph replay
+    inference_decode_session_chunk_size: int = 1  # Reserved DecodeSession decode chunk size
+    inference_native_decode_kernels: bool = False  # Reserved default-off native C++/CUDA/CUTLASS decode-kernel experiments
     use_server: bool = True  # Use server for optimized multiprocess inference
     max_batch_size: int = 16  # Maximum batch size for inference (only used for parallel sampling or super timing)
     profile_inference: bool = False  # Write stage and generation timing profile JSON
