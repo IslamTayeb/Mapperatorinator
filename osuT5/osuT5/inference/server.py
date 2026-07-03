@@ -214,6 +214,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     native_q1_rope_cache_self_attention_requested = bool(
         generate_kwargs.pop('native_q1_rope_cache_self_attention', False)
     )
+    native_one_token_linear_requested = bool(generate_kwargs.pop('native_one_token_linear', False))
     decode_session_state = generate_kwargs.pop('decode_session_state', None)
     decode_session_cuda_graph = bool(generate_kwargs.pop('decode_session_cuda_graph', False))
     if context_type is not None:
@@ -222,6 +223,10 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         raise ValueError("native_q1_rope_cache_self_attention requires native_q1_self_attention.")
     if native_q1_rope_cache_self_attention_requested and not active_prefix_decode_loop:
         raise ValueError("native_q1_rope_cache_self_attention requires active_prefix_decode_loop.")
+    if native_one_token_linear_requested and precision != "fp32":
+        raise ValueError("native_one_token_linear currently supports precision=fp32 only.")
+    if native_one_token_linear_requested and not active_prefix_decode_loop:
+        raise ValueError("native_one_token_linear requires active_prefix_decode_loop.")
     native_q1_self_attention = (
         native_q1_self_attention_requested
         and context_type != ContextType.TIMING
@@ -229,6 +234,10 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     native_q1_rope_cache_self_attention = (
         native_q1_rope_cache_self_attention_requested
         and native_q1_self_attention
+    )
+    native_one_token_linear = (
+        native_one_token_linear_requested
+        and context_type != ContextType.TIMING
     )
 
     # Create the logits processors
@@ -294,6 +303,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
                 q1_bmm_cross_attention=q1_bmm_cross_attention,
                 native_q1_self_attention=native_q1_self_attention,
                 native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
+                native_one_token_linear=native_one_token_linear,
             ):
         if sync_model_timing:
             _sync_cuda_for_model(model)
@@ -347,6 +357,8 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         "native_q1_self_attention_enabled": native_q1_self_attention,
         "native_q1_rope_cache_self_attention_requested": native_q1_rope_cache_self_attention_requested,
         "native_q1_rope_cache_self_attention_enabled": native_q1_rope_cache_self_attention,
+        "native_one_token_linear_requested": native_one_token_linear_requested,
+        "native_one_token_linear_enabled": native_one_token_linear,
         "decode_session_runtime_enabled": decode_session_state is not None,
         "decode_session_cuda_graph_enabled": bool(decode_session_cuda_graph),
         "decode_session_graph_count": (

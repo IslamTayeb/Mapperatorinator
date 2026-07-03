@@ -279,6 +279,7 @@ def run_one_token_gate(
         candidate_q1_bmm_cross_attention: bool = False,
         candidate_native_q1_self_attention: bool = False,
         candidate_native_q1_rope_cache_self_attention: bool = False,
+        candidate_native_one_token_linear: bool = False,
         candidate_decode_session: bool = False,
 ) -> dict[str, Any]:
     _assert_supported_probe(args)
@@ -351,6 +352,7 @@ def run_one_token_gate(
         "candidate_q1_bmm_cross_attention": bool(candidate_q1_bmm_cross_attention),
         "candidate_native_q1_self_attention": bool(candidate_native_q1_self_attention),
         "candidate_native_q1_rope_cache_self_attention": bool(candidate_native_q1_rope_cache_self_attention),
+        "candidate_native_one_token_linear": bool(candidate_native_one_token_linear),
         "candidate_decode_session": bool(candidate_decode_session),
     }
 
@@ -454,6 +456,7 @@ def run_one_token_gate(
                 q1_bmm_cross_attention=candidate_q1_bmm_cross_attention,
                 native_q1_self_attention=candidate_native_q1_self_attention,
                 native_q1_rope_cache_self_attention=candidate_native_q1_rope_cache_self_attention,
+                native_one_token_linear=candidate_native_one_token_linear,
         ):
             decode_session_metadata = None
             if candidate_decode_session:
@@ -637,6 +640,11 @@ def main() -> None:
         help="Enable the experimental fused RoPE/cache native q_len=1 self-attention candidate.",
     )
     parser.add_argument(
+        "--candidate-native-one-token-linear",
+        action="store_true",
+        help="Enable the experimental native fp32 one-token decoder Linear candidate.",
+    )
+    parser.add_argument(
         "--candidate-decode-session",
         action="store_true",
         help="Route the direct candidate through the verifier-first DecodeSession ABI.",
@@ -669,6 +677,7 @@ def main() -> None:
         candidate_q1_bmm_cross_attention=cli_args.candidate_q1_bmm_cross_attention,
         candidate_native_q1_self_attention=cli_args.candidate_native_q1_self_attention,
         candidate_native_q1_rope_cache_self_attention=cli_args.candidate_native_q1_rope_cache_self_attention,
+        candidate_native_one_token_linear=cli_args.candidate_native_one_token_linear,
         candidate_decode_session=cli_args.candidate_decode_session,
     )
     result["metadata"]["config_name"] = cli_args.config_name

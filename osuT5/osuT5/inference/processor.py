@@ -203,6 +203,7 @@ class Processor(object):
             native_q1_rope_cache_self_attention=bool(
                 getattr(self.args, "inference_native_q1_rope_cache_self_attention", False)
             ),
+            native_one_token_linear=bool(getattr(self.args, "inference_native_one_token_linear", False)),
             decode_session_cuda_graph=bool(getattr(self.args, "inference_decode_session_cuda_graph", False)),
         )
         if bool(getattr(self.args, "inference_decode_session_runtime", False)):
@@ -213,6 +214,8 @@ class Processor(object):
             generate_kwargs2["decode_session_state"] = self.decode_session_state
         if generate_kwargs2["active_prefix_decode_cuda_graph"] and isinstance(self.model, InferenceClient):
             raise ValueError("inference_active_prefix_decode_cuda_graph requires use_server=false.")
+        if generate_kwargs2["native_one_token_linear"] and isinstance(self.model, InferenceClient):
+            raise ValueError("inference_native_one_token_linear requires use_server=false.")
 
         if isinstance(self.model, InferenceClient):
             response = self.model.generate(model_kwargs, generate_kwargs2)
@@ -1524,6 +1527,8 @@ class Processor(object):
             "native_q1_rope_cache_self_attention_enabled": stats.get(
                 "native_q1_rope_cache_self_attention_enabled"
             ),
+            "native_one_token_linear_requested": stats.get("native_one_token_linear_requested"),
+            "native_one_token_linear_enabled": stats.get("native_one_token_linear_enabled"),
             "decode_session_runtime_enabled": stats.get("decode_session_runtime_enabled"),
             "decode_session_cuda_graph_enabled": stats.get("decode_session_cuda_graph_enabled"),
             "decode_session_graph_count": stats.get("decode_session_graph_count"),
