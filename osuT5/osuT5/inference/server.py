@@ -206,7 +206,6 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     active_prefix_decode_cuda_graph_min_decode_steps = int(
         generate_kwargs.pop('active_prefix_decode_cuda_graph_min_decode_steps', 1)
     )
-    active_prefix_fast_prepare = bool(generate_kwargs.pop('active_prefix_fast_prepare', False))
     stateful_monotonic_logits_processor = bool(
         generate_kwargs.pop('stateful_monotonic_logits_processor', False)
     )
@@ -258,8 +257,6 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     pad_token_id = generate_kwargs.get('pad_token_id', getattr(tokenizer, 'pad_id', None))
     if active_prefix_decode_cuda_graph and not active_prefix_decode_loop:
         raise ValueError("active_prefix_decode_cuda_graph requires active_prefix_decode_loop.")
-    if active_prefix_fast_prepare and not active_prefix_decode_loop:
-        raise ValueError("active_prefix_fast_prepare requires active_prefix_decode_loop.")
     if active_prefix_decode_loop:
         if batch_size != 1:
             raise ValueError("active_prefix_decode_loop currently supports batch_size=1 only.")
@@ -314,7 +311,6 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
                 cuda_graph_forward=active_prefix_decode_cuda_graph,
                 cuda_graph_warmup=active_prefix_decode_cuda_graph_warmup,
                 cuda_graph_min_decode_steps=active_prefix_decode_cuda_graph_min_decode_steps,
-                fast_prepare_inputs=active_prefix_fast_prepare,
                 active_prefix_decode_diagnostics=active_prefix_decode_diagnostics,
                 shared_graph_cache=(
                     decode_session_state.get("graph_cache")
@@ -367,7 +363,6 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         "active_prefix_decode_cuda_graph_min_decode_steps": (
             active_prefix_decode_cuda_graph_min_decode_steps if active_prefix_decode_cuda_graph else None
         ),
-        "active_prefix_fast_prepare_enabled": active_prefix_fast_prepare if active_prefix_decode_loop else False,
     })
     if active_prefix_decode_diagnostics is not None:
         stats["active_prefix_decode_diagnostics"] = active_prefix_decode_diagnostics

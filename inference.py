@@ -358,15 +358,43 @@ def compile_derived_args(args: InferenceConfig):
 
 
 def validate_reserved_runtime_flags(args: InferenceConfig):
-    if args.inference_decode_session_runtime:
+    def require_simple_sequential(flag_name: str) -> None:
         if args.use_server:
-            raise ValueError("inference_decode_session_runtime requires use_server=false.")
+            raise ValueError(f"{flag_name} requires use_server=false.")
         if args.parallel:
-            raise ValueError("inference_decode_session_runtime currently supports sequential inference only.")
+            raise ValueError(f"{flag_name} currently supports sequential inference only.")
         if args.cfg_scale != 1.0:
-            raise ValueError("inference_decode_session_runtime currently requires cfg_scale=1.0.")
+            raise ValueError(f"{flag_name} currently requires cfg_scale=1.0.")
         if args.num_beams != 1:
-            raise ValueError("inference_decode_session_runtime currently requires num_beams=1.")
+            raise ValueError(f"{flag_name} currently requires num_beams=1.")
+
+    if args.inference_active_prefix_decode_loop:
+        require_simple_sequential("inference_active_prefix_decode_loop")
+        if args.inference_active_prefix_decode_bucket_size <= 0:
+            raise ValueError("inference_active_prefix_decode_bucket_size must be positive.")
+        if args.inference_active_prefix_decode_cuda_graph_min_decode_steps <= 0:
+            raise ValueError("inference_active_prefix_decode_cuda_graph_min_decode_steps must be positive.")
+    if args.inference_active_prefix_decode_cuda_graph:
+        if not args.inference_active_prefix_decode_loop:
+            raise ValueError("inference_active_prefix_decode_cuda_graph requires inference_active_prefix_decode_loop=true.")
+        require_simple_sequential("inference_active_prefix_decode_cuda_graph")
+    if args.inference_stateful_monotonic_logits_processor:
+        require_simple_sequential("inference_stateful_monotonic_logits_processor")
+        if not args.inference_active_prefix_decode_loop:
+            raise ValueError(
+                "inference_stateful_monotonic_logits_processor is accepted only with "
+                "inference_active_prefix_decode_loop=true."
+            )
+    if args.inference_q1_bmm_cross_attention:
+        require_simple_sequential("inference_q1_bmm_cross_attention")
+        if args.precision != "fp32":
+            raise ValueError("inference_q1_bmm_cross_attention currently requires precision=fp32.")
+        if args.attn_implementation != "sdpa":
+            raise ValueError("inference_q1_bmm_cross_attention currently requires attn_implementation=sdpa.")
+        if not args.inference_active_prefix_decode_loop:
+            raise ValueError("inference_q1_bmm_cross_attention requires inference_active_prefix_decode_loop=true.")
+    if args.inference_decode_session_runtime:
+        require_simple_sequential("inference_decode_session_runtime")
         if not args.inference_active_prefix_decode_loop:
             raise ValueError("inference_decode_session_runtime requires inference_active_prefix_decode_loop=true.")
         if not args.inference_active_prefix_decode_cuda_graph:
@@ -381,6 +409,11 @@ def validate_reserved_runtime_flags(args: InferenceConfig):
             "inference_decode_session_chunk_size is reserved and must remain 1 until chunked DecodeSession "
             "generation preserves exact RNG/token behavior."
         )
+    if args.inference_native_q1_rope_cache_self_attention and not args.inference_native_q1_self_attention:
+        raise ValueError(
+            "inference_native_q1_rope_cache_self_attention requires "
+            "inference_native_q1_self_attention=true."
+        )
     if args.inference_native_q1_self_attention:
         if not args.inference_native_decode_kernels:
             raise ValueError("inference_native_q1_self_attention requires inference_native_decode_kernels=true.")
@@ -388,14 +421,7 @@ def validate_reserved_runtime_flags(args: InferenceConfig):
             raise ValueError("inference_native_q1_self_attention currently requires precision=fp32.")
         if args.attn_implementation != "sdpa":
             raise ValueError("inference_native_q1_self_attention currently requires attn_implementation=sdpa.")
-        if args.use_server:
-            raise ValueError("inference_native_q1_self_attention requires use_server=false.")
-        if args.parallel:
-            raise ValueError("inference_native_q1_self_attention currently supports sequential inference only.")
-        if args.cfg_scale != 1.0:
-            raise ValueError("inference_native_q1_self_attention currently requires cfg_scale=1.0.")
-        if args.num_beams != 1:
-            raise ValueError("inference_native_q1_self_attention currently requires num_beams=1.")
+        require_simple_sequential("inference_native_q1_self_attention")
         if not args.inference_active_prefix_decode_loop:
             raise ValueError("inference_native_q1_self_attention requires inference_active_prefix_decode_loop=true.")
         if not args.inference_active_prefix_decode_cuda_graph:
@@ -413,8 +439,8 @@ def validate_reserved_runtime_flags(args: InferenceConfig):
 
 def compile_args(args: InferenceConfig, verbose=True):
     """Validates and populates missing args."""
-    validate_reserved_runtime_flags(args)
     compile_device_and_seed(args, verbose=verbose)
+    validate_reserved_runtime_flags(args)
     compile_paths(args)
 
     if args.beatmap_path:
@@ -553,6 +579,7 @@ def generate(
         "inference_decode_session_chunk_size": args.inference_decode_session_chunk_size,
         "inference_native_decode_kernels": args.inference_native_decode_kernels,
         "inference_native_q1_self_attention": args.inference_native_q1_self_attention,
+        "inference_native_q1_rope_cache_self_attention": args.inference_native_q1_rope_cache_self_attention,
         "profile_record_token_ids": args.profile_record_token_ids,
         "profile_sync_cuda": args.profile_sync_cuda,
         "profile_torch_generation": args.profile_torch_generation,

@@ -7,7 +7,6 @@ import torch
 from torch import nn
 from transformers.modeling_outputs import BaseModelOutput
 
-from .direct_decode import prepare_one_token_decode_inputs_fast
 from ..runtime_profiling import active_prefix_self_attention_context, profile_range
 
 
@@ -264,7 +263,6 @@ def active_prefix_decode_generate(
         cuda_graph_forward: bool = False,
         cuda_graph_warmup: int = 0,
         cuda_graph_min_decode_steps: int = 1,
-        fast_prepare_inputs: bool = False,
         active_prefix_decode_diagnostics: dict[str, Any] | None = None,
         shared_graph_cache: dict[tuple[Any, ...], dict[str, Any]] | None = None,
         stable_encoder_holder: dict[str, BaseModelOutput] | None = None,
@@ -355,24 +353,15 @@ def active_prefix_decode_generate(
     )
     try:
         while model._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
-            use_fast_prepare = fast_prepare_inputs and not is_prefill
             if active_prefix_decode_diagnostics is not None:
                 with _diagnostic_range(
                         active_prefix_decode_diagnostics,
-                        "prepare_inputs.fast" if use_fast_prepare else "prepare_inputs",
+                        "prepare_inputs",
                         wall_key="prepare_inputs_wall_cpu_s",
                 ):
-                    model_inputs = (
-                        prepare_one_token_decode_inputs_fast(model, input_ids, model_kwargs)
-                        if use_fast_prepare
-                        else model.prepare_inputs_for_generation(input_ids, **model_kwargs)
-                    )
+                    model_inputs = model.prepare_inputs_for_generation(input_ids, **model_kwargs)
             else:
-                model_inputs = (
-                    prepare_one_token_decode_inputs_fast(model, input_ids, model_kwargs)
-                    if use_fast_prepare
-                    else model.prepare_inputs_for_generation(input_ids, **model_kwargs)
-                )
+                model_inputs = model.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
             if is_prefill:
                 if active_prefix_decode_diagnostics is not None:

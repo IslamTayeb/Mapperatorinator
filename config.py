@@ -78,7 +78,6 @@ class InferenceConfig:
     inference_active_prefix_decode_cuda_graph: bool = False  # Capture active-prefix one-token decode forwards with manual CUDA graphs
     inference_active_prefix_decode_cuda_graph_warmup: int = 0  # Warmup forwards before each active-prefix CUDA graph capture
     inference_active_prefix_decode_cuda_graph_min_decode_steps: int = 1  # First 1-based decode step eligible for graph capture
-    inference_active_prefix_fast_prepare: bool = False  # Experimental post-prefill batch-1 fast input builder for active-prefix decode
     inference_stateful_monotonic_logits_processor: bool = False  # Experimental batch-1 stateful monotonic time-shift mask
     inference_q1_bmm_cross_attention: bool = False  # Experimental fp32 q_len=1 cross-attention via bmm/softmax/bmm
     inference_decode_session_runtime: bool = False  # Verifier-first single-song DecodeSession runtime scaffold
