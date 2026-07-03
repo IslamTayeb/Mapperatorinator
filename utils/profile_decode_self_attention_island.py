@@ -610,6 +610,10 @@ def profile_decode_self_attention_island(
         repo_graph_ms = results["repo_module_forward"].get("cuda_graph_replay_ms_per_call")
         manual_ms = float(results["manual_native_attention_island"]["ms_per_call"])
         manual_graph_ms = results["manual_native_attention_island"].get("cuda_graph_replay_ms_per_call")
+        fused_ms = float(results["fused_rope_cache_attention_island"]["ms_per_call"])
+        fused_graph_ms = results["fused_rope_cache_attention_island"].get("cuda_graph_replay_ms_per_call")
+        fused_post_wqkv_ms = float(results["fused_post_wqkv_attention_only"]["ms_per_call"])
+        fused_post_wqkv_graph_ms = results["fused_post_wqkv_attention_only"].get("cuda_graph_replay_ms_per_call")
         pre_ms = float(results["pre_attention_setup_only"]["ms_per_call"])
         attention_ms = float(results["native_attention_only"]["ms_per_call"])
         out_ms = float(results["out_projection_only"]["ms_per_call"])
@@ -621,9 +625,12 @@ def profile_decode_self_attention_island(
             else None
         )
         manual_delta_s = (repo_ms - manual_ms) * member_count * full_song_decode_steps / 1000.0
+        fused_delta_s = (repo_ms - fused_ms) * member_count * full_song_decode_steps / 1000.0
+        fused_vs_manual_delta_s = (manual_ms - fused_ms) * member_count * full_song_decode_steps / 1000.0
         pre_attention_ceiling_s = pre_ms * member_count * full_song_decode_steps / 1000.0
         out_projection_ceiling_s = out_ms * member_count * full_song_decode_steps / 1000.0
         native_attention_ceiling_s = attention_ms * member_count * full_song_decode_steps / 1000.0
+        fused_post_wqkv_attention_ceiling_s = fused_post_wqkv_ms * member_count * full_song_decode_steps / 1000.0
         projected_full_song[signature] = {
             "member_count": member_count,
             "decode_steps": int(full_song_decode_steps),
@@ -632,8 +639,15 @@ def profile_decode_self_attention_island(
             "repo_self_attention_island_fraction_of_model_time": repo_seconds / full_song_model_time_s,
             "manual_native_island_delta_s": manual_delta_s,
             "manual_native_island_delta_fraction_of_model_time": manual_delta_s / full_song_model_time_s,
+            "fused_rope_cache_island_delta_s": fused_delta_s,
+            "fused_rope_cache_island_delta_fraction_of_model_time": fused_delta_s / full_song_model_time_s,
+            "fused_rope_cache_vs_manual_delta_s": fused_vs_manual_delta_s,
+            "fused_rope_cache_vs_manual_delta_fraction_of_model_time": (
+                fused_vs_manual_delta_s / full_song_model_time_s
+            ),
             "pre_attention_setup_ceiling_s": pre_attention_ceiling_s,
             "native_attention_ceiling_s": native_attention_ceiling_s,
+            "fused_post_wqkv_attention_ceiling_s": fused_post_wqkv_attention_ceiling_s,
             "out_projection_ceiling_s": out_projection_ceiling_s,
             "ungraphed_projection_valid": projection_with_ungraphed_module_valid,
             "ideal_free_island_tps": (
@@ -665,6 +679,30 @@ def profile_decode_self_attention_island(
             projected_full_song[signature]["cuda_graph_manual_native_island_delta_s"] = graph_delta_s
             projected_full_song[signature]["cuda_graph_manual_native_island_delta_fraction_of_model_time"] = (
                 graph_delta_s / full_song_model_time_s
+            )
+        if isinstance(repo_graph_ms, float) and isinstance(fused_graph_ms, float):
+            graph_fused_delta_s = (repo_graph_ms - fused_graph_ms) * member_count * full_song_decode_steps / 1000.0
+            projected_full_song[signature]["cuda_graph_fused_rope_cache_island_delta_s"] = graph_fused_delta_s
+            projected_full_song[signature]["cuda_graph_fused_rope_cache_island_delta_fraction_of_model_time"] = (
+                graph_fused_delta_s / full_song_model_time_s
+            )
+        if isinstance(manual_graph_ms, float) and isinstance(fused_graph_ms, float):
+            graph_fused_vs_manual_delta_s = (
+                (manual_graph_ms - fused_graph_ms) * member_count * full_song_decode_steps / 1000.0
+            )
+            projected_full_song[signature]["cuda_graph_fused_rope_cache_vs_manual_delta_s"] = (
+                graph_fused_vs_manual_delta_s
+            )
+            projected_full_song[signature]["cuda_graph_fused_rope_cache_vs_manual_delta_fraction_of_model_time"] = (
+                graph_fused_vs_manual_delta_s / full_song_model_time_s
+            )
+        if isinstance(fused_post_wqkv_graph_ms, float):
+            graph_fused_post_wqkv_s = fused_post_wqkv_graph_ms * member_count * full_song_decode_steps / 1000.0
+            projected_full_song[signature]["cuda_graph_fused_post_wqkv_attention_ceiling_s"] = (
+                graph_fused_post_wqkv_s
+            )
+            projected_full_song[signature]["cuda_graph_fused_post_wqkv_attention_fraction_of_model_time"] = (
+                graph_fused_post_wqkv_s / full_song_model_time_s
             )
 
     return {
