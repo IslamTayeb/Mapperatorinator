@@ -350,6 +350,12 @@ def _run_one_step_tail_graph_ceiling(
         *,
         input_ids: torch.LongTensor,
         raw_logits: torch.FloatTensor,
+        rng_state: tuple[torch.Tensor, list[torch.Tensor] | None],
+        actual_next_tokens: torch.LongTensor | None,
+        actual_output_ids: torch.LongTensor | None,
+        actual_unfinished: torch.LongTensor | None,
+        actual_finished: torch.Tensor | None,
+        actual_final_rng_state: tuple[torch.Tensor, list[torch.Tensor] | None] | None,
         logits_processor,
         stopping_criteria,
         do_sample: bool,
@@ -385,10 +391,10 @@ def _run_one_step_tail_graph_ceiling(
             next_tokens = next_tokens * static_unfinished + static_pad * (1 - static_unfinished)
         output_ids = torch.cat([static_input_ids, next_tokens[:, None]], dim=-1)
         next_unfinished = static_unfinished & ~criteria(output_ids, None)
-        finished = next_unfinished.max()
+        finished = next_unfinished.max() == 0
         return next_tokens, output_ids, next_unfinished, finished
 
-    start_rng_state = _rng_state()
+    start_rng_state = rng_state
     _set_rng_state(start_rng_state)
     eager_next, eager_output, eager_unfinished, eager_finished = tail_fn(eager_processors, eager_stopping)
     eager_final_rng = _rng_state()
@@ -418,11 +424,62 @@ def _run_one_step_tail_graph_ceiling(
         "finished_match": bool(torch.equal(eager_finished, graph_finished)),
         "final_rng_match": _rng_states_equal(eager_final_rng, graph_final_rng),
         "next_eager_sample_match": eager_next_after == graph_next_after,
+        "actual_anchor_complete": (
+            actual_next_tokens is not None
+            and actual_output_ids is not None
+            and actual_unfinished is not None
+            and actual_finished is not None
+            and actual_final_rng_state is not None
+        ),
         "eager_next_tokens": _tail_graph_token_ids(eager_next),
         "graph_next_tokens": _tail_graph_token_ids(graph_next),
         "eager_next_samples_after": eager_next_after,
         "graph_next_samples_after": graph_next_after,
     }
+    required_correctness = [
+        "next_token_match",
+        "output_ids_match",
+        "unfinished_match",
+        "finished_match",
+        "final_rng_match",
+        "next_eager_sample_match",
+        "actual_anchor_complete",
+    ]
+    if actual_next_tokens is not None:
+        actual_next_tokens = actual_next_tokens.detach().clone(memory_format=torch.contiguous_format)
+        correctness["actual_next_token_match"] = bool(
+            torch.equal(eager_next, actual_next_tokens)
+            and torch.equal(graph_next, actual_next_tokens)
+        )
+        correctness["actual_next_tokens"] = _tail_graph_token_ids(actual_next_tokens)
+        required_correctness.append("actual_next_token_match")
+    if actual_output_ids is not None:
+        actual_output_ids = actual_output_ids.detach().clone(memory_format=torch.contiguous_format)
+        correctness["actual_output_ids_match"] = bool(
+            torch.equal(eager_output, actual_output_ids)
+            and torch.equal(graph_output, actual_output_ids)
+        )
+        required_correctness.append("actual_output_ids_match")
+    if actual_unfinished is not None:
+        actual_unfinished = actual_unfinished.detach().clone(memory_format=torch.contiguous_format)
+        correctness["actual_unfinished_match"] = bool(
+            torch.equal(eager_unfinished, actual_unfinished)
+            and torch.equal(graph_unfinished, actual_unfinished)
+        )
+        required_correctness.append("actual_unfinished_match")
+    if actual_finished is not None:
+        actual_finished = actual_finished.detach().clone()
+        correctness["actual_finished_match"] = bool(
+            torch.equal(eager_finished, actual_finished)
+            and torch.equal(graph_finished, actual_finished)
+        )
+        required_correctness.append("actual_finished_match")
+    if actual_final_rng_state is not None:
+        correctness["actual_final_rng_match"] = (
+            _rng_states_equal(eager_final_rng, actual_final_rng_state)
+            and _rng_states_equal(graph_final_rng, actual_final_rng_state)
+        )
+        required_correctness.append("actual_final_rng_match")
 
     _set_rng_state(start_rng_state)
     eager_timing_processors, _ = _clone_production_tail_processors(logits_processor)
@@ -450,14 +507,7 @@ def _run_one_step_tail_graph_ceiling(
         "enabled": True,
         "pass": all(
             bool(correctness[key])
-            for key in (
-                "next_token_match",
-                "output_ids_match",
-                "unfinished_match",
-                "finished_match",
-                "final_rng_match",
-                "next_eager_sample_match",
-            )
+            for key in required_correctness
         ),
         "do_sample": bool(do_sample),
         "input_shape": list(static_input_ids.shape),
@@ -477,6 +527,246 @@ def _run_one_step_tail_graph_ceiling(
             "Verifier-only one-step tail graph ceiling. The verifier raw-logit capture hook is "
             "excluded from timing. This does not solve multi-step EOS/control or production "
             "integration by itself."
+        ),
+    }
+
+
+def _run_multistep_tail_graph_ceiling(
+        *,
+        input_ids: torch.LongTensor,
+        raw_logits_steps: list[torch.FloatTensor],
+        rng_state: tuple[torch.Tensor, list[torch.Tensor] | None],
+        actual_next_tokens: list[torch.LongTensor] | None,
+        actual_output_ids: torch.LongTensor | None,
+        actual_unfinished: torch.LongTensor | None,
+        actual_continue_values: list[torch.Tensor] | None,
+        actual_final_rng_state: tuple[torch.Tensor, list[torch.Tensor] | None] | None,
+        logits_processor,
+        stopping_criteria,
+        do_sample: bool,
+        has_eos_stopping_criteria: bool,
+        pad_token_id: torch.Tensor,
+        unfinished_sequences: torch.LongTensor,
+        warmup: int,
+        iters: int,
+) -> dict[str, Any]:
+    if not torch.cuda.is_available() or input_ids.device.type != "cuda":
+        raise RuntimeError("multistep tail graph ceiling requires CUDA tensors")
+    if input_ids.shape[0] != 1:
+        raise RuntimeError("multistep tail graph ceiling currently supports batch=1")
+    if not raw_logits_steps:
+        raise RuntimeError("multistep tail graph ceiling requires at least one raw-logit step")
+    if any(raw_logits.shape[0] != 1 for raw_logits in raw_logits_steps):
+        raise RuntimeError("multistep tail graph ceiling currently supports batch=1 logits")
+
+    steps = len(raw_logits_steps)
+    start_len = int(input_ids.shape[-1])
+    static_sequence_template = torch.full(
+        (input_ids.shape[0], start_len + steps),
+        int(pad_token_id.item()),
+        dtype=input_ids.dtype,
+        device=input_ids.device,
+    )
+    static_sequence_template[:, :start_len].copy_(input_ids)
+    static_raw_logits_steps = [
+        raw_logits.detach().clone(memory_format=torch.contiguous_format)
+        for raw_logits in raw_logits_steps
+    ]
+    static_unfinished = unfinished_sequences.detach().clone(memory_format=torch.contiguous_format)
+    static_pad = pad_token_id.detach().clone(memory_format=torch.contiguous_format)
+    eager_processors, excluded_processor_classes = _clone_production_tail_processors(logits_processor)
+    graph_processors, _ = _clone_production_tail_processors(logits_processor)
+    eager_stopping = copy.deepcopy(stopping_criteria)
+    graph_stopping = copy.deepcopy(stopping_criteria)
+
+    def tail_fn(processors, criteria):
+        sequence_buffer = static_sequence_template.clone(memory_format=torch.contiguous_format)
+        unfinished = static_unfinished.clone(memory_format=torch.contiguous_format)
+        generated_tokens = torch.empty((steps, input_ids.shape[0]), dtype=input_ids.dtype, device=input_ids.device)
+        continue_values = torch.empty((steps,), dtype=unfinished.dtype, device=input_ids.device)
+        for step_index, raw_logits in enumerate(static_raw_logits_steps):
+            active_len = start_len + step_index
+            active_input_ids = sequence_buffer[:, :active_len]
+            scores = raw_logits.clone(memory_format=torch.contiguous_format)
+            next_token_scores = processors(active_input_ids, scores)
+            if do_sample:
+                probs = nn.functional.softmax(next_token_scores, dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+            else:
+                next_tokens = torch.argmax(next_token_scores, dim=-1)
+            if has_eos_stopping_criteria:
+                next_tokens = next_tokens * unfinished + static_pad * (1 - unfinished)
+            sequence_buffer[:, active_len].copy_(next_tokens)
+            output_ids = sequence_buffer[:, :active_len + 1]
+            unfinished = unfinished & ~criteria(output_ids, None)
+            generated_tokens[step_index].copy_(next_tokens)
+            continue_values[step_index].copy_(unfinished.max())
+        return sequence_buffer, generated_tokens, unfinished, continue_values
+
+    start_rng_state = rng_state
+    _set_rng_state(start_rng_state)
+    eager_output, eager_next, eager_unfinished, eager_continue = tail_fn(eager_processors, eager_stopping)
+    eager_final_rng = _rng_state()
+    eager_next_after = [
+        int(torch.multinomial(torch.ones_like(static_raw_logits_steps[-1]), num_samples=1).item())
+        for _ in range(8)
+    ]
+
+    _set_rng_state(start_rng_state)
+    capture_start_rng = _rng_state()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output, graph_next, graph_unfinished, graph_continue = tail_fn(graph_processors, graph_stopping)
+    _set_rng_state(capture_start_rng)
+    graph.replay()
+    torch.cuda.synchronize()
+    graph_final_rng = _rng_state()
+    graph_next_after = [
+        int(torch.multinomial(torch.ones_like(static_raw_logits_steps[-1]), num_samples=1).item())
+        for _ in range(8)
+    ]
+
+    no_stop_before_block_end = (
+        bool(torch.all(eager_continue[:-1] != 0).item())
+        if eager_continue.numel() > 1
+        else True
+    )
+    correctness = {
+        "next_token_match": bool(torch.equal(eager_next, graph_next)),
+        "output_buffer_match": bool(torch.equal(eager_output, graph_output)),
+        "unfinished_match": bool(torch.equal(eager_unfinished, graph_unfinished)),
+        "continue_values_match": bool(torch.equal(eager_continue, graph_continue)),
+        "final_rng_match": _rng_states_equal(eager_final_rng, graph_final_rng),
+        "next_eager_sample_match": eager_next_after == graph_next_after,
+        "no_stop_before_block_end": no_stop_before_block_end,
+        "actual_anchor_complete": (
+            actual_next_tokens is not None
+            and len(actual_next_tokens) == steps
+            and actual_output_ids is not None
+            and actual_unfinished is not None
+            and actual_continue_values is not None
+            and len(actual_continue_values) == steps
+            and actual_final_rng_state is not None
+        ),
+        "eager_next_tokens": _tail_graph_token_ids(eager_next),
+        "graph_next_tokens": _tail_graph_token_ids(graph_next),
+        "eager_continue_values": _tail_graph_token_ids(eager_continue),
+        "graph_continue_values": _tail_graph_token_ids(graph_continue),
+        "eager_next_samples_after": eager_next_after,
+        "graph_next_samples_after": graph_next_after,
+    }
+    required_correctness = [
+        "next_token_match",
+        "output_buffer_match",
+        "unfinished_match",
+        "continue_values_match",
+        "final_rng_match",
+        "next_eager_sample_match",
+        "no_stop_before_block_end",
+        "actual_anchor_complete",
+    ]
+    if actual_next_tokens is not None and len(actual_next_tokens) == steps:
+        actual_next = torch.stack([
+            token.detach().clone(memory_format=torch.contiguous_format)
+            for token in actual_next_tokens
+        ], dim=0)
+        correctness["actual_next_token_match"] = bool(
+            torch.equal(eager_next, actual_next)
+            and torch.equal(graph_next, actual_next)
+        )
+        correctness["actual_next_tokens"] = _tail_graph_token_ids(actual_next)
+        required_correctness.append("actual_next_token_match")
+    elif actual_next_tokens is not None:
+        correctness["actual_next_token_count"] = int(len(actual_next_tokens))
+    if actual_output_ids is not None:
+        actual_output_ids = actual_output_ids.detach().clone(memory_format=torch.contiguous_format)
+        correctness["actual_output_buffer_match"] = bool(
+            torch.equal(eager_output, actual_output_ids)
+            and torch.equal(graph_output, actual_output_ids)
+        )
+        required_correctness.append("actual_output_buffer_match")
+    if actual_unfinished is not None:
+        actual_unfinished = actual_unfinished.detach().clone(memory_format=torch.contiguous_format)
+        correctness["actual_unfinished_match"] = bool(
+            torch.equal(eager_unfinished, actual_unfinished)
+            and torch.equal(graph_unfinished, actual_unfinished)
+        )
+        required_correctness.append("actual_unfinished_match")
+    if actual_continue_values is not None and len(actual_continue_values) == steps:
+        actual_continue = torch.stack([
+            value.detach().clone()
+            for value in actual_continue_values
+        ], dim=0)
+        correctness["actual_continue_values_match"] = bool(
+            torch.equal(eager_continue, actual_continue)
+            and torch.equal(graph_continue, actual_continue)
+        )
+        correctness["actual_continue_values"] = _tail_graph_token_ids(actual_continue)
+        required_correctness.append("actual_continue_values_match")
+    elif actual_continue_values is not None:
+        correctness["actual_continue_value_count"] = int(len(actual_continue_values))
+    if actual_final_rng_state is not None:
+        correctness["actual_final_rng_match"] = (
+            _rng_states_equal(eager_final_rng, actual_final_rng_state)
+            and _rng_states_equal(graph_final_rng, actual_final_rng_state)
+        )
+        required_correctness.append("actual_final_rng_match")
+
+    _set_rng_state(start_rng_state)
+    eager_timing_processors, _ = _clone_production_tail_processors(logits_processor)
+    eager_timing_stopping = copy.deepcopy(stopping_criteria)
+    eager_ms = _cuda_event_elapsed_ms(
+        lambda: tail_fn(eager_timing_processors, eager_timing_stopping),
+        warmup=warmup,
+        iters=iters,
+    )
+
+    _set_rng_state(start_rng_state)
+    graph_timing_processors, _ = _clone_production_tail_processors(logits_processor)
+    graph_timing_stopping = copy.deepcopy(stopping_criteria)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_timing_outputs = tail_fn(graph_timing_processors, graph_timing_stopping)
+    _set_rng_state(start_rng_state)
+    graph.replay()
+    torch.cuda.synchronize()
+    graph_ms = _cuda_event_elapsed_ms(graph.replay, warmup=warmup, iters=iters)
+    _ = graph_timing_outputs
+
+    eager_ms_per_token = float(eager_ms) / steps
+    graph_ms_per_token = float(graph_ms) / steps
+    _set_rng_state(start_rng_state)
+    return {
+        "enabled": True,
+        "pass": all(
+            bool(correctness[key])
+            for key in required_correctness
+        ),
+        "do_sample": bool(do_sample),
+        "steps": int(steps),
+        "start_len": int(start_len),
+        "input_shape": list(input_ids.shape),
+        "buffer_shape": list(static_sequence_template.shape),
+        "logits_shape": list(static_raw_logits_steps[0].shape),
+        "processor_classes": [processor.__class__.__name__ for processor in eager_processors],
+        "excluded_verifier_processor_classes": excluded_processor_classes,
+        "stopping_classes": [criteria.__class__.__name__ for criteria in stopping_criteria],
+        "warmup": int(warmup),
+        "iters": int(iters),
+        "eager_ms_per_call": float(eager_ms),
+        "graph_ms_per_replay": float(graph_ms),
+        "eager_ms_per_token": eager_ms_per_token,
+        "graph_ms_per_token": graph_ms_per_token,
+        "speedup": float(eager_ms / graph_ms) if graph_ms > 0 else None,
+        "saved_us_per_token": float((eager_ms_per_token - graph_ms_per_token) * 1000.0),
+        "projected_full_song_saved_s_7639": float(
+            (eager_ms_per_token - graph_ms_per_token) * 7639.0 / 1000.0
+        ),
+        "correctness": correctness,
+        "note": (
+            "Verifier-only fixed-start multi-step tail graph ceiling. This uses a preallocated "
+            "sequence buffer and fails if the captured block stops before its final sampled step. "
+            "It is not a production throughput claim."
         ),
     }
 
@@ -503,7 +793,9 @@ def direct_decode_loop_generate(
         fast_prepare_inputs: bool = False,
         tail_diagnostics: dict[str, Any] | None = None,
         tail_graph_ceiling: dict[str, Any] | None = None,
+        tail_graph_multistep_ceiling: dict[str, Any] | None = None,
         tail_graph_step_index: int = 0,
+        tail_graph_multistep_steps: int = 4,
         tail_graph_warmup: int = 50,
         tail_graph_iters: int = 500,
         **model_kwargs,
@@ -579,6 +871,7 @@ def direct_decode_loop_generate(
     scores = None
     graph_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
     tail_graph_capture: dict[str, Any] | None = None
+    tail_graph_multistep_capture: dict[str, Any] | None = None
     while model._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
         current_input_ids = sequence_buffer[:, :cur_len] if sequence_buffer is not None else input_ids
         model_inputs = (
@@ -653,6 +946,12 @@ def direct_decode_loop_generate(
             tail_graph_capture = {
                 "input_ids": current_input_ids.detach().clone(memory_format=torch.contiguous_format),
                 "raw_logits": next_token_logits.detach().clone(memory_format=torch.contiguous_format),
+                "rng_state": _rng_state(),
+                "actual_next_tokens": None,
+                "actual_output_ids": None,
+                "actual_unfinished": None,
+                "actual_finished": None,
+                "actual_final_rng_state": None,
                 "logits_processor": copy.deepcopy(logits_processor),
                 "stopping_criteria": copy.deepcopy(stopping_criteria),
                 "do_sample": bool(do_sample),
@@ -662,6 +961,37 @@ def direct_decode_loop_generate(
                 "generated_so_far": int(generated_so_far),
                 "cur_len": int(cur_len),
             }
+        if (
+                tail_graph_multistep_ceiling is not None
+                and tail_graph_multistep_capture is None
+                and generated_so_far == int(tail_graph_step_index)
+        ):
+            tail_graph_multistep_capture = {
+                "input_ids": current_input_ids.detach().clone(memory_format=torch.contiguous_format),
+                "raw_logits_steps": [],
+                "rng_state": _rng_state(),
+                "actual_next_tokens": [],
+                "actual_output_ids": None,
+                "actual_unfinished": None,
+                "actual_continue_values": [],
+                "actual_final_rng_state": None,
+                "logits_processor": copy.deepcopy(logits_processor),
+                "stopping_criteria": copy.deepcopy(stopping_criteria),
+                "do_sample": bool(do_sample),
+                "has_eos_stopping_criteria": bool(has_eos_stopping_criteria),
+                "pad_token_id": pad_token_id.detach().clone(memory_format=torch.contiguous_format),
+                "unfinished_sequences": unfinished_sequences.detach().clone(memory_format=torch.contiguous_format),
+                "generated_so_far": int(generated_so_far),
+                "cur_len": int(cur_len),
+                "requested_steps": int(tail_graph_multistep_steps),
+            }
+        if (
+                tail_graph_multistep_capture is not None
+                and len(tail_graph_multistep_capture["raw_logits_steps"]) < int(tail_graph_multistep_steps)
+        ):
+            tail_graph_multistep_capture["raw_logits_steps"].append(
+                next_token_logits.detach().clone(memory_format=torch.contiguous_format)
+            )
 
         if tail_diagnostics is not None:
             handle = _tail_begin(tail_diagnostics, "logits_processor.total")
@@ -710,6 +1040,38 @@ def direct_decode_loop_generate(
         handle = _tail_begin(tail_diagnostics, "finished_check")
         this_peer_finished = unfinished_sequences.max() == 0
         _tail_end(tail_diagnostics, handle)
+        if (
+                tail_graph_capture is not None
+                and tail_graph_capture["actual_next_tokens"] is None
+                and generated_so_far == int(tail_graph_capture["generated_so_far"])
+        ):
+            tail_graph_capture["actual_next_tokens"] = next_tokens.detach().clone(
+                memory_format=torch.contiguous_format
+            )
+            tail_graph_capture["actual_output_ids"] = input_ids.detach().clone(memory_format=torch.contiguous_format)
+            tail_graph_capture["actual_unfinished"] = unfinished_sequences.detach().clone(
+                memory_format=torch.contiguous_format
+            )
+            tail_graph_capture["actual_finished"] = this_peer_finished.detach().clone()
+            tail_graph_capture["actual_final_rng_state"] = _rng_state()
+        if tail_graph_multistep_capture is not None:
+            actual_count = len(tail_graph_multistep_capture["actual_next_tokens"])
+            raw_count = len(tail_graph_multistep_capture["raw_logits_steps"])
+            if actual_count < raw_count and actual_count < int(tail_graph_multistep_steps):
+                tail_graph_multistep_capture["actual_next_tokens"].append(
+                    next_tokens.detach().clone(memory_format=torch.contiguous_format)
+                )
+                tail_graph_multistep_capture["actual_continue_values"].append(
+                    unfinished_sequences.max().detach().clone()
+                )
+                if actual_count + 1 == int(tail_graph_multistep_steps):
+                    tail_graph_multistep_capture["actual_output_ids"] = input_ids.detach().clone(
+                        memory_format=torch.contiguous_format
+                    )
+                    tail_graph_multistep_capture["actual_unfinished"] = unfinished_sequences.detach().clone(
+                        memory_format=torch.contiguous_format
+                    )
+                    tail_graph_multistep_capture["actual_final_rng_state"] = _rng_state()
         cur_len += 1
 
         del outputs
@@ -733,6 +1095,12 @@ def direct_decode_loop_generate(
                 tail_graph_ceiling.update(_run_one_step_tail_graph_ceiling(
                     input_ids=tail_graph_capture["input_ids"],
                     raw_logits=tail_graph_capture["raw_logits"],
+                    rng_state=tail_graph_capture["rng_state"],
+                    actual_next_tokens=tail_graph_capture["actual_next_tokens"],
+                    actual_output_ids=tail_graph_capture["actual_output_ids"],
+                    actual_unfinished=tail_graph_capture["actual_unfinished"],
+                    actual_finished=tail_graph_capture["actual_finished"],
+                    actual_final_rng_state=tail_graph_capture["actual_final_rng_state"],
                     logits_processor=tail_graph_capture["logits_processor"],
                     stopping_criteria=tail_graph_capture["stopping_criteria"],
                     do_sample=tail_graph_capture["do_sample"],
@@ -743,9 +1111,53 @@ def direct_decode_loop_generate(
                     iters=tail_graph_iters,
                 ))
                 _set_rng_state(final_rng_state)
-                for key in ("input_ids", "raw_logits", "logits_processor", "stopping_criteria",
-                            "pad_token_id", "unfinished_sequences"):
+                for key in ("input_ids", "raw_logits", "rng_state", "actual_next_tokens", "actual_output_ids",
+                            "actual_unfinished", "actual_finished", "actual_final_rng_state", "logits_processor",
+                            "stopping_criteria", "pad_token_id", "unfinished_sequences"):
                     tail_graph_ceiling.pop(key, None)
+        if tail_graph_multistep_ceiling is not None:
+            if tail_graph_multistep_capture is None:
+                tail_graph_multistep_ceiling.update({
+                    "enabled": True,
+                    "pass": False,
+                    "error": f"did not reach tail graph step index {int(tail_graph_step_index)}",
+                })
+            elif len(tail_graph_multistep_capture["raw_logits_steps"]) < int(tail_graph_multistep_steps):
+                tail_graph_multistep_ceiling.update({
+                    "enabled": True,
+                    "pass": False,
+                    "error": (
+                        f"captured only {len(tail_graph_multistep_capture['raw_logits_steps'])} "
+                        f"of {int(tail_graph_multistep_steps)} requested tail graph steps"
+                    ),
+                })
+            else:
+                final_rng_state = _rng_state()
+                tail_graph_multistep_ceiling.update(tail_graph_multistep_capture)
+                tail_graph_multistep_ceiling.update(_run_multistep_tail_graph_ceiling(
+                    input_ids=tail_graph_multistep_capture["input_ids"],
+                    raw_logits_steps=tail_graph_multistep_capture["raw_logits_steps"],
+                    rng_state=tail_graph_multistep_capture["rng_state"],
+                    actual_next_tokens=tail_graph_multistep_capture["actual_next_tokens"],
+                    actual_output_ids=tail_graph_multistep_capture["actual_output_ids"],
+                    actual_unfinished=tail_graph_multistep_capture["actual_unfinished"],
+                    actual_continue_values=tail_graph_multistep_capture["actual_continue_values"],
+                    actual_final_rng_state=tail_graph_multistep_capture["actual_final_rng_state"],
+                    logits_processor=tail_graph_multistep_capture["logits_processor"],
+                    stopping_criteria=tail_graph_multistep_capture["stopping_criteria"],
+                    do_sample=tail_graph_multistep_capture["do_sample"],
+                    has_eos_stopping_criteria=tail_graph_multistep_capture["has_eos_stopping_criteria"],
+                    pad_token_id=tail_graph_multistep_capture["pad_token_id"],
+                    unfinished_sequences=tail_graph_multistep_capture["unfinished_sequences"],
+                    warmup=tail_graph_warmup,
+                    iters=tail_graph_iters,
+                ))
+                _set_rng_state(final_rng_state)
+                for key in ("input_ids", "raw_logits_steps", "rng_state", "actual_next_tokens",
+                            "actual_output_ids", "actual_unfinished", "actual_continue_values",
+                            "actual_final_rng_state", "logits_processor", "stopping_criteria", "pad_token_id",
+                            "unfinished_sequences"):
+                    tail_graph_multistep_ceiling.pop(key, None)
         return output
     if decode_session is not None and decode_session_metadata is not None:
         decode_session_metadata.update(decode_session.metadata())
@@ -763,6 +1175,12 @@ def direct_decode_loop_generate(
             tail_graph_ceiling.update(_run_one_step_tail_graph_ceiling(
                 input_ids=tail_graph_capture["input_ids"],
                 raw_logits=tail_graph_capture["raw_logits"],
+                rng_state=tail_graph_capture["rng_state"],
+                actual_next_tokens=tail_graph_capture["actual_next_tokens"],
+                actual_output_ids=tail_graph_capture["actual_output_ids"],
+                actual_unfinished=tail_graph_capture["actual_unfinished"],
+                actual_finished=tail_graph_capture["actual_finished"],
+                actual_final_rng_state=tail_graph_capture["actual_final_rng_state"],
                 logits_processor=tail_graph_capture["logits_processor"],
                 stopping_criteria=tail_graph_capture["stopping_criteria"],
                 do_sample=tail_graph_capture["do_sample"],
@@ -773,9 +1191,53 @@ def direct_decode_loop_generate(
                 iters=tail_graph_iters,
             ))
             _set_rng_state(final_rng_state)
-            for key in ("input_ids", "raw_logits", "logits_processor", "stopping_criteria",
-                        "pad_token_id", "unfinished_sequences"):
+            for key in ("input_ids", "raw_logits", "rng_state", "actual_next_tokens", "actual_output_ids",
+                        "actual_unfinished", "actual_finished", "actual_final_rng_state", "logits_processor",
+                        "stopping_criteria", "pad_token_id", "unfinished_sequences"):
                 tail_graph_ceiling.pop(key, None)
+    if tail_graph_multistep_ceiling is not None:
+        if tail_graph_multistep_capture is None:
+            tail_graph_multistep_ceiling.update({
+                "enabled": True,
+                "pass": False,
+                "error": f"did not reach tail graph step index {int(tail_graph_step_index)}",
+            })
+        elif len(tail_graph_multistep_capture["raw_logits_steps"]) < int(tail_graph_multistep_steps):
+            tail_graph_multistep_ceiling.update({
+                "enabled": True,
+                "pass": False,
+                "error": (
+                    f"captured only {len(tail_graph_multistep_capture['raw_logits_steps'])} "
+                    f"of {int(tail_graph_multistep_steps)} requested tail graph steps"
+                ),
+            })
+        else:
+            final_rng_state = _rng_state()
+            tail_graph_multistep_ceiling.update(tail_graph_multistep_capture)
+            tail_graph_multistep_ceiling.update(_run_multistep_tail_graph_ceiling(
+                input_ids=tail_graph_multistep_capture["input_ids"],
+                raw_logits_steps=tail_graph_multistep_capture["raw_logits_steps"],
+                rng_state=tail_graph_multistep_capture["rng_state"],
+                actual_next_tokens=tail_graph_multistep_capture["actual_next_tokens"],
+                actual_output_ids=tail_graph_multistep_capture["actual_output_ids"],
+                actual_unfinished=tail_graph_multistep_capture["actual_unfinished"],
+                actual_continue_values=tail_graph_multistep_capture["actual_continue_values"],
+                actual_final_rng_state=tail_graph_multistep_capture["actual_final_rng_state"],
+                logits_processor=tail_graph_multistep_capture["logits_processor"],
+                stopping_criteria=tail_graph_multistep_capture["stopping_criteria"],
+                do_sample=tail_graph_multistep_capture["do_sample"],
+                has_eos_stopping_criteria=tail_graph_multistep_capture["has_eos_stopping_criteria"],
+                pad_token_id=tail_graph_multistep_capture["pad_token_id"],
+                unfinished_sequences=tail_graph_multistep_capture["unfinished_sequences"],
+                warmup=tail_graph_warmup,
+                iters=tail_graph_iters,
+            ))
+            _set_rng_state(final_rng_state)
+            for key in ("input_ids", "raw_logits_steps", "rng_state", "actual_next_tokens",
+                        "actual_output_ids", "actual_unfinished", "actual_continue_values",
+                        "actual_final_rng_state", "logits_processor", "stopping_criteria", "pad_token_id",
+                        "unfinished_sequences"):
+                tail_graph_multistep_ceiling.pop(key, None)
     return input_ids
 
 
@@ -953,13 +1415,17 @@ def run_direct_decode_loop_gate(
         tail_graph_k: int = 4,
         tail_diagnostics: bool = False,
         tail_graph_ceiling: bool = False,
+        tail_graph_multistep_ceiling: bool = False,
         tail_graph_step_index: int = 0,
+        tail_graph_multistep_steps: int = 4,
         tail_graph_warmup: int = 50,
         tail_graph_iters: int = 500,
 ) -> dict[str, Any]:
     _assert_supported_probe(args)
     if max_new_tokens <= 0:
         raise ValueError("max_new_tokens must be positive")
+    if tail_graph_multistep_ceiling and tail_graph_multistep_steps <= 0:
+        raise ValueError("--tail-graph-multistep-steps must be positive")
 
     compile_args(args, verbose=False)
     setup_inference_environment(args.seed)
@@ -1024,7 +1490,9 @@ def run_direct_decode_loop_gate(
         "tail_graph_k": int(tail_graph_k),
         "tail_diagnostics": bool(tail_diagnostics),
         "tail_graph_ceiling": bool(tail_graph_ceiling),
+        "tail_graph_multistep_ceiling": bool(tail_graph_multistep_ceiling),
         "tail_graph_step_index": int(tail_graph_step_index),
+        "tail_graph_multistep_steps": int(tail_graph_multistep_steps),
         "tail_graph_warmup": int(tail_graph_warmup),
         "tail_graph_iters": int(tail_graph_iters),
     }
@@ -1125,6 +1593,14 @@ def run_direct_decode_loop_gate(
         if tail_graph_ceiling
         else None
     )
+    candidate_tail_graph_multistep_ceiling: dict[str, Any] | None = (
+        {
+            "enabled": True,
+            "note": "Verifier-only fixed-start multi-step tail CUDA graph ceiling; not a throughput claim.",
+        }
+        if tail_graph_multistep_ceiling
+        else None
+    )
 
     with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16, enabled=args.precision == "amp"), \
             generation_profile_context(
@@ -1162,7 +1638,9 @@ def run_direct_decode_loop_gate(
                 fast_prepare_inputs=candidate_fast_prepare,
                 tail_diagnostics=candidate_tail_diagnostics,
                 tail_graph_ceiling=candidate_tail_graph_ceiling,
+                tail_graph_multistep_ceiling=candidate_tail_graph_multistep_ceiling,
                 tail_graph_step_index=tail_graph_step_index,
+                tail_graph_multistep_steps=tail_graph_multistep_steps,
                 tail_graph_warmup=tail_graph_warmup,
                 tail_graph_iters=tail_graph_iters,
             ),
@@ -1228,6 +1706,11 @@ def run_direct_decode_loop_gate(
             candidate_tail_graph_ceiling is not None
             and candidate_tail_graph_ceiling.get("pass")
         )
+    if tail_graph_multistep_ceiling:
+        pass_result = pass_result and bool(
+            candidate_tail_graph_multistep_ceiling is not None
+            and candidate_tail_graph_multistep_ceiling.get("pass")
+        )
 
     return {
         "pass": pass_result,
@@ -1259,6 +1742,7 @@ def run_direct_decode_loop_gate(
         ),
         "candidate_tail_diagnostics": candidate_tail_diagnostics,
         "candidate_tail_graph_ceiling": candidate_tail_graph_ceiling,
+        "candidate_tail_graph_multistep_ceiling": candidate_tail_graph_multistep_ceiling,
         "force_eos_direct_loop": force_eos_direct_loop,
         "fixed_k_tail_graph_audit": fixed_k_tail_graph_report,
         "metadata": metadata,
@@ -1362,10 +1846,24 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--tail-graph-multistep-ceiling",
+        action="store_true",
+        help=(
+            "Verifier-only: capture consecutive exact tail steps and replay them through a "
+            "fixed-start preallocated-buffer CUDA graph."
+        ),
+    )
+    parser.add_argument(
         "--tail-graph-step-index",
         type=int,
         default=0,
         help="Generated-token index to capture for --tail-graph-ceiling.",
+    )
+    parser.add_argument(
+        "--tail-graph-multistep-steps",
+        type=int,
+        default=4,
+        help="Number of consecutive generated tail steps for --tail-graph-multistep-ceiling.",
     )
     parser.add_argument(
         "--tail-graph-warmup",
@@ -1415,7 +1913,9 @@ def main() -> None:
         fixed_k_tail_graph_audit=cli_args.fixed_k_tail_graph_audit,
         tail_graph_k=cli_args.tail_graph_k,
         tail_graph_ceiling=cli_args.tail_graph_ceiling,
+        tail_graph_multistep_ceiling=cli_args.tail_graph_multistep_ceiling,
         tail_graph_step_index=cli_args.tail_graph_step_index,
+        tail_graph_multistep_steps=cli_args.tail_graph_multistep_steps,
         tail_graph_warmup=cli_args.tail_graph_warmup,
         tail_graph_iters=cli_args.tail_graph_iters,
         tail_diagnostics=cli_args.tail_diagnostics,
