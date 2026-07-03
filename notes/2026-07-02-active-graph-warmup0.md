@@ -1,5 +1,7 @@
 # Active Graph Zero-Warmup Promotion
 
+Superseded update: this note promoted `warmup=0` for the active-prefix CUDA graph path and was current at `146.602 tok/s`. Job `49206207` later kept `warmup=0` but reduced `inference_active_prefix_decode_bucket_size` to `64`, reaching `155.578 tok/s` full-song main generation with exact token identity. See `notes/2026-07-02-active-bucket-size-sweep.md`.
+
 ## Hypothesis
 
 The active-prefix CUDA graph path no longer benefits from replay warmups before capture. The three warmup forwards were intended to stabilize graph capture, but after the stateful monotonic processor and active-prefix graph path stabilized the repeated one-token decode shape, those extra forwards may be pure measured overhead. Because active-prefix graph remains default-off, a simpler `warmup=0` default is worth keeping if it is exact and improves full-song main, timing, and total stage time.
@@ -12,7 +14,7 @@ Set the active-prefix CUDA graph warmup default to zero:
 inference_active_prefix_decode_cuda_graph_warmup: 0
 ```
 
-The active graph path remains opt-in. The current fastest accepted variant uses:
+The active graph path remains opt-in. At the time of this warmup promotion, the fastest accepted variant used:
 
 ```bash
 inference_active_prefix_decode_loop=true
@@ -92,7 +94,7 @@ These are not meaningful operational regressions relative to `3.123s` to `3.625s
 
 Keep `inference_active_prefix_decode_cuda_graph_warmup=0` as the default for the default-off active-prefix CUDA graph path. This is a simple exact 5-10% full-song main-generation improvement over the previous fastest opt-in active graph path and improves timing-context throughput as well.
 
-The retained cold single-song baseline remains compile-only SDPA with active-prefix disabled: `92.465 tok/s`. The current fastest exact opt-in path is active512 graph + stateful monotonic + warmup0: `146.602 tok/s`, `52.107s` main model time, `7,639` generated main tokens, token-equivalence PASS.
+The retained cold single-song baseline remains compile-only SDPA with active-prefix disabled: `92.465 tok/s`. At the time of this note, the fastest exact opt-in path was active512 graph + stateful monotonic + warmup0: `146.602 tok/s`, `52.107s` main model time, `7,639` generated main tokens, token-equivalence PASS.
 
 ## Next
 

@@ -80,7 +80,7 @@ The current RTX 2080/2080 Ti retained cold single-song baseline is SDPA plus `in
 - Stretch target: `150+ tok/s`.
 - Active long-range research target: `200 tok/s`.
 
-The first 100 tok/s loop ended below target by the documented stop condition because profiling showed no remaining plausible current-architecture quick win of `>=10%`. A renewed runtime pass found exact active-prefix and CUDA graph evidence, then job `49168188` added a stateful monotonic logits processor on top of that default-off path and job `49204568` reduced active-graph capture warmup to zero. The current fastest accepted exact opt-in path reaches `146.602 tok/s` with fixed-seed token equivalence. Reaching `200 tok/s` from the retained `92.465 tok/s` conservative baseline requires cutting full-song synchronized main-generation model time from `82.615s` to about `38.195s`, a `53.8%` reduction. Reaching `200 tok/s` from the current fastest accepted exact opt-in path requires cutting `52.107s` to `38.195s`, removing another `13.912s` or `26.7%` of that path's model time.
+The first 100 tok/s loop ended below target by the documented stop condition because profiling showed no remaining plausible current-architecture quick win of `>=10%`. A renewed runtime pass found exact active-prefix and CUDA graph evidence, then job `49168188` added a stateful monotonic logits processor on top of that default-off path, job `49204568` reduced active-graph capture warmup to zero, and job `49206207` reduced the active graph bucket size. The current fastest accepted exact opt-in path reaches `155.578 tok/s` with fixed-seed token equivalence. Reaching `200 tok/s` from the retained `92.465 tok/s` conservative baseline requires cutting full-song synchronized main-generation model time from `82.615s` to about `38.195s`, a `53.8%` reduction. Reaching `200 tok/s` from the current fastest accepted exact opt-in path requires cutting `49.101s` to `38.195s`, removing another `10.906s` or `22.2%` of that path's model time.
 
 Only count a speedup as equivalent when fixed-seed generated token IDs match the baseline for the same audio/config slice. Do not claim wins from changed precision, sampling policy, output policy, model quality, windowing/overlap, or generated-token behavior unless the run is explicitly labeled non-equivalent.
 
@@ -370,6 +370,37 @@ Rejected simple active-prefix stopping specialization, DCC job `49204960`, dirty
 | simple stopping candidate | `1,084` | `6.433s` | `168.512` | `48.209` | PASS, `1,084 / 1,084` | rejected |
 
 Run dir: `/work/imt11/Mapperatorinator/runs/simple-stop-smoke-49204960-bb11d9f-simple-stop-dirty`. The 64-step direct-loop graph gate passed for generated tokens, raw logits, final RNG state, and stop reason. The candidate still improved main generation by only `+3.76%`, below the keep threshold for a custom stopping path, and the diagnostic run still reported `stopping_criteria_wall_cpu_s=4.265s` of `6.450s` main model time. The patch was reverted without full-song promotion. See `notes/2026-07-02-simple-stopping-scout.md`.
+
+Accepted active-prefix graph bucket-size reduction, DCC jobs `49205143`, `49205622`, and `49206207` on RTX 2080 Ti, commit `39e85e4`:
+
+| bucket | main tokens | main model time | main tok/s | timing tok/s | total timing+map stage | token equivalence vs bucket512 | status |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| `512` | `7,639` | `51.887s` | `147.223` | `75.016` | `67.773s` | baseline | historical active control |
+| `192` | `7,639` | `49.369s` | `154.733` | `77.070` | `65.225s` | PASS main and timing | safer fallback |
+| `64` | `7,639` | `49.101s` | `155.578` | `76.524` | `64.946s` | PASS main and timing | fastest opt-in |
+
+Run dirs:
+
+- Broad 15s smoke sweep: `/work/imt11/Mapperatorinator/runs/active-bucket-sweep-49205143-39e85e4`
+- Low-bucket 15s smoke sweep: `/work/imt11/Mapperatorinator/runs/active-low-bucket-sweep-49205622-39e85e4`
+- Full-song validation: `/work/imt11/Mapperatorinator/runs/active-bucket-full-49206207-39e85e4`
+
+All smoke candidates tested from bucket64 through bucket1024 matched bucket512 generated token IDs for both main and timing. Full-song bucket64 improved same-job main generation by `+5.7%` over bucket512 (`147.223 -> 155.578 tok/s`), improved aggregate timing by `+2.0%`, and reduced total timing+map stage wall by `4.2%`. Full-song bucket192 improved same-job main by `+5.1%`, improved aggregate timing by `+2.7%`, and reduced total stage by `3.8%`.
+
+Strict per-window checks still failed with scoped small regressions. Bucket64 failed `12 / 87` main windows with `67ms` total failed-window model overhead and `29 / 87` timing windows with `185ms` total failed-window model overhead. Bucket192 failed the same `12 / 87` main windows with `71ms` failed-window overhead but only `3 / 87` timing windows with `25ms` failed-window overhead. Because bucket64 is config-only, exact, improves full-song main/timing/total aggregates, and has small absolute failed-window overhead relative to `2.786s` main model-time savings and `2.828s` total-stage savings, keep it as the fastest opt-in setting. Use bucket192 as the safer fallback when timing-context per-window stability is more important than maximum main-generation throughput. See `notes/2026-07-02-active-bucket-size-sweep.md`.
+
+Use the fastest exact opt-in path:
+
+```bash
+python inference.py --config-name profile_salvalai \
+  inference_generation_compile=true \
+  inference_active_prefix_decode_loop=true \
+  inference_active_prefix_decode_bucket_size=64 \
+  inference_active_prefix_decode_cuda_graph=true \
+  inference_active_prefix_decode_cuda_graph_warmup=0 \
+  inference_active_prefix_decode_cuda_graph_min_decode_steps=1 \
+  inference_stateful_monotonic_logits_processor=true
+```
 
 Rejected delayed-capture variant, DCC job `49166715`, commit `f712b59`: setting `inference_active_prefix_decode_cuda_graph_min_decode_steps=16` remained token-equivalent on 15s smoke but failed per-window no-regression on 5/10 windows and reduced graph-path aggregate throughput versus immediate capture. Keep `min_decode_steps=1` as the default. Only revisit delayed capture if a future profiler trace shows graph capture itself has become the dominant cost and a better adaptive policy can avoid medium-window regressions.
 
