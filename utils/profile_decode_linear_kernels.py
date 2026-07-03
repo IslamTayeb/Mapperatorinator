@@ -261,6 +261,7 @@ def _benchmark_mlp_variants(
         fc1_capture: LinearCapture,
         fc2_capture: LinearCapture,
         activation: Callable[[torch.Tensor], torch.Tensor],
+        compile_variant: bool,
         warmup: int,
         iters: int,
         atol: float,
@@ -302,13 +303,19 @@ def _benchmark_mlp_variants(
         return output.reshape(*x.shape[:-1], fc2_weight.shape[0])
 
     reference = functional_mlp()
+    variants = {
+        "functional_mlp": functional_mlp,
+        "addmm_mlp": addmm_mlp,
+        "mv_mlp": mv_mlp,
+    }
+    if compile_variant:
+        variants["compiled_functional_mlp"] = torch.compile(
+            functional_mlp,
+            mode="reduce-overhead",
+        )
     return _benchmark_variants(
         reference=reference,
-        variants={
-            "functional_mlp": functional_mlp,
-            "addmm_mlp": addmm_mlp,
-            "mv_mlp": mv_mlp,
-        },
+        variants=variants,
         warmup=warmup,
         iters=iters,
         atol=atol,
@@ -325,6 +332,7 @@ def profile_decode_linear_kernels(
         active_prefix_decode_length: int | None,
         q1_bmm_cross_attention: bool,
         native_q1_self_attention: bool,
+        compile_mlp_variant: bool,
         warmup: int,
         iters: int,
         atol: float,
@@ -371,6 +379,7 @@ def profile_decode_linear_kernels(
         "active_prefix_decode_length_override": active_prefix_decode_length,
         "q1_bmm_cross_attention": bool(q1_bmm_cross_attention),
         "native_q1_self_attention": bool(native_q1_self_attention),
+        "compile_mlp_variant": bool(compile_mlp_variant),
         "per_module": bool(per_module),
     }
     prompt = model_inputs["decoder_input_ids"]
@@ -534,6 +543,7 @@ def profile_decode_linear_kernels(
                 fc1_capture=fc1_capture,
                 fc2_capture=fc2_capture,
                 activation=decoder_layers[layer_index].activation_fn,
+                compile_variant=compile_mlp_variant,
                 warmup=warmup,
                 iters=iters,
                 atol=atol,
@@ -575,6 +585,11 @@ def main() -> None:
     parser.add_argument("--active-prefix-decode-length", type=int, default=None)
     parser.add_argument("--q1-bmm-cross-attention", action="store_true")
     parser.add_argument("--native-q1-self-attention", action="store_true")
+    parser.add_argument(
+        "--compile-mlp-variant",
+        action="store_true",
+        help="Also benchmark a diagnostic torch.compile(mode='reduce-overhead') MLP island variant.",
+    )
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", type=int, default=500)
     parser.add_argument("--atol", type=float, default=1e-4)
@@ -593,6 +608,7 @@ def main() -> None:
         active_prefix_decode_length=cli_args.active_prefix_decode_length,
         q1_bmm_cross_attention=cli_args.q1_bmm_cross_attention,
         native_q1_self_attention=cli_args.native_q1_self_attention,
+        compile_mlp_variant=cli_args.compile_mlp_variant,
         warmup=cli_args.warmup,
         iters=cli_args.iters,
         atol=cli_args.atol,
