@@ -4,7 +4,7 @@
 
 Test the next implementation-class target after the accepted native q_len=1 self-attention path and the weighted decoder-layer accounting pass.
 
-Current accepted full-song single-song baseline remains DCC job `49225493`: `7,639` SALVALAI main tokens, `32.217s` synchronized model time, `237.111 tok/s`, fixed-seed token equivalence PASS for main/timing, and byte-identical `.osu` output.
+Starting accepted full-song single-song baseline was DCC job `49225493`: `7,639` SALVALAI main tokens, `32.217s` synchronized model time, `237.111 tok/s`, fixed-seed token equivalence PASS for main/timing, and byte-identical `.osu` output.
 
 The weighted split says the best next target is not standalone MLP or sampling:
 
@@ -109,3 +109,61 @@ Projected savings:
 | native attention only -> fused post-`Wqkv` attention only | `-0.018s` | `-0.06%` |
 
 The weighted probe clears the `>5%` strategic threshold but not the `>=10%` automatic keep threshold. It is worth one production-candidate attempt because the diagnostic kernel is narrow, fp32, batch1, default-off, and directly targets the largest remaining self-attention setup/cache/layout bucket. If production verification does not preserve token identity or loses most of the projected `2.5s`, revert or leave it diagnostic-only.
+
+Production correctness gates:
+
+- DCC job: `49230011`
+- Commit: `d7b8684`
+- Run dir: `/work/imt11/Mapperatorinator/runs/fused-rope-cache-gates3-49230011-d7b8684`
+- One-token logits gate: PASS at sequence index 9, active-prefix decode length `640`, max abs `1.9073486328125e-05`, allclose PASS, top-k order PASS.
+- Direct-loop gate: PASS over `64` sampled decode steps, generated-token identity PASS, raw-logit allclose/top-k PASS, final RNG-state PASS.
+
+15s SALVALAI smoke:
+
+- DCC job: `49230035`
+- Commit: `d7b8684`
+- Run dir: `/work/imt11/Mapperatorinator/runs/fused-rope-cache-smoke15-49230035-d7b8684`
+- Control flags: accepted native q1 self-attention stack, fused rope/cache flag disabled.
+- Candidate flags: same stack with `inference_native_q1_rope_cache_self_attention=true`.
+
+| label | tokens | model time | tok/s | token equivalence |
+| --- | ---: | ---: | ---: | --- |
+| control main | `1,084` | `4.183s` | `259.168` | baseline |
+| candidate main | `1,084` | `3.774s` | `287.257` | PASS |
+| control timing | `164` | `3.020s` | `54.313` | baseline |
+| candidate timing | `164` | `3.160s` | `51.906` | PASS |
+
+The smoke main-generation gain was `+10.8%`, enough to promote. Timing regressed in the smoke, but the fused flag was requested and not enabled for timing records because timing contexts disable `native_q1_self_attention`; treat that timing smoke result as noise/order sensitivity until full-song validation.
+
+Full-song SALVALAI validation:
+
+- DCC job: `49230082`
+- Commit: `d7b8684`
+- Node/GPU: `dcc-core-ferc-s-z25-20`, RTX 2080 Ti, UUID `GPU-de50b870-b708-690d-74a4-6e855163a133`
+- Run dir: `/work/imt11/Mapperatorinator/runs/fused-rope-cache-full-49230082-d7b8684`
+- Control profile: `/work/imt11/Mapperatorinator/runs/fused-rope-cache-full-49230082-d7b8684/control.profile.json`
+- Candidate profile: `/work/imt11/Mapperatorinator/runs/fused-rope-cache-full-49230082-d7b8684/candidate.profile.json`
+- Strict compare: `/work/imt11/Mapperatorinator/runs/fused-rope-cache-full-49230082-d7b8684/compare_strict_full.json`
+
+| label | tokens | model time | tok/s | timing tok/s | token/map equivalence |
+| --- | ---: | ---: | ---: | ---: | --- |
+| same-job control | `7,639` | `30.801s` | `248.015` | `101.706` | baseline |
+| fused rope/cache candidate | `7,639` | `28.243s` | `270.475` | `101.988` | PASS main/timing, byte-identical `.osu` |
+
+Against the same-job control, main generation improved `+9.1%` and saved `2.558s` synchronized model time. Against the prior retained native q1 self-attention result from job `49225493`, the new candidate improves `237.111 -> 270.475 tok/s` and saves `3.974s` model time.
+
+Generated output sanity passed: the control and candidate `.osu` files were byte-identical (`cmp_exit=0`, both `31,709` bytes). Main generated-token IDs matched `7,639 / 7,639`; timing generated-token IDs matched `821 / 821`.
+
+Strict zero-tolerance comparison still failed on scoped micro-regressions. Main generation failed `3 / 87` windows (`seq45`, `seq84`, `seq85`) totaling `4.738ms` positive model-time overhead versus `2.558s` aggregate main model-time savings. Timing failed many tiny windows by jitter, but timing aggregate still improved by `22.3ms`. This is not a strict zero-regression result, but it is an accepted default-off opt-in component because it is exact, byte-identical at output, improves main/timing aggregates, and clears the strategic 5-10% keep band with a narrow kernel change.
+
+Why it worked:
+
+- The attention math itself did not get faster; weighted `native attention only -> fused post-Wqkv attention only` was slightly negative.
+- The win came from fusing the post-`Wqkv` setup around q_len=1 self-attention: current-token RoPE application, direct StaticCache K/V write, active-prefix cache load, and attention launch shape handling.
+- This removes PyTorch-level transpose/unbind/RoPE/cache-update/layout plumbing inside the hottest self-attention setup bucket while preserving fp32 math, generated-token behavior, and output bytes.
+
+Decision:
+
+- Keep `inference_native_q1_rope_cache_self_attention=true` as a default-off opt-in only with the validated simple fp32 batch-1 DecodeSession active-prefix native path.
+- Do not enable it for timing contexts unless a separate timing-context run proves non-regression; current production gating leaves timing on the normal path.
+- Keep using one-token logits, direct-loop token/logit/RNG, 15s smoke, full-song token equivalence, and generated output checks before extending the fused kernel to broader modes.

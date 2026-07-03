@@ -81,7 +81,7 @@ The current RTX 2080/2080 Ti retained cold single-song baseline is SDPA plus `in
 - Historical active long-range research target: `200 tok/s`, reached by the default-off exact opt-in stack below.
 - Current single-song research target: `500 tok/s`, same-calculation only, not batching or multi-process aggregate throughput.
 
-The first 100 tok/s loop ended below target by the documented stop condition because profiling showed no remaining plausible current-architecture quick win of `>=10%`. A renewed runtime pass found exact active-prefix and CUDA graph evidence, then job `49168188` added a stateful monotonic logits processor on top of that default-off path, job `49204568` reduced active-graph capture warmup to zero, job `49206207` reduced the active graph bucket size, job `49213490` added q_len=1 BMM cross-attention for the simple fp32 active-graph path, job `49223294` added persistent DecodeSession graph/cache reuse, and job `49225493` added a narrow native q_len=1 self-attention kernel for non-timing/map generation. The current fastest accepted exact opt-in path reaches `237.111 tok/s` with fixed-seed token equivalence and byte-identical `.osu` output. Reaching `200 tok/s` from the retained `92.465 tok/s` conservative baseline required cutting full-song synchronized main-generation model time from `82.615s` to about `38.195s`; the accepted native self-attention opt-in path now measures `32.217s`. The conservative cold default remains compile-only SDPA unless the user explicitly opts into the active-prefix graph stack.
+The first 100 tok/s loop ended below target by the documented stop condition because profiling showed no remaining plausible current-architecture quick win of `>=10%`. A renewed runtime pass found exact active-prefix and CUDA graph evidence, then job `49168188` added a stateful monotonic logits processor on top of that default-off path, job `49204568` reduced active-graph capture warmup to zero, job `49206207` reduced the active graph bucket size, job `49213490` added q_len=1 BMM cross-attention for the simple fp32 active-graph path, job `49223294` added persistent DecodeSession graph/cache reuse, job `49225493` added a narrow native q_len=1 self-attention kernel for non-timing/map generation, and job `49230082` fused post-`Wqkv` RoPE/cache/native attention setup. The current fastest accepted exact opt-in path reaches `270.475 tok/s` with fixed-seed token equivalence and byte-identical `.osu` output. Reaching `200 tok/s` from the retained `92.465 tok/s` conservative baseline required cutting full-song synchronized main-generation model time from `82.615s` to about `38.195s`; the accepted fused RoPE/cache self-attention opt-in path now measures `28.243s`. The conservative cold default remains compile-only SDPA unless the user explicitly opts into the active-prefix graph stack.
 
 ### 500 tok/s single-song campaign
 
@@ -102,7 +102,8 @@ python inference.py --config-name profile_salvalai \
   inference_decode_session_runtime=true \
   inference_decode_session_cuda_graph=true \
   inference_native_decode_kernels=true \
-  inference_native_q1_self_attention=true
+  inference_native_q1_self_attention=true \
+  inference_native_q1_rope_cache_self_attention=true
 ```
 
 For full-song candidate promotion, compare both main generation and timing context in one strict gate:
@@ -116,7 +117,7 @@ python utils/summarize_inference_profile.py \
 
 `--strict-full-song` is equivalent to strict comparison for `main_generation` and `timing_context`. It should be the default full-song promotion command so timing-context regressions, token drift, total-stage wall regressions, and per-window regressions are not checked by hand after the fact. For one-token decoder gates, `utils/verify_one_token_decode.py` defaults to `--sequence-index 9`, the post-warmup smoke window used by the 500 tok/s runtime probes.
 
-For SALVALAI's `7,639` main tokens, `500 tok/s` implies about `15.278s` synchronized main-generation model time, a further `52.6%` reduction from the accepted native self-attention path (`32.217s`). Treat this as a runtime/kernel campaign, not a quick-tweak loop. Re-profile the accepted stack first, use untraced `profile_inference` for speed claims, and use Nsight/torch profiler only for diagnosis.
+For SALVALAI's `7,639` main tokens, `500 tok/s` implies about `15.278s` synchronized main-generation model time, a further `45.9%` reduction from the accepted fused RoPE/cache self-attention path (`28.243s`). Treat this as a runtime/kernel campaign, not a quick-tweak loop. Re-profile the accepted stack first, use untraced `profile_inference` for speed claims, and use Nsight/torch profiler only for diagnosis.
 
 The current DecodeSession runtime flags are default-off and accepted only for the simple single-song active-prefix graph + stateful + q1-BMM path:
 
@@ -125,6 +126,7 @@ The current DecodeSession runtime flags are default-off and accepted only for th
 - `inference_decode_session_chunk_size=1`
 - `inference_native_decode_kernels=true`
 - `inference_native_q1_self_attention=true`
+- `inference_native_q1_rope_cache_self_attention=true`
 - `utils/verify_one_token_decode.py --candidate-decode-session`
 
 `DecodeSession` verifier helpers live in `osuT5.osuT5.inference.direct_decode` and delegate to the existing exact static-cache one-token helpers. Use them before broadening the production path. Future DecodeSession changes still need generated-token identity, raw-logit/top-k equality, final RNG-state identity, and output/map behavior proven across multiple sampled decode steps and windows.
@@ -135,7 +137,7 @@ Normal inference intentionally raises if DecodeSession/native-kernel flags are e
 
 Prefer PyTorch built-ins first, then isolated C++/CUDA/CUTLASS/cuBLASLt kernels for measured dominant hotspots. Avoid Triton-first work unless there is no stable practical alternative and the path is default-off, isolated, exact, and strongly measured. Do not implement a PyTorch q1 BMM branch for active-prefix self-attention, even thresholded to long buckets, unless new full-song evidence changes the ceiling. Jobs `49222759`, `49222781`, and production-prefix sweep `49222883` showed self-attention BMM is slower than SDPA through `L=576`, only mildly faster at `L>=640`, and projects to only about `0.463s` saved on full-song SALVALAI (`201.125 -> ~203.6 tok/s`, `~1.2%`). q1 BMM remains justified for long unmasked cross-attention.
 
-Fresh post-q1 500 tok/s profiling, DCC jobs `49221975` through `49221977` on RTX 2080 Ti, commit `b0ec059`, confirmed the then-current q1 exact opt-in path remained around `200 tok/s` but did not improve it. Full-song untraced throughput was `200.646 tok/s` for `7,639` main tokens (`38.072s` model time), with main token equivalence PASS against job `49213490`; that q1 baseline was later superseded by DecodeSession job `49223294` at `216.173 tok/s`, then by native self-attention job `49225493` at `237.111 tok/s`. Job `49221975` is marked Slurm `FAILED` only because the strict comparison command returned nonzero after detecting no-regression failures; the profile itself is valid. The torch diagnostic for `main_generation.seq9` classified actual kernel self-CUDA, excluding profiling ranges and CUDA API calls, as `36.0%` one-token GEMV/GEMM linear work, `32.9%` FMHA attention, `13.9%` elementwise, `10.1%` copy/index/cat, `3.1%` layernorm, and `1.7%` softmax. This supports prioritizing one-token linear launch reduction and q_len=1 active-prefix attention/cache layout before fused sampling. See `notes/2026-07-03-post-q1-500tps-profiling.md`.
+Fresh post-q1 500 tok/s profiling, DCC jobs `49221975` through `49221977` on RTX 2080 Ti, commit `b0ec059`, confirmed the then-current q1 exact opt-in path remained around `200 tok/s` but did not improve it. Full-song untraced throughput was `200.646 tok/s` for `7,639` main tokens (`38.072s` model time), with main token equivalence PASS against job `49213490`; that q1 baseline was later superseded by DecodeSession job `49223294` at `216.173 tok/s`, by native self-attention job `49225493` at `237.111 tok/s`, and by fused RoPE/cache self-attention job `49230082` at `270.475 tok/s`. Job `49221975` is marked Slurm `FAILED` only because the strict comparison command returned nonzero after detecting no-regression failures; the profile itself is valid. The torch diagnostic for `main_generation.seq9` classified actual kernel self-CUDA, excluding profiling ranges and CUDA API calls, as `36.0%` one-token GEMV/GEMM linear work, `32.9%` FMHA attention, `13.9%` elementwise, `10.1%` copy/index/cat, `3.1%` layernorm, and `1.7%` softmax. This supports prioritizing one-token linear launch reduction and q_len=1 active-prefix attention/cache layout before fused sampling. See `notes/2026-07-03-post-q1-500tps-profiling.md`.
 
 The first post-q1 linear microprobe rejected simple PyTorch call-form cleanup. `utils/profile_decode_linear_kernels.py` captures actual one-token decoder linear inputs through the direct decode verifier path and compares equivalent call forms. DCC job `49222623` on RTX 2080 Ti, commit `41a1af0`, captured `73` decoder linears for `profile_salvalai_smoke15` seq9 with active-prefix length `128`, q1 BMM enabled, and logits replay `max_abs=0.0`. The captured one-token linears were `12x` self-attn `768 -> 2304`, `36x` `768 -> 768` projection linears, `12x` MLP `768 -> 3072`, `12x` MLP `3072 -> 768`, and `1x` output projection `768 -> 4069`. Rewriting individual `F.linear` calls to `matmul`, `addmm`, or `mv` was flat to tiny: the best per-signature isolated gains project to only about `0.22s` over full-song SALVALAI. A synthetic `fc1 -> GELU -> fc2` MLP block improved only `1.074x` isolated, about `1%` projected full-song. Do not pursue individual linears one by one; future linear work must be fused/native decoder-block or cuBLASLt/CUDA work with verifier gates. See `notes/2026-07-03-decode-linear-kernel-probe.md`.
 
@@ -544,7 +546,7 @@ Accepted native q_len=1 self-attention, DCC jobs `49224045`, `49224965`, `492252
 | run | main tokens | main model time | main tok/s | timing tok/s | total timing+map stage | token/map equivalence | status |
 | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
 | DecodeSession native-off control | `7,639` | `36.863s` | `207.226` | `93.785` | `50.736s` | baseline | control |
-| Native q1 self-attn candidate | `7,639` | `32.217s` | `237.111` | `100.822` | `48.527s` | PASS main/timing, byte-identical `.osu` | fastest opt-in |
+| Native q1 self-attn candidate | `7,639` | `32.217s` | `237.111` | `100.822` | `48.527s` | PASS main/timing, byte-identical `.osu` | accepted opt-in |
 
 Run dirs:
 
@@ -559,7 +561,28 @@ Correctness gates passed before the full-song speed claim. The one-token logits 
 
 Full-song validation accepted the candidate: same-job native-off DecodeSession control `207.226 -> 237.111 tok/s` (`+14.4%`), main model time `36.863s -> 32.217s`, timing-context `93.785 -> 100.822 tok/s`, and total timing+map stage `50.736s -> 48.527s`. Fixed-seed generated token IDs matched for main (`7,639 / 7,639`) and timing (`821 / 821`), and the generated `.osu` files were byte-identical.
 
-Strict zero-tolerance per-window gates still failed in scoped places. Main generation failed `4 / 87` windows: `seq0` improved model time by `244ms` but had `+2.411s` outer-wall setup cost from native extension load/setup, while `seq44`, `seq45`, and `seq84` totaled only `1.511ms` model-time overhead. Timing failed `1 / 87` window with `0.347ms` model-time overhead. Because the candidate is default-off, exact, byte-identical at output, improves main/timing/total aggregates, and is a measured native kernel win that should carry to future autoregressive decoder work, keep it as the current fastest exact single-song opt-in path. See `notes/2026-07-03-native-q1-self-attention.md`.
+Strict zero-tolerance per-window gates still failed in scoped places. Main generation failed `4 / 87` windows: `seq0` improved model time by `244ms` but had `+2.411s` outer-wall setup cost from native extension load/setup, while `seq44`, `seq45`, and `seq84` totaled only `1.511ms` model-time overhead. Timing failed `1 / 87` window with `0.347ms` model-time overhead. Because the candidate is default-off, exact, byte-identical at output, improves main/timing/total aggregates, and is a measured native kernel win that should carry to future autoregressive decoder work, keep it as an accepted exact single-song opt-in path. It is superseded as the fastest path by fused RoPE/cache self-attention below. See `notes/2026-07-03-native-q1-self-attention.md`.
+
+Accepted fused RoPE/cache q_len=1 self-attention, DCC jobs `49230011`, `49230035`, and `49230082` on RTX 2080 Ti, commit `d7b8684`:
+
+| run | main tokens | main model time | main tok/s | timing tok/s | token/map equivalence | status |
+| --- | ---: | ---: | ---: | ---: | --- | --- |
+| Fused-off same-job control | `7,639` | `30.801s` | `248.015` | `101.706` | baseline | control |
+| Fused RoPE/cache candidate | `7,639` | `28.243s` | `270.475` | `101.988` | PASS main/timing, byte-identical `.osu` | fastest opt-in |
+
+Run dirs:
+
+- Correctness gates: `/work/imt11/Mapperatorinator/runs/fused-rope-cache-gates3-49230011-d7b8684`
+- 15s smoke: `/work/imt11/Mapperatorinator/runs/fused-rope-cache-smoke15-49230035-d7b8684`
+- Full-song validation: `/work/imt11/Mapperatorinator/runs/fused-rope-cache-full-49230082-d7b8684`
+
+The weighted diagnostic probe projected `2.505s` full-song savings by replacing the post-`Wqkv` self-attention setup/cache/layout path, not by making the attention math faster. The production flag `inference_native_q1_rope_cache_self_attention=true` fuses current-token RoPE, direct StaticCache K/V write, active-prefix cache access, and native q_len=1 attention for the simple fp32 batch-1 DecodeSession active-prefix map-generation path. Timing contexts remain on the normal path unless separately validated.
+
+Correctness gates passed before the speed claim. The one-token logits gate passed at sequence index 9 with active-prefix decode length `640` (`max_abs=1.91e-05`, allclose PASS, top-k order PASS). The 64-token direct-loop gate passed generated-token identity, raw-logit/top-k checks, and final RNG-state equality. The 15s smoke matched main tokens (`1,084 / 1,084`) and improved main `259.168 -> 287.257 tok/s` (`+10.8%`), then full-song validation matched main tokens (`7,639 / 7,639`) and timing tokens (`821 / 821`).
+
+Full-song validation accepted the candidate: same-job fused-off control `248.015 -> 270.475 tok/s` (`+9.1%`), main model time `30.801s -> 28.243s`, and timing-context `101.706 -> 101.988 tok/s`. The generated `.osu` files were byte-identical. Against the prior retained native q1 self-attention result, the new stack improves `237.111 -> 270.475 tok/s` and saves `3.974s` synchronized main-generation model time.
+
+Strict zero-tolerance per-window gates still failed in scoped places. Main generation failed `3 / 87` windows (`seq45`, `seq84`, `seq85`) totaling `4.738ms` model-time overhead versus `2.558s` aggregate main model-time savings. Timing had tiny per-window jitter but improved aggregate timing model time by `22.3ms`. Because the candidate is default-off, exact, byte-identical at output, improves main/timing aggregates, and is a narrow kernel/runtime change that clears the strategic 5-10% keep band, keep it as the current fastest exact single-song opt-in path. See `notes/2026-07-03-fused-self-attention-cache-probe.md`.
 
 Five-song before/after validation, DCC jobs `49218365` through `49218368` on RTX 2080 Ti, commit `8a2de72`, compared original-repo-equivalent flags disabled against the current optimized opt-in stack on Lambada, PEGASUS, Ela ke Leitada, SALVALAI, and Nube Negra. Official TPS came from untraced `profile_inference`; each job also wrote 1s `nvidia-smi` telemetry and an Nsight Systems diagnostic report.
 
