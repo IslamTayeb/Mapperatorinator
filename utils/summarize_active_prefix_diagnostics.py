@@ -53,6 +53,8 @@ def summarize_active_prefix_diagnostics(profile: dict[str, Any], *, label: str) 
     numeric_totals: dict[str, float] = {}
     processor_wall: dict[str, float] = {}
     processor_calls: dict[str, int] = {}
+    cuda_event_ms: dict[str, float] = {}
+    cuda_event_calls: dict[str, int] = {}
     bucket_lengths: Counter[int] = Counter()
     cuda_graph_by_prefix: dict[int, dict[str, float | int]] = defaultdict(
         lambda: {
@@ -81,6 +83,13 @@ def summarize_active_prefix_diagnostics(profile: dict[str, Any], *, label: str) 
         diagnostics = record.get("active_prefix_decode_diagnostics") or {}
         for key, value in diagnostics.items():
             _add_numeric(numeric_totals, key, value)
+
+        for key, value in (diagnostics.get("cuda_event_ms") or {}).items():
+            _add_numeric(cuda_event_ms, key, value)
+
+        for key, value in (diagnostics.get("cuda_event_calls") or {}).items():
+            if isinstance(value, int):
+                cuda_event_calls[key] = int(cuda_event_calls.get(key, 0)) + value
 
         for key, value in (diagnostics.get("logits_processor_detail_wall_cpu_s") or {}).items():
             _add_numeric(processor_wall, key, value)
@@ -125,6 +134,7 @@ def summarize_active_prefix_diagnostics(profile: dict[str, Any], *, label: str) 
 
     generated_tokens = _record_tokens(records)
     model_seconds = _record_model_seconds(records)
+    decode_steps = int(numeric_totals.get("decode_steps", 0))
     first_capture_seconds = sum(
         float(value["min_capture_seconds"] or 0.0)
         for value in normalized_graphs.values()
@@ -167,12 +177,20 @@ def summarize_active_prefix_diagnostics(profile: dict[str, Any], *, label: str) 
         "generated_tokens": generated_tokens,
         "model_elapsed_seconds": model_seconds,
         "tokens_per_second": generated_tokens / model_seconds if model_seconds > 0 else 0.0,
+        "decode_steps": decode_steps,
         "numeric_totals": dict(sorted(numeric_totals.items())),
         "wall_totals": {
             key: value for key, value in sorted(numeric_totals.items()) if key.endswith("_wall_cpu_s")
         },
         "processor_wall_cpu_s": dict(sorted(processor_wall.items(), key=lambda item: item[1], reverse=True)),
         "processor_calls": dict(sorted(processor_calls.items())),
+        "cuda_event_ms": dict(sorted(cuda_event_ms.items())),
+        "cuda_event_calls": dict(sorted(cuda_event_calls.items())),
+        "cuda_event_ms_ranked": sorted(cuda_event_ms.items(), key=lambda item: item[1], reverse=True),
+        "cuda_event_weighted_per_decode_step_us": {
+            key: value * 1000.0 / decode_steps
+            for key, value in sorted(cuda_event_ms.items())
+        } if decode_steps > 0 else {},
         "bucket_lengths_seen_counts": {
             str(key): value for key, value in sorted(bucket_lengths.items())
         },
@@ -234,6 +252,15 @@ def print_summary(summary: dict[str, Any], *, limit: int) -> None:
         calls = summary["processor_calls"].get(key, "n/a")
         print(f"  {_fmt_seconds(value)}  {key}  calls={calls}")
     if not summary["processor_wall_cpu_s"]:
+        print("  n/a")
+    print()
+
+    print("CUDA Event Totals")
+    for key, value in summary["cuda_event_ms_ranked"][:limit]:
+        calls = summary["cuda_event_calls"].get(key, "n/a")
+        per_decode_us = summary["cuda_event_weighted_per_decode_step_us"].get(key, 0.0)
+        print(f"  {value:.3f}ms  {key}  {per_decode_us:.3f}us/decode-step  calls={calls}")
+    if not summary["cuda_event_ms_ranked"]:
         print("  n/a")
     print()
 

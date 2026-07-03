@@ -28,8 +28,8 @@ def _add_diagnostic_wall(diagnostics: dict[str, Any], key: str, seconds: float) 
     diagnostics[key] = float(diagnostics.get(key, 0.0)) + float(seconds)
 
 
-def _record_diagnostic_cuda_start() -> tuple[Any, Any] | tuple[None, None]:
-    if not torch.cuda.is_available():
+def _record_diagnostic_cuda_start(diagnostics: dict[str, Any]) -> tuple[Any, Any] | tuple[None, None]:
+    if not diagnostics.get("_record_cuda_events", False):
         return None, None
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
@@ -84,7 +84,7 @@ def _diagnostic_range(
         return
 
     start = time.perf_counter()
-    start_event, end_event = _record_diagnostic_cuda_start()
+    start_event, end_event = _record_diagnostic_cuda_start(diagnostics)
     with profile_range(f"active_prefix.{name}"):
         try:
             yield
@@ -296,6 +296,10 @@ def active_prefix_decode_generate(
         raise RuntimeError("active-prefix CUDA graph decode requires CUDA input tensors")
     if cuda_graph_min_decode_steps <= 0:
         raise ValueError("cuda_graph_min_decode_steps must be positive")
+    if active_prefix_decode_diagnostics is not None:
+        active_prefix_decode_diagnostics["_record_cuda_events"] = (
+            input_ids.device.type == "cuda" and torch.cuda.is_available()
+        )
 
     this_peer_finished = False
     unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
