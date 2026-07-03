@@ -400,6 +400,10 @@ def validate_reserved_runtime_flags(args: InferenceConfig):
             raise ValueError("inference_native_q1_self_attention requires inference_active_prefix_decode_loop=true.")
         if not args.inference_active_prefix_decode_cuda_graph:
             raise ValueError("inference_native_q1_self_attention requires inference_active_prefix_decode_cuda_graph=true.")
+        if not args.inference_decode_session_runtime:
+            raise ValueError("inference_native_q1_self_attention requires inference_decode_session_runtime=true.")
+        if not args.inference_decode_session_cuda_graph:
+            raise ValueError("inference_native_q1_self_attention requires inference_decode_session_cuda_graph=true.")
     elif args.inference_native_decode_kernels:
         raise NotImplementedError(
             "inference_native_decode_kernels currently only has the explicitly selected "
