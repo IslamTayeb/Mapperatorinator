@@ -109,8 +109,12 @@ def _pre_attention_setup_only(capture: SelfAttentionIslandCapture) -> torch.Tens
     return query
 
 
-def _native_attention_only(capture: SelfAttentionIslandCapture) -> torch.Tensor:
-    query, key, value, attention_mask = _effective_self_attention_inputs(capture)
+def _native_attention_only(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+) -> torch.Tensor:
     return native_q1_attention(query, key, value, attention_mask)
 
 
@@ -144,12 +148,26 @@ def _benchmark_capture(
             native_q1_self_attention=True,
     ):
         reference = capture.output
-        precomputed_attention = _native_attention_only(capture).detach()
+        precomputed_query, precomputed_key, precomputed_value, precomputed_mask = _effective_self_attention_inputs(capture)
+        precomputed_attention = _native_attention_only(
+            precomputed_query,
+            precomputed_key,
+            precomputed_value,
+            precomputed_mask,
+        ).detach()
         variants: dict[str, tuple[Callable[[], torch.Tensor], torch.Tensor]] = {
             "repo_module_forward": (lambda: _module_forward(capture), reference),
             "manual_native_attention_island": (lambda: _native_attention_module_output(capture), reference),
             "pre_attention_setup_only": (lambda: _pre_attention_setup_only(capture), _pre_attention_setup_only(capture)),
-            "native_attention_only": (lambda: _native_attention_only(capture), precomputed_attention),
+            "native_attention_only": (
+                lambda: _native_attention_only(
+                    precomputed_query,
+                    precomputed_key,
+                    precomputed_value,
+                    precomputed_mask,
+                ),
+                precomputed_attention,
+            ),
             "out_projection_only": (
                 lambda: _out_projection_only(capture, precomputed_attention),
                 _out_projection_only(capture, precomputed_attention).detach(),
@@ -471,7 +489,12 @@ def profile_decode_self_attention_island(
         attention_ms = float(results["native_attention_only"]["ms_per_call"])
         out_ms = float(results["out_projection_only"]["ms_per_call"])
         repo_seconds = repo_ms * member_count * full_song_decode_steps / 1000.0
-        ideal_free_island_time_s = max(full_song_model_time_s - repo_seconds, 1e-9)
+        projection_with_ungraphed_module_valid = repo_seconds < full_song_model_time_s
+        ideal_free_island_time_s = (
+            full_song_model_time_s - repo_seconds
+            if projection_with_ungraphed_module_valid
+            else None
+        )
         manual_delta_s = (repo_ms - manual_ms) * member_count * full_song_decode_steps / 1000.0
         pre_attention_ceiling_s = pre_ms * member_count * full_song_decode_steps / 1000.0
         out_projection_ceiling_s = out_ms * member_count * full_song_decode_steps / 1000.0
@@ -487,7 +510,12 @@ def profile_decode_self_attention_island(
             "pre_attention_setup_ceiling_s": pre_attention_ceiling_s,
             "native_attention_ceiling_s": native_attention_ceiling_s,
             "out_projection_ceiling_s": out_projection_ceiling_s,
-            "ideal_free_island_tps": full_song_main_tokens / ideal_free_island_time_s,
+            "ungraphed_projection_valid": projection_with_ungraphed_module_valid,
+            "ideal_free_island_tps": (
+                full_song_main_tokens / ideal_free_island_time_s
+                if ideal_free_island_time_s is not None and ideal_free_island_time_s > 0
+                else None
+            ),
         }
 
     return {
