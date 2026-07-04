@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +69,24 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Delay between request submissions; default 0 launches the batch as tightly as Python threads allow.",
+    )
+    parser.add_argument(
+        "--server-start-timeout-seconds",
+        type=float,
+        default=900.0,
+        help="Fail if the owner server socket is not ready within this many seconds.",
+    )
+    parser.add_argument(
+        "--request-timeout-seconds",
+        type=float,
+        default=7200.0,
+        help="Fail an individual server request if no response arrives within this many seconds.",
+    )
+    parser.add_argument(
+        "--suite-timeout-seconds",
+        type=float,
+        default=7200.0,
+        help="Fail the concurrent suite if all requests do not finish within this many seconds.",
     )
     parser.add_argument(
         "--allow-short-suite",
@@ -168,7 +186,59 @@ def _validate_no_existing_server(socket_paths: dict[str, str]) -> None:
     )
 
 
-def _load_server_assets(args: Any) -> dict[str, Any]:
+def _server_config_fingerprint(args: Any) -> dict[str, Any]:
+    return {
+        "model_path": str(args.model_path),
+        "lora_path": str(args.lora_path) if args.lora_path is not None else None,
+        "gamemode": args.gamemode,
+        "auto_select_gamemode_model": bool(args.auto_select_gamemode_model),
+        "device": str(args.device),
+        "precision": str(args.precision),
+        "attn_implementation": str(args.attn_implementation),
+        "max_batch_size": int(args.max_batch_size),
+        "inference_generation_compile": bool(args.inference_generation_compile),
+    }
+
+
+def _validate_server_identity(
+        args: Any,
+        *,
+        expected_socket_paths: dict[str, str],
+        expected_config_fingerprint: dict[str, Any],
+) -> None:
+    socket_paths = _server_socket_paths(args)
+    if socket_paths != expected_socket_paths:
+        raise RuntimeError(
+            "Static server batch request resolved different server socket paths. "
+            f"expected={expected_socket_paths}, actual={socket_paths}"
+        )
+    fingerprint = _server_config_fingerprint(args)
+    if fingerprint != expected_config_fingerprint:
+        raise RuntimeError(
+            "Static server batch request changed server-loading configuration. "
+            f"expected={expected_config_fingerprint}, actual={fingerprint}"
+        )
+
+
+def _validate_server_sockets_ready(socket_paths: dict[str, str]) -> None:
+    if os.name != "posix":
+        return
+    missing = {name: path for name, path in socket_paths.items() if not Path(path).exists()}
+    if missing:
+        details = ", ".join(f"{name}={path}" for name, path in sorted(missing.items()))
+        raise RuntimeError(
+            "Static server worker refused to auto-start a server because expected socket(s) are missing: "
+            f"{details}"
+        )
+
+
+def _load_server_assets(
+        args: Any,
+        *,
+        allow_auto_start: bool,
+        connect_timeout: float | None,
+        request_timeout: float | None,
+) -> dict[str, Any]:
     model, tokenizer = load_model_with_server(
         args.model_path,
         args.train,
@@ -181,6 +251,9 @@ def _load_server_assets(args: Any) -> dict[str, Any]:
         gamemode=args.gamemode,
         auto_select_gamemode_model=args.auto_select_gamemode_model,
         generation_compile=args.inference_generation_compile,
+        server_allow_auto_start=allow_auto_start,
+        server_connect_timeout=connect_timeout,
+        server_request_timeout=request_timeout,
     )
     timing_model, timing_tokenizer = None, None
     if should_load_separate_timing_model(args):
@@ -195,6 +268,9 @@ def _load_server_assets(args: Any) -> dict[str, Any]:
             gamemode=args.gamemode,
             auto_select_gamemode_model=False,
             generation_compile=args.inference_generation_compile,
+            server_allow_auto_start=allow_auto_start,
+            server_connect_timeout=connect_timeout,
+            server_request_timeout=request_timeout,
         )
     return {
         "model": model,
@@ -204,9 +280,9 @@ def _load_server_assets(args: Any) -> dict[str, Any]:
     }
 
 
-def _ensure_server(asset: Any) -> None:
+def _ensure_server(asset: Any, timeout: float | None) -> None:
     if isinstance(asset, InferenceClient):
-        asset.ensure_server()
+        asset.ensure_server(timeout=timeout)
 
 
 def _shutdown_server(asset: Any) -> None:
@@ -221,6 +297,10 @@ def _run_request(
         suite_id: str,
         suite_song_count: int,
         suite_repeat_count: int,
+        expected_socket_paths: dict[str, str],
+        expected_config_fingerprint: dict[str, Any],
+        connect_timeout: float | None,
+        request_timeout: float | None,
         run_index: int,
         repeat_index: int,
         song_entry: dict[str, Any],
@@ -244,9 +324,20 @@ def _run_request(
     run_args.output_path = str(run_dir)
     run_args.profile_output_path = str(run_dir / f"run{run_index:02d}.profile.json")
     compile_args(run_args, verbose=False)
+    _validate_server_identity(
+        run_args,
+        expected_socket_paths=expected_socket_paths,
+        expected_config_fingerprint=expected_config_fingerprint,
+    )
+    _validate_server_sockets_ready(expected_socket_paths)
 
     request_start = time.perf_counter()
-    assets = _load_server_assets(run_args)
+    assets = _load_server_assets(
+        run_args,
+        allow_auto_start=False,
+        connect_timeout=connect_timeout,
+        request_timeout=request_timeout,
+    )
     generation_config, beatmap_config = get_config(run_args)
     profiler = InferenceProfiler.from_args(run_args)
     profiler.set_metadata(
@@ -260,6 +351,9 @@ def _run_request(
         suite_song_count=suite_song_count,
         suite_repeat_count=suite_repeat_count,
         rng_reset_policy="server_global_rng_shared_across_concurrent_requests",
+        requested_seed=run_args.seed,
+        server_seed_applied=False,
+        token_equivalence_status="not_checked_shared_server_rng",
         server_batch_claim_scope="static_ipc_concurrent_full_song_requests",
         warmup_excluded=False,
     )
@@ -307,6 +401,9 @@ def _run_request(
         "start_time": run_args.start_time,
         "end_time": run_args.end_time,
         "seed": run_args.seed,
+        "requested_seed": run_args.seed,
+        "server_seed_applied": False,
+        "token_equivalence_status": "not_checked_shared_server_rng",
         "request_wall_seconds": request_wall_seconds,
         "result_path": str(result_path),
         "result_file_sha256": result_file_sha256,
@@ -335,8 +432,17 @@ def _aggregate_runs(runs: list[dict[str, Any]], scheduler_wall_seconds: float) -
     timing_tokens = sum(int(run.get("timing_generated_tokens") or 0) for run in runs)
     request_wall = sum(float(run.get("request_wall_seconds") or 0.0) for run in runs)
     main_model_elapsed = sum(float(run.get("main_model_elapsed_seconds") or 0.0) for run in runs)
+    batching = _aggregate_batch_summaries(runs)
+    server_batch_observed = False
+    for label_summary in batching.get("by_label", {}).values():
+        hist = label_summary.get("server_unique_batch_size_histogram") or label_summary.get("server_batch_size_histogram")
+        if isinstance(hist, dict) and any(int(size) > 1 and int(count) > 0 for size, count in hist.items()):
+            server_batch_observed = True
+            break
     return {
         "runs": len(runs),
+        "result_class": "static_server_batch" if server_batch_observed else "static_server_no_batch_observed",
+        "server_batch_observed": server_batch_observed,
         "main_generated_tokens": main_tokens,
         "timing_generated_tokens": timing_tokens,
         "scheduler_wall_seconds": scheduler_wall_seconds,
@@ -348,7 +454,7 @@ def _aggregate_runs(runs: list[dict[str, Any]], scheduler_wall_seconds: float) -
         "main_tokens_per_request_model_second_attributed": (
             main_tokens / main_model_elapsed if main_model_elapsed > 0 else 0.0
         ),
-        "batching": _aggregate_batch_summaries(runs),
+        "batching": batching,
     }
 
 
@@ -358,6 +464,12 @@ def main() -> None:
         raise ValueError("--repeats must be positive.")
     if cli_args.launch_stagger_seconds < 0:
         raise ValueError("--launch-stagger-seconds must be non-negative.")
+    if cli_args.server_start_timeout_seconds <= 0:
+        raise ValueError("--server-start-timeout-seconds must be positive.")
+    if cli_args.request_timeout_seconds <= 0:
+        raise ValueError("--request-timeout-seconds must be positive.")
+    if cli_args.suite_timeout_seconds <= 0:
+        raise ValueError("--suite-timeout-seconds must be positive.")
 
     cfg = _compose_config(cli_args.config_name, cli_args.overrides)
     raw_args = OmegaConf.to_object(cfg)
@@ -380,6 +492,7 @@ def main() -> None:
     socket_paths = _server_socket_paths(raw_args)
     if not cli_args.allow_existing_server:
         _validate_no_existing_server(socket_paths)
+    server_config_fingerprint = _server_config_fingerprint(raw_args)
 
     suite_id = cli_args.suite_id or uuid.uuid4().hex[:12]
     suite_dir = Path(cli_args.output_root or raw_args.output_path) / f"static-server-batch-{suite_id}"
@@ -387,11 +500,16 @@ def main() -> None:
 
     setup_inference_environment(raw_args.seed)
     set_seed(raw_args.seed)
-    owner_assets = _load_server_assets(raw_args)
+    owner_assets = _load_server_assets(
+        raw_args,
+        allow_auto_start=True,
+        connect_timeout=cli_args.server_start_timeout_seconds,
+        request_timeout=cli_args.request_timeout_seconds,
+    )
     try:
-        _ensure_server(owner_assets["model"])
+        _ensure_server(owner_assets["model"], cli_args.server_start_timeout_seconds)
         if owner_assets.get("timing_model") is not None:
-            _ensure_server(owner_assets["timing_model"])
+            _ensure_server(owner_assets["timing_model"], cli_args.server_start_timeout_seconds)
 
         suite_items: list[tuple[int, int, dict[str, Any]]] = []
         for repeat_index in range(cli_args.repeats):
@@ -400,8 +518,9 @@ def main() -> None:
 
         runs: list[dict[str, Any]] = []
         scheduler_start = time.perf_counter()
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = []
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        futures = []
+        try:
             for repeat_index, run_index, song_entry in suite_items:
                 futures.append(
                     executor.submit(
@@ -411,6 +530,10 @@ def main() -> None:
                         suite_id=suite_id,
                         suite_song_count=len(song_entries),
                         suite_repeat_count=cli_args.repeats,
+                        expected_socket_paths=socket_paths,
+                        expected_config_fingerprint=server_config_fingerprint,
+                        connect_timeout=cli_args.server_start_timeout_seconds,
+                        request_timeout=cli_args.request_timeout_seconds,
                         run_index=run_index,
                         repeat_index=repeat_index,
                         song_entry=song_entry,
@@ -418,19 +541,29 @@ def main() -> None:
                 )
                 if cli_args.launch_stagger_seconds > 0:
                     time.sleep(cli_args.launch_stagger_seconds)
-            for future in as_completed(futures):
-                run = future.result()
-                runs.append(run)
-                print(
-                    "[static-server] run {run_index}: song={song_id}, main={tokens} tokens, "
-                    "request_wall={wall:.3f}s, attributed_tok/s={tok_s:.3f}".format(
-                        run_index=run["run_index"],
-                        song_id=run["song_id"],
-                        tokens=run["main_generated_tokens"],
-                        wall=run["request_wall_seconds"],
-                        tok_s=run["main_tokens_per_second"],
+            try:
+                for future in as_completed(futures, timeout=cli_args.suite_timeout_seconds):
+                    run = future.result()
+                    runs.append(run)
+                    print(
+                        "[static-server] run {run_index}: song={song_id}, main={tokens} tokens, "
+                        "request_wall={wall:.3f}s, attributed_model_tok/s={tok_s:.3f}".format(
+                            run_index=run["run_index"],
+                            song_id=run["song_id"],
+                            tokens=run["main_generated_tokens"],
+                            wall=run["request_wall_seconds"],
+                            tok_s=run["main_tokens_per_second"],
+                        )
                     )
-                )
+            except FuturesTimeoutError as exc:
+                for future in futures:
+                    future.cancel()
+                raise TimeoutError(
+                    f"Static server batch suite timed out after {cli_args.suite_timeout_seconds:.1f}s "
+                    f"with {len(runs)} / {len(futures)} requests completed."
+                ) from exc
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
         scheduler_wall_seconds = time.perf_counter() - scheduler_start
     finally:
         _shutdown_server(owner_assets.get("timing_model"))
@@ -448,8 +581,12 @@ def main() -> None:
         "repeats": cli_args.repeats,
         "max_workers": max_workers,
         "launch_stagger_seconds": cli_args.launch_stagger_seconds,
+        "server_start_timeout_seconds": cli_args.server_start_timeout_seconds,
+        "request_timeout_seconds": cli_args.request_timeout_seconds,
+        "suite_timeout_seconds": cli_args.suite_timeout_seconds,
         "allow_existing_server": cli_args.allow_existing_server,
         "server_socket_paths": socket_paths,
+        "server_config_fingerprint": server_config_fingerprint,
         "rng_reset_policy": "server_global_rng_shared_across_concurrent_requests",
         "equivalence_scope": (
             "static server batching is throughput evidence only unless compared against "

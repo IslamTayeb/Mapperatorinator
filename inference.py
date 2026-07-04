@@ -804,7 +804,9 @@ def generate(
 def load_model_with_server(ckpt_path: str | Path | None, t5_args: TrainConfig, device, max_batch_size: int = 8,
                            use_server: bool = False, precision: str = "fp32", attn_implementation: str = "sdpa",
                            eval_mode: bool = True, lora_path=None, gamemode: int | None = None,
-                           auto_select_gamemode_model: bool = True, generation_compile: bool = False):
+                           auto_select_gamemode_model: bool = True, generation_compile: bool = False,
+                           server_allow_auto_start: bool = True, server_connect_timeout: float | None = 60.0,
+                           server_request_timeout: float | None = None):
     model_loader, tokenizer_loader = load_model_loaders(
         ckpt_path=ckpt_path,
         t5_args=t5_args,
@@ -829,6 +831,9 @@ def load_model_with_server(ckpt_path: str | Path | None, t5_args: TrainConfig, d
             gamemode=gamemode,
             auto_select_gamemode_model=auto_select_gamemode_model,
         ),
+        allow_auto_start=server_allow_auto_start,
+        connect_timeout=server_connect_timeout,
+        request_timeout=server_request_timeout,
     ) if use_server else model_loader(), tokenizer_loader()
 
 

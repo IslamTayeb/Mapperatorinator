@@ -261,6 +261,7 @@ def _profile_batch_summary(profile: dict[str, Any]) -> dict[str, Any]:
                 "server_max_queue_wait_seconds": 0.0,
                 "server_batching_modes": {},
                 "server_elapsed_seconds_attributions": {},
+                "server_batches": [],
             },
         )
         label_summary["records"] += 1
@@ -288,11 +289,36 @@ def _profile_batch_summary(profile: dict[str, Any]) -> dict[str, Any]:
         if isinstance(server_sizes, list) and server_sizes:
             label_summary["server_request_record_count"] += 1
             label_summary["server_batch_count"] += len(server_sizes)
+            server_ids = record.get("server_batch_ids")
+            request_counts = record.get("server_batch_request_counts")
+            work_items = record.get("server_batch_work_items")
             for size in server_sizes:
                 key = str(int(size))
                 label_summary["server_batch_size_histogram"][key] = int(
                     label_summary["server_batch_size_histogram"].get(key, 0)
                 ) + 1
+            for index, size in enumerate(server_sizes):
+                batch_id = (
+                    server_ids[index]
+                    if isinstance(server_ids, list) and index < len(server_ids)
+                    else None
+                )
+                request_count = (
+                    request_counts[index]
+                    if isinstance(request_counts, list) and index < len(request_counts)
+                    else None
+                )
+                work_item = (
+                    work_items[index]
+                    if isinstance(work_items, list) and index < len(work_items)
+                    else None
+                )
+                label_summary["server_batches"].append({
+                    "batch_id": int(batch_id) if batch_id is not None else None,
+                    "batch_size": int(size),
+                    "request_count": int(request_count) if request_count is not None else None,
+                    "work_items": int(work_item) if work_item is not None else None,
+                })
         queue_wait = float(record.get("server_total_queue_wait_seconds") or 0.0)
         label_summary["server_total_queue_wait_seconds"] += queue_wait
         label_summary["server_max_queue_wait_seconds"] = max(
@@ -416,10 +442,13 @@ def _aggregate_batch_summaries(runs: list[dict[str, Any]]) -> dict[str, Any]:
                     "server_max_queue_wait_seconds": 0.0,
                     "server_batching_modes": {},
                     "server_elapsed_seconds_attributions": {},
+                    "server_batch_count_attributed": 0,
+                    "server_unique_batch_size_histogram": {},
+                    "_seen_server_batch_ids": set(),
                 },
             )
             target["records"] += int(label_summary.get("records", 0) or 0)
-            target["server_batch_count"] += int(label_summary.get("server_batch_count", 0) or 0)
+            target["server_batch_count_attributed"] += int(label_summary.get("server_batch_count", 0) or 0)
             target["server_request_record_count"] += int(
                 label_summary.get("server_request_record_count", 0) or 0
             )
@@ -442,6 +471,29 @@ def _aggregate_batch_summaries(runs: list[dict[str, Any]]) -> dict[str, Any]:
                     continue
                 for key, value in values.items():
                     target[field][str(key)] = int(target[field].get(str(key), 0)) + int(value)
+            server_batches = label_summary.get("server_batches")
+            if isinstance(server_batches, list):
+                for batch in server_batches:
+                    if not isinstance(batch, dict):
+                        continue
+                    batch_id = batch.get("batch_id")
+                    batch_size = batch.get("batch_size")
+                    if batch_id is None or batch_size is None:
+                        continue
+                    seen_key = str(batch_id)
+                    if seen_key in target["_seen_server_batch_ids"]:
+                        continue
+                    target["_seen_server_batch_ids"].add(seen_key)
+                    target["server_batch_count"] += 1
+                    size_key = str(int(batch_size))
+                    target["server_unique_batch_size_histogram"][size_key] = int(
+                        target["server_unique_batch_size_histogram"].get(size_key, 0)
+                    ) + 1
+            elif int(label_summary.get("server_batch_count", 0) or 0) > 0:
+                target["server_batch_count"] += int(label_summary.get("server_batch_count", 0) or 0)
+
+    for label_summary in aggregate.values():
+        label_summary.pop("_seen_server_batch_ids", None)
     return {"by_label": aggregate}
 
 

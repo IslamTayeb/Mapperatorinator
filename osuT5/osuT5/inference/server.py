@@ -694,31 +694,24 @@ class InferenceServer:
                         elapsed_seconds = request['elapsed_seconds']
                         generated_tokens = request['generated_tokens']
                         server_queue_wait_seconds = request['server_queue_wait_seconds']
-                        detail_stats = {
-                            key: stats.get(key)
-                            for key in (
-                                'generation_compile_enabled',
-                                'profile_generation_detail_ranges',
-                                'profile_active_prefix_decode_diagnostics',
-                                'profile_sdpa_backend',
-                                'stateful_monotonic_logits_processor',
-                                'q1_bmm_cross_attention_enabled',
-                                'native_q1_self_attention_requested',
-                                'native_q1_self_attention_enabled',
-                                'native_q1_self_attention_disabled_reason',
-                                'native_q1_rope_cache_self_attention_requested',
-                                'native_q1_rope_cache_self_attention_enabled',
-                                'native_q1_rope_cache_self_attention_disabled_reason',
-                                'decode_session_runtime_enabled',
-                                'decode_session_cuda_graph_enabled',
-                                'decode_session_graph_count',
-                                'active_prefix_decode_loop_enabled',
-                                'active_prefix_decode_bucket_size',
-                                'active_prefix_decode_cuda_graph_enabled',
-                                'active_prefix_decode_cuda_graph_warmup',
-                                'active_prefix_decode_cuda_graph_min_decode_steps',
-                            )
-                        }
+                        detail_stats = dict(stats)
+                        for key in (
+                            'batch_size',
+                            'prompt_tokens',
+                            'prompt_tokens_per_sample',
+                            'output_tokens',
+                            'output_tokens_per_sample',
+                            'generated_tokens',
+                            'generated_tokens_per_sample',
+                            'elapsed_seconds',
+                            'tokens_per_second',
+                            'precision',
+                            'context_type',
+                            'num_beams',
+                            'cfg_scale',
+                            'do_sample',
+                        ):
+                            detail_stats.pop(key, None)
                         request['result'] = {
                             'output': request['result'],
                             'stats': {
@@ -796,6 +789,9 @@ class InferenceClient:
             idle_timeout=20,
             server_thread_daemon=False,
             socket_path=SOCKET_PATH,
+            allow_auto_start=True,
+            connect_timeout=60.0,
+            request_timeout=None,
     ):
         """
         Initializes the inference client. Automatically starts the inference server if it is not running.
@@ -814,8 +810,12 @@ class InferenceClient:
         self.idle_timeout = idle_timeout
         self.server_thread_daemon = server_thread_daemon
         self.socket_path = socket_path
+        self.allow_auto_start = allow_auto_start
+        self.connect_timeout = connect_timeout
+        self.request_timeout = request_timeout
         self.conn = None
         self.last_generation_stats = None
+        self._server_start_error = None
         self._server = None
         self._server_thread = None
 
@@ -828,10 +828,28 @@ class InferenceClient:
             try:
                 self.conn = Client(self.socket_path)
             except FileNotFoundError:
+                if not self.allow_auto_start:
+                    raise ConnectionError(
+                        f"Inference server socket does not exist and auto-start is disabled: {self.socket_path}"
+                    )
                 # No server: start one
                 self._start_server_thread()
                 # Wait for server socket to appear
+                started_at = time.perf_counter()
                 while not os.path.exists(self.socket_path):
+                    if self._server_start_error is not None:
+                        raise RuntimeError(
+                            f"Inference server failed to start for socket {self.socket_path}"
+                        ) from self._server_start_error
+                    if self._server_thread is not None and not self._server_thread.is_alive():
+                        raise RuntimeError(
+                            f"Inference server thread exited before creating socket {self.socket_path}"
+                        )
+                    if self.connect_timeout is not None and time.perf_counter() - started_at > self.connect_timeout:
+                        raise TimeoutError(
+                            f"Timed out waiting for inference server socket after "
+                            f"{self.connect_timeout:.1f}s: {self.socket_path}"
+                        )
                     time.sleep(0.1)
                 self.conn = Client(self.socket_path)
 
@@ -851,23 +869,28 @@ class InferenceClient:
             self.conn.close()
 
     def _start_server(self, model_loader, tokenizer_loader):
-        # Load model inside server process
-        model = model_loader()
-        tokenizer = tokenizer_loader()
-        server = InferenceServer(
-            model,
-            tokenizer,
-            max_batch_size=self.max_batch_size,
-            batch_timeout=self.batch_timeout,
-            idle_timeout=self.idle_timeout,
-            socket_path=self.socket_path
-        )
-        self._server = server
-        server.start()
-        # Block until shutdown
-        while not server.shutdown_flag.is_set():
-            time.sleep(1)
-        self._server = None
+        try:
+            # Load model inside server process
+            model = model_loader()
+            tokenizer = tokenizer_loader()
+            server = InferenceServer(
+                model,
+                tokenizer,
+                max_batch_size=self.max_batch_size,
+                batch_timeout=self.batch_timeout,
+                idle_timeout=self.idle_timeout,
+                socket_path=self.socket_path
+            )
+            self._server = server
+            server.start()
+            # Block until shutdown
+            while not server.shutdown_flag.is_set():
+                time.sleep(1)
+        except BaseException as exc:
+            self._server_start_error = exc
+            raise
+        finally:
+            self._server = None
 
     def generate(self, model_kwargs, generate_kwargs, max_retries=3):
         attempts = 0
@@ -877,6 +900,11 @@ class InferenceClient:
                 if self.conn is None:
                     self._reconnect()
                 self.conn.send((model_kwargs, generate_kwargs))
+                if self.request_timeout is not None and not self.conn.poll(self.request_timeout):
+                    raise TimeoutError(
+                        f"Timed out waiting for inference server response after "
+                        f"{self.request_timeout:.1f}s: {self.socket_path}"
+                    )
                 result = self.conn.recv()
             except (EOFError, OSError):
                 print("Connection error, attempting to reconnect...")
@@ -899,7 +927,7 @@ class InferenceClient:
 
         raise RuntimeError(f"Failed to get a valid response after {max_retries} attempts.")
 
-    def ensure_server(self):
+    def ensure_server(self, timeout=None):
         """Ensure the background inference server is running.
 
         This is useful when an external owner (e.g., a web UI) wants to start the
@@ -911,7 +939,22 @@ class InferenceClient:
                 self._start_server_thread()
 
         # Wait for server socket to appear.
+        started_at = time.perf_counter()
         while not os.path.exists(self.socket_path):
+            if self._server_start_error is not None:
+                raise RuntimeError(
+                    f"Inference server failed to start for socket {self.socket_path}"
+                ) from self._server_start_error
+            if self._server_thread is not None and not self._server_thread.is_alive():
+                raise RuntimeError(
+                    f"Inference server thread exited before creating socket {self.socket_path}"
+                )
+            wait_timeout = self.connect_timeout if timeout is None else timeout
+            if wait_timeout is not None and time.perf_counter() - started_at > wait_timeout:
+                raise TimeoutError(
+                    f"Timed out waiting for inference server socket after "
+                    f"{wait_timeout:.1f}s: {self.socket_path}"
+                )
             time.sleep(0.1)
 
     def shutdown_server(self, join_timeout=5.0):
