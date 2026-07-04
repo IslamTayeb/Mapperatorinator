@@ -1557,6 +1557,24 @@ the next target is broad decoder compute/runtime or an exclusive
 production-vs-replay gap, not standalone sampling, copy, graph-cache cleanup, or
 SDPA work. See `notes/2026-07-04-post270-kernel-trace.md`.
 
+`utils/profile_decode_replay_gap.py` is the stop/go verifier for that
+exclusive production-vs-replay question. It builds the real seq9 one-token
+prepared inputs, then compares production-style `_capture_decode_cuda_graph()`
+replay against isolated same-input full-forward graph replay,
+decoder-stack-plus-projection graph replay, static input copy, and an optional
+empty graph shell. DCC job `49250100` on RTX 2080 Ti, branch
+`experiment/decode-replay-gap-probe` commit `3257f57`, passed all raw-logit
+correctness gates (`max_abs=0.0` for production graph, full-forward graph, and
+decoder-stack-plus-projection graph). It measured production graph replay at
+`1.811697ms/call`, isolated full-forward graph replay at `1.800818ms/call`, and
+decoder-stack-plus-projection graph replay at `1.801175ms/call`. The projected
+full-song production-minus-full-forward gap is only `0.082158s`, and static
+input copy is only `0.220091s`, both far below the `1.412s` 5% keep bar. This
+rules out standalone `_capture_decode_cuda_graph()` wrapper cleanup, static
+input-copy cleanup, or module-boundary graph replay rewrites as serious 500
+tok/s paths on the current stack. See
+`notes/2026-07-04-decode-replay-gap-probe.md`.
+
 ## Decode Prepare Oracle
 
 Use `utils/verify_decode_prepare_oracle.py` before replacing `prepare_inputs_for_generation` in any decode runtime path. The verifier drives the real model with the HF-prepared inputs while comparing a conservative fast post-prefill one-token builder against HF's prepared tensors at every checked decode step.
