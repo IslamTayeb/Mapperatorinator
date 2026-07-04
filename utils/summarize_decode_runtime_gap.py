@@ -507,6 +507,153 @@ def _decode_replay_gap_analysis(
     }
 
 
+def _theoretical_pressure_analysis(
+        *,
+        full_song_main_tokens: int,
+        baseline_model_seconds: float,
+        target_model_seconds: float,
+        active_event_projections: list[dict[str, Any]],
+        island_gap_analysis: dict[str, Any],
+        linear_roofline_analysis: dict[str, Any] | None,
+        decode_replay_gap_analysis: dict[str, Any] | None,
+) -> dict[str, Any]:
+    required_saving = baseline_model_seconds - target_model_seconds
+    if required_saving <= 0:
+        return {
+            "required_saving_seconds": required_saving,
+            "required_saving_fraction_of_baseline": 0.0,
+            "note": "Accepted baseline already meets or beats the target.",
+        }
+
+    def _event_pressure(name: str) -> dict[str, Any] | None:
+        event = next(
+            (
+                item for item in active_event_projections
+                if isinstance(item, dict) and item.get("name") == name
+            ),
+            None,
+        )
+        if not isinstance(event, dict):
+            return None
+        seconds = event.get("projected_full_song_seconds")
+        if not isinstance(seconds, (int, float)) or seconds <= 0:
+            return None
+        if_removed_tps = event.get("projected_tps_if_removed_from_baseline")
+        return {
+            "projected_seconds": float(seconds),
+            "required_fraction_to_hit_target_if_only_this_target_changes": required_saving / float(seconds),
+            "fully_removed_reaches_target": (
+                isinstance(if_removed_tps, (int, float))
+                and float(if_removed_tps) >= full_song_main_tokens / target_model_seconds
+            ),
+            "target_class": event.get("target_class"),
+            "caveat": event.get("action_note"),
+        }
+
+    def _island_pressure(name: str) -> dict[str, Any] | None:
+        analysis = island_gap_analysis.get(name)
+        if not isinstance(analysis, dict):
+            return None
+        replay_seconds = analysis.get("replay_seconds")
+        saving = analysis.get("saving_vs_accepted_baseline_seconds")
+        if not isinstance(replay_seconds, (int, float)) or not isinstance(saving, (int, float)):
+            return None
+        replay_seconds = float(replay_seconds)
+        saving = float(saving)
+        return {
+            "replay_seconds": replay_seconds,
+            "saving_if_production_reached_replay_seconds": saving,
+            "remaining_gap_to_target_after_reaching_replay_seconds": max(
+                replay_seconds - target_model_seconds,
+                0.0,
+            ),
+            "surplus_below_target_if_reached_replay_seconds": max(
+                target_model_seconds - replay_seconds,
+                0.0,
+            ),
+            "saving_fraction_of_required_target_saving": saving / required_saving,
+            "reaches_target_if_production_reached_replay": replay_seconds <= target_model_seconds,
+            "caveat": (
+                "Not a removable-cost claim: this assumes production model time can collapse to this "
+                "idealized graph-replay boundary."
+            ),
+        }
+
+    linear_pressure = None
+    if isinstance(linear_roofline_analysis, dict):
+        removable = linear_roofline_analysis.get("removable_above_peak_bandwidth_floor_seconds")
+        projected = linear_roofline_analysis.get("linear_projected_full_song_seconds")
+        if isinstance(removable, (int, float)):
+            remaining = baseline_model_seconds - float(removable)
+            linear_pressure = {
+                "captured_linear_projected_seconds": projected,
+                "removable_above_peak_bandwidth_floor_seconds": float(removable),
+                "required_fraction_of_removable_above_floor_to_hit_target_if_only_linears_change": (
+                    required_saving / float(removable)
+                    if float(removable) > 0
+                    else None
+                ),
+                "remaining_gap_to_target_after_peak_floor_seconds": max(remaining - target_model_seconds, 0.0),
+                "reaches_target_at_peak_floor": remaining <= target_model_seconds,
+                "caveat": (
+                    "Use removable-above-floor for target pressure; the rest is necessary linear "
+                    "math/data movement under this roofline model."
+                ),
+            }
+
+    replay_shell_pressure = None
+    if isinstance(decode_replay_gap_analysis, dict):
+        shell = decode_replay_gap_analysis.get("production_minus_full_forward_seconds")
+        static_copy = decode_replay_gap_analysis.get("static_input_copy_seconds")
+        replay_shell_pressure = {
+            "production_minus_full_forward_seconds": shell,
+            "static_input_copy_seconds": static_copy,
+            "production_minus_full_forward_fraction_of_required_saving": (
+                float(shell) / required_saving
+                if isinstance(shell, (int, float))
+                else None
+            ),
+            "static_input_copy_fraction_of_required_saving": (
+                float(static_copy) / required_saving
+                if isinstance(static_copy, (int, float))
+                else None
+            ),
+            "caveat": "Replay-shell/input-copy work is far too small unless new profiling changes these numbers.",
+        }
+
+    graph_replay_pressure = _event_pressure("graph.replay")
+    decoder_layer_pressure = _island_pressure("decoder_layers")
+    full_forward_pressure = _island_pressure("full_forward")
+    decoder_stack_pressure = _island_pressure("decoder_stack_hidden")
+
+    next_boundary = (
+        "No current standalone cleanup target can plausibly hit 500 tok/s. "
+        "Any new work must either collapse production time toward the broad decoder-layer/forward replay "
+        "boundary or prove a new avoidable cost above the keep bar."
+    )
+    if (
+        isinstance(decoder_layer_pressure, dict)
+        and decoder_layer_pressure.get("reaches_target_if_production_reached_replay")
+    ):
+        next_boundary = (
+            "The only current 500-capable replay boundary is the broad decoder-layer boundary, but this is "
+            "an idealized production-time-collapse claim, not evidence that decoder-layer math is removable."
+        )
+
+    return {
+        "required_saving_seconds": required_saving,
+        "required_saving_fraction_of_baseline": required_saving / baseline_model_seconds,
+        "target_model_seconds": target_model_seconds,
+        "graph_replay_event": graph_replay_pressure,
+        "full_forward_replay_boundary": full_forward_pressure,
+        "decoder_stack_hidden_replay_boundary": decoder_stack_pressure,
+        "decoder_layer_replay_boundary": decoder_layer_pressure,
+        "linear_roofline": linear_pressure,
+        "replay_shell": replay_shell_pressure,
+        "next_boundary_interpretation": next_boundary,
+    }
+
+
 def _recommended_next_steps(report: dict[str, Any]) -> list[str]:
     recommendations: list[str] = []
     ledger = report.get("model_generate_ledger") or {}
@@ -593,6 +740,18 @@ def _recommended_next_steps(report: dict[str, Any]) -> list[str]:
         recommendations.append(
             "Do not pursue static graph input copy as a standalone target; projected replay-gap ceiling is below the 5% bar."
         )
+    pressure = report.get("theoretical_pressure") or {}
+    graph_replay = pressure.get("graph_replay_event") or {}
+    required_fraction = graph_replay.get("required_fraction_to_hit_target_if_only_this_target_changes")
+    if isinstance(required_fraction, (int, float)) and required_fraction > 0.75:
+        recommendations.append(
+            "Hitting 500 by optimizing graph-replayed decoder compute alone would require removing most of that bucket; require a broad math/memory proof, not another narrow kernel."
+        )
+    full_forward = pressure.get("full_forward_replay_boundary") or {}
+    if full_forward.get("reaches_target_if_production_reached_replay") is False:
+        recommendations.append(
+            "Even the weighted full-forward replay boundary is short of 500; wrapper/runtime cleanup without decoder math wins is not enough."
+        )
     return recommendations
 
 
@@ -673,6 +832,15 @@ def summarize_runtime_gap(
         decode_replay_gap_report,
         baseline_model_seconds=full_song_model_time_seconds,
     )
+    theoretical_pressure = _theoretical_pressure_analysis(
+        full_song_main_tokens=full_song_main_tokens,
+        baseline_model_seconds=full_song_model_time_seconds,
+        target_model_seconds=target_model_seconds,
+        active_event_projections=active_event_projections,
+        island_gap_analysis=island_gap_analysis,
+        linear_roofline_analysis=linear_roofline_analysis,
+        decode_replay_gap_analysis=decode_replay_gap_analysis,
+    )
 
     result: dict[str, Any] = {
         "label": label,
@@ -722,6 +890,7 @@ def summarize_runtime_gap(
         "island_gap_analysis": island_gap_analysis,
         "linear_roofline_analysis": linear_roofline_analysis,
         "decode_replay_gap_analysis": decode_replay_gap_analysis,
+        "theoretical_pressure": theoretical_pressure,
         "candidate_ledger": _candidate_ledger(
             active_events=active_event_projections,
             island_analysis=island_gap_analysis,
@@ -845,6 +1014,37 @@ def print_summary(report: dict[str, Any], *, event_limit: int) -> None:
             "empty_graph_shell: "
             f"{_fmt(replay_gap.get('empty_graph_shell_seconds'))}s"
         )
+        print()
+    pressure = report.get("theoretical_pressure")
+    if isinstance(pressure, dict):
+        print("Theoretical Pressure")
+        print(
+            "  required saving: "
+            f"{_fmt(pressure.get('required_saving_seconds'))}s "
+            f"({_fmt(pressure.get('required_saving_fraction_of_baseline') * 100 if isinstance(pressure.get('required_saving_fraction_of_baseline'), (int, float)) else None)}% of baseline)"
+        )
+        graph_replay = pressure.get("graph_replay_event") or {}
+        if isinstance(graph_replay, dict):
+            print(
+                "  graph.replay-only path would need: "
+                f"{_fmt(graph_replay.get('required_fraction_to_hit_target_if_only_this_target_changes') * 100 if isinstance(graph_replay.get('required_fraction_to_hit_target_if_only_this_target_changes'), (int, float)) else None)}% "
+                "of that projected bucket removed"
+            )
+        full_forward = pressure.get("full_forward_replay_boundary") or {}
+        if isinstance(full_forward, dict):
+            print(
+                "  after reaching full-forward replay: "
+                f"{_fmt(full_forward.get('remaining_gap_to_target_after_reaching_replay_seconds'))}s "
+                "still above target"
+            )
+        decoder_layer = pressure.get("decoder_layer_replay_boundary") or {}
+        if isinstance(decoder_layer, dict):
+            print(
+                "  decoder-layer replay boundary: "
+                f"reaches_target={bool(decoder_layer.get('reaches_target_if_production_reached_replay'))}, "
+                f"surplus={_fmt(decoder_layer.get('surplus_below_target_if_reached_replay_seconds'))}s"
+            )
+        print(f"  interpretation: {pressure.get('next_boundary_interpretation')}")
         print()
     print("Recommendations")
     for item in report["recommendations"]:

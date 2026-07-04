@@ -38,6 +38,22 @@ per-linear call-form/native/cuBLAS work, self-attention-only work, and manual
 Python/module recomposition are not current bottlenecks under the accepted
 stack.
 
+## Target Pressure
+
+`utils/summarize_decode_runtime_gap.py` now emits a `theoretical_pressure`
+section so a large profiler bucket is not mistaken for removable work. The
+current pressure numbers are:
+
+- required saving for `500 tok/s`: `12.965s`, or `45.9%` of baseline model
+  time;
+- optimizing only the projected `graph.replay` bucket would require removing
+  `83.2%` of that bucket;
+- reaching the weighted full-forward replay boundary would still be `1.842s`
+  short of `500 tok/s`;
+- the decoder-layer replay boundary reaches the target only as an idealized
+  production-time-collapse boundary with `2.260s` surplus, not as evidence that
+  decoder-layer math is removable.
+
 ## Stop/Go Rule
 
 Do not start production runtime or kernel code unless a current-stack proof
