@@ -611,6 +611,16 @@ class InferenceServer:
                 # Grab full or partial requests until BATCH_SIZE is reached or requests is empty
                 batch_requests = []
                 remaining_batch_size = self.max_batch_size // batch_multiplier
+                if remaining_batch_size <= 0:
+                    error_message = (
+                        "max_batch_size is too small for server batching: "
+                        f"max_batch_size={self.max_batch_size}, num_beams={num_beams}, cfg_scale={cfg_scale}."
+                    )
+                    for request in requests:
+                        request['result'] = {'error': error_message}
+                        request['event'].set()
+                    del self.grouped_requests[generate_kwargs_set]
+                    continue
                 while remaining_batch_size > 0 and len(requests) > 0:
                     request = requests.pop(0)
                     req_kwargs = request['model_kwargs']
@@ -684,6 +694,31 @@ class InferenceServer:
                         elapsed_seconds = request['elapsed_seconds']
                         generated_tokens = request['generated_tokens']
                         server_queue_wait_seconds = request['server_queue_wait_seconds']
+                        detail_stats = {
+                            key: stats.get(key)
+                            for key in (
+                                'generation_compile_enabled',
+                                'profile_generation_detail_ranges',
+                                'profile_active_prefix_decode_diagnostics',
+                                'profile_sdpa_backend',
+                                'stateful_monotonic_logits_processor',
+                                'q1_bmm_cross_attention_enabled',
+                                'native_q1_self_attention_requested',
+                                'native_q1_self_attention_enabled',
+                                'native_q1_self_attention_disabled_reason',
+                                'native_q1_rope_cache_self_attention_requested',
+                                'native_q1_rope_cache_self_attention_enabled',
+                                'native_q1_rope_cache_self_attention_disabled_reason',
+                                'decode_session_runtime_enabled',
+                                'decode_session_cuda_graph_enabled',
+                                'decode_session_graph_count',
+                                'active_prefix_decode_loop_enabled',
+                                'active_prefix_decode_bucket_size',
+                                'active_prefix_decode_cuda_graph_enabled',
+                                'active_prefix_decode_cuda_graph_warmup',
+                                'active_prefix_decode_cuda_graph_min_decode_steps',
+                            )
+                        }
                         request['result'] = {
                             'output': request['result'],
                             'stats': {
@@ -701,7 +736,11 @@ class InferenceServer:
                                 'num_beams': stats.get('num_beams'),
                                 'cfg_scale': stats.get('cfg_scale'),
                                 'do_sample': stats.get('do_sample'),
+                                **detail_stats,
                                 'server_batching_mode': 'static_ipc',
+                                'server_elapsed_seconds_attribution': 'merged_batch_elapsed_replicated_per_request',
+                                'server_max_batch_size': self.max_batch_size,
+                                'server_batch_timeout_seconds': self.batch_timeout,
                                 'server_batch_count': len(request['server_batch_ids']),
                                 'server_batch_ids': request['server_batch_ids'],
                                 'server_batch_sizes': request['server_batch_sizes'],
@@ -847,6 +886,8 @@ class InferenceClient:
                 print("Retrying request due to Error.")
                 attempts += 1
                 continue
+            if isinstance(result, dict) and 'error' in result:
+                raise RuntimeError(str(result['error']))
             else:
                 if isinstance(result, dict) and 'output' in result:
                     self.last_generation_stats = result.get('stats')

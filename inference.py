@@ -372,6 +372,19 @@ def compile_derived_args(args: InferenceConfig):
 
 
 def validate_reserved_runtime_flags(args: InferenceConfig):
+    def effective_generation_batch_size() -> int:
+        batch_multiplier = args.num_beams * (2 if args.cfg_scale > 1.0 else 1)
+        return args.max_batch_size // batch_multiplier
+
+    if args.max_batch_size <= 0:
+        raise ValueError("max_batch_size must be positive.")
+    if (args.use_server or args.parallel) and effective_generation_batch_size() <= 0:
+        raise ValueError(
+            "max_batch_size is too small for the requested batching configuration: "
+            f"max_batch_size={args.max_batch_size}, num_beams={args.num_beams}, cfg_scale={args.cfg_scale}. "
+            "Increase max_batch_size or reduce num_beams/cfg_scale."
+        )
+
     def require_simple_sequential(flag_name: str) -> None:
         if args.use_server:
             raise ValueError(f"{flag_name} requires use_server=false.")

@@ -243,6 +243,65 @@ def _flatten_token_ids(profile: dict[str, Any], label: str) -> list[int] | None:
     return tokens if saw_tokens else None
 
 
+def _profile_batch_summary(profile: dict[str, Any]) -> dict[str, Any]:
+    records = profile.get("generation", [])
+    by_label: dict[str, dict[str, Any]] = {}
+    for record in records:
+        label = str(record.get("profile_label") or "unknown")
+        label_summary = by_label.setdefault(
+            label,
+            {
+                "records": 0,
+                "modes": {},
+                "batch_size_histogram": {},
+                "server_batch_size_histogram": {},
+                "server_batch_count": 0,
+                "server_request_record_count": 0,
+                "server_total_queue_wait_seconds": 0.0,
+                "server_max_queue_wait_seconds": 0.0,
+                "server_batching_modes": {},
+                "server_elapsed_seconds_attributions": {},
+            },
+        )
+        label_summary["records"] += 1
+        mode = str(record.get("mode") or "unknown")
+        label_summary["modes"][mode] = int(label_summary["modes"].get(mode, 0)) + 1
+        batch_size = record.get("batch_size")
+        if batch_size is not None:
+            key = str(int(batch_size))
+            label_summary["batch_size_histogram"][key] = int(
+                label_summary["batch_size_histogram"].get(key, 0)
+            ) + 1
+        server_mode = record.get("server_batching_mode")
+        if server_mode is not None:
+            server_mode = str(server_mode)
+            label_summary["server_batching_modes"][server_mode] = int(
+                label_summary["server_batching_modes"].get(server_mode, 0)
+            ) + 1
+        attribution = record.get("server_elapsed_seconds_attribution")
+        if attribution is not None:
+            attribution = str(attribution)
+            label_summary["server_elapsed_seconds_attributions"][attribution] = int(
+                label_summary["server_elapsed_seconds_attributions"].get(attribution, 0)
+            ) + 1
+        server_sizes = record.get("server_batch_sizes")
+        if isinstance(server_sizes, list) and server_sizes:
+            label_summary["server_request_record_count"] += 1
+            label_summary["server_batch_count"] += len(server_sizes)
+            for size in server_sizes:
+                key = str(int(size))
+                label_summary["server_batch_size_histogram"][key] = int(
+                    label_summary["server_batch_size_histogram"].get(key, 0)
+                ) + 1
+        queue_wait = float(record.get("server_total_queue_wait_seconds") or 0.0)
+        label_summary["server_total_queue_wait_seconds"] += queue_wait
+        label_summary["server_max_queue_wait_seconds"] = max(
+            float(label_summary["server_max_queue_wait_seconds"]),
+            float(record.get("server_max_queue_wait_seconds") or 0.0),
+        )
+    return {"by_label": by_label}
+
+
 def _token_sha256(tokens: list[int] | None) -> str | None:
     if tokens is None:
         return None
@@ -334,6 +393,58 @@ def _aggregate_by_song(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return summaries
 
 
+def _aggregate_batch_summaries(runs: list[dict[str, Any]]) -> dict[str, Any]:
+    aggregate: dict[str, dict[str, Any]] = {}
+    for run in runs:
+        batch_summary = run.get("generation_batch_summary")
+        if not isinstance(batch_summary, dict):
+            continue
+        by_label = batch_summary.get("by_label")
+        if not isinstance(by_label, dict):
+            continue
+        for label, label_summary in by_label.items():
+            target = aggregate.setdefault(
+                str(label),
+                {
+                    "records": 0,
+                    "modes": {},
+                    "batch_size_histogram": {},
+                    "server_batch_size_histogram": {},
+                    "server_batch_count": 0,
+                    "server_request_record_count": 0,
+                    "server_total_queue_wait_seconds": 0.0,
+                    "server_max_queue_wait_seconds": 0.0,
+                    "server_batching_modes": {},
+                    "server_elapsed_seconds_attributions": {},
+                },
+            )
+            target["records"] += int(label_summary.get("records", 0) or 0)
+            target["server_batch_count"] += int(label_summary.get("server_batch_count", 0) or 0)
+            target["server_request_record_count"] += int(
+                label_summary.get("server_request_record_count", 0) or 0
+            )
+            target["server_total_queue_wait_seconds"] += float(
+                label_summary.get("server_total_queue_wait_seconds", 0.0) or 0.0
+            )
+            target["server_max_queue_wait_seconds"] = max(
+                float(target["server_max_queue_wait_seconds"]),
+                float(label_summary.get("server_max_queue_wait_seconds", 0.0) or 0.0),
+            )
+            for field in (
+                "modes",
+                "batch_size_histogram",
+                "server_batch_size_histogram",
+                "server_batching_modes",
+                "server_elapsed_seconds_attributions",
+            ):
+                values = label_summary.get(field)
+                if not isinstance(values, dict):
+                    continue
+                for key, value in values.items():
+                    target[field][str(key)] = int(target[field].get(str(key), 0)) + int(value)
+    return {"by_label": aggregate}
+
+
 def _runtime_environment() -> dict[str, Any]:
     env_keys = [
         "TORCHINDUCTOR_CACHE_DIR",
@@ -392,6 +503,7 @@ def _write_manifest(
             "all_runs": _aggregate(runs, start_index=0),
             "warmed_runs": _aggregate_runs(_warmed_runs(runs)) if _warmed_runs(runs) else None,
             "by_song": _aggregate_by_song(runs),
+            "batching": _aggregate_batch_summaries(runs),
         },
     }
     manifest_path = suite_dir / "suite_manifest.json"
@@ -575,6 +687,7 @@ def main() -> None:
             "main_token_sha256": token_sha256,
             "token_equivalence_to_song_baseline": token_equivalence,
             "token_equivalence_to_run0": token_equivalence if song_index == 0 else "not_applicable",
+            "generation_batch_summary": _profile_batch_summary(profile),
         }
         print(
             "[suite] run {run_index}: song={song_id}, main={tokens} tokens, model={seconds:.3f}s, "

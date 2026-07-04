@@ -1545,6 +1545,9 @@ class Processor(object):
                 "active_prefix_decode_cuda_graph_min_decode_steps"
             ),
             "server_batching_mode": stats.get("server_batching_mode"),
+            "server_elapsed_seconds_attribution": stats.get("server_elapsed_seconds_attribution"),
+            "server_max_batch_size": stats.get("server_max_batch_size"),
+            "server_batch_timeout_seconds": stats.get("server_batch_timeout_seconds"),
             "server_batch_count": stats.get("server_batch_count"),
             "server_batch_ids": stats.get("server_batch_ids"),
             "server_batch_sizes": stats.get("server_batch_sizes"),
