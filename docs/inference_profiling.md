@@ -1646,6 +1646,29 @@ matching PyTorch/HF byte-for-byte. Do not start another narrow production flag,
 tail graph, cold-start package pass, or documented-drift native path as an exact
 optimization. See `notes/2026-07-04-current-exact-optimization-frontier.md`.
 
+`utils/profile_decode_decoder_layer_island.py --candidate-native-cross-mlp-tail`
+is the first post-frontier multi-segment verifier that clears the 5% weighted
+bar while preserving the reference self-cache write. The candidate keeps normal
+self-attention/cache behavior, then replaces the cross-attention residual and
+MLP residual tail with native one-token helpers. DCC single-prefix job
+`49266324` passed logits replay, cache-write SHA, and ABI validation at
+prefix128; the Slurm state was `FAILED` only because a final summary helper
+misquoted `$RUN_DIR` after valid artifacts were written. DCC weighted job
+`49266355` produced all 11 bucket reports; its original Slurm summary failed
+because the weighted summarizer still required the default manual-island variant
+when explicit `--require-variant` values were passed. Commit `02813ee` fixed
+that harness issue, and
+`/work/imt11/Mapperatorinator/runs/native-cross-mlp-weighted-49266355-b022e86/weighted_native_cross_mlp_tail_summary.fixed.json`
+passes with `7,552` weighted decode replays. Best variant
+`native_cross_mlp_tail_warp8` projects weighted decoder-layer graph replay
+`16.766751s -> 15.045932s`, saving `1.720819s` and projecting
+`270.474 -> 288.023 tok/s`. This is target-sized verifier evidence, not a
+throughput claim. A production spike is allowed only as a default-off path after
+the standard one-token, direct-loop token/logit/RNG, 15s smoke, full-song
+strict token/output/no-regression gates, and it must be rejected if the
+untraced `profile_inference` gain lands below the 5% keep bar or regresses
+stage wall. See `notes/2026-07-04-native-cross-mlp-tail-verifier.md`.
+
 `utils/summarize_decoder_layer_segment_pressure.py` is the segment-level stop/go auditor for native decoder-layer work. It reads a decoder-layer island report, uses captured ABI dimensions, compares measured CUDA-graph segment replay against optimistic fp32 compute/bandwidth floors, and reports whether each segment has above-floor headroom above the 5%/10% bars. DCC run `/work/imt11/Mapperatorinator/runs/decoder-layer-segment-pressure-20260704141703-0a28a3e` on the candidate-cache report showed self-attention residual `5.430s` measured / `1.513s` floor / `3.917s` above-floor, cross-attention residual `4.024s` / `1.626s` / `2.397s`, MLP residual `4.692s` / `2.789s` / `1.903s`, and whole decoder layer `15.739s` / `5.928s` / `9.811s`. All three major residual segments clear the 5% verifier bar, but no single segment reaches `500 tok/s` at its floor, and even this representative whole layer at floor projects only `414.435 tok/s`. The next implementation-worthy scope remains a multi-segment or whole-layer native math/memory verifier, not another narrow production path. See `notes/2026-07-04-decoder-layer-segment-pressure.md`.
 
 `utils/summarize_torch_trace_kernels.py` is the lightweight Chrome-trace kernel
