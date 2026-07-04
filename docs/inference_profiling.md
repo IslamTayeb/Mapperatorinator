@@ -1616,6 +1616,23 @@ single-prefix excitement must be confirmed on the actual bucket distribution
 before runtime or kernel work graduates. See
 `notes/2026-07-04-weighted-manual-decoder-layer-confirmation.md`.
 
+Native self+cross exactness classification confirms that this candidate is not
+a same-calculation path today. Branch
+`codex/native-prefix-exactness-classifier` commit `b71c275` extended
+`utils/profile_decode_decoder_layer_island.py --verify-cache-write-candidates`
+with expected-slot bit-pattern mismatch counts for cache-writing candidates.
+DCC job `49266140` on RTX 2080 Ti reran prefix640 native self+cross and produced
+`/work/imt11/Mapperatorinator/runs/native-prefix-exactness2-49266140-b71c275/native_self_cross_prefix_exactness.json`.
+The report JSON is valid even though the Slurm wrapper is `FAILED`, because the
+strict verifier exits nonzero when cache-write checks fail. The result shows
+real numeric fp32 drift, not signed-zero or NaN-payload noise: every native
+self+cross warp variant had `456` key and `595` value numeric bit mismatches,
+`0` signed-zero mismatches, cache max_abs `7.15e-07`/`4.77e-07`, and layer output
+max_abs `7.63e-06`. Do not production-wire native self+cross for exact
+same-calculation inference; only revisit it under explicit documented-drift
+policy with direct-loop token/logit/RNG, full-song output, and large operational
+speedup gates. See `notes/2026-07-04-native-prefix-exactness-classifier.md`.
+
 `utils/summarize_decoder_layer_segment_pressure.py` is the segment-level stop/go auditor for native decoder-layer work. It reads a decoder-layer island report, uses captured ABI dimensions, compares measured CUDA-graph segment replay against optimistic fp32 compute/bandwidth floors, and reports whether each segment has above-floor headroom above the 5%/10% bars. DCC run `/work/imt11/Mapperatorinator/runs/decoder-layer-segment-pressure-20260704141703-0a28a3e` on the candidate-cache report showed self-attention residual `5.430s` measured / `1.513s` floor / `3.917s` above-floor, cross-attention residual `4.024s` / `1.626s` / `2.397s`, MLP residual `4.692s` / `2.789s` / `1.903s`, and whole decoder layer `15.739s` / `5.928s` / `9.811s`. All three major residual segments clear the 5% verifier bar, but no single segment reaches `500 tok/s` at its floor, and even this representative whole layer at floor projects only `414.435 tok/s`. The next implementation-worthy scope remains a multi-segment or whole-layer native math/memory verifier, not another narrow production path. See `notes/2026-07-04-decoder-layer-segment-pressure.md`.
 
 `utils/summarize_torch_trace_kernels.py` is the lightweight Chrome-trace kernel
