@@ -197,6 +197,11 @@ def test_compatibility_key_guard_and_config_validation():
         lambda: scheduler.enqueue(_request("bad-arrival", [3], key=("model", "a"), planned_arrival_step=-1)),
         "planned_arrival_step",
     )
+    _assert_raises(
+        ValueError,
+        lambda: scheduler.enqueue(_request("future-arrival", [3], key=("model", "a"), planned_arrival_step=2)),
+        "before its planned arrival step",
+    )
 
 
 def test_round_robin_changes_decode_order_without_changing_slots():
@@ -288,6 +293,10 @@ def test_profile_continuous_scheduler_honors_staggered_arrivals():
             "max_new_tokens": 2,
             "script_tokens": [1, 2],
             "generate_kwargs": {"do_sample": True, "top_p": 0.9, "top_k": 20, "temperature": 1.0},
+            "initial_rng_state_hash": "rng-before-a",
+            "final_rng_state_hash": "rng-after-a",
+            "logits_processor_state_hash": "logits-a",
+            "cache_state_hash": "cache-a",
         },
         {
             "request_id": "b",
@@ -296,6 +305,10 @@ def test_profile_continuous_scheduler_honors_staggered_arrivals():
             "max_new_tokens": 1,
             "script_tokens": [3],
             "generate_kwargs": {"do_sample": True, "top_p": 0.9, "top_k": 20, "temperature": 1.0},
+            "initial_rng_state_hash": "rng-before-b",
+            "final_rng_state_hash": "rng-after-b",
+            "logits_processor_state_hash": "logits-b",
+            "cache_state_hash": "cache-b",
         },
         {
             "request_id": "c",
@@ -304,6 +317,10 @@ def test_profile_continuous_scheduler_honors_staggered_arrivals():
             "max_new_tokens": 1,
             "script_tokens": [4],
             "generate_kwargs": {"do_sample": True, "top_p": 0.9, "top_k": 20, "temperature": 1.0},
+            "initial_rng_state_hash": "rng-before-c",
+            "final_rng_state_hash": "rng-after-c",
+            "logits_processor_state_hash": "logits-c",
+            "cache_state_hash": "cache-c",
         },
     ]
     with TemporaryDirectory() as tmpdir:
@@ -319,6 +336,7 @@ def test_profile_continuous_scheduler_honors_staggered_arrivals():
                 prefill_policy="serial",
                 decode_order_policy="arrival_order",
                 rng_policy="serial_global",
+                allow_missing_state_hashes=False,
                 max_steps=16,
             )
         )
@@ -335,3 +353,50 @@ def test_profile_continuous_scheduler_honors_staggered_arrivals():
     assert rows["c"]["planned_arrival_step"] == 4
     assert rows["c"]["enqueue_step"] == 4
     assert rows["c"]["queue_wait_steps"] == 0
+    assert rows["c"]["missing_state_hash_fields"] == []
+
+
+def test_profile_continuous_scheduler_requires_state_hashes_by_default():
+    requests = [
+        {
+            "request_id": "missing-state",
+            "arrival_step": 0,
+            "prompt_tokens": 4,
+            "max_new_tokens": 1,
+            "script_tokens": [1],
+            "generate_kwargs": {"do_sample": True},
+        },
+    ]
+    with TemporaryDirectory() as tmpdir:
+        requests_path = Path(tmpdir) / "requests.json"
+        requests_path.write_text(json.dumps(requests), encoding="utf-8")
+        args = Namespace(
+            requests_json=requests_path,
+            output_root=None,
+            suite_id="missing-state-test",
+            max_active_sequences=1,
+            max_wait_ms=0,
+            prefill_policy="serial",
+            decode_order_policy="arrival_order",
+            rng_policy="serial_global",
+            allow_missing_state_hashes=False,
+            max_steps=4,
+        )
+
+        _assert_raises(
+            ValueError,
+            lambda: run_scheduler_dry_run(args),
+            "missing state hash fields",
+        )
+
+        args.allow_missing_state_hashes = True
+        manifest = run_scheduler_dry_run(args)
+
+    assert manifest["state_hash_policy"] == "allow_missing_planning_only"
+    assert manifest["aggregate"]["missing_state_hash_request_count"] == 1
+    assert manifest["requests"][0]["missing_state_hash_fields"] == [
+        "initial_rng_state_hash",
+        "final_rng_state_hash",
+        "logits_processor_state_hash",
+        "cache_state_hash",
+    ]

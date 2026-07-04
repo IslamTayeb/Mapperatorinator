@@ -1884,6 +1884,9 @@ slot/generation events, stop reasons, generated-token counts, and placeholder
 RNG/logits/cache state hashes. These fields are useful for designing continuous
 server gates, but missing or synthetic hashes still mean the result is
 `scheduler_only` evidence rather than exact model-backed continuous batching.
+Dry-run requests now require RNG/logits/cache state hashes by default; use
+`--allow-missing-state-hashes` only for planning manifests that should fail
+strict equivalence comparison.
 The dry-run request format supports `arrival_step` / `planned_arrival_step`, so
 future scheduler tests can model staggered arrivals, idle service periods,
 queued requests, and cache-slot reuse without running model generation.
@@ -1898,12 +1901,15 @@ python utils/summarize_inference_profile.py \
 ```
 
 Strict mode checks the dry-run/result-class contract, scripted token hashes and
-stop reasons, lifecycle/state ledger fields, and scheduling shape. The ledger
-check covers RNG hashes, logits-processor state hash, cache state hash,
-enqueue/activation/finish steps, queue wait, decode/latency steps, cache slot id,
-and slot generation. CPU scheduler wall time is recorded for auditability only;
-require it explicitly with `--require-no-regression` when a CPU-harness change is
-the thing being measured.
+stop reasons, lifecycle/state ledger fields, scheduling shape, and manifest
+self-validation. The ledger check covers RNG hashes, logits-processor state
+hash, cache state hash, enqueue/activation/finish steps, queue wait,
+decode/latency steps, cache slot id, and slot generation. Self-validation
+recomputes generated-token hashes/counts, active-batch histograms, aggregate
+counts, cache-slot acquire/release balance, slot-generation monotonicity, and
+request lifecycle ordering. CPU scheduler wall time is recorded for auditability
+only; require it explicitly with `--require-no-regression` when a CPU-harness
+change is the thing being measured.
 
 Do not combine `use_server=true` with `inference_generation_compile=true` on the
 current static IPC server. DCC job `49267683` on RTX 2080 Ti reached generation

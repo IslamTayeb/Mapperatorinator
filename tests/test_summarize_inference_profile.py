@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import json
 from pathlib import Path
 
 
@@ -725,22 +727,29 @@ def test_compare_static_server_manifests_can_allow_max_batch_size_knob_change(tm
 
 def _continuous_scheduler_manifest(
     *,
-    token_hash: str = "same-token-hash",
+    token_hash: str | None = None,
     generated_tokens: int = 3,
     stop_reason: str = "eos",
     result_class: str = "continuous_scheduler_dry_run",
     model_generation_executed: bool = False,
     token_status: str = "scheduler_only_scripted_tokens",
+    state_hash_policy: str = "required",
+    missing_state_hash_fields: list[str] | None = None,
     active_batch_size_histogram: dict | None = None,
     scheduler_cpu_wall_seconds: float = 0.01,
 ):
+    token_ids = [1, 2, 99][:generated_tokens]
+    if token_hash is None:
+        token_hash = hashlib.sha256(
+            json.dumps(token_ids, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
     request = {
         "request_id": "song0-window0",
         "prompt_tokens": 4,
         "max_new_tokens": 4,
         "eos_token_ids": [99],
         "planned_arrival_step": 0,
-        "generated_tokens": [1, 2, 99][:generated_tokens],
+        "generated_tokens": token_ids,
         "generated_token_count": generated_tokens,
         "generated_token_sha256": token_hash,
         "stop_reason": stop_reason,
@@ -758,7 +767,10 @@ def _continuous_scheduler_manifest(
         "final_rng_state_hash": "rng-after",
         "logits_processor_state_hash": "logits-state",
         "cache_state_hash": "cache-state",
+        "missing_state_hash_fields": [] if missing_state_hash_fields is None else list(missing_state_hash_fields),
     }
+    for field in missing_state_hash_fields or []:
+        request[field] = None
     histogram = active_batch_size_histogram or {"1": 3}
     return {
         "schema_version": 1,
@@ -766,6 +778,13 @@ def _continuous_scheduler_manifest(
         "result_class": result_class,
         "model_generation_executed": model_generation_executed,
         "token_equivalence_status": token_status,
+        "state_hash_policy": state_hash_policy,
+        "required_state_hash_fields": [
+            "initial_rng_state_hash",
+            "final_rng_state_hash",
+            "logits_processor_state_hash",
+            "cache_state_hash",
+        ],
         "request_count": 1,
         "config": {
             "max_active_sequences": 1,
@@ -812,7 +831,7 @@ def _continuous_scheduler_manifest(
                         "decode_steps": 3,
                         "latency_steps": 3,
                         "stop_reason": stop_reason,
-                        "generated_tokens": [1, 2, 99][:generated_tokens],
+                        "generated_tokens": token_ids,
                     }
                 ],
                 "active_batch_size": 1,
@@ -838,6 +857,7 @@ def _continuous_scheduler_manifest(
             "stop_reason_counts": {stop_reason: 1},
             "cache_slot_acquire_count": 1,
             "cache_slot_release_count": 1,
+            "missing_state_hash_request_count": 0 if not missing_state_hash_fields else 1,
         },
     }
 
@@ -914,3 +934,19 @@ def test_compare_continuous_scheduler_manifests_rejects_model_backed_manifest(tm
 
     assert not report["result_class"]["pass"]
     assert not report["scripted_token_equivalence"]["pass"]
+
+
+def test_compare_continuous_scheduler_manifests_rejects_missing_state_hash_policy(tmp_path):
+    module = _load_module()
+    baseline = tmp_path / "baseline-continuous.json"
+    candidate = tmp_path / "candidate-continuous.json"
+    baseline.write_text(module.json.dumps(_continuous_scheduler_manifest()))
+    candidate.write_text(module.json.dumps(_continuous_scheduler_manifest(
+        state_hash_policy="allow_missing_planning_only",
+        missing_state_hash_fields=["final_rng_state_hash"],
+    )))
+
+    report = module.compare_continuous_scheduler_manifests(baseline, candidate)
+
+    assert not report["result_class"]["pass"]
+    assert not report["state_ledger"]["pass"]

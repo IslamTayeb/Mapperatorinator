@@ -45,6 +45,12 @@ ContinuousBatchSchedulerConfig = _continuous_batching.ContinuousBatchSchedulerCo
 generation_compatibility_key = _generation_compatibility.generation_compatibility_key
 
 CONTINUOUS_SCHEDULER_TOKEN_STATUS = "scheduler_only_scripted_tokens"
+REQUIRED_STATE_HASH_FIELDS = (
+    "initial_rng_state_hash",
+    "final_rng_state_hash",
+    "logits_processor_state_hash",
+    "cache_state_hash",
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -65,6 +71,14 @@ def _parse_args() -> argparse.Namespace:
         "--rng-policy",
         default="serial_global",
         choices=["serial_global", "per_request_generator", "documented_drift"],
+    )
+    parser.add_argument(
+        "--allow-missing-state-hashes",
+        action="store_true",
+        help=(
+            "Allow scripted dry-run requests without RNG/logits/cache state hashes. "
+            "This is planning-only evidence; strict continuous-scheduler comparisons reject it."
+        ),
     )
     parser.add_argument("--max-steps", type=int, default=1000)
     return parser.parse_args()
@@ -150,7 +164,15 @@ def _load_request_specs(path: Path | None) -> list[dict[str, Any]]:
     return payload
 
 
-def _build_request(spec: dict[str, Any]) -> ContinuousBatchRequest:
+def _missing_state_hash_fields(spec: dict[str, Any]) -> list[str]:
+    return [
+        field
+        for field in REQUIRED_STATE_HASH_FIELDS
+        if spec.get(field) in (None, "")
+    ]
+
+
+def _build_request(spec: dict[str, Any], *, require_state_hashes: bool) -> ContinuousBatchRequest:
     try:
         request_id = str(spec["request_id"])
         prompt_tokens = int(spec["prompt_tokens"])
@@ -158,6 +180,14 @@ def _build_request(spec: dict[str, Any]) -> ContinuousBatchRequest:
         script_tokens = [int(token) for token in spec["script_tokens"]]
     except KeyError as exc:
         raise ValueError(f"Missing request field: {exc.args[0]}") from exc
+    missing_state_hashes = _missing_state_hash_fields(spec)
+    if require_state_hashes and missing_state_hashes:
+        raise ValueError(
+            f"Continuous scheduler request {request_id!r} is missing state hash fields: "
+            + ", ".join(missing_state_hashes)
+            + ". Provide synthetic hashes for scheduler-only planning or pass "
+            "--allow-missing-state-hashes for non-strict exploratory dry runs."
+        )
     generate_kwargs = dict(spec.get("generate_kwargs") or {})
     return ContinuousBatchRequest(
         request_id=request_id,
@@ -185,10 +215,16 @@ def _request_arrival_step(spec: dict[str, Any]) -> int:
 
 def _request_manifest_row(request: dict[str, Any]) -> dict[str, Any]:
     generated_tokens = [int(token) for token in request.get("generated_tokens", [])]
+    missing_state_hashes = [
+        field
+        for field in REQUIRED_STATE_HASH_FIELDS
+        if request.get(field) in (None, "")
+    ]
     return {
         **request,
         "generated_token_sha256": _token_sha256(generated_tokens),
         "token_equivalence_status": CONTINUOUS_SCHEDULER_TOKEN_STATUS,
+        "missing_state_hash_fields": missing_state_hashes,
     }
 
 
@@ -200,6 +236,11 @@ def _aggregate_report(report: dict[str, Any], scheduler_wall_seconds: float) -> 
     completed_requests = sum(1 for request in requests if request.get("stop_reason") is not None)
     generated_tokens = sum(int(request.get("generated_token_count", 0) or 0) for request in requests)
     cache_slot_events = report.get("cache_slot_events", [])
+    missing_state_hash_request_count = sum(
+        1
+        for request in requests
+        if any(request.get(field) in (None, "") for field in REQUIRED_STATE_HASH_FIELDS)
+    )
     idle_step_count = sum(
         1
         for step in steps
@@ -227,6 +268,7 @@ def _aggregate_report(report: dict[str, Any], scheduler_wall_seconds: float) -> 
         "stop_reason_counts": {str(key): value for key, value in sorted(stop_reason_counts.items(), key=lambda item: str(item[0]))},
         "cache_slot_acquire_count": sum(1 for event in cache_slot_events if event.get("event") == "acquire"),
         "cache_slot_release_count": sum(1 for event in cache_slot_events if event.get("event") == "release"),
+        "missing_state_hash_request_count": missing_state_hash_request_count,
     }
 
 
@@ -234,6 +276,7 @@ def run_scheduler_dry_run(args: argparse.Namespace) -> dict[str, Any]:
     request_specs = _load_request_specs(args.requests_json)
     if not request_specs:
         raise ValueError("continuous scheduler dry run requires at least one request.")
+    require_state_hashes = not bool(getattr(args, "allow_missing_state_hashes", False))
     ordered_specs = sorted(
         enumerate(request_specs),
         key=lambda item: (_request_arrival_step(item[1]), item[0]),
@@ -256,7 +299,12 @@ def run_scheduler_dry_run(args: argparse.Namespace) -> dict[str, Any]:
             next_spec_index < len(ordered_specs)
             and _request_arrival_step(ordered_specs[next_spec_index][1]) <= scheduler.current_step
         ):
-            scheduler.enqueue(_build_request(ordered_specs[next_spec_index][1]))
+            scheduler.enqueue(
+                _build_request(
+                    ordered_specs[next_spec_index][1],
+                    require_state_hashes=require_state_hashes,
+                )
+            )
             next_spec_index += 1
         if steps_run >= args.max_steps:
             raise RuntimeError(f"ContinuousBatchScheduler still has work or future arrivals after {args.max_steps} steps.")
@@ -275,6 +323,8 @@ def run_scheduler_dry_run(args: argparse.Namespace) -> dict[str, Any]:
         "result_class": "continuous_scheduler_dry_run",
         "model_generation_executed": False,
         "token_equivalence_status": CONTINUOUS_SCHEDULER_TOKEN_STATUS,
+        "state_hash_policy": "required" if require_state_hashes else "allow_missing_planning_only",
+        "required_state_hash_fields": list(REQUIRED_STATE_HASH_FIELDS),
         "equivalence_scope": (
             "scheduler-only scripted-token lifecycle evidence; no model, sampling, RNG consumption, "
             "logits processors, cache tensors, or output files are executed"

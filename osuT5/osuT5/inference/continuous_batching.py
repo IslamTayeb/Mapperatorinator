@@ -135,6 +135,11 @@ class ContinuousBatchScheduler:
             raise ValueError("max_new_tokens must be positive.")
         if request.planned_arrival_step is not None and request.planned_arrival_step < 0:
             raise ValueError("planned_arrival_step must be non-negative.")
+        if request.planned_arrival_step is not None and request.planned_arrival_step > self._step_index:
+            raise ValueError(
+                "ContinuousBatchScheduler.enqueue() received a request before its planned arrival step. "
+                "Delay enqueue until planned_arrival_step or leave planned_arrival_step unset."
+            )
         if self._compatibility_key is None:
             self._compatibility_key = request.compatibility_key
         elif request.compatibility_key != self._compatibility_key:

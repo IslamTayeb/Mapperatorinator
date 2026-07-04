@@ -519,3 +519,57 @@ Recommended sequence:
 1. Keep static batching instrumentation mergeable and non-regressing.
 2. Add RNG/logits-processor/cache-slot equivalence gates against the harness.
 3. Only then wire a disabled real continuous server mode for DCC profiling.
+
+## Continuous Scheduler State-Hash / Self-Validation Gate
+
+This checkpoint strengthens the CPU-only continuous scheduler harness before any
+model-backed continuous server work. It still does not execute model generation
+and does not claim throughput.
+
+Changes:
+
+- `ContinuousBatchScheduler.enqueue()` now rejects direct enqueue of a request
+  whose `planned_arrival_step` is in the future. The dry-run harness remains the
+  owner of staggered arrival release.
+- `utils/profile_continuous_scheduler.py` requires per-request
+  `initial_rng_state_hash`, `final_rng_state_hash`,
+  `logits_processor_state_hash`, and `cache_state_hash` by default.
+  `--allow-missing-state-hashes` exists only for planning manifests and marks
+  them `state_hash_policy=allow_missing_planning_only`.
+- `utils/summarize_inference_profile.py --compare-continuous-scheduler
+  --strict` now requires `state_hash_policy=required` and performs manifest
+  self-validation on both inputs. Self-validation recomputes token hashes,
+  token counts, active-batch histograms, aggregate counts, cache-slot
+  acquire/release balance, slot-generation monotonicity, and request lifecycle
+  ordering.
+
+Local validation:
+
+```bash
+.venv/bin/python -m py_compile \
+  osuT5/osuT5/inference/continuous_batching.py \
+  utils/profile_continuous_scheduler.py \
+  utils/summarize_inference_profile.py \
+  tests/test_continuous_batching_scheduler.py \
+  tests/test_summarize_inference_profile.py
+
+rm -rf /tmp/mapperatorinator-continuous-scheduler-state-gate
+.venv/bin/python utils/profile_continuous_scheduler.py \
+  --output-root /tmp/mapperatorinator-continuous-scheduler-state-gate \
+  --suite-id local-state-gate
+.venv/bin/python utils/summarize_inference_profile.py \
+  --compare-continuous-scheduler \
+  /tmp/mapperatorinator-continuous-scheduler-state-gate/continuous_scheduler_manifest.json \
+  /tmp/mapperatorinator-continuous-scheduler-state-gate/continuous_scheduler_manifest.json \
+  --strict \
+  --json-output /tmp/mapperatorinator-continuous-scheduler-state-gate/compare-self.json
+```
+
+The CLI dry run produced `3` requests, `9` scripted tokens, active batch
+histogram `{'1': 1, '2': 4}`, and strict self-compare PASS with manifest
+self-validation PASS on both sides. The repo venv does not have `pytest`; the
+dependency-light in-process runner executed `36` batching/profile test
+functions, including the new missing-hash and self-validation cases.
+
+Decision: keep as mergeable verifier infrastructure. This is not a continuous
+batching runtime, not a static-server speedup, and not a single-song TPS claim.

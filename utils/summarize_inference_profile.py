@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -623,6 +625,17 @@ def _print_suite_metric_block(name: str, report: dict[str, Any]) -> None:
 
 STATIC_SERVER_TOKEN_STATUS = "not_checked_shared_server_rng"
 CONTINUOUS_SCHEDULER_TOKEN_STATUS = "scheduler_only_scripted_tokens"
+CONTINUOUS_SCHEDULER_STATE_HASH_FIELDS = [
+    "initial_rng_state_hash",
+    "final_rng_state_hash",
+    "logits_processor_state_hash",
+    "cache_state_hash",
+]
+
+
+def _continuous_token_sha256(tokens: list[int]) -> str:
+    payload = json.dumps([int(token) for token in tokens], separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _compare_static_server_contract(
@@ -940,12 +953,16 @@ def _compare_continuous_scheduler_result_class(baseline: dict[str, Any], candida
         "candidate_result_class": candidate.get("result_class"),
         "baseline_model_generation_executed": bool(baseline.get("model_generation_executed", True)),
         "candidate_model_generation_executed": bool(candidate.get("model_generation_executed", True)),
+        "baseline_state_hash_policy": baseline.get("state_hash_policy"),
+        "candidate_state_hash_policy": candidate.get("state_hash_policy"),
     }
     passed = (
         checks["baseline_result_class"] == "continuous_scheduler_dry_run"
         and checks["candidate_result_class"] == "continuous_scheduler_dry_run"
         and not checks["baseline_model_generation_executed"]
         and not checks["candidate_model_generation_executed"]
+        and checks["baseline_state_hash_policy"] == "required"
+        and checks["candidate_state_hash_policy"] == "required"
     )
     print("Continuous-scheduler result class")
     print(f"  {'PASS' if passed else 'FAIL'}")
@@ -1027,6 +1044,7 @@ def _compare_continuous_scheduler_state_ledger(baseline: dict[str, Any], candida
         "final_rng_state_hash",
         "logits_processor_state_hash",
         "cache_state_hash",
+        "missing_state_hash_fields",
     ]
     lifecycle_keys = [
         "enqueue_step",
@@ -1044,7 +1062,12 @@ def _compare_continuous_scheduler_state_ledger(baseline: dict[str, Any], candida
         for key in state_keys:
             baseline_value = baseline_request.get(key)
             candidate_value = candidate_request.get(key)
-            if baseline_value is None or candidate_value is None or baseline_value != candidate_value:
+            if (
+                    baseline_value is None
+                    or candidate_value is None
+                    or baseline_value != candidate_value
+                    or (key == "missing_state_hash_fields" and baseline_value)
+            ):
                 mismatches.append({
                     "index": index,
                     "request_id": _continuous_request_key(baseline_request, index),
@@ -1143,6 +1166,320 @@ def _compare_continuous_scheduler_performance(
     }
 
 
+def _counter_to_manifest_dict(counter: Counter) -> dict[str, int]:
+    return {str(key): int(value) for key, value in sorted(counter.items(), key=lambda item: str(item[0]))}
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _validate_continuous_scheduler_manifest(manifest: dict[str, Any], *, side: str) -> dict[str, Any]:
+    requests = manifest.get("requests", [])
+    steps = manifest.get("steps", [])
+    cache_slot_events = manifest.get("cache_slot_events", [])
+    aggregate = manifest.get("aggregate") or {}
+    mismatches: list[dict[str, Any]] = []
+
+    if _int_or_none(manifest.get("request_count")) != len(requests):
+        mismatches.append({
+            "side": side,
+            "key": "request_count",
+            "manifest": manifest.get("request_count"),
+            "computed": len(requests),
+        })
+
+    completed_requests = 0
+    total_generated_tokens = 0
+    stop_reason_counts: Counter = Counter()
+    planned_arrival_counts: Counter = Counter()
+    request_by_id: dict[str, dict[str, Any]] = {}
+    for index, request in enumerate(requests):
+        request_id = _continuous_request_key(request, index)
+        request_by_id[request_id] = request
+        generated_tokens = [int(token) for token in request.get("generated_tokens", [])]
+        total_generated_tokens += len(generated_tokens)
+        if request.get("generated_token_count") != len(generated_tokens):
+            mismatches.append({
+                "side": side,
+                "request_id": request_id,
+                "key": "generated_token_count",
+                "manifest": request.get("generated_token_count"),
+                "computed": len(generated_tokens),
+            })
+        computed_hash = _continuous_token_sha256(generated_tokens)
+        if request.get("generated_token_sha256") != computed_hash:
+            mismatches.append({
+                "side": side,
+                "request_id": request_id,
+                "key": "generated_token_sha256",
+                "manifest": request.get("generated_token_sha256"),
+                "computed": computed_hash,
+            })
+
+        missing_hashes = [
+            field
+            for field in CONTINUOUS_SCHEDULER_STATE_HASH_FIELDS
+            if request.get(field) in (None, "")
+        ]
+        if request.get("missing_state_hash_fields") != missing_hashes:
+            mismatches.append({
+                "side": side,
+                "request_id": request_id,
+                "key": "missing_state_hash_fields",
+                "manifest": request.get("missing_state_hash_fields"),
+                "computed": missing_hashes,
+            })
+
+        enqueue_step = request.get("enqueue_step")
+        activation_step = request.get("activation_step")
+        finish_step = request.get("finish_step")
+        planned_arrival_step = request.get("planned_arrival_step")
+        if planned_arrival_step is not None:
+            planned_arrival_counts[planned_arrival_step] += 1
+        if activation_step is not None and planned_arrival_step is not None and activation_step < planned_arrival_step:
+            mismatches.append({
+                "side": side,
+                "request_id": request_id,
+                "key": "activation_before_planned_arrival",
+                "planned_arrival_step": planned_arrival_step,
+                "activation_step": activation_step,
+            })
+        if enqueue_step is not None and activation_step is not None:
+            computed_queue_wait = activation_step - enqueue_step
+            if request.get("queue_wait_steps") != computed_queue_wait:
+                mismatches.append({
+                    "side": side,
+                    "request_id": request_id,
+                    "key": "queue_wait_steps",
+                    "manifest": request.get("queue_wait_steps"),
+                    "computed": computed_queue_wait,
+                })
+        if activation_step is not None and finish_step is not None:
+            computed_decode_steps = finish_step - activation_step + 1
+            if request.get("decode_steps") != computed_decode_steps:
+                mismatches.append({
+                    "side": side,
+                    "request_id": request_id,
+                    "key": "decode_steps",
+                    "manifest": request.get("decode_steps"),
+                    "computed": computed_decode_steps,
+                })
+        if enqueue_step is not None and finish_step is not None:
+            computed_latency_steps = finish_step - enqueue_step + 1
+            if request.get("latency_steps") != computed_latency_steps:
+                mismatches.append({
+                    "side": side,
+                    "request_id": request_id,
+                    "key": "latency_steps",
+                    "manifest": request.get("latency_steps"),
+                    "computed": computed_latency_steps,
+                })
+        if request.get("stop_reason") is not None:
+            completed_requests += 1
+        stop_reason_counts[request.get("stop_reason")] += 1
+
+    active_histogram: Counter = Counter()
+    for step in steps:
+        step_index = step.get("step_index")
+        decoded = step.get("decoded") or []
+        active_batch_size = int(step.get("active_batch_size", 0) or 0)
+        if active_batch_size != len(decoded):
+            mismatches.append({
+                "side": side,
+                "step_index": step_index,
+                "key": "active_batch_size",
+                "manifest": active_batch_size,
+                "computed": len(decoded),
+            })
+        if active_batch_size:
+            active_histogram[active_batch_size] += 1
+
+        for activation in step.get("activated") or []:
+            request_id = activation.get("request_id")
+            request = request_by_id.get(request_id)
+            if request is None:
+                mismatches.append({
+                    "side": side,
+                    "step_index": step_index,
+                    "key": "activation_unknown_request",
+                    "request_id": request_id,
+                })
+                continue
+            planned_arrival_step = request.get("planned_arrival_step")
+            if planned_arrival_step is not None and step_index is not None and step_index < planned_arrival_step:
+                mismatches.append({
+                    "side": side,
+                    "request_id": request_id,
+                    "key": "step_activation_before_planned_arrival",
+                    "planned_arrival_step": planned_arrival_step,
+                    "step_index": step_index,
+                })
+
+        for decoded in decoded:
+            request_id = decoded.get("request_id")
+            request = request_by_id.get(request_id)
+            if request is None:
+                mismatches.append({
+                    "side": side,
+                    "step_index": step_index,
+                    "key": "decode_unknown_request",
+                    "request_id": request_id,
+                })
+                continue
+            finish_step = request.get("finish_step")
+            activation_step = request.get("activation_step")
+            if activation_step is not None and step_index is not None and step_index < activation_step:
+                mismatches.append({
+                    "side": side,
+                    "request_id": request_id,
+                    "key": "decode_before_activation",
+                    "activation_step": activation_step,
+                    "step_index": step_index,
+                })
+            if finish_step is not None and step_index is not None and step_index > finish_step:
+                mismatches.append({
+                    "side": side,
+                    "request_id": request_id,
+                    "key": "decode_after_finish",
+                    "finish_step": finish_step,
+                    "step_index": step_index,
+                })
+
+    expected_active_histogram = _counter_to_manifest_dict(active_histogram)
+    if manifest.get("active_batch_size_histogram") != expected_active_histogram:
+        mismatches.append({
+            "side": side,
+            "key": "active_batch_size_histogram",
+            "manifest": manifest.get("active_batch_size_histogram"),
+            "computed": expected_active_histogram,
+        })
+    if aggregate.get("active_batch_size_histogram") != expected_active_histogram:
+        mismatches.append({
+            "side": side,
+            "key": "aggregate.active_batch_size_histogram",
+            "manifest": aggregate.get("active_batch_size_histogram"),
+            "computed": expected_active_histogram,
+        })
+
+    acquire_events = [event for event in cache_slot_events if event.get("event") == "acquire"]
+    release_events = [event for event in cache_slot_events if event.get("event") == "release"]
+    if _int_or_none(aggregate.get("cache_slot_acquire_count")) != len(acquire_events):
+        mismatches.append({
+            "side": side,
+            "key": "aggregate.cache_slot_acquire_count",
+            "manifest": aggregate.get("cache_slot_acquire_count"),
+            "computed": len(acquire_events),
+        })
+    if _int_or_none(aggregate.get("cache_slot_release_count")) != len(release_events):
+        mismatches.append({
+            "side": side,
+            "key": "aggregate.cache_slot_release_count",
+            "manifest": aggregate.get("cache_slot_release_count"),
+            "computed": len(release_events),
+        })
+
+    acquire_by_request = Counter(event.get("request_id") for event in acquire_events)
+    release_by_request = Counter(event.get("request_id") for event in release_events)
+    for request in requests:
+        request_id = request.get("request_id")
+        if acquire_by_request[request_id] != 1:
+            mismatches.append({
+                "side": side,
+                "request_id": request_id,
+                "key": "cache_slot_acquire_events",
+                "computed": acquire_by_request[request_id],
+            })
+        expected_releases = 1 if request.get("stop_reason") is not None else 0
+        if release_by_request[request_id] != expected_releases:
+            mismatches.append({
+                "side": side,
+                "request_id": request_id,
+                "key": "cache_slot_release_events",
+                "computed": release_by_request[request_id],
+                "expected": expected_releases,
+            })
+
+    last_generation_by_slot: dict[Any, int] = {}
+    for event in acquire_events:
+        slot_id = event.get("cache_slot_id")
+        generation = int(event.get("slot_generation", 0) or 0)
+        previous_generation = last_generation_by_slot.get(slot_id, 0)
+        if generation <= previous_generation:
+            mismatches.append({
+                "side": side,
+                "key": "slot_generation_monotonic",
+                "cache_slot_id": slot_id,
+                "previous_generation": previous_generation,
+                "slot_generation": generation,
+            })
+        last_generation_by_slot[slot_id] = generation
+
+    if _int_or_none(aggregate.get("request_count")) != len(requests):
+        mismatches.append({
+            "side": side,
+            "key": "aggregate.request_count",
+            "manifest": aggregate.get("request_count"),
+            "computed": len(requests),
+        })
+    if _int_or_none(aggregate.get("completed_request_count")) != completed_requests:
+        mismatches.append({
+            "side": side,
+            "key": "aggregate.completed_request_count",
+            "manifest": aggregate.get("completed_request_count"),
+            "computed": completed_requests,
+        })
+    if _int_or_none(aggregate.get("total_generated_tokens")) != total_generated_tokens:
+        mismatches.append({
+            "side": side,
+            "key": "aggregate.total_generated_tokens",
+            "manifest": aggregate.get("total_generated_tokens"),
+            "computed": total_generated_tokens,
+        })
+    expected_stop_reason_counts = _counter_to_manifest_dict(stop_reason_counts)
+    if aggregate.get("stop_reason_counts") != expected_stop_reason_counts:
+        mismatches.append({
+            "side": side,
+            "key": "aggregate.stop_reason_counts",
+            "manifest": aggregate.get("stop_reason_counts"),
+            "computed": expected_stop_reason_counts,
+        })
+    expected_arrival_counts = _counter_to_manifest_dict(planned_arrival_counts)
+    if aggregate.get("planned_arrival_step_histogram") != expected_arrival_counts:
+        mismatches.append({
+            "side": side,
+            "key": "aggregate.planned_arrival_step_histogram",
+            "manifest": aggregate.get("planned_arrival_step_histogram"),
+            "computed": expected_arrival_counts,
+        })
+    missing_state_hash_request_count = sum(
+        1
+        for request in requests
+        if any(request.get(field) in (None, "") for field in CONTINUOUS_SCHEDULER_STATE_HASH_FIELDS)
+    )
+    if _int_or_none(aggregate.get("missing_state_hash_request_count")) != missing_state_hash_request_count:
+        mismatches.append({
+            "side": side,
+            "key": "aggregate.missing_state_hash_request_count",
+            "manifest": aggregate.get("missing_state_hash_request_count"),
+            "computed": missing_state_hash_request_count,
+        })
+
+    passed = not mismatches
+    print(f"Continuous-scheduler manifest self-validation ({side})")
+    print(f"  {'PASS' if passed else 'FAIL'}")
+    if passed:
+        print(f"  requests={len(requests)}, steps={len(steps)}, cache_events={len(cache_slot_events)}")
+    else:
+        for mismatch in mismatches[:8]:
+            print(f"  {mismatch['key']}: manifest={mismatch.get('manifest')!r}, computed={mismatch.get('computed')!r}")
+    print()
+    return {"pass": passed, "mismatches": mismatches}
+
+
 def compare_continuous_scheduler_manifests(
         baseline_path: Path,
         candidate_path: Path,
@@ -1160,6 +1497,7 @@ def compare_continuous_scheduler_manifests(
         "scripted_token_equivalence": {},
         "state_ledger": {},
         "scheduling_shape": {},
+        "manifest_self_validation": {},
         "cpu_timing": {},
     }
 
@@ -1172,6 +1510,10 @@ def compare_continuous_scheduler_manifests(
     report["scripted_token_equivalence"] = _compare_continuous_scheduler_tokens(baseline, candidate)
     report["state_ledger"] = _compare_continuous_scheduler_state_ledger(baseline, candidate)
     report["scheduling_shape"] = _compare_continuous_scheduler_shape(baseline, candidate)
+    report["manifest_self_validation"] = {
+        "baseline": _validate_continuous_scheduler_manifest(baseline, side="baseline"),
+        "candidate": _validate_continuous_scheduler_manifest(candidate, side="candidate"),
+    }
     report["cpu_timing"] = _compare_continuous_scheduler_performance(
         baseline,
         candidate,
@@ -1930,6 +2272,11 @@ def main() -> None:
                 and not report["state_ledger"].get("pass", False))
             or ((args.require_mode_contract or args.strict)
                 and not report["scheduling_shape"].get("pass", False))
+            or ((args.require_mode_contract or args.strict)
+                and not (
+                    report["manifest_self_validation"].get("baseline", {}).get("pass", False)
+                    and report["manifest_self_validation"].get("candidate", {}).get("pass", False)
+                ))
             or (args.require_no_regression and not report["cpu_timing"].get("pass", False))
         )
         raise SystemExit(1 if failed else 0)
