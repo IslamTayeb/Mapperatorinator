@@ -290,6 +290,31 @@ Local validation used the repo `.venv`:
 - direct calls to `tests/test_continuous_batching_scheduler.py` and
   `tests/test_server_batch_state.py`
 
+## Batching Summary Tests
+
+Branch `codex/batching-summary-tests` adds
+`tests/test_batching_summary_helpers.py`, covering synthetic static-server
+metadata without GPU/model/audio dependencies. The tests lock down three
+important reporting rules:
+
+- `_profile_batch_summary()` preserves per-record static server metadata,
+  including batch IDs, sizes, request counts, work items, batching mode,
+  elapsed-time attribution, and queue waits.
+- `_aggregate_batch_summaries()` keeps attributed per-request batch counts
+  separate from deduped unique server-batch counts, preventing replicated
+  merged-batch elapsed metadata from inflating batch totals.
+- `utils/profile_static_server_batch.py` classifies runs with only batch size
+  `1` as `static_server_no_batch_observed`, and reports
+  `static_server_batch` only when at least one server batch size is greater
+  than `1`.
+
+Local validation used the repo `.venv`:
+
+- `python -m py_compile tests/test_batching_summary_helpers.py utils/profile_inference_suite.py utils/profile_static_server_batch.py`
+- direct calls to `tests/test_batching_summary_helpers.py`,
+  `tests/test_continuous_batching_scheduler.py`, and
+  `tests/test_server_batch_state.py`
+
 Recommended sequence:
 
 1. Keep static batching instrumentation mergeable and non-regressing.
