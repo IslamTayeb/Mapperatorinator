@@ -369,6 +369,36 @@ python utils/summarize_inference_profile.py \
   --json-output "$RUN/compare-static-server.json"
 ```
 
+Result:
+
+- Job `49268949` failed before inference because the ad hoc Slurm script had a
+  metadata-print quoting bug. No Mapperatorinator profile was produced.
+- Job `49268950` completed on `dcc-core-gpu-ferc-s-h36-5`, RTX 2080 Ti UUID
+  `GPU-cbcd7909-6bd2-1b73-d336-a63ead10aa5d`, commit `68b63d3`.
+- Run root:
+  `/work/imt11/Mapperatorinator/runs/static-server-timeout-20260704-200509-68b63d3-rerun`
+- Summary:
+  `/work/imt11/Mapperatorinator/runs/static-server-timeout-20260704-200509-68b63d3-rerun/summary.json`
+- Telemetry:
+  `/work/imt11/Mapperatorinator/runs/static-server-timeout-20260704-200509-68b63d3-rerun/nvidia-smi.csv`
+
+| timeout | main tokens | scheduler wall | scheduler-wall tok/s | result |
+| ---: | ---: | ---: | ---: | --- |
+| `0.2` | `7,474` | `65.541s` | `114.035` | baseline |
+| `0.05` | `6,392` | `62.639s` | `102.046` | comparator FAIL |
+| `0.02` | `7,163` | `91.372s` | `78.394` | comparator FAIL |
+
+Both lower-timeout runs still observed real `static_server_batch` batches and
+preserved the shared-RNG token-status label. They failed because scheduler-wall
+throughput dropped and generated main-token counts shrank. Lowering the static
+IPC coalescing wait is rejected for this workload; keep the default `0.2s`
+unless new profiling gives a concrete reason to retest.
+
+Telemetry for the whole three-pass job: `151` samples, average GPU util
+`45.46%`, max `85%`, average memory `2071.45 MiB`, max `3726 MiB`, average
+power `112.92 W`, max `249.45 W`. Active-memory samples averaged `59.57%` GPU
+util and `2700.70 MiB`.
+
 Recommended sequence:
 
 1. Keep static batching instrumentation mergeable and non-regressing.

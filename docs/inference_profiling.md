@@ -1815,6 +1815,24 @@ contract, real `static_server_batch` observation on both sides, preserved
 non-regression, and no aggregate generated-token shrinkage. This gate is
 operational throughput evidence only under the current shared server RNG policy.
 
+DCC timeout sweep job `49268950` on RTX 2080 Ti, commit `68b63d3`, tested the
+five-song 15s static server harness with default `0.2s` versus lower coalescing
+waits:
+
+| `server_batch_timeout` | main tokens | scheduler wall | scheduler-wall main tok/s | gate result |
+| ---: | ---: | ---: | ---: | --- |
+| `0.2` | `7,474` | `65.541s` | `114.035` | baseline |
+| `0.05` | `6,392` | `62.639s` | `102.046` | FAIL: `-10.5%` scheduler tok/s and generated-token shrinkage |
+| `0.02` | `7,163` | `91.372s` | `78.394` | FAIL: `-31.3%` scheduler tok/s and wall regression |
+
+Both candidates observed real static server batches and kept
+`token_equivalence_status=not_checked_shared_server_rng`, but the lower wait
+fragmented batches enough to lose throughput. Keep `0.2s` as the current static
+server default unless a new workload/profile overturns this result. Artifacts:
+`/work/imt11/Mapperatorinator/runs/static-server-timeout-20260704-200509-68b63d3-rerun/summary.json`;
+comparisons `compare-timeout020-vs-050.json` and
+`compare-timeout020-vs-020.json`.
+
 Static server batching currently uses shared global server RNG. Until an
 explicit per-request reseed/replay protocol exists, concurrent server token
 hashes are throughput diagnostics only; do not compare them against cold
