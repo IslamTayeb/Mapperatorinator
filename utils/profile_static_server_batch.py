@@ -28,6 +28,7 @@ from inference import (  # noqa: E402
     generate,
     get_config,
     get_default_logger,
+    get_server_address,
     load_model_with_server,
     setup_inference_environment,
     should_load_separate_timing_model,
@@ -73,6 +74,14 @@ def _parse_args() -> argparse.Namespace:
         "--allow-short-suite",
         action="store_true",
         help="Allow fewer than 5 songs for harness smoke tests.",
+    )
+    parser.add_argument(
+        "--allow-existing-server",
+        action="store_true",
+        help=(
+            "Permit reuse of an existing IPC server socket. Default is to fail loudly so stale "
+            "servers with different runtime flags cannot contaminate batching profiles."
+        ),
     )
     parser.add_argument(
         "overrides",
@@ -126,6 +135,39 @@ def _runtime_environment() -> dict[str, Any]:
     }
 
 
+def _server_socket_paths(args: Any) -> dict[str, str]:
+    paths = {
+        "main": get_server_address(
+            args.model_path,
+            lora_path=args.lora_path,
+            gamemode=args.gamemode,
+            auto_select_gamemode_model=args.auto_select_gamemode_model,
+        )
+    }
+    if should_load_separate_timing_model(args):
+        paths["timing"] = get_server_address(
+            args.model_path,
+            gamemode=args.gamemode,
+            auto_select_gamemode_model=False,
+        )
+    return paths
+
+
+def _validate_no_existing_server(socket_paths: dict[str, str]) -> None:
+    if os.name != "posix":
+        return
+    existing = {name: path for name, path in socket_paths.items() if Path(path).exists()}
+    if not existing:
+        return
+    details = ", ".join(f"{name}={path}" for name, path in sorted(existing.items()))
+    raise RuntimeError(
+        "Refusing to run static server batch profile with an existing IPC socket. "
+        "This harness needs a fresh server so runtime flags, RNG state, and metadata are known. "
+        f"Existing sockets: {details}. Stop the old server/remove stale sockets, or pass "
+        "--allow-existing-server only for an explicitly documented reuse run."
+    )
+
+
 def _load_server_assets(args: Any) -> dict[str, Any]:
     model, tokenizer = load_model_with_server(
         args.model_path,
@@ -177,6 +219,8 @@ def _run_request(
         raw_args: Any,
         suite_dir: Path,
         suite_id: str,
+        suite_song_count: int,
+        suite_repeat_count: int,
         run_index: int,
         repeat_index: int,
         song_entry: dict[str, Any],
@@ -213,8 +257,8 @@ def _run_request(
         repeat_index=repeat_index,
         song_index=int(song_entry["song_index"]),
         song_id=song_entry["song_id"],
-        suite_song_count=None,
-        suite_repeat_count=None,
+        suite_song_count=suite_song_count,
+        suite_repeat_count=suite_repeat_count,
         rng_reset_policy="server_global_rng_shared_across_concurrent_requests",
         server_batch_claim_scope="static_ipc_concurrent_full_song_requests",
         warmup_excluded=False,
@@ -333,6 +377,9 @@ def main() -> None:
     max_workers = cli_args.max_workers or len(song_entries)
     if max_workers <= 0:
         raise ValueError("--max-workers must be positive.")
+    socket_paths = _server_socket_paths(raw_args)
+    if not cli_args.allow_existing_server:
+        _validate_no_existing_server(socket_paths)
 
     suite_id = cli_args.suite_id or uuid.uuid4().hex[:12]
     suite_dir = Path(cli_args.output_root or raw_args.output_path) / f"static-server-batch-{suite_id}"
@@ -362,6 +409,8 @@ def main() -> None:
                         raw_args=raw_args,
                         suite_dir=suite_dir,
                         suite_id=suite_id,
+                        suite_song_count=len(song_entries),
+                        suite_repeat_count=cli_args.repeats,
                         run_index=run_index,
                         repeat_index=repeat_index,
                         song_entry=song_entry,
@@ -399,6 +448,8 @@ def main() -> None:
         "repeats": cli_args.repeats,
         "max_workers": max_workers,
         "launch_stagger_seconds": cli_args.launch_stagger_seconds,
+        "allow_existing_server": cli_args.allow_existing_server,
+        "server_socket_paths": socket_paths,
         "rng_reset_policy": "server_global_rng_shared_across_concurrent_requests",
         "equivalence_scope": (
             "static server batching is throughput evidence only unless compared against "
