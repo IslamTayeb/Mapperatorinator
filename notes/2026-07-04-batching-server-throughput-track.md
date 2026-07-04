@@ -261,9 +261,37 @@ Paired DCC regression smoke:
   an NFS temp-dir cleanup warning after successful completion; Slurm exit codes
   were `0:0`.
 
+## Continuous Scheduler Harness
+
+Branch `codex/continuous-batch-scheduler-harness` adds a CPU-only scripted
+scheduler harness in `osuT5/osuT5/inference/continuous_batching.py`. It is not
+wired into `InferenceServer`, does not change runtime behavior, and does not
+claim throughput.
+
+The harness models:
+
+- one compatibility-key group per scheduler instance;
+- FIFO and round-robin decode order policies;
+- active slot acquire/release events with slot generations;
+- scripted token emission;
+- `eos`, `max_new_tokens`, and `script_exhausted` stop reasons;
+- no post-stop decode;
+- active batch-size histograms;
+- deterministic report dictionaries with reserved RNG/logits state hash fields.
+
+It intentionally does not model real RNG, logits processors, cache tensors,
+CUDA graphs, `torch.multinomial`, or output assembly. Those are still required
+equivalence gates before any real continuous batching runtime can be considered
+same-calculation.
+
+Local validation used the repo `.venv`:
+
+- `python -m py_compile osuT5/osuT5/inference/continuous_batching.py tests/test_continuous_batching_scheduler.py tests/test_server_batch_state.py`
+- direct calls to `tests/test_continuous_batching_scheduler.py` and
+  `tests/test_server_batch_state.py`
+
 Recommended sequence:
 
 1. Keep static batching instrumentation mergeable and non-regressing.
-2. Build a dummy-model scheduler test before touching real generation.
-3. Add RNG/logits-processor/cache-slot equivalence gates.
-4. Only then profile real continuous batching on DCC.
+2. Add RNG/logits-processor/cache-slot equivalence gates against the harness.
+3. Only then wire a disabled real continuous server mode for DCC profiling.
