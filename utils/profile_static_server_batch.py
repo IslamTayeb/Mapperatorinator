@@ -481,11 +481,13 @@ def main() -> None:
         raise ValueError("profile_inference must be true for static server batch profiling.")
     if not raw_args.profile_record_token_ids:
         raise ValueError("profile_record_token_ids must be true for token hash reporting.")
-    compile_args(raw_args)
 
     song_entries = _load_song_entries(cli_args.song_list)
     if len(song_entries) < 5 and not cli_args.allow_short_suite:
         raise ValueError("static server batch profiling expects at least 5 songs.")
+    raw_args.audio_path = str(song_entries[0]["audio_path"])
+    raw_args.beatmap_path = str(song_entries[0].get("beatmap_path") or "")
+    compile_args(raw_args)
     max_workers = cli_args.max_workers or len(song_entries)
     if max_workers <= 0:
         raise ValueError("--max-workers must be positive.")
