@@ -17,7 +17,6 @@ def _load_native_decoder_layer():
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
-#include <c10/cuda/CUDAGuard.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 
@@ -153,7 +152,6 @@ torch::Tensor one_token_mlp_residual(
     TORCH_CHECK(fc2_weight.size(0) == hidden_dim, "fc2_weight hidden_dim mismatch");
     TORCH_CHECK(fc2_weight.size(1) == intermediate_dim, "fc2_weight intermediate_dim mismatch");
 
-    const c10::cuda::CUDAGuard device_guard(input.device());
     auto input_contiguous = input.contiguous();
     auto norm_weight_contiguous = norm_weight.contiguous();
     auto fc1_weight_contiguous = fc1_weight.contiguous();

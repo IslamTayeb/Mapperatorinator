@@ -7,15 +7,7 @@ import torch
 from torch import nn
 from transformers.modeling_outputs import BaseModelOutput
 
-from ..runtime_profiling import (
-    active_prefix_self_attention_context,
-    native_decoder_layer_mlp_tail_enabled,
-    native_decoder_layer_mlp_tail_outputs_per_block,
-    native_q1_rope_cache_self_attention_enabled,
-    native_q1_self_attention_enabled,
-    profile_range,
-    q1_bmm_cross_attention_enabled,
-)
+from ..runtime_profiling import active_prefix_self_attention_context, profile_range
 
 
 def _bucketed_prefix_length(cur_len: int, bucket_size: int, max_cache_len: int) -> int:
@@ -283,17 +275,7 @@ def _capture_decode_cuda_graph(
 
 
 def _cuda_graph_signature(active_prefix_length: int, model_inputs: dict[str, Any]) -> tuple[Any, ...]:
-    signature: list[Any] = [
-        active_prefix_length,
-        ("q1_bmm_cross_attention", q1_bmm_cross_attention_enabled()),
-        ("native_q1_self_attention", native_q1_self_attention_enabled()),
-        ("native_q1_rope_cache_self_attention", native_q1_rope_cache_self_attention_enabled()),
-        ("native_decoder_layer_mlp_tail", native_decoder_layer_mlp_tail_enabled()),
-        (
-            "native_decoder_layer_mlp_tail_outputs_per_block",
-            native_decoder_layer_mlp_tail_outputs_per_block(),
-        ),
-    ]
+    signature: list[Any] = [active_prefix_length]
     for key in sorted(model_inputs):
         value = model_inputs[key]
         if isinstance(value, torch.Tensor):

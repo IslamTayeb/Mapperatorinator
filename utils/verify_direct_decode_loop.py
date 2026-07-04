@@ -1428,20 +1428,6 @@ def run_direct_decode_loop_gate(
         raise ValueError("max_new_tokens must be positive")
     if tail_graph_multistep_ceiling and tail_graph_multistep_steps <= 0:
         raise ValueError("--tail-graph-multistep-steps must be positive")
-    if candidate_native_decoder_layer_mlp_tail:
-        if not candidate_decode_session:
-            raise ValueError("--candidate-native-decoder-layer-mlp-tail requires --candidate-decode-session")
-        if not candidate_cuda_graph_forward:
-            raise ValueError("--candidate-native-decoder-layer-mlp-tail requires --candidate-cuda-graph-forward")
-        if not candidate_active_prefix_decode:
-            raise ValueError("--candidate-native-decoder-layer-mlp-tail requires --candidate-active-prefix-decode")
-        if not candidate_q1_bmm_cross_attention:
-            raise ValueError("--candidate-native-decoder-layer-mlp-tail requires --candidate-q1-bmm-cross-attention")
-        if not candidate_native_q1_rope_cache_self_attention:
-            raise ValueError(
-                "--candidate-native-decoder-layer-mlp-tail requires "
-                "--candidate-native-q1-rope-cache-self-attention"
-            )
 
     compile_args(args, verbose=False)
     setup_inference_environment(args.seed)
