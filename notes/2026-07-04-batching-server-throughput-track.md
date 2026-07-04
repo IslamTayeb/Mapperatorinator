@@ -504,6 +504,16 @@ The smoke produced `3` requests, `9` scripted tokens, active batch histogram
 `{'1': 1, '2': 4}`, and strict self-compare PASS. Local in-process tests now run
 `32` batching/profile comparison tests.
 
+DCC login-node validation after the dependency-light import fix also passed on
+`main@628b0de`:
+
+- manifest:
+  `/work/imt11/Mapperatorinator/runs/continuous-scheduler-dry-run-628b0de/continuous_scheduler_manifest.json`
+- compare report:
+  `/work/imt11/Mapperatorinator/runs/continuous-scheduler-dry-run-628b0de/compare-self.json`
+- result: `3` requests, `9` scripted tokens, active batch histogram
+  `{'1': 1, '2': 4}`, strict self-compare PASS.
+
 Recommended sequence:
 
 1. Keep static batching instrumentation mergeable and non-regressing.
