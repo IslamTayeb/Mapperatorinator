@@ -1669,6 +1669,24 @@ strict token/output/no-regression gates, and it must be rejected if the
 untraced `profile_inference` gain lands below the 5% keep bar or regresses
 stage wall. See `notes/2026-07-04-native-cross-mlp-tail-verifier.md`.
 
+The bounded production spike was attempted on branch
+`codex/native-cross-mlp-production`, commits `f9bf235` and `4e7c73f`, and is
+rejected. DCC job `49266703` passed the one-token logits/top-k gate, job
+`49266798` passed the 256-step direct-loop token/logit/RNG gate, and reciprocal
+15s smoke job `49266821` preserved token/output equivalence. Full-song
+reciprocal job `49266934` also preserved exact output bytes
+(`sha256=483483a1c29ef8a44c4a8d3a82fe0778ae306470ec3157e98969eeabd92c2631`,
+`size_bytes=31709`) and all main/timing token IDs, but the speedup was only
+borderline: `271.597 -> 284.780 tok/s` (`28.126s -> 26.824s`) in control-first
+order and `268.733 -> 284.103 tok/s` (`28.426s -> 26.888s`) in candidate-first
+order. Both strict full-song comparisons failed no-regression checks, and the
+candidate-first pair regressed timing context `100.805 -> 99.725 tok/s` despite
+the candidate path being disabled for timing. Leave the production branch
+unmerged; keep only the verifier infrastructure, and do not retry this
+cross+MLP production flag without new bottleneck evidence that is comfortably
+above the keep bar and explains the timing/stage sensitivity. See
+`notes/2026-07-04-native-cross-mlp-tail-production-rejection.md`.
+
 `utils/summarize_decoder_layer_segment_pressure.py` is the segment-level stop/go auditor for native decoder-layer work. It reads a decoder-layer island report, uses captured ABI dimensions, compares measured CUDA-graph segment replay against optimistic fp32 compute/bandwidth floors, and reports whether each segment has above-floor headroom above the 5%/10% bars. DCC run `/work/imt11/Mapperatorinator/runs/decoder-layer-segment-pressure-20260704141703-0a28a3e` on the candidate-cache report showed self-attention residual `5.430s` measured / `1.513s` floor / `3.917s` above-floor, cross-attention residual `4.024s` / `1.626s` / `2.397s`, MLP residual `4.692s` / `2.789s` / `1.903s`, and whole decoder layer `15.739s` / `5.928s` / `9.811s`. All three major residual segments clear the 5% verifier bar, but no single segment reaches `500 tok/s` at its floor, and even this representative whole layer at floor projects only `414.435 tok/s`. The next implementation-worthy scope remains a multi-segment or whole-layer native math/memory verifier, not another narrow production path. See `notes/2026-07-04-decoder-layer-segment-pressure.md`.
 
 `utils/summarize_torch_trace_kernels.py` is the lightweight Chrome-trace kernel
