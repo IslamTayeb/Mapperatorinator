@@ -86,6 +86,9 @@ Compile-enabled server smoke:
   `/work/imt11/Mapperatorinator/runs/static-server-batch-smoke-20260704-142136-2d0d6d7`
 - Result: reached generation and failed in TorchInductor cudagraph-tree setup
   with `AssertionError` from `torch/_inductor/cudagraph_trees.py`.
+- Slurm cleanup: the job stayed alive after the Python failure because the
+  background server thread did not exit cleanly; it was cancelled after the
+  failure was diagnosed.
 - Decision: `use_server=true` plus `inference_generation_compile=true` is
   rejected for the current static IPC server because generation runs in a
   background batch thread. Commit `1475062` adds an `inference.py` validation
