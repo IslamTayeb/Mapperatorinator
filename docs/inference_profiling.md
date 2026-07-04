@@ -1576,6 +1576,29 @@ The decoder-layer ABI can now include an explicit self-cache write fingerprint. 
 
 Candidate cache-write checks are now part of the decoder-layer verifier. `utils/profile_decode_decoder_layer_island.py --verify-cache-write-candidates` resets the q_len=1 self-cache K/V slot to `NaN`, runs each cache-writing candidate once, fingerprints the actual written slot, and restores the reference slot before timing. `utils/validate_decoder_layer_abi.py --require-candidate-cache-write-checks` requires the repo layer, self-attention residual segment, manual decoder runtime island, and any present compiled layer to reproduce both the hidden output and cache-slot SHA256s. DCC job `49253972` on RTX 2080 Ti, branch `codex/candidate-cache-write-checks` commit `7044278`, passed the report and strict validation on `profile_salvalai_smoke15` seq9: candidate checks passed for `repo_decoder_layer`, `self_attn_residual_segment`, and `manual_decoder_runtime_island`, with zero validation failures. This is verifier-only. The same diagnostic projected the manual decoder runtime island at `15.739054s -> 15.058896s` CUDA graph replay, only `0.680159s` saved and `277.148 tok/s`, below the production keep threshold. Do not promote manual module-boundary recomposition from this; use the gate before any native whole-layer math/memory candidate. See `notes/2026-07-04-decoder-layer-candidate-cache-write-checks.md`.
 
+The native self+cross prefix verifier keeps the bottleneck focus on a
+multi-segment decoder-layer boundary. Branch
+`codex/native-self-cross-prefix-verifier` commit `e370bd5` added
+`utils/profile_decode_decoder_layer_island.py --candidate-native-self-cross-prefix`
+and cache-slot allclose/max-abs diagnostics for cache-writing candidates. DCC
+job `49258712` on RTX 2080 Ti showed the approximate native self+cross prefix is
+target-sized but not strict-cache exact: logits replay passed (`max_abs=0.0`),
+layer output allclose passed (`max_abs=7.63e-06`), cache K/V allclose passed
+(`<=7.15e-07` max abs), and projected savings were about `4.93-4.96s`
+(`~328 tok/s` projected), but cache-slot SHA checks failed, so this is not a
+same-calculation speed claim and must not be production-wired. The same report
+showed the exact manual decoder runtime island cache/output checks passing with
+`3.537833s` projected saved time, but a manual-only confirmation is the cleaner
+number: DCC job `49258725` completed with ABI validation PASS, logits replay
+PASS, cache-write checks PASS, and projected the manual decoder runtime island
+at `17.847813s -> 16.022411s`, `1.825402s` saved, `289.163 tok/s`. Treat this
+as verifier-only evidence that broad decoder-layer runtime structure remains a
+current bottleneck candidate above the 5% bar. Because earlier manual-island
+runs were flat or negative, the next step is weighted/full-bucket confirmation
+and a source-of-gap audit before any production flag through `inference.py` /
+`server.py`. See
+`notes/2026-07-04-native-self-cross-prefix-verifier.md`.
+
 `utils/summarize_decoder_layer_segment_pressure.py` is the segment-level stop/go auditor for native decoder-layer work. It reads a decoder-layer island report, uses captured ABI dimensions, compares measured CUDA-graph segment replay against optimistic fp32 compute/bandwidth floors, and reports whether each segment has above-floor headroom above the 5%/10% bars. DCC run `/work/imt11/Mapperatorinator/runs/decoder-layer-segment-pressure-20260704141703-0a28a3e` on the candidate-cache report showed self-attention residual `5.430s` measured / `1.513s` floor / `3.917s` above-floor, cross-attention residual `4.024s` / `1.626s` / `2.397s`, MLP residual `4.692s` / `2.789s` / `1.903s`, and whole decoder layer `15.739s` / `5.928s` / `9.811s`. All three major residual segments clear the 5% verifier bar, but no single segment reaches `500 tok/s` at its floor, and even this representative whole layer at floor projects only `414.435 tok/s`. The next implementation-worthy scope remains a multi-segment or whole-layer native math/memory verifier, not another narrow production path. See `notes/2026-07-04-decoder-layer-segment-pressure.md`.
 
 `utils/summarize_torch_trace_kernels.py` is the lightweight Chrome-trace kernel
