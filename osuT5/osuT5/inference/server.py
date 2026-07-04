@@ -490,6 +490,7 @@ class InferenceServer:
         self.shutdown_flag = threading.Event()
         self.listener = None
         self.connections = 0
+        self.batch_counter = 0
 
     def start(self):
         # Remove stale socket
@@ -564,6 +565,13 @@ class InferenceServer:
                         'prompt_tokens_per_sample': [],
                         'output_tokens_per_sample': [],
                         'elapsed_seconds': 0.0,
+                        'enqueued_at': time.perf_counter(),
+                        'server_batch_ids': [],
+                        'server_batch_sizes': [],
+                        'server_batch_request_counts': [],
+                        'server_batch_work_items': [],
+                        'server_batch_elapsed_seconds': [],
+                        'server_queue_wait_seconds': [],
                     }
 
                     # Enqueue request
@@ -618,6 +626,9 @@ class InferenceServer:
 
                 if not self.grouped_requests[generate_kwargs_set]:
                     del self.grouped_requests[generate_kwargs_set]
+                self.batch_counter += 1
+                batch_id = self.batch_counter
+                batch_started_at = time.perf_counter()
 
             try:
                 # Collate inputs
@@ -635,6 +646,8 @@ class InferenceServer:
                     model_kwargs[k] = torch.cat(kwargses, dim=0)
 
                 outputs, stats = model_generate(self.model, self.tokenizer, model_kwargs, generate_kwargs)
+                server_batch_size = int(stats.get('batch_size') or model_kwargs['inputs'].shape[0])
+                server_batch_elapsed_seconds = float(stats.get('elapsed_seconds', 0.0) or 0.0)
                 generated_tokens_per_sample = stats.get('generated_tokens_per_sample', [])
                 prompt_tokens_per_sample = stats.get('prompt_tokens_per_sample') or []
                 output_tokens_per_sample = stats.get('output_tokens_per_sample', [])
@@ -658,10 +671,19 @@ class InferenceServer:
                     request['prompt_tokens_per_sample'].extend(request_prompt_counts)
                     request['output_tokens_per_sample'].extend(request_output_counts)
                     request['elapsed_seconds'] += stats.get('elapsed_seconds', 0.0)
+                    request['server_batch_ids'].append(batch_id)
+                    request['server_batch_sizes'].append(server_batch_size)
+                    request['server_batch_request_counts'].append(len(batch_requests))
+                    request['server_batch_work_items'].append(work_done)
+                    request['server_batch_elapsed_seconds'].append(server_batch_elapsed_seconds)
+                    request['server_queue_wait_seconds'].append(
+                        max(0.0, batch_started_at - float(request.get('enqueued_at', batch_started_at)))
+                    )
                     if request['work_done'] >= request['total_work']:
                         # All work done for this record, signal completion
                         elapsed_seconds = request['elapsed_seconds']
                         generated_tokens = request['generated_tokens']
+                        server_queue_wait_seconds = request['server_queue_wait_seconds']
                         request['result'] = {
                             'output': request['result'],
                             'stats': {
@@ -679,6 +701,18 @@ class InferenceServer:
                                 'num_beams': stats.get('num_beams'),
                                 'cfg_scale': stats.get('cfg_scale'),
                                 'do_sample': stats.get('do_sample'),
+                                'server_batching_mode': 'static_ipc',
+                                'server_batch_count': len(request['server_batch_ids']),
+                                'server_batch_ids': request['server_batch_ids'],
+                                'server_batch_sizes': request['server_batch_sizes'],
+                                'server_batch_request_counts': request['server_batch_request_counts'],
+                                'server_batch_work_items': request['server_batch_work_items'],
+                                'server_batch_elapsed_seconds': request['server_batch_elapsed_seconds'],
+                                'server_queue_wait_seconds': server_queue_wait_seconds,
+                                'server_total_queue_wait_seconds': sum(server_queue_wait_seconds),
+                                'server_max_queue_wait_seconds': (
+                                    max(server_queue_wait_seconds) if server_queue_wait_seconds else 0.0
+                                ),
                             },
                         }
                         request['event'].set()

@@ -1544,6 +1544,16 @@ class Processor(object):
             "active_prefix_decode_cuda_graph_min_decode_steps": stats.get(
                 "active_prefix_decode_cuda_graph_min_decode_steps"
             ),
+            "server_batching_mode": stats.get("server_batching_mode"),
+            "server_batch_count": stats.get("server_batch_count"),
+            "server_batch_ids": stats.get("server_batch_ids"),
+            "server_batch_sizes": stats.get("server_batch_sizes"),
+            "server_batch_request_counts": stats.get("server_batch_request_counts"),
+            "server_batch_work_items": stats.get("server_batch_work_items"),
+            "server_batch_elapsed_seconds": stats.get("server_batch_elapsed_seconds"),
+            "server_queue_wait_seconds": stats.get("server_queue_wait_seconds"),
+            "server_total_queue_wait_seconds": stats.get("server_total_queue_wait_seconds"),
+            "server_max_queue_wait_seconds": stats.get("server_max_queue_wait_seconds"),
             "use_server": isinstance(self.model, InferenceClient),
             "parallel": self.parallel,
         }
