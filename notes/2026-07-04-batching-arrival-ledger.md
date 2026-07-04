@@ -69,3 +69,48 @@ model generation.
 Next DCC validation should rerun the existing five-song 15s static server smoke
 from this branch and compare against the latest accepted static-server manifest
 as operational throughput/no-regression evidence only.
+
+## DCC Static-Server Validation
+
+Job `49269123` ran the current branch on DCC from commit `0e6346d`:
+
+- Node/GPU: `dcc-core-ferc-s-z25-21`, RTX 2080 Ti
+  `GPU-825b182c-b59e-7d16-c8ec-6084dc8199b8`
+- Env: Python `3.10.12`, torch `2.10.0+cu128`, CUDA `12.8`
+- Run root:
+  `/work/imt11/Mapperatorinator/runs/static-server-ledger-20260704-0e6346d`
+- Telemetry:
+  `/work/imt11/Mapperatorinator/runs/static-server-ledger-20260704-0e6346d/nvidia-smi.csv`
+- Comparator:
+  `/work/imt11/Mapperatorinator/runs/static-server-ledger-20260704-0e6346d/compare-maxbatch5-vs-10.json`
+
+| max batch | main tokens | scheduler wall | scheduler-wall tok/s | p95 request wall | unique main batches |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| `5` | `16,559` | `106.028s` | `156.175` | `105.790s` | `20x size 5` |
+| `10` | `15,037` | `92.138s` | `163.201` | `91.758s` | `8x size 10`, `1x size 9`, `1x size 7`, `2x size 1`, `1x size 2` |
+
+Strict static-server comparison failed by design:
+
+- contract/result-class/shared-RNG token-status checks: PASS;
+- scheduler-wall main throughput: PASS, `+4.5%`;
+- scheduler wall: PASS, `-13.1%`;
+- p95/max request wall: PASS, `-13.3%`;
+- timing scheduler throughput: PASS, `+21.6%`;
+- generated main-token non-shrink: FAIL, `16,559 -> 15,037`.
+
+This is not a same-calculation speed claim and not an accepted new batching
+optimization. The run validates that the new metadata/ledger code still executes
+real static IPC batches and that `max_batch_size=10` still lowers scheduler wall
+and improves scheduler-wall tok/s for this workload, but shared global server RNG
+can change output lengths enough that the strict operational gate refuses
+promotion.
+
+Compared with the earlier max-batch sweep job `49268989`, current scheduler-wall
+tok/s did not regress (`134.781 -> 156.175` for maxbatch5 and `151.011 ->
+163.201` for maxbatch10), but this cross-job comparison is also throughput-only
+because shared server RNG and scheduling are not exact-equivalent.
+
+Slurm state was `FAILED` with exit code `1:0` because the strict comparator
+returned nonzero after the generated-token shrink. Both manifests and the compare
+report were written successfully. The stderr also included the known NFS temp-dir
+cleanup warning after completed server runs.

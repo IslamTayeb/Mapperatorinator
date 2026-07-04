@@ -1851,6 +1851,19 @@ evidence because static server RNG remains shared-global and request scheduling
 can change generated tokens. Artifacts:
 `/work/imt11/Mapperatorinator/runs/static-server-maxbatch-20260704-201718-195dfd7/summary.json`.
 
+DCC validation job `49269123` on RTX 2080 Ti, commit `0e6346d`, reran the same
+static-server max-batch workload after adding stricter batching ledgers. It wrote
+manifests and real static batches for both settings, and the operational runtime
+metrics still favored `max_batch_size=10`: scheduler-wall main throughput
+`156.175 -> 163.201 tok/s` (`+4.5%`), scheduler wall `106.028s -> 92.138s`
+(`-13.1%`), p95 request wall `105.790s -> 91.758s`, and timing scheduler
+throughput `15.298 -> 18.603 tok/s`. The strict comparator intentionally failed
+because generated main tokens shrank under shared server RNG (`16,559 -> 15,037`).
+Do not treat this as a new accepted batching speedup; treat it as functional
+validation that the stricter metadata still runs real static IPC batches and
+correctly blocks promotion when output-length drift is large. Artifacts:
+`/work/imt11/Mapperatorinator/runs/static-server-ledger-20260704-0e6346d/compare-maxbatch5-vs-10.json`.
+
 Static server batching currently uses shared global server RNG. Until an
 explicit per-request reseed/replay protocol exists, concurrent server token
 hashes are throughput diagnostics only; do not compare them against cold
