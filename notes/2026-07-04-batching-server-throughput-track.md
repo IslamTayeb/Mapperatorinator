@@ -195,13 +195,32 @@ state, cache slots, logits-processor state, RNG behavior, output assembly, and
 profile metadata. If exact per-request token/output/RNG behavior cannot be
 proved, report the mode only as `documented-drift`.
 
+The control plane now reserves the batch-specific flags without changing runtime
+behavior:
+
+- `inference_continuous_batching`
+- `inference_continuous_batching_mode`
+- `continuous_batch_max_active_sequences`
+- `continuous_batch_max_wait_ms`
+- `continuous_batch_prefill_policy`
+- `continuous_batch_decode_order_policy`
+- `continuous_batch_rng_policy`
+- `inference_batch_decode_session_runtime`
+- `inference_batch_native_decode_kernels`
+
+These are declared in `config.py` and `configs/inference/default.yaml`, included
+in inference profile metadata, and rejected in `inference.py` until an explicit
+continuous scheduler exists. Local validation with the repo `.venv` passed:
+default settings are accepted, changing scheduler options without
+`inference_continuous_batching=true` raises `ValueError`, batch-specific native
+flags without the master flag raise `ValueError`, and enabling continuous
+batching with `use_server=true` raises the reserved `NotImplementedError`.
+
 Recommended sequence:
 
 1. Keep static batching instrumentation mergeable and non-regressing.
-2. Add explicit continuous-batching flags and validation without changing
-   runtime behavior.
-3. Refactor server request/window state and compatibility-key helpers while
+2. Refactor server request/window state and compatibility-key helpers while
    preserving static IPC behavior.
-4. Build a dummy-model scheduler test before touching real generation.
-5. Add RNG/logits-processor/cache-slot equivalence gates.
-6. Only then profile real continuous batching on DCC.
+3. Build a dummy-model scheduler test before touching real generation.
+4. Add RNG/logits-processor/cache-slot equivalence gates.
+5. Only then profile real continuous batching on DCC.

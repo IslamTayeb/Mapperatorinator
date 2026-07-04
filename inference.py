@@ -376,6 +376,58 @@ def validate_reserved_runtime_flags(args: InferenceConfig):
         batch_multiplier = args.num_beams * (2 if args.cfg_scale > 1.0 else 1)
         return args.max_batch_size // batch_multiplier
 
+    continuous_defaults = {
+        "inference_continuous_batching_mode": "disabled",
+        "continuous_batch_max_active_sequences": 0,
+        "continuous_batch_max_wait_ms": 0,
+        "continuous_batch_prefill_policy": "serial",
+        "continuous_batch_decode_order_policy": "serial",
+        "continuous_batch_rng_policy": "serial_global",
+    }
+    continuous_requested = bool(args.inference_continuous_batching)
+    batch_runtime_requested = bool(args.inference_batch_decode_session_runtime) or bool(
+        args.inference_batch_native_decode_kernels
+    )
+    changed_continuous_options = [
+        name
+        for name, default in continuous_defaults.items()
+        if getattr(args, name) != default
+    ]
+    if changed_continuous_options and not continuous_requested:
+        raise ValueError(
+            "Continuous-batching scheduler options require inference_continuous_batching=true: "
+            + ", ".join(changed_continuous_options)
+        )
+    if batch_runtime_requested and not continuous_requested:
+        raise ValueError(
+            "Batch-specific DecodeSession/native flags require inference_continuous_batching=true."
+        )
+    if continuous_requested:
+        if not args.use_server:
+            raise ValueError("inference_continuous_batching requires use_server=true.")
+        if args.inference_continuous_batching_mode not in {"disabled", "static_decode", "continuous_decode"}:
+            raise ValueError(
+                "inference_continuous_batching_mode must be one of: disabled, static_decode, continuous_decode."
+            )
+        if args.continuous_batch_max_active_sequences <= 0:
+            raise ValueError("continuous_batch_max_active_sequences must be positive when continuous batching is enabled.")
+        if args.continuous_batch_max_wait_ms < 0:
+            raise ValueError("continuous_batch_max_wait_ms must be non-negative.")
+        if args.continuous_batch_prefill_policy not in {"serial", "batch_prefill"}:
+            raise ValueError("continuous_batch_prefill_policy must be one of: serial, batch_prefill.")
+        if args.continuous_batch_decode_order_policy not in {"serial", "arrival_order", "round_robin"}:
+            raise ValueError(
+                "continuous_batch_decode_order_policy must be one of: serial, arrival_order, round_robin."
+            )
+        if args.continuous_batch_rng_policy not in {"serial_global", "per_request_generator", "documented_drift"}:
+            raise ValueError(
+                "continuous_batch_rng_policy must be one of: serial_global, per_request_generator, documented_drift."
+            )
+        raise NotImplementedError(
+            "inference_continuous_batching is reserved for a future explicit scheduler. "
+            "Current mergeable work supports static IPC server batching and static window batching only."
+        )
+
     if args.max_batch_size <= 0:
         raise ValueError("max_batch_size must be positive.")
     if (args.use_server or args.parallel) and effective_generation_batch_size() <= 0:
@@ -626,6 +678,15 @@ def generate(
         "inference_native_decode_kernels": args.inference_native_decode_kernels,
         "inference_native_q1_self_attention": args.inference_native_q1_self_attention,
         "inference_native_q1_rope_cache_self_attention": args.inference_native_q1_rope_cache_self_attention,
+        "inference_continuous_batching": args.inference_continuous_batching,
+        "inference_continuous_batching_mode": args.inference_continuous_batching_mode,
+        "continuous_batch_max_active_sequences": args.continuous_batch_max_active_sequences,
+        "continuous_batch_max_wait_ms": args.continuous_batch_max_wait_ms,
+        "continuous_batch_prefill_policy": args.continuous_batch_prefill_policy,
+        "continuous_batch_decode_order_policy": args.continuous_batch_decode_order_policy,
+        "continuous_batch_rng_policy": args.continuous_batch_rng_policy,
+        "inference_batch_decode_session_runtime": args.inference_batch_decode_session_runtime,
+        "inference_batch_native_decode_kernels": args.inference_batch_native_decode_kernels,
         "profile_record_token_ids": args.profile_record_token_ids,
         "profile_sync_cuda": args.profile_sync_cuda,
         "profile_model_generate_cuda_ledger": args.profile_model_generate_cuda_ledger,

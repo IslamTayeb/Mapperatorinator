@@ -73,6 +73,15 @@ inference_decode_session_chunk_size: 1 # Reserved DecodeSession decode chunk siz
 inference_native_decode_kernels: false # Reserved default-off native C++/CUDA/CUTLASS decode-kernel experiments
 inference_native_q1_self_attention: false # Experimental native fp32 q_len=1 active-prefix self-attention; requires DecodeSession graph path
 inference_native_q1_rope_cache_self_attention: false # Experimental fused RoPE/cache q_len=1 self-attention; requires native q1 self-attention
+inference_continuous_batching: false # Reserved server-side continuous batching mode; not implemented yet
+inference_continuous_batching_mode: disabled # Reserved scheduler mode for future continuous batching
+continuous_batch_max_active_sequences: 0 # Reserved max active decode sequences for future continuous batching
+continuous_batch_max_wait_ms: 0 # Reserved scheduler wait budget for future continuous batching
+continuous_batch_prefill_policy: serial # Reserved prefill policy for future continuous batching
+continuous_batch_decode_order_policy: serial # Reserved decode ordering policy for future continuous batching
+continuous_batch_rng_policy: serial_global # Reserved RNG policy for future continuous batching
+inference_batch_decode_session_runtime: false # Reserved batch-specific DecodeSession runtime flag
+inference_batch_native_decode_kernels: false # Reserved batch-specific native kernel flag
 use_server: false        # Use server for optimized multiprocess inference (adds about 8% overhead)
 max_batch_size: 16       # Maximum batch size for inference
 profile_inference: false # Write stage and generation timing profile JSON
