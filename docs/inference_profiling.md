@@ -1858,6 +1858,15 @@ single-song token IDs as exact same-calculation evidence. Equivalent continuous
 or static server claims need same-policy per-request token/output hashes and RNG
 state reporting.
 
+The CPU-only continuous-batching scheduler harness is verifier infrastructure,
+not a runtime path. It now records the config and state surfaces a future model
+runtime must preserve: max active sequences, wait/prefill/decode/RNG policy,
+enqueue/activation/finish steps, queue-wait/decode/latency steps, cache
+slot/generation events, stop reasons, generated-token counts, and placeholder
+RNG/logits/cache state hashes. These fields are useful for designing continuous
+server gates, but missing or synthetic hashes still mean the result is
+`scheduler_only` evidence rather than exact model-backed continuous batching.
+
 Do not combine `use_server=true` with `inference_generation_compile=true` on the
 current static IPC server. DCC job `49267683` on RTX 2080 Ti reached generation
 but failed inside TorchInductor cudagraph tree setup with an `AssertionError`

@@ -431,6 +431,35 @@ python utils/summarize_inference_profile.py \
   --json-output "$RUN/compare-static-server-maxbatch.json"
 ```
 
+## Continuous Batching Scheduler Ledger
+
+The next mergeable continuous-batching step is still verifier infrastructure,
+not runtime. The CPU scheduler now reports the state surfaces that a future
+server-side model runtime must preserve before it can claim equivalence:
+
+- scheduler config: max active sequences, wait budget, prefill policy, decode
+  order, and RNG policy;
+- per-request enqueue, activation, and finish steps;
+- queue-wait, decode, and end-to-end latency step counts;
+- cache slot id/generation acquire and release events;
+- stop reasons and generated-token counts;
+- placeholder per-request RNG, logits-processor, and cache state hashes.
+
+This lets future continuous batching work fail loudly if it cannot account for
+request-local RNG, logits-processor state, cache slot reuse/reorder, or stopping
+behavior. It does not run the model, does not touch `InferenceServer`, and does
+not create a throughput claim.
+
+Local validation:
+
+```bash
+.venv/bin/python -m py_compile osuT5/osuT5/inference/continuous_batching.py tests/test_continuous_batching_scheduler.py
+.venv/bin/python - <<'PY'
+# in-process run of tests/test_continuous_batching_scheduler.py
+PY
+# ran 7 continuous batching tests
+```
+
 Recommended sequence:
 
 1. Keep static batching instrumentation mergeable and non-regressing.

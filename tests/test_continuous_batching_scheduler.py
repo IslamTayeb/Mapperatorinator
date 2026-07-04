@@ -14,7 +14,18 @@ def _assert_raises(exc_type, fn, message_fragment):
         raise AssertionError(f"Expected {exc_type.__name__}")
 
 
-def _request(request_id, script_tokens, *, max_new_tokens=8, eos_token_ids=(99,), key=("model", "same")):
+def _request(
+        request_id,
+        script_tokens,
+        *,
+        max_new_tokens=8,
+        eos_token_ids=(99,),
+        key=("model", "same"),
+        initial_rng_state_hash=None,
+        final_rng_state_hash=None,
+        logits_processor_state_hash=None,
+        cache_state_hash=None,
+):
     return ContinuousBatchRequest(
         request_id=request_id,
         compatibility_key=key,
@@ -23,6 +34,10 @@ def _request(request_id, script_tokens, *, max_new_tokens=8, eos_token_ids=(99,)
         eos_token_ids=eos_token_ids,
         script_tokens=list(script_tokens),
         metadata={"song": request_id},
+        initial_rng_state_hash=initial_rng_state_hash,
+        final_rng_state_hash=final_rng_state_hash,
+        logits_processor_state_hash=logits_processor_state_hash,
+        cache_state_hash=cache_state_hash,
     )
 
 
@@ -56,16 +71,23 @@ def test_fifo_lifecycle_slot_replacement_and_report_metadata():
             request["request_id"],
             request["generated_tokens"],
             request["stop_reason"],
+            request["enqueue_step"],
             request["activation_step"],
             request["finish_step"],
+            request["queue_wait_steps"],
+            request["decode_steps"],
+            request["latency_steps"],
             request["cache_slot_id"],
             request["slot_generation"],
         )
         for request in report["requests"]
     ] == [
-        ("a", [10, 99], "eos", 0, 1, 0, 1),
-        ("b", [20, 21], "max_new_tokens", 0, 1, 1, 1),
-        ("c", [30], "script_exhausted", 1, 2, 0, 2),
+        ("a", [10, 99], "eos", 0, 0, 1, 0, 2, 2, 0, 1),
+        ("b", [20, 21], "max_new_tokens", 0, 0, 1, 0, 2, 2, 1, 1),
+        ("c", [30], "script_exhausted", 0, 1, 2, 1, 2, 3, 0, 2),
+    ]
+    assert step1.activated == [
+        {"request_id": "c", "cache_slot_id": 0, "slot_generation": 2, "activation_step": 1, "queue_wait_steps": 1}
     ]
     assert report["cache_slot_events"] == [
         {"event": "acquire", "step_index": 0, "request_id": "a", "cache_slot_id": 0, "slot_generation": 1},
@@ -114,6 +136,20 @@ def test_compatibility_key_guard_and_config_validation():
         ValueError,
         lambda: ContinuousBatchScheduler(ContinuousBatchSchedulerConfig(max_active_sequences=0)),
         "max_active_sequences",
+    )
+    _assert_raises(
+        ValueError,
+        lambda: ContinuousBatchScheduler(
+            ContinuousBatchSchedulerConfig(max_active_sequences=1, max_wait_ms=-1)
+        ),
+        "max_wait_ms",
+    )
+    _assert_raises(
+        ValueError,
+        lambda: ContinuousBatchScheduler(
+            ContinuousBatchSchedulerConfig(max_active_sequences=1, prefill_policy="surprise")
+        ),
+        "prefill_policy",
     )
     _assert_raises(
         ValueError,
@@ -193,3 +229,37 @@ def test_no_post_stop_decode_for_finished_requests():
     assert report_after_finish["requests"][0]["stop_reason"] == "eos"
     assert scheduler.step().is_noop
     assert scheduler.report().to_dict()["requests"][0]["generated_tokens"] == [99]
+
+
+def test_report_preserves_exactness_ledger_hashes_and_config():
+    scheduler = ContinuousBatchScheduler(
+        ContinuousBatchSchedulerConfig(
+            max_active_sequences=1,
+            max_wait_ms=25,
+            prefill_policy="batch_prefill",
+            decode_order_policy="arrival_order",
+            rng_policy="per_request_generator",
+        )
+    )
+    scheduler.enqueue(_request(
+        "a",
+        [1],
+        initial_rng_state_hash="rng-before",
+        final_rng_state_hash="rng-after",
+        logits_processor_state_hash="logits-state",
+        cache_state_hash="cache-state",
+    ))
+
+    report = scheduler.run_until_idle(max_steps=4).to_dict()
+
+    assert report["config"] == {
+        "max_active_sequences": 1,
+        "max_wait_ms": 25,
+        "prefill_policy": "batch_prefill",
+        "decode_order_policy": "arrival_order",
+        "rng_policy": "per_request_generator",
+    }
+    assert report["requests"][0]["initial_rng_state_hash"] == "rng-before"
+    assert report["requests"][0]["final_rng_state_hash"] == "rng-after"
+    assert report["requests"][0]["logits_processor_state_hash"] == "logits-state"
+    assert report["requests"][0]["cache_state_hash"] == "cache-state"

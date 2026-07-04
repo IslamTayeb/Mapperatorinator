@@ -8,6 +8,8 @@ from typing import Any, Deque
 @dataclass(frozen=True)
 class ContinuousBatchSchedulerConfig:
     max_active_sequences: int
+    max_wait_ms: int = 0
+    prefill_policy: str = "serial"
     decode_order_policy: str = "arrival_order"
     rng_policy: str = "serial_global"
 
@@ -21,7 +23,12 @@ class ContinuousBatchRequest:
     eos_token_ids: tuple[int, ...] = ()
     script_tokens: list[int] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    initial_rng_state_hash: str | None = None
+    final_rng_state_hash: str | None = None
+    logits_processor_state_hash: str | None = None
+    cache_state_hash: str | None = None
     enqueue_order: int | None = None
+    enqueue_step: int | None = None
     activation_step: int | None = None
     finish_step: int | None = None
     generated_tokens: list[int] = field(default_factory=list)
@@ -93,6 +100,10 @@ class ContinuousBatchScheduler:
     def __init__(self, config: ContinuousBatchSchedulerConfig):
         if config.max_active_sequences <= 0:
             raise ValueError("max_active_sequences must be positive.")
+        if config.max_wait_ms < 0:
+            raise ValueError("max_wait_ms must be non-negative.")
+        if config.prefill_policy not in {"serial", "batch_prefill"}:
+            raise ValueError("prefill_policy must be one of: serial, batch_prefill.")
         if config.decode_order_policy not in {"arrival_order", "round_robin"}:
             raise ValueError("decode_order_policy must be one of: arrival_order, round_robin.")
         if config.rng_policy not in {"serial_global", "per_request_generator", "documented_drift"}:
@@ -127,6 +138,7 @@ class ContinuousBatchScheduler:
             raise ValueError("ContinuousBatchScheduler accepts one compatibility_key group at a time.")
 
         request.enqueue_order = self._next_enqueue_order
+        request.enqueue_step = self._step_index
         self._next_enqueue_order += 1
         self._requests[request.request_id] = request
         self._pending.append(request)
@@ -213,6 +225,8 @@ class ContinuousBatchScheduler:
         return ContinuousBatchReport(
             config={
                 "max_active_sequences": self.config.max_active_sequences,
+                "max_wait_ms": self.config.max_wait_ms,
+                "prefill_policy": self.config.prefill_policy,
                 "decode_order_policy": self.config.decode_order_policy,
                 "rng_policy": self.config.rng_policy,
             },
@@ -266,6 +280,7 @@ class ContinuousBatchScheduler:
                 "cache_slot_id": slot.slot_id,
                 "slot_generation": slot.slot_generation,
                 "activation_step": request.activation_step,
+                "queue_wait_steps": self._queue_wait_steps(request),
             })
         return activated
 
@@ -308,6 +323,8 @@ class ContinuousBatchScheduler:
             "cache_slot_id": slot.slot_id,
             "slot_generation": slot.slot_generation,
             "finish_step": request.finish_step,
+            "decode_steps": self._decode_steps(request),
+            "latency_steps": self._latency_steps(request),
             "stop_reason": stop_reason,
             "generated_tokens": list(request.generated_tokens),
         }
@@ -328,11 +345,35 @@ class ContinuousBatchScheduler:
             "generated_tokens": list(request.generated_tokens),
             "generated_token_count": len(request.generated_tokens),
             "stop_reason": request.stop_reason,
+            "enqueue_step": request.enqueue_step,
             "activation_step": request.activation_step,
             "finish_step": request.finish_step,
+            "queue_wait_steps": ContinuousBatchScheduler._queue_wait_steps(request),
+            "decode_steps": ContinuousBatchScheduler._decode_steps(request),
+            "latency_steps": ContinuousBatchScheduler._latency_steps(request),
             "cache_slot_id": request.slot_id,
             "slot_generation": request.slot_generation,
             "metadata": dict(request.metadata),
-            "rng_state_hash": None,
-            "logits_processor_state_hash": None,
+            "initial_rng_state_hash": request.initial_rng_state_hash,
+            "final_rng_state_hash": request.final_rng_state_hash,
+            "logits_processor_state_hash": request.logits_processor_state_hash,
+            "cache_state_hash": request.cache_state_hash,
         }
+
+    @staticmethod
+    def _queue_wait_steps(request: ContinuousBatchRequest) -> int | None:
+        if request.enqueue_step is None or request.activation_step is None:
+            return None
+        return request.activation_step - request.enqueue_step
+
+    @staticmethod
+    def _decode_steps(request: ContinuousBatchRequest) -> int | None:
+        if request.activation_step is None or request.finish_step is None:
+            return None
+        return request.finish_step - request.activation_step + 1
+
+    @staticmethod
+    def _latency_steps(request: ContinuousBatchRequest) -> int | None:
+        if request.enqueue_step is None or request.finish_step is None:
+            return None
+        return request.finish_step - request.enqueue_step + 1
