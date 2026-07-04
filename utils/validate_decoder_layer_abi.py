@@ -166,7 +166,111 @@ def _check_cache_layer(
         )
 
 
-def _validate_signature(signature: str, signature_report: dict[str, Any]) -> dict[str, Any]:
+def _is_sha256(value: Any) -> bool:
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    return all(char in "0123456789abcdef" for char in value)
+
+
+def _check_tensor_fingerprint(
+        fingerprint: dict[str, Any] | None,
+        *,
+        path: str,
+        failures: list[str],
+        expected_dtype: str,
+        expected_shape: list[int],
+) -> None:
+    if not isinstance(fingerprint, dict):
+        _fail(failures, path, "missing tensor fingerprint")
+        return
+    if not _is_sha256(fingerprint.get("sha256")):
+        _fail(failures, f"{path}.sha256", "missing or invalid SHA256")
+    num_bytes = fingerprint.get("num_bytes")
+    expected_bytes = expected_shape[0] * expected_shape[1] * expected_shape[2] * expected_shape[3] * 4
+    if not isinstance(num_bytes, int) or num_bytes != expected_bytes:
+        _fail(failures, f"{path}.num_bytes", f"expected {expected_bytes}, got {num_bytes!r}")
+    if fingerprint.get("hash_layout") != "contiguous_tensor_bytes":
+        _fail(failures, f"{path}.hash_layout", "expected contiguous_tensor_bytes")
+    if fingerprint.get("hash_dtype") != expected_dtype:
+        _fail(failures, f"{path}.hash_dtype", f"expected {expected_dtype!r}")
+    _check_tensor(
+        fingerprint.get("tensor"),
+        path=f"{path}.tensor",
+        failures=failures,
+        expected_dtype=expected_dtype,
+        expected_shape=expected_shape,
+        require_cuda=True,
+        require_contiguous=None,
+    )
+
+
+def _check_cache_write_fingerprint(
+        fingerprint: dict[str, Any] | None,
+        *,
+        path: str,
+        failures: list[str],
+        report_cache_position: list[int] | None,
+        active_prefix_len: int,
+        self_cache_len: int,
+        heads: int,
+        head_dim: int,
+        expected_dtype: str = "torch.float32",
+) -> None:
+    if not isinstance(fingerprint, dict):
+        _fail(failures, path, "missing cache-write fingerprint")
+        return
+    if fingerprint.get("schema_version") != 1:
+        _fail(failures, f"{path}.schema_version", f"expected 1, got {fingerprint.get('schema_version')!r}")
+    if fingerprint.get("available") is not True:
+        _fail(failures, f"{path}.available", f"expected true, got {fingerprint.get('available')!r}")
+        return
+    cache_position = fingerprint.get("cache_position")
+    if not isinstance(cache_position, int):
+        _fail(failures, f"{path}.cache_position", f"expected int, got {cache_position!r}")
+    elif report_cache_position is not None and report_cache_position != [cache_position]:
+        _fail(
+            failures,
+            f"{path}.cache_position",
+            f"{cache_position} does not match report cache_position {report_cache_position}",
+        )
+    if fingerprint.get("active_prefix_length") != active_prefix_len:
+        _fail(
+            failures,
+            f"{path}.active_prefix_length",
+            f"{fingerprint.get('active_prefix_length')} != {active_prefix_len}",
+        )
+    if fingerprint.get("max_cache_len") != self_cache_len:
+        _fail(failures, f"{path}.max_cache_len", f"{fingerprint.get('max_cache_len')} != {self_cache_len}")
+    if fingerprint.get("position_within_cache") is not True:
+        _fail(failures, f"{path}.position_within_cache", "expected true")
+    if fingerprint.get("position_within_active_prefix") is not True:
+        _fail(failures, f"{path}.position_within_active_prefix", "expected true")
+    if fingerprint.get("slot_shape_contract") != "[batch, heads, 1, head_dim]":
+        _fail(failures, f"{path}.slot_shape_contract", "unexpected slot shape contract")
+    expected_slot_shape = [1, heads, 1, head_dim]
+    _check_tensor_fingerprint(
+        fingerprint.get("keys"),
+        path=f"{path}.keys",
+        failures=failures,
+        expected_dtype=expected_dtype,
+        expected_shape=expected_slot_shape,
+    )
+    _check_tensor_fingerprint(
+        fingerprint.get("values"),
+        path=f"{path}.values",
+        failures=failures,
+        expected_dtype=expected_dtype,
+        expected_shape=expected_slot_shape,
+    )
+
+
+def _validate_signature(
+        signature: str,
+        signature_report: dict[str, Any],
+        *,
+        require_cache_write_fingerprint: bool,
+        report_cache_position: list[int] | None,
+) -> dict[str, Any]:
     failures: list[str] = []
     warnings: list[str] = []
     abi = signature_report.get("native_decoder_layer_abi")
@@ -306,6 +410,17 @@ def _validate_signature(signature: str, signature_report: dict[str, Any]) -> dic
         cache_len=encoder_len,
         head_dim=head_dim,
     )
+    if require_cache_write_fingerprint:
+        _check_cache_write_fingerprint(
+            abi.get("cache_write_fingerprint"),
+            path=f"{signature}.cache_write_fingerprint",
+            failures=failures,
+            report_cache_position=report_cache_position,
+            active_prefix_len=active_prefix_len,
+            self_cache_len=self_cache_len,
+            heads=heads,
+            head_dim=head_dim,
+        )
 
     return {
         "signature": signature,
@@ -320,10 +435,19 @@ def _validate_signature(signature: str, signature_report: dict[str, Any]) -> dic
         "active_prefix_length": active_prefix_len,
         "encoder_len": encoder_len,
         "self_cache_len": self_cache_len,
+        "cache_write_fingerprint": (
+            isinstance(abi.get("cache_write_fingerprint"), dict)
+            and abi.get("cache_write_fingerprint", {}).get("available") is True
+        ),
     }
 
 
-def validate_decoder_layer_abi(report: dict[str, Any], *, require_logits_replay: bool = True) -> dict[str, Any]:
+def validate_decoder_layer_abi(
+        report: dict[str, Any],
+        *,
+        require_logits_replay: bool = True,
+        require_cache_write_fingerprint: bool = False,
+) -> dict[str, Any]:
     failures: list[str] = []
     warnings: list[str] = []
     if require_logits_replay:
@@ -344,8 +468,22 @@ def validate_decoder_layer_abi(report: dict[str, Any], *, require_logits_replay:
         _fail(failures, "signature_reports", "missing or empty")
         signature_results: list[dict[str, Any]] = []
     else:
+        report_cache_position = report.get("cache_position")
+        if report_cache_position is not None:
+            if not (
+                    isinstance(report_cache_position, list)
+                    and len(report_cache_position) == 1
+                    and isinstance(report_cache_position[0], int)
+            ):
+                _fail(failures, "report.cache_position", "expected one integer cache position")
+                report_cache_position = None
         signature_results = [
-            _validate_signature(signature, signature_report)
+            _validate_signature(
+                signature,
+                signature_report,
+                require_cache_write_fingerprint=require_cache_write_fingerprint,
+                report_cache_position=report_cache_position,
+            )
             for signature, signature_report in sorted(signatures.items())
             if isinstance(signature_report, dict)
         ]
@@ -358,6 +496,7 @@ def validate_decoder_layer_abi(report: dict[str, Any], *, require_logits_replay:
         "failures": failures,
         "warnings": warnings,
         "signature_count": len(signature_results),
+        "require_cache_write_fingerprint": bool(require_cache_write_fingerprint),
         "signatures": signature_results,
     }
     return result
@@ -378,7 +517,8 @@ def print_summary(result: dict[str, Any]) -> None:
             f"ffn={signature.get('ffn_dim')} "
             f"heads={signature.get('heads')} "
             f"prefix={signature.get('active_prefix_length')} "
-            f"encoder={signature.get('encoder_len')}"
+            f"encoder={signature.get('encoder_len')} "
+            f"cache_fingerprint={signature.get('cache_write_fingerprint')}"
         )
     if result["failures"]:
         print("Failures:")
@@ -400,11 +540,17 @@ def main() -> None:
     parser.add_argument("report", type=Path)
     parser.add_argument("--json-output", type=Path, default=None)
     parser.add_argument("--allow-missing-logits-replay", action="store_true")
+    parser.add_argument(
+        "--require-cache-write-fingerprint",
+        action="store_true",
+        help="Require q_len=1 self-cache K/V slot fingerprints in native_decoder_layer_abi.",
+    )
     args = parser.parse_args()
 
     result = validate_decoder_layer_abi(
         _load_json(args.report),
         require_logits_replay=not args.allow_missing_logits_replay,
+        require_cache_write_fingerprint=args.require_cache_write_fingerprint,
     )
     if args.json_output is not None:
         args.json_output.parent.mkdir(parents=True, exist_ok=True)

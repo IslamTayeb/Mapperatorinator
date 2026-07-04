@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -61,6 +62,7 @@ class DecoderLayerCapture:
     encoder_max_seqlen: int | None
     output: torch.Tensor
     active_prefix_length: int
+    cache_write_fingerprint: dict[str, Any] | None
 
 
 def _clone_tensor(value: Any) -> Any:
@@ -131,6 +133,90 @@ def _cache_layer_metadata(cache: Any, layer_idx: int) -> dict[str, Any] | None:
         "is_initialized": bool(getattr(layer, "is_initialized", False)),
         "keys": _tensor_metadata(getattr(layer, "keys", None)),
         "values": _tensor_metadata(getattr(layer, "values", None)),
+    }
+
+
+def _tensor_fingerprint(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, torch.Tensor):
+        return None
+    contiguous_cpu = value.detach().contiguous().cpu()
+    try:
+        payload = contiguous_cpu.numpy().tobytes()
+    except TypeError:
+        payload = contiguous_cpu.view(torch.uint8).numpy().tobytes()
+    return {
+        "tensor": _tensor_metadata(value),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "num_bytes": int(len(payload)),
+        "hash_layout": "contiguous_tensor_bytes",
+        "hash_dtype": str(contiguous_cpu.dtype),
+    }
+
+
+def _cache_write_fingerprint(
+        past_key_value: Any,
+        *,
+        layer_idx: int,
+        cache_position: torch.Tensor,
+        active_prefix_length: int,
+) -> dict[str, Any]:
+    position_values = [int(item) for item in cache_position.detach().cpu().view(-1).tolist()]
+    if len(position_values) != 1:
+        return {
+            "schema_version": 1,
+            "available": False,
+            "reason": f"expected scalar cache_position, got {position_values}",
+            "cache_position_values": position_values,
+        }
+    cache_pos = int(position_values[0])
+    self_cache = getattr(past_key_value, "self_attention_cache", None)
+    layers = getattr(self_cache, "layers", None)
+    if not isinstance(layers, (list, tuple)) or layer_idx >= len(layers):
+        return {
+            "schema_version": 1,
+            "available": False,
+            "reason": "missing self-attention cache layer",
+            "cache_position": cache_pos,
+        }
+    layer = layers[layer_idx]
+    keys = getattr(layer, "keys", None)
+    values = getattr(layer, "values", None)
+    if not isinstance(keys, torch.Tensor) or not isinstance(values, torch.Tensor):
+        return {
+            "schema_version": 1,
+            "available": False,
+            "reason": "missing tensor keys/values",
+            "cache_position": cache_pos,
+        }
+    if keys.dim() != 4 or values.dim() != 4:
+        return {
+            "schema_version": 1,
+            "available": False,
+            "reason": f"expected 4D keys/values, got {list(keys.shape)} and {list(values.shape)}",
+            "cache_position": cache_pos,
+        }
+    max_cache_len = int(keys.shape[2])
+    if cache_pos < 0 or cache_pos >= max_cache_len:
+        return {
+            "schema_version": 1,
+            "available": False,
+            "reason": f"cache_position {cache_pos} outside cache length {max_cache_len}",
+            "cache_position": cache_pos,
+            "max_cache_len": max_cache_len,
+        }
+    key_slot = keys[:, :, cache_pos:cache_pos + 1, :]
+    value_slot = values[:, :, cache_pos:cache_pos + 1, :]
+    return {
+        "schema_version": 1,
+        "available": True,
+        "cache_position": cache_pos,
+        "active_prefix_length": int(active_prefix_length),
+        "max_cache_len": max_cache_len,
+        "position_within_cache": bool(cache_pos < max_cache_len),
+        "position_within_active_prefix": bool(cache_pos < int(active_prefix_length)),
+        "slot_shape_contract": "[batch, heads, 1, head_dim]",
+        "keys": _tensor_fingerprint(key_slot),
+        "values": _tensor_fingerprint(value_slot),
     }
 
 
@@ -225,6 +311,7 @@ def _decoder_layer_abi_manifest(capture: DecoderLayerCapture) -> dict[str, Any]:
             "self_layer": _cache_layer_metadata(self_cache, capture.layer_idx),
             "cross_layer": _cache_layer_metadata(cross_cache, capture.layer_idx),
         },
+        "cache_write_fingerprint": capture.cache_write_fingerprint,
         "guardrails": {
             "batch_size_1": (
                 isinstance(capture.hidden_states, torch.Tensor)
@@ -527,6 +614,7 @@ def _capture_decoder_layers(
         active_prefix_length: int,
         native_q1_rope_cache_self_attention: bool,
         sdpa_backend: str | None,
+        include_cache_write_fingerprint: bool,
 ) -> tuple[dict[str, DecoderLayerCapture], torch.Tensor]:
     captures: dict[str, DecoderLayerCapture] = {}
     handles = []
@@ -562,9 +650,20 @@ def _capture_decoder_layers(
                 raise RuntimeError(f"{name} did not receive past_key_value")
             if not isinstance(cache_position, torch.Tensor):
                 raise RuntimeError(f"{name} did not receive tensor cache_position")
+            layer_idx = int(match.group(2))
+            cache_write_fingerprint = (
+                _cache_write_fingerprint(
+                    past_key_value,
+                    layer_idx=layer_idx,
+                    cache_position=cache_position,
+                    active_prefix_length=active_prefix_length,
+                )
+                if include_cache_write_fingerprint
+                else None
+            )
             captures[name] = DecoderLayerCapture(
                 name=name,
-                layer_idx=int(match.group(2)),
+                layer_idx=layer_idx,
                 module=module,
                 hidden_states=hidden_states.detach(),
                 attention_mask=_clone_tensor(kwargs.get("attention_mask")),
@@ -578,6 +677,7 @@ def _capture_decoder_layers(
                 encoder_max_seqlen=kwargs.get("encoder_max_seqlen"),
                 output=output[0].detach(),
                 active_prefix_length=active_prefix_length,
+                cache_write_fingerprint=cache_write_fingerprint,
             )
 
         return hook
@@ -621,6 +721,7 @@ def profile_decode_decoder_layer_island(
         full_song_decode_steps: int,
         full_song_main_tokens: int,
         full_song_model_time_s: float,
+        include_cache_write_fingerprint: bool,
 ) -> dict[str, Any]:
     if not torch.cuda.is_available():
         raise RuntimeError("Decode decoder-layer island profiling requires CUDA")
@@ -667,6 +768,7 @@ def profile_decode_decoder_layer_island(
         "full_song_decode_steps": int(full_song_decode_steps),
         "full_song_main_tokens": int(full_song_main_tokens),
         "full_song_model_time_s": float(full_song_model_time_s),
+        "include_cache_write_fingerprint": bool(include_cache_write_fingerprint),
     }
     prompt = model_inputs["decoder_input_ids"]
     prompt_mask = model_inputs["decoder_attention_mask"]
@@ -753,6 +855,7 @@ def profile_decode_decoder_layer_island(
             active_prefix_length=active_prefix_length,
             native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
             sdpa_backend=args.profile_sdpa_backend,
+            include_cache_write_fingerprint=include_cache_write_fingerprint,
         )
 
     if not captures:
@@ -968,6 +1071,14 @@ def main() -> None:
     parser.add_argument("--full-song-decode-steps", type=int, default=7552)
     parser.add_argument("--full-song-main-tokens", type=int, default=7639)
     parser.add_argument("--full-song-model-time-s", type=float, default=28.243)
+    parser.add_argument(
+        "--include-cache-write-fingerprint",
+        action="store_true",
+        help=(
+            "Include SHA256 fingerprints for the q_len=1 self-cache K/V slot written by each "
+            "representative decoder layer. Diagnostic verifier metadata only."
+        ),
+    )
     parser.add_argument("--report-path", type=Path, default=None)
     parser.add_argument("overrides", nargs="*", help="Hydra overrides, e.g. model_path=/path/to/model")
     cli_args = parser.parse_args()
@@ -990,6 +1101,7 @@ def main() -> None:
         full_song_decode_steps=cli_args.full_song_decode_steps,
         full_song_main_tokens=cli_args.full_song_main_tokens,
         full_song_model_time_s=cli_args.full_song_model_time_s,
+        include_cache_write_fingerprint=cli_args.include_cache_write_fingerprint,
     )
     result["metadata"]["config_name"] = cli_args.config_name
     result["wall_seconds"] = time.perf_counter() - start
