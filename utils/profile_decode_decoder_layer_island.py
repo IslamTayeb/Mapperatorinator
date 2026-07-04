@@ -326,7 +326,10 @@ def _verify_cache_write_candidate(
             cache_position=capture.cache_position,
             active_prefix_length=capture.active_prefix_length,
         )
+        actual_key_slot, actual_value_slot = _cache_slot_views(capture)
         match = _cache_fingerprint_matches(expected_fingerprint, actual_fingerprint)
+        keys_allclose = _allclose(reference_key, actual_key_slot, atol=atol, rtol=rtol)
+        values_allclose = _allclose(reference_value, actual_value_slot, atol=atol, rtol=rtol)
         output_allclose = _allclose(expected_output, output, atol=atol, rtol=rtol)
         return {
             "checked": True,
@@ -335,6 +338,10 @@ def _verify_cache_write_candidate(
             "slot_reset_fill": "nan",
             "output_allclose": bool(output_allclose),
             "output_max_abs": _max_abs(expected_output, output),
+            "keys_allclose": bool(keys_allclose),
+            "values_allclose": bool(values_allclose),
+            "keys_max_abs": _max_abs(reference_key, actual_key_slot),
+            "values_max_abs": _max_abs(reference_value, actual_value_slot),
             "actual": actual_fingerprint,
             **match,
         }
@@ -1435,7 +1442,12 @@ def profile_decode_decoder_layer_island(
                     "checked": bool(cache_check.get("checked")),
                     "keys_match": cache_check.get("keys_match"),
                     "values_match": cache_check.get("values_match"),
+                    "keys_allclose": cache_check.get("keys_allclose"),
+                    "values_allclose": cache_check.get("values_allclose"),
+                    "keys_max_abs": cache_check.get("keys_max_abs"),
+                    "values_max_abs": cache_check.get("values_max_abs"),
                     "output_allclose": cache_check.get("output_allclose"),
+                    "output_max_abs": cache_check.get("output_max_abs"),
                     "error": cache_check.get("error"),
                     "reason": cache_check.get("reason"),
                 })
