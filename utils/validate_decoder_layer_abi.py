@@ -264,11 +264,60 @@ def _check_cache_write_fingerprint(
     )
 
 
+def _check_candidate_cache_write_checks(
+        signature: str,
+        signature_report: dict[str, Any],
+        *,
+        failures: list[str],
+) -> None:
+    results = signature_report.get("results")
+    if not isinstance(results, dict):
+        _fail(failures, f"{signature}.results", "missing results for candidate cache-write checks")
+        return
+    required_variants = [
+        name
+        for name in ("repo_decoder_layer", "self_attn_residual_segment", "manual_decoder_runtime_island", "compiled_decoder_layer")
+        if name in results
+    ]
+    if not required_variants:
+        _fail(failures, f"{signature}.results", "no cache-writing variants present")
+        return
+    for variant in required_variants:
+        variant_result = results.get(variant)
+        if not isinstance(variant_result, dict):
+            _fail(failures, f"{signature}.results.{variant}", "missing variant result")
+            continue
+        cache_check = variant_result.get("cache_write_check")
+        if not isinstance(cache_check, dict):
+            _fail(failures, f"{signature}.results.{variant}.cache_write_check", "missing cache-write check")
+            continue
+        for key in ("checked", "pass", "matches_expected", "keys_match", "values_match", "output_allclose"):
+            if cache_check.get(key) is not True:
+                _fail(
+                    failures,
+                    f"{signature}.results.{variant}.cache_write_check.{key}",
+                    f"expected true, got {cache_check.get(key)!r}",
+                )
+        actual = cache_check.get("actual")
+        if not isinstance(actual, dict) or actual.get("available") is not True:
+            _fail(failures, f"{signature}.results.{variant}.cache_write_check.actual", "missing actual fingerprint")
+        else:
+            for name in ("keys", "values"):
+                fingerprint = actual.get(name)
+                if not isinstance(fingerprint, dict) or not _is_sha256(fingerprint.get("sha256")):
+                    _fail(
+                        failures,
+                        f"{signature}.results.{variant}.cache_write_check.actual.{name}.sha256",
+                        "missing or invalid SHA256",
+                    )
+
+
 def _validate_signature(
         signature: str,
         signature_report: dict[str, Any],
         *,
         require_cache_write_fingerprint: bool,
+        require_candidate_cache_write_checks: bool,
         report_cache_position: list[int] | None,
 ) -> dict[str, Any]:
     failures: list[str] = []
@@ -421,6 +470,8 @@ def _validate_signature(
             heads=heads,
             head_dim=head_dim,
         )
+    if require_candidate_cache_write_checks:
+        _check_candidate_cache_write_checks(signature, signature_report, failures=failures)
 
     return {
         "signature": signature,
@@ -447,6 +498,7 @@ def validate_decoder_layer_abi(
         *,
         require_logits_replay: bool = True,
         require_cache_write_fingerprint: bool = False,
+        require_candidate_cache_write_checks: bool = False,
 ) -> dict[str, Any]:
     failures: list[str] = []
     warnings: list[str] = []
@@ -482,6 +534,7 @@ def validate_decoder_layer_abi(
                 signature,
                 signature_report,
                 require_cache_write_fingerprint=require_cache_write_fingerprint,
+                require_candidate_cache_write_checks=require_candidate_cache_write_checks,
                 report_cache_position=report_cache_position,
             )
             for signature, signature_report in sorted(signatures.items())
@@ -497,6 +550,7 @@ def validate_decoder_layer_abi(
         "warnings": warnings,
         "signature_count": len(signature_results),
         "require_cache_write_fingerprint": bool(require_cache_write_fingerprint),
+        "require_candidate_cache_write_checks": bool(require_candidate_cache_write_checks),
         "signatures": signature_results,
     }
     return result
@@ -545,12 +599,18 @@ def main() -> None:
         action="store_true",
         help="Require q_len=1 self-cache K/V slot fingerprints in native_decoder_layer_abi.",
     )
+    parser.add_argument(
+        "--require-candidate-cache-write-checks",
+        action="store_true",
+        help="Require cache-writing decoder-layer benchmark variants to reproduce the reference K/V slot.",
+    )
     args = parser.parse_args()
 
     result = validate_decoder_layer_abi(
         _load_json(args.report),
         require_logits_replay=not args.allow_missing_logits_replay,
         require_cache_write_fingerprint=args.require_cache_write_fingerprint,
+        require_candidate_cache_write_checks=args.require_candidate_cache_write_checks,
     )
     if args.json_output is not None:
         args.json_output.parent.mkdir(parents=True, exist_ok=True)

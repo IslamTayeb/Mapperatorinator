@@ -45,6 +45,14 @@ from utils.verify_one_token_decode import (
 )
 
 
+CACHE_WRITING_VARIANTS = {
+    "repo_decoder_layer",
+    "self_attn_residual_segment",
+    "manual_decoder_runtime_island",
+    "compiled_decoder_layer",
+}
+
+
 @dataclass
 class DecoderLayerCapture:
     name: str
@@ -218,6 +226,113 @@ def _cache_write_fingerprint(
         "keys": _tensor_fingerprint(key_slot),
         "values": _tensor_fingerprint(value_slot),
     }
+
+
+def _cache_slot_views(capture: DecoderLayerCapture) -> tuple[torch.Tensor, torch.Tensor]:
+    self_cache = getattr(capture.past_key_value, "self_attention_cache", None)
+    layers = getattr(self_cache, "layers", None)
+    if not isinstance(layers, (list, tuple)) or capture.layer_idx >= len(layers):
+        raise RuntimeError("missing self-attention cache layer")
+    layer = layers[capture.layer_idx]
+    keys = getattr(layer, "keys", None)
+    values = getattr(layer, "values", None)
+    if not isinstance(keys, torch.Tensor) or not isinstance(values, torch.Tensor):
+        raise RuntimeError("missing tensor keys/values")
+    positions = [int(item) for item in capture.cache_position.detach().cpu().view(-1).tolist()]
+    if len(positions) != 1:
+        raise RuntimeError(f"expected scalar cache_position, got {positions}")
+    pos = positions[0]
+    if pos < 0 or pos >= int(keys.shape[2]):
+        raise RuntimeError(f"cache_position {pos} outside cache length {int(keys.shape[2])}")
+    return keys[:, :, pos:pos + 1, :], values[:, :, pos:pos + 1, :]
+
+
+def _restore_cache_slot(capture: DecoderLayerCapture, key_slot: torch.Tensor, value_slot: torch.Tensor) -> None:
+    keys, values = _cache_slot_views(capture)
+    keys.copy_(key_slot)
+    values.copy_(value_slot)
+
+
+def _cache_fingerprint_matches(expected: dict[str, Any] | None, actual: dict[str, Any] | None) -> dict[str, Any]:
+    expected_keys = expected.get("keys") if isinstance(expected, dict) else None
+    expected_values = expected.get("values") if isinstance(expected, dict) else None
+    actual_keys = actual.get("keys") if isinstance(actual, dict) else None
+    actual_values = actual.get("values") if isinstance(actual, dict) else None
+    keys_match = (
+        isinstance(expected_keys, dict)
+        and isinstance(actual_keys, dict)
+        and expected_keys.get("sha256") == actual_keys.get("sha256")
+    )
+    values_match = (
+        isinstance(expected_values, dict)
+        and isinstance(actual_values, dict)
+        and expected_values.get("sha256") == actual_values.get("sha256")
+    )
+    return {
+        "keys_match": bool(keys_match),
+        "values_match": bool(values_match),
+        "matches_expected": bool(keys_match and values_match),
+        "expected_key_sha256": expected_keys.get("sha256") if isinstance(expected_keys, dict) else None,
+        "actual_key_sha256": actual_keys.get("sha256") if isinstance(actual_keys, dict) else None,
+        "expected_value_sha256": expected_values.get("sha256") if isinstance(expected_values, dict) else None,
+        "actual_value_sha256": actual_values.get("sha256") if isinstance(actual_values, dict) else None,
+    }
+
+
+def _verify_cache_write_candidate(
+        capture: DecoderLayerCapture,
+        *,
+        name: str,
+        fn: Callable[[], torch.Tensor],
+        expected_output: torch.Tensor,
+        atol: float,
+        rtol: float,
+) -> dict[str, Any]:
+    expected_fingerprint = capture.cache_write_fingerprint
+    if not isinstance(expected_fingerprint, dict) or expected_fingerprint.get("available") is not True:
+        return {
+            "checked": False,
+            "pass": False,
+            "variant": name,
+            "reason": "missing expected cache-write fingerprint",
+        }
+    try:
+        key_slot, value_slot = _cache_slot_views(capture)
+        reference_key = key_slot.detach().clone()
+        reference_value = value_slot.detach().clone()
+        key_slot.fill_(float("nan"))
+        value_slot.fill_(float("nan"))
+        output = fn()
+        if isinstance(output, torch.Tensor) and output.is_cuda:
+            torch.cuda.synchronize(output.device)
+        actual_fingerprint = _cache_write_fingerprint(
+            capture.past_key_value,
+            layer_idx=capture.layer_idx,
+            cache_position=capture.cache_position,
+            active_prefix_length=capture.active_prefix_length,
+        )
+        match = _cache_fingerprint_matches(expected_fingerprint, actual_fingerprint)
+        output_allclose = _allclose(expected_output, output, atol=atol, rtol=rtol)
+        return {
+            "checked": True,
+            "pass": bool(match["matches_expected"] and output_allclose),
+            "variant": name,
+            "slot_reset_fill": "nan",
+            "output_allclose": bool(output_allclose),
+            "output_max_abs": _max_abs(expected_output, output),
+            "actual": actual_fingerprint,
+            **match,
+        }
+    except Exception as exc:
+        return {
+            "checked": True,
+            "pass": False,
+            "variant": name,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    finally:
+        if "reference_key" in locals() and "reference_value" in locals():
+            _restore_cache_slot(capture, reference_key, reference_value)
 
 
 def _decoder_layer_abi_manifest(capture: DecoderLayerCapture) -> dict[str, Any]:
@@ -445,6 +560,7 @@ def _benchmark_capture(
         native_q1_rope_cache_self_attention: bool,
         compile_decoder_layer_variant: bool,
         candidate_decoder_runtime_island: bool,
+        verify_cache_write_candidates: bool,
         warmup: int,
         iters: int,
         atol: float,
@@ -534,6 +650,18 @@ def _benchmark_capture(
 
         results: dict[str, dict[str, Any]] = {}
         for name, (fn, expected) in variants.items():
+            cache_write_check = (
+                _verify_cache_write_candidate(
+                    capture,
+                    name=name,
+                    fn=fn,
+                    expected_output=expected,
+                    atol=atol,
+                    rtol=rtol,
+                )
+                if verify_cache_write_candidates and name in CACHE_WRITING_VARIANTS
+                else None
+            )
             ms, output = _cuda_event_time_ms(fn, warmup=warmup, iters=iters)
             results[name] = {
                 "ms_per_call": ms,
@@ -541,6 +669,8 @@ def _benchmark_capture(
                 "max_abs": _max_abs(expected, output),
                 "output_shape": list(output.shape),
             }
+            if cache_write_check is not None:
+                results[name]["cache_write_check"] = cache_write_check
             if cuda_graph_replay:
                 try:
                     graph_ms, graph_output = _cuda_graph_replay_time_ms(fn, warmup=warmup, iters=iters)
@@ -573,6 +703,18 @@ def _benchmark_capture(
                 )[0]
 
             try:
+                cache_write_check = (
+                    _verify_cache_write_candidate(
+                        capture,
+                        name="compiled_decoder_layer",
+                        fn=compiled_layer_forward,
+                        expected_output=capture.output,
+                        atol=atol,
+                        rtol=rtol,
+                    )
+                    if verify_cache_write_candidates
+                    else None
+                )
                 ms, output = _cuda_event_time_ms(compiled_layer_forward, warmup=warmup, iters=iters)
                 results["compiled_decoder_layer"] = {
                     "ms_per_call": ms,
@@ -580,6 +722,8 @@ def _benchmark_capture(
                     "max_abs": _max_abs(capture.output, output),
                     "output_shape": list(output.shape),
                 }
+                if cache_write_check is not None:
+                    results["compiled_decoder_layer"]["cache_write_check"] = cache_write_check
                 if cuda_graph_replay:
                     try:
                         graph_ms, graph_output = _cuda_graph_replay_time_ms(
@@ -722,6 +866,7 @@ def profile_decode_decoder_layer_island(
         full_song_main_tokens: int,
         full_song_model_time_s: float,
         include_cache_write_fingerprint: bool,
+        verify_cache_write_candidates: bool,
 ) -> dict[str, Any]:
     if not torch.cuda.is_available():
         raise RuntimeError("Decode decoder-layer island profiling requires CUDA")
@@ -769,6 +914,7 @@ def profile_decode_decoder_layer_island(
         "full_song_main_tokens": int(full_song_main_tokens),
         "full_song_model_time_s": float(full_song_model_time_s),
         "include_cache_write_fingerprint": bool(include_cache_write_fingerprint),
+        "verify_cache_write_candidates": bool(verify_cache_write_candidates),
     }
     prompt = model_inputs["decoder_input_ids"]
     prompt_mask = model_inputs["decoder_attention_mask"]
@@ -855,7 +1001,7 @@ def profile_decode_decoder_layer_island(
             active_prefix_length=active_prefix_length,
             native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
             sdpa_backend=args.profile_sdpa_backend,
-            include_cache_write_fingerprint=include_cache_write_fingerprint,
+            include_cache_write_fingerprint=include_cache_write_fingerprint or verify_cache_write_candidates,
         )
 
     if not captures:
@@ -874,6 +1020,7 @@ def profile_decode_decoder_layer_island(
             native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
             compile_decoder_layer_variant=compile_decoder_layer_variant,
             candidate_decoder_runtime_island=candidate_decoder_runtime_island,
+            verify_cache_write_candidates=verify_cache_write_candidates,
             warmup=warmup,
             iters=iters,
             atol=atol,
@@ -1020,8 +1167,33 @@ def profile_decode_decoder_layer_island(
                 else None
             )
 
+    candidate_cache_write_checks: list[dict[str, Any]] = []
+    for signature, report in signature_reports.items():
+        results = report.get("results") or {}
+        for variant_name, variant_result in results.items():
+            if not isinstance(variant_result, dict):
+                continue
+            cache_check = variant_result.get("cache_write_check")
+            if isinstance(cache_check, dict):
+                candidate_cache_write_checks.append({
+                    "signature": signature,
+                    "variant": variant_name,
+                    "pass": bool(cache_check.get("pass")),
+                    "checked": bool(cache_check.get("checked")),
+                    "keys_match": cache_check.get("keys_match"),
+                    "values_match": cache_check.get("values_match"),
+                    "output_allclose": cache_check.get("output_allclose"),
+                    "error": cache_check.get("error"),
+                    "reason": cache_check.get("reason"),
+                })
+    candidate_cache_write_checks_pass = (
+        all(item["pass"] for item in candidate_cache_write_checks)
+        if verify_cache_write_candidates and candidate_cache_write_checks
+        else not verify_cache_write_candidates
+    )
+    logits_replay_allclose = bool(_allclose(direct_result.logits, replay_logits, atol=atol, rtol=rtol))
     return {
-        "pass": bool(_allclose(direct_result.logits, replay_logits, atol=atol, rtol=rtol)),
+        "pass": bool(logits_replay_allclose and candidate_cache_write_checks_pass),
         "prompt_tokens": prompt_len,
         "probe_token_id": int(probe_token.item()),
         "full_prefix_tokens": int(full_prefix.shape[-1]),
@@ -1032,7 +1204,9 @@ def profile_decode_decoder_layer_island(
         "captured_decoder_layer_count": len(captures),
         "signature_reports": signature_reports,
         "projected_full_song": projected_full_song,
-        "logits_replay_allclose": bool(_allclose(direct_result.logits, replay_logits, atol=atol, rtol=rtol)),
+        "candidate_cache_write_checks_pass": bool(candidate_cache_write_checks_pass),
+        "candidate_cache_write_checks": candidate_cache_write_checks,
+        "logits_replay_allclose": logits_replay_allclose,
         "logits_replay_max_abs": _max_abs(direct_result.logits, replay_logits),
         "metadata": metadata,
     }
@@ -1079,6 +1253,15 @@ def main() -> None:
             "representative decoder layer. Diagnostic verifier metadata only."
         ),
     )
+    parser.add_argument(
+        "--verify-cache-write-candidates",
+        action="store_true",
+        help=(
+            "Reset the q_len=1 self-cache K/V slot before cache-writing candidate variants, "
+            "run each candidate once, and require the slot fingerprint to match the reference. "
+            "Diagnostic verifier only."
+        ),
+    )
     parser.add_argument("--report-path", type=Path, default=None)
     parser.add_argument("overrides", nargs="*", help="Hydra overrides, e.g. model_path=/path/to/model")
     cli_args = parser.parse_args()
@@ -1102,6 +1285,7 @@ def main() -> None:
         full_song_main_tokens=cli_args.full_song_main_tokens,
         full_song_model_time_s=cli_args.full_song_model_time_s,
         include_cache_write_fingerprint=cli_args.include_cache_write_fingerprint,
+        verify_cache_write_candidates=cli_args.verify_cache_write_candidates,
     )
     result["metadata"]["config_name"] = cli_args.config_name
     result["wall_seconds"] = time.perf_counter() - start
