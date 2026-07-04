@@ -4,8 +4,10 @@ import time
 import threading
 import traceback
 import torch
+from dataclasses import dataclass, field
 from functools import partial
 from multiprocessing.connection import Listener, Client
+from typing import Any
 
 from transformers import LogitsProcessorList, ClassifierFreeGuidanceLogitsProcessor, TemperatureLogitsWarper
 
@@ -26,6 +28,92 @@ MILISECONDS_PER_SECOND = 1000
 MILISECONDS_PER_STEP = 10
 
 RETRY_SIGNAL = "RETRY_SIGNAL"
+
+
+def _freeze_for_generation_compatibility_key(value: Any, path: str) -> Any:
+    if isinstance(value, ContextType):
+        return ("ContextType", value.value)
+    if isinstance(value, torch.dtype):
+        return ("torch.dtype", str(value))
+    if isinstance(value, torch.device):
+        return ("torch.device", str(value))
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, tuple):
+        return ("tuple", tuple(
+            _freeze_for_generation_compatibility_key(item, f"{path}[{idx}]")
+            for idx, item in enumerate(value)
+        ))
+    if isinstance(value, list):
+        return ("list", tuple(
+            _freeze_for_generation_compatibility_key(item, f"{path}[{idx}]")
+            for idx, item in enumerate(value)
+        ))
+    if isinstance(value, (set, frozenset)):
+        frozen_items = [
+            _freeze_for_generation_compatibility_key(item, f"{path}[{idx}]")
+            for idx, item in enumerate(value)
+        ]
+        return ("set", tuple(sorted(frozen_items, key=repr)))
+    if isinstance(value, dict):
+        frozen_items = [
+            (
+                _freeze_for_generation_compatibility_key(key, f"{path}.key"),
+                _freeze_for_generation_compatibility_key(item, f"{path}[{key!r}]"),
+            )
+            for key, item in value.items()
+        ]
+        return ("dict", tuple(sorted(frozen_items, key=repr)))
+
+    raise TypeError(
+        f"Cannot use {path}={type(value).__name__} in the server batching compatibility key. "
+        "Move mutable runtime state out of generate_kwargs or add an explicit stable key."
+    )
+
+
+def generation_compatibility_key(generate_kwargs: dict[str, Any]) -> tuple[Any, ...]:
+    frozen_items = [
+        (
+            _freeze_for_generation_compatibility_key(key, "generate_kwargs.key"),
+            _freeze_for_generation_compatibility_key(value, f"generate_kwargs[{key!r}]"),
+        )
+        for key, value in generate_kwargs.items()
+    ]
+    return tuple(sorted(frozen_items, key=repr))
+
+
+@dataclass
+class StaticServerRequest:
+    model_kwargs: dict[str, Any]
+    total_work: int
+    conn: Any
+    event: threading.Event
+    work_done: int = 0
+    result: Any = None
+    generated_tokens: int = 0
+    prompt_tokens: int = 0
+    output_tokens: int = 0
+    generated_tokens_per_sample: list[int] = field(default_factory=list)
+    prompt_tokens_per_sample: list[int] = field(default_factory=list)
+    output_tokens_per_sample: list[int] = field(default_factory=list)
+    elapsed_seconds: float = 0.0
+    enqueued_at: float = field(default_factory=time.perf_counter)
+    server_batch_ids: list[int] = field(default_factory=list)
+    server_batch_sizes: list[int] = field(default_factory=list)
+    server_batch_request_counts: list[int] = field(default_factory=list)
+    server_batch_work_items: list[int] = field(default_factory=list)
+    server_batch_elapsed_seconds: list[float] = field(default_factory=list)
+    server_queue_wait_seconds: list[float] = field(default_factory=list)
+
+    @property
+    def remaining_work(self) -> int:
+        return self.total_work - self.work_done
+
+
+@dataclass
+class StaticServerRequestGroup:
+    generate_kwargs: dict[str, Any]
+    requests: list[StaticServerRequest] = field(default_factory=list)
 
 
 def _prompt_token_counts(model_kwargs, pad_token_id: int | None) -> torch.Tensor | None:
@@ -546,47 +634,36 @@ class InferenceServer:
                     except (EOFError, OSError):
                         break
 
-                    generate_kwargs_set = frozenset(generate_kwargs.items())
+                    try:
+                        generate_key = generation_compatibility_key(generate_kwargs)
+                    except TypeError as exc:
+                        conn.send({'error': str(exc)})
+                        continue
 
                     # Prepare a response event
                     response_event = threading.Event()
                     batch_size = model_kwargs['inputs'].shape[0]
-                    record = {
-                        'model_kwargs': model_kwargs,
-                        'total_work': batch_size,
-                        'work_done': 0,
-                        'conn': conn,
-                        'event': response_event,
-                        'result': None,
-                        'generated_tokens': 0,
-                        'prompt_tokens': 0,
-                        'output_tokens': 0,
-                        'generated_tokens_per_sample': [],
-                        'prompt_tokens_per_sample': [],
-                        'output_tokens_per_sample': [],
-                        'elapsed_seconds': 0.0,
-                        'enqueued_at': time.perf_counter(),
-                        'server_batch_ids': [],
-                        'server_batch_sizes': [],
-                        'server_batch_request_counts': [],
-                        'server_batch_work_items': [],
-                        'server_batch_elapsed_seconds': [],
-                        'server_queue_wait_seconds': [],
-                    }
+                    record = StaticServerRequest(
+                        model_kwargs=model_kwargs,
+                        total_work=batch_size,
+                        conn=conn,
+                        event=response_event,
+                    )
 
                     # Enqueue request
                     with self.lock:
-                        if generate_kwargs_set in self.grouped_requests:
-                            self.grouped_requests[generate_kwargs_set].append(record)
-                        else:
-                            self.grouped_requests[generate_kwargs_set] = [record]
+                        group = self.grouped_requests.get(generate_key)
+                        if group is None:
+                            group = StaticServerRequestGroup(generate_kwargs=dict(generate_kwargs))
+                            self.grouped_requests[generate_key] = group
+                        group.requests.append(record)
 
                     # Wait until batch thread processes it
                     response_event.wait()
 
                     # Send back result
                     try:
-                        conn.send(record['result'])
+                        conn.send(record.result)
                     except BrokenPipeError:
                         # Client disconnected
                         break
@@ -600,10 +677,11 @@ class InferenceServer:
             with self.lock:
                 if not self.grouped_requests:
                     continue
-                generate_kwargs_set: frozenset = list(self.grouped_requests.keys())[0]
-                requests: list = self.grouped_requests[generate_kwargs_set]
+                generate_key = list(self.grouped_requests.keys())[0]
+                group = self.grouped_requests[generate_key]
+                requests = group.requests
 
-                generate_kwargs: dict = dict(generate_kwargs_set)
+                generate_kwargs: dict = dict(group.generate_kwargs)
                 cfg_scale = generate_kwargs.get('cfg_scale', 1.0)
                 num_beams = generate_kwargs.get('num_beams', 1)
                 batch_multiplier = 2 * num_beams if cfg_scale > 1 else num_beams
@@ -617,16 +695,15 @@ class InferenceServer:
                         f"max_batch_size={self.max_batch_size}, num_beams={num_beams}, cfg_scale={cfg_scale}."
                     )
                     for request in requests:
-                        request['result'] = {'error': error_message}
-                        request['event'].set()
-                    del self.grouped_requests[generate_kwargs_set]
+                        request.result = {'error': error_message}
+                        request.event.set()
+                    del self.grouped_requests[generate_key]
                     continue
                 while remaining_batch_size > 0 and len(requests) > 0:
                     request = requests.pop(0)
-                    req_kwargs = request['model_kwargs']
-                    req_total_work = request['total_work']
-                    req_work_done = request['work_done']
-                    req_remaining_work = req_total_work - req_work_done
+                    req_kwargs = request.model_kwargs
+                    req_work_done = request.work_done
+                    req_remaining_work = request.remaining_work
                     work = min(req_remaining_work, remaining_batch_size)
                     batch_requests.append((self._cut_model_kwargs(req_kwargs, req_work_done, work), request, work))
                     remaining_batch_size -= work
@@ -634,8 +711,8 @@ class InferenceServer:
                         # If there is still work left, re-add the record to the queue
                         requests.insert(0, request)
 
-                if not self.grouped_requests[generate_kwargs_set]:
-                    del self.grouped_requests[generate_kwargs_set]
+                if not group.requests:
+                    del self.grouped_requests[generate_key]
                 self.batch_counter += 1
                 batch_id = self.batch_counter
                 batch_started_at = time.perf_counter()
@@ -672,28 +749,28 @@ class InferenceServer:
                     request_output_counts = output_tokens_per_sample[batch_i:batch_i + work_done]
                     request_generated_tokens = sum(request_generated_counts)
                     batch_i += work_done
-                    request['result'] = out if request['result'] is None else torch.cat((request['result'], out), dim=0)
-                    request['work_done'] += work_done
-                    request['generated_tokens'] += request_generated_tokens
-                    request['prompt_tokens'] += sum(request_prompt_counts)
-                    request['output_tokens'] += sum(request_output_counts)
-                    request['generated_tokens_per_sample'].extend(request_generated_counts)
-                    request['prompt_tokens_per_sample'].extend(request_prompt_counts)
-                    request['output_tokens_per_sample'].extend(request_output_counts)
-                    request['elapsed_seconds'] += stats.get('elapsed_seconds', 0.0)
-                    request['server_batch_ids'].append(batch_id)
-                    request['server_batch_sizes'].append(server_batch_size)
-                    request['server_batch_request_counts'].append(len(batch_requests))
-                    request['server_batch_work_items'].append(work_done)
-                    request['server_batch_elapsed_seconds'].append(server_batch_elapsed_seconds)
-                    request['server_queue_wait_seconds'].append(
-                        max(0.0, batch_started_at - float(request.get('enqueued_at', batch_started_at)))
+                    request.result = out if request.result is None else torch.cat((request.result, out), dim=0)
+                    request.work_done += work_done
+                    request.generated_tokens += request_generated_tokens
+                    request.prompt_tokens += sum(request_prompt_counts)
+                    request.output_tokens += sum(request_output_counts)
+                    request.generated_tokens_per_sample.extend(request_generated_counts)
+                    request.prompt_tokens_per_sample.extend(request_prompt_counts)
+                    request.output_tokens_per_sample.extend(request_output_counts)
+                    request.elapsed_seconds += stats.get('elapsed_seconds', 0.0)
+                    request.server_batch_ids.append(batch_id)
+                    request.server_batch_sizes.append(server_batch_size)
+                    request.server_batch_request_counts.append(len(batch_requests))
+                    request.server_batch_work_items.append(work_done)
+                    request.server_batch_elapsed_seconds.append(server_batch_elapsed_seconds)
+                    request.server_queue_wait_seconds.append(
+                        max(0.0, batch_started_at - request.enqueued_at)
                     )
-                    if request['work_done'] >= request['total_work']:
+                    if request.work_done >= request.total_work:
                         # All work done for this record, signal completion
-                        elapsed_seconds = request['elapsed_seconds']
-                        generated_tokens = request['generated_tokens']
-                        server_queue_wait_seconds = request['server_queue_wait_seconds']
+                        elapsed_seconds = request.elapsed_seconds
+                        generated_tokens = request.generated_tokens
+                        server_queue_wait_seconds = request.server_queue_wait_seconds
                         detail_stats = dict(stats)
                         for key in (
                             'batch_size',
@@ -712,16 +789,16 @@ class InferenceServer:
                             'do_sample',
                         ):
                             detail_stats.pop(key, None)
-                        request['result'] = {
-                            'output': request['result'],
+                        request.result = {
+                            'output': request.result,
                             'stats': {
-                                'batch_size': request['total_work'],
-                                'prompt_tokens': request['prompt_tokens'],
-                                'prompt_tokens_per_sample': request['prompt_tokens_per_sample'],
-                                'output_tokens': request['output_tokens'],
-                                'output_tokens_per_sample': request['output_tokens_per_sample'],
+                                'batch_size': request.total_work,
+                                'prompt_tokens': request.prompt_tokens,
+                                'prompt_tokens_per_sample': request.prompt_tokens_per_sample,
+                                'output_tokens': request.output_tokens,
+                                'output_tokens_per_sample': request.output_tokens_per_sample,
                                 'generated_tokens': generated_tokens,
-                                'generated_tokens_per_sample': request['generated_tokens_per_sample'],
+                                'generated_tokens_per_sample': request.generated_tokens_per_sample,
                                 'elapsed_seconds': elapsed_seconds,
                                 'tokens_per_second': generated_tokens / elapsed_seconds if elapsed_seconds > 0 else 0.0,
                                 'precision': stats.get('precision'),
@@ -734,12 +811,12 @@ class InferenceServer:
                                 'server_elapsed_seconds_attribution': 'merged_batch_elapsed_replicated_per_request',
                                 'server_max_batch_size': self.max_batch_size,
                                 'server_batch_timeout_seconds': self.batch_timeout,
-                                'server_batch_count': len(request['server_batch_ids']),
-                                'server_batch_ids': request['server_batch_ids'],
-                                'server_batch_sizes': request['server_batch_sizes'],
-                                'server_batch_request_counts': request['server_batch_request_counts'],
-                                'server_batch_work_items': request['server_batch_work_items'],
-                                'server_batch_elapsed_seconds': request['server_batch_elapsed_seconds'],
+                                'server_batch_count': len(request.server_batch_ids),
+                                'server_batch_ids': request.server_batch_ids,
+                                'server_batch_sizes': request.server_batch_sizes,
+                                'server_batch_request_counts': request.server_batch_request_counts,
+                                'server_batch_work_items': request.server_batch_work_items,
+                                'server_batch_elapsed_seconds': request.server_batch_elapsed_seconds,
                                 'server_queue_wait_seconds': server_queue_wait_seconds,
                                 'server_total_queue_wait_seconds': sum(server_queue_wait_seconds),
                                 'server_max_queue_wait_seconds': (
@@ -747,14 +824,14 @@ class InferenceServer:
                                 ),
                             },
                         }
-                        request['event'].set()
+                        request.event.set()
             except Exception as e:
                 print(f"[Batch Thread] Error processing batch: {e}")
                 traceback.print_exc()
                 # Signal all requests in this batch to retry
                 for _, request, _ in batch_requests:
-                    request['result'] = RETRY_SIGNAL
-                    request['event'].set()  # Signal completion
+                    request.result = RETRY_SIGNAL
+                    request.event.set()  # Signal completion
             finally:
                 torch.cuda.empty_cache()  # Clear any cached memory, otherwise will definitely run out of memory if multiple batch sizes are used
 

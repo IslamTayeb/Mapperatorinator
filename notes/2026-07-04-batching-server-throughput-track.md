@@ -216,11 +216,27 @@ default settings are accepted, changing scheduler options without
 flags without the master flag raise `ValueError`, and enabling continuous
 batching with `use_server=true` raises the reserved `NotImplementedError`.
 
+The next mergeable infrastructure step refactors the static IPC queue to use
+explicit state:
+
+- `generation_compatibility_key()` replaces `frozenset(generate_kwargs.items())`
+  for request grouping, supports nested hashable/list/dict values, and rejects
+  mutable runtime objects such as tensors with a clear `TypeError`;
+- `StaticServerRequest` stores per-request progress, token counts, queue waits,
+  and static-server batch metadata;
+- `StaticServerRequestGroup` stores the original generation kwargs plus pending
+  request records.
+
+This is not a throughput optimization or continuous scheduler yet. It is meant
+to preserve current static batching behavior while creating a reviewable state
+boundary for future continuous batching. Local CPU validation ran
+`py_compile` on `server.py` and direct helper tests for deterministic grouping,
+ordered-value distinction, tensor rejection, isolated metadata lists, remaining
+work accounting, and `_cut_model_kwargs()` row slicing.
+
 Recommended sequence:
 
 1. Keep static batching instrumentation mergeable and non-regressing.
-2. Refactor server request/window state and compatibility-key helpers while
-   preserving static IPC behavior.
-3. Build a dummy-model scheduler test before touching real generation.
-4. Add RNG/logits-processor/cache-slot equivalence gates.
-5. Only then profile real continuous batching on DCC.
+2. Build a dummy-model scheduler test before touching real generation.
+3. Add RNG/logits-processor/cache-slot equivalence gates.
+4. Only then profile real continuous batching on DCC.
