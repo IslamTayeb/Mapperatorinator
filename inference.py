@@ -806,7 +806,7 @@ def load_model_with_server(ckpt_path: str | Path | None, t5_args: TrainConfig, d
                            eval_mode: bool = True, lora_path=None, gamemode: int | None = None,
                            auto_select_gamemode_model: bool = True, generation_compile: bool = False,
                            server_allow_auto_start: bool = True, server_connect_timeout: float | None = 60.0,
-                           server_request_timeout: float | None = None):
+                           server_request_timeout: float | None = None, server_idle_timeout: float = 20):
     model_loader, tokenizer_loader = load_model_loaders(
         ckpt_path=ckpt_path,
         t5_args=t5_args,
@@ -834,6 +834,7 @@ def load_model_with_server(ckpt_path: str | Path | None, t5_args: TrainConfig, d
         allow_auto_start=server_allow_auto_start,
         connect_timeout=server_connect_timeout,
         request_timeout=server_request_timeout,
+        idle_timeout=server_idle_timeout,
     ) if use_server else model_loader(), tokenizer_loader()
 
 

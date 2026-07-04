@@ -89,6 +89,12 @@ def _parse_args() -> argparse.Namespace:
         help="Fail the concurrent suite if all requests do not finish within this many seconds.",
     )
     parser.add_argument(
+        "--server-idle-timeout-seconds",
+        type=float,
+        default=7200.0,
+        help="Keep the owner server alive between request bursts for this many seconds.",
+    )
+    parser.add_argument(
         "--allow-short-suite",
         action="store_true",
         help="Allow fewer than 5 songs for harness smoke tests.",
@@ -238,6 +244,7 @@ def _load_server_assets(
         allow_auto_start: bool,
         connect_timeout: float | None,
         request_timeout: float | None,
+        idle_timeout: float,
 ) -> dict[str, Any]:
     model, tokenizer = load_model_with_server(
         args.model_path,
@@ -254,6 +261,7 @@ def _load_server_assets(
         server_allow_auto_start=allow_auto_start,
         server_connect_timeout=connect_timeout,
         server_request_timeout=request_timeout,
+        server_idle_timeout=idle_timeout,
     )
     timing_model, timing_tokenizer = None, None
     if should_load_separate_timing_model(args):
@@ -271,6 +279,7 @@ def _load_server_assets(
             server_allow_auto_start=allow_auto_start,
             server_connect_timeout=connect_timeout,
             server_request_timeout=request_timeout,
+            server_idle_timeout=idle_timeout,
         )
     return {
         "model": model,
@@ -301,6 +310,7 @@ def _run_request(
         expected_config_fingerprint: dict[str, Any],
         connect_timeout: float | None,
         request_timeout: float | None,
+        idle_timeout: float,
         run_index: int,
         repeat_index: int,
         song_entry: dict[str, Any],
@@ -337,6 +347,7 @@ def _run_request(
         allow_auto_start=False,
         connect_timeout=connect_timeout,
         request_timeout=request_timeout,
+        idle_timeout=idle_timeout,
     )
     generation_config, beatmap_config = get_config(run_args)
     profiler = InferenceProfiler.from_args(run_args)
@@ -470,6 +481,8 @@ def main() -> None:
         raise ValueError("--request-timeout-seconds must be positive.")
     if cli_args.suite_timeout_seconds <= 0:
         raise ValueError("--suite-timeout-seconds must be positive.")
+    if cli_args.server_idle_timeout_seconds <= 0:
+        raise ValueError("--server-idle-timeout-seconds must be positive.")
 
     cfg = _compose_config(cli_args.config_name, cli_args.overrides)
     raw_args = OmegaConf.to_object(cfg)
@@ -507,6 +520,7 @@ def main() -> None:
         allow_auto_start=True,
         connect_timeout=cli_args.server_start_timeout_seconds,
         request_timeout=cli_args.request_timeout_seconds,
+        idle_timeout=cli_args.server_idle_timeout_seconds,
     )
     try:
         _ensure_server(owner_assets["model"], cli_args.server_start_timeout_seconds)
@@ -536,6 +550,7 @@ def main() -> None:
                         expected_config_fingerprint=server_config_fingerprint,
                         connect_timeout=cli_args.server_start_timeout_seconds,
                         request_timeout=cli_args.request_timeout_seconds,
+                        idle_timeout=cli_args.server_idle_timeout_seconds,
                         run_index=run_index,
                         repeat_index=repeat_index,
                         song_entry=song_entry,
@@ -586,6 +601,7 @@ def main() -> None:
         "server_start_timeout_seconds": cli_args.server_start_timeout_seconds,
         "request_timeout_seconds": cli_args.request_timeout_seconds,
         "suite_timeout_seconds": cli_args.suite_timeout_seconds,
+        "server_idle_timeout_seconds": cli_args.server_idle_timeout_seconds,
         "allow_existing_server": cli_args.allow_existing_server,
         "server_socket_paths": socket_paths,
         "server_config_fingerprint": server_config_fingerprint,
