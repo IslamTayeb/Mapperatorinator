@@ -82,6 +82,169 @@ def _decoder_layer_signature(capture: DecoderLayerCapture) -> str:
     )
 
 
+def _tensor_metadata(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, torch.Tensor):
+        return None
+    return {
+        "shape": list(value.shape),
+        "stride": list(value.stride()),
+        "dtype": str(value.dtype),
+        "device_type": value.device.type,
+        "is_cuda": bool(value.is_cuda),
+        "is_contiguous": bool(value.is_contiguous()),
+        "requires_grad": bool(value.requires_grad),
+        "numel": int(value.numel()),
+        "element_size": int(value.element_size()),
+        "storage_offset": int(value.storage_offset()),
+    }
+
+
+def _linear_metadata(module: torch.nn.Module) -> dict[str, Any]:
+    return {
+        "type": module.__class__.__name__,
+        "in_features": int(module.in_features),
+        "out_features": int(module.out_features),
+        "has_bias": module.bias is not None,
+        "weight": _tensor_metadata(module.weight),
+        "bias": _tensor_metadata(module.bias),
+    }
+
+
+def _norm_metadata(module: torch.nn.Module) -> dict[str, Any]:
+    return {
+        "type": module.__class__.__name__,
+        "normalized_shape": list(module.normalized_shape),
+        "eps": module.eps,
+        "elementwise_affine": bool(getattr(module, "elementwise_affine", True)),
+        "weight": _tensor_metadata(module.weight),
+        "bias": _tensor_metadata(getattr(module, "bias", None)),
+    }
+
+
+def _cache_layer_metadata(cache: Any, layer_idx: int) -> dict[str, Any] | None:
+    layers = getattr(cache, "layers", None)
+    if not isinstance(layers, (list, tuple)) or layer_idx >= len(layers):
+        return None
+    layer = layers[layer_idx]
+    return {
+        "type": layer.__class__.__name__,
+        "is_initialized": bool(getattr(layer, "is_initialized", False)),
+        "keys": _tensor_metadata(getattr(layer, "keys", None)),
+        "values": _tensor_metadata(getattr(layer, "values", None)),
+    }
+
+
+def _decoder_layer_abi_manifest(capture: DecoderLayerCapture) -> dict[str, Any]:
+    module = capture.module
+    self_attn = module.self_attn
+    cross_attn = module.cross_attn
+    past_key_value = capture.past_key_value
+    self_cache = getattr(past_key_value, "self_attention_cache", None)
+    cross_cache = getattr(past_key_value, "cross_attention_cache", None)
+    is_updated = getattr(past_key_value, "is_updated", {})
+    is_cross_updated = None
+    if isinstance(is_updated, dict):
+        is_cross_updated = bool(is_updated.get(capture.layer_idx, False))
+
+    return {
+        "schema_version": 1,
+        "purpose": (
+            "Verifier-only ABI metadata for a future whole decoder-layer native "
+            "math/memory island. This is not a speed claim."
+        ),
+        "boundary": [
+            "self_attn_layer_norm",
+            "self_attn.Wqkv",
+            "self_attn.RoPE/cache write/q_len1 attention",
+            "self_attn.Wo",
+            "self residual add",
+            "cross_attn_layer_norm",
+            "cross_attn.Wq",
+            "cross_attn cached q_len1 attention",
+            "cross_attn.Wo",
+            "cross residual add",
+            "final_layer_norm",
+            "fc1",
+            "activation",
+            "fc2",
+            "mlp residual add",
+        ],
+        "layer": {
+            "name": capture.name,
+            "layer_idx": int(capture.layer_idx),
+            "training": bool(module.training),
+            "dropout": float(module.dropout),
+            "activation_dropout": float(module.activation_dropout),
+            "activation_fn": getattr(module.activation_fn, "__name__", module.activation_fn.__class__.__name__),
+            "embed_dim": int(module.embed_dim),
+            "active_prefix_length": int(capture.active_prefix_length),
+        },
+        "runtime_inputs": {
+            "hidden_states": _tensor_metadata(capture.hidden_states),
+            "attention_mask": _tensor_metadata(capture.attention_mask),
+            "encoder_hidden_states": _tensor_metadata(capture.encoder_hidden_states),
+            "cache_position": _tensor_metadata(capture.cache_position),
+            "position_ids": _tensor_metadata(capture.position_ids),
+            "cu_seqlens": _tensor_metadata(capture.cu_seqlens),
+            "encoder_cu_seqlens": _tensor_metadata(capture.encoder_cu_seqlens),
+            "output": _tensor_metadata(capture.output),
+            "max_seqlen": capture.max_seqlen,
+            "encoder_max_seqlen": capture.encoder_max_seqlen,
+        },
+        "modules": {
+            "self_attn_layer_norm": _norm_metadata(module.self_attn_layer_norm),
+            "cross_attn_layer_norm": _norm_metadata(module.cross_attn_layer_norm),
+            "final_layer_norm": _norm_metadata(module.final_layer_norm),
+            "self_attn": {
+                "num_heads": int(self_attn.num_heads),
+                "head_dim": int(self_attn.head_dim),
+                "all_head_size": int(self_attn.all_head_size),
+                "local_attention": list(self_attn.local_attention),
+                "max_position_embeddings": int(self_attn.max_position_embeddings),
+                "Wqkv": _linear_metadata(self_attn.Wqkv),
+                "Wo": _linear_metadata(self_attn.Wo),
+            },
+            "cross_attn": {
+                "num_heads": int(cross_attn.num_heads),
+                "head_dim": int(cross_attn.head_dim),
+                "all_head_size": int(cross_attn.all_head_size),
+                "local_attention": list(cross_attn.local_attention),
+                "max_position_embeddings": int(cross_attn.max_position_embeddings),
+                "Wq": _linear_metadata(cross_attn.Wq),
+                "Wkv": _linear_metadata(cross_attn.Wkv),
+                "Wo": _linear_metadata(cross_attn.Wo),
+            },
+            "fc1": _linear_metadata(module.fc1),
+            "fc2": _linear_metadata(module.fc2),
+        },
+        "cache": {
+            "type": past_key_value.__class__.__name__,
+            "self_attention_cache_type": self_cache.__class__.__name__ if self_cache is not None else None,
+            "cross_attention_cache_type": cross_cache.__class__.__name__ if cross_cache is not None else None,
+            "cross_attention_cache_updated_for_layer": is_cross_updated,
+            "self_layer": _cache_layer_metadata(self_cache, capture.layer_idx),
+            "cross_layer": _cache_layer_metadata(cross_cache, capture.layer_idx),
+        },
+        "guardrails": {
+            "batch_size_1": (
+                isinstance(capture.hidden_states, torch.Tensor)
+                and capture.hidden_states.shape[:2] == (1, 1)
+            ),
+            "fp32_hidden_states": (
+                isinstance(capture.hidden_states, torch.Tensor)
+                and capture.hidden_states.dtype == torch.float32
+            ),
+            "has_static_cache_layers": (
+                _cache_layer_metadata(self_cache, capture.layer_idx) is not None
+                and _cache_layer_metadata(cross_cache, capture.layer_idx) is not None
+            ),
+            "cross_kv_expected_reused": bool(is_cross_updated),
+            "native_candidate_must_preserve_cache_write": True,
+            "native_candidate_must_match_output": True,
+        },
+    }
+
+
 def _layer_forward(capture: DecoderLayerCapture) -> torch.Tensor:
     return capture.module(
         hidden_states=capture.hidden_states,
@@ -631,6 +794,7 @@ def profile_decode_decoder_layer_island(
                 if isinstance(representative.attention_mask, torch.Tensor)
                 else None
             ),
+            "native_decoder_layer_abi": _decoder_layer_abi_manifest(representative),
             "results": benchmark,
         }
         repo_ms = float(benchmark["repo_decoder_layer"]["ms_per_call"])
