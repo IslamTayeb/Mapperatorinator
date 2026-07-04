@@ -430,29 +430,6 @@ def validate_reserved_runtime_flags(args: InferenceConfig):
             "inference_native_q1_rope_cache_self_attention requires "
             "inference_native_q1_self_attention=true."
         )
-    if args.inference_native_decoder_layer_mlp_tail_outputs_per_block not in (2, 4, 8):
-        raise ValueError("inference_native_decoder_layer_mlp_tail_outputs_per_block must be one of 2, 4, or 8.")
-    if args.inference_native_decoder_layer_mlp_tail:
-        if not args.inference_native_decode_kernels:
-            raise ValueError("inference_native_decoder_layer_mlp_tail requires inference_native_decode_kernels=true.")
-        if args.device != "cuda":
-            raise ValueError("inference_native_decoder_layer_mlp_tail requires device=cuda.")
-        if args.precision != "fp32":
-            raise ValueError("inference_native_decoder_layer_mlp_tail currently requires precision=fp32.")
-        if args.attn_implementation != "sdpa":
-            raise ValueError("inference_native_decoder_layer_mlp_tail currently requires attn_implementation=sdpa.")
-        require_simple_sequential("inference_native_decoder_layer_mlp_tail")
-        if not args.inference_q1_bmm_cross_attention:
-            raise ValueError("inference_native_decoder_layer_mlp_tail requires inference_q1_bmm_cross_attention=true.")
-        if not args.inference_native_q1_rope_cache_self_attention:
-            raise ValueError(
-                "inference_native_decoder_layer_mlp_tail requires "
-                "inference_native_q1_rope_cache_self_attention=true."
-            )
-        if not args.inference_decode_session_runtime:
-            raise ValueError("inference_native_decoder_layer_mlp_tail requires inference_decode_session_runtime=true.")
-        if not args.inference_decode_session_cuda_graph:
-            raise ValueError("inference_native_decoder_layer_mlp_tail requires inference_decode_session_cuda_graph=true.")
     if args.inference_native_q1_self_attention:
         if not args.inference_native_decode_kernels:
             raise ValueError("inference_native_q1_self_attention requires inference_native_decode_kernels=true.")
@@ -472,10 +449,10 @@ def validate_reserved_runtime_flags(args: InferenceConfig):
         if not args.inference_decode_session_cuda_graph:
             raise ValueError("inference_native_q1_self_attention requires inference_decode_session_cuda_graph=true.")
     elif args.inference_native_decode_kernels:
-        if not args.inference_native_decoder_layer_mlp_tail:
-            raise NotImplementedError(
-                "inference_native_decode_kernels currently only has explicitly selected native experiments."
-            )
+        raise NotImplementedError(
+            "inference_native_decode_kernels currently only has the explicitly selected "
+            "inference_native_q1_self_attention experiment."
+        )
     if args.profile_model_generate_cuda_ledger:
         if not args.profile_inference:
             raise ValueError("profile_model_generate_cuda_ledger requires profile_inference=true.")
@@ -628,10 +605,6 @@ def generate(
         "inference_native_decode_kernels": args.inference_native_decode_kernels,
         "inference_native_q1_self_attention": args.inference_native_q1_self_attention,
         "inference_native_q1_rope_cache_self_attention": args.inference_native_q1_rope_cache_self_attention,
-        "inference_native_decoder_layer_mlp_tail": args.inference_native_decoder_layer_mlp_tail,
-        "inference_native_decoder_layer_mlp_tail_outputs_per_block": (
-            args.inference_native_decoder_layer_mlp_tail_outputs_per_block
-        ),
         "profile_record_token_ids": args.profile_record_token_ids,
         "profile_sync_cuda": args.profile_sync_cuda,
         "profile_model_generate_cuda_ledger": args.profile_model_generate_cuda_ledger,

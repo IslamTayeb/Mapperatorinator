@@ -215,24 +215,14 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     native_q1_rope_cache_self_attention_requested = bool(
         generate_kwargs.pop('native_q1_rope_cache_self_attention', False)
     )
-    native_decoder_layer_mlp_tail_requested = bool(
-        generate_kwargs.pop('native_decoder_layer_mlp_tail', False)
-    )
-    native_decoder_layer_mlp_tail_outputs_per_block = int(
-        generate_kwargs.pop('native_decoder_layer_mlp_tail_outputs_per_block', 4)
-    )
     decode_session_state = generate_kwargs.pop('decode_session_state', None)
     decode_session_cuda_graph = bool(generate_kwargs.pop('decode_session_cuda_graph', False))
     if context_type is not None:
         context_type = ContextType(context_type)  # Convert to ContextType enum
-    if native_decoder_layer_mlp_tail_outputs_per_block not in (2, 4, 8):
-        raise ValueError("native_decoder_layer_mlp_tail_outputs_per_block must be one of 2, 4, or 8.")
     if native_q1_rope_cache_self_attention_requested and not native_q1_self_attention_requested:
         raise ValueError("native_q1_rope_cache_self_attention requires native_q1_self_attention.")
     if native_q1_rope_cache_self_attention_requested and not active_prefix_decode_loop:
         raise ValueError("native_q1_rope_cache_self_attention requires active_prefix_decode_loop.")
-    if native_decoder_layer_mlp_tail_requested and not native_q1_rope_cache_self_attention_requested:
-        raise ValueError("native_decoder_layer_mlp_tail requires native_q1_rope_cache_self_attention.")
     native_q1_self_attention = (
         native_q1_self_attention_requested
         and context_type != ContextType.TIMING
@@ -240,10 +230,6 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     native_q1_rope_cache_self_attention = (
         native_q1_rope_cache_self_attention_requested
         and native_q1_self_attention
-    )
-    native_decoder_layer_mlp_tail = (
-        native_decoder_layer_mlp_tail_requested
-        and native_q1_rope_cache_self_attention
     )
 
     # Create the logits processors
@@ -311,8 +297,6 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
                 q1_bmm_cross_attention=q1_bmm_cross_attention,
                 native_q1_self_attention=native_q1_self_attention,
                 native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
-                native_decoder_layer_mlp_tail=native_decoder_layer_mlp_tail,
-                native_decoder_layer_mlp_tail_outputs_per_block=native_decoder_layer_mlp_tail_outputs_per_block,
             ):
         if sync_model_timing:
             _sync_cuda_for_model(model)
@@ -395,18 +379,6 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         "native_q1_rope_cache_self_attention_disabled_reason": (
             "timing_context"
             if native_q1_rope_cache_self_attention_requested and not native_q1_rope_cache_self_attention
-            else None
-        ),
-        "native_decoder_layer_mlp_tail_requested": native_decoder_layer_mlp_tail_requested,
-        "native_decoder_layer_mlp_tail_enabled": native_decoder_layer_mlp_tail,
-        "native_decoder_layer_mlp_tail_disabled_reason": (
-            "timing_context"
-            if native_decoder_layer_mlp_tail_requested and not native_decoder_layer_mlp_tail
-            else None
-        ),
-        "native_decoder_layer_mlp_tail_outputs_per_block": (
-            native_decoder_layer_mlp_tail_outputs_per_block
-            if native_decoder_layer_mlp_tail_requested
             else None
         ),
         "decode_session_runtime_enabled": decode_session_state is not None,

@@ -206,12 +206,6 @@ class Processor(object):
             native_q1_rope_cache_self_attention=bool(
                 getattr(self.args, "inference_native_q1_rope_cache_self_attention", False)
             ),
-            native_decoder_layer_mlp_tail=bool(
-                getattr(self.args, "inference_native_decoder_layer_mlp_tail", False)
-            ),
-            native_decoder_layer_mlp_tail_outputs_per_block=int(
-                getattr(self.args, "inference_native_decoder_layer_mlp_tail_outputs_per_block", 4)
-            ),
             decode_session_cuda_graph=bool(getattr(self.args, "inference_decode_session_cuda_graph", False)),
         )
         if bool(getattr(self.args, "inference_decode_session_runtime", False)):
@@ -1539,14 +1533,6 @@ class Processor(object):
             ),
             "native_q1_rope_cache_self_attention_disabled_reason": stats.get(
                 "native_q1_rope_cache_self_attention_disabled_reason"
-            ),
-            "native_decoder_layer_mlp_tail_requested": stats.get("native_decoder_layer_mlp_tail_requested"),
-            "native_decoder_layer_mlp_tail_enabled": stats.get("native_decoder_layer_mlp_tail_enabled"),
-            "native_decoder_layer_mlp_tail_disabled_reason": stats.get(
-                "native_decoder_layer_mlp_tail_disabled_reason"
-            ),
-            "native_decoder_layer_mlp_tail_outputs_per_block": stats.get(
-                "native_decoder_layer_mlp_tail_outputs_per_block"
             ),
             "decode_session_runtime_enabled": stats.get("decode_session_runtime_enabled"),
             "decode_session_cuda_graph_enabled": stats.get("decode_session_cuda_graph_enabled"),

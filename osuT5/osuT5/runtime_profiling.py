@@ -12,8 +12,6 @@ _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH: int | None = None
 _Q1_BMM_CROSS_ATTENTION_ENABLED = False
 _NATIVE_Q1_SELF_ATTENTION_ENABLED = False
 _NATIVE_Q1_ROPE_CACHE_SELF_ATTENTION_ENABLED = False
-_NATIVE_DECODER_LAYER_MLP_TAIL_ENABLED = False
-_NATIVE_DECODER_LAYER_MLP_TAIL_OUTPUTS_PER_BLOCK = 4
 
 _SDPA_BACKEND_ALIASES = {
     "flash": "FLASH_ATTENTION",
@@ -48,14 +46,6 @@ def native_q1_rope_cache_self_attention_enabled() -> bool:
     return _NATIVE_Q1_ROPE_CACHE_SELF_ATTENTION_ENABLED
 
 
-def native_decoder_layer_mlp_tail_enabled() -> bool:
-    return _NATIVE_DECODER_LAYER_MLP_TAIL_ENABLED
-
-
-def native_decoder_layer_mlp_tail_outputs_per_block() -> int:
-    return _NATIVE_DECODER_LAYER_MLP_TAIL_OUTPUTS_PER_BLOCK
-
-
 @contextmanager
 def generation_profile_context(
         *,
@@ -65,38 +55,27 @@ def generation_profile_context(
         q1_bmm_cross_attention: bool = False,
         native_q1_self_attention: bool = False,
         native_q1_rope_cache_self_attention: bool = False,
-        native_decoder_layer_mlp_tail: bool = False,
-        native_decoder_layer_mlp_tail_outputs_per_block: int = 4,
 ) -> Iterator[None]:
     """Temporarily enable opt-in generation profiling controls."""
     global _DETAIL_RANGES_ENABLED, _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH
     global _Q1_BMM_CROSS_ATTENTION_ENABLED, _NATIVE_Q1_SELF_ATTENTION_ENABLED
     global _NATIVE_Q1_ROPE_CACHE_SELF_ATTENTION_ENABLED
-    global _NATIVE_DECODER_LAYER_MLP_TAIL_ENABLED, _NATIVE_DECODER_LAYER_MLP_TAIL_OUTPUTS_PER_BLOCK
 
     previous_detail_ranges = _DETAIL_RANGES_ENABLED
     previous_active_prefix_length = _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH
     previous_q1_bmm_cross_attention = _Q1_BMM_CROSS_ATTENTION_ENABLED
     previous_native_q1_self_attention = _NATIVE_Q1_SELF_ATTENTION_ENABLED
     previous_native_q1_rope_cache_self_attention = _NATIVE_Q1_ROPE_CACHE_SELF_ATTENTION_ENABLED
-    previous_native_decoder_layer_mlp_tail = _NATIVE_DECODER_LAYER_MLP_TAIL_ENABLED
-    previous_native_decoder_layer_mlp_tail_outputs_per_block = _NATIVE_DECODER_LAYER_MLP_TAIL_OUTPUTS_PER_BLOCK
     _DETAIL_RANGES_ENABLED = bool(detail_ranges)
     _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH = active_prefix_self_attention_length
     _Q1_BMM_CROSS_ATTENTION_ENABLED = bool(q1_bmm_cross_attention)
     _NATIVE_Q1_SELF_ATTENTION_ENABLED = bool(native_q1_self_attention)
     _NATIVE_Q1_ROPE_CACHE_SELF_ATTENTION_ENABLED = bool(native_q1_rope_cache_self_attention)
-    _NATIVE_DECODER_LAYER_MLP_TAIL_ENABLED = bool(native_decoder_layer_mlp_tail)
-    _NATIVE_DECODER_LAYER_MLP_TAIL_OUTPUTS_PER_BLOCK = int(native_decoder_layer_mlp_tail_outputs_per_block)
     try:
         if native_q1_self_attention or native_q1_rope_cache_self_attention:
             from osuT5.osuT5.inference.native_q1_attention import preload_native_q1_attention
 
             preload_native_q1_attention()
-        if native_decoder_layer_mlp_tail:
-            from osuT5.osuT5.inference.native_decoder_layer import preload_native_decoder_layer
-
-            preload_native_decoder_layer()
         with sdpa_backend_context(sdpa_backend):
             yield
     finally:
@@ -105,8 +84,6 @@ def generation_profile_context(
         _Q1_BMM_CROSS_ATTENTION_ENABLED = previous_q1_bmm_cross_attention
         _NATIVE_Q1_SELF_ATTENTION_ENABLED = previous_native_q1_self_attention
         _NATIVE_Q1_ROPE_CACHE_SELF_ATTENTION_ENABLED = previous_native_q1_rope_cache_self_attention
-        _NATIVE_DECODER_LAYER_MLP_TAIL_ENABLED = previous_native_decoder_layer_mlp_tail
-        _NATIVE_DECODER_LAYER_MLP_TAIL_OUTPUTS_PER_BLOCK = previous_native_decoder_layer_mlp_tail_outputs_per_block
 
 
 @contextmanager

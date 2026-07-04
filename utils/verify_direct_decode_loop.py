@@ -1408,8 +1408,6 @@ def run_direct_decode_loop_gate(
         candidate_q1_bmm_cross_attention: bool,
         candidate_native_q1_self_attention: bool,
         candidate_native_q1_rope_cache_self_attention: bool,
-        candidate_native_decoder_layer_mlp_tail: bool,
-        candidate_native_decoder_layer_mlp_tail_outputs_per_block: int,
         candidate_decode_session: bool,
         candidate_fast_prepare: bool,
         force_eos_at_generated_token: int | None = None,
@@ -1485,10 +1483,6 @@ def run_direct_decode_loop_gate(
         "candidate_q1_bmm_cross_attention": bool(candidate_q1_bmm_cross_attention),
         "candidate_native_q1_self_attention": bool(candidate_native_q1_self_attention),
         "candidate_native_q1_rope_cache_self_attention": bool(candidate_native_q1_rope_cache_self_attention),
-        "candidate_native_decoder_layer_mlp_tail": bool(candidate_native_decoder_layer_mlp_tail),
-        "candidate_native_decoder_layer_mlp_tail_outputs_per_block": (
-            int(candidate_native_decoder_layer_mlp_tail_outputs_per_block)
-        ),
         "candidate_decode_session": bool(candidate_decode_session),
         "candidate_fast_prepare": bool(candidate_fast_prepare),
         "force_eos_at_generated_token": force_eos_at_generated_token,
@@ -1614,10 +1608,6 @@ def run_direct_decode_loop_gate(
                 q1_bmm_cross_attention=candidate_q1_bmm_cross_attention,
                 native_q1_self_attention=candidate_native_q1_self_attention,
                 native_q1_rope_cache_self_attention=candidate_native_q1_rope_cache_self_attention,
-                native_decoder_layer_mlp_tail=candidate_native_decoder_layer_mlp_tail,
-                native_decoder_layer_mlp_tail_outputs_per_block=(
-                    candidate_native_decoder_layer_mlp_tail_outputs_per_block
-                ),
             ):
         candidate_cache = get_cache(model, batch_size=1, num_beams=1, cfg_scale=1.0)
         candidate_output = model.generate(
@@ -1818,18 +1808,6 @@ def main() -> None:
         help="Enable the experimental fused RoPE/cache native q_len=1 self-attention candidate.",
     )
     parser.add_argument(
-        "--candidate-native-decoder-layer-mlp-tail",
-        action="store_true",
-        help="Enable the experimental native fp32 decoder-layer MLP tail candidate.",
-    )
-    parser.add_argument(
-        "--candidate-native-decoder-layer-mlp-tail-outputs-per-block",
-        type=int,
-        default=4,
-        choices=(2, 4, 8),
-        help="Warp-group width for the experimental native decoder-layer MLP tail.",
-    )
-    parser.add_argument(
         "--candidate-decode-session",
         action="store_true",
         help="Wrap the candidate direct loop in the verifier-first DecodeSession state owner.",
@@ -1929,10 +1907,6 @@ def main() -> None:
         candidate_q1_bmm_cross_attention=cli_args.candidate_q1_bmm_cross_attention,
         candidate_native_q1_self_attention=cli_args.candidate_native_q1_self_attention,
         candidate_native_q1_rope_cache_self_attention=cli_args.candidate_native_q1_rope_cache_self_attention,
-        candidate_native_decoder_layer_mlp_tail=cli_args.candidate_native_decoder_layer_mlp_tail,
-        candidate_native_decoder_layer_mlp_tail_outputs_per_block=(
-            cli_args.candidate_native_decoder_layer_mlp_tail_outputs_per_block
-        ),
         candidate_decode_session=cli_args.candidate_decode_session,
         candidate_fast_prepare=cli_args.candidate_fast_prepare,
         force_eos_at_generated_token=cli_args.force_eos_at_generated_token,
