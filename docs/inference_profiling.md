@@ -1599,6 +1599,23 @@ and a source-of-gap audit before any production flag through `inference.py` /
 `server.py`. See
 `notes/2026-07-04-native-self-cross-prefix-verifier.md`.
 
+Weighted full-bucket confirmation closed that manual-island ambiguity. Branch
+`codex/weighted-manual-layer-confirmation` commit `fc66274` added
+`utils/summarize_weighted_decoder_layer_island.py`, which combines per-prefix
+decoder-layer reports with full-song replay counts from weighted stack job
+`49233687`. DCC job `49262108` on RTX 2080 Ti reran the exact manual decoder
+runtime island across prefixes `128..768` with candidate cache-write checks and
+summarized the result in
+`/work/imt11/Mapperatorinator/runs/weighted-layer-manual-49262108-fc66274/weighted_decoder_layer_manual_summary.json`.
+The weighted report passed (`failures=[]`), but the manual island saved only
+`0.616916s` over the weighted repo decoder layer (`16.512013s -> 15.895097s`),
+projecting `270.474 -> 276.514 tok/s`. That is below the `1.412150s` 5% keep
+bar, so manual Python/module recomposition remains rejected as a production
+speed path. Keep the weighted summarizer as bottleneck/verifier infrastructure:
+single-prefix excitement must be confirmed on the actual bucket distribution
+before runtime or kernel work graduates. See
+`notes/2026-07-04-weighted-manual-decoder-layer-confirmation.md`.
+
 `utils/summarize_decoder_layer_segment_pressure.py` is the segment-level stop/go auditor for native decoder-layer work. It reads a decoder-layer island report, uses captured ABI dimensions, compares measured CUDA-graph segment replay against optimistic fp32 compute/bandwidth floors, and reports whether each segment has above-floor headroom above the 5%/10% bars. DCC run `/work/imt11/Mapperatorinator/runs/decoder-layer-segment-pressure-20260704141703-0a28a3e` on the candidate-cache report showed self-attention residual `5.430s` measured / `1.513s` floor / `3.917s` above-floor, cross-attention residual `4.024s` / `1.626s` / `2.397s`, MLP residual `4.692s` / `2.789s` / `1.903s`, and whole decoder layer `15.739s` / `5.928s` / `9.811s`. All three major residual segments clear the 5% verifier bar, but no single segment reaches `500 tok/s` at its floor, and even this representative whole layer at floor projects only `414.435 tok/s`. The next implementation-worthy scope remains a multi-segment or whole-layer native math/memory verifier, not another narrow production path. See `notes/2026-07-04-decoder-layer-segment-pressure.md`.
 
 `utils/summarize_torch_trace_kernels.py` is the lightweight Chrome-trace kernel
