@@ -217,9 +217,6 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     )
     decode_session_state = generate_kwargs.pop('decode_session_state', None)
     decode_session_cuda_graph = bool(generate_kwargs.pop('decode_session_cuda_graph', False))
-    decode_session_tail_cuda_graph_requested = bool(
-        generate_kwargs.pop('decode_session_tail_cuda_graph', False)
-    )
     if context_type is not None:
         context_type = ContextType(context_type)  # Convert to ContextType enum
     if native_q1_rope_cache_self_attention_requested and not native_q1_self_attention_requested:
@@ -279,13 +276,6 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
             raise ValueError("decode_session_state currently requires active-prefix CUDA graph replay.")
         decode_session_state.setdefault("graph_cache", {})
         decode_session_state.setdefault("stable_encoder_holder", {})
-        decode_session_state.setdefault("tail_graph_cache", {})
-    if decode_session_tail_cuda_graph_requested and decode_session_state is None:
-        raise ValueError("decode_session_tail_cuda_graph requires decode_session_state.")
-    decode_session_tail_cuda_graph = (
-        decode_session_tail_cuda_graph_requested
-        and context_type != ContextType.TIMING
-    )
     active_prefix_decode_diagnostics = (
         {
             "enabled": True,
@@ -344,12 +334,6 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
                     if decode_session_state is not None and decode_session_cuda_graph
                     else None
                 ),
-                tail_cuda_graph=decode_session_tail_cuda_graph,
-                shared_tail_graph_cache=(
-                    decode_session_state.get("tail_graph_cache")
-                    if decode_session_state is not None and decode_session_tail_cuda_graph
-                    else None
-                ),
             ) if active_prefix_decode_loop else None,
         )
         if generate_end_event is not None:
@@ -361,12 +345,6 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
             generate_cuda_event_seconds = float(generate_start_event.elapsed_time(generate_end_event)) / 1000.0
 
     result = result.cpu()
-    tail_graph_cache = (
-        decode_session_state.get("tail_graph_cache")
-        if decode_session_state is not None
-        else None
-    )
-    tail_graph_entries = list(tail_graph_cache.values()) if isinstance(tail_graph_cache, dict) else []
     stats = _build_generation_stats(result, model_kwargs, pad_token_id, elapsed_seconds)
     stats.update({
         "precision": precision,
@@ -408,28 +386,6 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         "decode_session_graph_count": (
             len(decode_session_state.get("graph_cache", {}))
             if decode_session_state is not None
-            else None
-        ),
-        "decode_session_tail_cuda_graph_requested": decode_session_tail_cuda_graph_requested,
-        "decode_session_tail_cuda_graph_enabled": decode_session_tail_cuda_graph,
-        "decode_session_tail_cuda_graph_disabled_reason": (
-            "timing_context"
-            if decode_session_tail_cuda_graph_requested and not decode_session_tail_cuda_graph
-            else None
-        ),
-        "decode_session_tail_graph_count": (
-            len(tail_graph_entries)
-            if tail_graph_cache is not None
-            else None
-        ),
-        "decode_session_tail_graph_capture_count": (
-            int(sum(int(entry.get("capture_count", 0)) for entry in tail_graph_entries))
-            if tail_graph_cache is not None
-            else None
-        ),
-        "decode_session_tail_graph_replay_count": (
-            int(sum(int(entry.get("replay_count", 0)) for entry in tail_graph_entries))
-            if tail_graph_cache is not None
             else None
         ),
         "active_prefix_decode_loop_enabled": active_prefix_decode_loop,
