@@ -207,6 +207,9 @@ class Processor(object):
                 getattr(self.args, "inference_native_q1_rope_cache_self_attention", False)
             ),
             decode_session_cuda_graph=bool(getattr(self.args, "inference_decode_session_cuda_graph", False)),
+            decode_session_tail_cuda_graph=bool(
+                getattr(self.args, "inference_decode_session_tail_cuda_graph", False)
+            ),
         )
         if bool(getattr(self.args, "inference_decode_session_runtime", False)):
             if isinstance(self.model, InferenceClient):
@@ -1537,6 +1540,14 @@ class Processor(object):
             "decode_session_runtime_enabled": stats.get("decode_session_runtime_enabled"),
             "decode_session_cuda_graph_enabled": stats.get("decode_session_cuda_graph_enabled"),
             "decode_session_graph_count": stats.get("decode_session_graph_count"),
+            "decode_session_tail_cuda_graph_requested": stats.get("decode_session_tail_cuda_graph_requested"),
+            "decode_session_tail_cuda_graph_enabled": stats.get("decode_session_tail_cuda_graph_enabled"),
+            "decode_session_tail_cuda_graph_disabled_reason": stats.get(
+                "decode_session_tail_cuda_graph_disabled_reason"
+            ),
+            "decode_session_tail_graph_count": stats.get("decode_session_tail_graph_count"),
+            "decode_session_tail_graph_capture_count": stats.get("decode_session_tail_graph_capture_count"),
+            "decode_session_tail_graph_replay_count": stats.get("decode_session_tail_graph_replay_count"),
             "active_prefix_decode_loop_enabled": stats.get("active_prefix_decode_loop_enabled"),
             "active_prefix_decode_bucket_size": stats.get("active_prefix_decode_bucket_size"),
             "active_prefix_decode_cuda_graph_enabled": stats.get("active_prefix_decode_cuda_graph_enabled"),

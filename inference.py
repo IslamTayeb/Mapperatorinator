@@ -420,6 +420,19 @@ def validate_reserved_runtime_flags(args: InferenceConfig):
     if args.inference_decode_session_cuda_graph:
         if not args.inference_decode_session_runtime:
             raise ValueError("inference_decode_session_cuda_graph requires inference_decode_session_runtime=true.")
+    if args.inference_decode_session_tail_cuda_graph:
+        require_simple_sequential("inference_decode_session_tail_cuda_graph")
+        if args.device != "cuda":
+            raise ValueError("inference_decode_session_tail_cuda_graph requires device=cuda.")
+        if not args.inference_decode_session_runtime:
+            raise ValueError("inference_decode_session_tail_cuda_graph requires inference_decode_session_runtime=true.")
+        if not args.inference_decode_session_cuda_graph:
+            raise ValueError("inference_decode_session_tail_cuda_graph requires inference_decode_session_cuda_graph=true.")
+        if not args.inference_stateful_monotonic_logits_processor:
+            raise ValueError(
+                "inference_decode_session_tail_cuda_graph requires "
+                "inference_stateful_monotonic_logits_processor=true."
+            )
     if args.inference_decode_session_chunk_size != 1:
         raise NotImplementedError(
             "inference_decode_session_chunk_size is reserved and must remain 1 until chunked DecodeSession "

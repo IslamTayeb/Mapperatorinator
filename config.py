@@ -82,6 +82,7 @@ class InferenceConfig:
     inference_q1_bmm_cross_attention: bool = False  # Experimental fp32 q_len=1 cross-attention via bmm/softmax/bmm
     inference_decode_session_runtime: bool = False  # Verifier-first single-song DecodeSession runtime scaffold
     inference_decode_session_cuda_graph: bool = False  # Reserved for DecodeSession-owned CUDA graph replay
+    inference_decode_session_tail_cuda_graph: bool = False  # Experimental DecodeSession-owned CUDA graph for batch-1 sampling tail
     inference_decode_session_chunk_size: int = 1  # Reserved DecodeSession decode chunk size
     inference_native_decode_kernels: bool = False  # Reserved default-off native C++/CUDA/CUTLASS decode-kernel experiments
     inference_native_q1_self_attention: bool = False  # Experimental native fp32 q_len=1 active-prefix self-attention

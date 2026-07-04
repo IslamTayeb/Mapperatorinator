@@ -319,6 +319,229 @@ def _update_cuda_graph_diagnostics(
     })
 
 
+_SUPPORTED_TAIL_SCORE_PROCESSORS = {
+    "TemperatureLogitsWarper",
+    "TopPLogitsWarper",
+    "TopKLogitsWarper",
+}
+_TAIL_PROCESSOR_SIGNATURE_ATTRS = (
+    "temperature",
+    "top_p",
+    "top_k",
+    "filter_value",
+    "min_tokens_to_keep",
+)
+
+
+def _tail_processor_signature(processor: Any) -> tuple[Any, ...]:
+    attrs = []
+    for name in _TAIL_PROCESSOR_SIGNATURE_ATTRS:
+        if hasattr(processor, name):
+            value = getattr(processor, name)
+            if isinstance(value, (bool, int, float, str)) or value is None:
+                attrs.append((name, value))
+            elif isinstance(value, torch.Tensor) and value.numel() <= 16:
+                attrs.append((name, tuple(value.detach().cpu().reshape(-1).tolist())))
+            else:
+                attrs.append((name, repr(value)))
+    return (processor.__class__.__module__, processor.__class__.__name__, tuple(attrs))
+
+
+def _split_tail_cuda_graph_processors(logits_processor) -> tuple[Any, list[Any]]:
+    monotonic_processor = None
+    score_processors = []
+    for processor in logits_processor:
+        name = processor.__class__.__name__
+        if name == "MonotonicTimeShiftLogitsProcessor":
+            if not bool(getattr(processor, "stateful_batch1", False)):
+                raise RuntimeError(
+                    "decode-session tail CUDA graph requires stateful MonotonicTimeShiftLogitsProcessor."
+                )
+            if monotonic_processor is not None:
+                raise RuntimeError("decode-session tail CUDA graph saw multiple monotonic processors.")
+            monotonic_processor = processor
+        elif name in _SUPPORTED_TAIL_SCORE_PROCESSORS:
+            score_processors.append(processor)
+        else:
+            raise RuntimeError(
+                "decode-session tail CUDA graph does not support logits processor "
+                f"{processor.__class__.__module__}.{name}."
+            )
+    if monotonic_processor is None:
+        raise RuntimeError("decode-session tail CUDA graph requires MonotonicTimeShiftLogitsProcessor.")
+    return monotonic_processor, score_processors
+
+
+class _TailCudaGraphRuntime:
+    def __init__(
+            self,
+            logits_processor,
+            *,
+            do_sample: bool,
+            graph_cache: dict[tuple[Any, ...], dict[str, Any]] | None,
+    ) -> None:
+        self.monotonic_processor, self.score_processors = _split_tail_cuda_graph_processors(logits_processor)
+        self.do_sample = bool(do_sample)
+        self.graph_cache = graph_cache if graph_cache is not None else {}
+        self.ready = False
+        self.entry: dict[str, Any] | None = None
+        self.eager_tail_steps = 0
+        self.replay_steps = 0
+
+    def _cache_key(self, raw_logits: torch.Tensor) -> tuple[Any, ...]:
+        sos_ids = getattr(self.monotonic_processor, "sos_ids", None)
+        if not isinstance(sos_ids, torch.Tensor):
+            raise RuntimeError("decode-session tail CUDA graph requires tensor SOS ids.")
+        return (
+            tuple(raw_logits.shape),
+            str(raw_logits.dtype),
+            str(raw_logits.device),
+            bool(self.do_sample),
+            int(getattr(self.monotonic_processor, "time_shift_start")),
+            int(getattr(self.monotonic_processor, "time_shift_end")),
+            tuple(int(value) for value in sos_ids.detach().cpu().reshape(-1).tolist()),
+            tuple(_tail_processor_signature(processor) for processor in self.score_processors),
+        )
+
+    def _ensure_entry(self, raw_logits: torch.Tensor) -> dict[str, Any]:
+        key = self._cache_key(raw_logits)
+        entry = self.graph_cache.get(key)
+        if entry is not None:
+            self.entry = entry
+            return entry
+
+        if raw_logits.device.type != "cuda" or not torch.cuda.is_available():
+            raise RuntimeError("decode-session tail CUDA graph requires CUDA logits.")
+        if raw_logits.shape[0] != 1:
+            raise RuntimeError("decode-session tail CUDA graph currently supports batch_size=1 only.")
+
+        time_shift_start = int(getattr(self.monotonic_processor, "time_shift_start"))
+        time_shift_end = int(getattr(self.monotonic_processor, "time_shift_end"))
+        sos_ids = self.monotonic_processor._sos_ids(raw_logits.device).detach().clone()
+        entry = {
+            "graph": None,
+            "static_raw_logits": torch.empty_like(raw_logits, memory_format=torch.contiguous_format),
+            "static_last_token": torch.empty((raw_logits.shape[0],), dtype=torch.long, device=raw_logits.device),
+            "static_next_tokens": torch.empty((raw_logits.shape[0],), dtype=torch.long, device=raw_logits.device),
+            "state_has_time_shift": torch.zeros((raw_logits.shape[0],), dtype=torch.bool, device=raw_logits.device),
+            "state_last_time_shift_value": torch.zeros((raw_logits.shape[0],), dtype=torch.long, device=raw_logits.device),
+            "dummy_input_ids": torch.empty((raw_logits.shape[0], 1), dtype=torch.long, device=raw_logits.device),
+            "time_shift_offsets": torch.arange(time_shift_end - time_shift_start, device=raw_logits.device),
+            "sos_ids": sos_ids,
+            "time_shift_start": time_shift_start,
+            "time_shift_end": time_shift_end,
+            "capture_count": 0,
+            "replay_count": 0,
+            "processor_classes": [processor.__class__.__name__ for processor in self.score_processors],
+        }
+        self.graph_cache[key] = entry
+        self.entry = entry
+        return entry
+
+    def initialize_after_eager_tail(self, raw_logits: torch.Tensor) -> None:
+        entry = self._ensure_entry(raw_logits)
+        state_has_time_shift = getattr(self.monotonic_processor, "_state_has_time_shift", None)
+        state_last_time_shift_value = getattr(self.monotonic_processor, "_state_last_time_shift_value", None)
+        if not isinstance(state_has_time_shift, torch.Tensor) or not isinstance(state_last_time_shift_value, torch.Tensor):
+            raise RuntimeError(
+                "decode-session tail CUDA graph could not initialize monotonic processor state."
+            )
+        entry["state_has_time_shift"].copy_(state_has_time_shift.to(device=raw_logits.device, dtype=torch.bool))
+        entry["state_last_time_shift_value"].copy_(
+            state_last_time_shift_value.to(device=raw_logits.device, dtype=torch.long)
+        )
+        self.eager_tail_steps += 1
+        self.ready = True
+
+    def _graph_body(self, entry: dict[str, Any]) -> None:
+        scores = entry["static_raw_logits"].clone(memory_format=torch.contiguous_format)
+        last_token = entry["static_last_token"]
+        time_shift_start = int(entry["time_shift_start"])
+        time_shift_end = int(entry["time_shift_end"])
+
+        is_time_shift = (last_token >= time_shift_start) & (last_token < time_shift_end)
+        is_sos = (last_token.unsqueeze(-1) == entry["sos_ids"]).any(dim=-1)
+        last_time_shift_value = last_token - time_shift_start
+        new_has_time_shift = torch.where(
+            is_sos,
+            torch.zeros_like(entry["state_has_time_shift"], dtype=torch.bool),
+            torch.where(
+                is_time_shift,
+                torch.ones_like(entry["state_has_time_shift"], dtype=torch.bool),
+                entry["state_has_time_shift"],
+            ),
+        )
+        new_last_time_shift_value = torch.where(
+            is_time_shift,
+            last_time_shift_value,
+            entry["state_last_time_shift_value"],
+        )
+        entry["state_has_time_shift"].copy_(new_has_time_shift)
+        entry["state_last_time_shift_value"].copy_(new_last_time_shift_value)
+
+        invalid_mask = entry["time_shift_offsets"] < entry["state_last_time_shift_value"].reshape(1)
+        invalid_mask = invalid_mask & entry["state_has_time_shift"].reshape(1)
+        scores[:, time_shift_start:time_shift_end].masked_fill_(invalid_mask.unsqueeze(0), float("-inf"))
+
+        entry["dummy_input_ids"].copy_(last_token.reshape(-1, 1))
+        next_token_scores = scores
+        for processor in self.score_processors:
+            next_token_scores = processor(entry["dummy_input_ids"], next_token_scores)
+
+        if self.do_sample:
+            probs = nn.functional.softmax(next_token_scores, dim=-1)
+            next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+        else:
+            next_tokens = torch.argmax(next_token_scores, dim=-1)
+        entry["static_next_tokens"].copy_(next_tokens)
+
+    def _capture(self, entry: dict[str, Any]) -> None:
+        state_has = entry["state_has_time_shift"].detach().clone(memory_format=torch.contiguous_format)
+        state_last = entry["state_last_time_shift_value"].detach().clone(memory_format=torch.contiguous_format)
+        cuda_rng_state = torch.cuda.get_rng_state_all() if self.do_sample else None
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            self._graph_body(entry)
+        if cuda_rng_state is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_state)
+        entry["state_has_time_shift"].copy_(state_has)
+        entry["state_last_time_shift_value"].copy_(state_last)
+        entry["graph"] = graph
+        entry["capture_count"] = int(entry["capture_count"]) + 1
+
+    def replay(self, *, input_ids: torch.LongTensor, raw_logits: torch.Tensor) -> torch.LongTensor:
+        if not self.ready:
+            raise RuntimeError("decode-session tail CUDA graph was replayed before eager-state initialization.")
+        entry = self._ensure_entry(raw_logits)
+        entry["static_raw_logits"].copy_(raw_logits)
+        entry["static_last_token"].copy_(input_ids[:, -1])
+        if entry["graph"] is None:
+            self._capture(entry)
+            entry["static_raw_logits"].copy_(raw_logits)
+            entry["static_last_token"].copy_(input_ids[:, -1])
+        entry["graph"].replay()
+        entry["replay_count"] = int(entry["replay_count"]) + 1
+        self.replay_steps += 1
+        return entry["static_next_tokens"]
+
+    def diagnostics(self) -> dict[str, Any]:
+        entries = list(self.graph_cache.values())
+        return {
+            "enabled": True,
+            "ready": bool(self.ready),
+            "eager_tail_steps": int(self.eager_tail_steps),
+            "replay_steps": int(self.replay_steps),
+            "cache_entries": len(entries),
+            "capture_count": int(sum(int(entry.get("capture_count", 0)) for entry in entries)),
+            "replay_count": int(sum(int(entry.get("replay_count", 0)) for entry in entries)),
+            "processor_classes": (
+                [processor.__class__.__name__ for processor in self.score_processors]
+                if self.score_processors is not None
+                else []
+            ),
+        }
+
+
 def active_prefix_decode_generate(
         model,
         input_ids: torch.LongTensor,
@@ -335,6 +558,8 @@ def active_prefix_decode_generate(
         active_prefix_decode_diagnostics: dict[str, Any] | None = None,
         shared_graph_cache: dict[tuple[Any, ...], dict[str, Any]] | None = None,
         stable_encoder_holder: dict[str, BaseModelOutput] | None = None,
+        tail_cuda_graph: bool = False,
+        shared_tail_graph_cache: dict[tuple[Any, ...], dict[str, Any]] | None = None,
         **model_kwargs,
 ) -> torch.LongTensor:
     """HF custom_generate loop with normal prefill and bucketed active-prefix one-token decode."""
@@ -363,6 +588,10 @@ def active_prefix_decode_generate(
         raise ValueError("active_prefix_decode_generate currently supports batch_size=1 only")
     if cuda_graph_forward and input_ids.device.type != "cuda":
         raise RuntimeError("active-prefix CUDA graph decode requires CUDA input tensors")
+    if tail_cuda_graph and input_ids.device.type != "cuda":
+        raise RuntimeError("decode-session tail CUDA graph requires CUDA input tensors")
+    if tail_cuda_graph and not cuda_graph_forward:
+        raise RuntimeError("decode-session tail CUDA graph requires active-prefix CUDA graph replay")
     if cuda_graph_min_decode_steps <= 0:
         raise ValueError("cuda_graph_min_decode_steps must be positive")
     if active_prefix_decode_diagnostics is not None:
@@ -424,6 +653,15 @@ def active_prefix_decode_generate(
     )
     diagnostic_graph_cache: dict[tuple[Any, ...], dict[str, Any]] = (
         graph_cache if shared_graph_cache is None else {}
+    )
+    tail_graph_runtime = (
+        _TailCudaGraphRuntime(
+            logits_processor,
+            do_sample=do_sample,
+            graph_cache=shared_tail_graph_cache,
+        )
+        if tail_cuda_graph
+        else None
     )
     try:
         while model._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
@@ -597,6 +835,27 @@ def active_prefix_decode_generate(
                         dtype=torch.float32,
                         device=input_ids.device,
                     )
+            else:
+                next_token_logits = outputs.logits[:, -1, :].to(copy=True, dtype=torch.float32, device=input_ids.device)
+            tail_graph_used = False
+            if tail_graph_runtime is not None and tail_graph_runtime.ready:
+                if active_prefix_decode_diagnostics is not None:
+                    with _diagnostic_range(
+                            active_prefix_decode_diagnostics,
+                            "tail_cuda_graph.replay",
+                            wall_key="tail_cuda_graph_wall_cpu_s",
+                    ):
+                        next_tokens = tail_graph_runtime.replay(
+                            input_ids=input_ids,
+                            raw_logits=next_token_logits,
+                        )
+                else:
+                    next_tokens = tail_graph_runtime.replay(
+                        input_ids=input_ids,
+                        raw_logits=next_token_logits,
+                    )
+                tail_graph_used = True
+            elif active_prefix_decode_diagnostics is not None:
                 with _diagnostic_range(
                         active_prefix_decode_diagnostics,
                         "logits_processor",
@@ -609,10 +868,14 @@ def active_prefix_decode_generate(
                         active_prefix_decode_diagnostics,
                     )
             else:
-                next_token_logits = outputs.logits[:, -1, :].to(copy=True, dtype=torch.float32, device=input_ids.device)
                 next_token_scores = logits_processor(input_ids, next_token_logits)
 
-            if do_sample:
+            if tail_graph_runtime is not None and not tail_graph_used:
+                tail_graph_runtime.initialize_after_eager_tail(next_token_logits)
+
+            if tail_graph_used:
+                pass
+            elif do_sample:
                 if active_prefix_decode_diagnostics is not None:
                     with _diagnostic_range(
                             active_prefix_decode_diagnostics,
@@ -684,6 +947,8 @@ def active_prefix_decode_generate(
 
             del outputs
     finally:
+        if tail_graph_runtime is not None and active_prefix_decode_diagnostics is not None:
+            active_prefix_decode_diagnostics["tail_cuda_graph"] = tail_graph_runtime.diagnostics()
         if active_prefix_decode_diagnostics is not None:
             active_prefix_decode_diagnostics["loop_total_wall_cpu_s"] = (
                 time.perf_counter() - float(loop_start_wall)
