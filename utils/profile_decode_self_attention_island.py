@@ -711,6 +711,24 @@ def profile_decode_self_attention_island(
             projected_full_song[signature]["cuda_graph_fused_post_wqkv_attention_fraction_of_model_time"] = (
                 graph_fused_post_wqkv_s / full_song_model_time_s
             )
+        graph_component_sum = results.get("estimated_cuda_graph_component_sum")
+        if isinstance(graph_component_sum, dict):
+            graph_components = graph_component_sum.get("components")
+            if isinstance(graph_components, dict):
+                graph_component_seconds = {
+                    name: float(ms) * member_count * full_song_decode_steps / 1000.0
+                    for name, ms in graph_components.items()
+                    if isinstance(ms, (int, float))
+                }
+                projected_full_song[signature]["cuda_graph_component_seconds"] = graph_component_seconds
+                projected_full_song[signature]["cuda_graph_component_sum_s"] = (
+                    float(graph_component_sum.get("ms_per_call", 0.0)) * member_count * full_song_decode_steps / 1000.0
+                )
+                unexplained_ms = graph_component_sum.get("unexplained_vs_repo_ms")
+                if isinstance(unexplained_ms, (int, float)):
+                    projected_full_song[signature]["cuda_graph_component_unexplained_vs_repo_s"] = (
+                        float(unexplained_ms) * member_count * full_song_decode_steps / 1000.0
+                    )
 
     return {
         "pass": bool(_allclose(direct_result.logits, replay_logits, atol=atol, rtol=rtol)),
