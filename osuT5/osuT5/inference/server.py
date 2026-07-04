@@ -17,6 +17,7 @@ from .logit_processors import ConditionalTemperatureLogitsWarper, get_beat_type_
     MonotonicTimeShiftLogitsProcessor
 from .cache_utils import MapperatorinatorCache, get_cache
 from .decode_loop import active_prefix_decode_generate
+from .generation_compatibility import generation_compatibility_key
 from ..runtime_profiling import generation_profile_context
 from ..model import Mapperatorinator
 from ..tokenizer import Tokenizer
@@ -28,58 +29,6 @@ MILISECONDS_PER_SECOND = 1000
 MILISECONDS_PER_STEP = 10
 
 RETRY_SIGNAL = "RETRY_SIGNAL"
-
-
-def _freeze_for_generation_compatibility_key(value: Any, path: str) -> Any:
-    if isinstance(value, ContextType):
-        return ("ContextType", value.value)
-    if isinstance(value, torch.dtype):
-        return ("torch.dtype", str(value))
-    if isinstance(value, torch.device):
-        return ("torch.device", str(value))
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, tuple):
-        return ("tuple", tuple(
-            _freeze_for_generation_compatibility_key(item, f"{path}[{idx}]")
-            for idx, item in enumerate(value)
-        ))
-    if isinstance(value, list):
-        return ("list", tuple(
-            _freeze_for_generation_compatibility_key(item, f"{path}[{idx}]")
-            for idx, item in enumerate(value)
-        ))
-    if isinstance(value, (set, frozenset)):
-        frozen_items = [
-            _freeze_for_generation_compatibility_key(item, f"{path}[{idx}]")
-            for idx, item in enumerate(value)
-        ]
-        return ("set", tuple(sorted(frozen_items, key=repr)))
-    if isinstance(value, dict):
-        frozen_items = [
-            (
-                _freeze_for_generation_compatibility_key(key, f"{path}.key"),
-                _freeze_for_generation_compatibility_key(item, f"{path}[{key!r}]"),
-            )
-            for key, item in value.items()
-        ]
-        return ("dict", tuple(sorted(frozen_items, key=repr)))
-
-    raise TypeError(
-        f"Cannot use {path}={type(value).__name__} in the server batching compatibility key. "
-        "Move mutable runtime state out of generate_kwargs or add an explicit stable key."
-    )
-
-
-def generation_compatibility_key(generate_kwargs: dict[str, Any]) -> tuple[Any, ...]:
-    frozen_items = [
-        (
-            _freeze_for_generation_compatibility_key(key, "generate_kwargs.key"),
-            _freeze_for_generation_compatibility_key(value, f"generate_kwargs[{key!r}]"),
-        )
-        for key, value in generate_kwargs.items()
-    ]
-    return tuple(sorted(frozen_items, key=repr))
 
 
 @dataclass

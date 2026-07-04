@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import socket
 import subprocess
@@ -16,12 +17,32 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from osuT5.osuT5.inference.continuous_batching import (  # noqa: E402
-    ContinuousBatchRequest,
-    ContinuousBatchScheduler,
-    ContinuousBatchSchedulerConfig,
+INFERENCE_DIR = REPO_ROOT / "osuT5" / "osuT5" / "inference"
+
+
+def _load_module_from_path(module_name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load {module_name} from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_continuous_batching = _load_module_from_path(
+    "_mapperatorinator_continuous_batching",
+    INFERENCE_DIR / "continuous_batching.py",
 )
-from osuT5.osuT5.inference.server import generation_compatibility_key  # noqa: E402
+_generation_compatibility = _load_module_from_path(
+    "_mapperatorinator_generation_compatibility",
+    INFERENCE_DIR / "generation_compatibility.py",
+)
+
+ContinuousBatchRequest = _continuous_batching.ContinuousBatchRequest
+ContinuousBatchScheduler = _continuous_batching.ContinuousBatchScheduler
+ContinuousBatchSchedulerConfig = _continuous_batching.ContinuousBatchSchedulerConfig
+generation_compatibility_key = _generation_compatibility.generation_compatibility_key
 
 CONTINUOUS_SCHEDULER_TOKEN_STATUS = "scheduler_only_scripted_tokens"
 
