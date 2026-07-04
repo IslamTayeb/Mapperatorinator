@@ -234,6 +234,33 @@ boundary for future continuous batching. Local CPU validation ran
 ordered-value distinction, tensor rejection, isolated metadata lists, remaining
 work accounting, and `_cut_model_kwargs()` row slicing.
 
+Paired DCC regression smoke:
+
+- Control job: `49268405`, `main@46ccc50`, node
+  `dcc-core-ferc-s-z25-21`, RTX 2080 Ti UUID
+  `GPU-8de8e67b-289d-a1ae-3745-25f40db81f55`.
+- Branch job: `49268272`, `codex/server-batch-request-state@41de52c`, same
+  node/GPU.
+- Control manifest:
+  `/work/imt11/Mapperatorinator/runs/static-server-batch-control-20260704-46ccc50/static-server-batch-static-batch-ctrl-49268405/static_server_batch_manifest.json`
+- Branch manifest:
+  `/work/imt11/Mapperatorinator/runs/static-server-batch-request-state-20260704-41de52c/static-server-batch-static-batch-state-49268272/static_server_batch_manifest.json`
+- Both jobs completed with Slurm state `COMPLETED` and observed real
+  `static_server_batch` batches.
+- Control: `7,172` main tokens, `62.368s` scheduler wall,
+  `114.995` generated-token/s by scheduler wall, main unique batches
+  `8x size 5`, `2x size 4`, `2x size 1`.
+- Branch: `6,681` main tokens, `59.428s` scheduler wall,
+  `112.422` generated-token/s by scheduler wall, main unique batches
+  `8x size 5`, `2x size 3`, `2x size 2`.
+- Interpretation: shared global server RNG and concurrent scheduling changed
+  generated-token counts and batch-tail shape, so this pair is not exact
+  token-equivalent throughput evidence. It is a functional/no-wall-regression
+  smoke for the request-state refactor: real batching still happens, scheduler
+  wall did not regress, and no server batching error occurred. Both jobs emitted
+  an NFS temp-dir cleanup warning after successful completion; Slurm exit codes
+  were `0:0`.
+
 Recommended sequence:
 
 1. Keep static batching instrumentation mergeable and non-regressing.
