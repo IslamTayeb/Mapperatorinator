@@ -578,6 +578,7 @@ def _static_server_manifest(
     server_batch_observed: bool = True,
     token_status: str = "not_checked_shared_server_rng",
     server_batch_timeout: float = 0.2,
+    max_batch_size: int = 5,
 ):
     runs = [
         {
@@ -610,7 +611,7 @@ def _static_server_manifest(
             "model_path": "same-model",
             "precision": "fp32",
             "attn_implementation": "sdpa",
-            "max_batch_size": 5,
+            "max_batch_size": max_batch_size,
             "server_batch_timeout": server_batch_timeout,
             "inference_generation_compile": False,
         },
@@ -682,6 +683,28 @@ def test_compare_static_server_manifests_can_allow_timeout_knob_change(tmp_path)
         baseline,
         candidate,
         allow_server_batch_timeout_change=True,
+    )
+
+    assert not strict_report["contract"]["pass"]
+    assert allowed_report["contract"]["pass"]
+
+
+def test_compare_static_server_manifests_can_allow_max_batch_size_knob_change(tmp_path):
+    module = _load_module()
+    baseline = tmp_path / "baseline-static.json"
+    candidate = tmp_path / "candidate-static.json"
+    baseline.write_text(module.json.dumps(_static_server_manifest(max_batch_size=5)))
+    candidate.write_text(module.json.dumps(_static_server_manifest(
+        tok_s=130.0,
+        scheduler_wall_seconds=9.0,
+        max_batch_size=10,
+    )))
+
+    strict_report = module.compare_static_server_manifests(baseline, candidate)
+    allowed_report = module.compare_static_server_manifests(
+        baseline,
+        candidate,
+        allow_server_max_batch_size_change=True,
     )
 
     assert not strict_report["contract"]["pass"]

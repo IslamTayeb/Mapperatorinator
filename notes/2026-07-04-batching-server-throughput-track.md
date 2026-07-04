@@ -399,6 +399,38 @@ Telemetry for the whole three-pass job: `151` samples, average GPU util
 power `112.92 W`, max `249.45 W`. Active-memory samples averaged `59.57%` GPU
 util and `2700.70 MiB`.
 
+## Static Server Max Batch Size Sweep
+
+Job `49268989` tested whether static server throughput improves when the server
+can coalesce ten concurrent requests into larger batches. It ran from
+`main@195dfd7` on `dcc-core-gpu-ferc-s-h36-5` with the same five-song 15s
+smoke, `repeats=2`, `max_workers=10`, fp32/SDPA, compile disabled,
+`server_batch_timeout=0.2`, and `generate_positions=false`.
+
+Run root:
+`/work/imt11/Mapperatorinator/runs/static-server-maxbatch-20260704-201718-195dfd7`
+
+| max batch | main tokens | scheduler wall | scheduler-wall tok/s | unique main batches |
+| ---: | ---: | ---: | ---: | --- |
+| `5` | `13,436` | `99.687s` | `134.781` | `20x size 5` |
+| `10` | `14,068` | `93.159s` | `151.011` | `4x size 10`, `3x size 9`, `2x size 7`, `1x size 5`, `1x size 4`, `2x size 2`, `6x size 1` |
+
+Result: `max_batch_size=10` improved scheduler-wall main throughput by
+`+12.0%` and reduced scheduler wall by `-6.55%`. This is an accepted
+operational static-server batching recommendation for ten-request workloads,
+not an exact token-equivalent or single-song claim. Shared server RNG remains
+`not_checked_shared_server_rng`.
+
+Future max-batch comparisons should use:
+
+```bash
+python utils/summarize_inference_profile.py \
+  --compare-static-server "$BASE/static_server_batch_manifest.json" "$CAND/static_server_batch_manifest.json" \
+  --allow-server-max-batch-size-change \
+  --strict \
+  --json-output "$RUN/compare-static-server-maxbatch.json"
+```
+
 Recommended sequence:
 
 1. Keep static batching instrumentation mergeable and non-regressing.

@@ -629,6 +629,7 @@ def _compare_static_server_contract(
         candidate: dict[str, Any],
         *,
         allow_server_batch_timeout_change: bool,
+        allow_server_max_batch_size_change: bool,
 ) -> dict[str, Any]:
     mismatches = []
     for key in ["run_kind", "song_count", "repeats", "max_workers"]:
@@ -640,6 +641,9 @@ def _compare_static_server_contract(
     if allow_server_batch_timeout_change:
         baseline_fingerprint.pop("server_batch_timeout", None)
         candidate_fingerprint.pop("server_batch_timeout", None)
+    if allow_server_max_batch_size_change:
+        baseline_fingerprint.pop("max_batch_size", None)
+        candidate_fingerprint.pop("max_batch_size", None)
     if baseline_fingerprint != candidate_fingerprint:
         mismatches.append({
             "key": "server_config_fingerprint",
@@ -692,6 +696,7 @@ def _compare_static_server_contract(
         "pass": passed,
         "mismatches": mismatches,
         "allow_server_batch_timeout_change": allow_server_batch_timeout_change,
+        "allow_server_max_batch_size_change": allow_server_max_batch_size_change,
     }
 
 
@@ -810,6 +815,7 @@ def compare_static_server_manifests(
         *,
         regression_tolerance_pct: float = 0.0,
         allow_server_batch_timeout_change: bool = False,
+        allow_server_max_batch_size_change: bool = False,
 ) -> dict[str, Any]:
     baseline = _load_json(baseline_path)
     candidate = _load_json(candidate_path)
@@ -818,6 +824,7 @@ def compare_static_server_manifests(
         "candidate_path": str(candidate_path),
         "regression_tolerance_pct": regression_tolerance_pct,
         "allow_server_batch_timeout_change": allow_server_batch_timeout_change,
+        "allow_server_max_batch_size_change": allow_server_max_batch_size_change,
         "contract": {},
         "result_class": {},
         "token_status": {},
@@ -832,6 +839,7 @@ def compare_static_server_manifests(
         baseline,
         candidate,
         allow_server_batch_timeout_change=allow_server_batch_timeout_change,
+        allow_server_max_batch_size_change=allow_server_max_batch_size_change,
     )
     report["result_class"] = _compare_static_server_result_class(baseline, candidate)
     report["token_status"] = _compare_static_server_token_status(baseline, candidate)
@@ -1410,6 +1418,14 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--allow-server-max-batch-size-change",
+        action="store_true",
+        help=(
+            "For --compare-static-server, allow max_batch_size to differ in the server config "
+            "fingerprint. Use only when evaluating static server batch-cap scaling explicitly."
+        ),
+    )
+    parser.add_argument(
         "--strict",
         action="store_true",
         help=(
@@ -1532,6 +1548,7 @@ def main() -> None:
             args.compare_static_server[1],
             regression_tolerance_pct=args.regression_tolerance_pct,
             allow_server_batch_timeout_change=args.allow_server_batch_timeout_change,
+            allow_server_max_batch_size_change=args.allow_server_max_batch_size_change,
         )
         if args.json_output is not None:
             args.json_output.parent.mkdir(parents=True, exist_ok=True)

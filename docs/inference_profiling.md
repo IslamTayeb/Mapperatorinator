@@ -1814,6 +1814,8 @@ contract, real `static_server_batch` observation on both sides, preserved
 `not_checked_shared_server_rng` labeling, scheduler-wall throughput/wall
 non-regression, and no aggregate generated-token shrinkage. This gate is
 operational throughput evidence only under the current shared server RNG policy.
+When the intended config change is the static server capacity cap, add
+`--allow-server-max-batch-size-change`.
 
 DCC timeout sweep job `49268950` on RTX 2080 Ti, commit `68b63d3`, tested the
 five-song 15s static server harness with default `0.2s` versus lower coalescing
@@ -1832,6 +1834,22 @@ server default unless a new workload/profile overturns this result. Artifacts:
 `/work/imt11/Mapperatorinator/runs/static-server-timeout-20260704-200509-68b63d3-rerun/summary.json`;
 comparisons `compare-timeout020-vs-050.json` and
 `compare-timeout020-vs-020.json`.
+
+DCC max-batch sweep job `49268989` on RTX 2080 Ti, commit `195dfd7`, tested ten
+concurrent requests (`repeats=2`, `max_workers=10`) with the same five-song 15s
+static server harness:
+
+| `max_batch_size` | main tokens | scheduler wall | scheduler-wall main tok/s | result |
+| ---: | ---: | ---: | ---: | --- |
+| `5` | `13,436` | `99.687s` | `134.781` | baseline |
+| `10` | `14,068` | `93.159s` | `151.011` | `+12.0%`, real static batches observed |
+
+This is a useful operational batching setting: for static server workloads with
+around ten concurrent requests, set `max_batch_size` high enough to cover the
+active request count when memory allows. It is not exact same-calculation
+evidence because static server RNG remains shared-global and request scheduling
+can change generated tokens. Artifacts:
+`/work/imt11/Mapperatorinator/runs/static-server-maxbatch-20260704-201718-195dfd7/summary.json`.
 
 Static server batching currently uses shared global server RNG. Until an
 explicit per-request reseed/replay protocol exists, concurrent server token
