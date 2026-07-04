@@ -261,6 +261,8 @@ def _profile_batch_summary(profile: dict[str, Any]) -> dict[str, Any]:
                 "server_request_record_count": 0,
                 "server_total_queue_wait_seconds": 0.0,
                 "server_max_queue_wait_seconds": 0.0,
+                "server_total_first_queue_wait_seconds": 0.0,
+                "server_max_first_queue_wait_seconds": 0.0,
                 "server_batching_modes": {},
                 "server_elapsed_seconds_attributions": {},
                 "server_batches": [],
@@ -294,6 +296,8 @@ def _profile_batch_summary(profile: dict[str, Any]) -> dict[str, Any]:
             server_ids = record.get("server_batch_ids")
             request_counts = record.get("server_batch_request_counts")
             work_items = record.get("server_batch_work_items")
+            elapsed_seconds = record.get("server_batch_elapsed_seconds")
+            queue_waits = record.get("server_queue_wait_seconds")
             for size in server_sizes:
                 key = str(int(size))
                 label_summary["server_batch_size_histogram"][key] = int(
@@ -315,11 +319,23 @@ def _profile_batch_summary(profile: dict[str, Any]) -> dict[str, Any]:
                     if isinstance(work_items, list) and index < len(work_items)
                     else None
                 )
+                elapsed = (
+                    elapsed_seconds[index]
+                    if isinstance(elapsed_seconds, list) and index < len(elapsed_seconds)
+                    else None
+                )
+                queue_wait = (
+                    queue_waits[index]
+                    if isinstance(queue_waits, list) and index < len(queue_waits)
+                    else None
+                )
                 label_summary["server_batches"].append({
                     "batch_id": int(batch_id) if batch_id is not None else None,
                     "batch_size": int(size),
                     "request_count": int(request_count) if request_count is not None else None,
                     "work_items": int(work_item) if work_item is not None else None,
+                    "elapsed_seconds": float(elapsed) if elapsed is not None else None,
+                    "queue_wait_seconds": float(queue_wait) if queue_wait is not None else None,
                 })
         queue_wait = float(record.get("server_total_queue_wait_seconds") or 0.0)
         label_summary["server_total_queue_wait_seconds"] += queue_wait
@@ -327,6 +343,13 @@ def _profile_batch_summary(profile: dict[str, Any]) -> dict[str, Any]:
             float(label_summary["server_max_queue_wait_seconds"]),
             float(record.get("server_max_queue_wait_seconds") or 0.0),
         )
+        first_queue_wait = record.get("server_first_queue_wait_seconds")
+        if isinstance(first_queue_wait, (int, float)):
+            label_summary["server_total_first_queue_wait_seconds"] += float(first_queue_wait)
+            label_summary["server_max_first_queue_wait_seconds"] = max(
+                float(label_summary["server_max_first_queue_wait_seconds"]),
+                float(first_queue_wait),
+            )
     return {"by_label": by_label}
 
 
@@ -442,10 +465,14 @@ def _aggregate_batch_summaries(runs: list[dict[str, Any]]) -> dict[str, Any]:
                     "server_request_record_count": 0,
                     "server_total_queue_wait_seconds": 0.0,
                     "server_max_queue_wait_seconds": 0.0,
+                    "server_total_first_queue_wait_seconds": 0.0,
+                    "server_max_first_queue_wait_seconds": 0.0,
                     "server_batching_modes": {},
                     "server_elapsed_seconds_attributions": {},
                     "server_batch_count_attributed": 0,
                     "server_unique_batch_size_histogram": {},
+                    "server_unique_batch_elapsed_seconds_sum": 0.0,
+                    "server_unique_batch_elapsed_seconds_max": 0.0,
                     "_seen_server_batch_ids": set(),
                 },
             )
@@ -460,6 +487,13 @@ def _aggregate_batch_summaries(runs: list[dict[str, Any]]) -> dict[str, Any]:
             target["server_max_queue_wait_seconds"] = max(
                 float(target["server_max_queue_wait_seconds"]),
                 float(label_summary.get("server_max_queue_wait_seconds", 0.0) or 0.0),
+            )
+            target["server_total_first_queue_wait_seconds"] += float(
+                label_summary.get("server_total_first_queue_wait_seconds", 0.0) or 0.0
+            )
+            target["server_max_first_queue_wait_seconds"] = max(
+                float(target["server_max_first_queue_wait_seconds"]),
+                float(label_summary.get("server_max_first_queue_wait_seconds", 0.0) or 0.0),
             )
             for field in (
                 "modes",
@@ -491,6 +525,13 @@ def _aggregate_batch_summaries(runs: list[dict[str, Any]]) -> dict[str, Any]:
                     target["server_unique_batch_size_histogram"][size_key] = int(
                         target["server_unique_batch_size_histogram"].get(size_key, 0)
                     ) + 1
+                    elapsed = batch.get("elapsed_seconds")
+                    if isinstance(elapsed, (int, float)):
+                        target["server_unique_batch_elapsed_seconds_sum"] += float(elapsed)
+                        target["server_unique_batch_elapsed_seconds_max"] = max(
+                            float(target["server_unique_batch_elapsed_seconds_max"]),
+                            float(elapsed),
+                        )
             elif int(label_summary.get("server_batch_count", 0) or 0) > 0:
                 target["server_batch_count"] += int(label_summary.get("server_batch_count", 0) or 0)
 

@@ -1,8 +1,14 @@
+from argparse import Namespace
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
 from osuT5.osuT5.inference.continuous_batching import (
     ContinuousBatchRequest,
     ContinuousBatchScheduler,
     ContinuousBatchSchedulerConfig,
 )
+from utils.profile_continuous_scheduler import run_scheduler_dry_run
 
 
 def _assert_raises(exc_type, fn, message_fragment):
@@ -25,6 +31,7 @@ def _request(
         final_rng_state_hash=None,
         logits_processor_state_hash=None,
         cache_state_hash=None,
+        planned_arrival_step=None,
 ):
     return ContinuousBatchRequest(
         request_id=request_id,
@@ -34,6 +41,7 @@ def _request(
         eos_token_ids=eos_token_ids,
         script_tokens=list(script_tokens),
         metadata={"song": request_id},
+        planned_arrival_step=planned_arrival_step,
         initial_rng_state_hash=initial_rng_state_hash,
         final_rng_state_hash=final_rng_state_hash,
         logits_processor_state_hash=logits_processor_state_hash,
@@ -126,6 +134,7 @@ def test_empty_scheduler_step_returns_noop_metadata():
 
     assert step.is_noop
     assert step.step_index == 0
+    assert scheduler.current_step == 1
     assert scheduler.report().to_dict()["steps"] == [
         {"step_index": 0, "activated": [], "decoded": [], "finished": [], "active_batch_size": 0}
     ]
@@ -182,6 +191,11 @@ def test_compatibility_key_guard_and_config_validation():
         ValueError,
         lambda: scheduler.enqueue(_request("bad", [3], max_new_tokens=0, key=("model", "a"))),
         "max_new_tokens",
+    )
+    _assert_raises(
+        ValueError,
+        lambda: scheduler.enqueue(_request("bad-arrival", [3], key=("model", "a"), planned_arrival_step=-1)),
+        "planned_arrival_step",
     )
 
 
@@ -263,3 +277,61 @@ def test_report_preserves_exactness_ledger_hashes_and_config():
     assert report["requests"][0]["final_rng_state_hash"] == "rng-after"
     assert report["requests"][0]["logits_processor_state_hash"] == "logits-state"
     assert report["requests"][0]["cache_state_hash"] == "cache-state"
+
+
+def test_profile_continuous_scheduler_honors_staggered_arrivals():
+    requests = [
+        {
+            "request_id": "a",
+            "arrival_step": 0,
+            "prompt_tokens": 4,
+            "max_new_tokens": 2,
+            "script_tokens": [1, 2],
+            "generate_kwargs": {"do_sample": True, "top_p": 0.9, "top_k": 20, "temperature": 1.0},
+        },
+        {
+            "request_id": "b",
+            "arrival_step": 0,
+            "prompt_tokens": 4,
+            "max_new_tokens": 1,
+            "script_tokens": [3],
+            "generate_kwargs": {"do_sample": True, "top_p": 0.9, "top_k": 20, "temperature": 1.0},
+        },
+        {
+            "request_id": "c",
+            "arrival_step": 4,
+            "prompt_tokens": 4,
+            "max_new_tokens": 1,
+            "script_tokens": [4],
+            "generate_kwargs": {"do_sample": True, "top_p": 0.9, "top_k": 20, "temperature": 1.0},
+        },
+    ]
+    with TemporaryDirectory() as tmpdir:
+        requests_path = Path(tmpdir) / "requests.json"
+        requests_path.write_text(json.dumps(requests), encoding="utf-8")
+        manifest = run_scheduler_dry_run(
+            Namespace(
+                requests_json=requests_path,
+                output_root=None,
+                suite_id="arrival-test",
+                max_active_sequences=1,
+                max_wait_ms=0,
+                prefill_policy="serial",
+                decode_order_policy="arrival_order",
+                rng_policy="serial_global",
+                max_steps=16,
+            )
+        )
+
+    assert manifest["aggregate"]["scheduler_step_count"] == 5
+    assert manifest["aggregate"]["idle_step_count"] == 1
+    assert manifest["aggregate"]["planned_arrival_step_histogram"] == {"0": 2, "4": 1}
+    assert manifest["active_batch_size_histogram"] == {"1": 4}
+    rows = {request["request_id"]: request for request in manifest["requests"]}
+    assert rows["a"]["planned_arrival_step"] == 0
+    assert rows["a"]["queue_wait_steps"] == 0
+    assert rows["b"]["planned_arrival_step"] == 0
+    assert rows["b"]["queue_wait_steps"] == 1
+    assert rows["c"]["planned_arrival_step"] == 4
+    assert rows["c"]["enqueue_step"] == 4
+    assert rows["c"]["queue_wait_steps"] == 0

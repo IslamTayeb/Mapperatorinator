@@ -167,11 +167,20 @@ def _build_request(spec: dict[str, Any]) -> ContinuousBatchRequest:
         eos_token_ids=tuple(int(token) for token in spec.get("eos_token_ids", [])),
         script_tokens=script_tokens,
         metadata=dict(spec.get("metadata") or {}),
+        planned_arrival_step=_request_arrival_step(spec),
         initial_rng_state_hash=spec.get("initial_rng_state_hash"),
         final_rng_state_hash=spec.get("final_rng_state_hash"),
         logits_processor_state_hash=spec.get("logits_processor_state_hash"),
         cache_state_hash=spec.get("cache_state_hash"),
     )
+
+
+def _request_arrival_step(spec: dict[str, Any]) -> int:
+    value = spec.get("arrival_step", spec.get("planned_arrival_step", 0))
+    arrival_step = int(value)
+    if arrival_step < 0:
+        raise ValueError("arrival_step must be non-negative.")
+    return arrival_step
 
 
 def _request_manifest_row(request: dict[str, Any]) -> dict[str, Any]:
@@ -185,21 +194,36 @@ def _request_manifest_row(request: dict[str, Any]) -> dict[str, Any]:
 
 def _aggregate_report(report: dict[str, Any], scheduler_wall_seconds: float) -> dict[str, Any]:
     requests = report.get("requests", [])
+    steps = report.get("steps", [])
     stop_reason_counts = Counter(request.get("stop_reason") for request in requests)
+    arrival_step_counts = Counter(request.get("planned_arrival_step") for request in requests)
     completed_requests = sum(1 for request in requests if request.get("stop_reason") is not None)
     generated_tokens = sum(int(request.get("generated_token_count", 0) or 0) for request in requests)
     cache_slot_events = report.get("cache_slot_events", [])
+    idle_step_count = sum(
+        1
+        for step in steps
+        if int(step.get("active_batch_size", 0) or 0) == 0
+        and not step.get("activated")
+        and not step.get("decoded")
+        and not step.get("finished")
+    )
     return {
         "result_class": "continuous_scheduler_dry_run",
         "model_generation_executed": False,
         "request_count": len(requests),
         "completed_request_count": completed_requests,
         "total_generated_tokens": generated_tokens,
+        "scheduler_step_count": len(steps),
+        "idle_step_count": idle_step_count,
         "scheduler_cpu_wall_seconds": scheduler_wall_seconds,
         "scheduler_tokens_per_cpu_second": (
             generated_tokens / scheduler_wall_seconds if scheduler_wall_seconds > 0 else 0.0
         ),
         "active_batch_size_histogram": report.get("active_batch_size_histogram", {}),
+        "planned_arrival_step_histogram": {
+            str(key): value for key, value in sorted(arrival_step_counts.items(), key=lambda item: int(item[0] or 0))
+        },
         "stop_reason_counts": {str(key): value for key, value in sorted(stop_reason_counts.items(), key=lambda item: str(item[0]))},
         "cache_slot_acquire_count": sum(1 for event in cache_slot_events if event.get("event") == "acquire"),
         "cache_slot_release_count": sum(1 for event in cache_slot_events if event.get("event") == "release"),
@@ -208,6 +232,12 @@ def _aggregate_report(report: dict[str, Any], scheduler_wall_seconds: float) -> 
 
 def run_scheduler_dry_run(args: argparse.Namespace) -> dict[str, Any]:
     request_specs = _load_request_specs(args.requests_json)
+    if not request_specs:
+        raise ValueError("continuous scheduler dry run requires at least one request.")
+    ordered_specs = sorted(
+        enumerate(request_specs),
+        key=lambda item: (_request_arrival_step(item[1]), item[0]),
+    )
     scheduler = ContinuousBatchScheduler(
         ContinuousBatchSchedulerConfig(
             max_active_sequences=args.max_active_sequences,
@@ -217,11 +247,22 @@ def run_scheduler_dry_run(args: argparse.Namespace) -> dict[str, Any]:
             rng_policy=args.rng_policy,
         )
     )
-    for spec in request_specs:
-        scheduler.enqueue(_build_request(spec))
 
     started = time.perf_counter()
-    report = scheduler.run_until_idle(max_steps=args.max_steps).to_dict()
+    next_spec_index = 0
+    steps_run = 0
+    while next_spec_index < len(ordered_specs) or scheduler.has_work():
+        while (
+            next_spec_index < len(ordered_specs)
+            and _request_arrival_step(ordered_specs[next_spec_index][1]) <= scheduler.current_step
+        ):
+            scheduler.enqueue(_build_request(ordered_specs[next_spec_index][1]))
+            next_spec_index += 1
+        if steps_run >= args.max_steps:
+            raise RuntimeError(f"ContinuousBatchScheduler still has work or future arrivals after {args.max_steps} steps.")
+        scheduler.step()
+        steps_run += 1
+    report = scheduler.report().to_dict()
     scheduler_wall_seconds = time.perf_counter() - started
     request_rows = [_request_manifest_row(request) for request in report.get("requests", [])]
     report["requests"] = request_rows

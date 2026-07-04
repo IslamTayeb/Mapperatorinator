@@ -444,8 +444,10 @@ def _run_request(
 def _aggregate_runs(runs: list[dict[str, Any]], scheduler_wall_seconds: float) -> dict[str, Any]:
     main_tokens = sum(int(run.get("main_generated_tokens") or 0) for run in runs)
     timing_tokens = sum(int(run.get("timing_generated_tokens") or 0) for run in runs)
-    request_wall = sum(float(run.get("request_wall_seconds") or 0.0) for run in runs)
+    request_walls = sorted(float(run.get("request_wall_seconds") or 0.0) for run in runs)
+    request_wall = sum(request_walls)
     main_model_elapsed = sum(float(run.get("main_model_elapsed_seconds") or 0.0) for run in runs)
+    timing_model_elapsed = sum(float(run.get("timing_model_elapsed_seconds") or 0.0) for run in runs)
     batching = _aggregate_batch_summaries(runs)
     server_batch_observed = False
     for label_summary in batching.get("by_label", {}).values():
@@ -457,19 +459,38 @@ def _aggregate_runs(runs: list[dict[str, Any]], scheduler_wall_seconds: float) -
         "runs": len(runs),
         "result_class": "static_server_batch" if server_batch_observed else "static_server_no_batch_observed",
         "server_batch_observed": server_batch_observed,
+        "same_calculation": False,
+        "throughput_claim_scope": "static_ipc_concurrent_full_song_requests",
+        "token_equivalence_status": "not_checked_shared_server_rng",
         "main_generated_tokens": main_tokens,
         "timing_generated_tokens": timing_tokens,
         "scheduler_wall_seconds": scheduler_wall_seconds,
         "request_wall_seconds_sum": request_wall,
+        "request_wall_seconds_max": max(request_walls) if request_walls else 0.0,
+        "request_wall_seconds_p95": _nearest_rank_percentile(request_walls, 0.95),
         "main_model_elapsed_seconds_sum": main_model_elapsed,
+        "timing_model_elapsed_seconds_sum": timing_model_elapsed,
         "main_tokens_per_scheduler_second": (
             main_tokens / scheduler_wall_seconds if scheduler_wall_seconds > 0 else 0.0
+        ),
+        "timing_tokens_per_scheduler_second": (
+            timing_tokens / scheduler_wall_seconds if scheduler_wall_seconds > 0 else 0.0
         ),
         "main_tokens_per_request_model_second_attributed": (
             main_tokens / main_model_elapsed if main_model_elapsed > 0 else 0.0
         ),
+        "timing_tokens_per_request_model_second_attributed": (
+            timing_tokens / timing_model_elapsed if timing_model_elapsed > 0 else 0.0
+        ),
         "batching": batching,
     }
+
+
+def _nearest_rank_percentile(sorted_values: list[float], percentile: float) -> float:
+    if not sorted_values:
+        return 0.0
+    index = max(0, min(len(sorted_values) - 1, int(len(sorted_values) * percentile + 0.999999) - 1))
+    return sorted_values[index]
 
 
 def main() -> None:
@@ -610,6 +631,9 @@ def main() -> None:
         "server_socket_paths": socket_paths,
         "server_config_fingerprint": server_config_fingerprint,
         "rng_reset_policy": "server_global_rng_shared_across_concurrent_requests",
+        "same_calculation": False,
+        "throughput_claim_scope": "static_ipc_concurrent_full_song_requests",
+        "token_equivalence_status": "not_checked_shared_server_rng",
         "equivalence_scope": (
             "static server batching is throughput evidence only unless compared against "
             "per-song token/output baselines from the same server/RNG policy"

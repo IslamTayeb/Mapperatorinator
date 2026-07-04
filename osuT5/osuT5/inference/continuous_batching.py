@@ -23,6 +23,7 @@ class ContinuousBatchRequest:
     eos_token_ids: tuple[int, ...] = ()
     script_tokens: list[int] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    planned_arrival_step: int | None = None
     initial_rng_state_hash: str | None = None
     final_rng_state_hash: str | None = None
     logits_processor_state_hash: str | None = None
@@ -132,6 +133,8 @@ class ContinuousBatchScheduler:
             raise ValueError("prompt_tokens must be non-negative.")
         if request.max_new_tokens <= 0:
             raise ValueError("max_new_tokens must be positive.")
+        if request.planned_arrival_step is not None and request.planned_arrival_step < 0:
+            raise ValueError("planned_arrival_step must be non-negative.")
         if self._compatibility_key is None:
             self._compatibility_key = request.compatibility_key
         elif request.compatibility_key != self._compatibility_key:
@@ -155,6 +158,7 @@ class ContinuousBatchScheduler:
                 active_batch_size=0,
             )
             self._step_metadata.append(metadata)
+            self._step_index += 1
             return metadata
 
         active_batch_size = len(active_slots)
@@ -217,6 +221,10 @@ class ContinuousBatchScheduler:
 
     def has_work(self) -> bool:
         return bool(self._pending or any(not slot.is_free for slot in self._slots))
+
+    @property
+    def current_step(self) -> int:
+        return self._step_index
 
     def active_slots(self) -> tuple[ActiveSequenceSlot, ...]:
         return tuple(slot for slot in self._slots if not slot.is_free)
@@ -342,6 +350,7 @@ class ContinuousBatchScheduler:
             "prompt_tokens": request.prompt_tokens,
             "max_new_tokens": request.max_new_tokens,
             "eos_token_ids": request.eos_token_ids,
+            "planned_arrival_step": request.planned_arrival_step,
             "generated_tokens": list(request.generated_tokens),
             "generated_token_count": len(request.generated_tokens),
             "stop_reason": request.stop_reason,

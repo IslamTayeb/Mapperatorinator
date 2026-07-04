@@ -1555,8 +1555,17 @@ class Processor(object):
             "server_batch_work_items": stats.get("server_batch_work_items"),
             "server_batch_elapsed_seconds": stats.get("server_batch_elapsed_seconds"),
             "server_queue_wait_seconds": stats.get("server_queue_wait_seconds"),
+            "server_first_queue_wait_seconds": stats.get("server_first_queue_wait_seconds"),
             "server_total_queue_wait_seconds": stats.get("server_total_queue_wait_seconds"),
             "server_max_queue_wait_seconds": stats.get("server_max_queue_wait_seconds"),
+            "server_rng_policy": stats.get(
+                "server_rng_policy",
+                "shared_global" if isinstance(self.model, InferenceClient) else None,
+            ),
+            "token_equivalence_status": stats.get(
+                "token_equivalence_status",
+                "not_checked_shared_server_rng" if isinstance(self.model, InferenceClient) else None,
+            ),
             "use_server": isinstance(self.model, InferenceClient),
             "parallel": self.parallel,
         }

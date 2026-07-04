@@ -15,6 +15,9 @@ def test_profile_batch_summary_preserves_static_server_batch_metadata():
                 "server_batch_sizes": [5, 3],
                 "server_batch_request_counts": [5, 3],
                 "server_batch_work_items": [1, 1],
+                "server_batch_elapsed_seconds": [1.5, 1.0],
+                "server_queue_wait_seconds": [0.3, 0.2],
+                "server_first_queue_wait_seconds": 0.3,
                 "server_total_queue_wait_seconds": 0.5,
                 "server_max_queue_wait_seconds": 0.4,
             },
@@ -28,6 +31,9 @@ def test_profile_batch_summary_preserves_static_server_batch_metadata():
                 "server_batch_sizes": [5, 3],
                 "server_batch_request_counts": [5, 3],
                 "server_batch_work_items": [1, 1],
+                "server_batch_elapsed_seconds": [1.5, 1.0],
+                "server_queue_wait_seconds": [0.15, 0.1],
+                "server_first_queue_wait_seconds": 0.15,
                 "server_total_queue_wait_seconds": 0.25,
                 "server_max_queue_wait_seconds": 0.2,
             },
@@ -48,11 +54,13 @@ def test_profile_batch_summary_preserves_static_server_batch_metadata():
     assert label["server_batch_size_histogram"] == {"5": 2, "3": 2}
     assert label["server_total_queue_wait_seconds"] == 0.75
     assert label["server_max_queue_wait_seconds"] == 0.4
+    assert label["server_total_first_queue_wait_seconds"] == 0.44999999999999996
+    assert label["server_max_first_queue_wait_seconds"] == 0.3
     assert label["server_batches"] == [
-        {"batch_id": 11, "batch_size": 5, "request_count": 5, "work_items": 1},
-        {"batch_id": 12, "batch_size": 3, "request_count": 3, "work_items": 1},
-        {"batch_id": 11, "batch_size": 5, "request_count": 5, "work_items": 1},
-        {"batch_id": 12, "batch_size": 3, "request_count": 3, "work_items": 1},
+        {"batch_id": 11, "batch_size": 5, "request_count": 5, "work_items": 1, "elapsed_seconds": 1.5, "queue_wait_seconds": 0.3},
+        {"batch_id": 12, "batch_size": 3, "request_count": 3, "work_items": 1, "elapsed_seconds": 1.0, "queue_wait_seconds": 0.2},
+        {"batch_id": 11, "batch_size": 5, "request_count": 5, "work_items": 1, "elapsed_seconds": 1.5, "queue_wait_seconds": 0.15},
+        {"batch_id": 12, "batch_size": 3, "request_count": 3, "work_items": 1, "elapsed_seconds": 1.0, "queue_wait_seconds": 0.1},
     ]
 
 
@@ -69,15 +77,17 @@ def test_aggregate_batch_summaries_deduplicates_shared_server_batch_ids():
                     "server_request_record_count": 2,
                     "server_total_queue_wait_seconds": 0.75,
                     "server_max_queue_wait_seconds": 0.4,
+                    "server_total_first_queue_wait_seconds": 0.45,
+                    "server_max_first_queue_wait_seconds": 0.3,
                     "server_batching_modes": {"static_ipc": 2},
                     "server_elapsed_seconds_attributions": {
                         "merged_batch_elapsed_replicated_per_request": 2,
                     },
                     "server_batches": [
-                        {"batch_id": 11, "batch_size": 5, "request_count": 5, "work_items": 1},
-                        {"batch_id": 12, "batch_size": 3, "request_count": 3, "work_items": 1},
-                        {"batch_id": 11, "batch_size": 5, "request_count": 5, "work_items": 1},
-                        {"batch_id": 12, "batch_size": 3, "request_count": 3, "work_items": 1},
+                        {"batch_id": 11, "batch_size": 5, "request_count": 5, "work_items": 1, "elapsed_seconds": 1.5},
+                        {"batch_id": 12, "batch_size": 3, "request_count": 3, "work_items": 1, "elapsed_seconds": 1.0},
+                        {"batch_id": 11, "batch_size": 5, "request_count": 5, "work_items": 1, "elapsed_seconds": 1.5},
+                        {"batch_id": 12, "batch_size": 3, "request_count": 3, "work_items": 1, "elapsed_seconds": 1.0},
                     ],
                 }
             }
@@ -94,6 +104,10 @@ def test_aggregate_batch_summaries_deduplicates_shared_server_batch_ids():
     assert label["server_request_record_count"] == 2
     assert label["server_total_queue_wait_seconds"] == 0.75
     assert label["server_max_queue_wait_seconds"] == 0.4
+    assert label["server_total_first_queue_wait_seconds"] == 0.45
+    assert label["server_max_first_queue_wait_seconds"] == 0.3
+    assert label["server_unique_batch_elapsed_seconds_sum"] == 2.5
+    assert label["server_unique_batch_elapsed_seconds_max"] == 1.5
 
 
 def test_static_server_aggregate_classifies_no_batch_and_real_batch_runs():

@@ -47,12 +47,14 @@ class StaticServerRequest:
     output_tokens_per_sample: list[int] = field(default_factory=list)
     elapsed_seconds: float = 0.0
     enqueued_at: float = field(default_factory=time.perf_counter)
+    queued_at: float = field(default_factory=time.perf_counter)
     server_batch_ids: list[int] = field(default_factory=list)
     server_batch_sizes: list[int] = field(default_factory=list)
     server_batch_request_counts: list[int] = field(default_factory=list)
     server_batch_work_items: list[int] = field(default_factory=list)
     server_batch_elapsed_seconds: list[float] = field(default_factory=list)
     server_queue_wait_seconds: list[float] = field(default_factory=list)
+    server_first_queue_wait_seconds: float | None = None
 
     @property
     def remaining_work(self) -> int:
@@ -658,6 +660,7 @@ class InferenceServer:
                     remaining_batch_size -= work
                     if req_remaining_work > work:
                         # If there is still work left, re-add the record to the queue
+                        request.queued_at = time.perf_counter()
                         requests.insert(0, request)
 
                 if not group.requests:
@@ -712,9 +715,10 @@ class InferenceServer:
                     request.server_batch_request_counts.append(len(batch_requests))
                     request.server_batch_work_items.append(work_done)
                     request.server_batch_elapsed_seconds.append(server_batch_elapsed_seconds)
-                    request.server_queue_wait_seconds.append(
-                        max(0.0, batch_started_at - request.enqueued_at)
-                    )
+                    slice_queue_wait = max(0.0, batch_started_at - request.queued_at)
+                    if request.server_first_queue_wait_seconds is None:
+                        request.server_first_queue_wait_seconds = max(0.0, batch_started_at - request.enqueued_at)
+                    request.server_queue_wait_seconds.append(slice_queue_wait)
                     if request.work_done >= request.total_work:
                         # All work done for this record, signal completion
                         elapsed_seconds = request.elapsed_seconds
@@ -767,10 +771,13 @@ class InferenceServer:
                                 'server_batch_work_items': request.server_batch_work_items,
                                 'server_batch_elapsed_seconds': request.server_batch_elapsed_seconds,
                                 'server_queue_wait_seconds': server_queue_wait_seconds,
+                                'server_first_queue_wait_seconds': request.server_first_queue_wait_seconds,
                                 'server_total_queue_wait_seconds': sum(server_queue_wait_seconds),
                                 'server_max_queue_wait_seconds': (
                                     max(server_queue_wait_seconds) if server_queue_wait_seconds else 0.0
                                 ),
+                                'server_rng_policy': 'shared_global',
+                                'token_equivalence_status': 'not_checked_shared_server_rng',
                             },
                         }
                         request.event.set()

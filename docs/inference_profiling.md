@@ -1857,6 +1857,11 @@ hashes are throughput diagnostics only; do not compare them against cold
 single-song token IDs as exact same-calculation evidence. Equivalent continuous
 or static server claims need same-policy per-request token/output hashes and RNG
 state reporting.
+Raw `use_server=true` profile metadata labels this explicitly with
+`server_rng_policy=shared_global` and
+`token_equivalence_status=not_checked_shared_server_rng`. Static-server
+manifests and aggregates also set `same_calculation=false` and
+`throughput_claim_scope=static_ipc_concurrent_full_song_requests`.
 
 The CPU-only continuous-batching scheduler harness is verifier infrastructure,
 not a runtime path. It now records the config and state surfaces a future model
@@ -1866,6 +1871,9 @@ slot/generation events, stop reasons, generated-token counts, and placeholder
 RNG/logits/cache state hashes. These fields are useful for designing continuous
 server gates, but missing or synthetic hashes still mean the result is
 `scheduler_only` evidence rather than exact model-backed continuous batching.
+The dry-run request format supports `arrival_step` / `planned_arrival_step`, so
+future scheduler tests can model staggered arrivals, idle service periods,
+queued requests, and cache-slot reuse without running model generation.
 Use `utils/profile_continuous_scheduler.py` to emit
 `continuous_scheduler_manifest.json` files, and compare them with:
 
@@ -1877,9 +1885,12 @@ python utils/summarize_inference_profile.py \
 ```
 
 Strict mode checks the dry-run/result-class contract, scripted token hashes and
-stop reasons, and scheduling shape. CPU scheduler wall time is recorded for
-auditability only; require it explicitly with `--require-no-regression` when a
-CPU-harness change is the thing being measured.
+stop reasons, lifecycle/state ledger fields, and scheduling shape. The ledger
+check covers RNG hashes, logits-processor state hash, cache state hash,
+enqueue/activation/finish steps, queue wait, decode/latency steps, cache slot id,
+and slot generation. CPU scheduler wall time is recorded for auditability only;
+require it explicitly with `--require-no-regression` when a CPU-harness change is
+the thing being measured.
 
 Do not combine `use_server=true` with `inference_generation_compile=true` on the
 current static IPC server. DCC job `49267683` on RTX 2080 Ti reached generation
@@ -1911,6 +1922,10 @@ serial-vs-parallel report is
 Future continuous batching work is a separate throughput-mode project, not a single-song TPS path. The reserved control-plane flags are now present in `config.py`, `configs/inference/default.yaml`, and profile metadata: `inference_continuous_batching`, `inference_continuous_batching_mode`, `continuous_batch_max_active_sequences`, `continuous_batch_max_wait_ms`, `continuous_batch_prefill_policy`, `continuous_batch_decode_order_policy`, `continuous_batch_rng_policy`, `inference_batch_decode_session_runtime`, and `inference_batch_native_decode_kernels`. They intentionally fail loudly in `inference.py` until an explicit server scheduler exists.
 
 Continuous batching needs gates for cold single-song, warm repeat, static server batch, static window batch, and continuous server batch. Exact-equivalent continuous batching must preserve each request's generated-token IDs, stopping state, cache state, logits-processor state, RNG behavior, output policy, and generated-token accounting. If that cannot be proven, report it only as `documented-drift`/non-equivalent and keep it out of retained same-calculation baselines. The existing single-song DecodeSession/native flags should keep failing loudly for `use_server=true` and `parallel=true` until batch-specific verifiers prove equivalent behavior.
+
+Do not combine `use_server=true` with `parallel=true` until a dedicated mixed-mode
+harness exists. Static IPC request batching and static window batching are
+separate modes with separate claims and gates.
 
 The server static batching queue now uses an explicit `generation_compatibility_key()` plus `StaticServerRequest`/`StaticServerRequestGroup` state instead of grouping by `frozenset(generate_kwargs.items())`. This is infrastructure only: it preserves static IPC request batching behavior while making future continuous-batching state boundaries explicit. Mutable runtime objects such as tensors in `generate_kwargs` fail loudly rather than crashing the batch thread or silently fragmenting batches.
 

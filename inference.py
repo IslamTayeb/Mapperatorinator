@@ -438,6 +438,11 @@ def validate_reserved_runtime_flags(args: InferenceConfig):
             f"max_batch_size={args.max_batch_size}, num_beams={args.num_beams}, cfg_scale={args.cfg_scale}. "
             "Increase max_batch_size or reduce num_beams/cfg_scale."
         )
+    if args.use_server and args.parallel:
+        raise ValueError(
+            "use_server=true and parallel=true are separate batching modes and are not validated together. "
+            "Use static IPC server batching or static window batching separately until a mixed-mode harness exists."
+        )
     if args.use_server and args.inference_generation_compile:
         raise ValueError(
             "inference_generation_compile=true is not supported with use_server=true. "
@@ -665,6 +670,8 @@ def generate(
         "server_batch_timeout": args.server_batch_timeout,
         "parallel": args.parallel,
         "max_batch_size": args.max_batch_size,
+        "server_rng_policy": "shared_global" if args.use_server else None,
+        "token_equivalence_status": "not_checked_shared_server_rng" if args.use_server else None,
         "inference_generation_compile": args.inference_generation_compile,
         "inference_active_prefix_decode_loop": args.inference_active_prefix_decode_loop,
         "inference_active_prefix_decode_bucket_size": args.inference_active_prefix_decode_bucket_size,

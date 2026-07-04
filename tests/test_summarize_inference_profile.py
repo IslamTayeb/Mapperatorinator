@@ -604,6 +604,9 @@ def _static_server_manifest(
     return {
         "schema_version": 1,
         "run_kind": "static_server_batch",
+        "same_calculation": False,
+        "throughput_claim_scope": "static_ipc_concurrent_full_song_requests",
+        "token_equivalence_status": token_status,
         "song_count": 5,
         "repeats": 1,
         "max_workers": 5,
@@ -619,12 +622,21 @@ def _static_server_manifest(
         "aggregate": {
             "result_class": result_class,
             "server_batch_observed": server_batch_observed,
+            "same_calculation": False,
+            "throughput_claim_scope": "static_ipc_concurrent_full_song_requests",
+            "token_equivalence_status": token_status,
             "main_generated_tokens": generated_tokens,
+            "timing_generated_tokens": 0,
             "scheduler_wall_seconds": scheduler_wall_seconds,
             "request_wall_seconds_sum": scheduler_wall_seconds * 5,
+            "request_wall_seconds_max": scheduler_wall_seconds,
+            "request_wall_seconds_p95": scheduler_wall_seconds,
             "main_model_elapsed_seconds_sum": generated_tokens / tok_s,
+            "timing_model_elapsed_seconds_sum": 0.0,
             "main_tokens_per_scheduler_second": generated_tokens / scheduler_wall_seconds,
+            "timing_tokens_per_scheduler_second": 0.0,
             "main_tokens_per_request_model_second_attributed": tok_s,
+            "timing_tokens_per_request_model_second_attributed": 0.0,
         },
     }
 
@@ -727,10 +739,19 @@ def _continuous_scheduler_manifest(
         "prompt_tokens": 4,
         "max_new_tokens": 4,
         "eos_token_ids": [99],
+        "planned_arrival_step": 0,
         "generated_tokens": [1, 2, 99][:generated_tokens],
         "generated_token_count": generated_tokens,
         "generated_token_sha256": token_hash,
         "stop_reason": stop_reason,
+        "enqueue_step": 0,
+        "activation_step": 0,
+        "finish_step": 2,
+        "queue_wait_steps": 0,
+        "decode_steps": 3,
+        "latency_steps": 3,
+        "cache_slot_id": 0,
+        "slot_generation": 1,
         "metadata": {"song_id": "song0", "window_index": 0},
         "token_equivalence_status": token_status,
         "initial_rng_state_hash": "rng-before",
@@ -755,6 +776,48 @@ def _continuous_scheduler_manifest(
         },
         "compatibility_key": [["do_sample", True]],
         "active_batch_size_histogram": histogram,
+        "steps": [
+            {
+                "step_index": 0,
+                "activated": [{"request_id": "song0-window0", "cache_slot_id": 0, "slot_generation": 1}],
+                "decoded": [{"request_id": "song0-window0", "slot_id": 0, "slot_generation": 1, "token_id": 1, "stop_reason": None}],
+                "finished": [],
+                "active_batch_size": 1,
+            },
+            {
+                "step_index": 1,
+                "activated": [],
+                "decoded": [{"request_id": "song0-window0", "slot_id": 0, "slot_generation": 1, "token_id": 2, "stop_reason": None}],
+                "finished": [],
+                "active_batch_size": 1,
+            },
+            {
+                "step_index": 2,
+                "activated": [],
+                "decoded": [
+                    {
+                        "request_id": "song0-window0",
+                        "slot_id": 0,
+                        "slot_generation": 1,
+                        "token_id": 99,
+                        "stop_reason": stop_reason,
+                    }
+                ],
+                "finished": [
+                    {
+                        "request_id": "song0-window0",
+                        "cache_slot_id": 0,
+                        "slot_generation": 1,
+                        "finish_step": 2,
+                        "decode_steps": 3,
+                        "latency_steps": 3,
+                        "stop_reason": stop_reason,
+                        "generated_tokens": [1, 2, 99][:generated_tokens],
+                    }
+                ],
+                "active_batch_size": 1,
+            },
+        ],
         "requests": [request],
         "cache_slot_events": [
             {"event": "acquire", "step_index": 0, "request_id": "song0-window0", "cache_slot_id": 0, "slot_generation": 1},
@@ -766,9 +829,12 @@ def _continuous_scheduler_manifest(
             "request_count": 1,
             "completed_request_count": 1,
             "total_generated_tokens": generated_tokens,
+            "scheduler_step_count": 3,
+            "idle_step_count": 0,
             "scheduler_cpu_wall_seconds": scheduler_cpu_wall_seconds,
             "scheduler_tokens_per_cpu_second": generated_tokens / scheduler_cpu_wall_seconds,
             "active_batch_size_histogram": histogram,
+            "planned_arrival_step_histogram": {"0": 1},
             "stop_reason_counts": {stop_reason: 1},
             "cache_slot_acquire_count": 1,
             "cache_slot_release_count": 1,
@@ -788,6 +854,7 @@ def test_compare_continuous_scheduler_manifests_passes_scheduler_only_equivalenc
     assert report["contract"]["pass"]
     assert report["result_class"]["pass"]
     assert report["scripted_token_equivalence"]["pass"]
+    assert report["state_ledger"]["pass"]
     assert report["scheduling_shape"]["pass"]
     assert not report["cpu_timing"]["pass"]
 
@@ -809,7 +876,27 @@ def test_compare_continuous_scheduler_manifests_reports_token_and_shape_mismatch
     assert report["contract"]["pass"]
     assert report["result_class"]["pass"]
     assert not report["scripted_token_equivalence"]["pass"]
+    assert report["state_ledger"]["pass"]
     assert not report["scheduling_shape"]["pass"]
+
+
+def test_compare_continuous_scheduler_manifests_reports_state_ledger_mismatch(tmp_path):
+    module = _load_module()
+    baseline = tmp_path / "baseline-continuous.json"
+    candidate = tmp_path / "candidate-continuous.json"
+    base_manifest = _continuous_scheduler_manifest()
+    candidate_manifest = _continuous_scheduler_manifest()
+    candidate_manifest["requests"][0]["final_rng_state_hash"] = "different-rng-after"
+    baseline.write_text(module.json.dumps(base_manifest))
+    candidate.write_text(module.json.dumps(candidate_manifest))
+
+    report = module.compare_continuous_scheduler_manifests(baseline, candidate)
+
+    assert report["contract"]["pass"]
+    assert report["result_class"]["pass"]
+    assert report["scripted_token_equivalence"]["pass"]
+    assert not report["state_ledger"]["pass"]
+    assert report["scheduling_shape"]["pass"]
 
 
 def test_compare_continuous_scheduler_manifests_rejects_model_backed_manifest(tmp_path):

@@ -709,12 +709,25 @@ def _compare_static_server_result_class(baseline: dict[str, Any], candidate: dic
         "candidate_result_class": candidate_aggregate.get("result_class"),
         "baseline_server_batch_observed": bool(baseline_aggregate.get("server_batch_observed", False)),
         "candidate_server_batch_observed": bool(candidate_aggregate.get("server_batch_observed", False)),
+        "baseline_same_calculation": bool(baseline_aggregate.get("same_calculation", baseline.get("same_calculation", True))),
+        "candidate_same_calculation": bool(candidate_aggregate.get("same_calculation", candidate.get("same_calculation", True))),
+        "baseline_throughput_claim_scope": baseline_aggregate.get(
+            "throughput_claim_scope",
+            baseline.get("throughput_claim_scope"),
+        ),
+        "candidate_throughput_claim_scope": candidate_aggregate.get(
+            "throughput_claim_scope",
+            candidate.get("throughput_claim_scope"),
+        ),
     }
     passed = (
         checks["baseline_result_class"] == "static_server_batch"
         and checks["candidate_result_class"] == "static_server_batch"
         and checks["baseline_server_batch_observed"]
         and checks["candidate_server_batch_observed"]
+        and not checks["baseline_same_calculation"]
+        and not checks["candidate_same_calculation"]
+        and checks["baseline_throughput_claim_scope"] == checks["candidate_throughput_claim_scope"]
     )
     print("Static-server result class")
     print(f"  {'PASS' if passed else 'FAIL'}")
@@ -766,7 +779,11 @@ def _compare_static_server_performance(
     metric_specs = {
         "main_tokens_per_scheduler_second": True,
         "scheduler_wall_seconds": False,
+        "request_wall_seconds_p95": False,
+        "request_wall_seconds_max": False,
     }
+    if int(baseline_aggregate.get("timing_generated_tokens", 0) or 0) > 0:
+        metric_specs["timing_tokens_per_scheduler_second"] = True
     metrics = {}
     print("Static-server scheduler throughput")
     for key, higher_is_better in metric_specs.items():
@@ -789,9 +806,16 @@ def _compare_static_server_performance(
     baseline_tokens = int(baseline_aggregate.get("main_generated_tokens", 0) or 0)
     candidate_tokens = int(candidate_aggregate.get("main_generated_tokens", 0) or 0)
     generated_tokens_non_decreasing = candidate_tokens >= baseline_tokens
+    baseline_timing_tokens = int(baseline_aggregate.get("timing_generated_tokens", 0) or 0)
+    candidate_timing_tokens = int(candidate_aggregate.get("timing_generated_tokens", 0) or 0)
+    timing_tokens_non_decreasing = candidate_timing_tokens >= baseline_timing_tokens
     passed = all(metric["pass"] for metric in metrics.values()) and generated_tokens_non_decreasing
+    if baseline_timing_tokens > 0:
+        passed = passed and timing_tokens_non_decreasing
     print(f"  main_generated_tokens: baseline={baseline_tokens}, candidate={candidate_tokens}")
     print(f"  generated_tokens_non_decreasing: {generated_tokens_non_decreasing}")
+    print(f"  timing_generated_tokens: baseline={baseline_timing_tokens}, candidate={candidate_timing_tokens}")
+    print(f"  timing_tokens_non_decreasing: {timing_tokens_non_decreasing}")
     print(
         "  attributed_request_model_tok/s: baseline={baseline:.3f}, candidate={candidate:.3f}".format(
             baseline=attributed_metric["baseline"],
@@ -805,8 +829,11 @@ def _compare_static_server_performance(
         "metrics": metrics,
         "attributed_request_model_tokens_per_second": attributed_metric,
         "generated_tokens_non_decreasing": generated_tokens_non_decreasing,
+        "timing_tokens_non_decreasing": timing_tokens_non_decreasing,
         "baseline_main_generated_tokens": baseline_tokens,
         "candidate_main_generated_tokens": candidate_tokens,
+        "baseline_timing_generated_tokens": baseline_timing_tokens,
+        "candidate_timing_generated_tokens": candidate_timing_tokens,
     }
 
 
@@ -881,6 +908,7 @@ def _compare_continuous_scheduler_contract(
         "prompt_tokens",
         "max_new_tokens",
         "eos_token_ids",
+        "planned_arrival_step",
         "metadata",
     ]
     for index in range(min(len(baseline_requests), len(candidate_requests))):
@@ -990,10 +1018,67 @@ def _compare_continuous_scheduler_tokens(baseline: dict[str, Any], candidate: di
     }
 
 
+def _compare_continuous_scheduler_state_ledger(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    mismatches = []
+    baseline_requests = baseline.get("requests", [])
+    candidate_requests = candidate.get("requests", [])
+    state_keys = [
+        "initial_rng_state_hash",
+        "final_rng_state_hash",
+        "logits_processor_state_hash",
+        "cache_state_hash",
+    ]
+    lifecycle_keys = [
+        "enqueue_step",
+        "activation_step",
+        "finish_step",
+        "queue_wait_steps",
+        "decode_steps",
+        "latency_steps",
+        "cache_slot_id",
+        "slot_generation",
+    ]
+    for index in range(min(len(baseline_requests), len(candidate_requests))):
+        baseline_request = baseline_requests[index]
+        candidate_request = candidate_requests[index]
+        for key in state_keys:
+            baseline_value = baseline_request.get(key)
+            candidate_value = candidate_request.get(key)
+            if baseline_value is None or candidate_value is None or baseline_value != candidate_value:
+                mismatches.append({
+                    "index": index,
+                    "request_id": _continuous_request_key(baseline_request, index),
+                    "key": key,
+                    "baseline": baseline_value,
+                    "candidate": candidate_value,
+                })
+        for key in lifecycle_keys:
+            if baseline_request.get(key) != candidate_request.get(key):
+                mismatches.append({
+                    "index": index,
+                    "request_id": _continuous_request_key(baseline_request, index),
+                    "key": key,
+                    "baseline": baseline_request.get(key),
+                    "candidate": candidate_request.get(key),
+                })
+
+    passed = not mismatches
+    print("Continuous-scheduler state/lifecycle ledger")
+    print(f"  {'PASS' if passed else 'FAIL'}")
+    if passed:
+        print(f"  requests_checked: {min(len(baseline_requests), len(candidate_requests))}")
+    else:
+        for mismatch in mismatches[:8]:
+            print(f"  {mismatch['key']}: baseline={mismatch.get('baseline')!r}, candidate={mismatch.get('candidate')!r}")
+    print()
+    return {"pass": passed, "mismatches": mismatches}
+
+
 def _compare_continuous_scheduler_shape(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
     mismatches = []
     shape_keys = [
         "active_batch_size_histogram",
+        "steps",
         "cache_slot_events",
     ]
     for key in shape_keys:
@@ -1073,6 +1158,7 @@ def compare_continuous_scheduler_manifests(
         "contract": {},
         "result_class": {},
         "scripted_token_equivalence": {},
+        "state_ledger": {},
         "scheduling_shape": {},
         "cpu_timing": {},
     }
@@ -1084,6 +1170,7 @@ def compare_continuous_scheduler_manifests(
     report["contract"] = _compare_continuous_scheduler_contract(baseline, candidate)
     report["result_class"] = _compare_continuous_scheduler_result_class(baseline, candidate)
     report["scripted_token_equivalence"] = _compare_continuous_scheduler_tokens(baseline, candidate)
+    report["state_ledger"] = _compare_continuous_scheduler_state_ledger(baseline, candidate)
     report["scheduling_shape"] = _compare_continuous_scheduler_shape(baseline, candidate)
     report["cpu_timing"] = _compare_continuous_scheduler_performance(
         baseline,
@@ -1839,6 +1926,8 @@ def main() -> None:
                 and not report["result_class"].get("pass", False))
             or ((args.require_token_equivalence or args.strict)
                 and not report["scripted_token_equivalence"].get("pass", False))
+            or ((args.require_mode_contract or args.strict)
+                and not report["state_ledger"].get("pass", False))
             or ((args.require_mode_contract or args.strict)
                 and not report["scheduling_shape"].get("pass", False))
             or (args.require_no_regression and not report["cpu_timing"].get("pass", False))
