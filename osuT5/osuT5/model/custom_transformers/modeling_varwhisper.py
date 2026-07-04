@@ -952,6 +952,7 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
             native_mlp_tail_requested
             and prefix_length is not None
             and prefix_length > 0
+            and hidden_states.shape[1] == 1
         )
         use_native_mlp_tail = (
             native_mlp_tail_decode_scope
@@ -999,8 +1000,6 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
                     fallback_reasons.append(f"dtype_{hidden_states.dtype}")
                 if hidden_states.shape[0] != 1:
                     fallback_reasons.append(f"batch_{hidden_states.shape[0]}")
-                if hidden_states.shape[1] != 1:
-                    fallback_reasons.append(f"seq_{hidden_states.shape[1]}")
                 if self.activation_dropout != 0.0:
                     fallback_reasons.append(f"activation_dropout_{self.activation_dropout}")
                 if self.dropout != 0.0:
@@ -1014,7 +1013,10 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
                     f"but guard checks failed: {fallback_reason}"
                 )
             if native_mlp_tail_requested:
-                record_native_decoder_layer_mlp_tail_fallback("non_active_prefix_prefill_or_context")
+                if prefix_length is not None and prefix_length > 0 and hidden_states.shape[1] != 1:
+                    record_native_decoder_layer_mlp_tail_fallback(f"active_prefix_prefill_seq_{hidden_states.shape[1]}")
+                else:
+                    record_native_decoder_layer_mlp_tail_fallback("non_active_prefix_prefill_or_context")
             if profile_ranges:
                 with profile_range(f"{layer_name}.mlp_norm"):
                     hidden_states = self.final_layer_norm(hidden_states)
