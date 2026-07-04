@@ -1952,4 +1952,14 @@ Paired DCC smoke jobs on `dcc-core-ferc-s-z25-21` validated this as static-serve
 
 The first continuous-batching scheduler harness is CPU-only and not wired into `InferenceServer`. `osuT5/osuT5/inference/continuous_batching.py` models request lifecycle, compatibility-key grouping, active slot acquisition/release, slot generations, scripted token emission, stop reasons, active batch-size histograms, and deterministic reports. It intentionally does not run model forward passes, sample, consume RNG, mutate logits processors, write KV cache tensors, or claim throughput. Use it to build lifecycle/equivalence scaffolding before any real continuous server mode.
 
+Static server manifest comparison now includes manifest self-validation.
+`utils/summarize_inference_profile.py --compare-static-server ... --strict`
+recomputes run counts, token totals, request wall aggregates, scheduler tok/s,
+request-attributed model tok/s, result class, token-status labels, and aggregate
+batching summaries from the manifest's `runs`. It also validates each
+`server_batches` ledger entry shape and requires observed unique batch size
+`>1` for `static_server_batch`. This is validation infrastructure only; it does
+not change the shared-RNG throughput-only status of static server batching. See
+`notes/2026-07-04-static-server-manifest-self-validation.md`.
+
 Suggested future profile metadata: `result_class`, `throughput_claim_scope`, `batching_mode`, scheduler policy, request/window IDs, batch IDs, active batch-size histogram, queue wait, per-request latency, prefill/decode timing split, per-sample token hashes, stop reasons, RNG policy/state hashes, cache slot/reorder events, graph capture/replay counts, and effective fast-path flags.
