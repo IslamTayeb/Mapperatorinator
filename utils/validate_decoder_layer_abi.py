@@ -287,6 +287,9 @@ def _check_candidate_cache_write_checks(
             "native_decoder_layer_mlp_tail_warp2",
             "native_decoder_layer_mlp_tail_warp4",
             "native_decoder_layer_mlp_tail_warp8",
+            "native_cross_mlp_tail_warp2",
+            "native_cross_mlp_tail_warp4",
+            "native_cross_mlp_tail_warp8",
         )
         if name in results
     ]

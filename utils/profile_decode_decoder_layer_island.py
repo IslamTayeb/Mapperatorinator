@@ -58,6 +58,9 @@ CACHE_WRITING_VARIANTS = {
     "native_decoder_layer_mlp_tail_warp2",
     "native_decoder_layer_mlp_tail_warp4",
     "native_decoder_layer_mlp_tail_warp8",
+    "native_cross_mlp_tail_warp2",
+    "native_cross_mlp_tail_warp4",
+    "native_cross_mlp_tail_warp8",
 }
 
 NATIVE_DECODER_LAYER_CANDIDATES = (
@@ -67,6 +70,9 @@ NATIVE_DECODER_LAYER_CANDIDATES = (
     "native_decoder_layer_mlp_tail_warp2",
     "native_decoder_layer_mlp_tail_warp4",
     "native_decoder_layer_mlp_tail_warp8",
+    "native_cross_mlp_tail_warp2",
+    "native_cross_mlp_tail_warp4",
+    "native_cross_mlp_tail_warp8",
 )
 
 
@@ -876,6 +882,78 @@ def _native_decoder_layer_mlp_tail_variants(
     }
 
 
+def _native_cross_mlp_tail_variants(
+        capture: DecoderLayerCapture,
+) -> dict[str, Callable[[], torch.Tensor]]:
+    """Whole-layer verifier candidates with reference self-cache and native tail.
+
+    The rejected native self+cross prefix was target-shaped but changed the
+    q_len=1 self-cache slot. This variant keeps the reference self-attention
+    segment, including its cache write, then replaces the adjacent cross-attn
+    residual and MLP residual segments.
+    """
+    if capture.module.training or capture.module.cross_attn.training:
+        raise ValueError("native cross+MLP tail candidate only supports eval mode")
+    if capture.module.activation_dropout != 0 or capture.module.dropout != 0:
+        raise ValueError("native cross+MLP tail candidate only supports no-dropout layers")
+    if capture.encoder_hidden_states is None:
+        raise ValueError("native cross+MLP tail candidate requires encoder hidden states")
+    if capture.hidden_states.dtype != torch.float32 or capture.hidden_states.shape[:2] != (1, 1):
+        raise ValueError("native cross+MLP tail candidate requires fp32 [1, 1, hidden] input")
+    activation_name = _activation_name(capture.module.activation_fn)
+    if activation_name not in {"GELUActivation", "gelu"}:
+        raise ValueError(f"native cross+MLP tail candidate requires exact GELU, got {activation_name}")
+
+    from osuT5.osuT5.inference.native_decoder_layer import (
+        native_one_token_linear_residual,
+        native_one_token_mlp_residual,
+        native_one_token_rmsnorm_linear,
+        preload_native_decoder_layer,
+    )
+
+    preload_native_decoder_layer()
+    cross_attn = capture.module.cross_attn
+    cross_cache_keys, cross_cache_values = _cross_attention_cache_tensors(capture)
+    cross_norm_eps = _rmsnorm_eps(capture.module.cross_attn_layer_norm, capture.hidden_states.dtype)
+    mlp_norm = capture.module.final_layer_norm
+    mlp_norm_eps = _rmsnorm_eps(mlp_norm, capture.hidden_states.dtype)
+
+    def run(outputs_per_block: int) -> torch.Tensor:
+        after_self_attn = _self_attn_residual_segment(capture)
+        query = native_one_token_rmsnorm_linear(
+            after_self_attn,
+            capture.module.cross_attn_layer_norm.weight,
+            cross_attn.Wq.weight,
+            cross_attn.Wq.bias,
+            eps=cross_norm_eps,
+            outputs_per_block=outputs_per_block,
+        ).view(1, 1, cross_attn.num_heads, cross_attn.head_dim).transpose(1, 2)
+        cross_attention_output = _q1_bmm_attention(query, cross_cache_keys, cross_cache_values)
+        after_cross_attn = native_one_token_linear_residual(
+            cross_attention_output,
+            after_self_attn,
+            cross_attn.Wo.weight,
+            cross_attn.Wo.bias,
+            outputs_per_block=outputs_per_block,
+        )
+        return native_one_token_mlp_residual(
+            after_cross_attn,
+            mlp_norm.weight,
+            capture.module.fc1.weight,
+            capture.module.fc1.bias,
+            capture.module.fc2.weight,
+            capture.module.fc2.bias,
+            eps=mlp_norm_eps,
+            outputs_per_block=outputs_per_block,
+        )
+
+    return {
+        "native_cross_mlp_tail_warp2": lambda: run(2),
+        "native_cross_mlp_tail_warp4": lambda: run(4),
+        "native_cross_mlp_tail_warp8": lambda: run(8),
+    }
+
+
 def _benchmark_capture(
         capture: DecoderLayerCapture,
         *,
@@ -884,6 +962,7 @@ def _benchmark_capture(
         candidate_decoder_runtime_island: bool,
         candidate_native_decoder_layer_island: bool,
         candidate_native_self_cross_prefix: bool,
+        candidate_native_cross_mlp_tail: bool,
         verify_cache_write_candidates: bool,
         warmup: int,
         iters: int,
@@ -965,6 +1044,15 @@ def _benchmark_capture(
                     variants[variant_name] = (fn, capture.output)
             except Exception as exc:
                 variants["native_decoder_layer_setup"] = (
+                    lambda exc=exc: (_ for _ in ()).throw(exc),
+                    capture.output,
+                )
+        if candidate_native_cross_mlp_tail:
+            try:
+                for variant_name, fn in _native_cross_mlp_tail_variants(capture).items():
+                    variants[variant_name] = (fn, capture.output)
+            except Exception as exc:
+                variants["native_cross_mlp_tail_setup"] = (
                     lambda exc=exc: (_ for _ in ()).throw(exc),
                     capture.output,
                 )
@@ -1216,6 +1304,7 @@ def profile_decode_decoder_layer_island(
         candidate_decoder_runtime_island: bool,
         candidate_native_decoder_layer_island: bool,
         candidate_native_self_cross_prefix: bool,
+        candidate_native_cross_mlp_tail: bool,
         warmup: int,
         iters: int,
         atol: float,
@@ -1270,6 +1359,7 @@ def profile_decode_decoder_layer_island(
         "candidate_decoder_runtime_island": bool(candidate_decoder_runtime_island),
         "candidate_native_decoder_layer_island": bool(candidate_native_decoder_layer_island),
         "candidate_native_self_cross_prefix": bool(candidate_native_self_cross_prefix),
+        "candidate_native_cross_mlp_tail": bool(candidate_native_cross_mlp_tail),
         "cuda_graph_replay": bool(cuda_graph_replay),
         "full_song_decode_steps": int(full_song_decode_steps),
         "full_song_main_tokens": int(full_song_main_tokens),
@@ -1383,6 +1473,7 @@ def profile_decode_decoder_layer_island(
             candidate_decoder_runtime_island=candidate_decoder_runtime_island,
             candidate_native_decoder_layer_island=candidate_native_decoder_layer_island,
             candidate_native_self_cross_prefix=candidate_native_self_cross_prefix,
+            candidate_native_cross_mlp_tail=candidate_native_cross_mlp_tail,
             verify_cache_write_candidates=verify_cache_write_candidates,
             warmup=warmup,
             iters=iters,
@@ -1663,6 +1754,15 @@ def main() -> None:
             "production inference path."
         ),
     )
+    parser.add_argument(
+        "--candidate-native-cross-mlp-tail",
+        action="store_true",
+        help=(
+            "Also benchmark verifier-only reference self-attention plus native cross-attention and "
+            "native MLP tail candidates at the full decoder-layer boundary. This is diagnostic sizing "
+            "only, not a production inference path."
+        ),
+    )
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", type=int, default=500)
     parser.add_argument("--atol", type=float, default=1e-4)
@@ -1704,6 +1804,7 @@ def main() -> None:
         candidate_decoder_runtime_island=cli_args.candidate_decoder_runtime_island,
         candidate_native_decoder_layer_island=cli_args.candidate_native_decoder_layer_island,
         candidate_native_self_cross_prefix=cli_args.candidate_native_self_cross_prefix,
+        candidate_native_cross_mlp_tail=cli_args.candidate_native_cross_mlp_tail,
         warmup=cli_args.warmup,
         iters=cli_args.iters,
         atol=cli_args.atol,
