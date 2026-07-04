@@ -384,6 +384,14 @@ def validate_reserved_runtime_flags(args: InferenceConfig):
             f"max_batch_size={args.max_batch_size}, num_beams={args.num_beams}, cfg_scale={args.cfg_scale}. "
             "Increase max_batch_size or reduce num_beams/cfg_scale."
         )
+    if args.use_server and args.inference_generation_compile:
+        raise ValueError(
+            "inference_generation_compile=true is not supported with use_server=true. "
+            "The current static IPC server runs generation in a background batch thread, and DCC static-server "
+            "smoke job 49267683 hit a TorchInductor cudagraph TLS AssertionError in that path. "
+            "Use inference_generation_compile=false for server batching until a server-specific compile path "
+            "is validated."
+        )
 
     def require_simple_sequential(flag_name: str) -> None:
         if args.use_server:
