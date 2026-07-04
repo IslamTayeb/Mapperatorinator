@@ -279,6 +279,8 @@ def run_one_token_gate(
         candidate_q1_bmm_cross_attention: bool = False,
         candidate_native_q1_self_attention: bool = False,
         candidate_native_q1_rope_cache_self_attention: bool = False,
+        candidate_native_decoder_layer_mlp_tail: bool = False,
+        candidate_native_decoder_layer_mlp_tail_outputs_per_block: int = 4,
         candidate_decode_session: bool = False,
 ) -> dict[str, Any]:
     _assert_supported_probe(args)
@@ -351,6 +353,10 @@ def run_one_token_gate(
         "candidate_q1_bmm_cross_attention": bool(candidate_q1_bmm_cross_attention),
         "candidate_native_q1_self_attention": bool(candidate_native_q1_self_attention),
         "candidate_native_q1_rope_cache_self_attention": bool(candidate_native_q1_rope_cache_self_attention),
+        "candidate_native_decoder_layer_mlp_tail": bool(candidate_native_decoder_layer_mlp_tail),
+        "candidate_native_decoder_layer_mlp_tail_outputs_per_block": (
+            int(candidate_native_decoder_layer_mlp_tail_outputs_per_block)
+        ),
         "candidate_decode_session": bool(candidate_decode_session),
     }
 
@@ -454,6 +460,10 @@ def run_one_token_gate(
                 q1_bmm_cross_attention=candidate_q1_bmm_cross_attention,
                 native_q1_self_attention=candidate_native_q1_self_attention,
                 native_q1_rope_cache_self_attention=candidate_native_q1_rope_cache_self_attention,
+                native_decoder_layer_mlp_tail=candidate_native_decoder_layer_mlp_tail,
+                native_decoder_layer_mlp_tail_outputs_per_block=(
+                    candidate_native_decoder_layer_mlp_tail_outputs_per_block
+                ),
         ):
             decode_session_metadata = None
             if candidate_decode_session:
@@ -637,6 +647,18 @@ def main() -> None:
         help="Enable the experimental fused RoPE/cache native q_len=1 self-attention candidate.",
     )
     parser.add_argument(
+        "--candidate-native-decoder-layer-mlp-tail",
+        action="store_true",
+        help="Enable the experimental native fp32 decoder-layer MLP tail candidate.",
+    )
+    parser.add_argument(
+        "--candidate-native-decoder-layer-mlp-tail-outputs-per-block",
+        type=int,
+        default=4,
+        choices=(2, 4, 8),
+        help="Warp-group width for the experimental native decoder-layer MLP tail.",
+    )
+    parser.add_argument(
         "--candidate-decode-session",
         action="store_true",
         help="Route the direct candidate through the verifier-first DecodeSession ABI.",
@@ -669,6 +691,10 @@ def main() -> None:
         candidate_q1_bmm_cross_attention=cli_args.candidate_q1_bmm_cross_attention,
         candidate_native_q1_self_attention=cli_args.candidate_native_q1_self_attention,
         candidate_native_q1_rope_cache_self_attention=cli_args.candidate_native_q1_rope_cache_self_attention,
+        candidate_native_decoder_layer_mlp_tail=cli_args.candidate_native_decoder_layer_mlp_tail,
+        candidate_native_decoder_layer_mlp_tail_outputs_per_block=(
+            cli_args.candidate_native_decoder_layer_mlp_tail_outputs_per_block
+        ),
         candidate_decode_session=cli_args.candidate_decode_session,
     )
     result["metadata"]["config_name"] = cli_args.config_name

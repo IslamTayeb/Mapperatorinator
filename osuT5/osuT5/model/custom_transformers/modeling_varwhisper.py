@@ -31,11 +31,14 @@ from transformers.utils import (
 from ...runtime_profiling import (
     active_prefix_self_attention_length,
     detail_ranges_enabled,
+    native_decoder_layer_mlp_tail_enabled,
+    native_decoder_layer_mlp_tail_outputs_per_block,
     native_q1_rope_cache_self_attention_enabled,
     native_q1_self_attention_enabled,
     profile_range,
     q1_bmm_cross_attention_enabled,
 )
+from ...inference.native_decoder_layer import native_one_token_mlp_residual
 from ...inference.native_q1_attention import native_q1_attention, native_q1_rope_cache_attention
 from .configuration_varwhisper import VarWhisperConfig
 
@@ -940,29 +943,67 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
 
         # Fully Connected
         residual = hidden_states
-        if profile_ranges:
-            with profile_range(f"{layer_name}.mlp_norm"):
+        activation_name = getattr(self.activation_fn, "__name__", self.activation_fn.__class__.__name__)
+        use_native_mlp_tail = (
+            native_decoder_layer_mlp_tail_enabled()
+            and not self.training
+            and hidden_states.dtype == torch.float32
+            and hidden_states.shape[0] == 1
+            and hidden_states.shape[1] == 1
+            and self.activation_dropout == 0.0
+            and self.dropout == 0.0
+            and activation_name in {"GELUActivation", "gelu"}
+        )
+        if use_native_mlp_tail:
+            norm_eps = getattr(self.final_layer_norm, "eps", None)
+            eps = torch.finfo(hidden_states.dtype).eps if norm_eps is None else float(norm_eps)
+            if profile_ranges:
+                with profile_range(f"{layer_name}.mlp.native_tail"):
+                    hidden_states = native_one_token_mlp_residual(
+                        hidden_states,
+                        self.final_layer_norm.weight,
+                        self.fc1.weight,
+                        self.fc1.bias,
+                        self.fc2.weight,
+                        self.fc2.bias,
+                        eps=eps,
+                        outputs_per_block=native_decoder_layer_mlp_tail_outputs_per_block(),
+                    )
+            else:
+                hidden_states = native_one_token_mlp_residual(
+                    hidden_states,
+                    self.final_layer_norm.weight,
+                    self.fc1.weight,
+                    self.fc1.bias,
+                    self.fc2.weight,
+                    self.fc2.bias,
+                    eps=eps,
+                    outputs_per_block=native_decoder_layer_mlp_tail_outputs_per_block(),
+                )
+        else:
+            if profile_ranges:
+                with profile_range(f"{layer_name}.mlp_norm"):
+                    hidden_states = self.final_layer_norm(hidden_states)
+            else:
                 hidden_states = self.final_layer_norm(hidden_states)
-        else:
-            hidden_states = self.final_layer_norm(hidden_states)
-        if profile_ranges:
-            with profile_range(f"{layer_name}.mlp.fc1"):
+            if profile_ranges:
+                with profile_range(f"{layer_name}.mlp.fc1"):
+                    hidden_states = self.fc1(hidden_states)
+            else:
                 hidden_states = self.fc1(hidden_states)
-        else:
-            hidden_states = self.fc1(hidden_states)
-        if profile_ranges:
-            with profile_range(f"{layer_name}.mlp.activation"):
+            if profile_ranges:
+                with profile_range(f"{layer_name}.mlp.activation"):
+                    hidden_states = self.activation_fn(hidden_states)
+            else:
                 hidden_states = self.activation_fn(hidden_states)
-        else:
-            hidden_states = self.activation_fn(hidden_states)
-        hidden_states = nn.functional.dropout(hidden_states, p=self.activation_dropout, training=self.training)
-        if profile_ranges:
-            with profile_range(f"{layer_name}.mlp.fc2"):
+            hidden_states = nn.functional.dropout(hidden_states, p=self.activation_dropout, training=self.training)
+            if profile_ranges:
+                with profile_range(f"{layer_name}.mlp.fc2"):
+                    hidden_states = self.fc2(hidden_states)
+            else:
                 hidden_states = self.fc2(hidden_states)
-        else:
-            hidden_states = self.fc2(hidden_states)
-        hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
-        hidden_states = residual + hidden_states
+            hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+            hidden_states = residual + hidden_states
 
         outputs = (hidden_states,) + self_attn_outputs[1:] + cross_attn_outputs[1:]
 
