@@ -134,6 +134,7 @@
 - Full-song accepted profiling runs should pin the seed and record generated token IDs, not only smoke runs.
 - Treat `torch_profiled=true` generation windows as diagnostic traces only; use synchronized `model_elapsed_seconds` from untraced profile records for throughput claims.
 - For deep torch-profiler diagnosis, raise `profile_torch_event_limit` to keep enough key-average events in the profile JSON before opening large Chrome traces.
+- Use `utils/summarize_torch_trace_kernels.py` for kernel-level torch-profiler Chrome trace summaries before manually opening large trace files. It buckets GPU kernel/memcpy/memset events into linear/GEMV, native q1 attention, SDPA/FMHA, elementwise/reduce, copy/index/memcpy, layernorm, sampling/sort/softmax, and other categories. Treat it as diagnostic-only: kernel shares can identify bottleneck families, but production work still needs a removable-overhead/theoretical-ceiling argument and normal token/output/no-regression gates.
 - When cleaning DCC profiling artifacts, restrict deletion to explicit `/work/imt11/Mapperatorinator/runs/smoke-*` and `/work/imt11/Mapperatorinator/logs/smoke-*` paths owned by `imt11`, leave full-song accepted runs intact, and write a manifest of deleted smoke paths.
 - Keep profiling run instructions and schema notes in `docs/inference_profiling.md` when the workflow changes.
 - DCC source paths: repo at `/hpc/group/romerolab/imt11/projects/Mapperatorinator`, env at `/hpc/group/romerolab/imt11/envs/mapperatorinator`, and active data/cache/runs/logs under `/work/imt11/Mapperatorinator`.

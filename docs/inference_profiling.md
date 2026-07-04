@@ -1538,6 +1538,25 @@ Current-stack runtime-gap smoke job `49250056` on RTX 2080 Ti, commit `9374133`,
 
 `utils/summarize_decode_runtime_gap.py` is now the default lightweight auditor before another broad runtime/kernel branch. It combines a production profile, active-prefix diagnostic summary, and optional graph-replay island reports into one bottleneck/ceiling report. Validation on the latest DCC artifacts reproduced the current target ordering: projected full-song `graph.replay=15.585s`, `prepare_inputs=2.993s`, `stopping_criteria=1.767s`, `prefill_forward=1.605s`, `logits_processor=0.735s`, `graph.input_copy=0.442s`, and `sampling.multinomial=0.320s`, with graph-replay islands around `14.095s` full forward, `13.807s` decoder stack hidden, and `13.018s` decoder layers. The script labels aggregate/composite CUDA-event ranges, separates graph-replayed decoder compute from control/setup ranges, emits a `candidate_ledger` with idealized saving, 5%/10% bars, target-TPS reachability, and caveats, and repeats the host-gap check so future work does not chase stale, non-exclusive, or mathematically required buckets. See `notes/2026-07-04-runtime-gap-auditor.md`.
 
+`utils/summarize_torch_trace_kernels.py` is the lightweight Chrome-trace kernel
+summarizer for deep torch-profiler diagnosis. It reads a torch-profiler trace
+JSON and buckets GPU kernel/memcpy/memset events into linear/GEMV, native q1
+attention, SDPA/FMHA, elementwise/reduce, copy/index/memcpy, layernorm,
+sampling/sort/softmax, and other categories. DCC job `49250089` on RTX 2080 Ti,
+branch `experiment/post270-kernel-trace` commit `376898e`, traced
+`profile_salvalai_smoke15` `main_generation.seq9` on the current fastest opt-in
+stack. Main tokens and output bytes matched the current-stack smoke baseline
+(`1,084 / 1,084` generated token IDs, output hash
+`ff63c232115906483a592c940e6f0fccbb8639775378d39fd86237f4191ed4ba`). The trace
+showed `593.186ms` of seq9 GPU work: `48.8%` `gemv_gemm_linear`, `18.5%`
+`attention_native_q1`, `13.1%` elementwise/reduce, `8.5%` copy/index/memcpy,
+`4.4%` layernorm, `3.5%` sampling/sort/softmax, `2.8%` residual SDPA/FMHA, and
+`0.4%` other. This is diagnostic-only and not a throughput claim; the traced
+window's outer wall regressed from profiler overhead. The result confirms that
+the next target is broad decoder compute/runtime or an exclusive
+production-vs-replay gap, not standalone sampling, copy, graph-cache cleanup, or
+SDPA work. See `notes/2026-07-04-post270-kernel-trace.md`.
+
 ## Decode Prepare Oracle
 
 Use `utils/verify_decode_prepare_oracle.py` before replacing `prepare_inputs_for_generation` in any decode runtime path. The verifier drives the real model with the HF-prepared inputs while comparing a conservative fast post-prefill one-token builder against HF's prepared tensors at every checked decode step.

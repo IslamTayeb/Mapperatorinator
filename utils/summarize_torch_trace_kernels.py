@@ -17,9 +17,29 @@ def _duration_us(event: dict[str, Any]) -> float:
     return float(value) if isinstance(value, (int, float)) else 0.0
 
 
+_KERNEL_NAME_HINTS = (
+    "q1_rope_cache_attention_kernel",
+    "fmha_cutlass",
+    "gemv2T_kernel_val",
+    "gemmk1_kernel",
+    "volta_sgemm",
+    "implicit_convolve_sgemm",
+    "softmax_warp_forward",
+    "radixSortKVInPlace",
+    "vectorized_layer_norm_kernel",
+    "CatArrayBatchedCopy_vectorized",
+    "vectorized_elementwise_kernel",
+    "unrolled_elementwise_kernel",
+    "reduce_kernel",
+)
+
+
 def _normalize_kernel_name(name: str) -> str:
-    normalized = re.sub(r"<.*", "<...>", name)
-    normalized = re.sub(r"\s+", " ", normalized).strip()
+    normalized = re.sub(r"\s+", " ", name).strip()
+    for hint in _KERNEL_NAME_HINTS:
+        if hint in normalized:
+            return f"{hint}<...>" if "_kernel" in hint or "fmha" in hint else hint
+    normalized = re.sub(r"<[^<>]*>", "<...>", normalized)
     return normalized[:240]
 
 
