@@ -276,7 +276,15 @@ def _check_candidate_cache_write_checks(
         return
     required_variants = [
         name
-        for name in ("repo_decoder_layer", "self_attn_residual_segment", "manual_decoder_runtime_island", "compiled_decoder_layer")
+        for name in (
+            "repo_decoder_layer",
+            "self_attn_residual_segment",
+            "manual_decoder_runtime_island",
+            "compiled_decoder_layer",
+            "native_decoder_layer_mlp_tail_warp2",
+            "native_decoder_layer_mlp_tail_warp4",
+            "native_decoder_layer_mlp_tail_warp8",
+        )
         if name in results
     ]
     if not required_variants:

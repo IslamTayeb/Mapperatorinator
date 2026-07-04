@@ -50,7 +50,16 @@ CACHE_WRITING_VARIANTS = {
     "self_attn_residual_segment",
     "manual_decoder_runtime_island",
     "compiled_decoder_layer",
+    "native_decoder_layer_mlp_tail_warp2",
+    "native_decoder_layer_mlp_tail_warp4",
+    "native_decoder_layer_mlp_tail_warp8",
 }
+
+NATIVE_DECODER_LAYER_CANDIDATES = (
+    "native_decoder_layer_mlp_tail_warp2",
+    "native_decoder_layer_mlp_tail_warp4",
+    "native_decoder_layer_mlp_tail_warp8",
+)
 
 
 @dataclass
@@ -554,12 +563,65 @@ def _manual_decoder_runtime_island(capture: DecoderLayerCapture) -> torch.Tensor
     return _mlp_residual_segment(capture, hidden_states)
 
 
+def _activation_name(activation: Callable[..., Any]) -> str:
+    return getattr(activation, "__name__", activation.__class__.__name__)
+
+
+def _native_decoder_layer_mlp_tail_variants(
+        capture: DecoderLayerCapture,
+) -> dict[str, Callable[[], torch.Tensor]]:
+    """Whole-layer profiler candidates with a native MLP tail.
+
+    These variants intentionally keep the candidate at the full decoder-layer
+    verifier boundary: self-attn, cross-attn, then native MLP tail. They are not
+    production inference paths.
+    """
+    if capture.module.training or capture.module.activation_dropout != 0 or capture.module.dropout != 0:
+        raise ValueError("native decoder-layer MLP-tail candidate only supports eval/no-dropout layers")
+    activation_name = _activation_name(capture.module.activation_fn)
+    if activation_name not in {"GELUActivation", "gelu"}:
+        raise ValueError(f"native decoder-layer MLP-tail candidate requires exact GELU, got {activation_name}")
+
+    from osuT5.osuT5.inference.native_decoder_layer import (
+        native_one_token_mlp_residual,
+        preload_native_decoder_layer,
+    )
+
+    preload_native_decoder_layer()
+    norm = capture.module.final_layer_norm
+    fc1 = capture.module.fc1
+    fc2 = capture.module.fc2
+    norm_eps = getattr(norm, "eps", None)
+
+    def run(outputs_per_block: int) -> torch.Tensor:
+        hidden_states = _self_attn_residual_segment(capture)
+        hidden_states = _cross_attn_residual_segment(capture, hidden_states)
+        eps = torch.finfo(hidden_states.dtype).eps if norm_eps is None else float(norm_eps)
+        return native_one_token_mlp_residual(
+            hidden_states,
+            norm.weight,
+            fc1.weight,
+            fc1.bias,
+            fc2.weight,
+            fc2.bias,
+            eps=eps,
+            outputs_per_block=outputs_per_block,
+        )
+
+    return {
+        "native_decoder_layer_mlp_tail_warp2": lambda: run(2),
+        "native_decoder_layer_mlp_tail_warp4": lambda: run(4),
+        "native_decoder_layer_mlp_tail_warp8": lambda: run(8),
+    }
+
+
 def _benchmark_capture(
         capture: DecoderLayerCapture,
         *,
         native_q1_rope_cache_self_attention: bool,
         compile_decoder_layer_variant: bool,
         candidate_decoder_runtime_island: bool,
+        candidate_native_decoder_layer_island: bool,
         verify_cache_write_candidates: bool,
         warmup: int,
         iters: int,
@@ -623,6 +685,15 @@ def _benchmark_capture(
                 lambda: _manual_decoder_runtime_island(capture),
                 capture.output,
             )
+        if candidate_native_decoder_layer_island:
+            try:
+                for variant_name, fn in _native_decoder_layer_mlp_tail_variants(capture).items():
+                    variants[variant_name] = (fn, capture.output)
+            except Exception as exc:
+                variants["native_decoder_layer_setup"] = (
+                    lambda exc=exc: (_ for _ in ()).throw(exc),
+                    capture.output,
+                )
         if capture.encoder_hidden_states is not None:
             self_attn_output = capture.module.self_attn(
                 hidden_states=capture.module.self_attn_layer_norm(capture.hidden_states),
@@ -857,6 +928,7 @@ def profile_decode_decoder_layer_island(
         native_q1_rope_cache_self_attention: bool,
         compile_decoder_layer_variant: bool,
         candidate_decoder_runtime_island: bool,
+        candidate_native_decoder_layer_island: bool,
         warmup: int,
         iters: int,
         atol: float,
@@ -909,6 +981,7 @@ def profile_decode_decoder_layer_island(
         "native_q1_rope_cache_self_attention": bool(native_q1_rope_cache_self_attention),
         "compile_decoder_layer_variant": bool(compile_decoder_layer_variant),
         "candidate_decoder_runtime_island": bool(candidate_decoder_runtime_island),
+        "candidate_native_decoder_layer_island": bool(candidate_native_decoder_layer_island),
         "cuda_graph_replay": bool(cuda_graph_replay),
         "full_song_decode_steps": int(full_song_decode_steps),
         "full_song_main_tokens": int(full_song_main_tokens),
@@ -1020,6 +1093,7 @@ def profile_decode_decoder_layer_island(
             native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
             compile_decoder_layer_variant=compile_decoder_layer_variant,
             candidate_decoder_runtime_island=candidate_decoder_runtime_island,
+            candidate_native_decoder_layer_island=candidate_native_decoder_layer_island,
             verify_cache_write_candidates=verify_cache_write_candidates,
             warmup=warmup,
             iters=iters,
@@ -1166,6 +1240,29 @@ def profile_decode_decoder_layer_island(
                 if projected_model_time_s > 0
                 else None
             )
+        for native_name in NATIVE_DECODER_LAYER_CANDIDATES:
+            native_candidate = benchmark.get(native_name) or {}
+            native_graph_ms = native_candidate.get("cuda_graph_replay_ms_per_call")
+            if (
+                    isinstance(native_graph_ms, float)
+                    and isinstance(repo_graph_ms, float)
+                    and native_candidate.get("cuda_graph_replay_allclose")
+            ):
+                native_graph_seconds = native_graph_ms * member_count * full_song_decode_steps / 1000.0
+                saved_seconds = repo_graph_seconds - native_graph_seconds
+                projected_model_time_s = full_song_model_time_s - saved_seconds
+                projected_full_song[signature][f"cuda_graph_{native_name}_s"] = native_graph_seconds
+                projected_full_song[signature][f"cuda_graph_{native_name}_saved_s"] = saved_seconds
+                projected_full_song[signature][f"cuda_graph_{native_name}_speedup"] = (
+                    repo_graph_ms / native_graph_ms
+                    if native_graph_ms > 0
+                    else None
+                )
+                projected_full_song[signature][f"cuda_graph_{native_name}_projected_tps"] = (
+                    full_song_main_tokens / projected_model_time_s
+                    if projected_model_time_s > 0
+                    else None
+                )
 
     candidate_cache_write_checks: list[dict[str, Any]] = []
     for signature, report in signature_reports.items():
@@ -1237,6 +1334,14 @@ def main() -> None:
             "This is diagnostic sizing only, not a production inference path."
         ),
     )
+    parser.add_argument(
+        "--candidate-native-decoder-layer-island",
+        action="store_true",
+        help=(
+            "Also benchmark verifier-only native decoder-layer MLP-tail candidates at the whole-layer "
+            "boundary. This is diagnostic sizing only, not a production inference path."
+        ),
+    )
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", type=int, default=500)
     parser.add_argument("--atol", type=float, default=1e-4)
@@ -1276,6 +1381,7 @@ def main() -> None:
         native_q1_rope_cache_self_attention=cli_args.native_q1_rope_cache_self_attention,
         compile_decoder_layer_variant=cli_args.compile_decoder_layer_variant,
         candidate_decoder_runtime_island=cli_args.candidate_decoder_runtime_island,
+        candidate_native_decoder_layer_island=cli_args.candidate_native_decoder_layer_island,
         warmup=cli_args.warmup,
         iters=cli_args.iters,
         atol=cli_args.atol,
