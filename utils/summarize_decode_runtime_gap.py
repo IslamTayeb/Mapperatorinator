@@ -276,6 +276,7 @@ def _candidate_ledger(
         *,
         active_events: list[dict[str, Any]],
         island_analysis: dict[str, Any],
+        linear_roofline_analysis: dict[str, Any] | None,
         full_song_main_tokens: int,
         baseline_model_seconds: float,
         target_model_seconds: float,
@@ -340,7 +341,102 @@ def _candidate_ledger(
             "standalone_target_candidate": False,
             "caveat": analysis.get("note"),
         })
+    if isinstance(linear_roofline_analysis, dict):
+        for name, saving_key, tps_key, caveat in (
+            (
+                "captured_linears_zero_fantasy",
+                "linear_projected_full_song_seconds",
+                "zero_linear_tps",
+                "Fantasy only: all captured one-token linears cannot be deleted without changing the model.",
+            ),
+            (
+                "captured_linears_above_bandwidth_floor",
+                "removable_above_peak_bandwidth_floor_seconds",
+                "peak_bandwidth_floor_tps",
+                "Hardware-floor ceiling: bandwidth-floor linear work remains necessary model math/data movement.",
+            ),
+        ):
+            saving = linear_roofline_analysis.get(saving_key)
+            tps = linear_roofline_analysis.get(tps_key)
+            if not isinstance(saving, (int, float)):
+                continue
+            remaining = baseline_model_seconds - float(saving)
+            rows.append({
+                "source": "linear_roofline",
+                "name": name,
+                "target_class": "hardware_floor_ceiling",
+                "idealized_saving_seconds": float(saving),
+                "idealized_remaining_seconds": remaining,
+                "idealized_tps": tps,
+                "throughput_speedup_pct": (
+                    ((float(tps) / baseline_tps) - 1.0) * 100.0
+                    if isinstance(tps, (int, float)) and baseline_tps
+                    else None
+                ),
+                "meets_5pct_model_time_bar": float(saving) >= baseline_model_seconds * 0.05,
+                "meets_10pct_model_time_bar": float(saving) >= baseline_model_seconds * 0.10,
+                "meets_5pct_throughput_bar": (
+                    isinstance(tps, (int, float)) and baseline_tps is not None and float(tps) >= baseline_tps * 1.05
+                ),
+                "meets_10pct_throughput_bar": (
+                    isinstance(tps, (int, float)) and baseline_tps is not None and float(tps) >= baseline_tps * 1.10
+                ),
+                "reaches_target_tps": remaining <= target_model_seconds,
+                "missing_seconds_to_target": max(remaining - target_model_seconds, 0.0),
+                "exclusive_proof_required": True,
+                "standalone_target_candidate": False,
+                "caveat": caveat,
+            })
     return sorted(rows, key=lambda item: item["idealized_saving_seconds"], reverse=True)
+
+
+def _linear_roofline_analysis(
+        linear_roofline_report: dict[str, Any] | None,
+        *,
+        baseline_model_seconds: float,
+        target_model_seconds: float,
+) -> dict[str, Any] | None:
+    if not isinstance(linear_roofline_report, dict):
+        return None
+    summary = linear_roofline_report.get("summary")
+    if not isinstance(summary, dict):
+        return None
+    projected = summary.get("linear_projected_full_song_seconds")
+    bandwidth_floor = summary.get("peak_bandwidth_lower_bound_full_song_seconds")
+    removable_above_floor = summary.get("removable_above_peak_bandwidth_floor_seconds")
+    if not isinstance(projected, (int, float)):
+        return None
+    zero_tps = summary.get("zero_linear_tps")
+    floor_tps = summary.get("peak_bandwidth_floor_tps")
+    return {
+        "source_pass": bool(linear_roofline_report.get("pass", False)),
+        "source_active_prefix_length": linear_roofline_report.get("source_active_prefix_length"),
+        "linear_projected_full_song_seconds": float(projected),
+        "linear_fraction_of_model_time": summary.get("linear_fraction_of_model_time"),
+        "peak_bandwidth_lower_bound_full_song_seconds": bandwidth_floor,
+        "removable_above_peak_bandwidth_floor_seconds": removable_above_floor,
+        "zero_linear_tps": zero_tps,
+        "peak_bandwidth_floor_tps": floor_tps,
+        "missing_seconds_to_target_at_peak_floor": (
+            max((baseline_model_seconds - float(removable_above_floor)) - target_model_seconds, 0.0)
+            if isinstance(removable_above_floor, (int, float))
+            else None
+        ),
+        "meets_5pct_bar_above_floor": (
+            float(removable_above_floor) >= baseline_model_seconds * 0.05
+            if isinstance(removable_above_floor, (int, float))
+            else None
+        ),
+        "meets_10pct_bar_above_floor": (
+            float(removable_above_floor) >= baseline_model_seconds * 0.10
+            if isinstance(removable_above_floor, (int, float))
+            else None
+        ),
+        "note": (
+            "Use the removable-above-floor number for target sizing; the full linear bucket includes required "
+            "weight/input/output data movement and model math."
+        ),
+    }
 
 
 def _recommended_next_steps(report: dict[str, Any]) -> list[str]:
@@ -406,6 +502,18 @@ def _recommended_next_steps(report: dict[str, Any]) -> list[str]:
         recommendations.append(
             "No standalone active-loop event is both exclusive-looking and above the 5% bar; avoid micro-optimizing tail/setup paths."
         )
+    linear_roofline = report.get("linear_roofline_analysis") or {}
+    above_floor = linear_roofline.get("removable_above_peak_bandwidth_floor_seconds")
+    ten_pct_model = keep_bars.get("ten_pct_model_time_seconds")
+    if isinstance(above_floor, (int, float)) and isinstance(five_pct_model, (int, float)):
+        if above_floor < five_pct_model:
+            recommendations.append(
+                "Do not pursue standalone captured-linear work; roofline headroom is below the 5% model-time bar."
+            )
+        elif isinstance(ten_pct_model, (int, float)) and above_floor < ten_pct_model:
+            recommendations.append(
+                "Standalone captured-linear work has supporting-sized roofline headroom but is below the 10% bar; combine it with broader decoder-layer/runtime work."
+            )
     return recommendations
 
 
@@ -420,6 +528,7 @@ def summarize_runtime_gap(
         full_forward_report: dict[str, Any] | None = None,
         decoder_stack_report: dict[str, Any] | None = None,
         decoder_layer_report: dict[str, Any] | None = None,
+        linear_roofline_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     records = _records_for_label(profile, label)
     active_summary = active_summary or summarize_active_prefix_diagnostics(profile, label=label)
@@ -475,6 +584,11 @@ def summarize_runtime_gap(
         target_model_seconds=target_model_seconds,
         islands=island_replay_seconds,
     )
+    linear_roofline_analysis = _linear_roofline_analysis(
+        linear_roofline_report,
+        baseline_model_seconds=full_song_model_time_seconds,
+        target_model_seconds=target_model_seconds,
+    )
 
     result: dict[str, Any] = {
         "label": label,
@@ -522,9 +636,11 @@ def summarize_runtime_gap(
         "active_event_projections": active_event_projections,
         "island_replay_seconds": island_replay_seconds,
         "island_gap_analysis": island_gap_analysis,
+        "linear_roofline_analysis": linear_roofline_analysis,
         "candidate_ledger": _candidate_ledger(
             active_events=active_event_projections,
             island_analysis=island_gap_analysis,
+            linear_roofline_analysis=linear_roofline_analysis,
             full_song_main_tokens=full_song_main_tokens,
             baseline_model_seconds=full_song_model_time_seconds,
             target_model_seconds=target_model_seconds,
@@ -550,6 +666,9 @@ def summarize_runtime_gap(
 
 
 def print_summary(report: dict[str, Any], *, event_limit: int) -> None:
+    def _fmt(value: Any, digits: int = 3) -> str:
+        return f"{value:.{digits}f}" if isinstance(value, (int, float)) else "n/a"
+
     baseline = report["accepted_baseline"]
     target = report["target"]
     ledger = report["model_generate_ledger"]
@@ -606,6 +725,26 @@ def print_summary(report: dict[str, Any], *, event_limit: int) -> None:
         tps_text = "" if tps is None else f" ({tps:.3f} tok/s ceiling)"
         print(f"  {key}: {value_text}{tps_text}{reach_text}")
     print()
+    linear_roofline = report.get("linear_roofline_analysis")
+    if isinstance(linear_roofline, dict):
+        projected = linear_roofline.get("linear_projected_full_song_seconds")
+        floor = linear_roofline.get("peak_bandwidth_lower_bound_full_song_seconds")
+        removable = linear_roofline.get("removable_above_peak_bandwidth_floor_seconds")
+        zero_tps = linear_roofline.get("zero_linear_tps")
+        floor_tps = linear_roofline.get("peak_bandwidth_floor_tps")
+        print("Linear Roofline")
+        print(
+            "  captured linears: "
+            f"{_fmt(projected)}s, "
+            f"bandwidth_floor={_fmt(floor)}s, "
+            f"removable_above_floor={_fmt(removable)}s"
+        )
+        print(
+            "  ceilings: "
+            f"zero_linear={_fmt(zero_tps)} tok/s, "
+            f"bandwidth_floor={_fmt(floor_tps)} tok/s"
+        )
+        print()
     print("Recommendations")
     for item in report["recommendations"]:
         print(f"  - {item}")
@@ -624,6 +763,7 @@ def main() -> None:
     parser.add_argument("--full-forward-report", type=Path, default=None)
     parser.add_argument("--decoder-stack-report", type=Path, default=None)
     parser.add_argument("--decoder-layer-report", type=Path, default=None)
+    parser.add_argument("--linear-roofline-report", type=Path, default=None)
     parser.add_argument("--full-song-main-tokens", type=int, default=7639)
     parser.add_argument("--full-song-model-time-seconds", type=float, default=28.243)
     parser.add_argument("--target-tps", type=float, default=500.0)
@@ -641,6 +781,7 @@ def main() -> None:
         full_forward_report=_load_json(args.full_forward_report),
         decoder_stack_report=_load_json(args.decoder_stack_report),
         decoder_layer_report=_load_json(args.decoder_layer_report),
+        linear_roofline_report=_load_json(args.linear_roofline_report),
     )
     print_summary(report, event_limit=args.event_limit)
     if args.json_output is not None:

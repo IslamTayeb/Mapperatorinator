@@ -116,3 +116,24 @@ also reduces adjacent elementwise, residual, layout, cache, or attention work.
 Before production code, require a current-stack verifier or microprobe showing a
 combined projected saving above the normal keep threshold, not just a large
 linear category share.
+
+## Follow-up Auditor Integration
+
+`utils/summarize_decode_runtime_gap.py` now accepts the roofline JSON through
+`--linear-roofline-report` so the bottleneck ledger can show both the full
+captured-linear bucket and the removable-above-bandwidth-floor ceiling.
+
+Using the current runtime-gap smoke artifacts from job `49250056` plus this
+roofline report, the combined auditor reports:
+
+- `graph.replay` remains the large target: `15.585s` projected full-song, enough
+  to close the `500 tok/s` gap only if broad decoder compute/runtime changes
+  can reduce real graph-replayed work;
+- captured linears are `7.156s`, but the nominal bandwidth floor is `5.027s`,
+  leaving `2.129s` above the floor;
+- the bandwidth-floor linear ceiling is `292.526 tok/s`;
+- host gap remains below `1%`, and standalone `logits_processor`,
+  `graph.input_copy`, and `sampling.multinomial` cleanup are below the 5% bar.
+
+That keeps the next production target on broad decoder-layer/runtime work, not
+standalone per-linear kernels.
