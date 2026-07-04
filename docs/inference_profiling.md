@@ -1623,6 +1623,24 @@ DCC job `49231765` on RTX 2080 Ti, commit `8cb1fd6`, passed on `profile_salvalai
 
 Follow-up direct-loop gate `49231798` on commit `912bdf7` passed with `--candidate-fast-prepare` over `256` sampled decode steps: generated tokens matched, raw logits/top-k matched, and final RNG state matched. The first production smoke, job `49231829`, then failed before producing a speed result. `control_a` completed, but `fast_a` crashed in timing generation while capturing the active-prefix CUDA graph because the fast builder copied wrapper-level `negative_prompt` into the model forward, which does not accept it. The attempted `inference_active_prefix_fast_prepare` production flag was backed out. Keep `prepare_one_token_decode_inputs_fast` verifier-only until the input-builder contract is fixed through the normal `inference.py`/`server.py` routing surface.
 
+## Native MLP Tail Rejection
+
+The first production attempt from the native decoder-layer verifier was a narrow native fp32 decoder-layer MLP tail. It passed the corrected exactness gates on branch `codex/native-decoder-layer-verifier`, commit `7e89f17`: one-token logits/top-k gate `49258638` passed with normal prefill plus active-prefix decode length `128`, and direct-loop gate `49258622` passed `256` sampled steps with generated-token, raw-logit/top-k, and final RNG equality.
+
+The untraced 15s smoke promotion gate did not justify keeping the production flag. DCC job `49258644` compared the accepted opt-in stack against the same stack plus the native MLP tail:
+
+| metric | control | native MLP tail | result |
+| --- | ---: | ---: | --- |
+| main tokens | 1,084 | 1,084 | token equivalence PASS |
+| main model time | 3.833s | 3.728s | -0.105s |
+| main tok/s | 282.783 | 290.752 | +2.8% |
+| output bytes/hash | 4,144 | 4,144 | artifact equivalence PASS |
+| outer wall | 67.468s | 70.036s | +3.8% worse |
+| total stage wall | 74.777s | 76.930s | +2.9% worse |
+| per-window no-regression | - | - | FAIL on `seq0` and `seq2` |
+
+The strict comparison failed despite exact tokens and byte-identical output. The observed model-time saving projects to roughly `0.74s` over full-song SALVALAI if it scales perfectly, below the `5%` keep threshold and far below the 500 tok/s target. Production wiring commits `127f246`, `7bf0c68`, and `7e89f17` were reverted; keep only the verifier/profiler infrastructure. Do not retry a narrow MLP-tail production flag without new current-stack bottleneck evidence. See `notes/2026-07-04-native-mlp-tail-production-rejection.md`.
+
 ## Runtime Control Plane
 
 Treat `inference.py` and `osuT5/osuT5/inference/server.py:model_generate()` as the inference runtime control plane. User-facing optimization flags should be declared in `config.py` and Hydra defaults, validated in `inference.py`, routed through `server.py:model_generate()` where practical, and recorded in profile metadata. Low-level modules may hold helpers, direct-loop verifiers, or native kernels, but they should not become a second public mode-selection surface without a measured and documented reason.
