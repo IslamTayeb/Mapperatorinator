@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import re
+import struct
 import sys
 import time
 from collections import defaultdict
@@ -294,6 +296,90 @@ def _cache_fingerprint_matches(expected: dict[str, Any] | None, actual: dict[str
     }
 
 
+def _json_float(value: float) -> float | str:
+    if math.isnan(value):
+        return "nan"
+    if math.isinf(value):
+        return "inf" if value > 0 else "-inf"
+    return float(value)
+
+
+def _float32_bit_pattern_diff(
+        expected: torch.Tensor,
+        actual: torch.Tensor,
+        *,
+        max_examples: int = 8,
+) -> dict[str, Any]:
+    if expected.shape != actual.shape:
+        return {
+            "available": False,
+            "reason": f"shape mismatch: {list(expected.shape)} vs {list(actual.shape)}",
+        }
+    if expected.dtype != torch.float32 or actual.dtype != torch.float32:
+        return {
+            "available": False,
+            "reason": f"expected fp32 tensors, got {expected.dtype} and {actual.dtype}",
+        }
+    expected_cpu = expected.detach().contiguous().cpu()
+    actual_cpu = actual.detach().contiguous().cpu()
+    expected_bytes = expected_cpu.numpy().tobytes()
+    actual_bytes = actual_cpu.numpy().tobytes()
+    if len(expected_bytes) != len(actual_bytes) or len(expected_bytes) % 4 != 0:
+        return {
+            "available": False,
+            "reason": f"unexpected byte lengths: {len(expected_bytes)} vs {len(actual_bytes)}",
+        }
+
+    bitwise_mismatches = 0
+    numeric_mismatches = 0
+    signed_zero_mismatches = 0
+    nan_payload_mismatches = 0
+    max_abs_bit_pattern_delta = 0
+    examples: list[dict[str, Any]] = []
+    count = len(expected_bytes) // 4
+    for flat_index in range(count):
+        offset = flat_index * 4
+        expected_bits = struct.unpack_from("<I", expected_bytes, offset)[0]
+        actual_bits = struct.unpack_from("<I", actual_bytes, offset)[0]
+        if expected_bits == actual_bits:
+            continue
+        expected_value = struct.unpack_from("<f", expected_bytes, offset)[0]
+        actual_value = struct.unpack_from("<f", actual_bytes, offset)[0]
+        both_nan = math.isnan(expected_value) and math.isnan(actual_value)
+        same_numeric = expected_value == actual_value or both_nan
+        signed_zero = expected_value == 0.0 and actual_value == 0.0
+        bitwise_mismatches += 1
+        numeric_mismatches += 0 if same_numeric else 1
+        signed_zero_mismatches += 1 if signed_zero else 0
+        nan_payload_mismatches += 1 if both_nan else 0
+        max_abs_bit_pattern_delta = max(
+            max_abs_bit_pattern_delta,
+            abs(int(expected_bits) - int(actual_bits)),
+        )
+        if len(examples) < max_examples:
+            examples.append({
+                "flat_index": flat_index,
+                "expected": _json_float(expected_value),
+                "actual": _json_float(actual_value),
+                "expected_bits_hex": f"0x{expected_bits:08x}",
+                "actual_bits_hex": f"0x{actual_bits:08x}",
+                "same_numeric": bool(same_numeric),
+                "signed_zero": bool(signed_zero),
+                "both_nan": bool(both_nan),
+            })
+
+    return {
+        "available": True,
+        "numel": int(count),
+        "bitwise_mismatch_count": int(bitwise_mismatches),
+        "numeric_mismatch_count": int(numeric_mismatches),
+        "signed_zero_mismatch_count": int(signed_zero_mismatches),
+        "nan_payload_mismatch_count": int(nan_payload_mismatches),
+        "max_abs_bit_pattern_delta": int(max_abs_bit_pattern_delta),
+        "examples": examples,
+    }
+
+
 def _verify_cache_write_candidate(
         capture: DecoderLayerCapture,
         *,
@@ -331,6 +417,8 @@ def _verify_cache_write_candidate(
         keys_allclose = _allclose(reference_key, actual_key_slot, atol=atol, rtol=rtol)
         values_allclose = _allclose(reference_value, actual_value_slot, atol=atol, rtol=rtol)
         output_allclose = _allclose(expected_output, output, atol=atol, rtol=rtol)
+        key_bit_pattern_diff = _float32_bit_pattern_diff(reference_key, actual_key_slot)
+        value_bit_pattern_diff = _float32_bit_pattern_diff(reference_value, actual_value_slot)
         return {
             "checked": True,
             "pass": bool(match["matches_expected"] and output_allclose),
@@ -342,6 +430,8 @@ def _verify_cache_write_candidate(
             "values_allclose": bool(values_allclose),
             "keys_max_abs": _max_abs(reference_key, actual_key_slot),
             "values_max_abs": _max_abs(reference_value, actual_value_slot),
+            "key_bit_pattern_diff": key_bit_pattern_diff,
+            "value_bit_pattern_diff": value_bit_pattern_diff,
             "actual": actual_fingerprint,
             **match,
         }
@@ -1446,6 +1536,24 @@ def profile_decode_decoder_layer_island(
                     "values_allclose": cache_check.get("values_allclose"),
                     "keys_max_abs": cache_check.get("keys_max_abs"),
                     "values_max_abs": cache_check.get("values_max_abs"),
+                    "keys_bitwise_mismatch_count": (
+                        (cache_check.get("key_bit_pattern_diff") or {}).get("bitwise_mismatch_count")
+                    ),
+                    "values_bitwise_mismatch_count": (
+                        (cache_check.get("value_bit_pattern_diff") or {}).get("bitwise_mismatch_count")
+                    ),
+                    "keys_signed_zero_mismatch_count": (
+                        (cache_check.get("key_bit_pattern_diff") or {}).get("signed_zero_mismatch_count")
+                    ),
+                    "values_signed_zero_mismatch_count": (
+                        (cache_check.get("value_bit_pattern_diff") or {}).get("signed_zero_mismatch_count")
+                    ),
+                    "keys_numeric_mismatch_count": (
+                        (cache_check.get("key_bit_pattern_diff") or {}).get("numeric_mismatch_count")
+                    ),
+                    "values_numeric_mismatch_count": (
+                        (cache_check.get("value_bit_pattern_diff") or {}).get("numeric_mismatch_count")
+                    ),
                     "output_allclose": cache_check.get("output_allclose"),
                     "output_max_abs": cache_check.get("output_max_abs"),
                     "error": cache_check.get("error"),
