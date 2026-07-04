@@ -100,6 +100,54 @@ This utility makes the bottleneck discipline explicit:
 - keep the next implementation-class path focused on broad decoder-layer or
   decoder-runtime work unless a fresh auditor report changes the ordering.
 
+## Avoidability Ledger Update
+
+The auditor now emits per-row decision fields instead of requiring manual
+interpretation:
+
+- `target_class`, distinguishing aggregate/composite ranges,
+  graph-replayed decoder compute, control/setup, and unknown events;
+- `contains_required_model_math` and `standalone_target_candidate`;
+- idealized remaining model time, target-TPS reachability, and missing seconds
+  to target after removing a bucket;
+- 5%/10% model-time and throughput bars;
+- `exclusive_proof_required` for control/setup and idealized replay rows;
+- `candidate_ledger`, which combines active-loop events and graph-replay island
+  ceilings into one sorted table with caveats.
+
+Validation on the same DCC artifacts produced the intended ordering. The rows
+that can close the `500 tok/s` gap are aggregate ranges, graph-replayed decoder
+compute, or idealized graph-replay island boundaries:
+
+| Source | Name | Idealized saving | Target class | Reaches target | Standalone target | Needs exclusive proof |
+| --- | --- | ---: | --- | --- | --- | --- |
+| active event | `loop_total` | `26.589s` | aggregate/composite | yes | no | yes |
+| active event | `decode_forward.cuda_graph` | `17.737s` | aggregate/composite | yes | no | yes |
+| active event | `graph.replay` | `15.585s` | graph-replayed decoder compute | yes | no | yes |
+| island replay | decoder layers | `15.225s` | idealized graph replay boundary | yes | no | yes |
+| island replay | decoder stack hidden | `14.436s` | idealized graph replay boundary | yes | no | yes |
+| island replay | full forward | `14.148s` | idealized graph replay boundary | yes | no | yes |
+| active event | `prepare_inputs` | `2.993s` | control/setup | no | no | yes |
+
+That is the useful constraint: standalone control/setup cleanup can clear a
+small keep bar but cannot reach the goal by itself, while the only 500-class
+rows include required decoder math or idealized replay boundaries. Future
+runtime/kernel work should therefore start by reducing broad decoder compute or
+by proving an exclusive production-vs-replay gap, not by retrying rejected
+prepare, sampling, graph-copy, or tail-only paths.
+
+Checks:
+
+```text
+python3 -m py_compile utils/summarize_decode_runtime_gap.py
+python3 utils/summarize_decode_runtime_gap.py /tmp/mapper-runtime-gap/profile.json \
+  --active-summary /tmp/mapper-runtime-gap/main_active_summary.json \
+  --full-forward-report /tmp/mapper-runtime-gap/full_forward_island_seq9.json \
+  --decoder-stack-report /tmp/mapper-runtime-gap/decoder_stack_island.json \
+  --decoder-layer-report /tmp/mapper-runtime-gap/decoder_layer_island_seq9.json \
+  --json-output /tmp/mapper-runtime-gap/runtime_gap_summary.updated.json
+```
+
 ## Decision
 
 Keep the utility as verifier/profiling infrastructure. No optimization

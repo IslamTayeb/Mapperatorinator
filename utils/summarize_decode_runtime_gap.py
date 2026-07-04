@@ -20,9 +20,19 @@ AGGREGATE_EVENT_NAMES = {
 }
 
 CONTROL_EVENT_NAMES = {
+    "finished_check",
+    "graph.capture",
+    "graph.input_copy",
+    "graph.signature_lookup",
+    "logits_processor",
     "prepare_inputs",
     "stopping_criteria",
     "prefill_forward",
+    "sampling.multinomial",
+}
+
+GRAPH_REPLAY_EVENT_NAMES = {
+    "graph.replay",
 }
 
 
@@ -119,11 +129,34 @@ def _if_removed_tps(tokens: int, baseline_model_seconds: float, removed_seconds:
     return _tps(tokens, remaining)
 
 
+def _event_target_class(event_name: str) -> str:
+    if event_name in AGGREGATE_EVENT_NAMES:
+        return "aggregate_or_composite"
+    if event_name in GRAPH_REPLAY_EVENT_NAMES:
+        return "graph_replayed_decoder_compute"
+    if event_name in CONTROL_EVENT_NAMES:
+        return "control_or_setup"
+    return "unknown"
+
+
+def _event_action_note(event_name: str, target_class: str, projected_seconds: float, five_pct_bar: float) -> str:
+    if target_class == "aggregate_or_composite":
+        return "Do not target directly; split into exclusive child ranges first."
+    if target_class == "graph_replayed_decoder_compute":
+        return "Target only with broad decoder-layer/runtime compute work; this contains necessary model math."
+    if projected_seconds < five_pct_bar:
+        return "Below the 5% full-song model-time bar as a standalone target."
+    if event_name in {"prepare_inputs", "stopping_criteria", "prefill_forward"}:
+        return "Requires low-perturb exclusive proof; prior standalone control-path attempts overstated production gains."
+    return "Potentially target-sized, but needs exclusive current-stack proof before production code."
+
+
 def _active_event_projections(
         active_summary: dict[str, Any] | None,
         *,
         baseline_model_seconds: float,
         full_song_main_tokens: int,
+        target_model_seconds: float,
 ) -> list[dict[str, Any]]:
     if not isinstance(active_summary, dict):
         return []
@@ -131,6 +164,17 @@ def _active_event_projections(
     if generated_tokens <= 0:
         return []
     scale = full_song_main_tokens / generated_tokens
+    baseline_tps = _tps(full_song_main_tokens, baseline_model_seconds)
+    five_pct_throughput_saving = (
+        baseline_model_seconds - (full_song_main_tokens / (baseline_tps * 1.05))
+        if baseline_tps
+        else None
+    )
+    ten_pct_throughput_saving = (
+        baseline_model_seconds - (full_song_main_tokens / (baseline_tps * 1.10))
+        if baseline_tps
+        else None
+    )
     rows = []
     cuda_events = active_summary.get("cuda_event_ms") or {}
     calls = active_summary.get("cuda_event_calls") or {}
@@ -140,12 +184,25 @@ def _active_event_projections(
         event_name = str(name)
         event_seconds = float(milliseconds) / 1000.0
         projected_seconds = event_seconds * scale
+        five_pct_bar = baseline_model_seconds * 0.05
+        ten_pct_bar = baseline_model_seconds * 0.10
+        required_saving_for_target = baseline_model_seconds - target_model_seconds
         is_aggregate = event_name in AGGREGATE_EVENT_NAMES
+        target_class = _event_target_class(event_name)
+        if_removed_tps = _if_removed_tps(
+            full_song_main_tokens,
+            baseline_model_seconds,
+            projected_seconds,
+        )
+        remaining_seconds_after_removed = baseline_model_seconds - projected_seconds
         rows.append({
             "name": event_name,
+            "target_class": target_class,
             "is_aggregate_or_composite": is_aggregate,
             "is_control_or_setup": event_name in CONTROL_EVENT_NAMES,
-            "standalone_target_candidate": not is_aggregate,
+            "contains_required_model_math": event_name in GRAPH_REPLAY_EVENT_NAMES,
+            "exclusive_proof_required": target_class != "unknown",
+            "standalone_target_candidate": target_class == "unknown",
             "diagnostic_event_seconds": event_seconds,
             "projected_full_song_seconds": projected_seconds,
             "calls": int(calls.get(name, 0) or 0),
@@ -154,13 +211,136 @@ def _active_event_projections(
                 if baseline_model_seconds > 0
                 else None
             ),
-            "projected_tps_if_removed_from_baseline": _if_removed_tps(
-                full_song_main_tokens,
-                baseline_model_seconds,
-                projected_seconds,
+            "projected_tps_if_removed_from_baseline": if_removed_tps,
+            "throughput_speedup_pct_if_removed": (
+                ((if_removed_tps / baseline_tps) - 1.0) * 100.0
+                if if_removed_tps is not None and baseline_tps
+                else None
             ),
+            "remaining_seconds_after_removed": remaining_seconds_after_removed,
+            "missing_seconds_to_target_after_removed": max(
+                remaining_seconds_after_removed - target_model_seconds,
+                0.0,
+            ),
+            "meets_5pct_model_time_bar": projected_seconds >= five_pct_bar,
+            "meets_10pct_model_time_bar": projected_seconds >= ten_pct_bar,
+            "meets_5pct_throughput_bar": (
+                projected_seconds >= five_pct_throughput_saving
+                if five_pct_throughput_saving is not None
+                else False
+            ),
+            "meets_10pct_throughput_bar": (
+                projected_seconds >= ten_pct_throughput_saving
+                if ten_pct_throughput_saving is not None
+                else False
+            ),
+            "closes_target_tps_gap_if_fully_removed": projected_seconds >= required_saving_for_target,
+            "reaches_target_tps_if_fully_removed": (
+                if_removed_tps is not None and if_removed_tps >= (full_song_main_tokens / target_model_seconds)
+            ),
+            "action_note": _event_action_note(event_name, target_class, projected_seconds, five_pct_bar),
         })
     return sorted(rows, key=lambda item: item["projected_full_song_seconds"], reverse=True)
+
+
+def _island_gap_analysis(
+        *,
+        full_song_main_tokens: int,
+        baseline_model_seconds: float,
+        target_model_seconds: float,
+        islands: dict[str, Any],
+) -> dict[str, Any]:
+    analysis: dict[str, Any] = {}
+    for name, seconds in islands.items():
+        if name == "decoder_layer_segments" or not isinstance(seconds, (int, float)):
+            continue
+        saved = baseline_model_seconds - float(seconds)
+        analysis[name] = {
+            "replay_seconds": float(seconds),
+            "tps_if_production_reached_replay": _tps(full_song_main_tokens, float(seconds)),
+            "saving_vs_accepted_baseline_seconds": saved,
+            "saving_fraction_of_baseline_model_time": (
+                saved / baseline_model_seconds
+                if baseline_model_seconds > 0
+                else None
+            ),
+            "would_reach_target_tps_if_production_reached_replay": float(seconds) <= target_model_seconds,
+            "note": (
+                "Ceiling only: graph replay removes surrounding generation/runtime overhead and may omit required production work."
+            ),
+        }
+    return analysis
+
+
+def _candidate_ledger(
+        *,
+        active_events: list[dict[str, Any]],
+        island_analysis: dict[str, Any],
+        full_song_main_tokens: int,
+        baseline_model_seconds: float,
+        target_model_seconds: float,
+) -> list[dict[str, Any]]:
+    baseline_tps = _tps(full_song_main_tokens, baseline_model_seconds)
+    rows: list[dict[str, Any]] = []
+    for event in active_events:
+        saving = event.get("projected_full_song_seconds")
+        remaining = event.get("remaining_seconds_after_removed")
+        tps = event.get("projected_tps_if_removed_from_baseline")
+        if not isinstance(saving, (int, float)) or not isinstance(remaining, (int, float)):
+            continue
+        rows.append({
+            "source": "active_event",
+            "name": event.get("name"),
+            "target_class": event.get("target_class"),
+            "idealized_saving_seconds": float(saving),
+            "idealized_remaining_seconds": float(remaining),
+            "idealized_tps": tps,
+            "throughput_speedup_pct": event.get("throughput_speedup_pct_if_removed"),
+            "meets_5pct_model_time_bar": event.get("meets_5pct_model_time_bar"),
+            "meets_10pct_model_time_bar": event.get("meets_10pct_model_time_bar"),
+            "meets_5pct_throughput_bar": event.get("meets_5pct_throughput_bar"),
+            "meets_10pct_throughput_bar": event.get("meets_10pct_throughput_bar"),
+            "reaches_target_tps": event.get("reaches_target_tps_if_fully_removed"),
+            "missing_seconds_to_target": event.get("missing_seconds_to_target_after_removed"),
+            "exclusive_proof_required": event.get("exclusive_proof_required"),
+            "standalone_target_candidate": event.get("standalone_target_candidate"),
+            "caveat": event.get("action_note"),
+        })
+    for name, analysis in island_analysis.items():
+        if not isinstance(analysis, dict):
+            continue
+        saving = analysis.get("saving_vs_accepted_baseline_seconds")
+        remaining = analysis.get("replay_seconds")
+        tps = analysis.get("tps_if_production_reached_replay")
+        if not isinstance(saving, (int, float)) or not isinstance(remaining, (int, float)):
+            continue
+        rows.append({
+            "source": "island_replay",
+            "name": name,
+            "target_class": "idealized_graph_replay_boundary",
+            "idealized_saving_seconds": float(saving),
+            "idealized_remaining_seconds": float(remaining),
+            "idealized_tps": tps,
+            "throughput_speedup_pct": (
+                ((float(tps) / baseline_tps) - 1.0) * 100.0
+                if isinstance(tps, (int, float)) and baseline_tps
+                else None
+            ),
+            "meets_5pct_model_time_bar": float(saving) >= baseline_model_seconds * 0.05,
+            "meets_10pct_model_time_bar": float(saving) >= baseline_model_seconds * 0.10,
+            "meets_5pct_throughput_bar": (
+                isinstance(tps, (int, float)) and baseline_tps is not None and float(tps) >= baseline_tps * 1.05
+            ),
+            "meets_10pct_throughput_bar": (
+                isinstance(tps, (int, float)) and baseline_tps is not None and float(tps) >= baseline_tps * 1.10
+            ),
+            "reaches_target_tps": float(remaining) <= target_model_seconds,
+            "missing_seconds_to_target": max(float(remaining) - target_model_seconds, 0.0),
+            "exclusive_proof_required": True,
+            "standalone_target_candidate": False,
+            "caveat": analysis.get("note"),
+        })
+    return sorted(rows, key=lambda item: item["idealized_saving_seconds"], reverse=True)
 
 
 def _recommended_next_steps(report: dict[str, Any]) -> list[str]:
@@ -178,7 +358,13 @@ def _recommended_next_steps(report: dict[str, Any]) -> list[str]:
         event for event in events
         if isinstance(event, dict) and event.get("standalone_target_candidate")
     ]
-    top_event = targetable_events[0] if targetable_events else None
+    top_event = next(
+        (
+            event for event in events
+            if isinstance(event, dict) and not event.get("is_aggregate_or_composite")
+        ),
+        None,
+    )
     if isinstance(top_event, dict):
         name = top_event.get("name")
         if name in {"graph.replay"}:
@@ -195,7 +381,7 @@ def _recommended_next_steps(report: dict[str, Any]) -> list[str]:
                     f"Do not pursue standalone {event['name']} cleanup from this evidence; projected ceiling is below the 5% model-time bar."
                 )
     control_events_above_bar = [
-        event for event in targetable_events
+        event for event in events
         if (
             event.get("is_control_or_setup")
             and isinstance(event.get("projected_full_song_seconds"), (int, float))
@@ -210,6 +396,15 @@ def _recommended_next_steps(report: dict[str, Any]) -> list[str]:
     if report.get("production_minus_full_forward_replay_seconds") is not None:
         recommendations.append(
             "Explain any remaining production-vs-replay gap with a more exclusive auditor before production runtime code."
+        )
+    event_actions = [
+        event for event in events
+        if event.get("standalone_target_candidate")
+        and event.get("meets_5pct_model_time_bar")
+    ]
+    if not event_actions:
+        recommendations.append(
+            "No standalone active-loop event is both exclusive-looking and above the 5% bar; avoid micro-optimizing tail/setup paths."
         )
     return recommendations
 
@@ -260,6 +455,26 @@ def summarize_runtime_gap(
             "mlp_residual_segment",
         ),
     }
+    island_replay_seconds = {
+        "full_forward": full_forward_s,
+        "decoder_stack_hidden": decoder_stack_s,
+        "decoder_stack_plus_projection": decoder_stack_projection_s,
+        "decoder_layers": decoder_layer_s,
+        "decoder_layer_segments": decoder_layer_segments,
+    }
+
+    active_event_projections = _active_event_projections(
+        active_summary,
+        baseline_model_seconds=full_song_model_time_seconds,
+        full_song_main_tokens=full_song_main_tokens,
+        target_model_seconds=target_model_seconds,
+    )
+    island_gap_analysis = _island_gap_analysis(
+        full_song_main_tokens=full_song_main_tokens,
+        baseline_model_seconds=full_song_model_time_seconds,
+        target_model_seconds=target_model_seconds,
+        islands=island_replay_seconds,
+    )
 
     result: dict[str, Any] = {
         "label": label,
@@ -304,18 +519,16 @@ def summarize_runtime_gap(
                 else None
             ),
         },
-        "active_event_projections": _active_event_projections(
-            active_summary,
-            baseline_model_seconds=full_song_model_time_seconds,
+        "active_event_projections": active_event_projections,
+        "island_replay_seconds": island_replay_seconds,
+        "island_gap_analysis": island_gap_analysis,
+        "candidate_ledger": _candidate_ledger(
+            active_events=active_event_projections,
+            island_analysis=island_gap_analysis,
             full_song_main_tokens=full_song_main_tokens,
+            baseline_model_seconds=full_song_model_time_seconds,
+            target_model_seconds=target_model_seconds,
         ),
-        "island_replay_seconds": {
-            "full_forward": full_forward_s,
-            "decoder_stack_hidden": decoder_stack_s,
-            "decoder_stack_plus_projection": decoder_stack_projection_s,
-            "decoder_layers": decoder_layer_s,
-            "decoder_layer_segments": decoder_layer_segments,
-        },
         "production_minus_full_forward_replay_seconds": (
             full_song_model_time_seconds - full_forward_s
             if full_forward_s is not None
@@ -365,10 +578,20 @@ def print_summary(report: dict[str, Any], *, event_limit: int) -> None:
         tps = event["projected_tps_if_removed_from_baseline"]
         tps_text = "n/a" if tps is None else f"{tps:.3f}"
         tag = " aggregate" if event.get("is_aggregate_or_composite") else ""
+        bar_tags = []
+        if event.get("meets_10pct_model_time_bar"):
+            bar_tags.append(">=10%")
+        elif event.get("meets_5pct_model_time_bar"):
+            bar_tags.append(">=5%")
+        if event.get("closes_target_tps_gap_if_fully_removed"):
+            bar_tags.append("closes_500_gap")
+        class_text = event.get("target_class", "unknown")
+        bar_text = "" if not bar_tags else " " + ",".join(bar_tags)
         print(
             f"  {event['projected_full_song_seconds']:.3f}s  "
             f"if_removed={tps_text} tok/s  "
-            f"{event['name']}{tag}"
+            f"{event['name']}{tag}  "
+            f"class={class_text}{bar_text}"
         )
     print()
     print("Graph-Replay Islands")
@@ -376,7 +599,12 @@ def print_summary(report: dict[str, Any], *, event_limit: int) -> None:
     for key in ("full_forward", "decoder_stack_hidden", "decoder_stack_plus_projection", "decoder_layers"):
         value = islands.get(key)
         value_text = "n/a" if value is None else f"{value:.3f}s"
-        print(f"  {key}: {value_text}")
+        analysis = (report.get("island_gap_analysis") or {}).get(key) or {}
+        reach = analysis.get("would_reach_target_tps_if_production_reached_replay")
+        reach_text = "" if reach is None else f" reaches_target={bool(reach)}"
+        tps = analysis.get("tps_if_production_reached_replay")
+        tps_text = "" if tps is None else f" ({tps:.3f} tok/s ceiling)"
+        print(f"  {key}: {value_text}{tps_text}{reach_text}")
     print()
     print("Recommendations")
     for item in report["recommendations"]:
