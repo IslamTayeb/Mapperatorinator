@@ -430,6 +430,8 @@ def validate_reserved_runtime_flags(args: InferenceConfig):
 
     if args.max_batch_size <= 0:
         raise ValueError("max_batch_size must be positive.")
+    if args.server_batch_timeout <= 0:
+        raise ValueError("server_batch_timeout must be positive.")
     if (args.use_server or args.parallel) and effective_generation_batch_size() <= 0:
         raise ValueError(
             "max_batch_size is too small for the requested batching configuration: "
@@ -660,6 +662,7 @@ def generate(
         "precision": args.precision,
         "attn_implementation": args.attn_implementation,
         "use_server": args.use_server,
+        "server_batch_timeout": args.server_batch_timeout,
         "parallel": args.parallel,
         "max_batch_size": args.max_batch_size,
         "inference_generation_compile": args.inference_generation_compile,
@@ -875,7 +878,8 @@ def load_model_with_server(ckpt_path: str | Path | None, t5_args: TrainConfig, d
                            eval_mode: bool = True, lora_path=None, gamemode: int | None = None,
                            auto_select_gamemode_model: bool = True, generation_compile: bool = False,
                            server_allow_auto_start: bool = True, server_connect_timeout: float | None = 60.0,
-                           server_request_timeout: float | None = None, server_idle_timeout: float = 20):
+                           server_request_timeout: float | None = None, server_idle_timeout: float = 20,
+                           server_batch_timeout: float = 0.2):
     model_loader, tokenizer_loader = load_model_loaders(
         ckpt_path=ckpt_path,
         t5_args=t5_args,
@@ -894,6 +898,7 @@ def load_model_with_server(ckpt_path: str | Path | None, t5_args: TrainConfig, d
         model_loader,
         tokenizer_loader,
         max_batch_size=max_batch_size,
+        batch_timeout=server_batch_timeout,
         socket_path=get_server_address(
             ckpt_path,
             lora_path=lora_path,
@@ -985,7 +990,8 @@ def main(args: InferenceConfig):
                                                   precision=args.precision, attn_implementation=args.attn_implementation,
                                                   lora_path=args.lora_path, gamemode=args.gamemode,
                                                   auto_select_gamemode_model=args.auto_select_gamemode_model,
-                                                  generation_compile=args.inference_generation_compile)
+                                                  generation_compile=args.inference_generation_compile,
+                                                  server_batch_timeout=args.server_batch_timeout)
 
     timing_model, timing_tokenizer = None, None
     if should_load_separate_timing_model(args):
@@ -1002,6 +1008,7 @@ def main(args: InferenceConfig):
                 gamemode=args.gamemode,
                 auto_select_gamemode_model=False,
                 generation_compile=args.inference_generation_compile,
+                server_batch_timeout=args.server_batch_timeout,
             )
 
     diff_model, diff_tokenizer, refine_model = None, None, None

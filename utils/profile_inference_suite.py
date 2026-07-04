@@ -180,6 +180,7 @@ def _load_models(args: Any) -> dict[str, Any]:
         gamemode=args.gamemode,
         auto_select_gamemode_model=args.auto_select_gamemode_model,
         generation_compile=args.inference_generation_compile,
+        server_batch_timeout=args.server_batch_timeout,
     )
 
     timing_model, timing_tokenizer = None, None
@@ -196,6 +197,7 @@ def _load_models(args: Any) -> dict[str, Any]:
             gamemode=args.gamemode,
             auto_select_gamemode_model=False,
             generation_compile=args.inference_generation_compile,
+            server_batch_timeout=args.server_batch_timeout,
         )
 
     diff_model, diff_tokenizer, refine_model = None, None, None

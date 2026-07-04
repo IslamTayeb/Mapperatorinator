@@ -202,6 +202,7 @@ def _server_config_fingerprint(args: Any) -> dict[str, Any]:
         "precision": str(args.precision),
         "attn_implementation": str(args.attn_implementation),
         "max_batch_size": int(args.max_batch_size),
+        "server_batch_timeout": float(args.server_batch_timeout),
         "inference_generation_compile": bool(args.inference_generation_compile),
     }
 
@@ -262,6 +263,7 @@ def _load_server_assets(
         server_connect_timeout=connect_timeout,
         server_request_timeout=request_timeout,
         server_idle_timeout=idle_timeout,
+        server_batch_timeout=args.server_batch_timeout,
     )
     timing_model, timing_tokenizer = None, None
     if should_load_separate_timing_model(args):
@@ -280,6 +282,7 @@ def _load_server_assets(
             server_connect_timeout=connect_timeout,
             server_request_timeout=request_timeout,
             server_idle_timeout=idle_timeout,
+            server_batch_timeout=args.server_batch_timeout,
         )
     return {
         "model": model,
@@ -598,6 +601,7 @@ def main() -> None:
         "repeats": cli_args.repeats,
         "max_workers": max_workers,
         "launch_stagger_seconds": cli_args.launch_stagger_seconds,
+        "server_batch_timeout_seconds": raw_args.server_batch_timeout,
         "server_start_timeout_seconds": cli_args.server_start_timeout_seconds,
         "request_timeout_seconds": cli_args.request_timeout_seconds,
         "suite_timeout_seconds": cli_args.suite_timeout_seconds,

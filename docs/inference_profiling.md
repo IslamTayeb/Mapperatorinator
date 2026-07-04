@@ -1783,6 +1783,13 @@ existing socket was explicitly allowed. Worker clients are connect-only; they
 must not auto-start replacement servers if the owner server dies or a socket is
 missing.
 
+`server_batch_timeout` is now a public inference config field for the static IPC
+server coalescing wait. Its default remains `0.2s`, matching the historical
+server behavior. Lower values may reduce queue wait and scheduler wall time, but
+they can also reduce actual batch size or change shared-RNG scheduling. Treat it
+as an opt-in batching throughput knob, not a single-song or exact-output win
+unless a later per-request RNG/token/output protocol proves equivalence.
+
 For static server batching, report scheduler-wall aggregate throughput as the
 primary TPS metric. Server/model elapsed time attached to individual request
 records is attributed because a single merged server batch can be copied back to
@@ -1790,6 +1797,23 @@ multiple requests. Keep both `main_tokens_per_scheduler_second` and explicitly
 named attributed metrics, and use deduped server batch IDs/histograms to decide
 whether a run actually observed multi-request batching. If no batch size above
 one is observed, classify it as `static_server_no_batch_observed`.
+
+Use the static-server comparator before promoting batching infrastructure or
+scheduler-knob changes:
+
+```bash
+python utils/summarize_inference_profile.py \
+  --compare-static-server BASE/static_server_batch_manifest.json CAND/static_server_batch_manifest.json \
+  --strict \
+  --json-output compare-static-server.json
+```
+
+When the only intended config change is the coalescing wait, add
+`--allow-server-batch-timeout-change`. The comparator checks the request/server
+contract, real `static_server_batch` observation on both sides, preserved
+`not_checked_shared_server_rng` labeling, scheduler-wall throughput/wall
+non-regression, and no aggregate generated-token shrinkage. This gate is
+operational throughput evidence only under the current shared server RNG policy.
 
 Static server batching currently uses shared global server RNG. Until an
 explicit per-request reseed/replay protocol exists, concurrent server token

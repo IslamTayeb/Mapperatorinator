@@ -567,3 +567,122 @@ def test_compare_suite_manifests_reports_contract_mismatch(tmp_path):
 
     assert not report["shape"]["pass"]
     assert any(mismatch["key"] == "audio_path" for mismatch in report["shape"]["mismatches"])
+
+
+def _static_server_manifest(
+    *,
+    tok_s: float = 120.0,
+    scheduler_wall_seconds: float = 10.0,
+    generated_tokens: int = 1200,
+    result_class: str = "static_server_batch",
+    server_batch_observed: bool = True,
+    token_status: str = "not_checked_shared_server_rng",
+    server_batch_timeout: float = 0.2,
+):
+    runs = [
+        {
+            "run_index": 0,
+            "repeat_index": 0,
+            "song_index": 0,
+            "song_id": "song0",
+            "audio_path": "/work/song0.mp3",
+            "beatmap_path": "",
+            "start_time": 71000,
+            "end_time": 86000,
+            "seed": 12345,
+            "requested_seed": 12345,
+            "sequence_count": 10,
+            "song_length_ms": 15000,
+            "token_equivalence_status": token_status,
+            "main_generated_tokens": generated_tokens,
+            "main_model_elapsed_seconds": generated_tokens / tok_s,
+            "main_wall_seconds": generated_tokens / tok_s,
+            "main_tokens_per_second": tok_s,
+        }
+    ]
+    return {
+        "schema_version": 1,
+        "run_kind": "static_server_batch",
+        "song_count": 5,
+        "repeats": 1,
+        "max_workers": 5,
+        "server_config_fingerprint": {
+            "model_path": "same-model",
+            "precision": "fp32",
+            "attn_implementation": "sdpa",
+            "max_batch_size": 5,
+            "server_batch_timeout": server_batch_timeout,
+            "inference_generation_compile": False,
+        },
+        "runs": runs,
+        "aggregate": {
+            "result_class": result_class,
+            "server_batch_observed": server_batch_observed,
+            "main_generated_tokens": generated_tokens,
+            "scheduler_wall_seconds": scheduler_wall_seconds,
+            "request_wall_seconds_sum": scheduler_wall_seconds * 5,
+            "main_model_elapsed_seconds_sum": generated_tokens / tok_s,
+            "main_tokens_per_scheduler_second": generated_tokens / scheduler_wall_seconds,
+            "main_tokens_per_request_model_second_attributed": tok_s,
+        },
+    }
+
+
+def test_compare_static_server_manifests_passes_operational_non_regression(tmp_path):
+    module = _load_module()
+    baseline = tmp_path / "baseline-static.json"
+    candidate = tmp_path / "candidate-static.json"
+    baseline.write_text(module.json.dumps(_static_server_manifest(tok_s=100.0, scheduler_wall_seconds=12.0)))
+    candidate.write_text(module.json.dumps(_static_server_manifest(tok_s=110.0, scheduler_wall_seconds=10.0)))
+
+    report = module.compare_static_server_manifests(baseline, candidate)
+
+    assert report["contract"]["pass"]
+    assert report["result_class"]["pass"]
+    assert report["token_status"]["pass"]
+    assert report["performance"]["pass"]
+
+
+def test_compare_static_server_manifests_reports_regression_and_nonbatch(tmp_path):
+    module = _load_module()
+    baseline = tmp_path / "baseline-static.json"
+    candidate = tmp_path / "candidate-static.json"
+    baseline.write_text(module.json.dumps(_static_server_manifest(tok_s=100.0, scheduler_wall_seconds=10.0)))
+    candidate.write_text(module.json.dumps(_static_server_manifest(
+        tok_s=90.0,
+        scheduler_wall_seconds=12.0,
+        generated_tokens=900,
+        result_class="static_server_no_batch_observed",
+        server_batch_observed=False,
+        token_status="PASS",
+    )))
+
+    report = module.compare_static_server_manifests(baseline, candidate)
+
+    assert report["contract"]["pass"]
+    assert not report["result_class"]["pass"]
+    assert not report["token_status"]["pass"]
+    assert not report["performance"]["pass"]
+    assert not report["performance"]["generated_tokens_non_decreasing"]
+
+
+def test_compare_static_server_manifests_can_allow_timeout_knob_change(tmp_path):
+    module = _load_module()
+    baseline = tmp_path / "baseline-static.json"
+    candidate = tmp_path / "candidate-static.json"
+    baseline.write_text(module.json.dumps(_static_server_manifest(server_batch_timeout=0.2)))
+    candidate.write_text(module.json.dumps(_static_server_manifest(
+        tok_s=130.0,
+        scheduler_wall_seconds=9.0,
+        server_batch_timeout=0.02,
+    )))
+
+    strict_report = module.compare_static_server_manifests(baseline, candidate)
+    allowed_report = module.compare_static_server_manifests(
+        baseline,
+        candidate,
+        allow_server_batch_timeout_change=True,
+    )
+
+    assert not strict_report["contract"]["pass"]
+    assert allowed_report["contract"]["pass"]

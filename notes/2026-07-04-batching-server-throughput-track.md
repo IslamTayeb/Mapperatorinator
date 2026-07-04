@@ -315,6 +315,60 @@ Local validation used the repo `.venv`:
   `tests/test_continuous_batching_scheduler.py`, and
   `tests/test_server_batch_state.py`
 
+## Static Server Comparator And Batch Timeout Knob
+
+Branch `codex/batching-continuous-next` adds mergeable batching gate
+infrastructure, not a runtime speed claim.
+
+Changes:
+
+- `server_batch_timeout` is now a public `InferenceConfig`/Hydra field and is
+  recorded in profile metadata plus static-server manifests.
+- `load_model_with_server()` forwards the configured timeout into
+  `InferenceClient(batch_timeout=...)`.
+- `utils/profile_static_server_batch.py` includes `server_batch_timeout` in the
+  server config fingerprint and manifest.
+- `utils/summarize_inference_profile.py --compare-static-server` compares two
+  static server manifests.
+
+The static-server comparator is deliberately narrower than exact suite
+comparison. Under the current shared global server RNG, static server token
+hashes are not exactness evidence. The strict static-server gate checks:
+
+- same run/request/server contract;
+- real `static_server_batch` observed on both sides;
+- all runs remain labelled `not_checked_shared_server_rng`;
+- scheduler-wall throughput and scheduler wall do not regress;
+- aggregate generated main-token count does not shrink.
+
+When profiling only the coalescing wait knob, use
+`--allow-server-batch-timeout-change` so the comparator ignores only
+`server_batch_timeout` in the server fingerprint. This does not make the result
+exact-equivalent; it only makes the intended scheduler-policy change explicit.
+
+Local validation used the repo `.venv`:
+
+- `.venv/bin/python -m py_compile config.py inference.py utils/profile_inference_suite.py utils/profile_static_server_batch.py utils/summarize_inference_profile.py tests/test_summarize_inference_profile.py`
+- YAML load smoke for `configs/inference/default.yaml`
+- `git diff --check`
+- custom in-process runner for `tests/test_summarize_inference_profile.py`,
+  `tests/test_batching_summary_helpers.py`,
+  `tests/test_continuous_batching_scheduler.py`, and
+  `tests/test_server_batch_state.py`, which executed `27` test functions. The
+  only warning was the existing pydub ffmpeg discovery warning.
+
+Recommended DCC next step: run paired five-song static server smoke jobs from
+the same commit, one with `server_batch_timeout=0.2` and one with a lower value
+such as `0.02`, then compare with:
+
+```bash
+python utils/summarize_inference_profile.py \
+  --compare-static-server "$BASE/static_server_batch_manifest.json" "$CAND/static_server_batch_manifest.json" \
+  --allow-server-batch-timeout-change \
+  --strict \
+  --json-output "$RUN/compare-static-server.json"
+```
+
 Recommended sequence:
 
 1. Keep static batching instrumentation mergeable and non-regressing.

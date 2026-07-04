@@ -621,6 +621,228 @@ def _print_suite_metric_block(name: str, report: dict[str, Any]) -> None:
     print()
 
 
+STATIC_SERVER_TOKEN_STATUS = "not_checked_shared_server_rng"
+
+
+def _compare_static_server_contract(
+        baseline: dict[str, Any],
+        candidate: dict[str, Any],
+        *,
+        allow_server_batch_timeout_change: bool,
+) -> dict[str, Any]:
+    mismatches = []
+    for key in ["run_kind", "song_count", "repeats", "max_workers"]:
+        if baseline.get(key) != candidate.get(key):
+            mismatches.append({"key": key, "baseline": baseline.get(key), "candidate": candidate.get(key)})
+
+    baseline_fingerprint = dict(baseline.get("server_config_fingerprint") or {})
+    candidate_fingerprint = dict(candidate.get("server_config_fingerprint") or {})
+    if allow_server_batch_timeout_change:
+        baseline_fingerprint.pop("server_batch_timeout", None)
+        candidate_fingerprint.pop("server_batch_timeout", None)
+    if baseline_fingerprint != candidate_fingerprint:
+        mismatches.append({
+            "key": "server_config_fingerprint",
+            "baseline": baseline_fingerprint,
+            "candidate": candidate_fingerprint,
+        })
+
+    baseline_runs = baseline.get("runs", [])
+    candidate_runs = candidate.get("runs", [])
+    if len(baseline_runs) != len(candidate_runs):
+        mismatches.append({"key": "run_count", "baseline": len(baseline_runs), "candidate": len(candidate_runs)})
+
+    run_contract_keys = [
+        "run_index",
+        "repeat_index",
+        "song_index",
+        "song_id",
+        "audio_path",
+        "beatmap_path",
+        "start_time",
+        "end_time",
+        "seed",
+        "requested_seed",
+        "sequence_count",
+        "song_length_ms",
+    ]
+    for index in range(min(len(baseline_runs), len(candidate_runs))):
+        baseline_run = baseline_runs[index]
+        candidate_run = candidate_runs[index]
+        for key in run_contract_keys:
+            if key not in baseline_run and key not in candidate_run:
+                continue
+            if baseline_run.get(key) != candidate_run.get(key):
+                mismatches.append({
+                    "index": index,
+                    "key": key,
+                    "baseline": baseline_run.get(key),
+                    "candidate": candidate_run.get(key),
+                    "baseline_key": _suite_run_key(baseline_run, index),
+                    "candidate_key": _suite_run_key(candidate_run, index),
+                })
+
+    passed = not mismatches
+    print("Static-server contract")
+    print(f"  {'PASS' if passed else 'FAIL'}")
+    for mismatch in mismatches[:8]:
+        print(f"  {mismatch['key']}: baseline={mismatch.get('baseline')!r}, candidate={mismatch.get('candidate')!r}")
+    print()
+    return {
+        "pass": passed,
+        "mismatches": mismatches,
+        "allow_server_batch_timeout_change": allow_server_batch_timeout_change,
+    }
+
+
+def _compare_static_server_result_class(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    baseline_aggregate = baseline.get("aggregate", {})
+    candidate_aggregate = candidate.get("aggregate", {})
+    checks = {
+        "baseline_result_class": baseline_aggregate.get("result_class"),
+        "candidate_result_class": candidate_aggregate.get("result_class"),
+        "baseline_server_batch_observed": bool(baseline_aggregate.get("server_batch_observed", False)),
+        "candidate_server_batch_observed": bool(candidate_aggregate.get("server_batch_observed", False)),
+    }
+    passed = (
+        checks["baseline_result_class"] == "static_server_batch"
+        and checks["candidate_result_class"] == "static_server_batch"
+        and checks["baseline_server_batch_observed"]
+        and checks["candidate_server_batch_observed"]
+    )
+    print("Static-server result class")
+    print(f"  {'PASS' if passed else 'FAIL'}")
+    for key, value in checks.items():
+        print(f"  {key}: {value}")
+    print()
+    return {"pass": passed, **checks}
+
+
+def _compare_static_server_token_status(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    statuses = []
+    mismatches = []
+    for side, manifest in [("baseline", baseline), ("candidate", candidate)]:
+        for index, run in enumerate(manifest.get("runs", [])):
+            status = run.get("token_equivalence_status")
+            statuses.append({"side": side, "index": index, "status": status})
+            if status != STATIC_SERVER_TOKEN_STATUS:
+                mismatches.append({
+                    "side": side,
+                    "index": index,
+                    "key": _suite_run_key(run, index),
+                    "status": status,
+                    "expected": STATIC_SERVER_TOKEN_STATUS,
+                })
+    passed = not mismatches
+    print("Static-server token-equivalence status")
+    print(f"  {'PASS' if passed else 'FAIL'}")
+    if passed:
+        print(f"  all runs are labelled {STATIC_SERVER_TOKEN_STATUS}")
+    else:
+        for mismatch in mismatches[:8]:
+            print(
+                "  {side} {key}: status={status!r}, expected={expected!r}".format(
+                    **mismatch
+                )
+            )
+    print()
+    return {"pass": passed, "statuses": statuses, "mismatches": mismatches}
+
+
+def _compare_static_server_performance(
+        baseline: dict[str, Any],
+        candidate: dict[str, Any],
+        *,
+        regression_tolerance_pct: float,
+) -> dict[str, Any]:
+    baseline_aggregate = baseline.get("aggregate", {})
+    candidate_aggregate = candidate.get("aggregate", {})
+    metric_specs = {
+        "main_tokens_per_scheduler_second": True,
+        "scheduler_wall_seconds": False,
+    }
+    metrics = {}
+    print("Static-server scheduler throughput")
+    for key, higher_is_better in metric_specs.items():
+        baseline_value = float(baseline_aggregate.get(key, 0.0) or 0.0)
+        candidate_value = float(candidate_aggregate.get(key, 0.0) or 0.0)
+        _compare_number(key, baseline_value, candidate_value, higher_is_better=higher_is_better)
+        metrics[key] = _metric_comparison(
+            baseline_value,
+            candidate_value,
+            higher_is_better=higher_is_better,
+            tolerance_pct=regression_tolerance_pct,
+        )
+
+    attributed_metric = _metric_comparison(
+        float(baseline_aggregate.get("main_tokens_per_request_model_second_attributed", 0.0) or 0.0),
+        float(candidate_aggregate.get("main_tokens_per_request_model_second_attributed", 0.0) or 0.0),
+        higher_is_better=True,
+        tolerance_pct=regression_tolerance_pct,
+    )
+    baseline_tokens = int(baseline_aggregate.get("main_generated_tokens", 0) or 0)
+    candidate_tokens = int(candidate_aggregate.get("main_generated_tokens", 0) or 0)
+    generated_tokens_non_decreasing = candidate_tokens >= baseline_tokens
+    passed = all(metric["pass"] for metric in metrics.values()) and generated_tokens_non_decreasing
+    print(f"  main_generated_tokens: baseline={baseline_tokens}, candidate={candidate_tokens}")
+    print(f"  generated_tokens_non_decreasing: {generated_tokens_non_decreasing}")
+    print(
+        "  attributed_request_model_tok/s: baseline={baseline:.3f}, candidate={candidate:.3f}".format(
+            baseline=attributed_metric["baseline"],
+            candidate=attributed_metric["candidate"],
+        )
+    )
+    print(f"  no_regression_gate: {'PASS' if passed else 'FAIL'}")
+    print()
+    return {
+        "pass": passed,
+        "metrics": metrics,
+        "attributed_request_model_tokens_per_second": attributed_metric,
+        "generated_tokens_non_decreasing": generated_tokens_non_decreasing,
+        "baseline_main_generated_tokens": baseline_tokens,
+        "candidate_main_generated_tokens": candidate_tokens,
+    }
+
+
+def compare_static_server_manifests(
+        baseline_path: Path,
+        candidate_path: Path,
+        *,
+        regression_tolerance_pct: float = 0.0,
+        allow_server_batch_timeout_change: bool = False,
+) -> dict[str, Any]:
+    baseline = _load_json(baseline_path)
+    candidate = _load_json(candidate_path)
+    report: dict[str, Any] = {
+        "baseline_path": str(baseline_path),
+        "candidate_path": str(candidate_path),
+        "regression_tolerance_pct": regression_tolerance_pct,
+        "allow_server_batch_timeout_change": allow_server_batch_timeout_change,
+        "contract": {},
+        "result_class": {},
+        "token_status": {},
+        "performance": {},
+    }
+
+    print(f"Baseline static server manifest:  {baseline_path}")
+    print(f"Candidate static server manifest: {candidate_path}")
+    print()
+
+    report["contract"] = _compare_static_server_contract(
+        baseline,
+        candidate,
+        allow_server_batch_timeout_change=allow_server_batch_timeout_change,
+    )
+    report["result_class"] = _compare_static_server_result_class(baseline, candidate)
+    report["token_status"] = _compare_static_server_token_status(baseline, candidate)
+    report["performance"] = _compare_static_server_performance(
+        baseline,
+        candidate,
+        regression_tolerance_pct=regression_tolerance_pct,
+    )
+    return report
+
+
 def compare_suite_manifests(
         baseline_path: Path,
         candidate_path: Path,
@@ -1092,6 +1314,13 @@ def main() -> None:
         help="Compare two profile_inference_suite suite_manifest.json files.",
     )
     parser.add_argument(
+        "--compare-static-server",
+        nargs=2,
+        metavar=("BASE_MANIFEST", "CANDIDATE_MANIFEST"),
+        type=Path,
+        help="Compare two profile_static_server_batch static_server_batch_manifest.json files.",
+    )
+    parser.add_argument(
         "--suite-scope",
         choices=["all_runs", "warmed_runs"],
         default="warmed_runs",
@@ -1173,6 +1402,14 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--allow-server-batch-timeout-change",
+        action="store_true",
+        help=(
+            "For --compare-static-server, allow server_batch_timeout to differ in the server config "
+            "fingerprint. Use only when evaluating that scheduler knob explicitly."
+        ),
+    )
+    parser.add_argument(
         "--strict",
         action="store_true",
         help=(
@@ -1196,8 +1433,9 @@ def main() -> None:
         help="Write a machine-readable comparison report.",
     )
     args = parser.parse_args()
-    if args.compare and args.compare_suite:
-        parser.error("use either --compare or --compare-suite, not both")
+    compare_modes = [bool(args.compare), bool(args.compare_suite), bool(args.compare_static_server)]
+    if sum(compare_modes) > 1:
+        parser.error("use only one of --compare, --compare-suite, or --compare-static-server")
     if args.strict_full_song and not args.compare:
         parser.error("--strict-full-song requires --compare")
     if args.compare:
@@ -1288,10 +1526,35 @@ def main() -> None:
             or (args.gate_cold_run0 and not report["cold_run0"].get("pass", False))
         )
         raise SystemExit(1 if failed else 0)
+    elif args.compare_static_server:
+        report = compare_static_server_manifests(
+            args.compare_static_server[0],
+            args.compare_static_server[1],
+            regression_tolerance_pct=args.regression_tolerance_pct,
+            allow_server_batch_timeout_change=args.allow_server_batch_timeout_change,
+        )
+        if args.json_output is not None:
+            args.json_output.parent.mkdir(parents=True, exist_ok=True)
+            args.json_output.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+        failed = (
+            ((args.require_contract_match or args.require_mode_contract or args.strict)
+             and not report["contract"].get("pass", False))
+            or ((args.require_mode_contract or args.strict)
+                and not report["result_class"].get("pass", False))
+            or ((args.require_token_equivalence or args.strict)
+                and not report["token_status"].get("pass", False))
+            or ((args.require_no_regression or args.strict)
+                and not report["performance"].get("pass", False))
+        )
+        raise SystemExit(1 if failed else 0)
     elif args.profile:
         summarize(args.profile, limit=args.limit)
     else:
-        parser.error("provide a profile path, --compare BASELINE CANDIDATE, or --compare-suite BASE CANDIDATE")
+        parser.error(
+            "provide a profile path, --compare BASELINE CANDIDATE, "
+            "--compare-suite BASE CANDIDATE, or --compare-static-server BASE CANDIDATE"
+        )
 
 
 if __name__ == "__main__":
