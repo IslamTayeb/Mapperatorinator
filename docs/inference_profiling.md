@@ -1633,6 +1633,19 @@ same-calculation inference; only revisit it under explicit documented-drift
 policy with direct-loop token/logit/RNG, full-song output, and large operational
 speedup gates. See `notes/2026-07-04-native-prefix-exactness-classifier.md`.
 
+Current exact-frontier audit: after the weighted manual-island rejection and the
+native self+cross drift classifier, the only remaining exact target-sized class
+is a broad decoder-layer or decoder-stack math/memory verifier. The weighted
+decoder layer/stack remains large enough to justify one bounded verifier, but a
+candidate must preserve the decoder-layer ABI, cache-write SHA, logits/top-k,
+direct-loop token/RNG, smoke/full-song generated-token IDs, output bytes, and
+no-regression gates before production wiring. External vendor docs are
+consistent with this caution: cuBLAS can be repeatable on a fixed toolkit/GPU
+stack, but repeatability of a new native reduction is not the same thing as
+matching PyTorch/HF byte-for-byte. Do not start another narrow production flag,
+tail graph, cold-start package pass, or documented-drift native path as an exact
+optimization. See `notes/2026-07-04-current-exact-optimization-frontier.md`.
+
 `utils/summarize_decoder_layer_segment_pressure.py` is the segment-level stop/go auditor for native decoder-layer work. It reads a decoder-layer island report, uses captured ABI dimensions, compares measured CUDA-graph segment replay against optimistic fp32 compute/bandwidth floors, and reports whether each segment has above-floor headroom above the 5%/10% bars. DCC run `/work/imt11/Mapperatorinator/runs/decoder-layer-segment-pressure-20260704141703-0a28a3e` on the candidate-cache report showed self-attention residual `5.430s` measured / `1.513s` floor / `3.917s` above-floor, cross-attention residual `4.024s` / `1.626s` / `2.397s`, MLP residual `4.692s` / `2.789s` / `1.903s`, and whole decoder layer `15.739s` / `5.928s` / `9.811s`. All three major residual segments clear the 5% verifier bar, but no single segment reaches `500 tok/s` at its floor, and even this representative whole layer at floor projects only `414.435 tok/s`. The next implementation-worthy scope remains a multi-segment or whole-layer native math/memory verifier, not another narrow production path. See `notes/2026-07-04-decoder-layer-segment-pressure.md`.
 
 `utils/summarize_torch_trace_kernels.py` is the lightweight Chrome-trace kernel
