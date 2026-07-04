@@ -1770,6 +1770,61 @@ Existing throughput paths are separate:
 - `parallel=true` uses `InferenceProcessor._batched_inference` for static window batching inside one song/context. It stacks prompts/windows up to `max_batch_size` and records `mode=parallel` profile rows.
 - The accepted DecodeSession/native stack rejects both `use_server=true` and `parallel=true`; do not report it as a batching win.
 
+The current mergeable batching/server track is separate from the never-merge
+decoder-layer runtime island. Work from current `main` for mergeable batching
+infrastructure, and keep `experiment/decoder-layer-runtime-island-do-not-merge`
+out of `main` unless a generally useful verifier/docs/tooling change is
+separately approved and cherry-picked.
+
+Static server batching profile infrastructure should fail loudly on stale or
+ambiguous server state. The harness records server socket paths, a server-loading
+configuration fingerprint, request/server/suite timeouts, and whether an
+existing socket was explicitly allowed. Worker clients are connect-only; they
+must not auto-start replacement servers if the owner server dies or a socket is
+missing.
+
+For static server batching, report scheduler-wall aggregate throughput as the
+primary TPS metric. Server/model elapsed time attached to individual request
+records is attributed because a single merged server batch can be copied back to
+multiple requests. Keep both `main_tokens_per_scheduler_second` and explicitly
+named attributed metrics, and use deduped server batch IDs/histograms to decide
+whether a run actually observed multi-request batching. If no batch size above
+one is observed, classify it as `static_server_no_batch_observed`.
+
+Static server batching currently uses shared global server RNG. Until an
+explicit per-request reseed/replay protocol exists, concurrent server token
+hashes are throughput diagnostics only; do not compare them against cold
+single-song token IDs as exact same-calculation evidence. Equivalent continuous
+or static server claims need same-policy per-request token/output hashes and RNG
+state reporting.
+
+Do not combine `use_server=true` with `inference_generation_compile=true` on the
+current static IPC server. DCC job `49267683` on RTX 2080 Ti reached generation
+but failed inside TorchInductor cudagraph tree setup with an `AssertionError`
+because the server executes generation in a background batch thread. The
+control plane now rejects this combination; server batching profiles should use
+`inference_generation_compile=false` until a server-specific compile path is
+validated.
+
+The first compile-disabled five-song 15s batching smoke on commit `1475062`
+used Lambada, PEGASUS, Ela ke Leitada, SALVALAI, and Nube Negra with fp32/SDPA,
+`profile_record_token_ids=true`, and `generate_positions=false`:
+
+| mode | job | main tokens | primary tok/s | equivalence/status |
+| --- | ---: | ---: | ---: | --- |
+| serial multi-song | `49267816` | `5,955` | `69.727` model-time tok/s | baseline for this smoke |
+| static server batch | `49267768` | `7,234` | `120.568` scheduler-wall tok/s | real multi-request batches observed; throughput evidence only under shared server RNG |
+| `parallel=true` static window | `49267817` | `3,524` | `58.749` model-time tok/s | strict serial comparison FAIL; token/output mismatches for all five songs |
+
+Static server unique main-generation batches were `8x size 5`, `2x size 4`,
+and `2x size 1`; timing batches were `9x size 5`, `1x size 4`, and `1x size 1`.
+The static server run averaged `58.06%` GPU util over active-memory telemetry
+samples, versus `55.35%` for serial and `46.8%` for `parallel=true`. Treat this
+as evidence that current static IPC batching can improve aggregate service
+throughput, not as a single-song or exact token-equivalent speedup. The strict
+serial-vs-parallel report is
+`/work/imt11/Mapperatorinator/runs/batching-compare-smoke-20260704-142810-1475062/serial-vs-parallel-strict-compare.json`.
+
 Future continuous batching work is a separate throughput-mode project, not a single-song TPS path. It needs explicit flags, profile metadata, and gates for cold single-song, warm repeat, static server batch, static window batch, and continuous server batch. Exact-equivalent continuous batching must preserve each request's generated-token IDs, stopping state, cache state, logits-processor state, RNG behavior, output policy, and generated-token accounting. If that cannot be proven, report it only as `documented-drift`/non-equivalent and keep it out of retained same-calculation baselines.
 
 Suggested future flags should be batch-specific, for example `inference_continuous_batching`, `inference_continuous_batching_mode`, `continuous_batch_max_active_sequences`, `continuous_batch_max_wait_ms`, `continuous_batch_prefill_policy`, `continuous_batch_decode_order_policy`, `continuous_batch_rng_policy`, `inference_batch_decode_session_runtime`, and `inference_batch_native_decode_kernels`. The existing single-song DecodeSession/native flags should keep failing loudly for `use_server=true` and `parallel=true` until batch-specific verifiers prove equivalent behavior.
