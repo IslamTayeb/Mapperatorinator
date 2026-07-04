@@ -1518,6 +1518,24 @@ Native `fc1 + GELU` fusion is not target-sized by itself. DCC job `49232032` on 
 
 Native full-MLP residual replacement is still below threshold as a standalone kernel. DCC job `49233007` on RTX 2080 Ti, commit `14a077c`, temporarily added a diagnostic fp32 CUDA helper for `RMSNorm -> fc1 -> GELU -> fc2 -> residual` and benchmarked it through `utils/profile_decode_decoder_layer_island.py`. The native path passed allclose (`max_abs=7.63e-06`) and decoder logits replay stayed exact (`max_abs=0.0`), but repeated seq9/prefix128 projections saved only `0.756-0.822s` full-song, about `270.475 -> 278 tok/s`. The native code was removed. Treat this as evidence that MLP-only native work is too small unless paired with broader decoder-layer/runtime savings. See `notes/2026-07-03-native-mlp-residual-probe.md`.
 
+`utils/summarize_decode_linear_roofline.py` adds a roofline-style parser for
+`utils/profile_decode_linear_kernels.py` JSON reports. It estimates FLOPs,
+minimum fp32 bytes, achieved minimum-byte bandwidth, projected full-song seconds,
+and a nominal RTX 2080 Ti memory-bandwidth floor for captured one-token decoder
+linear calls. DCC job `49250117` on RTX 2080 Ti, branch
+`experiment/current-linear-roofline` commit `407edbf`, reran the linear graph
+probe on the current fastest fused stack and passed logits replay exactly
+(`max_abs=0.0`). Captured decoder linears project to `7.156s` over the accepted
+full-song decode count, but a nominal `616 GB/s` bandwidth floor is already
+`5.027s`, leaving only `2.129s` fantasy removable headroom above that floor.
+Zeroing all captured linears would reach only about `362 tok/s`, and the
+bandwidth-floor case is about `292.5 tok/s`. This confirms that the large
+linear/GEMV kernel bucket is real model math, not an easy per-linear wrapper
+target. Do not start standalone per-linear CUDA/cuBLAS/CUTLASS production work
+from category share alone; any future linear work should be fused with adjacent
+decoder-layer/runtime work and must show a current-stack projected saving above
+the keep threshold. See `notes/2026-07-04-current-linear-roofline.md`.
+
 ## CUDA Graph Sampling RNG Diagnostics
 
 Before graphing any sampling/tail work, verify token sequence and final RNG state. DCC jobs `49231654` and `49231667` showed that one-token CUDA graph replay of `torch.multinomial(probs, 1)` matches eager sampling on the RTX 2080 Ti stack for the default CUDA generator: sampled token sequence, final CUDA RNG state, and the next eager sample all matched. Explicit CUDA generators must be registered with `CUDAGraph.register_generator_state` before capture.
