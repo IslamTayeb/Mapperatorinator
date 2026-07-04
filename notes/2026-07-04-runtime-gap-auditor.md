@@ -17,7 +17,10 @@ It combines:
 - a `profile_inference` JSON;
 - optional `utils/summarize_active_prefix_diagnostics.py` JSON;
 - optional full-forward, decoder-stack, and decoder-layer graph-replay island
-  reports.
+  reports;
+- optional weighted decoder-stack summaries;
+- optional linear roofline summaries;
+- optional graph replay shell gap reports.
 
 It does not run inference, import model code, or claim throughput. It only
 aggregates existing evidence.
@@ -152,3 +155,32 @@ python3 utils/summarize_decode_runtime_gap.py /tmp/mapper-runtime-gap/profile.js
 
 Keep the utility as verifier/profiling infrastructure. No optimization
 graduated and the accepted baseline remains job `49230082` at `270.475 tok/s`.
+
+## Follow-up Support
+
+The auditor now accepts:
+
+```text
+--linear-roofline-report
+--decode-replay-gap-report
+```
+
+It also understands `weighted_seconds` from
+`weighted_decoder_stack_summary.json` when passed through
+`--decoder-stack-report`.
+
+The combined ledger in
+`notes/2026-07-04-combined-bottleneck-ledger.md` uses these inputs to show:
+
+- weighted full-forward replay at `17.120s`, only a `446.214 tok/s` ceiling;
+- weighted decoder stack hidden at `16.666s`, only a `458.350 tok/s` ceiling;
+- decoder-layer replay at `13.018s`, the only current 500-capable idealized
+  compute boundary;
+- captured linears at `7.156s`, but only `2.129s` removable above the nominal
+  RTX 2080 Ti bandwidth floor;
+- production graph replay shell gap at `0.082s` and static input copy at
+  `0.220s`, both below the 5% keep bar.
+
+This keeps the next implementation-class target on broad decoder-layer/native
+runtime work, not wrapper cleanup, static input copies, or standalone per-linear
+kernels.

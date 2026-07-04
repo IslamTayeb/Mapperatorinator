@@ -69,6 +69,12 @@ def _projection_seconds(result: dict[str, Any] | None) -> float | None:
 def _result_projection(report: dict[str, Any] | None, *names: str) -> float | None:
     if not isinstance(report, dict):
         return None
+    weighted_seconds = report.get("weighted_seconds")
+    if isinstance(weighted_seconds, dict):
+        for name in names:
+            seconds = weighted_seconds.get(name)
+            if isinstance(seconds, (int, float)):
+                return float(seconds)
     results = report.get("results")
     if not isinstance(results, dict):
         return None
@@ -439,6 +445,68 @@ def _linear_roofline_analysis(
     }
 
 
+def _decode_replay_gap_analysis(
+        decode_replay_gap_report: dict[str, Any] | None,
+        *,
+        baseline_model_seconds: float,
+) -> dict[str, Any] | None:
+    if not isinstance(decode_replay_gap_report, dict):
+        return None
+    measurements = decode_replay_gap_report.get("measurements")
+    deltas = decode_replay_gap_report.get("deltas")
+    if not isinstance(measurements, dict) and not isinstance(deltas, dict):
+        return None
+
+    def _measurement_seconds(name: str) -> float | None:
+        if not isinstance(measurements, dict):
+            return None
+        measurement = measurements.get(name)
+        if not isinstance(measurement, dict):
+            return None
+        seconds = measurement.get("projected_full_song_seconds")
+        return float(seconds) if isinstance(seconds, (int, float)) else None
+
+    def _delta_seconds(name: str) -> float | None:
+        if not isinstance(deltas, dict):
+            return None
+        delta = deltas.get(name)
+        if not isinstance(delta, dict):
+            return None
+        seconds = delta.get("projected_full_song_seconds_delta")
+        return float(seconds) if isinstance(seconds, (int, float)) else None
+
+    production_minus_full_forward = _delta_seconds("production_minus_full_forward")
+    production_minus_stack_projection = _delta_seconds("production_minus_decoder_stack_plus_projection")
+    static_input_copy = _measurement_seconds("static_input_copy")
+    empty_graph_shell = _measurement_seconds("empty_graph_shell")
+    return {
+        "source_pass": bool(decode_replay_gap_report.get("pass", False)),
+        "active_prefix_length": decode_replay_gap_report.get("active_prefix_length"),
+        "production_graph_replay_seconds": _measurement_seconds("production_graph_replay"),
+        "full_forward_graph_replay_seconds": _measurement_seconds("full_forward_graph_replay"),
+        "decoder_stack_plus_projection_graph_replay_seconds": _measurement_seconds(
+            "decoder_stack_plus_projection_graph_replay"
+        ),
+        "production_minus_full_forward_seconds": production_minus_full_forward,
+        "production_minus_decoder_stack_plus_projection_seconds": production_minus_stack_projection,
+        "static_input_copy_seconds": static_input_copy,
+        "empty_graph_shell_seconds": empty_graph_shell,
+        "production_minus_full_forward_fraction": (
+            production_minus_full_forward / baseline_model_seconds
+            if isinstance(production_minus_full_forward, (int, float)) and baseline_model_seconds > 0
+            else None
+        ),
+        "static_input_copy_fraction": (
+            static_input_copy / baseline_model_seconds
+            if isinstance(static_input_copy, (int, float)) and baseline_model_seconds > 0
+            else None
+        ),
+        "note": (
+            "Use this to reject graph replay shell/input-copy work; it does not measure broader decoder compute."
+        ),
+    }
+
+
 def _recommended_next_steps(report: dict[str, Any]) -> list[str]:
     recommendations: list[str] = []
     ledger = report.get("model_generate_ledger") or {}
@@ -514,6 +582,17 @@ def _recommended_next_steps(report: dict[str, Any]) -> list[str]:
             recommendations.append(
                 "Standalone captured-linear work has supporting-sized roofline headroom but is below the 10% bar; combine it with broader decoder-layer/runtime work."
             )
+    replay_gap = report.get("decode_replay_gap_analysis") or {}
+    shell_gap = replay_gap.get("production_minus_full_forward_seconds")
+    static_copy = replay_gap.get("static_input_copy_seconds")
+    if isinstance(shell_gap, (int, float)) and isinstance(five_pct_model, (int, float)) and shell_gap < five_pct_model:
+        recommendations.append(
+            "Do not pursue DecodeSession graph replay shell cleanup; production-minus-full-forward replay gap is below the 5% bar."
+        )
+    if isinstance(static_copy, (int, float)) and isinstance(five_pct_model, (int, float)) and static_copy < five_pct_model:
+        recommendations.append(
+            "Do not pursue static graph input copy as a standalone target; projected replay-gap ceiling is below the 5% bar."
+        )
     return recommendations
 
 
@@ -529,6 +608,7 @@ def summarize_runtime_gap(
         decoder_stack_report: dict[str, Any] | None = None,
         decoder_layer_report: dict[str, Any] | None = None,
         linear_roofline_report: dict[str, Any] | None = None,
+        decode_replay_gap_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     records = _records_for_label(profile, label)
     active_summary = active_summary or summarize_active_prefix_diagnostics(profile, label=label)
@@ -589,6 +669,10 @@ def summarize_runtime_gap(
         baseline_model_seconds=full_song_model_time_seconds,
         target_model_seconds=target_model_seconds,
     )
+    decode_replay_gap_analysis = _decode_replay_gap_analysis(
+        decode_replay_gap_report,
+        baseline_model_seconds=full_song_model_time_seconds,
+    )
 
     result: dict[str, Any] = {
         "label": label,
@@ -637,6 +721,7 @@ def summarize_runtime_gap(
         "island_replay_seconds": island_replay_seconds,
         "island_gap_analysis": island_gap_analysis,
         "linear_roofline_analysis": linear_roofline_analysis,
+        "decode_replay_gap_analysis": decode_replay_gap_analysis,
         "candidate_ledger": _candidate_ledger(
             active_events=active_event_projections,
             island_analysis=island_gap_analysis,
@@ -745,6 +830,22 @@ def print_summary(report: dict[str, Any], *, event_limit: int) -> None:
             f"bandwidth_floor={_fmt(floor_tps)} tok/s"
         )
         print()
+    replay_gap = report.get("decode_replay_gap_analysis")
+    if isinstance(replay_gap, dict):
+        print("Replay Shell Gap")
+        print(
+            "  production - full_forward: "
+            f"{_fmt(replay_gap.get('production_minus_full_forward_seconds'))}s, "
+            "production - stack+projection: "
+            f"{_fmt(replay_gap.get('production_minus_decoder_stack_plus_projection_seconds'))}s"
+        )
+        print(
+            "  static_input_copy: "
+            f"{_fmt(replay_gap.get('static_input_copy_seconds'))}s, "
+            "empty_graph_shell: "
+            f"{_fmt(replay_gap.get('empty_graph_shell_seconds'))}s"
+        )
+        print()
     print("Recommendations")
     for item in report["recommendations"]:
         print(f"  - {item}")
@@ -764,6 +865,7 @@ def main() -> None:
     parser.add_argument("--decoder-stack-report", type=Path, default=None)
     parser.add_argument("--decoder-layer-report", type=Path, default=None)
     parser.add_argument("--linear-roofline-report", type=Path, default=None)
+    parser.add_argument("--decode-replay-gap-report", type=Path, default=None)
     parser.add_argument("--full-song-main-tokens", type=int, default=7639)
     parser.add_argument("--full-song-model-time-seconds", type=float, default=28.243)
     parser.add_argument("--target-tps", type=float, default=500.0)
@@ -782,6 +884,7 @@ def main() -> None:
         decoder_stack_report=_load_json(args.decoder_stack_report),
         decoder_layer_report=_load_json(args.decoder_layer_report),
         linear_roofline_report=_load_json(args.linear_roofline_report),
+        decode_replay_gap_report=_load_json(args.decode_replay_gap_report),
     )
     print_summary(report, event_limit=args.event_limit)
     if args.json_output is not None:
