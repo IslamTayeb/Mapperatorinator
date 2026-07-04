@@ -252,7 +252,7 @@ def main() -> None:
         "--require-variant",
         action="append",
         dest="require_variants",
-        default=["repo_decoder_layer", "manual_decoder_runtime_island"],
+        default=None,
     )
     parser.add_argument("--require-candidate-cache-write-checks", action="store_true")
     args = parser.parse_args()
@@ -263,7 +263,7 @@ def main() -> None:
         report_template=args.report_template,
         full_song_model_time_s=args.full_song_model_time_s,
         full_song_main_tokens=args.full_song_main_tokens,
-        require_variants=args.require_variants,
+        require_variants=args.require_variants or ["repo_decoder_layer", "manual_decoder_runtime_island"],
         require_candidate_cache_write_checks=args.require_candidate_cache_write_checks,
         target_tps=args.target_tps,
     )
