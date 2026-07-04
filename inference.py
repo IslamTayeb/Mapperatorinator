@@ -991,6 +991,9 @@ def get_server_address(
     ckpt_path_str = _sanitize_socket_component(ckpt_path_str)
     # Check if the OS supports Unix sockets
     if os.name == 'posix':
+        if len(f"/tmp/{ckpt_path_str}.sock".encode()) >= 100:
+            digest = hashlib.sha256(ckpt_path_str.encode()).hexdigest()[:16]
+            ckpt_path_str = f"mapperatorinator-{digest}"
         # Use a Unix socket for Linux and macOS
         return f"/tmp/{ckpt_path_str}.sock"
     else:

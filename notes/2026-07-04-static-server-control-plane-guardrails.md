@@ -34,6 +34,19 @@ Local only:
 tests/test_inference_server_control_plane.py
 ```
 
-No DCC/GPU profiling was run for this checkpoint. Future static-server
-capacity runs should use these keyed sockets so `max_batch_size` and
-`server_batch_timeout` changes cannot silently attach to stale owner servers.
+Future static-server capacity runs should use these keyed sockets so
+`max_batch_size` and `server_batch_timeout` changes cannot silently attach to
+stale owner servers.
+
+## DCC Regression
+
+DCC job `49269896` failed before profiling because the first runtime-keyed
+socket path exceeded the AF_UNIX path-length limit:
+
+```text
+OSError: AF_UNIX path too long
+```
+
+The socket helper now hashes overlong final socket names to
+`/tmp/mapperatorinator-<hash>.sock`, preserving runtime separation without
+invalid Unix socket paths. No throughput result came from job `49269896`.

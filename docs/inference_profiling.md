@@ -1968,7 +1968,9 @@ mergeable Track B path. `load_model_with_server()` now fails loudly for
 paths include `get_server_runtime_key()` so normal inference, the web UI server
 owner, and static-server profiling do not attach to stale IPC servers with a
 different `max_batch_size`, `server_batch_timeout`, device, precision, attention
-backend, or generation-compile setting. `InferenceConfig.use_server` now matches the
+backend, or generation-compile setting. Overlong Unix socket names are
+hash-shortened after DCC job `49269896` failed before profiling with
+`OSError: AF_UNIX path too long`. `InferenceConfig.use_server` now matches the
 Hydra default (`false`). This is guardrail infrastructure only, not a throughput
 result. See `notes/2026-07-04-static-server-control-plane-guardrails.md`.
 

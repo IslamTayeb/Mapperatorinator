@@ -33,6 +33,19 @@ def test_server_address_includes_runtime_key():
     assert "mb-10__bt-0_2" in first
 
 
+def test_server_address_hashes_overlong_unix_socket_names():
+    long_key = "x" * 200
+
+    address = get_server_address(
+        "OliBomby/Mapperatorinator-v32/gamemode=0",
+        auto_select_gamemode_model=False,
+        server_runtime_key=long_key,
+    )
+
+    assert len(address.encode()) < 100
+    assert "mapperatorinator-" in address
+
+
 def test_load_model_with_server_rejects_generation_compile_server_path():
     try:
         load_model_with_server(
