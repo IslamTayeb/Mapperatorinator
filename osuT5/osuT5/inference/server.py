@@ -874,6 +874,8 @@ class InferenceClient:
         while attempts < max_retries:
             # Send request and wait for response
             try:
+                if self.conn is None:
+                    self._reconnect()
                 self.conn.send((model_kwargs, generate_kwargs))
                 result = self.conn.recv()
             except (EOFError, OSError):
