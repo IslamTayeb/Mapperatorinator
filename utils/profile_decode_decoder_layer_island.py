@@ -88,6 +88,8 @@ class DecoderLayerCapture:
     output: torch.Tensor
     active_prefix_length: int
     cache_write_fingerprint: dict[str, Any] | None
+    expected_cache_key_slot: torch.Tensor | None
+    expected_cache_value_slot: torch.Tensor | None
 
 
 def _clone_tensor(value: Any) -> Any:
@@ -245,23 +247,36 @@ def _cache_write_fingerprint(
     }
 
 
-def _cache_slot_views(capture: DecoderLayerCapture) -> tuple[torch.Tensor, torch.Tensor]:
-    self_cache = getattr(capture.past_key_value, "self_attention_cache", None)
+def _cache_slot_views_from(
+        past_key_value: Any,
+        *,
+        layer_idx: int,
+        cache_position: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    self_cache = getattr(past_key_value, "self_attention_cache", None)
     layers = getattr(self_cache, "layers", None)
-    if not isinstance(layers, (list, tuple)) or capture.layer_idx >= len(layers):
+    if not isinstance(layers, (list, tuple)) or layer_idx >= len(layers):
         raise RuntimeError("missing self-attention cache layer")
-    layer = layers[capture.layer_idx]
+    layer = layers[layer_idx]
     keys = getattr(layer, "keys", None)
     values = getattr(layer, "values", None)
     if not isinstance(keys, torch.Tensor) or not isinstance(values, torch.Tensor):
         raise RuntimeError("missing tensor keys/values")
-    positions = [int(item) for item in capture.cache_position.detach().cpu().view(-1).tolist()]
+    positions = [int(item) for item in cache_position.detach().cpu().view(-1).tolist()]
     if len(positions) != 1:
         raise RuntimeError(f"expected scalar cache_position, got {positions}")
     pos = positions[0]
     if pos < 0 or pos >= int(keys.shape[2]):
         raise RuntimeError(f"cache_position {pos} outside cache length {int(keys.shape[2])}")
     return keys[:, :, pos:pos + 1, :], values[:, :, pos:pos + 1, :]
+
+
+def _cache_slot_views(capture: DecoderLayerCapture) -> tuple[torch.Tensor, torch.Tensor]:
+    return _cache_slot_views_from(
+        capture.past_key_value,
+        layer_idx=capture.layer_idx,
+        cache_position=capture.cache_position,
+    )
 
 
 def _restore_cache_slot(capture: DecoderLayerCapture, key_slot: torch.Tensor, value_slot: torch.Tensor) -> None:
@@ -399,8 +414,17 @@ def _verify_cache_write_candidate(
         }
     try:
         key_slot, value_slot = _cache_slot_views(capture)
-        reference_key = key_slot.detach().clone()
-        reference_value = value_slot.detach().clone()
+        reference_key = (
+            capture.expected_cache_key_slot.detach().clone()
+            if isinstance(capture.expected_cache_key_slot, torch.Tensor)
+            else key_slot.detach().clone()
+        )
+        reference_value = (
+            capture.expected_cache_value_slot.detach().clone()
+            if isinstance(capture.expected_cache_value_slot, torch.Tensor)
+            else value_slot.detach().clone()
+        )
+        _restore_cache_slot(capture, reference_key, reference_value)
         key_slot.fill_(float("nan"))
         value_slot.fill_(float("nan"))
         output = fn()
@@ -1126,6 +1150,16 @@ def _capture_decoder_layers(
                 if include_cache_write_fingerprint
                 else None
             )
+            expected_cache_key_slot = None
+            expected_cache_value_slot = None
+            if include_cache_write_fingerprint:
+                expected_key_slot, expected_value_slot = _cache_slot_views_from(
+                    past_key_value,
+                    layer_idx=layer_idx,
+                    cache_position=cache_position,
+                )
+                expected_cache_key_slot = expected_key_slot.detach().clone()
+                expected_cache_value_slot = expected_value_slot.detach().clone()
             captures[name] = DecoderLayerCapture(
                 name=name,
                 layer_idx=layer_idx,
@@ -1143,6 +1177,8 @@ def _capture_decoder_layers(
                 output=output[0].detach(),
                 active_prefix_length=active_prefix_length,
                 cache_write_fingerprint=cache_write_fingerprint,
+                expected_cache_key_slot=expected_cache_key_slot,
+                expected_cache_value_slot=expected_cache_value_slot,
             )
 
         return hook
