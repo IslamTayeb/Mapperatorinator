@@ -1962,4 +1962,14 @@ batching summaries from the manifest's `runs`. It also validates each
 not change the shared-RNG throughput-only status of static server batching. See
 `notes/2026-07-04-static-server-manifest-self-validation.md`.
 
+Static IPC server control-plane guardrails were tightened after auditing the
+mergeable Track B path. `load_model_with_server()` now fails loudly for
+`use_server=true` plus `inference_generation_compile=true`, and server socket
+paths include `get_server_runtime_key()` so normal inference, the web UI server
+owner, and static-server profiling do not attach to stale IPC servers with a
+different `max_batch_size`, `server_batch_timeout`, device, precision, attention
+backend, or generation-compile setting. `InferenceConfig.use_server` now matches the
+Hydra default (`false`). This is guardrail infrastructure only, not a throughput
+result. See `notes/2026-07-04-static-server-control-plane-guardrails.md`.
+
 Suggested future profile metadata: `result_class`, `throughput_claim_scope`, `batching_mode`, scheduler policy, request/window IDs, batch IDs, active batch-size histogram, queue wait, per-request latency, prefill/decode timing split, per-sample token hashes, stop reasons, RNG policy/state hashes, cache slot/reorder events, graph capture/replay counts, and effective fast-path flags.

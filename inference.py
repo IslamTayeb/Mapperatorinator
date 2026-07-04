@@ -880,6 +880,32 @@ def generate(
     return result, result_path
 
 
+def _sanitize_socket_component(value) -> str:
+    return str(value).replace(" ", "_").replace("/", "_").replace("\\", "_").replace(".", "_")
+
+
+def get_server_runtime_key(
+        *,
+        max_batch_size: int,
+        server_batch_timeout: float,
+        device,
+        precision: str,
+        attn_implementation: str,
+        generation_compile: bool,
+) -> str:
+    return "__".join(
+        f"{key}-{_sanitize_socket_component(value)}"
+        for key, value in {
+            "mb": int(max_batch_size),
+            "bt": f"{float(server_batch_timeout):.6g}",
+            "dev": device,
+            "p": precision,
+            "attn": attn_implementation,
+            "compile": int(bool(generation_compile)),
+        }.items()
+    )
+
+
 def load_model_with_server(ckpt_path: str | Path | None, t5_args: TrainConfig, device, max_batch_size: int = 8,
                            use_server: bool = False, precision: str = "fp32", attn_implementation: str = "sdpa",
                            eval_mode: bool = True, lora_path=None, gamemode: int | None = None,
@@ -887,6 +913,12 @@ def load_model_with_server(ckpt_path: str | Path | None, t5_args: TrainConfig, d
                            server_allow_auto_start: bool = True, server_connect_timeout: float | None = 60.0,
                            server_request_timeout: float | None = None, server_idle_timeout: float = 20,
                            server_batch_timeout: float = 0.2):
+    if use_server and generation_compile:
+        raise ValueError(
+            "inference_generation_compile=true is not supported with use_server=true. "
+            "Call compile_args()/validate_reserved_runtime_flags() before loading, or disable generation compile "
+            "for static IPC server batching."
+        )
     model_loader, tokenizer_loader = load_model_loaders(
         ckpt_path=ckpt_path,
         t5_args=t5_args,
@@ -911,6 +943,14 @@ def load_model_with_server(ckpt_path: str | Path | None, t5_args: TrainConfig, d
             lora_path=lora_path,
             gamemode=gamemode,
             auto_select_gamemode_model=auto_select_gamemode_model,
+            server_runtime_key=get_server_runtime_key(
+                max_batch_size=max_batch_size,
+                server_batch_timeout=server_batch_timeout,
+                device=device,
+                precision=precision,
+                attn_implementation=attn_implementation,
+                generation_compile=generation_compile,
+            ),
         ),
         allow_auto_start=server_allow_auto_start,
         connect_timeout=server_connect_timeout,
@@ -924,6 +964,7 @@ def get_server_address(
         lora_path: str | Path | None = None,
         gamemode: int | None = None,
         auto_select_gamemode_model: bool = True,
+        server_runtime_key: str | None = None,
 ):
     """
     Get a valid socket address for the OS and model version.
@@ -945,7 +986,9 @@ def get_server_address(
     if effective_lora_path:
         effective_lora_str = effective_lora_path.as_posix() if isinstance(effective_lora_path, Path) else str(effective_lora_path)
         ckpt_path_str = f"{ckpt_path_str}__lora__{effective_lora_str}"
-    ckpt_path_str = ckpt_path_str.replace(" ", "_").replace("/", "_").replace("\\", "_").replace(".", "_")
+    if server_runtime_key:
+        ckpt_path_str = f"{ckpt_path_str}__server__{server_runtime_key}"
+    ckpt_path_str = _sanitize_socket_component(ckpt_path_str)
     # Check if the OS supports Unix sockets
     if os.name == 'posix':
         # Use a Unix socket for Linux and macOS
