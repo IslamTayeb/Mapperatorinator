@@ -460,6 +460,50 @@ PY
 # ran 7 continuous batching tests
 ```
 
+## Continuous Scheduler Dry-Run Manifest Gate
+
+Added `utils/profile_continuous_scheduler.py` as a CPU-only dry-run harness for
+the scheduler. It uses `generation_compatibility_key()` to enforce the same
+compatibility-key discipline as the static server, feeds scripted requests into
+`ContinuousBatchScheduler`, and writes `continuous_scheduler_manifest.json` with
+`model_generation_executed=false`, `result_class=continuous_scheduler_dry_run`,
+request token hashes, stop reasons, active-batch histogram, cache slot
+acquire/release events, synthetic RNG/logits/cache state hashes, and scheduler
+CPU wall diagnostics.
+
+Added `utils/summarize_inference_profile.py --compare-continuous-scheduler` for
+manifest comparisons. `--strict` checks:
+
+- dry-run/model-free contract;
+- `continuous_scheduler_dry_run` result class;
+- scripted generated-token hashes/counts and stop reasons;
+- scheduling shape: active batch histogram, stop-reason counts, and cache slot
+  events.
+
+CPU scheduler wall time is recorded but not part of `--strict`; use
+`--require-no-regression` only when intentionally measuring CPU harness cost.
+This avoids turning a synthetic scheduler microbenchmark into a model-throughput
+claim.
+
+Local smoke:
+
+```bash
+rm -rf /tmp/mapperatorinator-continuous-scheduler-smoke
+.venv/bin/python utils/profile_continuous_scheduler.py \
+  --output-root /tmp/mapperatorinator-continuous-scheduler-smoke \
+  --suite-id local-smoke
+.venv/bin/python utils/summarize_inference_profile.py \
+  --compare-continuous-scheduler \
+  /tmp/mapperatorinator-continuous-scheduler-smoke/continuous_scheduler_manifest.json \
+  /tmp/mapperatorinator-continuous-scheduler-smoke/continuous_scheduler_manifest.json \
+  --strict \
+  --json-output /tmp/mapperatorinator-continuous-scheduler-smoke/compare-self.json
+```
+
+The smoke produced `3` requests, `9` scripted tokens, active batch histogram
+`{'1': 1, '2': 4}`, and strict self-compare PASS. Local in-process tests now run
+`32` batching/profile comparison tests.
+
 Recommended sequence:
 
 1. Keep static batching instrumentation mergeable and non-regressing.

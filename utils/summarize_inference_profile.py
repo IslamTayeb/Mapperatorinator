@@ -622,6 +622,7 @@ def _print_suite_metric_block(name: str, report: dict[str, Any]) -> None:
 
 
 STATIC_SERVER_TOKEN_STATUS = "not_checked_shared_server_rng"
+CONTINUOUS_SCHEDULER_TOKEN_STATUS = "scheduler_only_scripted_tokens"
 
 
 def _compare_static_server_contract(
@@ -844,6 +845,247 @@ def compare_static_server_manifests(
     report["result_class"] = _compare_static_server_result_class(baseline, candidate)
     report["token_status"] = _compare_static_server_token_status(baseline, candidate)
     report["performance"] = _compare_static_server_performance(
+        baseline,
+        candidate,
+        regression_tolerance_pct=regression_tolerance_pct,
+    )
+    return report
+
+
+def _continuous_request_key(request: dict[str, Any], index: int) -> str:
+    return str(request.get("request_id", f"request{index}"))
+
+
+def _compare_continuous_scheduler_contract(
+        baseline: dict[str, Any],
+        candidate: dict[str, Any],
+) -> dict[str, Any]:
+    mismatches = []
+    for key in [
+        "schema_version",
+        "run_kind",
+        "request_count",
+        "config",
+        "compatibility_key",
+    ]:
+        if baseline.get(key) != candidate.get(key):
+            mismatches.append({"key": key, "baseline": baseline.get(key), "candidate": candidate.get(key)})
+
+    baseline_requests = baseline.get("requests", [])
+    candidate_requests = candidate.get("requests", [])
+    if len(baseline_requests) != len(candidate_requests):
+        mismatches.append({"key": "request_count", "baseline": len(baseline_requests), "candidate": len(candidate_requests)})
+
+    request_contract_keys = [
+        "request_id",
+        "prompt_tokens",
+        "max_new_tokens",
+        "eos_token_ids",
+        "metadata",
+    ]
+    for index in range(min(len(baseline_requests), len(candidate_requests))):
+        baseline_request = baseline_requests[index]
+        candidate_request = candidate_requests[index]
+        for key in request_contract_keys:
+            if baseline_request.get(key) != candidate_request.get(key):
+                mismatches.append({
+                    "index": index,
+                    "key": key,
+                    "baseline": baseline_request.get(key),
+                    "candidate": candidate_request.get(key),
+                    "baseline_request": _continuous_request_key(baseline_request, index),
+                    "candidate_request": _continuous_request_key(candidate_request, index),
+                })
+
+    passed = not mismatches
+    print("Continuous-scheduler contract")
+    print(f"  {'PASS' if passed else 'FAIL'}")
+    for mismatch in mismatches[:8]:
+        print(f"  {mismatch['key']}: baseline={mismatch.get('baseline')!r}, candidate={mismatch.get('candidate')!r}")
+    print()
+    return {"pass": passed, "mismatches": mismatches}
+
+
+def _compare_continuous_scheduler_result_class(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    checks = {
+        "baseline_result_class": baseline.get("result_class"),
+        "candidate_result_class": candidate.get("result_class"),
+        "baseline_model_generation_executed": bool(baseline.get("model_generation_executed", True)),
+        "candidate_model_generation_executed": bool(candidate.get("model_generation_executed", True)),
+    }
+    passed = (
+        checks["baseline_result_class"] == "continuous_scheduler_dry_run"
+        and checks["candidate_result_class"] == "continuous_scheduler_dry_run"
+        and not checks["baseline_model_generation_executed"]
+        and not checks["candidate_model_generation_executed"]
+    )
+    print("Continuous-scheduler result class")
+    print(f"  {'PASS' if passed else 'FAIL'}")
+    for key, value in checks.items():
+        print(f"  {key}: {value}")
+    print()
+    return {"pass": passed, **checks}
+
+
+def _compare_continuous_scheduler_tokens(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    mismatches = []
+    baseline_requests = baseline.get("requests", [])
+    candidate_requests = candidate.get("requests", [])
+    for side, manifest in [("baseline", baseline), ("candidate", candidate)]:
+        if manifest.get("token_equivalence_status") != CONTINUOUS_SCHEDULER_TOKEN_STATUS:
+            mismatches.append({
+                "side": side,
+                "key": "token_equivalence_status",
+                "status": manifest.get("token_equivalence_status"),
+                "expected": CONTINUOUS_SCHEDULER_TOKEN_STATUS,
+            })
+        for index, request in enumerate(manifest.get("requests", [])):
+            status = request.get("token_equivalence_status")
+            if status != CONTINUOUS_SCHEDULER_TOKEN_STATUS:
+                mismatches.append({
+                    "side": side,
+                    "index": index,
+                    "request_id": _continuous_request_key(request, index),
+                    "key": "request.token_equivalence_status",
+                    "status": status,
+                    "expected": CONTINUOUS_SCHEDULER_TOKEN_STATUS,
+                })
+
+    semantic_keys = ["generated_token_count", "generated_token_sha256", "stop_reason"]
+    for index in range(min(len(baseline_requests), len(candidate_requests))):
+        baseline_request = baseline_requests[index]
+        candidate_request = candidate_requests[index]
+        for key in semantic_keys:
+            if baseline_request.get(key) != candidate_request.get(key):
+                mismatches.append({
+                    "index": index,
+                    "request_id": _continuous_request_key(baseline_request, index),
+                    "key": key,
+                    "baseline": baseline_request.get(key),
+                    "candidate": candidate_request.get(key),
+                })
+
+    baseline_tokens = int((baseline.get("aggregate") or {}).get("total_generated_tokens", 0) or 0)
+    candidate_tokens = int((candidate.get("aggregate") or {}).get("total_generated_tokens", 0) or 0)
+    total_tokens_match = baseline_tokens == candidate_tokens
+    if not total_tokens_match:
+        mismatches.append({
+            "key": "aggregate.total_generated_tokens",
+            "baseline": baseline_tokens,
+            "candidate": candidate_tokens,
+        })
+
+    passed = not mismatches
+    print("Continuous-scheduler scripted-token equivalence")
+    print(f"  {'PASS' if passed else 'FAIL'}")
+    print(f"  total_generated_tokens: baseline={baseline_tokens}, candidate={candidate_tokens}")
+    for mismatch in mismatches[:8]:
+        print(f"  {mismatch['key']}: baseline={mismatch.get('baseline')!r}, candidate={mismatch.get('candidate')!r}")
+    print()
+    return {
+        "pass": passed,
+        "mismatches": mismatches,
+        "baseline_total_generated_tokens": baseline_tokens,
+        "candidate_total_generated_tokens": candidate_tokens,
+    }
+
+
+def _compare_continuous_scheduler_shape(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    mismatches = []
+    shape_keys = [
+        "active_batch_size_histogram",
+        "cache_slot_events",
+    ]
+    for key in shape_keys:
+        if baseline.get(key) != candidate.get(key):
+            mismatches.append({"key": key, "baseline": baseline.get(key), "candidate": candidate.get(key)})
+    baseline_stop_reasons = (baseline.get("aggregate") or {}).get("stop_reason_counts")
+    candidate_stop_reasons = (candidate.get("aggregate") or {}).get("stop_reason_counts")
+    if baseline_stop_reasons != candidate_stop_reasons:
+        mismatches.append({
+            "key": "aggregate.stop_reason_counts",
+            "baseline": baseline_stop_reasons,
+            "candidate": candidate_stop_reasons,
+        })
+
+    passed = not mismatches
+    print("Continuous-scheduler scheduling shape")
+    print(f"  {'PASS' if passed else 'FAIL'}")
+    if passed:
+        print(f"  active_batch_size_histogram: {baseline.get('active_batch_size_histogram')}")
+    else:
+        for mismatch in mismatches[:8]:
+            print(f"  {mismatch['key']}: baseline={mismatch.get('baseline')!r}, candidate={mismatch.get('candidate')!r}")
+    print()
+    return {"pass": passed, "mismatches": mismatches}
+
+
+def _compare_continuous_scheduler_performance(
+        baseline: dict[str, Any],
+        candidate: dict[str, Any],
+        *,
+        regression_tolerance_pct: float,
+) -> dict[str, Any]:
+    baseline_aggregate = baseline.get("aggregate") or {}
+    candidate_aggregate = candidate.get("aggregate") or {}
+    metric = _metric_comparison(
+        float(baseline_aggregate.get("scheduler_cpu_wall_seconds", 0.0) or 0.0),
+        float(candidate_aggregate.get("scheduler_cpu_wall_seconds", 0.0) or 0.0),
+        higher_is_better=False,
+        tolerance_pct=regression_tolerance_pct,
+    )
+    baseline_tokens = int(baseline_aggregate.get("total_generated_tokens", 0) or 0)
+    candidate_tokens = int(candidate_aggregate.get("total_generated_tokens", 0) or 0)
+    generated_tokens_non_decreasing = candidate_tokens >= baseline_tokens
+    passed = metric["pass"] and generated_tokens_non_decreasing
+    print("Continuous-scheduler CPU timing diagnostic")
+    _compare_number(
+        "scheduler_cpu_wall_seconds",
+        metric["baseline"],
+        metric["candidate"],
+        higher_is_better=False,
+    )
+    print(f"  total_generated_tokens: baseline={baseline_tokens}, candidate={candidate_tokens}")
+    print(f"  generated_tokens_non_decreasing: {generated_tokens_non_decreasing}")
+    print(f"  no_regression_gate: {'PASS' if passed else 'FAIL'}")
+    print()
+    return {
+        "pass": passed,
+        "scheduler_cpu_wall_seconds": metric,
+        "generated_tokens_non_decreasing": generated_tokens_non_decreasing,
+        "baseline_total_generated_tokens": baseline_tokens,
+        "candidate_total_generated_tokens": candidate_tokens,
+    }
+
+
+def compare_continuous_scheduler_manifests(
+        baseline_path: Path,
+        candidate_path: Path,
+        *,
+        regression_tolerance_pct: float = 0.0,
+) -> dict[str, Any]:
+    baseline = _load_json(baseline_path)
+    candidate = _load_json(candidate_path)
+    report: dict[str, Any] = {
+        "baseline_path": str(baseline_path),
+        "candidate_path": str(candidate_path),
+        "regression_tolerance_pct": regression_tolerance_pct,
+        "contract": {},
+        "result_class": {},
+        "scripted_token_equivalence": {},
+        "scheduling_shape": {},
+        "cpu_timing": {},
+    }
+
+    print(f"Baseline continuous scheduler manifest:  {baseline_path}")
+    print(f"Candidate continuous scheduler manifest: {candidate_path}")
+    print()
+
+    report["contract"] = _compare_continuous_scheduler_contract(baseline, candidate)
+    report["result_class"] = _compare_continuous_scheduler_result_class(baseline, candidate)
+    report["scripted_token_equivalence"] = _compare_continuous_scheduler_tokens(baseline, candidate)
+    report["scheduling_shape"] = _compare_continuous_scheduler_shape(baseline, candidate)
+    report["cpu_timing"] = _compare_continuous_scheduler_performance(
         baseline,
         candidate,
         regression_tolerance_pct=regression_tolerance_pct,
@@ -1329,6 +1571,13 @@ def main() -> None:
         help="Compare two profile_static_server_batch static_server_batch_manifest.json files.",
     )
     parser.add_argument(
+        "--compare-continuous-scheduler",
+        nargs=2,
+        metavar=("BASE_MANIFEST", "CANDIDATE_MANIFEST"),
+        type=Path,
+        help="Compare two CPU-only continuous_scheduler_manifest.json dry-run files.",
+    )
+    parser.add_argument(
         "--suite-scope",
         choices=["all_runs", "warmed_runs"],
         default="warmed_runs",
@@ -1449,9 +1698,17 @@ def main() -> None:
         help="Write a machine-readable comparison report.",
     )
     args = parser.parse_args()
-    compare_modes = [bool(args.compare), bool(args.compare_suite), bool(args.compare_static_server)]
+    compare_modes = [
+        bool(args.compare),
+        bool(args.compare_suite),
+        bool(args.compare_static_server),
+        bool(args.compare_continuous_scheduler),
+    ]
     if sum(compare_modes) > 1:
-        parser.error("use only one of --compare, --compare-suite, or --compare-static-server")
+        parser.error(
+            "use only one of --compare, --compare-suite, --compare-static-server, "
+            "or --compare-continuous-scheduler"
+        )
     if args.strict_full_song and not args.compare:
         parser.error("--strict-full-song requires --compare")
     if args.compare:
@@ -1565,12 +1822,35 @@ def main() -> None:
                 and not report["performance"].get("pass", False))
         )
         raise SystemExit(1 if failed else 0)
+    elif args.compare_continuous_scheduler:
+        report = compare_continuous_scheduler_manifests(
+            args.compare_continuous_scheduler[0],
+            args.compare_continuous_scheduler[1],
+            regression_tolerance_pct=args.regression_tolerance_pct,
+        )
+        if args.json_output is not None:
+            args.json_output.parent.mkdir(parents=True, exist_ok=True)
+            args.json_output.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+        failed = (
+            ((args.require_contract_match or args.require_mode_contract or args.strict)
+             and not report["contract"].get("pass", False))
+            or ((args.require_mode_contract or args.strict)
+                and not report["result_class"].get("pass", False))
+            or ((args.require_token_equivalence or args.strict)
+                and not report["scripted_token_equivalence"].get("pass", False))
+            or ((args.require_mode_contract or args.strict)
+                and not report["scheduling_shape"].get("pass", False))
+            or (args.require_no_regression and not report["cpu_timing"].get("pass", False))
+        )
+        raise SystemExit(1 if failed else 0)
     elif args.profile:
         summarize(args.profile, limit=args.limit)
     else:
         parser.error(
             "provide a profile path, --compare BASELINE CANDIDATE, "
-            "--compare-suite BASE CANDIDATE, or --compare-static-server BASE CANDIDATE"
+            "--compare-suite BASE CANDIDATE, --compare-static-server BASE CANDIDATE, "
+            "or --compare-continuous-scheduler BASE CANDIDATE"
         )
 
 

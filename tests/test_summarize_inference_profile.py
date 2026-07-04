@@ -709,3 +709,121 @@ def test_compare_static_server_manifests_can_allow_max_batch_size_knob_change(tm
 
     assert not strict_report["contract"]["pass"]
     assert allowed_report["contract"]["pass"]
+
+
+def _continuous_scheduler_manifest(
+    *,
+    token_hash: str = "same-token-hash",
+    generated_tokens: int = 3,
+    stop_reason: str = "eos",
+    result_class: str = "continuous_scheduler_dry_run",
+    model_generation_executed: bool = False,
+    token_status: str = "scheduler_only_scripted_tokens",
+    active_batch_size_histogram: dict | None = None,
+    scheduler_cpu_wall_seconds: float = 0.01,
+):
+    request = {
+        "request_id": "song0-window0",
+        "prompt_tokens": 4,
+        "max_new_tokens": 4,
+        "eos_token_ids": [99],
+        "generated_tokens": [1, 2, 99][:generated_tokens],
+        "generated_token_count": generated_tokens,
+        "generated_token_sha256": token_hash,
+        "stop_reason": stop_reason,
+        "metadata": {"song_id": "song0", "window_index": 0},
+        "token_equivalence_status": token_status,
+        "initial_rng_state_hash": "rng-before",
+        "final_rng_state_hash": "rng-after",
+        "logits_processor_state_hash": "logits-state",
+        "cache_state_hash": "cache-state",
+    }
+    histogram = active_batch_size_histogram or {"1": 3}
+    return {
+        "schema_version": 1,
+        "run_kind": "continuous_scheduler_dry_run",
+        "result_class": result_class,
+        "model_generation_executed": model_generation_executed,
+        "token_equivalence_status": token_status,
+        "request_count": 1,
+        "config": {
+            "max_active_sequences": 1,
+            "max_wait_ms": 0,
+            "prefill_policy": "serial",
+            "decode_order_policy": "arrival_order",
+            "rng_policy": "serial_global",
+        },
+        "compatibility_key": [["do_sample", True]],
+        "active_batch_size_histogram": histogram,
+        "requests": [request],
+        "cache_slot_events": [
+            {"event": "acquire", "step_index": 0, "request_id": "song0-window0", "cache_slot_id": 0, "slot_generation": 1},
+            {"event": "release", "step_index": 2, "request_id": "song0-window0", "cache_slot_id": 0, "slot_generation": 1, "stop_reason": stop_reason},
+        ],
+        "aggregate": {
+            "result_class": result_class,
+            "model_generation_executed": model_generation_executed,
+            "request_count": 1,
+            "completed_request_count": 1,
+            "total_generated_tokens": generated_tokens,
+            "scheduler_cpu_wall_seconds": scheduler_cpu_wall_seconds,
+            "scheduler_tokens_per_cpu_second": generated_tokens / scheduler_cpu_wall_seconds,
+            "active_batch_size_histogram": histogram,
+            "stop_reason_counts": {stop_reason: 1},
+            "cache_slot_acquire_count": 1,
+            "cache_slot_release_count": 1,
+        },
+    }
+
+
+def test_compare_continuous_scheduler_manifests_passes_scheduler_only_equivalence(tmp_path):
+    module = _load_module()
+    baseline = tmp_path / "baseline-continuous.json"
+    candidate = tmp_path / "candidate-continuous.json"
+    baseline.write_text(module.json.dumps(_continuous_scheduler_manifest()))
+    candidate.write_text(module.json.dumps(_continuous_scheduler_manifest(scheduler_cpu_wall_seconds=0.02)))
+
+    report = module.compare_continuous_scheduler_manifests(baseline, candidate)
+
+    assert report["contract"]["pass"]
+    assert report["result_class"]["pass"]
+    assert report["scripted_token_equivalence"]["pass"]
+    assert report["scheduling_shape"]["pass"]
+    assert not report["cpu_timing"]["pass"]
+
+
+def test_compare_continuous_scheduler_manifests_reports_token_and_shape_mismatch(tmp_path):
+    module = _load_module()
+    baseline = tmp_path / "baseline-continuous.json"
+    candidate = tmp_path / "candidate-continuous.json"
+    baseline.write_text(module.json.dumps(_continuous_scheduler_manifest()))
+    candidate.write_text(module.json.dumps(_continuous_scheduler_manifest(
+        token_hash="different-token-hash",
+        generated_tokens=2,
+        stop_reason="max_new_tokens",
+        active_batch_size_histogram={"1": 1, "2": 1},
+    )))
+
+    report = module.compare_continuous_scheduler_manifests(baseline, candidate)
+
+    assert report["contract"]["pass"]
+    assert report["result_class"]["pass"]
+    assert not report["scripted_token_equivalence"]["pass"]
+    assert not report["scheduling_shape"]["pass"]
+
+
+def test_compare_continuous_scheduler_manifests_rejects_model_backed_manifest(tmp_path):
+    module = _load_module()
+    baseline = tmp_path / "baseline-continuous.json"
+    candidate = tmp_path / "candidate-continuous.json"
+    baseline.write_text(module.json.dumps(_continuous_scheduler_manifest()))
+    candidate.write_text(module.json.dumps(_continuous_scheduler_manifest(
+        result_class="continuous_model_runtime",
+        model_generation_executed=True,
+        token_status="PASS",
+    )))
+
+    report = module.compare_continuous_scheduler_manifests(baseline, candidate)
+
+    assert not report["result_class"]["pass"]
+    assert not report["scripted_token_equivalence"]["pass"]

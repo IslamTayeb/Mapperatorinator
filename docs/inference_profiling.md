@@ -1866,6 +1866,20 @@ slot/generation events, stop reasons, generated-token counts, and placeholder
 RNG/logits/cache state hashes. These fields are useful for designing continuous
 server gates, but missing or synthetic hashes still mean the result is
 `scheduler_only` evidence rather than exact model-backed continuous batching.
+Use `utils/profile_continuous_scheduler.py` to emit
+`continuous_scheduler_manifest.json` files, and compare them with:
+
+```bash
+python utils/summarize_inference_profile.py \
+  --compare-continuous-scheduler BASE/continuous_scheduler_manifest.json CAND/continuous_scheduler_manifest.json \
+  --strict \
+  --json-output compare-continuous-scheduler.json
+```
+
+Strict mode checks the dry-run/result-class contract, scripted token hashes and
+stop reasons, and scheduling shape. CPU scheduler wall time is recorded for
+auditability only; require it explicitly with `--require-no-regression` when a
+CPU-harness change is the thing being measured.
 
 Do not combine `use_server=true` with `inference_generation_compile=true` on the
 current static IPC server. DCC job `49267683` on RTX 2080 Ti reached generation
