@@ -15,7 +15,11 @@ from .logit_processors import ConditionalTemperatureLogitsWarper, get_beat_type_
     MonotonicTimeShiftLogitsProcessor
 from .cache_utils import MapperatorinatorCache, get_cache
 from .decode_loop import active_prefix_decode_generate
-from ..runtime_profiling import generation_profile_context
+from ..runtime_profiling import (
+    generation_profile_context,
+    native_decoder_layer_mlp_tail_stats,
+    reset_native_decoder_layer_mlp_tail_stats,
+)
 from ..model import Mapperatorinator
 from ..tokenizer import Tokenizer
 
@@ -233,6 +237,17 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         raise ValueError("native_q1_rope_cache_self_attention requires active_prefix_decode_loop.")
     if native_decoder_layer_mlp_tail_requested and not native_q1_rope_cache_self_attention_requested:
         raise ValueError("native_decoder_layer_mlp_tail requires native_q1_rope_cache_self_attention.")
+    if native_decoder_layer_mlp_tail_requested:
+        if not q1_bmm_cross_attention:
+            raise ValueError("native_decoder_layer_mlp_tail requires q1_bmm_cross_attention.")
+        if not active_prefix_decode_loop:
+            raise ValueError("native_decoder_layer_mlp_tail requires active_prefix_decode_loop.")
+        if not active_prefix_decode_cuda_graph:
+            raise ValueError("native_decoder_layer_mlp_tail requires active_prefix_decode_cuda_graph.")
+        if decode_session_state is None:
+            raise ValueError("native_decoder_layer_mlp_tail requires decode_session_state.")
+        if not decode_session_cuda_graph:
+            raise ValueError("native_decoder_layer_mlp_tail requires decode_session_cuda_graph.")
     native_q1_self_attention = (
         native_q1_self_attention_requested
         and context_type != ContextType.TIMING
@@ -304,6 +319,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     # Perform batched generation
     generate_start_event = generate_end_event = None
     generate_cuda_event_seconds = None
+    reset_native_decoder_layer_mlp_tail_stats()
     with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16, enabled=precision == 'amp'), \
             generation_profile_context(
                 detail_ranges=profile_generation_detail_ranges,
@@ -360,6 +376,15 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         if generate_start_event is not None and generate_end_event is not None:
             generate_cuda_event_seconds = float(generate_start_event.elapsed_time(generate_end_event)) / 1000.0
 
+    native_mlp_tail_stats = native_decoder_layer_mlp_tail_stats()
+    native_mlp_tail_capture_calls = int(native_mlp_tail_stats["capture_calls"])
+    if native_decoder_layer_mlp_tail and native_mlp_tail_capture_calls > 0 and decode_session_state is not None:
+        decode_session_state["native_decoder_layer_mlp_tail_seen"] = True
+    native_mlp_tail_seen = (
+        native_decoder_layer_mlp_tail
+        and decode_session_state is not None
+        and bool(decode_session_state.get("native_decoder_layer_mlp_tail_seen", False))
+    )
     result = result.cpu()
     stats = _build_generation_stats(result, model_kwargs, pad_token_id, elapsed_seconds)
     stats.update({
@@ -398,12 +423,16 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
             else None
         ),
         "native_decoder_layer_mlp_tail_requested": native_decoder_layer_mlp_tail_requested,
-        "native_decoder_layer_mlp_tail_enabled": native_decoder_layer_mlp_tail,
+        "native_decoder_layer_mlp_tail_enabled": native_mlp_tail_seen,
         "native_decoder_layer_mlp_tail_disabled_reason": (
             "timing_context"
             if native_decoder_layer_mlp_tail_requested and not native_decoder_layer_mlp_tail
+            else "not_captured"
+            if native_decoder_layer_mlp_tail_requested and not native_mlp_tail_seen
             else None
         ),
+        "native_decoder_layer_mlp_tail_capture_calls": native_mlp_tail_capture_calls,
+        "native_decoder_layer_mlp_tail_fallback_reasons": native_mlp_tail_stats["fallback_reasons"],
         "native_decoder_layer_mlp_tail_outputs_per_block": (
             native_decoder_layer_mlp_tail_outputs_per_block
             if native_decoder_layer_mlp_tail_requested

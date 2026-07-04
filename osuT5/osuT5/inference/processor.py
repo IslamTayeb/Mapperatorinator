@@ -1545,6 +1545,12 @@ class Processor(object):
             "native_decoder_layer_mlp_tail_disabled_reason": stats.get(
                 "native_decoder_layer_mlp_tail_disabled_reason"
             ),
+            "native_decoder_layer_mlp_tail_capture_calls": stats.get(
+                "native_decoder_layer_mlp_tail_capture_calls"
+            ),
+            "native_decoder_layer_mlp_tail_fallback_reasons": stats.get(
+                "native_decoder_layer_mlp_tail_fallback_reasons"
+            ),
             "native_decoder_layer_mlp_tail_outputs_per_block": stats.get(
                 "native_decoder_layer_mlp_tail_outputs_per_block"
             ),

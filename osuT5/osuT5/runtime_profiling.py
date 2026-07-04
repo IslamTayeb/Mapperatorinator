@@ -14,6 +14,8 @@ _NATIVE_Q1_SELF_ATTENTION_ENABLED = False
 _NATIVE_Q1_ROPE_CACHE_SELF_ATTENTION_ENABLED = False
 _NATIVE_DECODER_LAYER_MLP_TAIL_ENABLED = False
 _NATIVE_DECODER_LAYER_MLP_TAIL_OUTPUTS_PER_BLOCK = 4
+_NATIVE_DECODER_LAYER_MLP_TAIL_CAPTURE_CALLS = 0
+_NATIVE_DECODER_LAYER_MLP_TAIL_FALLBACK_REASONS: dict[str, int] = {}
 
 _SDPA_BACKEND_ALIASES = {
     "flash": "FLASH_ATTENTION",
@@ -54,6 +56,34 @@ def native_decoder_layer_mlp_tail_enabled() -> bool:
 
 def native_decoder_layer_mlp_tail_outputs_per_block() -> int:
     return _NATIVE_DECODER_LAYER_MLP_TAIL_OUTPUTS_PER_BLOCK
+
+
+def reset_native_decoder_layer_mlp_tail_stats() -> None:
+    global _NATIVE_DECODER_LAYER_MLP_TAIL_CAPTURE_CALLS, _NATIVE_DECODER_LAYER_MLP_TAIL_FALLBACK_REASONS
+
+    _NATIVE_DECODER_LAYER_MLP_TAIL_CAPTURE_CALLS = 0
+    _NATIVE_DECODER_LAYER_MLP_TAIL_FALLBACK_REASONS = {}
+
+
+def record_native_decoder_layer_mlp_tail_capture() -> None:
+    global _NATIVE_DECODER_LAYER_MLP_TAIL_CAPTURE_CALLS
+
+    _NATIVE_DECODER_LAYER_MLP_TAIL_CAPTURE_CALLS += 1
+
+
+def record_native_decoder_layer_mlp_tail_fallback(reason: str) -> None:
+    if not _NATIVE_DECODER_LAYER_MLP_TAIL_ENABLED:
+        return
+    _NATIVE_DECODER_LAYER_MLP_TAIL_FALLBACK_REASONS[reason] = (
+        _NATIVE_DECODER_LAYER_MLP_TAIL_FALLBACK_REASONS.get(reason, 0) + 1
+    )
+
+
+def native_decoder_layer_mlp_tail_stats() -> dict[str, object]:
+    return {
+        "capture_calls": int(_NATIVE_DECODER_LAYER_MLP_TAIL_CAPTURE_CALLS),
+        "fallback_reasons": dict(_NATIVE_DECODER_LAYER_MLP_TAIL_FALLBACK_REASONS),
+    }
 
 
 @contextmanager

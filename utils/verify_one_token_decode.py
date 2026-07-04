@@ -317,6 +317,18 @@ def run_one_token_gate(
     )
     if candidate_active_prefix_decode_length is not None and not active_prefix_decode:
         raise ValueError("--candidate-active-prefix-decode-length requires active-prefix decode to be enabled")
+    if candidate_native_decoder_layer_mlp_tail:
+        if not candidate_decode_session:
+            raise ValueError("--candidate-native-decoder-layer-mlp-tail requires --candidate-decode-session")
+        if not active_prefix_decode:
+            raise ValueError("--candidate-native-decoder-layer-mlp-tail requires active-prefix candidate decode")
+        if not candidate_q1_bmm_cross_attention:
+            raise ValueError("--candidate-native-decoder-layer-mlp-tail requires --candidate-q1-bmm-cross-attention")
+        if not candidate_native_q1_rope_cache_self_attention:
+            raise ValueError(
+                "--candidate-native-decoder-layer-mlp-tail requires "
+                "--candidate-native-q1-rope-cache-self-attention"
+            )
 
     metadata = {
         "config_name": None,

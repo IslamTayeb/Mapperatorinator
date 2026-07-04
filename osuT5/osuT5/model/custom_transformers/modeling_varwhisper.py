@@ -37,6 +37,8 @@ from ...runtime_profiling import (
     native_q1_self_attention_enabled,
     profile_range,
     q1_bmm_cross_attention_enabled,
+    record_native_decoder_layer_mlp_tail_capture,
+    record_native_decoder_layer_mlp_tail_fallback,
 )
 from ...inference.native_decoder_layer import native_one_token_mlp_residual
 from ...inference.native_q1_attention import native_q1_attention, native_q1_rope_cache_attention
@@ -943,9 +945,16 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
 
         # Fully Connected
         residual = hidden_states
+        prefix_length = active_prefix_self_attention_length()
         activation_name = getattr(self.activation_fn, "__name__", self.activation_fn.__class__.__name__)
+        native_mlp_tail_requested = native_decoder_layer_mlp_tail_enabled()
+        native_mlp_tail_decode_scope = (
+            native_mlp_tail_requested
+            and prefix_length is not None
+            and prefix_length > 0
+        )
         use_native_mlp_tail = (
-            native_decoder_layer_mlp_tail_enabled()
+            native_mlp_tail_decode_scope
             and not self.training
             and hidden_states.dtype == torch.float32
             and hidden_states.shape[0] == 1
@@ -955,6 +964,7 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
             and activation_name in {"GELUActivation", "gelu"}
         )
         if use_native_mlp_tail:
+            record_native_decoder_layer_mlp_tail_capture()
             norm_eps = getattr(self.final_layer_norm, "eps", None)
             eps = torch.finfo(hidden_states.dtype).eps if norm_eps is None else float(norm_eps)
             if profile_ranges:
@@ -981,6 +991,30 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
                     outputs_per_block=native_decoder_layer_mlp_tail_outputs_per_block(),
                 )
         else:
+            if native_mlp_tail_decode_scope:
+                fallback_reasons = []
+                if self.training:
+                    fallback_reasons.append("training")
+                if hidden_states.dtype != torch.float32:
+                    fallback_reasons.append(f"dtype_{hidden_states.dtype}")
+                if hidden_states.shape[0] != 1:
+                    fallback_reasons.append(f"batch_{hidden_states.shape[0]}")
+                if hidden_states.shape[1] != 1:
+                    fallback_reasons.append(f"seq_{hidden_states.shape[1]}")
+                if self.activation_dropout != 0.0:
+                    fallback_reasons.append(f"activation_dropout_{self.activation_dropout}")
+                if self.dropout != 0.0:
+                    fallback_reasons.append(f"dropout_{self.dropout}")
+                if activation_name not in {"GELUActivation", "gelu"}:
+                    fallback_reasons.append(f"activation_{activation_name}")
+                fallback_reason = ",".join(fallback_reasons) if fallback_reasons else "unknown"
+                record_native_decoder_layer_mlp_tail_fallback(fallback_reason)
+                raise RuntimeError(
+                    "native decoder-layer MLP tail was requested for an active-prefix decode step "
+                    f"but guard checks failed: {fallback_reason}"
+                )
+            if native_mlp_tail_requested:
+                record_native_decoder_layer_mlp_tail_fallback("non_active_prefix_prefill_or_context")
             if profile_ranges:
                 with profile_range(f"{layer_name}.mlp_norm"):
                     hidden_states = self.final_layer_norm(hidden_states)
