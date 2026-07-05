@@ -29,6 +29,7 @@ from inference import (  # noqa: E402
     get_config,
     get_default_logger,
     get_server_address,
+    get_server_runtime_key,
     load_model_with_server,
     setup_inference_environment,
     should_load_separate_timing_model,
@@ -160,12 +161,21 @@ def _runtime_environment() -> dict[str, Any]:
 
 
 def _server_socket_paths(args: Any) -> dict[str, str]:
+    server_runtime_key = get_server_runtime_key(
+        max_batch_size=args.max_batch_size,
+        server_batch_timeout=args.server_batch_timeout,
+        device=args.device,
+        precision=args.precision,
+        attn_implementation=args.attn_implementation,
+        generation_compile=args.inference_generation_compile,
+    )
     paths = {
         "main": get_server_address(
             args.model_path,
             lora_path=args.lora_path,
             gamemode=args.gamemode,
             auto_select_gamemode_model=args.auto_select_gamemode_model,
+            server_runtime_key=server_runtime_key,
         )
     }
     if should_load_separate_timing_model(args):
@@ -173,6 +183,7 @@ def _server_socket_paths(args: Any) -> dict[str, str]:
             args.model_path,
             gamemode=args.gamemode,
             auto_select_gamemode_model=False,
+            server_runtime_key=server_runtime_key,
         )
     return paths
 

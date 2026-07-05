@@ -1864,6 +1864,28 @@ validation that the stricter metadata still runs real static IPC batches and
 correctly blocks promotion when output-length drift is large. Artifacts:
 `/work/imt11/Mapperatorinator/runs/static-server-ledger-20260704-0e6346d/compare-maxbatch5-vs-10.json`.
 
+DCC capacity job `49269905` on RTX 2080 Ti, commit `b4039b0`, tested whether
+larger static batches help a 20-concurrent-request five-song 15s smoke
+(`repeats=4`, `max_workers=20`) after runtime-keyed server socket guardrails.
+They did not:
+
+| `max_batch_size` | main tokens | scheduler wall | scheduler-wall main tok/s | request p95 | main unique batch sizes | result |
+| ---: | ---: | ---: | ---: | ---: | --- | --- |
+| `10` | `31,420` | `198.706s` | `158.123` | `191.490s` | `10:18, 9:2, 1:2` | baseline |
+| `20` | `29,858` | `199.888s` | `149.374` | `199.500s` | `20:2, 19:4, 17:1, 16:1, 13:1, 9:1, 7:1, 4:2, 2:2, 1:10` | FAIL, `-5.5%` scheduler TPS |
+
+Both manifests self-validated, but strict static compare failed because
+`max_batch_size=20` regressed scheduler throughput and generated fewer main
+tokens (`31,420 -> 29,858`). Job telemetry across the whole run averaged
+`60.19%` GPU utilization and peaked at `9,334 MiB` memory. The same job's serial
+multi-song denominator measured `23,820` main tokens in `346.984s` model time
+(`68.649 tok/s`) with repeat token-equivalence PASS after each song baseline.
+Do not keep sweeping larger static `max_batch_size` values without new evidence;
+next batching work should target tail scheduling, per-request RNG/equivalence,
+or an explicit continuous-batching prototype. Artifacts:
+`/work/imt11/Mapperatorinator/runs/static-server-capacity20-20260704-194727-b4039b0/summary.json`;
+note: `notes/2026-07-04-static-server-capacity20-profile.md`.
+
 Static server batching currently uses shared global server RNG. Until an
 explicit per-request reseed/replay protocol exists, concurrent server token
 hashes are throughput diagnostics only; do not compare them against cold
@@ -1951,5 +1973,27 @@ The server static batching queue now uses an explicit `generation_compatibility_
 Paired DCC smoke jobs on `dcc-core-ferc-s-z25-21` validated this as static-server infrastructure only. Control `main@46ccc50`, job `49268405`, completed with real batches and `62.368s` scheduler wall; branch `41de52c`, job `49268272`, completed with real batches and `59.428s` scheduler wall. Generated main-token counts differed (`7,172` control, `6,681` branch) under the known shared-global server RNG, so do not use this pair as an exact token-equivalent throughput claim. Treat it as a no-crash/no-wall-regression smoke for the request-state refactor.
 
 The first continuous-batching scheduler harness is CPU-only and not wired into `InferenceServer`. `osuT5/osuT5/inference/continuous_batching.py` models request lifecycle, compatibility-key grouping, active slot acquisition/release, slot generations, scripted token emission, stop reasons, active batch-size histograms, and deterministic reports. It intentionally does not run model forward passes, sample, consume RNG, mutate logits processors, write KV cache tensors, or claim throughput. Use it to build lifecycle/equivalence scaffolding before any real continuous server mode.
+
+Static server manifest comparison now includes manifest self-validation.
+`utils/summarize_inference_profile.py --compare-static-server ... --strict`
+recomputes run counts, token totals, request wall aggregates, scheduler tok/s,
+request-attributed model tok/s, result class, token-status labels, and aggregate
+batching summaries from the manifest's `runs`. It also validates each
+`server_batches` ledger entry shape and requires observed unique batch size
+`>1` for `static_server_batch`. This is validation infrastructure only; it does
+not change the shared-RNG throughput-only status of static server batching. See
+`notes/2026-07-04-static-server-manifest-self-validation.md`.
+
+Static IPC server control-plane guardrails were tightened after auditing the
+mergeable Track B path. `load_model_with_server()` now fails loudly for
+`use_server=true` plus `inference_generation_compile=true`, and server socket
+paths include `get_server_runtime_key()` so normal inference, the web UI server
+owner, and static-server profiling do not attach to stale IPC servers with a
+different `max_batch_size`, `server_batch_timeout`, device, precision, attention
+backend, or generation-compile setting. Overlong Unix socket names are
+hash-shortened after DCC job `49269896` failed before profiling with
+`OSError: AF_UNIX path too long`. `InferenceConfig.use_server` now matches the
+Hydra default (`false`). This is guardrail infrastructure only, not a throughput
+result. See `notes/2026-07-04-static-server-control-plane-guardrails.md`.
 
 Suggested future profile metadata: `result_class`, `throughput_claim_scope`, `batching_mode`, scheduler policy, request/window IDs, batch IDs, active batch-size histogram, queue wait, per-request latency, prefill/decode timing split, per-sample token hashes, stop reasons, RNG policy/state hashes, cache slot/reorder events, graph capture/replay counts, and effective fast-path flags.

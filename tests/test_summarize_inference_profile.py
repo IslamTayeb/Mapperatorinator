@@ -582,6 +582,50 @@ def _static_server_manifest(
     server_batch_timeout: float = 0.2,
     max_batch_size: int = 5,
 ):
+    server_batch_size = 5 if server_batch_observed else 1
+    model_elapsed = generated_tokens / tok_s
+    server_batch = {
+        "batch_id": 1,
+        "batch_size": server_batch_size,
+        "request_count": server_batch_size,
+        "work_items": 1,
+        "elapsed_seconds": model_elapsed,
+        "queue_wait_seconds": 0.0,
+    }
+    batch_summary = {
+        "by_label": {
+            "main_generation": {
+                "records": 1,
+                "modes": {"sequential": 1},
+                "batch_size_histogram": {"1": 1},
+                "server_batch_size_histogram": {str(server_batch_size): 1},
+                "server_batch_count": 1,
+                "server_request_record_count": 1,
+                "server_total_queue_wait_seconds": 0.0,
+                "server_max_queue_wait_seconds": 0.0,
+                "server_total_first_queue_wait_seconds": 0.0,
+                "server_max_first_queue_wait_seconds": 0.0,
+                "server_batching_modes": {"static_ipc": 1},
+                "server_elapsed_seconds_attributions": {
+                    "merged_batch_elapsed_replicated_per_request": 1,
+                },
+                "server_batches": [server_batch],
+            }
+        }
+    }
+    aggregate_batch_summary = {
+        "by_label": {
+            "main_generation": {
+                **batch_summary["by_label"]["main_generation"],
+                "server_batch_count_attributed": 1,
+                "server_batch_count": 1,
+                "server_unique_batch_size_histogram": {str(server_batch_size): 1},
+                "server_unique_batch_elapsed_seconds_sum": model_elapsed,
+                "server_unique_batch_elapsed_seconds_max": model_elapsed,
+            }
+        }
+    }
+    aggregate_batch_summary["by_label"]["main_generation"].pop("server_batches", None)
     runs = [
         {
             "run_index": 0,
@@ -597,10 +641,16 @@ def _static_server_manifest(
             "sequence_count": 10,
             "song_length_ms": 15000,
             "token_equivalence_status": token_status,
+            "request_wall_seconds": scheduler_wall_seconds,
             "main_generated_tokens": generated_tokens,
-            "main_model_elapsed_seconds": generated_tokens / tok_s,
-            "main_wall_seconds": generated_tokens / tok_s,
+            "main_model_elapsed_seconds": model_elapsed,
+            "main_wall_seconds": model_elapsed,
             "main_tokens_per_second": tok_s,
+            "timing_generated_tokens": 0,
+            "timing_model_elapsed_seconds": 0.0,
+            "timing_wall_seconds": 0.0,
+            "timing_tokens_per_second": 0.0,
+            "generation_batch_summary": batch_summary,
         }
     ]
     return {
@@ -622,6 +672,7 @@ def _static_server_manifest(
         },
         "runs": runs,
         "aggregate": {
+            "runs": len(runs),
             "result_class": result_class,
             "server_batch_observed": server_batch_observed,
             "same_calculation": False,
@@ -630,15 +681,16 @@ def _static_server_manifest(
             "main_generated_tokens": generated_tokens,
             "timing_generated_tokens": 0,
             "scheduler_wall_seconds": scheduler_wall_seconds,
-            "request_wall_seconds_sum": scheduler_wall_seconds * 5,
+            "request_wall_seconds_sum": scheduler_wall_seconds,
             "request_wall_seconds_max": scheduler_wall_seconds,
             "request_wall_seconds_p95": scheduler_wall_seconds,
-            "main_model_elapsed_seconds_sum": generated_tokens / tok_s,
+            "main_model_elapsed_seconds_sum": model_elapsed,
             "timing_model_elapsed_seconds_sum": 0.0,
             "main_tokens_per_scheduler_second": generated_tokens / scheduler_wall_seconds,
             "timing_tokens_per_scheduler_second": 0.0,
             "main_tokens_per_request_model_second_attributed": tok_s,
             "timing_tokens_per_request_model_second_attributed": 0.0,
+            "batching": aggregate_batch_summary,
         },
     }
 
@@ -652,6 +704,7 @@ def test_compare_static_server_manifests_passes_operational_non_regression(tmp_p
 
     report = module.compare_static_server_manifests(baseline, candidate)
 
+    assert report["self_validation"]["pass"]
     assert report["contract"]["pass"]
     assert report["result_class"]["pass"]
     assert report["token_status"]["pass"]
@@ -679,6 +732,45 @@ def test_compare_static_server_manifests_reports_regression_and_nonbatch(tmp_pat
     assert not report["token_status"]["pass"]
     assert not report["performance"]["pass"]
     assert not report["performance"]["generated_tokens_non_decreasing"]
+
+
+def test_compare_static_server_manifests_rejects_bad_aggregate_totals(tmp_path):
+    module = _load_module()
+    baseline = tmp_path / "baseline-static.json"
+    candidate = tmp_path / "candidate-static.json"
+    bad = _static_server_manifest()
+    bad["aggregate"]["main_generated_tokens"] += 1
+    baseline.write_text(module.json.dumps(_static_server_manifest()))
+    candidate.write_text(module.json.dumps(bad))
+
+    report = module.compare_static_server_manifests(baseline, candidate)
+
+    assert report["self_validation"]["baseline"]["pass"]
+    assert not report["self_validation"]["candidate"]["pass"]
+    assert any(
+        failure["path"] == "aggregate.main_generated_tokens"
+        for failure in report["self_validation"]["candidate"]["failures"]
+    )
+
+
+def test_compare_static_server_manifests_rejects_bad_batch_ledger(tmp_path):
+    module = _load_module()
+    baseline = tmp_path / "baseline-static.json"
+    candidate = tmp_path / "candidate-static.json"
+    bad = _static_server_manifest()
+    bad["runs"][0]["generation_batch_summary"]["by_label"]["main_generation"]["server_batches"][0][
+        "batch_size"
+    ] = "5"
+    baseline.write_text(module.json.dumps(_static_server_manifest()))
+    candidate.write_text(module.json.dumps(bad))
+
+    report = module.compare_static_server_manifests(baseline, candidate)
+
+    assert not report["self_validation"]["candidate"]["pass"]
+    assert any(
+        "server_batches[0].batch_size" in failure["path"]
+        for failure in report["self_validation"]["candidate"]["failures"]
+    )
 
 
 def test_compare_static_server_manifests_can_allow_timeout_knob_change(tmp_path):

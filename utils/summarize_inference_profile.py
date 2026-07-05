@@ -781,6 +781,307 @@ def _compare_static_server_token_status(baseline: dict[str, Any], candidate: dic
     return {"pass": passed, "statuses": statuses, "mismatches": mismatches}
 
 
+def _float_close(left: Any, right: Any, *, rel_tol: float = 1e-6, abs_tol: float = 1e-6) -> bool:
+    if not isinstance(left, (int, float)) or not isinstance(right, (int, float)):
+        return left == right
+    return abs(float(left) - float(right)) <= max(abs_tol, rel_tol * max(abs(float(left)), abs(float(right)), 1.0))
+
+
+def _static_server_percentile(sorted_values: list[float], percentile: float) -> float:
+    if not sorted_values:
+        return 0.0
+    index = max(0, min(len(sorted_values) - 1, int(len(sorted_values) * percentile + 0.999999) - 1))
+    return sorted_values[index]
+
+
+def _static_server_batch_summary_from_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
+    aggregate: dict[str, dict[str, Any]] = {}
+    for run in runs:
+        batch_summary = run.get("generation_batch_summary")
+        if not isinstance(batch_summary, dict):
+            continue
+        by_label = batch_summary.get("by_label")
+        if not isinstance(by_label, dict):
+            continue
+        for label, label_summary in by_label.items():
+            if not isinstance(label_summary, dict):
+                continue
+            target = aggregate.setdefault(
+                str(label),
+                {
+                    "records": 0,
+                    "modes": {},
+                    "batch_size_histogram": {},
+                    "server_batch_size_histogram": {},
+                    "server_batch_count": 0,
+                    "server_request_record_count": 0,
+                    "server_total_queue_wait_seconds": 0.0,
+                    "server_max_queue_wait_seconds": 0.0,
+                    "server_total_first_queue_wait_seconds": 0.0,
+                    "server_max_first_queue_wait_seconds": 0.0,
+                    "server_batching_modes": {},
+                    "server_elapsed_seconds_attributions": {},
+                    "server_batch_count_attributed": 0,
+                    "server_unique_batch_size_histogram": {},
+                    "server_unique_batch_elapsed_seconds_sum": 0.0,
+                    "server_unique_batch_elapsed_seconds_max": 0.0,
+                    "_seen_server_batch_ids": set(),
+                },
+            )
+            target["records"] += int(label_summary.get("records", 0) or 0)
+            target["server_batch_count_attributed"] += int(label_summary.get("server_batch_count", 0) or 0)
+            target["server_request_record_count"] += int(
+                label_summary.get("server_request_record_count", 0) or 0
+            )
+            target["server_total_queue_wait_seconds"] += float(
+                label_summary.get("server_total_queue_wait_seconds", 0.0) or 0.0
+            )
+            target["server_max_queue_wait_seconds"] = max(
+                float(target["server_max_queue_wait_seconds"]),
+                float(label_summary.get("server_max_queue_wait_seconds", 0.0) or 0.0),
+            )
+            target["server_total_first_queue_wait_seconds"] += float(
+                label_summary.get("server_total_first_queue_wait_seconds", 0.0) or 0.0
+            )
+            target["server_max_first_queue_wait_seconds"] = max(
+                float(target["server_max_first_queue_wait_seconds"]),
+                float(label_summary.get("server_max_first_queue_wait_seconds", 0.0) or 0.0),
+            )
+            for field in (
+                "modes",
+                "batch_size_histogram",
+                "server_batch_size_histogram",
+                "server_batching_modes",
+                "server_elapsed_seconds_attributions",
+            ):
+                values = label_summary.get(field)
+                if not isinstance(values, dict):
+                    continue
+                for key, value in values.items():
+                    target[field][str(key)] = int(target[field].get(str(key), 0)) + int(value)
+            server_batches = label_summary.get("server_batches")
+            if isinstance(server_batches, list):
+                for batch in server_batches:
+                    if not isinstance(batch, dict):
+                        continue
+                    batch_id = batch.get("batch_id")
+                    batch_size = batch.get("batch_size")
+                    if batch_id is None or batch_size is None:
+                        continue
+                    seen_key = str(batch_id)
+                    if seen_key in target["_seen_server_batch_ids"]:
+                        continue
+                    target["_seen_server_batch_ids"].add(seen_key)
+                    target["server_batch_count"] += 1
+                    size_key = str(int(batch_size))
+                    target["server_unique_batch_size_histogram"][size_key] = int(
+                        target["server_unique_batch_size_histogram"].get(size_key, 0)
+                    ) + 1
+                    elapsed = batch.get("elapsed_seconds")
+                    if isinstance(elapsed, (int, float)):
+                        target["server_unique_batch_elapsed_seconds_sum"] += float(elapsed)
+                        target["server_unique_batch_elapsed_seconds_max"] = max(
+                            float(target["server_unique_batch_elapsed_seconds_max"]),
+                            float(elapsed),
+                        )
+            elif int(label_summary.get("server_batch_count", 0) or 0) > 0:
+                target["server_batch_count"] += int(label_summary.get("server_batch_count", 0) or 0)
+    for label_summary in aggregate.values():
+        label_summary.pop("_seen_server_batch_ids", None)
+    return {"by_label": aggregate}
+
+
+def _static_server_batch_observed(batching: dict[str, Any]) -> bool:
+    for label_summary in (batching.get("by_label") or {}).values():
+        hist = label_summary.get("server_unique_batch_size_histogram") or label_summary.get(
+            "server_batch_size_histogram"
+        )
+        if isinstance(hist, dict) and any(int(size) > 1 and int(count) > 0 for size, count in hist.items()):
+            return True
+    return False
+
+
+def _static_server_batch_ledger_failures(manifest: dict[str, Any], side: str) -> list[dict[str, Any]]:
+    failures = []
+    for run_index, run in enumerate(manifest.get("runs", [])):
+        batch_summary = run.get("generation_batch_summary")
+        if not isinstance(batch_summary, dict):
+            continue
+        for label, label_summary in (batch_summary.get("by_label") or {}).items():
+            if not isinstance(label_summary, dict):
+                failures.append({
+                    "side": side,
+                    "path": f"runs[{run_index}].generation_batch_summary.by_label.{label}",
+                    "reason": "label summary is not a dict",
+                })
+                continue
+            batches = label_summary.get("server_batches")
+            batch_count = int(label_summary.get("server_batch_count", 0) or 0)
+            if isinstance(batches, list):
+                if len(batches) != batch_count:
+                    failures.append({
+                        "side": side,
+                        "path": f"runs[{run_index}].generation_batch_summary.by_label.{label}.server_batches",
+                        "reason": f"len(server_batches)={len(batches)} != server_batch_count={batch_count}",
+                    })
+                for batch_index, batch in enumerate(batches):
+                    if not isinstance(batch, dict):
+                        failures.append({
+                            "side": side,
+                            "path": (
+                                f"runs[{run_index}].generation_batch_summary.by_label."
+                                f"{label}.server_batches[{batch_index}]"
+                            ),
+                            "reason": "batch entry is not a dict",
+                        })
+                        continue
+                    for key in ("batch_id", "batch_size", "request_count", "work_items"):
+                        if not isinstance(batch.get(key), int):
+                            failures.append({
+                                "side": side,
+                                "path": (
+                                    f"runs[{run_index}].generation_batch_summary.by_label."
+                                    f"{label}.server_batches[{batch_index}].{key}"
+                                ),
+                                "reason": f"expected int, got {batch.get(key)!r}",
+                            })
+                    for key in ("elapsed_seconds", "queue_wait_seconds"):
+                        value = batch.get(key)
+                        if value is not None and not isinstance(value, (int, float)):
+                            failures.append({
+                                "side": side,
+                                "path": (
+                                    f"runs[{run_index}].generation_batch_summary.by_label."
+                                    f"{label}.server_batches[{batch_index}].{key}"
+                                ),
+                                "reason": f"expected number or null, got {value!r}",
+                            })
+            elif batch_count:
+                failures.append({
+                    "side": side,
+                    "path": f"runs[{run_index}].generation_batch_summary.by_label.{label}.server_batches",
+                    "reason": "missing server_batches for nonzero server_batch_count",
+                })
+    return failures
+
+
+def _append_static_server_aggregate_failure(
+        failures: list[dict[str, Any]],
+        side: str,
+        key: str,
+        expected: Any,
+        actual: Any,
+) -> None:
+    if _float_close(expected, actual):
+        return
+    failures.append({
+        "side": side,
+        "path": f"aggregate.{key}",
+        "expected": expected,
+        "actual": actual,
+    })
+
+
+def _validate_static_server_manifest(manifest: dict[str, Any], *, side: str) -> dict[str, Any]:
+    failures = []
+    aggregate = manifest.get("aggregate")
+    runs = manifest.get("runs")
+    if not isinstance(aggregate, dict):
+        failures.append({"side": side, "path": "aggregate", "reason": "missing aggregate"})
+        aggregate = {}
+    if not isinstance(runs, list):
+        failures.append({"side": side, "path": "runs", "reason": "missing runs list"})
+        runs = []
+
+    if manifest.get("schema_version") != 1:
+        failures.append({"side": side, "path": "schema_version", "expected": 1, "actual": manifest.get("schema_version")})
+    if manifest.get("run_kind") != "static_server_batch":
+        failures.append({
+            "side": side,
+            "path": "run_kind",
+            "expected": "static_server_batch",
+            "actual": manifest.get("run_kind"),
+        })
+    if bool(manifest.get("same_calculation", True)):
+        failures.append({"side": side, "path": "same_calculation", "expected": False, "actual": manifest.get("same_calculation")})
+    if manifest.get("throughput_claim_scope") != "static_ipc_concurrent_full_song_requests":
+        failures.append({
+            "side": side,
+            "path": "throughput_claim_scope",
+            "expected": "static_ipc_concurrent_full_song_requests",
+            "actual": manifest.get("throughput_claim_scope"),
+        })
+    if manifest.get("token_equivalence_status") != STATIC_SERVER_TOKEN_STATUS:
+        failures.append({
+            "side": side,
+            "path": "token_equivalence_status",
+            "expected": STATIC_SERVER_TOKEN_STATUS,
+            "actual": manifest.get("token_equivalence_status"),
+        })
+
+    request_walls = sorted(float(run.get("request_wall_seconds") or 0.0) for run in runs)
+    main_tokens = sum(int(run.get("main_generated_tokens") or 0) for run in runs)
+    timing_tokens = sum(int(run.get("timing_generated_tokens") or 0) for run in runs)
+    main_model_elapsed = sum(float(run.get("main_model_elapsed_seconds") or 0.0) for run in runs)
+    timing_model_elapsed = sum(float(run.get("timing_model_elapsed_seconds") or 0.0) for run in runs)
+    scheduler_wall = float(aggregate.get("scheduler_wall_seconds", 0.0) or 0.0)
+    expected_batched = _static_server_batch_summary_from_runs(runs)
+    server_batch_observed = _static_server_batch_observed(expected_batched)
+    result_class = "static_server_batch" if server_batch_observed else "static_server_no_batch_observed"
+
+    expected_values = {
+        "runs": len(runs),
+        "result_class": result_class,
+        "server_batch_observed": server_batch_observed,
+        "same_calculation": False,
+        "throughput_claim_scope": "static_ipc_concurrent_full_song_requests",
+        "token_equivalence_status": STATIC_SERVER_TOKEN_STATUS,
+        "main_generated_tokens": main_tokens,
+        "timing_generated_tokens": timing_tokens,
+        "request_wall_seconds_sum": sum(request_walls),
+        "request_wall_seconds_max": max(request_walls) if request_walls else 0.0,
+        "request_wall_seconds_p95": _static_server_percentile(request_walls, 0.95),
+        "main_model_elapsed_seconds_sum": main_model_elapsed,
+        "timing_model_elapsed_seconds_sum": timing_model_elapsed,
+        "main_tokens_per_scheduler_second": main_tokens / scheduler_wall if scheduler_wall > 0 else 0.0,
+        "timing_tokens_per_scheduler_second": timing_tokens / scheduler_wall if scheduler_wall > 0 else 0.0,
+        "main_tokens_per_request_model_second_attributed": (
+            main_tokens / main_model_elapsed if main_model_elapsed > 0 else 0.0
+        ),
+        "timing_tokens_per_request_model_second_attributed": (
+            timing_tokens / timing_model_elapsed if timing_model_elapsed > 0 else 0.0
+        ),
+    }
+    for key, expected in expected_values.items():
+        _append_static_server_aggregate_failure(failures, side, key, expected, aggregate.get(key))
+
+    if (aggregate.get("batching") or {}) != expected_batched:
+        failures.append({
+            "side": side,
+            "path": "aggregate.batching",
+            "expected": expected_batched,
+            "actual": aggregate.get("batching"),
+        })
+    failures.extend(_static_server_batch_ledger_failures(manifest, side))
+
+    passed = not failures
+    print(f"Static-server manifest self-validation ({side})")
+    print(f"  {'PASS' if passed else 'FAIL'}")
+    if not passed:
+        for failure in failures[:8]:
+            detail = failure.get("reason")
+            if detail is None:
+                detail = f"expected={failure.get('expected')!r}, actual={failure.get('actual')!r}"
+            print(f"  {failure.get('path')}: {detail}")
+    print()
+    return {
+        "pass": passed,
+        "failures": failures,
+        "expected_aggregate": expected_values,
+        "expected_batching": expected_batched,
+    }
+
+
 def _compare_static_server_performance(
         baseline: dict[str, Any],
         candidate: dict[str, Any],
@@ -870,12 +1171,20 @@ def compare_static_server_manifests(
         "result_class": {},
         "token_status": {},
         "performance": {},
+        "self_validation": {},
     }
 
     print(f"Baseline static server manifest:  {baseline_path}")
     print(f"Candidate static server manifest: {candidate_path}")
     print()
 
+    baseline_validation = _validate_static_server_manifest(baseline, side="baseline")
+    candidate_validation = _validate_static_server_manifest(candidate, side="candidate")
+    report["self_validation"] = {
+        "pass": bool(baseline_validation["pass"] and candidate_validation["pass"]),
+        "baseline": baseline_validation,
+        "candidate": candidate_validation,
+    }
     report["contract"] = _compare_static_server_contract(
         baseline,
         candidate,
@@ -2241,7 +2550,9 @@ def main() -> None:
             args.json_output.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
         failed = (
-            ((args.require_contract_match or args.require_mode_contract or args.strict)
+            ((args.require_mode_contract or args.strict)
+             and not report["self_validation"].get("pass", False))
+            or ((args.require_contract_match or args.require_mode_contract or args.strict)
              and not report["contract"].get("pass", False))
             or ((args.require_mode_contract or args.strict)
                 and not report["result_class"].get("pass", False))
