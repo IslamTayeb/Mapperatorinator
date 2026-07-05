@@ -1864,6 +1864,28 @@ validation that the stricter metadata still runs real static IPC batches and
 correctly blocks promotion when output-length drift is large. Artifacts:
 `/work/imt11/Mapperatorinator/runs/static-server-ledger-20260704-0e6346d/compare-maxbatch5-vs-10.json`.
 
+DCC capacity job `49269905` on RTX 2080 Ti, commit `b4039b0`, tested whether
+larger static batches help a 20-concurrent-request five-song 15s smoke
+(`repeats=4`, `max_workers=20`) after runtime-keyed server socket guardrails.
+They did not:
+
+| `max_batch_size` | main tokens | scheduler wall | scheduler-wall main tok/s | request p95 | main unique batch sizes | result |
+| ---: | ---: | ---: | ---: | ---: | --- | --- |
+| `10` | `31,420` | `198.706s` | `158.123` | `191.490s` | `10:18, 9:2, 1:2` | baseline |
+| `20` | `29,858` | `199.888s` | `149.374` | `199.500s` | `20:2, 19:4, 17:1, 16:1, 13:1, 9:1, 7:1, 4:2, 2:2, 1:10` | FAIL, `-5.5%` scheduler TPS |
+
+Both manifests self-validated, but strict static compare failed because
+`max_batch_size=20` regressed scheduler throughput and generated fewer main
+tokens (`31,420 -> 29,858`). Job telemetry across the whole run averaged
+`60.19%` GPU utilization and peaked at `9,334 MiB` memory. The same job's serial
+multi-song denominator measured `23,820` main tokens in `346.984s` model time
+(`68.649 tok/s`) with repeat token-equivalence PASS after each song baseline.
+Do not keep sweeping larger static `max_batch_size` values without new evidence;
+next batching work should target tail scheduling, per-request RNG/equivalence,
+or an explicit continuous-batching prototype. Artifacts:
+`/work/imt11/Mapperatorinator/runs/static-server-capacity20-20260704-194727-b4039b0/summary.json`;
+note: `notes/2026-07-04-static-server-capacity20-profile.md`.
+
 Static server batching currently uses shared global server RNG. Until an
 explicit per-request reseed/replay protocol exists, concurrent server token
 hashes are throughput diagnostics only; do not compare them against cold
