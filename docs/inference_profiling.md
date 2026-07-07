@@ -1997,3 +1997,14 @@ Hydra default (`false`). This is guardrail infrastructure only, not a throughput
 result. See `notes/2026-07-04-static-server-control-plane-guardrails.md`.
 
 Suggested future profile metadata: `result_class`, `throughput_claim_scope`, `batching_mode`, scheduler policy, request/window IDs, batch IDs, active batch-size histogram, queue wait, per-request latency, prefill/decode timing split, per-sample token hashes, stop reasons, RNG policy/state hashes, cache slot/reorder events, graph capture/replay counts, and effective fast-path flags.
+
+Post-main branch `codex/batched-fast-decode-session` is abandoned at commit
+`a74537a` and should not be merged. Its best exact compiled server lockstep
+result was B=5 identical SALVALAI at `263.544` unique main tok/s, below the
+accepted full-song single-song fast path (`270.475` tok/s) and below the paired
+15s non-server fast reference (`288.703` tok/s). The B=10 check regressed to
+`199.721` unique main tok/s and was non-equivalent. For 5+ songs on one RTX
+2080 Ti, prefer the optimized single-song path serially in one long-lived
+process unless a future lower-level active-prefix graph-step or batched decoder
+runtime proves exact per-request output behavior and beats optimized serial
+throughput. See `notes/2026-07-07-batched-fast-branch-abandoned.md`.
