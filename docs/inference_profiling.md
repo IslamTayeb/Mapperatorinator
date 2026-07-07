@@ -2008,3 +2008,9 @@ accepted full-song single-song fast path (`270.475` tok/s) and below the paired
 process unless a future lower-level active-prefix graph-step or batched decoder
 runtime proves exact per-request output behavior and beats optimized serial
 throughput. See `notes/2026-07-07-batched-fast-branch-abandoned.md`.
+
+Rollback smoke job `49325496` then validated that `main@f6add76` still has the
+accepted fast single-song path: `profile_salvalai_smoke15`, fp32 SDPA,
+`use_server=false`, and the fast opt-in flags produced `1,084` main tokens in
+`3.867s` synchronized model time (`280.3` tok/s) with output SHA
+`ff63c232115906483a592c940e6f0fccbb8639775378d39fd86237f4191ed4ba`.
