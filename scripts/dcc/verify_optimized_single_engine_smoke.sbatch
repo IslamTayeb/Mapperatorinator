@@ -17,6 +17,7 @@ EXPECTED_COMMIT=${EXPECTED_COMMIT:?Set EXPECTED_COMMIT to the pushed migration c
 EXPECTED_BRANCH=${EXPECTED_BRANCH:-codex/optimized-single-architecture-migration}
 PROFILE_CONFIG=${PROFILE_CONFIG:-profile_salvalai_smoke15}
 RUN_LABEL=${RUN_LABEL:-smoke}
+ENGINE_GATE_SCOPE=${ENGINE_GATE_SCOPE:-reciprocal}
 WORK=/work/imt11/Mapperatorinator
 AUDIO="$WORK/data/salvalai.mp3"
 RUN_ROOT="$WORK/runs/optimized-single-engine-${RUN_LABEL}-${SLURM_JOB_ID:-manual}"
@@ -36,6 +37,10 @@ if [[ -n "$(git -C "$REPO" status --porcelain)" ]]; then
 fi
 if [[ ! -f "$AUDIO" ]]; then
   echo "missing SALVALAI audio at $AUDIO" >&2
+  exit 2
+fi
+if [[ "$ENGINE_GATE_SCOPE" != pair && "$ENGINE_GATE_SCOPE" != reciprocal ]]; then
+  echo "ENGINE_GATE_SCOPE must be pair or reciprocal" >&2
   exit 2
 fi
 
@@ -59,6 +64,7 @@ echo "host=$(hostname)"
 echo "job_id=${SLURM_JOB_ID:-manual}"
 echo "commit=$EXPECTED_COMMIT"
 echo "profile_config=$PROFILE_CONFIG"
+echo "engine_gate_scope=$ENGINE_GATE_SCOPE"
 echo "run_root=$RUN_ROOT"
 nvidia-smi -L
 nvidia-smi \
@@ -149,13 +155,9 @@ run_profile() {
 
 run_profile legacy legacy_first
 run_profile optimized optimized_second
-run_profile optimized optimized_first
-run_profile legacy legacy_second
 
 LEGACY_FIRST=$(<"$RUN_ROOT/legacy_first.profile-path.txt")
 OPTIMIZED_SECOND=$(<"$RUN_ROOT/optimized_second.profile-path.txt")
-OPTIMIZED_FIRST=$(<"$RUN_ROOT/optimized_first.profile-path.txt")
-LEGACY_SECOND=$(<"$RUN_ROOT/legacy_second.profile-path.txt")
 
 compare_pair() {
   local baseline=$1
@@ -173,7 +175,13 @@ compare_pair() {
 }
 
 compare_pair "$LEGACY_FIRST" "$OPTIMIZED_SECOND" "$RUN_ROOT/legacy-first-compare.json"
-compare_pair "$LEGACY_SECOND" "$OPTIMIZED_FIRST" "$RUN_ROOT/optimized-first-compare.json"
+if [[ "$ENGINE_GATE_SCOPE" == reciprocal ]]; then
+  run_profile optimized optimized_first
+  run_profile legacy legacy_second
+  OPTIMIZED_FIRST=$(<"$RUN_ROOT/optimized_first.profile-path.txt")
+  LEGACY_SECOND=$(<"$RUN_ROOT/legacy_second.profile-path.txt")
+  compare_pair "$LEGACY_SECOND" "$OPTIMIZED_FIRST" "$RUN_ROOT/optimized-first-compare.json"
+fi
 
 python - "$RUN_ROOT" <<'PY'
 import json
@@ -181,8 +189,9 @@ import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
-for name in ("legacy-first-compare.json", "optimized-first-compare.json"):
-    report = json.loads((root / name).read_text(encoding="utf-8"))
+for path in sorted(root.glob("*-compare.json")):
+    name = path.name
+    report = json.loads(path.read_text(encoding="utf-8"))
     if report.get("token_equivalence_pass") is not True:
         raise SystemExit(f"{name}: token equivalence failed")
     if report.get("output_artifact_pass") is not True:
