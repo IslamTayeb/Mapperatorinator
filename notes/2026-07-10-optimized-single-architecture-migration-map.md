@@ -528,3 +528,46 @@ Comparison reports:
 SHA `35148f9cf59880ea1099c09fbc98e25fbc0c77a0e4bf24c9ed422971c6e8afa2`,
 and `candidate-first-compare.json`, SHA
 `6b8d3b554712478b6a5a9e27412593560b74e9fc8ca4dd1e2ea8e2f2f8299769`.
+
+### E1 accepted real optimized single engine
+
+Commit `52bfeaf` made `inference_engine=optimized
+optimized_inference_mode=single` a working runtime. A neutral
+`InferenceEngineBinding` unwraps once in Processor so the raw Hugging Face model
+retains its identity on model, cache, compile, and graph paths. The lazy adapter
+validates unsupported modes before importing `optimized.single` or invoking the
+injected raw loader. Single mode forces the frozen
+`accepted-fp32-270.475-v1` effective config and generation compile without
+rewriting requested legacy flags. Processor creates one production session per
+unfinished context and delegates each window to optimized-owned generation
+orchestration. Requested metadata remains unchanged; effective config/version,
+runtime owner, and result class are reported separately.
+
+The full local `tests/` tree passed. Adapter/selector tests prove that
+`offline_batch` and `server` fail before single-engine import/model loading,
+the raw loader is called once with FP32/SDPA/compile enabled, the effective
+configuration is immutable and equals the accepted legacy stack, sampling
+settings remain request-owned, and binding unwrap preserves raw-model identity.
+Default V32 import and server tests remain optimized/native cold.
+
+DCC pair job `49561071` was the first end-to-end execution through the public
+optimized selector. It matched all `1,084` main and `164` timing tokens and
+the `.osu` SHA
+`ff63c232115906483a592c940e6f0fccbb8639775378d39fd86237f4191ed4ba`,
+size `4,144`, against the canonical legacy bundle. Aggregate optimized main
+throughput differed by `-0.5%`, timing by `-0.1%`, and stage wall by `+0.7%`,
+all below the meaningful-regression threshold. Comparison report:
+`/work/imt11/Mapperatorinator/runs/optimized-single-engine-e1-pair-49561071/legacy-first-compare.json`,
+SHA `ff24425b8911d142b84cbb771f77c064cd3df110b0fe71b8c9d9255bd1c365ff`.
+
+Reciprocal job `49561104` confirmed the result in both launch orders. All
+main/timing tokens and `.osu` bytes matched. Optimized main throughput was
+`-0.2%` with legacy launched first and `+0.9%` with optimized launched first;
+timing was `+5.0%` and `+4.3%`; stage wall improved `15.9%` and `12.7%`.
+No performance win is claimed. Effective metadata reported compile enabled and
+bucket `64` while requested `inference_generation_compile` remained false.
+Reports:
+`/work/imt11/Mapperatorinator/runs/optimized-single-engine-e1-reciprocal-49561104/legacy-first-compare.json`,
+SHA `e416b81cd5907d6683573abbe0fc9846712c1a75307c1e99185e04c480e6c9d5`,
+and `optimized-first-compare.json`, SHA
+`fcc11af93d7a3e527632eb88c760d87e9ff52852514e2f8dc2e56e870642e992`.
