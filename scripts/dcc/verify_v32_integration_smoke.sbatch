@@ -19,6 +19,7 @@ CONTROL_COMMIT=${CONTROL_COMMIT:?Set CONTROL_COMMIT}
 CANDIDATE_COMMIT=${CANDIDATE_COMMIT:?Set CANDIDATE_COMMIT}
 PROFILE_CONFIG=${PROFILE_CONFIG:-profile_salvalai_smoke15}
 RUN_LABEL=${RUN_LABEL:-smoke}
+V32_STACK=${V32_STACK:-accepted}
 AUDIO="$WORK/data/salvalai.mp3"
 RUN_ROOT="$WORK/runs/v32-integration-${RUN_LABEL}-${SLURM_JOB_ID:-manual}"
 
@@ -67,6 +68,7 @@ echo "job_id=${SLURM_JOB_ID:-manual}"
 echo "control_commit=$CONTROL_COMMIT"
 echo "candidate_commit=$CANDIDATE_COMMIT"
 echo "profile_config=$PROFILE_CONFIG"
+echo "v32_stack=$V32_STACK"
 echo "run_root=$RUN_ROOT"
 nvidia-smi -L
 nvidia-smi \
@@ -90,20 +92,51 @@ COMMON_OVERRIDES=(
   profile_inference=true
   profile_sync_cuda=true
   profile_record_token_ids=true
-  inference_generation_compile=true
-  inference_active_prefix_decode_loop=true
-  inference_active_prefix_decode_bucket_size=64
-  inference_active_prefix_decode_cuda_graph=true
-  inference_active_prefix_decode_cuda_graph_warmup=0
-  inference_active_prefix_decode_cuda_graph_min_decode_steps=1
-  inference_stateful_monotonic_logits_processor=true
-  inference_q1_bmm_cross_attention=true
-  inference_decode_session_runtime=true
-  inference_decode_session_cuda_graph=true
-  inference_native_decode_kernels=true
-  inference_native_q1_self_attention=true
-  inference_native_q1_rope_cache_self_attention=true
 )
+
+case "$V32_STACK" in
+  accepted)
+    STACK_OVERRIDES=(
+      inference_generation_compile=true
+      inference_active_prefix_decode_loop=true
+      inference_active_prefix_decode_bucket_size=64
+      inference_active_prefix_decode_cuda_graph=true
+      inference_active_prefix_decode_cuda_graph_warmup=0
+      inference_active_prefix_decode_cuda_graph_min_decode_steps=1
+      inference_stateful_monotonic_logits_processor=true
+      inference_q1_bmm_cross_attention=true
+      inference_decode_session_runtime=true
+      inference_decode_session_cuda_graph=true
+      inference_native_decode_kernels=true
+      inference_native_q1_self_attention=true
+      inference_native_q1_rope_cache_self_attention=true
+    )
+    ;;
+  compile_only|default)
+    STACK_OVERRIDES=(
+      inference_generation_compile=false
+      inference_active_prefix_decode_loop=false
+      inference_active_prefix_decode_bucket_size=128
+      inference_active_prefix_decode_cuda_graph=false
+      inference_active_prefix_decode_cuda_graph_warmup=0
+      inference_active_prefix_decode_cuda_graph_min_decode_steps=1
+      inference_stateful_monotonic_logits_processor=false
+      inference_q1_bmm_cross_attention=false
+      inference_decode_session_runtime=false
+      inference_decode_session_cuda_graph=false
+      inference_native_decode_kernels=false
+      inference_native_q1_self_attention=false
+      inference_native_q1_rope_cache_self_attention=false
+    )
+    if [[ "$V32_STACK" == compile_only ]]; then
+      STACK_OVERRIDES[0]=inference_generation_compile=true
+    fi
+    ;;
+  *)
+    echo "V32_STACK must be accepted, compile_only, or default" >&2
+    exit 2
+    ;;
+esac
 
 run_profile() {
   local repo=$1
@@ -114,7 +147,8 @@ run_profile() {
     cd "$repo"
     python inference.py --config-name "$PROFILE_CONFIG" \
       output_path="$output" \
-      "${COMMON_OVERRIDES[@]}"
+      "${COMMON_OVERRIDES[@]}" \
+      "${STACK_OVERRIDES[@]}"
   )
   local profile
   profile=$(find "$output" -name '*.profile.json' -type f | sort | head -n 1)
