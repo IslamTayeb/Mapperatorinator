@@ -1,4 +1,5 @@
 import logging
+import importlib
 import multiprocessing
 import os
 import socket
@@ -372,6 +373,70 @@ def compile_derived_args(args: InferenceConfig):
 
 
 def validate_reserved_runtime_flags(args: InferenceConfig):
+    supported_engines = {"v32", "optimized"}
+    supported_optimized_modes = {"single", "offline_batch", "server"}
+    if args.inference_engine not in supported_engines:
+        raise ValueError(
+            "inference_engine must be one of: " + ", ".join(sorted(supported_engines)) + "."
+        )
+    if args.optimized_inference_mode not in supported_optimized_modes:
+        raise ValueError(
+            "optimized_inference_mode must be one of: "
+            + ", ".join(sorted(supported_optimized_modes))
+            + "."
+        )
+    if args.inference_engine == "v32" and args.optimized_inference_mode != "single":
+        raise ValueError(
+            "optimized_inference_mode is only selectable when inference_engine=optimized; "
+            "leave it at single for the default V32 engine."
+        )
+    if args.inference_engine == "optimized":
+        if args.precision != "fp32":
+            raise ValueError("inference_engine=optimized currently requires precision=fp32.")
+        if args.use_server:
+            raise ValueError(
+                "inference_engine=optimized cannot be combined with the legacy use_server flag; "
+                "select optimized_inference_mode=server when that adapter is implemented."
+            )
+        if args.parallel:
+            raise ValueError(
+                "inference_engine=optimized cannot be combined with the legacy parallel inference path."
+            )
+
+        optimized_flag_defaults = {
+            "inference_generation_compile": False,
+            "inference_active_prefix_decode_loop": False,
+            "inference_active_prefix_decode_bucket_size": 128,
+            "inference_active_prefix_decode_cuda_graph": False,
+            "inference_active_prefix_decode_cuda_graph_warmup": 0,
+            "inference_active_prefix_decode_cuda_graph_min_decode_steps": 1,
+            "inference_stateful_monotonic_logits_processor": False,
+            "inference_q1_bmm_cross_attention": False,
+            "inference_decode_session_runtime": False,
+            "inference_decode_session_cuda_graph": False,
+            "inference_decode_session_chunk_size": 1,
+            "inference_native_decode_kernels": False,
+            "inference_native_q1_self_attention": False,
+            "inference_native_q1_rope_cache_self_attention": False,
+            "inference_continuous_batching": False,
+            "inference_continuous_batching_mode": "disabled",
+            "continuous_batch_max_active_sequences": 0,
+            "continuous_batch_max_wait_ms": 0,
+            "continuous_batch_prefill_policy": "serial",
+            "continuous_batch_decode_order_policy": "serial",
+            "continuous_batch_rng_policy": "serial_global",
+            "inference_batch_decode_session_runtime": False,
+            "inference_batch_native_decode_kernels": False,
+        }
+        conflicting_flags = [
+            name for name, default in optimized_flag_defaults.items() if getattr(args, name) != default
+        ]
+        if conflicting_flags:
+            raise ValueError(
+                "inference_engine=optimized owns its runtime configuration and cannot be combined with "
+                "legacy experimental inference flags: " + ", ".join(conflicting_flags)
+            )
+
     def effective_generation_batch_size() -> int:
         batch_multiplier = args.num_beams * (2 if args.cfg_scale > 1.0 else 1)
         return args.max_batch_size // batch_multiplier
@@ -666,6 +731,8 @@ def generate(
         "device": args.device,
         "precision": args.precision,
         "attn_implementation": args.attn_implementation,
+        "inference_engine": args.inference_engine,
+        "optimized_inference_mode": args.optimized_inference_mode,
         "use_server": args.use_server,
         "server_batch_timeout": args.server_batch_timeout,
         "parallel": args.parallel,
@@ -959,6 +1026,57 @@ def load_model_with_server(ckpt_path: str | Path | None, t5_args: TrainConfig, d
     ) if use_server else model_loader(), tokenizer_loader()
 
 
+def load_model_with_engine(
+        ckpt_path: str | Path | None,
+        t5_args: TrainConfig,
+        device,
+        max_batch_size: int = 8,
+        use_server: bool = False,
+        precision: str = "fp32",
+        attn_implementation: str = "sdpa",
+        eval_mode: bool = True,
+        lora_path=None,
+        gamemode: int | None = None,
+        auto_select_gamemode_model: bool = True,
+        generation_compile: bool = False,
+        server_allow_auto_start: bool = True,
+        server_connect_timeout: float | None = 60.0,
+        server_request_timeout: float | None = None,
+        server_idle_timeout: float = 20,
+        server_batch_timeout: float = 0.2,
+        inference_engine: str = "v32",
+        optimized_inference_mode: str = "single",
+):
+    """Select the public runtime without importing optimized code on the V32 path."""
+
+    loader_kwargs = {
+        "ckpt_path": ckpt_path,
+        "t5_args": t5_args,
+        "device": device,
+        "max_batch_size": max_batch_size,
+        "use_server": use_server,
+        "precision": precision,
+        "attn_implementation": attn_implementation,
+        "eval_mode": eval_mode,
+        "lora_path": lora_path,
+        "gamemode": gamemode,
+        "auto_select_gamemode_model": auto_select_gamemode_model,
+        "generation_compile": generation_compile,
+        "server_allow_auto_start": server_allow_auto_start,
+        "server_connect_timeout": server_connect_timeout,
+        "server_request_timeout": server_request_timeout,
+        "server_idle_timeout": server_idle_timeout,
+        "server_batch_timeout": server_batch_timeout,
+    }
+    if inference_engine == "v32":
+        return load_model_with_server(**loader_kwargs)
+    if inference_engine != "optimized":
+        raise ValueError("inference_engine must be one of: optimized, v32.")
+
+    adapter = importlib.import_module("osuT5.osuT5.inference.optimized.adapter")
+    return adapter.load_optimized_engine(mode=optimized_inference_mode, **loader_kwargs)
+
+
 def get_server_address(
         ckpt_path_str: str | Path | None,
         lora_path: str | Path | None = None,
@@ -1038,19 +1156,21 @@ def main(args: InferenceConfig):
         setup_inference_environment(args.seed)
 
     with profiler.stage("load_main_model"):
-        model, tokenizer = load_model_with_server(args.model_path, args.train, args.device,
+        model, tokenizer = load_model_with_engine(args.model_path, args.train, args.device,
                                                   max_batch_size=args.max_batch_size, use_server=args.use_server,
                                                   precision=args.precision, attn_implementation=args.attn_implementation,
                                                   lora_path=args.lora_path, gamemode=args.gamemode,
                                                   auto_select_gamemode_model=args.auto_select_gamemode_model,
                                                   generation_compile=args.inference_generation_compile,
-                                                  server_batch_timeout=args.server_batch_timeout)
+                                                  server_batch_timeout=args.server_batch_timeout,
+                                                  inference_engine=args.inference_engine,
+                                                  optimized_inference_mode=args.optimized_inference_mode)
 
     timing_model, timing_tokenizer = None, None
     if should_load_separate_timing_model(args):
         print("Using base model for timing generation.")
         with profiler.stage("load_timing_model"):
-            timing_model, timing_tokenizer = load_model_with_server(
+            timing_model, timing_tokenizer = load_model_with_engine(
                 args.model_path,
                 args.train,
                 args.device,
@@ -1062,6 +1182,8 @@ def main(args: InferenceConfig):
                 auto_select_gamemode_model=False,
                 generation_compile=args.inference_generation_compile,
                 server_batch_timeout=args.server_batch_timeout,
+                inference_engine=args.inference_engine,
+                optimized_inference_mode=args.optimized_inference_mode,
             )
 
     diff_model, diff_tokenizer, refine_model = None, None, None
