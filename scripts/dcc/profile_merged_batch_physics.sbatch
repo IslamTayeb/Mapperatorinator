@@ -30,14 +30,14 @@ case "$MERGED_BATCH_SIZE" in
       exit 2
     fi
     ;;
-  2|5)
+  2|5|8)
     if [[ -z "$PREVIOUS_GATE_REPORT" || ! -f "$PREVIOUS_GATE_REPORT" ]]; then
       echo "B=$MERGED_BATCH_SIZE requires an existing PREVIOUS_GATE_REPORT" >&2
       exit 2
     fi
     ;;
   *)
-    echo "MERGED_BATCH_SIZE must be 1, 2, or 5" >&2
+    echo "MERGED_BATCH_SIZE must be 1, 2, 5, or 8" >&2
     exit 2
     ;;
 esac

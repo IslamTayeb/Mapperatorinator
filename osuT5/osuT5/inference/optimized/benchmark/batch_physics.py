@@ -42,8 +42,8 @@ class BatchPhysicsPlan:
             "b1_lane_counts": list(self.b1_lane_counts),
             "result_class": self.result_class.value,
             "status": "merged_one_token_verifier_only",
-            "implemented_merged_one_token_batch_sizes": [1, 2, 5],
-            "planned_merged_batch_sizes": [8],
+            "implemented_merged_one_token_batch_sizes": [1, 2, 5, 8],
+            "planned_merged_batch_sizes": [],
             "lane_pool_status": "execution_not_implemented",
             "required_observation_fields": [
                 "execution_family",

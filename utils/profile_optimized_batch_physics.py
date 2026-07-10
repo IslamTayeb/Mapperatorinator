@@ -67,8 +67,9 @@ def main(argv: list[str] | None = None) -> int:
     else:
         raise RuntimeError(
             "This schema CLI does not execute CUDA. Use "
-            "utils/verify_optimized_merged_one_token.py for the staged B=1 -> B=2 -> B=5 "
-            "merged one-token verifier. B=8 and independent B1 lane pools remain unimplemented."
+            "utils/verify_optimized_merged_one_token.py for the staged "
+            "B=1 -> B=2 -> B=5 -> B=8 merged one-token verifier. "
+            "Independent B1 lane pools remain unimplemented."
         )
     rendered = json.dumps(payload, indent=2, sort_keys=True)
     if args.output_json is not None:

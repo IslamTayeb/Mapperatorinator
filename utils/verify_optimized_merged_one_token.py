@@ -25,6 +25,7 @@ from osuT5.osuT5.inference.optimized.batch.merged_one_token import (
     MergedOneTokenConfig,
     resolve_row_seeds,
     run_merged_one_token_gate,
+    summarize_previous_gate_scaling,
     validate_previous_gate,
 )
 from osuT5.osuT5.inference.server import get_eos_token_id
@@ -70,7 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config-name", default="profile_salvalai_smoke15")
     parser.add_argument("--sequence-index", type=int, default=9)
-    parser.add_argument("--batch-size", type=int, choices=(1, 2, 5), required=True)
+    parser.add_argument("--batch-size", type=int, choices=(1, 2, 5, 8), required=True)
     parser.add_argument("--previous-gate-report", type=Path)
     parser.add_argument("--report-path", type=Path, required=True)
     parser.add_argument("--row-seed", action="append", type=int, default=[])
@@ -253,6 +254,26 @@ def main(argv: list[str] | None = None) -> int:
             config=gate_config,
             runtime_metadata=runtime_metadata,
         )
+    report["exactness_pass"] = bool(report["pass"])
+    if previous_report is not None:
+        previous_batch_size = int(previous_report["batch_size"])
+        previous_tps = float(
+            previous_report["timing"]["complete_wall_tokens_per_second"]
+        )
+        candidate_tps = float(report["timing"]["complete_wall_tokens_per_second"])
+        report["previous_gate_scaling"] = summarize_previous_gate_scaling(
+            previous_batch_size=previous_batch_size,
+            previous_tokens_per_second=previous_tps,
+            candidate_batch_size=cli.batch_size,
+            candidate_tokens_per_second=candidate_tps,
+        )
+        report["performance_gate_pass"] = bool(
+            report["previous_gate_scaling"]["clears_five_percent_gain_gate"]
+        )
+        report["pass"] = bool(report["exactness_pass"] and report["performance_gate_pass"])
+    else:
+        report["previous_gate_scaling"] = None
+        report["performance_gate_pass"] = True
     report["total_wall_seconds"] = time.perf_counter() - total_started
     report["previous_gate_report"] = (
         str(cli.previous_gate_report.resolve())

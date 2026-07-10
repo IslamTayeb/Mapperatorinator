@@ -45,8 +45,8 @@ class MergedOneTokenConfig:
     active_prefix_decode_length: int | None = None
 
     def __post_init__(self) -> None:
-        if self.batch_size not in {1, 2, 5}:
-            raise ValueError("real merged one-token gates currently support B=1, B=2, or B=5.")
+        if self.batch_size not in {1, 2, 5, 8}:
+            raise ValueError("real merged one-token gates support B=1, B=2, B=5, or B=8.")
         if len(self.seeds) != self.batch_size:
             raise ValueError("seeds must contain exactly one private seed per batch row.")
         if any(not isinstance(seed, int) or isinstance(seed, bool) for seed in self.seeds):
@@ -176,9 +176,9 @@ def validate_previous_gate(batch_size: int, report: Mapping[str, Any] | None) ->
         if report is not None:
             raise ValueError("B=1 is the first gate and must not receive a previous report.")
         return
-    expected_previous = {2: 1, 5: 2}.get(batch_size)
+    expected_previous = {2: 1, 5: 2, 8: 5}.get(batch_size)
     if expected_previous is None:
-        raise ValueError("real merged one-token gates currently stop at B=5.")
+        raise ValueError("real merged one-token gates currently stop at B=8.")
     if report is None:
         raise ValueError(f"B={batch_size} requires a passed B={expected_previous} report.")
     if not bool(report.get("pass")):
@@ -195,6 +195,35 @@ def validate_previous_gate(batch_size: int, report: Mapping[str, Any] | None) ->
         raise ValueError("previous report is not a merged-batch observation.")
     if int(observation.get("parallelism", -1)) != expected_previous:
         raise ValueError("previous observation parallelism does not match its batch gate.")
+
+
+def summarize_previous_gate_scaling(
+        *,
+        previous_batch_size: int,
+        previous_tokens_per_second: float,
+        candidate_batch_size: int,
+        candidate_tokens_per_second: float,
+) -> dict[str, Any]:
+    """Apply the five-percent gate and report loss from ideal scaled capacity."""
+
+    if previous_batch_size <= 0 or candidate_batch_size <= previous_batch_size:
+        raise ValueError("candidate_batch_size must be greater than a positive previous batch size.")
+    if previous_tokens_per_second <= 0 or candidate_tokens_per_second <= 0:
+        raise ValueError("throughput values must be positive.")
+    relative_gain = candidate_tokens_per_second / previous_tokens_per_second - 1.0
+    ideal_scaled_tps = (
+        previous_tokens_per_second * candidate_batch_size / previous_batch_size
+    )
+    return {
+        "previous_batch_size": previous_batch_size,
+        "candidate_batch_size": candidate_batch_size,
+        "previous_complete_wall_tokens_per_second": previous_tokens_per_second,
+        "candidate_complete_wall_tokens_per_second": candidate_tokens_per_second,
+        "relative_complete_throughput_gain": relative_gain,
+        "clears_five_percent_gain_gate": relative_gain >= 0.05,
+        "ideal_scaled_previous_capacity_tokens_per_second": ideal_scaled_tps,
+        "ideal_capacity_loss": candidate_tokens_per_second / ideal_scaled_tps - 1.0,
+    }
 
 
 def _tensor_sha256(value: torch.Tensor) -> str:
@@ -562,6 +591,16 @@ def run_merged_one_token_gate(
     complete_cuda_seconds = complete_start.elapsed_time(complete_end) / 1000.0
     peak_allocated = torch.cuda.max_memory_allocated(device)
     peak_reserved = torch.cuda.max_memory_reserved(device)
+    model_seconds_per_step = model_cuda_seconds / config.timing_repeats
+    complete_wall_seconds_per_step = complete_wall_seconds / config.timing_repeats
+    rowwise_sampling_host_overhead_seconds_per_step = max(
+        0.0,
+        complete_wall_seconds_per_step - model_seconds_per_step,
+    )
+    model_only_tokens_per_second = batch_size / model_seconds_per_step
+    complete_wall_tokens_per_second = (
+        batch_size * config.timing_repeats / complete_wall_seconds
+    )
 
     workload_contract = {
         "batch_size": batch_size,
@@ -649,14 +688,24 @@ def run_merged_one_token_gate(
             "timing_repeats": config.timing_repeats,
             "generated_tokens": batch_size * config.timing_repeats,
             "model_only_cuda_seconds": model_cuda_seconds,
-            "model_only_cuda_seconds_per_step": model_cuda_seconds / config.timing_repeats,
+            "model_only_cuda_seconds_per_step": model_seconds_per_step,
+            "model_only_tokens_per_second": model_only_tokens_per_second,
             "complete_sampled_step_wall_seconds": complete_wall_seconds,
+            "complete_sampled_step_wall_seconds_per_step": complete_wall_seconds_per_step,
             "complete_sampled_step_cuda_seconds": complete_cuda_seconds,
-            "complete_wall_tokens_per_second": (
-                batch_size * config.timing_repeats / complete_wall_seconds
-            ),
+            "complete_wall_tokens_per_second": complete_wall_tokens_per_second,
             "complete_cuda_tokens_per_second": (
                 batch_size * config.timing_repeats / complete_cuda_seconds
+            ),
+            "rowwise_sampling_host_overhead_seconds_per_step": (
+                rowwise_sampling_host_overhead_seconds_per_step
+            ),
+            "rowwise_sampling_host_overhead_fraction_of_complete_wall": (
+                rowwise_sampling_host_overhead_seconds_per_step
+                / complete_wall_seconds_per_step
+            ),
+            "complete_capacity_loss_vs_model_only": (
+                complete_wall_tokens_per_second / model_only_tokens_per_second - 1.0
             ),
         },
         "memory": {

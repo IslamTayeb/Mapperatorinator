@@ -12,6 +12,7 @@ from osuT5.osuT5.inference.optimized.batch.merged_one_token import (
     repeat_batch_kwargs,
     repeat_batch_tensor,
     resolve_row_seeds,
+    summarize_previous_gate_scaling,
     validate_previous_gate,
 )
 
@@ -68,15 +69,15 @@ def test_row_seed_resolution_and_config_reject_ungraduated_shapes():
     _assert_raises(
         ValueError,
         lambda: MergedOneTokenConfig(
-            batch_size=8,
-            seeds=(1,) * 8,
+            batch_size=3,
+            seeds=(1,) * 3,
             do_sample=True,
         ),
-        "currently support B=1, B=2, or B=5",
+        "support B=1, B=2, B=5, or B=8",
     )
 
 
-def test_previous_gate_enforces_b1_then_b2_then_b5():
+def test_previous_gate_enforces_b1_then_b2_then_b5_then_b8():
     b1_report = {
         "pass": True,
         "batch_size": 1,
@@ -87,10 +88,16 @@ def test_previous_gate_enforces_b1_then_b2_then_b5():
         "batch_size": 2,
         "observation": {"execution_family": "merged_batch", "parallelism": 2},
     }
+    b5_report = {
+        "pass": True,
+        "batch_size": 5,
+        "observation": {"execution_family": "merged_batch", "parallelism": 5},
+    }
 
     validate_previous_gate(1, None)
     validate_previous_gate(2, b1_report)
     validate_previous_gate(5, b2_report)
+    validate_previous_gate(8, b5_report)
     _assert_raises(
         ValueError,
         lambda: validate_previous_gate(5, b1_report),
@@ -102,6 +109,27 @@ def test_previous_gate_enforces_b1_then_b2_then_b5():
         lambda: validate_previous_gate(2, failed),
         "did not pass",
     )
+
+
+def test_previous_gate_scaling_applies_keep_bar_and_ideal_capacity_loss():
+    passing = summarize_previous_gate_scaling(
+        previous_batch_size=5,
+        previous_tokens_per_second=300.0,
+        candidate_batch_size=8,
+        candidate_tokens_per_second=420.0,
+    )
+    below_bar = summarize_previous_gate_scaling(
+        previous_batch_size=5,
+        previous_tokens_per_second=300.0,
+        candidate_batch_size=8,
+        candidate_tokens_per_second=312.0,
+    )
+
+    assert passing["clears_five_percent_gain_gate"] is True
+    assert abs(passing["relative_complete_throughput_gain"] - 0.4) < 1e-12
+    assert passing["ideal_scaled_previous_capacity_tokens_per_second"] == 480.0
+    assert passing["ideal_capacity_loss"] == -0.125
+    assert below_bar["clears_five_percent_gain_gate"] is False
 
 
 def test_decode_session_prefill_allocates_cache_for_prompt_batch_size():
