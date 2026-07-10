@@ -24,7 +24,10 @@ from osuT5.osuT5.inference.optimized.single.session import (
     decode_one_token_raw_logits,
     prefill_static_cache,
 )
-from osuT5.osuT5.inference.server import build_logits_processor_list, get_eos_token_id
+from osuT5.osuT5.inference.server import get_eos_token_id
+from osuT5.osuT5.inference.optimized.single.logits import (
+    build_single_logits_processor_list as build_logits_processor_list,
+)
 from osuT5.osuT5.runtime_profiling import generation_profile_context
 from osuT5.osuT5.tokenizer import ContextType
 

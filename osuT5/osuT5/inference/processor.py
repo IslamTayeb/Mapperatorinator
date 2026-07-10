@@ -13,6 +13,7 @@ from tqdm import tqdm
 
 from config import InferenceConfig
 from .engine_binding import unwrap_engine_binding
+from .legacy_single_adapter import load_legacy_optimized_single_runtime
 from .profiler import InferenceProfiler
 from .server import InferenceClient, model_generate, model_forward
 from ..dataset.osu_parser import OsuParser
@@ -81,6 +82,8 @@ class Processor(object):
     ):
         """Model inference stage that processes sequences."""
         model, self.inference_runtime = unwrap_engine_binding(model)
+        if self.inference_runtime is None:
+            self.inference_runtime = load_legacy_optimized_single_runtime(args)
 
         self.device = args.device
         self.precision = args.precision

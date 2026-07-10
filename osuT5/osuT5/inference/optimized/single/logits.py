@@ -3,9 +3,22 @@
 from __future__ import annotations
 
 import torch
+from transformers import (
+    ClassifierFreeGuidanceLogitsProcessor,
+    LogitsProcessorList,
+    TemperatureLogitsWarper,
+)
+
+from ....event import EventType
 
 from ...logit_processors import (
+    ConditionalTemperatureLogitsWarper,
+    LookbackBiasLogitsWarper,
     MonotonicTimeShiftLogitsProcessor as _V32MonotonicTimeShiftLogitsProcessor,
+    TimeshiftBias,
+    get_beat_type_tokens,
+    get_mania_type_tokens,
+    get_scroll_speed_tokens,
 )
 
 
@@ -110,3 +123,77 @@ class MonotonicTimeShiftLogitsProcessor(_V32MonotonicTimeShiftLogitsProcessor):
                 device=device,
             )
         return self._time_shift_offsets_by_device[device]
+
+
+def build_single_logits_processor_list(
+    tokenizer,
+    *,
+    cfg_scale: float = 1.0,
+    timeshift_bias: float = 0.0,
+    types_first: bool = False,
+    temperature: float = 1.0,
+    timing_temperature: float | None = None,
+    mania_column_temperature: float | None = None,
+    taiko_hit_temperature: float | None = None,
+    lookback_time: float = 0.0,
+    device=None,
+    stateful_monotonic: bool = True,
+) -> LogitsProcessorList:
+    timing_temperature = (
+        temperature if timing_temperature is None else timing_temperature
+    )
+    mania_column_temperature = (
+        temperature
+        if mania_column_temperature is None
+        else mania_column_temperature
+    )
+    taiko_hit_temperature = (
+        temperature if taiko_hit_temperature is None else taiko_hit_temperature
+    )
+    device = device if device is not None else getattr(tokenizer, "device", None)
+
+    processors = LogitsProcessorList()
+    if cfg_scale > 1.0:
+        processors.append(ClassifierFreeGuidanceLogitsProcessor(cfg_scale))
+    if stateful_monotonic:
+        processors.append(
+            MonotonicTimeShiftLogitsProcessor(
+                tokenizer,
+                stateful_batch1=True,
+            )
+        )
+    else:
+        processors.append(_V32MonotonicTimeShiftLogitsProcessor(tokenizer))
+    if timeshift_bias != 0:
+        processors.append(
+            TimeshiftBias(
+                timeshift_bias,
+                tokenizer.event_start[EventType.TIME_SHIFT],
+                tokenizer.event_end[EventType.TIME_SHIFT],
+            )
+        )
+    if types_first:
+        processors.append(
+            ConditionalTemperatureLogitsWarper(
+                temperature,
+                timing_temperature,
+                mania_column_temperature,
+                taiko_hit_temperature,
+                types_first,
+                get_beat_type_tokens(tokenizer),
+                get_mania_type_tokens(tokenizer),
+                get_scroll_speed_tokens(tokenizer),
+            )
+        )
+    else:
+        processors.append(TemperatureLogitsWarper(temperature))
+    if lookback_time > 0:
+        processors.append(
+            LookbackBiasLogitsWarper(
+                lookback_time,
+                tokenizer,
+                types_first,
+                device,
+            )
+        )
+    return processors

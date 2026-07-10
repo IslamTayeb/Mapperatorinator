@@ -5,7 +5,6 @@ import threading
 import traceback
 import torch
 from dataclasses import dataclass, field
-from functools import partial
 from multiprocessing.connection import Listener, Client
 from typing import Any
 
@@ -152,17 +151,12 @@ def build_logits_processor_list(
         logits_processor_list.append(ClassifierFreeGuidanceLogitsProcessor(cfg_scale))
 
     if stateful_monotonic:
-        from .optimized.single.logits import (
-            MonotonicTimeShiftLogitsProcessor as StatefulMonotonicTimeShiftLogitsProcessor,
+        raise ValueError(
+            "stateful monotonic processing is owned by optimized single "
+            "inference; use inference_engine=optimized or the complete accepted "
+            "legacy bundle."
         )
-
-        monotonic_processor = StatefulMonotonicTimeShiftLogitsProcessor(
-            tokenizer,
-            stateful_batch1=True,
-        )
-    else:
-        monotonic_processor = MonotonicTimeShiftLogitsProcessor(tokenizer)
-    logits_processor_list.append(monotonic_processor)
+    logits_processor_list.append(MonotonicTimeShiftLogitsProcessor(tokenizer))
 
     if timeshift_bias != 0:
         logits_processor_list.append(
@@ -220,37 +214,33 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     profile_generation_detail_ranges = bool(generate_kwargs.pop('profile_generation_detail_ranges', False))
     profile_active_prefix_decode_diagnostics = bool(generate_kwargs.pop('profile_active_prefix_decode_diagnostics', False))
     profile_sdpa_backend = generate_kwargs.pop('profile_sdpa_backend', None)
-    active_prefix_decode_loop = bool(generate_kwargs.pop('active_prefix_decode_loop', False))
-    active_prefix_decode_bucket_size = int(generate_kwargs.pop('active_prefix_decode_bucket_size', 128))
-    active_prefix_decode_cuda_graph = bool(generate_kwargs.pop('active_prefix_decode_cuda_graph', False))
-    active_prefix_decode_cuda_graph_warmup = int(generate_kwargs.pop('active_prefix_decode_cuda_graph_warmup', 0))
-    active_prefix_decode_cuda_graph_min_decode_steps = int(
-        generate_kwargs.pop('active_prefix_decode_cuda_graph_min_decode_steps', 1)
-    )
-    stateful_monotonic_logits_processor = bool(
-        generate_kwargs.pop('stateful_monotonic_logits_processor', False)
-    )
-    q1_bmm_cross_attention = bool(generate_kwargs.pop('q1_bmm_cross_attention', False))
-    native_q1_self_attention_requested = bool(generate_kwargs.pop('native_q1_self_attention', False))
-    native_q1_rope_cache_self_attention_requested = bool(
-        generate_kwargs.pop('native_q1_rope_cache_self_attention', False)
-    )
+    optimized_defaults = {
+        'active_prefix_decode_loop': False,
+        'active_prefix_decode_bucket_size': 128,
+        'active_prefix_decode_cuda_graph': False,
+        'active_prefix_decode_cuda_graph_warmup': 0,
+        'active_prefix_decode_cuda_graph_min_decode_steps': 1,
+        'stateful_monotonic_logits_processor': False,
+        'q1_bmm_cross_attention': False,
+        'native_q1_self_attention': False,
+        'native_q1_rope_cache_self_attention': False,
+        'decode_session_cuda_graph': False,
+    }
+    changed_optimized_options = [
+        name
+        for name, default in optimized_defaults.items()
+        if generate_kwargs.pop(name, default) != default
+    ]
     decode_session_state = generate_kwargs.pop('decode_session_state', None)
-    decode_session_cuda_graph = bool(generate_kwargs.pop('decode_session_cuda_graph', False))
+    if changed_optimized_options or decode_session_state is not None:
+        raise ValueError(
+            "Optimized generation state is no longer implemented in server.py; "
+            "use inference_engine=optimized or the complete accepted legacy "
+            "bundle through Processor. Changed options: "
+            + ", ".join(changed_optimized_options or ["decode_session_state"])
+        )
     if context_type is not None:
         context_type = ContextType(context_type)  # Convert to ContextType enum
-    if native_q1_rope_cache_self_attention_requested and not native_q1_self_attention_requested:
-        raise ValueError("native_q1_rope_cache_self_attention requires native_q1_self_attention.")
-    if native_q1_rope_cache_self_attention_requested and not active_prefix_decode_loop:
-        raise ValueError("native_q1_rope_cache_self_attention requires active_prefix_decode_loop.")
-    native_q1_self_attention = (
-        native_q1_self_attention_requested
-        and context_type != ContextType.TIMING
-    )
-    native_q1_rope_cache_self_attention = (
-        native_q1_rope_cache_self_attention_requested
-        and native_q1_self_attention
-    )
 
     # Create the logits processors
     logits_processor_list = build_logits_processor_list(
@@ -264,76 +254,17 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         taiko_hit_temperature=taiko_hit_temperature,
         lookback_time=lookback_time,
         device=model.device,
-        stateful_monotonic=stateful_monotonic_logits_processor,
+        stateful_monotonic=False,
     )
 
     # Prepare cache
-    if decode_session_state is None:
-        cache = get_cache(
-            model,
-            batch_size,
-            generate_kwargs.get('num_beams', 1),
-            cfg_scale,
-        )
-    else:
-        cache_for_window = getattr(decode_session_state, "cache_for_window", None)
-        if not callable(cache_for_window):
-            raise TypeError(
-                "decode_session_state must be an optimized single "
-                "ProductionDecodeSession."
-            )
-        cache = cache_for_window(
-            model,
-            batch_size=batch_size,
-            num_beams=generate_kwargs.get('num_beams', 1),
-            cfg_scale=cfg_scale,
-        )
-    pad_token_id = generate_kwargs.get('pad_token_id', getattr(tokenizer, 'pad_id', None))
-    if active_prefix_decode_cuda_graph and not active_prefix_decode_loop:
-        raise ValueError("active_prefix_decode_cuda_graph requires active_prefix_decode_loop.")
-    if active_prefix_decode_loop:
-        if batch_size != 1:
-            raise ValueError("active_prefix_decode_loop currently supports batch_size=1 only.")
-        if cfg_scale != 1.0:
-            raise ValueError("active_prefix_decode_loop currently does not support classifier-free guidance.")
-        if int(generate_kwargs.get('num_beams', 1)) != 1:
-            raise ValueError("active_prefix_decode_loop currently supports num_beams=1 only.")
-        if active_prefix_decode_bucket_size <= 0:
-            raise ValueError("active_prefix_decode_bucket_size must be positive.")
-        if active_prefix_decode_cuda_graph_min_decode_steps <= 0:
-            raise ValueError("active_prefix_decode_cuda_graph_min_decode_steps must be positive.")
-    if decode_session_state is not None:
-        if not active_prefix_decode_loop:
-            raise ValueError("decode_session_state requires active_prefix_decode_loop.")
-        if not active_prefix_decode_cuda_graph or not decode_session_cuda_graph:
-            raise ValueError("decode_session_state currently requires active-prefix CUDA graph replay.")
-    active_prefix_decode_diagnostics = (
-        {
-            "enabled": True,
-            "decode_steps": 0,
-            "bucket_lengths_seen": [],
-            "bucket_transition_count": 0,
-        }
-        if active_prefix_decode_loop and profile_active_prefix_decode_diagnostics
-        else None
+    cache = get_cache(
+        model,
+        batch_size,
+        generate_kwargs.get('num_beams', 1),
+        cfg_scale,
     )
-    custom_generate = None
-    if active_prefix_decode_loop:
-        from .optimized.single.decode_loop import active_prefix_decode_generate
-
-        custom_generate = partial(
-            active_prefix_decode_generate,
-            active_prefix_bucket_size=active_prefix_decode_bucket_size,
-            cuda_graph_forward=active_prefix_decode_cuda_graph,
-            cuda_graph_warmup=active_prefix_decode_cuda_graph_warmup,
-            cuda_graph_min_decode_steps=active_prefix_decode_cuda_graph_min_decode_steps,
-            active_prefix_decode_diagnostics=active_prefix_decode_diagnostics,
-            **(
-                decode_session_state.active_prefix_decode_kwargs()
-                if decode_session_state is not None and decode_session_cuda_graph
-                else {}
-            ),
-        )
+    pad_token_id = generate_kwargs.get('pad_token_id', getattr(tokenizer, 'pad_id', None))
 
     # Perform batched generation
     generate_start_event = generate_end_event = None
@@ -342,9 +273,6 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
             generation_profile_context(
                 detail_ranges=profile_generation_detail_ranges,
                 sdpa_backend=profile_sdpa_backend,
-                q1_bmm_cross_attention=q1_bmm_cross_attention,
-                native_q1_self_attention=native_q1_self_attention,
-                native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
             ):
         if sync_model_timing:
             _sync_cuda_for_model(model)
@@ -365,7 +293,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
             past_key_values=cache,
             logits_processor=logits_processor_list,
             eos_token_id=get_eos_token_id(tokenizer, lookback_time=lookback_time, lookahead_time=lookahead_time, context_type=context_type),
-            custom_generate=custom_generate,
+            custom_generate=None,
         )
         if generate_end_event is not None:
             generate_end_event.record()
@@ -396,41 +324,23 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         "profile_generation_detail_ranges": profile_generation_detail_ranges,
         "profile_active_prefix_decode_diagnostics": profile_active_prefix_decode_diagnostics,
         "profile_sdpa_backend": profile_sdpa_backend,
-        "stateful_monotonic_logits_processor": stateful_monotonic_logits_processor,
-        "q1_bmm_cross_attention_enabled": q1_bmm_cross_attention,
-        "native_q1_self_attention_requested": native_q1_self_attention_requested,
-        "native_q1_self_attention_enabled": native_q1_self_attention,
-        "native_q1_self_attention_disabled_reason": (
-            "timing_context"
-            if native_q1_self_attention_requested and not native_q1_self_attention
-            else None
-        ),
-        "native_q1_rope_cache_self_attention_requested": native_q1_rope_cache_self_attention_requested,
-        "native_q1_rope_cache_self_attention_enabled": native_q1_rope_cache_self_attention,
-        "native_q1_rope_cache_self_attention_disabled_reason": (
-            "timing_context"
-            if native_q1_rope_cache_self_attention_requested and not native_q1_rope_cache_self_attention
-            else None
-        ),
-        "decode_session_runtime_enabled": decode_session_state is not None,
-        "decode_session_cuda_graph_enabled": bool(decode_session_cuda_graph),
-        "decode_session_graph_count": (
-            decode_session_state.graph_count
-            if decode_session_state is not None
-            else None
-        ),
-        "active_prefix_decode_loop_enabled": active_prefix_decode_loop,
-        "active_prefix_decode_bucket_size": active_prefix_decode_bucket_size if active_prefix_decode_loop else None,
-        "active_prefix_decode_cuda_graph_enabled": active_prefix_decode_cuda_graph if active_prefix_decode_loop else False,
-        "active_prefix_decode_cuda_graph_warmup": (
-            active_prefix_decode_cuda_graph_warmup if active_prefix_decode_cuda_graph else None
-        ),
-        "active_prefix_decode_cuda_graph_min_decode_steps": (
-            active_prefix_decode_cuda_graph_min_decode_steps if active_prefix_decode_cuda_graph else None
-        ),
+        "stateful_monotonic_logits_processor": False,
+        "q1_bmm_cross_attention_enabled": False,
+        "native_q1_self_attention_requested": False,
+        "native_q1_self_attention_enabled": False,
+        "native_q1_self_attention_disabled_reason": None,
+        "native_q1_rope_cache_self_attention_requested": False,
+        "native_q1_rope_cache_self_attention_enabled": False,
+        "native_q1_rope_cache_self_attention_disabled_reason": None,
+        "decode_session_runtime_enabled": False,
+        "decode_session_cuda_graph_enabled": False,
+        "decode_session_graph_count": None,
+        "active_prefix_decode_loop_enabled": False,
+        "active_prefix_decode_bucket_size": None,
+        "active_prefix_decode_cuda_graph_enabled": False,
+        "active_prefix_decode_cuda_graph_warmup": None,
+        "active_prefix_decode_cuda_graph_min_decode_steps": None,
     })
-    if active_prefix_decode_diagnostics is not None:
-        stats["active_prefix_decode_diagnostics"] = active_prefix_decode_diagnostics
 
     return result, stats
 

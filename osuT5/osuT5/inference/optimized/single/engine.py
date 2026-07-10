@@ -8,26 +8,13 @@ from functools import partial
 from typing import Any
 
 import torch
-from transformers import (
-    ClassifierFreeGuidanceLogitsProcessor,
-    LogitsProcessorList,
-    TemperatureLogitsWarper,
-)
 
 from ....event import ContextType, EventType
 from ....runtime_profiling import generation_profile_context
 from ...engine_binding import InferenceEngineBinding
-from ...logit_processors import (
-    ConditionalTemperatureLogitsWarper,
-    LookbackBiasLogitsWarper,
-    TimeshiftBias,
-    get_beat_type_tokens,
-    get_mania_type_tokens,
-    get_scroll_speed_tokens,
-)
 from .config import ACCEPTED_OPTIMIZED_SINGLE_CONFIG, OptimizedSingleConfig
 from .decode_loop import active_prefix_decode_generate
-from .logits import MonotonicTimeShiftLogitsProcessor
+from .logits import build_single_logits_processor_list
 from .state import ProductionDecodeSession
 
 
@@ -147,50 +134,20 @@ def _build_logits_processor_list(
     taiko_hit_temperature: float,
     lookback_time: float,
     device,
-) -> LogitsProcessorList:
-    processors = LogitsProcessorList()
-    if cfg_scale > 1.0:
-        processors.append(ClassifierFreeGuidanceLogitsProcessor(cfg_scale))
-
-    processors.append(
-        MonotonicTimeShiftLogitsProcessor(
-            tokenizer,
-            stateful_batch1=True,
-        )
+):
+    return build_single_logits_processor_list(
+        tokenizer,
+        cfg_scale=cfg_scale,
+        timeshift_bias=timeshift_bias,
+        types_first=types_first,
+        temperature=temperature,
+        timing_temperature=timing_temperature,
+        mania_column_temperature=mania_column_temperature,
+        taiko_hit_temperature=taiko_hit_temperature,
+        lookback_time=lookback_time,
+        device=device,
+        stateful_monotonic=True,
     )
-    if timeshift_bias != 0:
-        processors.append(
-            TimeshiftBias(
-                timeshift_bias,
-                tokenizer.event_start[EventType.TIME_SHIFT],
-                tokenizer.event_end[EventType.TIME_SHIFT],
-            )
-        )
-    if types_first:
-        processors.append(
-            ConditionalTemperatureLogitsWarper(
-                temperature,
-                timing_temperature,
-                mania_column_temperature,
-                taiko_hit_temperature,
-                types_first,
-                get_beat_type_tokens(tokenizer),
-                get_mania_type_tokens(tokenizer),
-                get_scroll_speed_tokens(tokenizer),
-            )
-        )
-    else:
-        processors.append(TemperatureLogitsWarper(temperature))
-    if lookback_time > 0:
-        processors.append(
-            LookbackBiasLogitsWarper(
-                lookback_time,
-                tokenizer,
-                types_first,
-                device,
-            )
-        )
-    return processors
 
 
 def _sync_cuda_for_model(model) -> None:

@@ -31,6 +31,10 @@ from osuT5.osuT5.dataset.data_utils import events_of_type, TIMING_TYPES, merge_e
 from osuT5.osuT5.inference import Preprocessor, Processor, Postprocessor, BeatmapConfig, GenerationConfig, \
     generation_config_from_beatmap, beatmap_config_from_beatmap, background_line
 from osuT5.osuT5.inference.profiler import InferenceProfiler
+from osuT5.osuT5.inference.legacy_single_adapter import (
+    legacy_optimized_single_profile_metadata,
+    validate_legacy_optimized_single,
+)
 from osuT5.osuT5.inference.server import InferenceClient
 from osuT5.osuT5.inference.super_timing_generator import SuperTimingGenerator
 from osuT5.osuT5.model import Mapperatorinator
@@ -529,6 +533,8 @@ def validate_reserved_runtime_flags(args: InferenceConfig):
             "is validated."
         )
 
+    validate_legacy_optimized_single(args)
+
     def require_simple_sequential(flag_name: str) -> None:
         if args.use_server:
             raise ValueError(f"{flag_name} requires use_server=false.")
@@ -801,6 +807,7 @@ def generate(
         "in_context": [context.value for context in args.in_context],
         "output_type": [context.value for context in args.output_type],
     }
+    profile_metadata.update(legacy_optimized_single_profile_metadata(args))
     binding_runtime = getattr(model, "runtime", None)
     runtime_profile_metadata = getattr(binding_runtime, "profile_metadata", None)
     if callable(runtime_profile_metadata):

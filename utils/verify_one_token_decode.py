@@ -238,7 +238,17 @@ def _condition_kwargs(model_inputs: dict[str, Any]) -> dict[str, Any]:
 
 
 def _build_generation_logits_processors(args: InferenceConfig, tokenizer, device, *, lookback_time: float):
-    return build_logits_processor_list(
+    stateful_monotonic = bool(
+        getattr(args, "inference_stateful_monotonic_logits_processor", False)
+    )
+    builder = build_logits_processor_list
+    if stateful_monotonic:
+        from osuT5.osuT5.inference.optimized.single.logits import (
+            build_single_logits_processor_list,
+        )
+
+        builder = build_single_logits_processor_list
+    return builder(
         tokenizer,
         cfg_scale=args.cfg_scale,
         timeshift_bias=args.timeshift_bias,
@@ -249,7 +259,7 @@ def _build_generation_logits_processors(args: InferenceConfig, tokenizer, device
         taiko_hit_temperature=args.taiko_hit_temperature,
         lookback_time=lookback_time,
         device=device,
-        stateful_monotonic=bool(getattr(args, "inference_stateful_monotonic_logits_processor", False)),
+        stateful_monotonic=stateful_monotonic,
     )
 
 
