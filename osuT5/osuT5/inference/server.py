@@ -16,7 +16,6 @@ from .logit_processors import ConditionalTemperatureLogitsWarper, get_beat_type_
     get_mania_type_tokens, get_scroll_speed_tokens, TimeshiftBias, LookbackBiasLogitsWarper, \
     MonotonicTimeShiftLogitsProcessor
 from .cache_utils import MapperatorinatorCache, get_cache
-from .decode_loop import active_prefix_decode_generate
 from .generation_compatibility import generation_compatibility_key
 from ..runtime_profiling import generation_profile_context
 from ..model import Mapperatorinator
@@ -325,6 +324,28 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         if active_prefix_decode_loop and profile_active_prefix_decode_diagnostics
         else None
     )
+    custom_generate = None
+    if active_prefix_decode_loop:
+        from .optimized.single.decode_loop import active_prefix_decode_generate
+
+        custom_generate = partial(
+            active_prefix_decode_generate,
+            active_prefix_bucket_size=active_prefix_decode_bucket_size,
+            cuda_graph_forward=active_prefix_decode_cuda_graph,
+            cuda_graph_warmup=active_prefix_decode_cuda_graph_warmup,
+            cuda_graph_min_decode_steps=active_prefix_decode_cuda_graph_min_decode_steps,
+            active_prefix_decode_diagnostics=active_prefix_decode_diagnostics,
+            shared_graph_cache=(
+                decode_session_state.get("graph_cache")
+                if decode_session_state is not None and decode_session_cuda_graph
+                else None
+            ),
+            stable_encoder_holder=(
+                decode_session_state.get("stable_encoder_holder")
+                if decode_session_state is not None and decode_session_cuda_graph
+                else None
+            ),
+        )
 
     # Perform batched generation
     generate_start_event = generate_end_event = None
@@ -356,24 +377,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
             past_key_values=cache,
             logits_processor=logits_processor_list,
             eos_token_id=get_eos_token_id(tokenizer, lookback_time=lookback_time, lookahead_time=lookahead_time, context_type=context_type),
-            custom_generate=partial(
-                active_prefix_decode_generate,
-                active_prefix_bucket_size=active_prefix_decode_bucket_size,
-                cuda_graph_forward=active_prefix_decode_cuda_graph,
-                cuda_graph_warmup=active_prefix_decode_cuda_graph_warmup,
-                cuda_graph_min_decode_steps=active_prefix_decode_cuda_graph_min_decode_steps,
-                active_prefix_decode_diagnostics=active_prefix_decode_diagnostics,
-                shared_graph_cache=(
-                    decode_session_state.get("graph_cache")
-                    if decode_session_state is not None and decode_session_cuda_graph
-                    else None
-                ),
-                stable_encoder_holder=(
-                    decode_session_state.get("stable_encoder_holder")
-                    if decode_session_state is not None and decode_session_cuda_graph
-                    else None
-                ),
-            ) if active_prefix_decode_loop else None,
+            custom_generate=custom_generate,
         )
         if generate_end_event is not None:
             generate_end_event.record()
