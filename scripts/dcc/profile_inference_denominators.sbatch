@@ -39,11 +39,22 @@ if [[ -n "$(git -C "$REPO" status --porcelain)" ]]; then
   exit 2
 fi
 
-mkdir -p "$WORK/logs" "$WORK/tmp" "$WORK/cache" "$WORK/torch_extensions" "$RUN_ROOT"
+mkdir -p \
+  "$WORK/logs" \
+  "$WORK/tmp" \
+  "$WORK/cache" \
+  "$WORK/cache/torch_inductor" \
+  "$WORK/cache/triton" \
+  "$WORK/cache/cuda" \
+  "$WORK/torch_extensions" \
+  "$RUN_ROOT"
 export PATH="$ENV/bin:$PATH"
 export XDG_CACHE_HOME="$WORK/cache"
 export HF_HOME="$WORK/cache/huggingface"
 export TRANSFORMERS_CACHE="$WORK/cache/huggingface"
+export TORCHINDUCTOR_CACHE_DIR="$WORK/cache/torch_inductor"
+export TRITON_CACHE_DIR="$WORK/cache/triton"
+export CUDA_CACHE_PATH="$WORK/cache/cuda"
 export TMPDIR="$WORK/tmp"
 export TOKENIZERS_PARALLELISM=false
 export TORCH_EXTENSIONS_DIR="$WORK/torch_extensions"
@@ -59,8 +70,12 @@ echo "cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-unset}"
 echo "torch_extensions_dir=$TORCH_EXTENSIONS_DIR"
 echo "torch_extensions_policy=shared_prebuilt"
 echo "torch_extensions_entries=$(find "$TORCH_EXTENSIONS_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
-echo "inductor_cache_dir=${TORCHINDUCTOR_CACHE_DIR:-$XDG_CACHE_HOME/torch/inductor}"
-echo "triton_cache_dir=${TRITON_CACHE_DIR:-unset}"
+echo "inductor_cache_dir=$TORCHINDUCTOR_CACHE_DIR"
+echo "inductor_cache_entries=$(find "$TORCHINDUCTOR_CACHE_DIR" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)"
+echo "triton_cache_dir=$TRITON_CACHE_DIR"
+echo "triton_cache_entries=$(find "$TRITON_CACHE_DIR" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)"
+echo "cuda_cache_path=$CUDA_CACHE_PATH"
+echo "cuda_cache_entries=$(find "$CUDA_CACHE_PATH" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)"
 nvidia-smi -L
 nvidia-smi --query-gpu=timestamp,uuid,utilization.gpu,memory.used,memory.total,power.draw,clocks.sm,temperature.gpu --format=csv -l 1 > "$TELEMETRY" &
 SMI_PID=$!

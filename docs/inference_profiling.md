@@ -46,7 +46,13 @@ export TMPDIR="$WORK/tmp"
 export TOKENIZERS_PARALLELISM=false
 ```
 
-Keep model/Hugging Face cache state identical across a comparison. If a claim includes compiler/native cold start, isolate and record `TORCH_EXTENSIONS_DIR`; otherwise use the same persistent extension cache for baseline and candidate and report whether it was prebuilt.
+Keep model/Hugging Face cache state identical across a comparison. Set and
+record persistent `TORCHINDUCTOR_CACHE_DIR`, `TRITON_CACHE_DIR`, and
+`CUDA_CACHE_PATH` explicitly; an unset compiler cache can silently become
+node-local and make the first timing window look like a runtime regression. If
+a claim includes compiler/native cold start, isolate and record
+`TORCH_EXTENSIONS_DIR`; otherwise use the same persistent extension cache for
+baseline and candidate and report whether it was prebuilt.
 
 Every run note must record:
 
