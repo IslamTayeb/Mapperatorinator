@@ -635,6 +635,7 @@ def run_one_lane_gate(
     candidate_complete_tokens: list[int] = []
     reference_complete_rng_hash: str | None = None
     candidate_complete_rng_hash: str | None = None
+    timed_complete_rng_hash: str | None = None
     workload_contract: dict[str, Any] | None = None
     observation = None
     if timing is not None:
@@ -670,9 +671,36 @@ def run_one_lane_gate(
             reference_complete_generator.get_state()
         )
 
+        candidate_exact_processor = logits_processor_factory()
+        candidate_exact_generator = _new_generator(device, seed)
+        candidate_complete_token_tensors: list[torch.Tensor] = []
+        with torch.cuda.stream(lane.stream):
+            for _ in range(gate_config.timing_repeats):
+                lane.graph.replay()
+                candidate_complete_token_tensors.append(_sample_next_token(
+                    input_ids=lane_full_prefix,
+                    raw_logits=lane.logits,
+                    logits_processor=candidate_exact_processor,
+                    generator=candidate_exact_generator,
+                    do_sample=bool(args.do_sample),
+                ))
+        lane.replay_count += gate_config.timing_repeats
+        lane.stream.synchronize()
+        candidate_complete_tokens = [
+            int(token.detach().cpu().item())
+            for token in candidate_complete_token_tensors
+        ]
+        candidate_complete_rng_hash = tensor_sha256(
+            candidate_exact_generator.get_state()
+        )
+        del reference_complete_token_tensors
+        del candidate_complete_token_tensors
+
         complete_processor = logits_processor_factory()
         complete_generator = _new_generator(device, seed)
-        candidate_complete_token_tensors: list[torch.Tensor] = []
+        torch.cuda.reset_peak_memory_stats(device)
+        complete_memory_before_allocated = torch.cuda.memory_allocated(device)
+        complete_memory_before_reserved = torch.cuda.memory_reserved(device)
         complete_start = torch.cuda.Event(enable_timing=True)
         complete_end = torch.cuda.Event(enable_timing=True)
         complete_wall_started = time.perf_counter()
@@ -680,27 +708,26 @@ def run_one_lane_gate(
             complete_start.record(lane.stream)
             for _ in range(gate_config.timing_repeats):
                 lane.graph.replay()
-                candidate_complete_token_tensors.append(_sample_next_token(
+                _sample_next_token(
                     input_ids=lane_full_prefix,
                     raw_logits=lane.logits,
                     logits_processor=complete_processor,
                     generator=complete_generator,
                     do_sample=bool(args.do_sample),
-                ))
+                )
             complete_end.record(lane.stream)
         lane.replay_count += gate_config.timing_repeats
         complete_end.synchronize()
         complete_wall_seconds = time.perf_counter() - complete_wall_started
         complete_cuda_seconds = complete_start.elapsed_time(complete_end) / 1000.0
-        candidate_complete_tokens = [
-            int(token.detach().cpu().item())
-            for token in candidate_complete_token_tensors
-        ]
-        candidate_complete_rng_hash = tensor_sha256(complete_generator.get_state())
+        timed_complete_rng_hash = tensor_sha256(complete_generator.get_state())
+        complete_peak_allocated = torch.cuda.max_memory_allocated(device)
+        complete_peak_reserved = torch.cuda.max_memory_reserved(device)
         timing_exactness_pass = bool(
             len(candidate_complete_tokens) == gate_config.timing_repeats
             and reference_complete_tokens == candidate_complete_tokens
             and reference_complete_rng_hash == candidate_complete_rng_hash
+            and reference_complete_rng_hash == timed_complete_rng_hash
         )
         timing.update({
             "complete_sampled_step_wall_seconds": complete_wall_seconds,
@@ -711,6 +738,10 @@ def run_one_lane_gate(
             "complete_cuda_tokens_per_second": (
                 gate_config.timing_repeats / complete_cuda_seconds
             ),
+            "complete_memory_before_allocated_bytes": complete_memory_before_allocated,
+            "complete_memory_before_reserved_bytes": complete_memory_before_reserved,
+            "complete_peak_allocated_bytes": complete_peak_allocated,
+            "complete_peak_reserved_bytes": complete_peak_reserved,
         })
         workload_contract = normalized_one_token_workload_contract(
             batch_size=1,
@@ -758,12 +789,12 @@ def run_one_lane_gate(
                 scheduler_wall_seconds=complete_wall_seconds,
                 model_seconds=float(timing["model_only_cuda_seconds"]),
                 cuda_seconds=complete_cuda_seconds,
-                peak_memory_bytes=torch.cuda.max_memory_allocated(device),
+                peak_memory_bytes=complete_peak_allocated,
                 graph_capture_count=1,
                 graph_replay_count=gate_config.timing_repeats,
                 active_batch_size_histogram={1: gate_config.timing_repeats},
                 token_hashes={request_id: _json_sha256(candidate_complete_tokens)},
-                final_rng_state_hashes={request_id: candidate_complete_rng_hash},
+                final_rng_state_hashes={request_id: timed_complete_rng_hash},
                 stop_reasons={request_id: "fixed_shape_repeats_complete"},
             ).as_dict()
 
@@ -826,8 +857,11 @@ def run_one_lane_gate(
             ),
             "reference_final_rng_state_hash": reference_complete_rng_hash,
             "candidate_final_rng_state_hash": candidate_complete_rng_hash,
+            "timed_final_rng_state_hash": timed_complete_rng_hash,
             "rng_state_match": (
-                reference_complete_rng_hash == candidate_complete_rng_hash
+                reference_complete_rng_hash
+                == candidate_complete_rng_hash
+                == timed_complete_rng_hash
                 if timing_exactness_pass is not None
                 else None
             ),
@@ -839,6 +873,9 @@ def run_one_lane_gate(
             "total_replay_count": lane.replay_count,
             "parity_replay_count": 1,
             "model_only_timing_replay_count": (
+                gate_config.timing_repeats if timing is not None else 0
+            ),
+            "exactness_transcript_replay_count": (
                 gate_config.timing_repeats if timing is not None else 0
             ),
             "complete_interval_replay_count": (
