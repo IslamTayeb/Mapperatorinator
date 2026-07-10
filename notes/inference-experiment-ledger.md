@@ -60,6 +60,7 @@ These tools remain useful even though their associated experiment did not become
 | Replay-gap probe | `49250100` / `3257f57` | proved graph shell `0.082s` and static input copy `0.220s` are not targets. [note](2026-07-04-decode-replay-gap-probe.md) |
 | Cache-write/decoder ABI verifier | `49253972` / `7044278` | checks that candidates rewrite the expected K/V slot with matching SHA and output behavior. [note](2026-07-04-decoder-layer-candidate-cache-write-checks.md) |
 | Weighted decoder-layer summarizer | `49262108` / `fc66274` | prevents a promising single-prefix result from bypassing full-song bucket weighting. [note](2026-07-04-weighted-manual-decoder-layer-confirmation.md) |
+| Exact target-span/speculative verifier | `49546980`, `49547062`, `49547134` / `f4c2156` | proves the q_len semantic offset, FP32 logits/top-k, production sampling/RNG, forced EOS, cache allclose, verifier-only reset, stable graph buffers, and current-stack weighted cost before runtime work. Artifacts: `/work/imt11/Mapperatorinator/runs/spec-target-span-k2-49546980-8972bb7/target-span-k2.json`, `/work/imt11/Mapperatorinator/runs/spec-target-span-k4-49547062-cdfb577/target-span-k4.json`, and `/work/imt11/Mapperatorinator/runs/spec-target-span-k4-49547134-f4c2156/target-span-k4.json`. |
 
 ## Rejected Or Cut Single-Song Families
 
@@ -89,6 +90,7 @@ These tools remain useful even though their associated experiment did not become
 | Fixed-K / multi-step graph | `49235335`, `49235341`; production tail `49250043` / `7891398` reverted by `aac5b7f`; [ceiling note](2026-07-03-kstep-graph-ceiling-probe.md), [rejection](2026-07-04-tail-graph-runtime-rejection.md) | modest replay ceiling, production `+0.375%`, and early EOS can over-advance RNG | an exact device-controlled early-exit/rollback design has a fresh `>5%` end-to-end ceiling. |
 | Native extension cold-build work as model TPS | `49246259`, `49246261` / `52d6f19`; [note](2026-07-04-cold-start-considerations.md) | build adds `60-65s` outer wall but synchronized decode stays near `270` | total user-visible cold stage wall becomes the explicit objective. |
 | TensorRT/Torch-TensorRT direct adoption | `49134026` / `a2cf83a`; [note](2026-07-01-tensorrt-feasibility.md) | unavailable in current env; SM75/FP32 support and fallback behavior require separate proof | isolated environment proves a real engine (not fallback), FP32 logits/tokens/output, and target-sized speed. |
+| Zero-cost n-gram speculative runtime | K2 `49546980`, eager K4 `49547062`, graph K4 `49547134` / `f4c2156` | Numerics were exact-output clean: raw logits/top-k, production tokens/RNG, forced EOS, and cache allclose passed. Eager K4 was `10.770ms`; one safe fixed-shape graph replay reached only `8.464ms`, above the strict `5.480ms` current-stack keep bar. With `20,078` empty q1 calls and `14,257` q4 spans, weighted five-full target time projects `163.088 -> 197.472s` (`~261.4 -> 215.9 tok/s`, `-21.1%`). Graph job exit `1` is the intentional keep-gate rejection, not a capture/numerics failure. Setup job `49546523` and old bitwise-policy job `49546922` are not performance claims. | Revisit only if the accepted q1 denominator materially slows, n-gram proposal/acceptance structure changes, or a new fixed-shape target kernel/graph ceiling first demonstrates q4 below `5.480ms`. Keep the verifier; do not production-wire the n-gram path. |
 
 ## Rejected Or Cut Batch Families
 
@@ -125,7 +127,7 @@ Advance generated-prefix n-grams to the GPU q_len=K numeric/cache/cost gate; sta
 
 | Family | Required pre-production evidence |
 | --- | --- |
-| Exact speculative verification | Generated-prefix acceptance clears structural triage; next prove K=4 sequential-vs-q_len=K numerics, exact target RNG consumption, EOS/cache rollback, and measured proposal/target cost before any TPS claim. Keep K=2 as the lower-cost control and test K=8 only if K=4 retains a target-sized measured signal. The v32-mini draft remains unmeasured. |
+| Exact v32-mini speculative verification | The zero-cost n-gram path is rejected above. Start with a bounded draft-cost and closed-loop acceptance scout only; do not write runtime code unless draft cost plus target-call structure projects a current-stack weighted `>5%` win. Any advancing candidate must then pass the existing q_len, RNG, EOS, and cache gates. |
 | Broad FP32 decoder-layer/stack verifier | ABI and cache-slot exactness; weighted prefixes `128..768`; projected `>=1.412s`, preferably `>=2.824s`; then full correctness ladder. |
 | Batch physics: merged B vs independent B1 lanes | distinct-song and permutation exactness, staggered arrival/slot reuse, model-only and complete-step TPS, VRAM, timeline, and `>5%` aggregate gain over optimized serial. |
 | Optimized offline scheduler | B1 parity through five-song/three-seed exact queue, explicit request state, scheduler-wall target, cold/latency/memory reporting. |
