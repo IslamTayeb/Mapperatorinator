@@ -217,6 +217,42 @@ verifier infrastructure, but do not build mini rollback/runtime, run K8, or
 expand to a second song/window. Revisit only if a different draft path first
 shows sub-millisecond K4 proposal cost at comparable closed-loop acceptance.
 
+## Broad Whole-Layer Gate Decision
+
+The one authorized broad FP32 scout is rejected before weighted buckets or
+runtime work. Job `49550902`, branch commit `ce82dda`, measured a verifier-only
+prefix-640 whole decoder-layer candidate on an RTX 2080 Ti. All 12 layer outputs
+and complete self caches passed the predeclared `atol=rtol=1e-4`; bytes outside
+the written self-cache slot and the complete cross cache remained bitwise
+unchanged. Baseline logits replay was bitwise exact.
+
+Reciprocal output-discard CUDA-graph timing measured:
+
+| Order | Baseline layer | Candidate layer | Extrapolated full-song saving |
+| --- | ---: | ---: | ---: |
+| baseline then candidate | `0.177353ms` | `0.155409ms` | `1.988652s` |
+| candidate then baseline | `0.178277ms` | `0.155119ms` | `2.098751s` |
+
+The required worst-order strong bar was fixed at `2.8243s`. The independent
+validator therefore failed exactly one condition, and Slurm exit `1` is the
+intentional performance rejection. The compiler-cold candidate stack took
+`136.466s` from an enforced empty `TORCH_EXTENSIONS_DIR`; this is setup evidence,
+not part of synchronized layer timing. Peak verifier state included `180 MiB` of
+full-cache snapshots.
+
+```text
+/work/imt11/Mapperatorinator/runs/native-full-decoder-layer-gate1-49550902-ce82dda/native-full-decoder-layer-gate1.json
+report SHA-256 71d8a367d9ef4260b3a201c47b7921c01cecffda2d80441955df8f1d8001c490
+branch codex/optimized-native-full-layer-gate @ ce82dda
+```
+
+Do not run the weighted all-bucket verifier, a 256-step loop, smoke/full-song,
+or production integration for this candidate. Its isolated layer improvement
+is real but below the predeclared strong promotion signal, and the prefix-640
+projection was already optimistic because it applied one measured delta to all
+accepted buckets. Revisit only if a materially different whole-layer candidate
+first clears `2.8243s` in the same reciprocal gate.
+
 ## Current Bottleneck And Ceiling
 
 Post-frontier diagnostics show that another narrow wrapper or launch tweak cannot reach `500`:
@@ -228,7 +264,10 @@ Post-frontier diagnostics show that another narrow wrapper or launch tweak canno
 - Production-like sampling/logits/EOS/append tail: about `1.6s` total, distributed across several operations and below a comfortable standalone keep case.
 - Duplicate graph capture, final projection, individual linears, self-attention alone, cross-attention alone, and MLP alone are not `500`-capable boundaries.
 
-The remaining exact target-sized family is broad decoder-layer/decoder-stack math and memory plus additional runtime/control savings. The weighted roofline is permission for one bounded verifier, not proof the required math is removable.
+The broad decoder-layer scout consumed the one roofline-authorized verifier and
+missed its strong bar. No current single-song production experiment is now
+authorized: a new family must begin with a refreshed current-stack profile and
+show more than `5%` avoidable end-to-end headroom before code is written.
 
 ## Current Stop/Go Rule
 
@@ -239,10 +278,11 @@ The next production-facing experiment must first be verifier-only and must:
 3. show weighted CUDA-graph projected saving of at least `1.412s`, preferably `2.824s`;
 4. then pass one-token logits/top-k/cache, 256-step token/logit/RNG, 15-second smoke, reciprocal-order full-song main/timing, and `.osu` byte gates.
 
-Current ranked scouts:
-
-1. a broad FP32 whole-layer/stack native or cuBLASLt verifier;
-2. a whole-step device-controlled graph only if refreshed profiling still shows more than `5%` exclusive headroom and exact early EOS/RNG rollback is proven.
+There is no ranked single-song scout left on current evidence. A whole-step
+device-controlled graph remains conditional only if a fresh profile first
+shows more than `5%` exclusive headroom and exact early EOS/RNG rollback can be
+proven; the existing graph-shell, input-copy, and tail measurements do not meet
+that prerequisite.
 
 Speculation must consume target RNG exactly one output position at a time, commit only matching draft tokens, discard uncommitted cache suffixes on mismatch, and preserve final token/RNG/output identity. Stop before production if draft cost plus verified target calls saved project below `5%`.
 
