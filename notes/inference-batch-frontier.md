@@ -638,8 +638,15 @@ change. `osuT5/osuT5/inference/logit_processors.py` and its legacy tests are
 byte-identical to `main`. The equivalent graph-capturable subclass now lives at
 `osuT5/osuT5/inference/optimized/graph_safe_logits.py` and is installed only by
 the Hybrid verifier factory. No default/server/runtime import path uses it.
-The final local boundary gate passed `2` legacy processor tests and `116`
-optimized tests.
+The final local boundary gate passed `2` legacy processor tests and `119`
+optimized tests. Final DCC regression job `49560227` at `2186d5a` then
+captured all seven H8 graphs through the isolated subclass and passed bitwise
+raw-logit, active self/cross-cache, token, RNG, state-feedback, ownership, and
+zero-timed-allocation gates. Its worst candidate throughput was still rejected
+at `514.276 < 623.657 tok/s`. The report is
+`/work/imt11/Mapperatorinator/runs/weighted-h8-49560227-2186d5a/weighted-h8.json`
+with SHA
+`bb52add44510a677b28c417c3f54bdb52dc07fa032ba6b77600c4223373eb01d`.
 
 ### CPU continuous-scheduler harness
 
