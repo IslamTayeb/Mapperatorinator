@@ -137,33 +137,19 @@ Keep the numeric/graph verifier, but do not build the n-gram runtime, run K8, or
 
 ### v32-mini bounded feasibility gate
 
-The mini draft is a fresh proposal family, not a revival of the rejected n-gram
-call structure. No mini GPU result exists yet. The following artifact audit and
-cost surface are permission for one real-window feasibility scout only.
+The greedy v32-mini K4 draft is rejected by the one authorized real-window
+scout. This is a fresh proposal family, not a revival of the n-gram call
+structure, but its measured draft compute is far above the current-stack budget.
 
-Artifact audit on the current Hugging Face revisions:
-
-- `OliBomby/Mapperatorinator-v32-mini@7807f0dc70cab671be012e1f5ddf945b0b8b7278`
-- `OliBomby/Mapperatorinator-v32@74f22583400d259bf424819e11027c17933efe54`
-- root tokenizer SHA-256 is byte-identical:
-  `737148191316146ba76b6b7b0c59646baff6002ef834734dd113a8eb1e5036da`;
-  `gamemode=0` also matches at
-  `6b98be0fc04a95a9e9d4feb8e8b67cc48728a6667e3091dcd5cc528baeca18bd`,
-  and gamemodes `1`/`3` match the root hash. The target repository has no
-  `gamemode=2` subfolder, so the loader falls back to target root; mini
-  `gamemode=2` is itself byte-identical to mini root;
-- generation configs are byte-identical at
-  `10b901beeb3c982c16c53cd5b37a4f9b3d4674fc70cbc3e64c7b20fdb0433f51`;
-- all non-capacity model-config fields match. The mini is the base backbone
-  (`d_model=512`, six encoder/decoder layers, eight heads); the target is small
-  (`d_model=768`, twelve encoder/decoder layers, twelve heads). They can share
-  token IDs and prompt construction, but not encoder output, weights, KV cache,
-  graph buffers, or workspaces;
-- both local v32 training configs use the same data/token schema. Their only
-  differences are backbone and training schedule. The inference configs use
-  the same `temperature=0.9` and `top_p=0.9`, but the first mini scout must use
-  an explicit greedy draft policy with no target RNG access. Target sampling
-  remains the accepted production sampler.
+Pinned artifact validation used target revision `74f22583400d259bf424819e11027c17933efe54`
+and mini revision `7807f0dc70cab671be012e1f5ddf945b0b8b7278`.
+CPU preflight job `49548759` loaded both gamemode-0 FP32 models and tokenizers;
+corresponding tokenizer and generation configs are byte-identical, and every
+non-capacity config field matches. The gamemode-0 tokenizer SHA-256 is
+`6b98be0fc04a95a9e9d4feb8e8b67cc48728a6667e3091dcd5cc528baeca18bd`.
+The target is small (`216,304,896` parameters) while mini is base
+(`55,646,720` parameters); they share token IDs and prompt construction but not
+encoder outputs, weights, caches, graph buffers, or workspaces.
 
 The target denominator is `q=3.825303748ms` per committed q1 output token and
 the measured safe K4 target replay is `T=8.4637517ms`. Let `h_j` count K4 calls
@@ -191,36 +177,45 @@ break even: D < 1.00 * q * L - T
 | `4` | `<6.837ms` | `<6.072ms` |
 
 Even a zero-cost draft therefore needs `L>2.329`, or more than `58.23%`
-committed-span efficiency. `mini_feasibility.py` computes the same surface from
-an empirical accepted-prefix histogram and charges fixed per-window draft
-overhead. It rejects a marginal-acceptance-only projection.
+committed-span efficiency. Job `49548890`, commit `3ddb585`, ran the exact
+seed-`12345`, FP32/SDPA, SALVALAI smoke15 main `sequence_index=9`,
+`max_new_tokens=256` scout on an RTX 2080 Ti:
 
-The next and only approved shape is a one-window, seed-`12345`, FP32/SDPA,
-`profile_salvalai_smoke15`, main `sequence_index=9`, `max_new_tokens=256` scout:
+| Field | Result |
+| --- | ---: |
+| Target transcript / stop / final RNG | exact PASS; `256` tokens, `max_new_tokens` |
+| Target/replayed token SHA-256 | `1adc1dbd1d15f6cd96888242beaa271b674125efc7cb6eef5e231d02c153e000` |
+| Accepted-prefix histogram `h0..h4` | `[26, 23, 15, 9, 25]` over `98` full calls |
+| Draft token acceptance / full accepts | `45.92%` / `25.51%` |
+| Effective committed `L` | `2.5816` tokens per target call |
+| Strict 5% draft budget at measured `L` | `<0.918ms` per full proposal |
+| Warm mini encoder | `7.366ms` CUDA |
+| Optimistic ready-cache proposal | `22.596ms` for the required `K-1=3` q1 calls |
+| Actual rebuild-inclusive full proposal | `31.970ms` CUDA / `32.153ms` wall mean |
+| Runnable finite-window projection | `0.979s -> 4.016s` CUDA (`-310.1%`) |
+| Conservative wall projection | `0.979s -> 4.034s` (`-312.0%`) |
+| Optimistic steady-cache projection | `0.979s -> 3.078s` (`-214.3%`) |
+| Combined allocated VRAM peak | `1.284 GiB` (`1,556 MiB` telemetry peak) |
 
-1. Capture the accepted target-only sampled transcript and final target RNG
-   hash. Do not use a standalone mini transcript as evidence.
-2. At every proposal boundary, feed the mini the real prompt plus the exact
-   committed target transcript, then greedily propose at most four tokens. On
-   the first mismatch, commit the captured target token and build the next mini
-   proposal from that corrected transcript. Record the committed-prefix hash
-   supplied to every proposal so reconditioning is auditable.
-3. Record `h_0..h_4`, short EOS/max boundary proposals separately, accepted
-   draft tokens, committed tokens per target call, full-accept fraction, and
-   the exact target-call structure. Replaying the closed loop must reproduce the
-   captured target transcript and stop reason exactly; the mini never consumes
-   target RNG.
-4. Measure cold and warmed mini encoder time, prefix-cache construction or
-   rebuild time, sequential four-token greedy proposal CUDA time, combined
-   target+mini peak VRAM, and steady draft cost on the exact corrected prefixes.
-   Report both an optimistic steady-cache lower bound and the actually runnable
-   rebuild-inclusive cost; do not implement cache rollback.
-5. Apply the finite-window projection, including mini encoder/rebuild overhead.
-   Stop if the measured point does not strictly clear `5%`. A passing point only
-   authorizes a multi-window acceptance/cost repeat, not runtime wiring.
+The accepted-prefix structure clears the zero-cost structural floor, but even
+the optimistic draft cost is `24.6x` the `<0.918ms` keep budget. Both strict
+CUDA and conservative wall gates fail. Slurm status `FAILED` is the intentional
+exit `1` from that valid rejection, not a numerical or loader failure. The
+authoritative report is:
 
-Do not submit this GPU scout until the root campaign agent explicitly approves
-the bounded experiment and its isolated DCC checkout.
+```text
+/work/imt11/Mapperatorinator/runs/spec-mini-onewindow-49548890-3ddb585/v32-mini-feasibility.json
+```
+
+Its SHA-256 is `322be4e4cd6d56d639e81f332ac4333ea555e9b3bb23242713d3c0a003bdc55f`.
+Setup-only job `49548295` caught a missing active-prefix companion flag before
+model load; `49548337` caught Transformers rejecting `subfolder=None` for an
+already-resolved local gamemode path. Neither is performance evidence. CPU job
+`49548759` then proved both pinned resolved-path loaders and tokenizers before
+the final GPU run. Keep the model-free projection, transcript-replay, and loader
+verifier infrastructure, but do not build mini rollback/runtime, run K8, or
+expand to a second song/window. Revisit only if a different draft path first
+shows sub-millisecond K4 proposal cost at comparable closed-loop acceptance.
 
 ## Current Bottleneck And Ceiling
 
@@ -246,9 +241,8 @@ The next production-facing experiment must first be verifier-only and must:
 
 Current ranked scouts:
 
-1. a bounded `OliBomby/Mapperatorinator-v32-mini` draft-cost and closed-loop acceptance scout, with no runtime work unless its weighted projection clears `5%` on the accepted stack;
-2. a broad FP32 whole-layer/stack native or cuBLASLt verifier;
-3. a whole-step device-controlled graph only if refreshed profiling still shows more than `5%` exclusive headroom and exact early EOS/RNG rollback is proven.
+1. a broad FP32 whole-layer/stack native or cuBLASLt verifier;
+2. a whole-step device-controlled graph only if refreshed profiling still shows more than `5%` exclusive headroom and exact early EOS/RNG rollback is proven.
 
 Speculation must consume target RNG exactly one output position at a time, commit only matching draft tokens, discard uncommitted cache suffixes on mismatch, and preserve final token/RNG/output identity. Stop before production if draft cost plus verified target calls saved project below `5%`.
 
@@ -260,6 +254,7 @@ Do not restart these without new current-stack evidence:
 - graph-cache dictionary cleanup, static input-copy cleanup, fast prepare-input rewrites;
 - naive fixed-K graphing that over-advances RNG at early EOS;
 - zero-cost n-gram speculative runtime on the current q1 denominator;
+- greedy `OliBomby/Mapperatorinator-v32-mini` K4 drafting on the current target denominator;
 - manual Python/module decoder-layer recomposition;
 - native self+cross prefix as `bitwise-calculation-exact` (cache writes have real FP32 bit drift);
 - cold native-extension compilation as a synchronized model-TPS target;
