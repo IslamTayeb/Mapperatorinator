@@ -132,7 +132,6 @@ COMMAND+=(
   num_beams=1
   seed=12345
   inference_generation_compile=false
-  inference_stateful_monotonic_logits_processor=true
 )
 
 set +e
