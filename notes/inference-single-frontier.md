@@ -29,7 +29,11 @@ Artifacts:
 /work/imt11/Mapperatorinator/runs/fused-rope-cache-full-49230082-d7b8684/compare_strict_full.json
 ```
 
-The accepted default-off stack is:
+The accepted immutable effective configuration is
+`accepted-fp32-270.475-v1`. It was historically requested through the complete
+legacy micro-flag bundle below; the canonical public selector is now
+`inference_engine=optimized optimized_inference_mode=single`, and the complete
+legacy bundle delegates to that same runtime:
 
 ```text
 inference_generation_compile=true
@@ -79,6 +83,50 @@ matched. That exposed an unset node-local compiler-cache ambiguity; commit
 /work/imt11/Mapperatorinator/runs/inference-denominator-single_full-49542938-a42c250
 /work/imt11/Mapperatorinator/runs/inference-denominator-single_full-49542938-a42c250/compare-warm-vs-cold.json
 ```
+
+### Optimized-single architecture reproduction
+
+The ownership migration does not replace the `270.475 tok/s` accepted numerical
+frontier and makes no speed claim. At final runtime commit `f68cf2b`, optimized
+attention dispatch, active-prefix attention state, single-song orchestration,
+session state, logits, and kernels are owned under `osuT5/osuT5/inference/optimized/`;
+later commits through `7326a62` add only final regression wrappers. Jobs
+`49562049`, `49562055`, and `49562091` passed the real one-token, 8-step, and
+256-step logit/top-k/token/RNG/cache gates. Reciprocal 15-second job `49562101`
+matched all `1,084` main and `164` timing tokens and `.osu` bytes.
+
+Reciprocal full-song job `49562130` compared the public optimized selector with
+the delegated complete legacy bundle on an RTX 2080 Ti. Both orders matched all
+`7,639` main and `821` timing tokens and output SHA-256
+`483483a1c29ef8a44c4a8d3a82fe0778ae306470ec3157e98969eeabd92c2631`,
+size `31,709`; aggregate main differences were `+0.2%` and `-0.1%` by launch
+order. Job `49562226` then compared the pre-migration accepted legacy path with
+the final delegated legacy path and preserved the same tokens and output, with
+main differences of `+0.0%` and `-0.1%`. Both jobs exited nonzero only because
+the strict comparator rejects ordinary zero-tolerance per-window jitter. Their
+absolute throughput drifted below `270.475 tok/s` equally in controls and
+candidates, so this is architecture-neutral reproduction evidence, not a new
+frontier. Detailed paths, hashes, stage/timing deltas, and ownership boundaries
+are in the [migration map](2026-07-10-optimized-single-architecture-migration-map.md).
+
+Final default and compile-only V32 reciprocal smoke jobs `49562311` and
+`49562444` also preserved all `1,084` main tokens, `164` timing tokens, and
+output bytes. Default main deltas were `-0.8%/+0.4%` by order; compile-only
+main deltas were `+0.4%/+0.5%`. Strict nonzero statuses came only from
+zero-tolerance per-window jitter.
+
+Reciprocal mixed-song static-server jobs `49562635` and `49562710` preserved
+the V32/shared-global-RNG runtime contract, real batching, null/false optimized
+state, candidate import coldness, and empty extension caches. Scheduler TPS
+flipped from `-20.8%` control-first to `+7.8%` candidate-first because request
+ordering changed shared-RNG stop lengths; strict comparisons remained red for
+different generated work. The explicitly diagnostic B5 active-step rates were
+`+1.3%` and `+23.6%` for the candidate. Neither diagnostic showed a negative
+normalized B5 rate, but active-step/prefix work differed and the primary
+scheduler comparisons were red. Server performance therefore remains
+non-comparable under the shared-RNG contract; this is not exactness evidence or
+a throughput win. The ownership migration is accepted across the tested
+interfaces, and `270.475 tok/s` remains the single-song frontier.
 
 ## Accepted Improvement Chain
 
@@ -265,7 +313,7 @@ Post-frontier diagnostics show that another narrow wrapper or launch tweak canno
 - Duplicate graph capture, final projection, individual linears, self-attention alone, cross-attention alone, and MLP alone are not `500`-capable boundaries.
 
 The broad decoder-layer scout consumed the one roofline-authorized verifier and
-missed its strong bar. No current single-song production experiment is now
+missed its strong bar. No current single-song performance experiment is now
 authorized: a new family must begin with a refreshed current-stack profile and
 show more than `5%` avoidable end-to-end headroom before code is written.
 

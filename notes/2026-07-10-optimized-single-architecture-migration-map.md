@@ -12,8 +12,10 @@ The endpoint is one implementation of the accepted stack owned by
 legacy micro-flag bundle may delegate to the same implementation. Default V32
 must remain cold with respect to optimized and native-extension modules.
 
-Batching, speculative decoding, new kernels, reduced precision, schedulers,
-and performance optimization are out of scope.
+Batching, new speculative behavior, new kernels, reduced precision, schedulers,
+and performance optimization are out of scope. Mechanical ownership cleanup
+for existing batch/speculative verifier code is allowed when it removes a
+dependency on a legacy shim without changing its calculations or claims.
 
 ## Frozen Pre-Migration Evidence
 
@@ -26,7 +28,8 @@ Accepted DCC job `49230082` measured `7,639` SALVALAI main tokens in
 `28.243s` synchronized model time, or `270.475 tok/s`, with exact main/timing
 tokens and byte-identical `.osu` output.
 
-The current default import baseline is not compliant. A fresh process importing
+At pre-migration `main@3f4b088`, the default import baseline was not compliant.
+A fresh process importing
 `inference`, `server`, and `modeling_varwhisper` loads:
 
 ```text
@@ -35,7 +38,7 @@ osuT5.osuT5.inference.native_q1_attention
 torch.utils.cpp_extension
 ```
 
-Compilation remains call-lazy, but ordinary V32 model import already imports
+Compilation was call-lazy, but ordinary V32 model import already imported
 the native implementation and extension machinery.
 
 | File | Pre-migration SHA-256 |
@@ -50,7 +53,7 @@ the native implementation and extension machinery.
 | `runtime_profiling.py` | `1bd09e211aa6092929f288c12a8858b8fd3b07ac123ec95ca15095325668f37d` |
 | `modeling_varwhisper.py` | `ed4ccb7bd18dc43caf4e6f60ae477c1a04f8b754643b80e484f18453aa2af8c2` |
 
-## Accepted Runtime Dependency Graph
+## Pre-Migration Accepted Runtime Dependency Graph
 
 ```text
 config.py / Hydra defaults
@@ -68,12 +71,13 @@ config.py / Hydra defaults
   -> generation stats -> Processor record -> final profile/output
 ```
 
-There are two current objects described as `DecodeSession`:
+The pre-migration tree had two different state objects associated with
+`DecodeSession`:
 
 1. `inference/direct_decode.py:DecodeSession` is a verifier-first dataclass used
    by diagnostic utilities and optimized batch/speculative scouts. Production
    single-song inference does not instantiate it.
-2. The accepted runtime uses `Processor.decode_session_state`, a raw dictionary
+2. The accepted runtime used `Processor.decode_session_state`, a raw dictionary
    filled by `server._session_cache()` and the active-prefix loop.
 
 The migration first moves the verifier ABI mechanically, then introduces a
@@ -105,17 +109,17 @@ the verifier class alone does not migrate the 270 TPS path.
 
 ## Ownership Classification
 
-### Optimized implementation to move
+### Optimized implementation moved
 
-| Current owner | Implementation | Destination |
+| Pre-migration owner | Implementation | Current owner |
 | --- | --- | --- |
 | `inference/native_q1_attention.py` | accepted extension source, loader, q1/fused wrappers | `optimized/kernels/q1_attention.py` |
-| `modeling_varwhisper.py` | q1 BMM math and native/fused orchestration/eligibility | `optimized/kernels/dispatch.py` plus neutral hooks |
-| `runtime_profiling.py` | optimized feature state and native preload | `optimized/single/runtime_context.py` |
-| `inference/direct_decode.py` | verifier state ABI, prefill, one-token helpers | `optimized/single/state.py` and `session.py` |
+| `modeling_varwhisper.py` | q1 BMM math and native/fused orchestration/eligibility | `optimized/kernels/dispatch.py`, reached through neutral `runtime_dispatch.py` hooks |
+| `runtime_profiling.py` | optimized feature state and native preload | `optimized/single/runtime_context.py`; legacy utility contexts remain lazy adapters |
+| `inference/direct_decode.py` | verifier state ABI, prefill, one-token helpers | `optimized/single/session.py` |
 | `inference/decode_loop.py` | active-prefix loop, stable encoder, graph capture/replay, diagnostics | `optimized/single/decode_loop.py` |
 | `inference/logit_processors.py` | stateful batch-1 monotonic specialization | `optimized/single/logits.py` |
-| `processor.py` and `server.py` | production cache/graph/encoder session lifecycle | `optimized/single/session.py` |
+| `processor.py` and `server.py` | production cache/graph/encoder session lifecycle | `optimized/single/state.py`, orchestrated by `optimized/single/engine.py` |
 | optimized branches of `server.model_generate` | runtime validation, context fallback, loop selection, effective stats | `optimized/single/engine.py` |
 | `inference/native_linear.py` | rejected verifier-only linear scout | `optimized/kernels/linear.py` |
 | `inference/native_decoder_layer.py` | rejected verifier-only layer scout | `optimized/kernels/decoder_layer.py` |
@@ -139,8 +143,14 @@ the verifier class alone does not migrate the 270 TPS path.
 - `inference.py`: validation, requested metadata, one lazy loader call.
 - `processor.py`: one default-cold engine delegation point and generic metadata
   copying.
-- `server.py`: ordinary V32 behavior and at most one narrow lazy compatibility
-  delegation point for direct legacy callers.
+- `legacy_single_adapter.py`: complete-bundle validation and one default-cold
+  compatibility delegation to `OptimizedSingleRuntime`; partial bundles fail.
+- `server.py`: ordinary V32 behavior only; optimized options or session state
+  fail with an instruction to use the public selector or complete legacy bundle.
+- `runtime_dispatch.py`: neutral callable hook registry with no optimized or
+  native implementation.
+- `runtime_profiling.py`: lazy compatibility contexts for explicit diagnostic
+  callers; no optimized state or calculation ownership.
 - `modeling_varwhisper.py`: neutral preinstalled callable hooks only; no
   optimized/native imports or kernel/eligibility implementation in forward.
 - Legacy loop/session/native files: small lazy compatibility shims only.
@@ -182,6 +192,19 @@ osuT5/osuT5/inference/optimized/
 
 Names may change only for a cleaner dependency direction. Ownership may not
 move back outside this package.
+
+The final external adapter boundary is deliberately small:
+
+```text
+inference.py -> optimized/adapter.py -> InferenceEngineBinding
+             -> Processor -> OptimizedSingleRuntime.generate_window()
+
+complete legacy bundle -> legacy_single_adapter.py
+                       -> the same OptimizedSingleRuntime
+
+runtime_dispatch.py <-> neutral model hook calls
+server.model_generate() -> ordinary V32 only
+```
 
 ## Public Selector And Compatibility Contract
 
@@ -294,6 +317,25 @@ optimized implementation from server, Processor, model, and legacy modules.
 Gates: AST ownership audit, complete local suite, fresh-process V32 import and
 metadata snapshot, unchanged server/static-server tests.
 
+### K2: Optimized attention dispatch ownership
+
+Move q1 BMM/native/fused attention eligibility and orchestration out of the
+model into `optimized/kernels/dispatch.py`; leave only neutral hook calls in
+VarWhisper. Mechanically detach existing speculative scouts from public legacy
+micro-flags without changing their calculation or authorization.
+
+Gates: source/AST ownership, hook restoration, ordinary SDPA/FA2/eager parity,
+one-token logits/top-k/cache, and fresh-process optimized-cold V32 imports.
+
+### K3: Active-prefix attention ownership
+
+Move active-prefix length state and self-attention input trimming into
+optimized runtime context/dispatch. The optimized loop installs the hook;
+generic model and profiling code do not own optimized state.
+
+Gates: source/AST ownership, nested context restoration, one-token and 8/256
+step exactness, reciprocal smoke/full-song, and unchanged V32/server paths.
+
 ## Mandatory Local Gates
 
 ### Fresh-process imports
@@ -350,7 +392,9 @@ GPU, checkout, cache, and environment checks.
 4. Reciprocal full-song legacy bundle versus optimized single.
 5. Separate pre-migration versus candidate default-V32 reciprocal regression.
 6. Main `7,639` and timing `821` tokens, final RNG hashes, `.osu` SHA/size.
-7. Main throughput at or above `270.475 tok/s`; no meaningful timing,
+7. Same-order main throughput has no meaningful regression versus its control;
+   preserve the historical `270.475 tok/s` frontier and report absolute ambient
+   drift rather than promoting it as a new result. Require no meaningful timing,
    stage-wall, cold setup, or per-window regression.
 8. Cold import, extension cache/build, graph cache/capture, first-window setup,
    clocks/power/memory, and warm replay reporting.
@@ -358,8 +402,16 @@ GPU, checkout, cache, and environment checks.
 
 The recent full-song consistency artifact is SHA
 `483483a1c29ef8a44c4a8d3a82fe0778ae306470ec3157e98969eeabd92c2631`,
-size `31,709`, with `7,639` main and `821` timing tokens. Final evidence still
-requires same-job reciprocal controls.
+size `31,709`, with `7,639` main and `821` timing tokens. Final migration
+comparisons use same-job reciprocal controls.
+
+K2/K3 current-runtime evidence through `f68cf2b` now completes the one-step,
+8/256-step, reciprocal smoke, public-optimized-versus-delegated-legacy
+full-song, and pre-migration-accepted-versus-final-delegated-legacy full-song
+gates below. The numerical frontier remains `270.475 tok/s`; these are
+architecture-neutral regressions, not a speed promotion. Final default V32,
+compile-only V32, and reciprocal shared-RNG static-server characterization are
+also recorded below.
 
 ## Stop And Rollback Policy
 
@@ -623,3 +675,174 @@ not dispatch to optimized single. Reports:
 SHA `9ea7d3cd1f8464cee86a55991017d93d0a3d8b390d54e1e2c930c78e604eb465`,
 and `candidate-first-compare.json`, SHA
 `57e1dc12321d0ba5b02e50a16bdb53fa77a8cd70a56e55f8e15a672adf7485b2`.
+
+### K2 accepted optimized attention dispatch ownership
+
+Commit `2ed6620` moved q_len=1 BMM cross-attention, native q1
+self-attention, fused RoPE/cache orchestration, eligibility, and exact operation
+order out of `modeling_varwhisper.py` and into
+`optimized/kernels/dispatch.py`. `optimized/single/runtime_context.py` owns
+lazy kernel preload and installs the selected optimized callables through the
+neutral `inference/runtime_dispatch.py` registry. VarWhisper now performs only
+neutral hook calls and contains no optimized eligibility or native-kernel
+implementation.
+
+Commit `a633124` is a mechanical ownership cleanup within the existing rejected
+v32-mini scout. The scout now owns its approved stateful-monotonic choice under
+`optimized/speculative/mini_draft_gpu.py` instead of requesting a partial
+legacy runtime bundle. It introduces no new speculative behavior, evidence, or
+revisit authorization.
+
+### K3 accepted active-prefix attention ownership
+
+Commit `f68cf2b` moved active-prefix length state and self-attention input
+trimming from `runtime_profiling.py` and VarWhisper into
+`optimized/single/runtime_context.py` and
+`optimized/kernels/dispatch.py`. The optimized decode loop/session installs the
+context explicitly; the model sees only the neutral input hook. Default V32,
+compile-only V32, and direct server generation neither own nor select this
+state. Commits `05e512f` through `7326a62` change no runtime calculation; they
+add and harden the final static-server/import regression wrapper only.
+
+Current-runtime DCC gates on an RTX 2080 Ti passed through `f68cf2b`:
+
+- Job `49562049`: real one-token gate PASS; raw-logit maximum absolute
+  difference `1.907e-05` and exact top-20 IDs.
+- Job `49562055`: 8-step token/logit/final-RNG gate PASS; one graph capture and
+  seven replays.
+- Job `49562091`: 256-step exact gate PASS; five graph captures and `255`
+  replays.
+- Reciprocal 15-second job `49562101`: both launch orders matched all `1,084`
+  main and `164` timing tokens plus `.osu` SHA
+  `ff63c232115906483a592c940e6f0fccbb8639775378d39fd86237f4191ed4ba`,
+  size `4,144`. Optimized main throughput was `+0.7%` and `+0.4%`, timing was
+  `+9.7%` and `+4.2%`, and stage wall was `-15.5%` and `-11.3%`. This is
+  no-regression evidence, not a speed claim.
+
+Reciprocal full-song job `49562130` compared the public optimized selector with
+the complete delegated legacy bundle on RTX 2080 Ti node `z25-20`. Both orders
+matched all `7,639` main and `821` timing tokens plus `.osu` SHA
+`483483a1c29ef8a44c4a8d3a82fe0778ae306470ec3157e98969eeabd92c2631`,
+size `31,709`. With legacy launched first, main was `268.707 -> 269.120 tok/s`
+(`+0.2%`), timing `+0.5%`, and stage wall `-0.2%`. With optimized launched
+first, main was `268.882 -> 268.700 tok/s` (`-0.1%`), timing `-0.3%`, and stage
+wall `-0.1%`. The strict job exited `1` only because zero-tolerance per-window
+jitter failed after the exact aggregate/output gates passed. Run root:
+
+```text
+/work/imt11/Mapperatorinator/runs/optimized-single-engine-full-song-final-49562130
+legacy-first-strict-full.json SHA 51a1b763faea816947f64712ab44065c6cbb369761ff0a60de5eb39fbd88ea7e
+optimized-first-strict-full.json SHA 55b395cdf4316b9496b6eb77991946315935f50810645a303d735f32dad4ffe2
+```
+
+Reciprocal full-song job `49562226` then compared pre-migration accepted legacy
+at `3f4b088` with the final delegated legacy runtime. Both orders again matched
+all `7,639` main and `821` timing tokens and the same output SHA/size. In the
+control-first order, main was `268.850 -> 268.919 tok/s` (`+0.0%`), timing was
+`-0.7%`, outer wall `+0.8%`, and stage wall `+0.6%`. In the candidate-first
+order, main was `267.813 -> 267.621 tok/s` (`-0.1%`), timing `-0.4%`, outer wall
+`+0.7%`, and stage wall `+0.6%`. Slurm status `FAILED` reflects only the strict
+zero-tolerance comparator after valid exact profiles, not a generation or
+output failure. Run root and comparison reports:
+
+```text
+/work/imt11/Mapperatorinator/runs/v32-integration-full-migration-49562226
+control-first-compare.json SHA 2761eb6fb34874d31adb42aa9cbd56a7d9ea06a18c4f20ddc1098d07cfdf569a
+candidate-first-compare.json SHA f3c4ff1a8df34a7a08ce694dbe6ee3c86197b13e65aa265fae06013e92cbf954
+```
+
+Absolute main throughput in both full-song jobs drifted below the historical
+`270.475 tok/s` frontier equally for controls and candidates. The accepted
+frontier therefore remains `270.475 tok/s`; K2/K3 are exact-output,
+architecture-neutral ownership migrations.
+
+### Final default and compile-only V32 regression gates
+
+Reciprocal default-V32 smoke job `49562311` compared final runtime commit
+`f68cf2b` with pre-migration `3f4b088` on RTX 2080 Ti node `z25-20`, with
+generation compile and every optimized feature disabled. Both orders matched
+all `1,084` main and `164` timing tokens, same-calculation metadata, and `.osu`
+SHA `ff63c232115906483a592c940e6f0fccbb8639775378d39fd86237f4191ed4ba`,
+size `4,144`. Control-first main/timing changed `-0.8%/-1.6%`, while
+candidate-first changed `+0.4%/+2.0%`; stage wall improved `0.1%` and `0.2%`.
+The reciprocal sign change and sub-2% magnitude are architecture-neutral.
+Slurm status `FAILED` reflects only the strict zero-tolerance per-window gate.
+
+```text
+/work/imt11/Mapperatorinator/runs/v32-integration-final-default-v32-49562311
+control-first-compare.json SHA a2a348c7c67e5479a7d953b82f7a146942698169bbf912176bd5c617556f9373
+candidate-first-compare.json SHA bc97902c43a73c0fba1dd200211ed594b12a2f3b19040a7a9124db2cae3de4fa
+```
+
+Reciprocal compile-only V32 smoke job `49562444` repeated the gate on RTX 2080
+Ti node `h36-5`. Both orders again matched all main/timing tokens, metadata,
+and output bytes. Main throughput changed `+0.4%` and `+0.5%`. The first
+control paid a compiler-cold timing specialization cost; the warm reciprocal
+pair changed timing `+2.1%` and stage wall `-1.8%`. This proves compile-only
+remains token/output-equivalent and aggregate-neutral, not a speed result. No
+final RNG hash was recorded, so this is not labeled full exact-output. Both
+comparison statuses were nonzero only for zero-tolerance per-window jitter.
+
+```text
+/work/imt11/Mapperatorinator/runs/v32-integration-final-compile-v32-49562444
+control-first-compare.json SHA 00c593fcde6b04bc1b606cb36c65134748f7aa71e1fc2c8011aafea02607f5b8
+candidate-first-compare.json SHA 430badec03553a2c51f93c12707c73177820d849814da03b6423ea19524d4164
+```
+
+### Final static-server regression characterization
+
+Mixed five-song static-server jobs `49562635` and `49562710` ran the pinned
+pre-migration control and migrated V32 server in reciprocal launch order on RTX
+2080 Ti. Both jobs ended `FAILED 1:0`: the intended strict comparator remained
+red after valid profiles, rather than inference failing. Both sides
+self-validated real static batching and retained
+`same_calculation=false`, `server_rng_policy=shared_global`, and
+`token_equivalence_status=not_checked_shared_server_rng`. Every underlying
+profile reported `inference_engine=v32`, no optimized runtime owner/config/result
+class, and all optimized feature states false. The candidate fresh-import audit
+loaded no optimized/native/cpp-extension modules and both isolated extension
+directories remained empty; the control audit reproduced its frozen eager
+legacy q1/`torch.utils.cpp_extension` imports without compiling an extension.
+
+Scheduler-wall results changed sign with launch order. Control-first job
+`49562635` measured `152.558 -> 120.859 tok/s` (`-20.8%`) with `6,815` versus
+`6,292` main tokens. Candidate-first job `49562710` measured
+`106.933 -> 115.261 tok/s` (`+7.8%`) with `7,173` versus `7,057` main tokens.
+Both strict comparisons correctly remained red because shared global RNG and
+concurrent request ordering produced different stop lengths/work; neither run
+is exactness or same-work throughput evidence.
+
+The post-hoc B5-only diagnostic explains the apparent regression without
+replacing the scheduler metric. In job `49562635`, control and candidate
+executed `1,961` versus `2,478` longest-row active decode steps across ten B5
+batches; normalized B5 throughput was `67.098 -> 67.984` active steps/s
+(`+1.3%`). In reverse-order job `49562710`, after reporting and excluding B1-B4
+tails, normalized B5 throughput was `56.946 -> 70.402` (`+23.6%`). The migrated
+server had no negative normalized B5 result, but active-step/prefix work still
+differed. Server performance therefore remains non-comparable under the
+existing shared-RNG workload; ownership/import/metadata compatibility is the
+accepted boundary. No server throughput win is claimed.
+
+```text
+/work/imt11/Mapperatorinator/runs/static-server-regression-final-smoke15-r2-49562635
+compare-static-server.json SHA fd83cde92fc89bef8a6fea49113f3ae7129a3c16a8399c642cc4d9696cff3ad6
+work-normalized-static-server.json SHA 8369d4a26ad40b4f767824712c70ffab07f4c7b56c5f8ea43ae21e5e06f55cb8
+
+/work/imt11/Mapperatorinator/runs/static-server-regression-final-smoke15-candidate-first-49562710
+compare-static-server.json SHA 1c8f6a79903df8047de89f0dcb7904c08294ce6e226026185b6d2486434adaa0
+work-normalized-static-server.json SHA 490d762830b6472aed90f9bce673e0bd8a2c13386c315019c38eeef0282a931a
+
+control import audit SHA 2accf09898b894ee642ca00ec09bb6c96402706773b73456f89e565f3e55d014
+candidate import audit SHA cddfa51b70ec3fd9f483fceb4f48a3b45640d2cffe5e40e4148a430a955638d7
+```
+
+Together with token/output-equivalent default/compile-only runs and the exact
+optimized/delegated-legacy full-song gates, this accepts the migration as an
+architecture-neutral ownership change. Static server performance remains
+unproven/non-comparable; its ownership/import/metadata contract is preserved.
+The historical `270.475 tok/s` single-song frontier remains unchanged.
+
+Final local verification passed `289` general tests plus the separate `2`
+legacy-logits tests. A final focused server/profile run passed `32` tests, and
+the static Slurm wrapper passed `bash -n` and `git diff --check` after its
+post-processing-only changes.

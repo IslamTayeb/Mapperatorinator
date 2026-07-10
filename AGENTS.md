@@ -10,11 +10,11 @@
 
 ## Maintainer Boundary
 
-- The maintainer's V32 inference/server behavior is the compatibility surface. The default engine remains V32 and must not change output, imports, metadata, performance, or server behavior.
+- The maintainer's V32 inference/server behavior is the compatibility surface. The default engine remains V32 and must preserve output, public APIs/import identities, metadata, performance, and server behavior; fresh default and compile-only V32 imports must remain cold with respect to optimized/native modules.
 - Put new inference-engine work under `osuT5/osuT5/inference/optimized/`. Keep scheduler, exactness, metrics, speculative, single-song, batch, benchmark, and kernel implementations there.
 - Existing files may receive only default-off selectors, validation, metadata, narrow lazy adapters, or small abstracted kernel dispatch hooks. Do not place optimized scheduler/runtime state machines or fused-kernel implementations in `inference.py`, `server.py`, or model files.
-- `inference.py` and `osuT5/osuT5/inference/server.py:model_generate()` remain the public runtime control plane. Public flags must be declared in `config.py`/Hydra defaults, validated in `inference.py`, forwarded through loader/server entry points, and surfaced in profile metadata.
-- Native extensions must not import or compile unless an explicitly selected optimized mode requests them.
+- `inference.py` remains the public selector/loader control plane. `Processor` is the shared per-window adapter: optimized single dispatches to `OptimizedSingleRuntime`, while `osuT5/osuT5/inference/server.py:model_generate()` remains V32-only and must reject optimized runtime state. Public flags must be declared in `config.py`/Hydra defaults, validated in `inference.py`, forwarded through the selected loader/runtime entry point, and surfaced in profile metadata.
+- Native extensions must not import or compile unless the public optimized selector or the complete accepted legacy compatibility bundle explicitly requests the optimized single runtime.
 
 ## Campaign Contract
 
@@ -47,7 +47,7 @@
 - Build and prove the offline optimized engine before adding an optimized server adapter. Keep encoder/prefill and token-decode scheduling separate; prefill remains serial until measured stalls exceed `5%` of scheduler wall.
 - Treat each production song's windows as one dependency chain: a later window cannot become active before the preceding window's generated output exists. Do not use synthetic probe inputs to claim mixed-queue compatibility; derive model-free schedules from accepted exact-token production profiles, and label tensor-shape compatibility unproven when those profiles do not record encoder/frame/condition shapes.
 - Hybrid L2 fixed-shape job `49552768`, commit `682abdc`, passed exact processed-score/token/RNG/resource gates at `670.026 tok/s` worst reciprocal order. Treat it only as a prefix-128 repeated-step ceiling: it authorizes one changing-prefix verifier, not scheduler/runtime wiring. The accepted five-song schedule projects `566.904` decode-only but `459.985` with current setup charges; setup would need about `42.43%` reduction if decode holds. Setup-only jobs `49552299`/`49552651` are not performance evidence.
-- Legacy reciprocal jobs `49559982` (smoke) and `49560037` (full song) proved the two proposed graph-safety calculations token/output exact, but the full-song aggregate straddled noise (`-0.7%` and `+0.2%` main TPS by reciprocal pairing) and strict per-window gates failed. Do not change V32 for this verifier need. Keep the graph-capturable monotonic processor subclass and replacement helper under `optimized/` only; `osuT5/osuT5/inference/logit_processors.py` and its legacy tests must remain byte-identical to `main`. Final isolated-subclass regression job `49560227`, commit `2186d5a`, passed the H8 bitwise/capture/resource gates and again failed only the absolute performance bar (`514.276 < 623.657 tok/s`); report SHA `bb52add44510a677b28c417c3f54bdb52dc07fa032ba6b77600c4223373eb01d`.
+- Legacy reciprocal jobs `49559982` (smoke) and `49560037` (full song) proved the two proposed graph-safety calculations token/output exact, but the full-song aggregate straddled noise (`-0.7%` and `+0.2%` main TPS by reciprocal pairing) and strict per-window gates failed. Do not change the V32 full-scan calculation for this verifier need. Keep the graph-capturable monotonic processor subclass and replacement helper under `optimized/` only; legacy `stateful_batch1` construction must fail with a migration instruction rather than reintroducing optimized state into the V32 class. Final isolated-subclass regression job `49560227`, commit `2186d5a`, passed the H8 bitwise/capture/resource gates and again failed only the absolute performance bar (`514.276 < 623.657 tok/s`); report SHA `bb52add44510a677b28c417c3f54bdb52dc07fa032ba6b77600c4223373eb01d`.
 - Weighted real-prefix H8 job `49559747`, commit `511e0ba`, passed bitwise raw-logit/cache/token/RNG/state gates but reached only `507.198-532.528 tok/s`, below the required `>623.657 tok/s`. Dependency-aware K3 then projected only `518.230 tok/s`, below its strict `>525` CPU gate. Do not build an offline scheduler/runtime/server from these results. The currently measured batch candidates are exhausted; reopen only after materially better accepted setup or complete-step evidence first restores more than `5%` projected headroom.
 - Compare merged fixed-slot decode at `B=1/2/5/8` against `1-4` independent B1 CUDA-graph lanes before choosing a scheduler execution shape. Do not assume larger batches improve Turing throughput.
 - Maintain explicit per-request generator, logits processors, stopping state, encoder outputs, self/cross caches, token buffer, cache position, slot generation, and graph state.
@@ -56,6 +56,7 @@
 - Static IPC socket identity must include the explicit runtime key for scheduling/backend knobs and be hash-shortened under AF_UNIX limits; never attach a normal client, web owner, or benchmark harness to a stale socket created with different runtime settings.
 - The existing CPU continuous-scheduler harness is model-free verifier infrastructure. Do not call it a runtime throughput optimization or wire it into `InferenceServer` before RNG/logits/cache/output gates exist.
 - Preserve `generation_compatibility_key()` and explicit request/group state for static server grouping; mutable runtime objects in generation kwargs must fail loudly or move into explicit request state.
+- Architecture-only static-server regression gates must read back every profile's V32/RNG/effective-runtime metadata and use isolated import/extension caches. Because the existing server uses shared global RNG, run mixed-song comparisons reciprocally: keep scheduler-wall strict results primary and red when generated work differs, and use B5 active-step normalization only as a diagnostic that cannot replace throughput or exactness evidence.
 
 ## DCC Operations
 
@@ -72,6 +73,7 @@
 - Single-song frontier: `notes/inference-single-frontier.md`
 - Batch/offline frontier: `notes/inference-batch-frontier.md`
 - Accepted/rejected evidence ledger: `notes/inference-experiment-ledger.md`
+- Optimized-single ownership and migration audit: `notes/2026-07-10-optimized-single-architecture-migration-map.md`
 - Historical dated notes remain evidence sources until a reviewed cleanup verifies that the canonical ledger preserves their job IDs, commits, artifacts, decisions, and revisit conditions.
 
 ## Protected Audit Trails

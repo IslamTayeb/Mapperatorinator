@@ -8,6 +8,16 @@ This is the operational runbook for exact FP32 inference experiments on one RTX 
 
 Profiling is opt-in. Normal V32 inference must not write profile artifacts, import optimized/native modules, or change behavior.
 
+The canonical accepted fast path is selected with
+`inference_engine=optimized optimized_inference_mode=single`. `inference.py`
+loads the default-cold optimized adapter, `Processor` delegates each window to
+`OptimizedSingleRuntime`, and `server.model_generate()` remains the ordinary
+V32 path. The complete historical micro-flag bundle may reproduce the same
+immutable runtime through `legacy_single_adapter.py`; partial bundles fail
+loudly, and the public optimized selector may not be combined with legacy
+micro-flags. Detailed ownership and migration evidence lives in the
+[optimized-single migration map](../notes/2026-07-10-optimized-single-architecture-migration-map.md).
+
 ## Result Classes And Metrics
 
 Use one explicit result class:
@@ -59,7 +69,8 @@ Every run note must record:
 - commit and branch;
 - Slurm job/status and node/GPU;
 - Hydra config and all changed flags;
-- seed, precision, attention backend, server/parallel mode;
+- requested engine/mode, seed, precision, attention backend, server/parallel mode;
+- effective optimized config version, runtime owner, and legacy-delegation status;
 - model/HF, compiler, native-extension, and graph-cache state;
 - run, profile/manifest, comparison, telemetry, and trace paths.
 
@@ -81,22 +92,25 @@ python inference.py --config-name profile_salvalai \
   attn_implementation=sdpa \
   use_server=false \
   parallel=false \
-  inference_generation_compile=true \
-  inference_active_prefix_decode_loop=true \
-  inference_active_prefix_decode_bucket_size=64 \
-  inference_active_prefix_decode_cuda_graph=true \
-  inference_active_prefix_decode_cuda_graph_warmup=0 \
-  inference_active_prefix_decode_cuda_graph_min_decode_steps=1 \
-  inference_stateful_monotonic_logits_processor=true \
-  inference_q1_bmm_cross_attention=true \
-  inference_decode_session_runtime=true \
-  inference_decode_session_cuda_graph=true \
-  inference_native_decode_kernels=true \
-  inference_native_q1_self_attention=true \
-  inference_native_q1_rope_cache_self_attention=true
+  inference_engine=optimized \
+  optimized_inference_mode=single
 ```
 
-These flags are a validated default-off combination, not a new default and not a server/batch configuration. Record requested and context-enabled flags separately; timing contexts intentionally do not use the native self-attention path.
+The selector activates immutable effective config
+`accepted-fp32-270.475-v1`; it is default-off and supports only the validated
+FP32/SDPA, batch-1, non-server, non-parallel, no-CFG, no-beam path. Record
+requested and effective fields separately; timing contexts intentionally do
+not use the native self-attention path. The complete historical legacy bundle
+delegates to the same runtime only for reproduction. Do not use subsets of its
+micro-flags as experimental switches.
+
+Architecture-only changes must preserve this numerical frontier rather than
+claim a new speed result. Gate them against the public selector, the delegated
+legacy bundle, and pre-migration V32 as applicable; require one-token and
+256-step exactness, reciprocal smoke and full-song output equivalence,
+fresh-process default/compile-only import checks, and the throughput-only
+static-server regression. Keep the per-boundary job history in the migration
+map and place only the final current-commit decision in the experiment ledger.
 
 ## Smoke-To-Full Ladder
 
@@ -215,6 +229,17 @@ python utils/summarize_inference_profile.py \
 
 The comparator self-validates aggregate fields and the unique server-batch ledger. A malformed manifest is invalid evidence, not a performance regression. Current capacity evidence rejects lowering `server_batch_timeout` below `0.2s` and increasing `max_batch_size` beyond `10`; see the batch frontier.
 
+For architecture-only server regressions, use
+`scripts/dcc/verify_static_server_regression.sbatch` in both launch orders. It
+reads every underlying profile to require V32/shared-RNG metadata and absent
+optimized runtime state, audits fresh imports, and keeps per-side extension
+directories empty. Mixed-song request ordering can assign the shared RNG stream
+to different rows, changing stop lengths and scheduler work. Keep the strict
+scheduler-wall comparison red when generated work differs. The script's
+B5-only active-step normalization is diagnostic-only: report it to explain
+shape variance, but never use it to replace scheduler throughput, token/output
+equivalence, or a real promotion gate.
+
 ## Continuous-Scheduler Dry Runs
 
 `osuT5/osuT5/inference/continuous_batching.py` is CPU-only and model-free. Use it to validate request lifecycle, planned arrivals, state hashes, slot acquire/release, and slot generations—not to claim TPS.
@@ -259,7 +284,7 @@ Before merging an optimization:
 
 1. Current accepted baseline and same-config candidate were run on the target GPU.
 2. The candidate clears the `<5%` reject policy or has explicit approval for a smaller infrastructure-only change.
-3. Main/timing tokens, counts, stops, RNG, output SHA/size, and touched caches pass the relevant exactness class.
+3. Main/timing tokens, counts, stops, RNG, output SHA/size, and touched caches pass the relevant exactness class; requested engine fields and effective runtime owner/config metadata are internally consistent.
 4. Main model time/TPS, timing context, total stage wall, per-window behavior, and cold/warm costs are reported.
 5. Batch claims additionally pass per-request order, arrival, EOS/max-token, slot reuse, and state isolation gates.
 6. The result note contains commit, job, GPU, config, artifacts, decision, why it worked, and a concrete revisit condition.
