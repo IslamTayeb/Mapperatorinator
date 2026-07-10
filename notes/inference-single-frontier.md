@@ -115,6 +115,26 @@ Run root:
 
 This proves realistic cold/serial behavior and exactness for that earlier stack. It is not concurrent batching. The current-stack replacement denominator is recorded in [the batch frontier](inference-batch-frontier.md). Separate timing aggregate improved for all songs, but `timing/sequential/seq0` had a scoped first-record regression.
 
+## Speculative Target-Span Decision
+
+The zero-cost n-gram speculative runtime is rejected on current-stack cost despite clean exact-output target-span numerics:
+
+| Gate | Job / commit | Exactness | Cost result |
+| --- | --- | --- | --- |
+| K2 eager target span | `49546980` / `8972bb7` | logits/top-k, tokens `[12, 1648]`, final RNG, forced EOS, and cache allclose pass | `11.365ms` span; diagnostic only |
+| K4 eager target span | `49547062` / `cdfb577` | logits/top-k, tokens `[12, 1648, 2242, 2717]`, final RNG, forced EOS, and cache allclose pass | `10.770ms` span |
+| K4 fixed-shape graph ceiling | `49547134` / `f4c2156` | graph pointers/output stable; replay logits bitwise to eager, tokens/RNG exact, cache allclose | `8.464ms`, above strict `<5.480ms` keep bar |
+
+The K4 graph projects the five-full target path from `163.088s` / `~261.4 tok/s` to `197.472s` / `215.9 tok/s` (`-21.1%`). Slurm job `49547134` is `FAILED` only because the strict cost gate intentionally exited `1`; capture, graph safety, and numerical evidence passed. Reports:
+
+```text
+/work/imt11/Mapperatorinator/runs/spec-target-span-k2-49546980-8972bb7/target-span-k2.json
+/work/imt11/Mapperatorinator/runs/spec-target-span-k4-49547062-cdfb577/target-span-k4.json
+/work/imt11/Mapperatorinator/runs/spec-target-span-k4-49547134-f4c2156/target-span-k4.json
+```
+
+Keep the numeric/graph verifier, but do not build the n-gram runtime, run K8, or spend on rollback integration. Revisit only if the accepted q1 denominator materially slows, proposal/acceptance structure changes, or a new fixed-shape target kernel first demonstrates K4 below `5.480ms`. The physical `StaticCache` rollback API remains absent. The mock-only logical stale-suffix oracle in historical commit `cdfb577` never received a GPU gate and was removed by `b21109c` after the cost ceiling killed the family; do not treat it as retained runtime or verifier evidence.
+
 ## Current Bottleneck And Ceiling
 
 Post-frontier diagnostics show that another narrow wrapper or launch tweak cannot reach `500`:
@@ -139,8 +159,8 @@ The next production-facing experiment must first be verifier-only and must:
 
 Current ranked scouts:
 
-1. exact speculative verification with zero-cost n-gram proposals and `OliBomby/Mapperatorinator-v32-mini` at `K=2/4/8`;
-2. a broad FP32 whole-layer/stack native or cuBLASLt verifier;
+1. a broad FP32 whole-layer/stack native or cuBLASLt verifier;
+2. `OliBomby/Mapperatorinator-v32-mini` speculative verification only if measured draft cost and target-call structure first project above `5%` on the accepted stack;
 3. a whole-step device-controlled graph only if refreshed profiling still shows more than `5%` exclusive headroom and exact early EOS/RNG rollback is proven.
 
 Speculation must consume target RNG exactly one output position at a time, commit only matching draft tokens, discard uncommitted cache suffixes on mismatch, and preserve final token/RNG/output identity. Stop before production if draft cost plus verified target calls saved project below `5%`.
@@ -152,6 +172,7 @@ Do not restart these without new current-stack evidence:
 - per-linear call-form rewrites, standalone final projection, narrow MLP or attention islands;
 - graph-cache dictionary cleanup, static input-copy cleanup, fast prepare-input rewrites;
 - naive fixed-K graphing that over-advances RNG at early EOS;
+- zero-cost n-gram speculative runtime on the current q1 denominator;
 - manual Python/module decoder-layer recomposition;
 - native self+cross prefix as `bitwise-calculation-exact` (cache writes have real FP32 bit drift);
 - cold native-extension compilation as a synchronized model-TPS target;
