@@ -6,10 +6,13 @@ from .physics import (
     BatchPhysicsScheduler,
     BatchPhysicsStep,
 )
+from .loop_state import ActiveRowLedger, ActiveRowState
 
 __all__ = [
     "BatchPhysicsRequest",
     "BatchPhysicsResult",
     "BatchPhysicsScheduler",
     "BatchPhysicsStep",
+    "ActiveRowLedger",
+    "ActiveRowState",
 ]
