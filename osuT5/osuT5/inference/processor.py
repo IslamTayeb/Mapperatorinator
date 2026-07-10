@@ -160,8 +160,14 @@ class Processor(object):
         self.timeshift_bias = args.timeshift_bias
         self.types_first = args.train.data.types_first
         self.last_generation_stats: dict[str, float | int] | None = None
-        self.decode_session_state: dict[str, Any] | None = None
+        self.decode_session_state: Any | None = None
         self.profiler = profiler or InferenceProfiler()
+
+    @staticmethod
+    def _new_decode_session_state():
+        from .optimized.single.state import ProductionDecodeSession
+
+        return ProductionDecodeSession()
 
     def model_generate(self, model_kwargs, **generate_kwargs: Any) -> Any:
         generate_kwargs2 = generate_kwargs | dict(
@@ -212,7 +218,7 @@ class Processor(object):
             if isinstance(self.model, InferenceClient):
                 raise ValueError("inference_decode_session_runtime requires use_server=false.")
             if self.decode_session_state is None:
-                self.decode_session_state = {}
+                self.decode_session_state = self._new_decode_session_state()
             generate_kwargs2["decode_session_state"] = self.decode_session_state
         if generate_kwargs2["active_prefix_decode_cuda_graph"] and isinstance(self.model, InferenceClient):
             raise ValueError("inference_active_prefix_decode_cuda_graph requires use_server=false.")
@@ -374,7 +380,7 @@ class Processor(object):
                 continue
 
             if bool(getattr(self.args, "inference_decode_session_runtime", False)):
-                self.decode_session_state = {}
+                self.decode_session_state = self._new_decode_session_state()
 
             if verbose:
                 print(f"Generating {context['context_type'].value}")

@@ -20,7 +20,8 @@ from transformers.modeling_outputs import BaseModelOutput
 
 from config import InferenceConfig
 from inference import compile_args, load_model_with_server, setup_inference_environment
-from osuT5.osuT5.inference.cache_utils import MapperatorinatorCache, get_cache
+from osuT5.osuT5.inference.cache_utils import get_cache
+from osuT5.osuT5.inference.optimized.single.state import ProductionDecodeSession
 from osuT5.osuT5.runtime_profiling import active_prefix_self_attention_context, generation_profile_context
 from osuT5.osuT5.tokenizer import ContextType
 from utils.verify_direct_decode_loop import (
@@ -58,13 +59,6 @@ def _parse_sequence_indices(value: str) -> list[int]:
 
 def _generated_token_ids(output: torch.Tensor, prompt_len: int) -> list[int]:
     return [int(item) for item in output[0, prompt_len:].tolist()]
-
-
-def _reset_mapperatorinator_cache(cache: MapperatorinatorCache) -> None:
-    cache.self_attention_cache.reset()
-    cache.cross_attention_cache.reset()
-    for layer_idx in list(cache.is_updated):
-        cache.is_updated[layer_idx] = False
 
 
 def _stable_encoder_outputs(
@@ -374,9 +368,8 @@ def verify_persistent_decode_session(
         reference_end_rng_state = _rng_state()
 
     candidate_results: list[dict[str, Any]] = []
-    shared_cache = get_cache(model, batch_size=1, num_beams=1, cfg_scale=1.0)
-    shared_graph_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
-    stable_encoder_holder: dict[str, BaseModelOutput] = {}
+    session = ProductionDecodeSession()
+    candidate_cache_ids: list[int] = []
     _set_rng_state(initial_rng_state)
     with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16, enabled=args.precision == "amp"), \
             generation_profile_context(
@@ -384,7 +377,13 @@ def verify_persistent_decode_session(
                 q1_bmm_cross_attention=q1_bmm_cross_attention,
             ):
         for window in windows:
-            _reset_mapperatorinator_cache(shared_cache)
+            shared_cache = session.cache_for_window(
+                model,
+                batch_size=1,
+                num_beams=1,
+                cfg_scale=1.0,
+            )
+            candidate_cache_ids.append(id(shared_cache))
             model_inputs = window["model_inputs"]
             captures = []
             processors = _build_generation_logits_processors(
@@ -410,8 +409,7 @@ def verify_persistent_decode_session(
                 eos_token_id=window["eos_token_ids"],
                 custom_generate=partial(
                     persistent_decode_loop_generate,
-                    shared_graph_cache=shared_graph_cache,
-                    stable_encoder_holder=stable_encoder_holder,
+                    **session.active_prefix_decode_kwargs(),
                     buffered_input_ids=buffered_input_ids,
                     active_prefix_decode=True,
                     active_prefix_decode_length=None,
@@ -459,8 +457,21 @@ def verify_persistent_decode_session(
 
     rng_match = _rng_states_equal(reference_end_rng_state, candidate_end_rng_state)
     all_pass = all_pass and rng_match
-    graph_summary = _graph_summary(shared_graph_cache)
+    graph_summary = _graph_summary(session.graph_cache)
     unique_prefixes = len(graph_summary["by_prefix"])
+    graph_capture_gate = int(graph_summary["graphs"]) == unique_prefixes
+    cache_identity_reused = len(set(candidate_cache_ids)) == 1
+    stable_encoder_output_shape = (
+        list(session.stable_encoder_holder["encoder_outputs"].last_hidden_state.shape)
+        if "encoder_outputs" in session.stable_encoder_holder
+        else None
+    )
+    all_pass = (
+        all_pass
+        and graph_capture_gate
+        and cache_identity_reused
+        and stable_encoder_output_shape is not None
+    )
 
     return {
         "pass": all_pass,
@@ -483,14 +494,12 @@ def verify_persistent_decode_session(
             "top_k": top_k,
         },
         "rng_state_match": rng_match,
+        "production_session_cache_identity_reused": cache_identity_reused,
+        "production_session_cache_ids": candidate_cache_ids,
         "windows": window_reports,
         "graph_summary": graph_summary,
-        "graph_capture_count_equals_unique_prefix_count": int(graph_summary["graphs"]) == unique_prefixes,
-        "stable_encoder_output_shape": (
-            list(stable_encoder_holder["encoder_outputs"].last_hidden_state.shape)
-            if "encoder_outputs" in stable_encoder_holder
-            else None
-        ),
+        "graph_capture_count_equals_unique_prefix_count": graph_capture_gate,
+        "stable_encoder_output_shape": stable_encoder_output_shape,
     }
 
 
