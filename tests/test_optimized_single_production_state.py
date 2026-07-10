@@ -110,6 +110,7 @@ from osuT5.osuT5.inference.processor import Processor
 
 assert "osuT5.osuT5.inference.optimized.single.state" not in sys.modules
 processor = object.__new__(Processor)
+processor.inference_runtime = None
 session = processor._new_decode_session_state()
 assert type(session).__name__ == "ProductionDecodeSession"
 assert "osuT5.osuT5.inference.optimized.single.state" in sys.modules
@@ -129,6 +130,7 @@ def test_sequential_generation_creates_one_session_per_unfinished_context():
 
     processor = object.__new__(Processor)
     processor.args = SimpleNamespace(inference_decode_session_runtime=True)
+    processor.inference_runtime = None
     processor.decode_session_state = object()
     processor._create_tokens_per_second_meter = lambda: object()
     created = []

@@ -436,6 +436,18 @@ def validate_reserved_runtime_flags(args: InferenceConfig):
                 "inference_engine=optimized owns its runtime configuration and cannot be combined with "
                 "legacy experimental inference flags: " + ", ".join(conflicting_flags)
             )
+        if args.device != "cuda":
+            raise ValueError("inference_engine=optimized single currently requires device=cuda.")
+        if args.attn_implementation != "sdpa":
+            raise ValueError(
+                "inference_engine=optimized single currently requires attn_implementation=sdpa."
+            )
+        if args.cfg_scale != 1.0:
+            raise ValueError("inference_engine=optimized single currently requires cfg_scale=1.0.")
+        if args.num_beams != 1:
+            raise ValueError("inference_engine=optimized single currently requires num_beams=1.")
+        if args.super_timing:
+            raise ValueError("inference_engine=optimized single does not support super_timing.")
 
     def effective_generation_batch_size() -> int:
         batch_multiplier = args.num_beams * (2 if args.cfg_scale > 1.0 else 1)
@@ -789,6 +801,10 @@ def generate(
         "in_context": [context.value for context in args.in_context],
         "output_type": [context.value for context in args.output_type],
     }
+    binding_runtime = getattr(model, "runtime", None)
+    runtime_profile_metadata = getattr(binding_runtime, "profile_metadata", None)
+    if callable(runtime_profile_metadata):
+        profile_metadata.update(runtime_profile_metadata())
     if profiler.enabled:
         profile_metadata.update(get_profile_runtime_metadata())
     profiler.set_metadata(**profile_metadata)
@@ -1074,7 +1090,11 @@ def load_model_with_engine(
         raise ValueError("inference_engine must be one of: optimized, v32.")
 
     adapter = importlib.import_module("osuT5.osuT5.inference.optimized.adapter")
-    return adapter.load_optimized_engine(mode=optimized_inference_mode, **loader_kwargs)
+    return adapter.load_optimized_engine(
+        mode=optimized_inference_mode,
+        model_loader=load_model_with_server,
+        loader_kwargs=loader_kwargs,
+    )
 
 
 def get_server_address(

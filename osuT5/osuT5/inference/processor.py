@@ -12,6 +12,7 @@ from slider import Beatmap, TimingPoint
 from tqdm import tqdm
 
 from config import InferenceConfig
+from .engine_binding import unwrap_engine_binding
 from .profiler import InferenceProfiler
 from .server import InferenceClient, model_generate, model_forward
 from ..dataset.osu_parser import OsuParser
@@ -79,6 +80,8 @@ class Processor(object):
             profiler: InferenceProfiler | None = None,
     ):
         """Model inference stage that processes sequences."""
+        model, self.inference_runtime = unwrap_engine_binding(model)
+
         self.device = args.device
         self.precision = args.precision
         self.args = args
@@ -163,8 +166,10 @@ class Processor(object):
         self.decode_session_state: Any | None = None
         self.profiler = profiler or InferenceProfiler()
 
-    @staticmethod
-    def _new_decode_session_state():
+    def _new_decode_session_state(self):
+        if self.inference_runtime is not None:
+            return self.inference_runtime.new_context_state()
+
         from .optimized.single.state import ProductionDecodeSession
 
         return ProductionDecodeSession()
@@ -214,6 +219,16 @@ class Processor(object):
             ),
             decode_session_cuda_graph=bool(getattr(self.args, "inference_decode_session_cuda_graph", False)),
         )
+        if self.inference_runtime is not None:
+            if self.decode_session_state is None:
+                self.decode_session_state = self._new_decode_session_state()
+            return self.inference_runtime.generate_window(
+                model=self.model,
+                tokenizer=self.tokenizer,
+                model_kwargs=model_kwargs,
+                generate_kwargs=generate_kwargs2,
+                context_state=self.decode_session_state,
+            )
         if bool(getattr(self.args, "inference_decode_session_runtime", False)):
             if isinstance(self.model, InferenceClient):
                 raise ValueError("inference_decode_session_runtime requires use_server=false.")
@@ -379,7 +394,10 @@ class Processor(object):
             if context["finished"]:
                 continue
 
-            if bool(getattr(self.args, "inference_decode_session_runtime", False)):
+            if (
+                self.inference_runtime is not None
+                or bool(getattr(self.args, "inference_decode_session_runtime", False))
+            ):
                 self.decode_session_state = self._new_decode_session_state()
 
             if verbose:
@@ -1556,6 +1574,11 @@ class Processor(object):
             "active_prefix_decode_cuda_graph_min_decode_steps": stats.get(
                 "active_prefix_decode_cuda_graph_min_decode_steps"
             ),
+            "optimized_effective_config_version": stats.get(
+                "optimized_effective_config_version"
+            ),
+            "optimized_runtime_owner": stats.get("optimized_runtime_owner"),
+            "optimized_result_class": stats.get("optimized_result_class"),
             "server_batching_mode": stats.get("server_batching_mode"),
             "server_elapsed_seconds_attribution": stats.get("server_elapsed_seconds_attribution"),
             "server_max_batch_size": stats.get("server_max_batch_size"),
