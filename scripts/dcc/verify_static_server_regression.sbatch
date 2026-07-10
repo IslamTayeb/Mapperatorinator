@@ -19,6 +19,7 @@ CONTROL_COMMIT=${CONTROL_COMMIT:?Set CONTROL_COMMIT}
 CANDIDATE_COMMIT=${CANDIDATE_COMMIT:?Set CANDIDATE_COMMIT}
 SONG_LIST=${SONG_LIST:-$WORK/data/five-song-profile/songs.yaml}
 RUN_LABEL=${RUN_LABEL:-smoke15}
+RUN_ORDER=${RUN_ORDER:-control_first}
 RUN_ROOT="$WORK/runs/static-server-regression-${RUN_LABEL}-${SLURM_JOB_ID:-manual}"
 
 for repo in "$CONTROL_REPO" "$CANDIDATE_REPO"; do
@@ -65,6 +66,7 @@ echo "job_id=${SLURM_JOB_ID:-manual}"
 echo "control_commit=$CONTROL_COMMIT"
 echo "candidate_commit=$CANDIDATE_COMMIT"
 echo "song_list=$SONG_LIST"
+echo "run_order=$RUN_ORDER"
 echo "run_root=$RUN_ROOT"
 nvidia-smi -L
 nvidia-smi \
@@ -193,11 +195,24 @@ run_suite() {
 # require the migrated candidate to remove those imports.
 audit_import_state "$CONTROL_REPO" control record_only
 audit_import_state "$CANDIDATE_REPO" candidate require_cold
-run_suite "$CONTROL_REPO" control
-run_suite "$CANDIDATE_REPO" candidate
+case "$RUN_ORDER" in
+  control_first)
+    run_suite "$CONTROL_REPO" control
+    run_suite "$CANDIDATE_REPO" candidate
+    ;;
+  candidate_first)
+    run_suite "$CANDIDATE_REPO" candidate
+    run_suite "$CONTROL_REPO" control
+    ;;
+  *)
+    echo "RUN_ORDER must be control_first or candidate_first" >&2
+    exit 2
+    ;;
+esac
 
 CONTROL_MANIFEST=$(<"$RUN_ROOT/control.manifest-path.txt")
 CANDIDATE_MANIFEST=$(<"$RUN_ROOT/candidate.manifest-path.txt")
+set +e
 (
   cd "$CANDIDATE_REPO"
   python utils/summarize_inference_profile.py \
@@ -205,6 +220,8 @@ CANDIDATE_MANIFEST=$(<"$RUN_ROOT/candidate.manifest-path.txt")
     --strict \
     --json-output "$RUN_ROOT/compare-static-server.json"
 )
+STRICT_COMPARE_STATUS=$?
+set -e
 
 python - "$CONTROL_MANIFEST" "$CANDIDATE_MANIFEST" <<'PY'
 import json
@@ -278,7 +295,116 @@ for name, path in zip(("control", "candidate"), sys.argv[1:]):
                         f"{name} run {run_index} generation {record_index}: {field}="
                         f"{record.get(field)!r}, expected {expected!r}"
                     )
-print("static_server_regression_gate=PASS")
+print("static_server_runtime_contract_gate=PASS")
+PY
+
+python - "$CONTROL_MANIFEST" "$CANDIDATE_MANIFEST" "$RUN_ROOT/work-normalized-static-server.json" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+
+def main_batch_work(manifest_path: str) -> dict:
+    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    batches: dict[str, dict] = {}
+    for run in manifest.get("runs", []):
+        profile = json.loads(Path(run["profile_path"]).read_text(encoding="utf-8"))
+        for record in profile.get("generation", []):
+            if record.get("profile_label") != "main_generation":
+                continue
+            ids = record.get("server_batch_ids") or []
+            elapsed = record.get("server_batch_elapsed_seconds") or []
+            sizes = record.get("server_batch_sizes") or []
+            request_counts = record.get("server_batch_request_counts") or []
+            work_items = record.get("server_batch_work_items") or []
+            per_sample_tokens = record.get("generated_tokens_per_sample") or []
+            if not (
+                len(ids)
+                == len(elapsed)
+                == len(sizes)
+                == len(request_counts)
+                == len(work_items)
+                == len(per_sample_tokens)
+                == 1
+            ):
+                raise SystemExit(
+                    "work-normalized diagnostic requires one B1 request row and one server batch "
+                    "per main record"
+                )
+            if int(sizes[0]) != 5 or int(request_counts[0]) != 5 or int(work_items[0]) != 1:
+                raise SystemExit(
+                    "work-normalized diagnostic requires a merged B5 server batch made from five "
+                    "independent B1 request rows"
+                )
+            batch_id = str(ids[0])
+            batch = batches.setdefault(
+                batch_id,
+                {
+                    "batch_id": ids[0],
+                    "batch_size": int(sizes[0]),
+                    "request_count": int(request_counts[0]),
+                    "work_items_per_request": int(work_items[0]),
+                    "elapsed_seconds": float(elapsed[0]),
+                    "request_generated_tokens": [],
+                },
+            )
+            if (
+                batch["batch_size"] != int(sizes[0])
+                or batch["request_count"] != int(request_counts[0])
+                or batch["work_items_per_request"] != int(work_items[0])
+                or batch["elapsed_seconds"] != float(elapsed[0])
+            ):
+                raise SystemExit(f"inconsistent duplicated server batch ledger for batch {batch_id}")
+            batch["request_generated_tokens"].append(int(per_sample_tokens[0]))
+
+    ordered = sorted(batches.values(), key=lambda batch: int(batch["batch_id"]))
+    for batch in ordered:
+        if len(batch["request_generated_tokens"]) != batch["batch_size"]:
+            raise SystemExit(
+                f"batch {batch['batch_id']} has {len(batch['request_generated_tokens'])} request records, "
+                f"expected {batch['batch_size']}"
+            )
+        batch["active_decode_steps"] = max(batch["request_generated_tokens"])
+        batch["generated_tokens_sum"] = sum(batch["request_generated_tokens"])
+    active_steps = sum(batch["active_decode_steps"] for batch in ordered)
+    elapsed_seconds = sum(batch["elapsed_seconds"] for batch in ordered)
+    if active_steps <= 0 or elapsed_seconds <= 0:
+        raise SystemExit("work-normalized diagnostic requires positive active steps and elapsed time")
+    return {
+        "git_commit": manifest.get("git_commit"),
+        "manifest_path": str(manifest_path),
+        "manifest_sha256": hashlib.sha256(Path(manifest_path).read_bytes()).hexdigest(),
+        "unique_main_batches": len(ordered),
+        "active_decode_steps": active_steps,
+        "unique_main_batch_elapsed_seconds": elapsed_seconds,
+        "active_decode_steps_per_second": active_steps / elapsed_seconds,
+        "seconds_per_active_decode_step": elapsed_seconds / active_steps,
+        "batches": ordered,
+    }
+
+
+control = main_batch_work(sys.argv[1])
+candidate = main_batch_work(sys.argv[2])
+baseline = control["active_decode_steps_per_second"]
+current = candidate["active_decode_steps_per_second"]
+report = {
+    "schema_version": 1,
+    "result_class": "static_server_shared_rng_work_normalized_diagnostic",
+    "claim_scope": (
+        "diagnostic only: normalizes unique B5 main-batch elapsed time by the longest generated "
+        "row in each batch; it does not replace scheduler-wall throughput or prove token equivalence"
+    ),
+    "control": control,
+    "candidate": candidate,
+    "active_decode_steps_per_second_delta_pct": ((current / baseline) - 1.0) * 100.0,
+}
+Path(sys.argv[3]).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+print(
+    "work_normalized_active_decode_steps_per_second: "
+    f"baseline={baseline:.3f}, candidate={current:.3f}, "
+    f"delta={report['active_decode_steps_per_second_delta_pct']:+.1f}%"
+)
 PY
 
 for extension_dir in "$RUN_ROOT/extensions/control" "$RUN_ROOT/extensions/candidate"; do
@@ -290,5 +416,10 @@ for extension_dir in "$RUN_ROOT/extensions/control" "$RUN_ROOT/extensions/candid
 done
 find "$RUN_ROOT" -type f \
   \( -name static_server_batch_manifest.json -o -name 'compare-static-server.json' \
-     -o -path '*/import-audits/*.json' \) \
+     -o -name 'work-normalized-static-server.json' -o -path '*/import-audits/*.json' \) \
   -print0 | sort -z | xargs -0 sha256sum
+echo "strict_compare_status=$STRICT_COMPARE_STATUS"
+if (( STRICT_COMPARE_STATUS != 0 )); then
+  echo "static server strict scheduler-wall gate failed" >&2
+  exit "$STRICT_COMPARE_STATUS"
+fi
