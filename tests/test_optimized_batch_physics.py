@@ -149,6 +149,8 @@ def test_measurement_schema_records_required_gpu_and_exactness_fields():
         model_seconds=0.8,
         cuda_seconds=0.7,
         peak_memory_bytes=1024,
+        graph_capture_count=1,
+        graph_replay_count=100,
         active_batch_size_histogram={5: 100},
         token_hashes={"a": "token-a", "b": "token-b"},
         final_rng_state_hashes={"a": "rng-a", "b": "rng-b"},
@@ -157,6 +159,8 @@ def test_measurement_schema_records_required_gpu_and_exactness_fields():
 
     assert observation.scheduler_wall_tokens_per_second == 500.0
     assert observation.as_dict()["active_batch_size_histogram"] == {"5": 100}
+    assert observation.as_dict()["graph_capture_count"] == 1
+    assert observation.as_dict()["graph_replay_count"] == 100
     assert BatchPhysicsPlan().as_dict() == {
         "merged_batch_sizes": [1, 2, 5, 8],
         "b1_lane_counts": [1, 2, 3, 4],
@@ -174,10 +178,16 @@ def test_measurement_schema_records_required_gpu_and_exactness_fields():
             "model_seconds",
             "cuda_seconds",
             "peak_memory_bytes",
+            "graph_capture_count",
+            "graph_replay_count",
             "active_batch_size_histogram",
             "token_hashes",
             "final_rng_state_hashes",
             "stop_reasons",
+        ],
+        "bitwise_required_observation_fields": [
+            "intermediate_state_hashes",
+            "cache_state_hashes",
         ],
     }
 
@@ -203,6 +213,19 @@ def test_measurement_schema_records_required_gpu_and_exactness_fields():
 
     wrong_class_payload = candidate.as_dict()
     wrong_class_payload["result_class"] = "bitwise-calculation-exact"
+    _assert_raises(
+        ValueError,
+        lambda: BatchPhysicsObservation.from_dict(wrong_class_payload),
+        "requires per-request intermediate_state_hashes",
+    )
+    wrong_class_payload["intermediate_state_hashes"] = {
+        "a": {"decoder_logits": "logits-a"},
+        "b": {"decoder_logits": "logits-b"},
+    }
+    wrong_class_payload["cache_state_hashes"] = {
+        "a": {"self_kv": "cache-a"},
+        "b": {"self_kv": "cache-b"},
+    }
     wrong_class = BatchPhysicsObservation.from_dict(wrong_class_payload)
     _assert_raises(
         ValueError,
@@ -217,4 +240,46 @@ def test_measurement_schema_records_required_gpu_and_exactness_fields():
         ValueError,
         lambda: compare_batch_physics_observations(observation, wrong_contract),
         "workload contracts differ",
+    )
+
+    bitwise_baseline_payload = observation.as_dict()
+    bitwise_baseline_payload["result_class"] = "bitwise-calculation-exact"
+    bitwise_baseline_payload["intermediate_state_hashes"] = {
+        "a": {"decoder_logits": "logits-a"},
+        "b": {"decoder_logits": "logits-b"},
+    }
+    bitwise_baseline_payload["cache_state_hashes"] = {
+        "a": {"self_kv": "cache-a"},
+        "b": {"self_kv": "cache-b"},
+    }
+    bitwise_candidate_payload = candidate.as_dict()
+    bitwise_candidate_payload["result_class"] = "bitwise-calculation-exact"
+    bitwise_candidate_payload["intermediate_state_hashes"] = {
+        "a": {"decoder_logits": "changed-logits-a"},
+        "b": {"decoder_logits": "logits-b"},
+    }
+    bitwise_candidate_payload["cache_state_hashes"] = {
+        "a": {"self_kv": "cache-a"},
+        "b": {"self_kv": "cache-b"},
+    }
+    bitwise_baseline = BatchPhysicsObservation.from_dict(bitwise_baseline_payload)
+    bitwise_candidate = BatchPhysicsObservation.from_dict(bitwise_candidate_payload)
+    _assert_raises(
+        ValueError,
+        lambda: compare_batch_physics_observations(bitwise_baseline, bitwise_candidate),
+        "intermediate_state_hashes",
+    )
+
+    bitwise_candidate_payload["intermediate_state_hashes"] = (
+        bitwise_baseline_payload["intermediate_state_hashes"]
+    )
+    bitwise_candidate_payload["cache_state_hashes"] = {
+        "a": {"self_kv": "changed-cache-a"},
+        "b": {"self_kv": "cache-b"},
+    }
+    bitwise_candidate = BatchPhysicsObservation.from_dict(bitwise_candidate_payload)
+    _assert_raises(
+        ValueError,
+        lambda: compare_batch_physics_observations(bitwise_baseline, bitwise_candidate),
+        "cache_state_hashes",
     )

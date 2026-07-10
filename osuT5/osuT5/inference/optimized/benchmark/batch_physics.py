@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Mapping
 
@@ -54,10 +54,16 @@ class BatchPhysicsPlan:
                 "model_seconds",
                 "cuda_seconds",
                 "peak_memory_bytes",
+                "graph_capture_count",
+                "graph_replay_count",
                 "active_batch_size_histogram",
                 "token_hashes",
                 "final_rng_state_hashes",
                 "stop_reasons",
+            ],
+            "bitwise_required_observation_fields": [
+                "intermediate_state_hashes",
+                "cache_state_hashes",
             ],
         }
 
@@ -77,10 +83,14 @@ class BatchPhysicsObservation:
     model_seconds: float
     cuda_seconds: float
     peak_memory_bytes: int
+    graph_capture_count: int
+    graph_replay_count: int
     active_batch_size_histogram: Mapping[int, int]
     token_hashes: Mapping[str, str]
     final_rng_state_hashes: Mapping[str, str]
     stop_reasons: Mapping[str, str]
+    intermediate_state_hashes: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    cache_state_hashes: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "execution_family", BatchPhysicsExecutionFamily(self.execution_family))
@@ -121,6 +131,10 @@ class BatchPhysicsObservation:
             raise ValueError("cuda_seconds cannot exceed scheduler_wall_seconds.")
         if self.peak_memory_bytes <= 0:
             raise ValueError("peak_memory_bytes must be positive.")
+        for name in ("graph_capture_count", "graph_replay_count"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer.")
         if not self.seeds or any(
                 not request_id
                 or not isinstance(seed, int)
@@ -158,6 +172,19 @@ class BatchPhysicsObservation:
         )
                for key, value in mapping.items()):
             raise ValueError("request IDs, exactness hashes, and stop reasons must be non-empty.")
+        bitwise_required = self.result_class is ExactnessResultClass.BITWISE_CALCULATION_EXACT
+        self._validate_per_request_state_hashes(
+            "intermediate_state_hashes",
+            self.intermediate_state_hashes,
+            request_ids,
+            required=bitwise_required,
+        )
+        self._validate_per_request_state_hashes(
+            "cache_state_hashes",
+            self.cache_state_hashes,
+            request_ids,
+            required=bitwise_required,
+        )
 
     @property
     def scheduler_wall_tokens_per_second(self) -> float:
@@ -189,6 +216,32 @@ class BatchPhysicsObservation:
         }
         return cls(**values)
 
+    @staticmethod
+    def _validate_per_request_state_hashes(
+            field_name: str,
+            hashes: Mapping[str, Mapping[str, str]],
+            request_ids: set[str],
+            *,
+            required: bool,
+    ) -> None:
+        if not hashes:
+            if required:
+                raise ValueError(
+                    f"bitwise-calculation-exact requires per-request {field_name}."
+                )
+            return
+        if set(hashes) != request_ids:
+            raise ValueError(f"{field_name} must cover every request when provided.")
+        if any(
+                not request_id
+                or not component_hashes
+                or any(not name or not value for name, value in component_hashes.items())
+                for request_id, component_hashes in hashes.items()
+        ):
+            raise ValueError(
+                f"{field_name} must contain non-empty component names and hashes per request."
+            )
+
 
 def compare_batch_physics_observations(
         baseline: BatchPhysicsObservation,
@@ -212,6 +265,10 @@ def compare_batch_physics_observations(
             baseline.final_rng_state_hashes == candidate.final_rng_state_hashes
         ),
         "stop_reasons": baseline.stop_reasons == candidate.stop_reasons,
+        "intermediate_state_hashes": (
+            baseline.intermediate_state_hashes == candidate.intermediate_state_hashes
+        ),
+        "cache_state_hashes": baseline.cache_state_hashes == candidate.cache_state_hashes,
     }
     failed_fields = [name for name, matched in exactness_fields.items() if not matched]
     if failed_fields:
