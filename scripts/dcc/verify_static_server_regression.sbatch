@@ -104,9 +104,10 @@ COMMON_OVERRIDES=(
   inference_native_q1_rope_cache_self_attention=false
 )
 
-audit_import_cold() {
+audit_import_state() {
   local repo=$1
   local label=$2
+  local cold_requirement=$3
   local extension_dir="$RUN_ROOT/extensions/$label"
   local audit_path="$RUN_ROOT/import-audits/$label.json"
   mkdir -p "$extension_dir"
@@ -116,13 +117,14 @@ audit_import_cold() {
   fi
   (
     cd "$repo"
-    TORCH_EXTENSIONS_DIR="$extension_dir" python - "$audit_path" <<'PY'
+    TORCH_EXTENSIONS_DIR="$extension_dir" python - "$audit_path" "$cold_requirement" <<'PY'
 import importlib
 import json
 from pathlib import Path
 import sys
 
 audit_path = Path(sys.argv[1])
+cold_requirement = sys.argv[2]
 audits = []
 for module_name in (
     "inference",
@@ -145,7 +147,7 @@ for module_name in (
         }
     )
     audits.append({"import": module_name, "forbidden_modules": forbidden_modules})
-    if forbidden_modules:
+    if cold_requirement == "require_cold" and forbidden_modules:
         raise SystemExit(
             f"{module_name} eagerly imported optimized/native modules: {forbidden_modules}"
         )
@@ -186,8 +188,11 @@ run_suite() {
   echo "$manifest" > "$RUN_ROOT/$label.manifest-path.txt"
 }
 
-audit_import_cold "$CONTROL_REPO" control
-audit_import_cold "$CANDIDATE_REPO" candidate
+# The pinned pre-migration control is known to import the legacy native q1
+# module and torch cpp-extension machinery eagerly. Record that frozen baseline;
+# require the migrated candidate to remove those imports.
+audit_import_state "$CONTROL_REPO" control record_only
+audit_import_state "$CANDIDATE_REPO" candidate require_cold
 run_suite "$CONTROL_REPO" control
 run_suite "$CANDIDATE_REPO" candidate
 
