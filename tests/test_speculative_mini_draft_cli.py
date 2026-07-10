@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from inference import compile_args
+from osuT5.osuT5.inference.optimized.speculative import mini_draft_gpu
 from utils.verify_speculative_mini_draft import (
     EXPECTED_GAMEMODE0_TOKENIZER_SHA256,
     MINI_REVISION,
@@ -16,6 +17,50 @@ from utils.verify_speculative_mini_draft import (
     _load_args,
     _validate_approved_contract,
 )
+
+
+def test_scout_owns_stateful_monotonic_processor_without_public_legacy_flag(
+    monkeypatch,
+):
+    calls = []
+
+    def fake_builder(*args, **kwargs):
+        calls.append(kwargs)
+        return []
+
+    monkeypatch.setattr(
+        mini_draft_gpu,
+        "build_logits_processor_list",
+        fake_builder,
+    )
+    args = SimpleNamespace(
+        timeshift_bias=0.0,
+        train=SimpleNamespace(data=SimpleNamespace(types_first=False)),
+        temperature=0.9,
+        timing_temperature=0.9,
+        mania_column_temperature=0.9,
+        taiko_hit_temperature=0.9,
+        cfg_scale=1.0,
+        top_k=0,
+        top_p=1.0,
+        inference_stateful_monotonic_logits_processor=False,
+    )
+
+    mini_draft_gpu._greedy_processors(
+        args,
+        object(),
+        "cpu",
+        lookback_time=0.0,
+    )
+    mini_draft_gpu._target_sampling_processors(
+        args,
+        object(),
+        "cpu",
+        lookback_time=0.0,
+    )
+
+    assert len(calls) == 2
+    assert all(call["stateful_monotonic"] is True for call in calls)
 
 
 def _artifact(*, hidden_size: int, layers: int, common_value: int = 7):
@@ -83,8 +128,8 @@ def test_cli_contract_rejects_any_second_shape_or_runtime_drift():
         top_p=0.9,
         top_k=0,
         inference_generation_compile=False,
-        inference_active_prefix_decode_loop=True,
-        inference_stateful_monotonic_logits_processor=True,
+        inference_active_prefix_decode_loop=False,
+        inference_stateful_monotonic_logits_processor=False,
         start_time=71000,
         end_time=86000,
         device="cuda",
@@ -153,8 +198,8 @@ def test_loader_preflight_contract_requires_cpu_and_remains_distinct_from_gpu_ga
         top_p=0.9,
         top_k=0,
         inference_generation_compile=False,
-        inference_active_prefix_decode_loop=True,
-        inference_stateful_monotonic_logits_processor=True,
+        inference_active_prefix_decode_loop=False,
+        inference_stateful_monotonic_logits_processor=False,
         start_time=71000,
         end_time=86000,
         device="cpu",
@@ -185,8 +230,8 @@ def test_exact_sbatch_hydra_contract_passes_runtime_flag_validation(tmp_path):
             "num_beams=1",
             "seed=12345",
             "inference_generation_compile=false",
-            "inference_active_prefix_decode_loop=true",
-            "inference_stateful_monotonic_logits_processor=true",
+            "inference_active_prefix_decode_loop=false",
+            "inference_stateful_monotonic_logits_processor=false",
         ],
     )
     cli = Namespace(

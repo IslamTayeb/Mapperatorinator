@@ -48,6 +48,7 @@ from .target_span_gpu import (
 
 GATE_NAME = "v32_mini_closed_loop_feasibility"
 EXPECTED_MAX_NEW_TOKENS = 256
+APPROVED_STATEFUL_MONOTONIC_LOGITS = True
 ENCODER_CONDITION_KEYS = ("beatmap_idx", "difficulty", "mapper_idx", "song_position")
 
 
@@ -140,9 +141,7 @@ def _greedy_processors(args, tokenizer, device, *, lookback_time: float):
         taiko_hit_temperature=args.taiko_hit_temperature,
         lookback_time=lookback_time,
         device=device,
-        stateful_monotonic=bool(
-            getattr(args, "inference_stateful_monotonic_logits_processor", False)
-        ),
+        stateful_monotonic=APPROVED_STATEFUL_MONOTONIC_LOGITS,
     )
 
 
@@ -160,9 +159,7 @@ def _target_sampling_processors(args, tokenizer, device, *, lookback_time: float
         taiko_hit_temperature=args.taiko_hit_temperature,
         lookback_time=lookback_time,
         device=device,
-        stateful_monotonic=bool(
-            getattr(args, "inference_stateful_monotonic_logits_processor", False)
-        ),
+        stateful_monotonic=APPROVED_STATEFUL_MONOTONIC_LOGITS,
     )
     if args.top_k:
         processors.append(TopKLogitsWarper(args.top_k))
@@ -694,6 +691,9 @@ def run_mini_draft_gpu_scout(
         ),
         "speculation_k": config.speculation_k,
         "max_new_tokens": config.max_new_tokens,
+        "stateful_monotonic_logits_processor": (
+            APPROVED_STATEFUL_MONOTONIC_LOGITS
+        ),
         "proposal_policy": (
             "greedy_argmax_after_production_structural_logits_processors; "
             "no mini sampling and no target RNG access"

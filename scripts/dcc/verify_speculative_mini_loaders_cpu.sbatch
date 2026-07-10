@@ -74,8 +74,8 @@ python utils/verify_speculative_mini_draft.py \
   num_beams=1 \
   seed=12345 \
   inference_generation_compile=false \
-  inference_active_prefix_decode_loop=true \
-  inference_stateful_monotonic_logits_processor=true
+  inference_active_prefix_decode_loop=false \
+  inference_stateful_monotonic_logits_processor=false
 
 echo "report=$REPORT"
 echo "run_root=$RUN_ROOT"
