@@ -160,19 +160,39 @@ gap.
 
 Only the logits-processor family has an individual target-sized ceiling. After
 subtracting the separately measured clone, its approximate incremental cost is
-`3.214 ms`, with a `533.950 tok/s` fantasy-free ceiling. The active processor
-list contains monotonic time-shift masking and conditional temperature; source
-inspection shows conditional temperature performs a device-to-host `.cpu()`
-lookback per row, but this job did not isolate those two processors from each
-other. The next cheapest gate is therefore a processor-only subcomponent probe,
-not an implementation. Component times overlap and must never be summed; CUDA
-event intervals include device idle between host submissions and are not
-kernel-active time.
+`3.214 ms`, with a `533.950 tok/s` fantasy-free ceiling. Component times overlap
+and must never be summed; CUDA event intervals include device idle between host
+submissions and are not kernel-active time.
 
 Component report:
 
 ```text
 /work/imt11/Mapperatorinator/runs/merged-batch-physics-b8-49547132-17fe895/merged-b8.json
+```
+
+Follow-up job `49547244`, commit `538bee7`, split the actual base processor list:
+
+- `MonotonicTimeShiftLogitsProcessor`: `2.424 ms/step` including clone; clears
+  the `2.197 ms` saving requirement by itself.
+- `TemperatureLogitsWarper`: `0.203 ms/step` including clone; below threshold.
+
+On the identical-prompt control only, applying the base processor list once to
+the full B8 score tensor and then retaining rowwise warpers, softmax, private
+generators, and multinomial draws preserved processed scores bitwise
+(`max_abs=0`), top-k, sampled tokens, and final RNG for every row. Same-run
+complete throughput improved `450.449 -> 544.383 tok/s` (`+20.85%`), reducing
+step wall `17.760 -> 14.696 ms` and clearing the `500 tok/s` control target.
+
+This is not a valid request-state design. It uses one shared processor object
+and has not covered mixed prompts/songs, staggered arrival, EOS/max-token stops,
+slot release/reuse, or processor-state reset. Do not wire it into a scheduler or
+production runtime. The next gate must give the batched monotonic operation
+explicit per-request state and pass those lifecycle cases.
+
+Candidate report:
+
+```text
+/work/imt11/Mapperatorinator/runs/merged-batch-physics-b8-49547244-538bee7/merged-b8.json
 ```
 
 ### CPU continuous-scheduler harness
