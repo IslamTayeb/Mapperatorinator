@@ -415,3 +415,69 @@ export and optimized source. Raw logits were allclose with the same
 the gate completed successfully. Report:
 `/work/imt11/Mapperatorinator/runs/optimized-single-one-token-49560747-caa5c00/one-token.json`,
 SHA `942a90b9bfb0f669524a2aa11bddf2fdeacf6f6f966e6e0122050451ed65af9f`.
+
+### L1 accepted active-prefix loop ownership move
+
+Commit `bb8d8a0` moved the active-prefix decode loop, bucket selection, stable
+encoder holder, graph signatures, capture/replay, static input copies, and
+diagnostics to `optimized/single/decode_loop.py`. The legacy module is a lazy
+compatibility export. `server.py` imports the source owner only inside the
+explicit active-prefix branch; a fresh ordinary server import remains
+optimized-cold.
+
+Local bucket, static-buffer, graph-signature, stable-encoder, compatibility,
+and fresh-import gates passed. DCC job `49560776`, wrapper commit `cb1bc50`,
+passed the 8-step direct-loop gate with exact generated tokens, exact final RNG,
+all raw-logit/top-k steps matching, `max_new_tokens` stopping, one graph capture,
+and seven replays. Report:
+`/work/imt11/Mapperatorinator/runs/optimized-single-short-loop-8-49560776-cb1bc50/direct-loop.json`,
+SHA `258fafe28bfaab710c6f49918a20db4edb2a7ab523302dd311bdf6c40af176bc`.
+
+Reciprocal production smoke job `49560783` compared the accumulated migration
+through L1 against pre-migration `3f4b088`. Both launch orders matched all
+`1,084` main and `164` timing tokens and produced the same `.osu` SHA
+`ff63c232115906483a592c940e6f0fccbb8639775378d39fd86237f4191ed4ba`,
+size `4,144`. Candidate aggregate main model throughput was `+1.2%` and
+`+0.3%`; timing was `+9.9%` and `+7.0%`; total stage wall improved in both
+orders. The zero-tolerance strict comparator returned nonzero only for ordinary
+sub-window timing jitter, so this is accepted as no meaningful regression, not
+as a performance win.
+
+### P1 accepted optimized stateful logits ownership move
+
+Commit `f7d6c46` left the V32 full-scan monotonic processor in the legacy module
+and moved the incremental batch-1 state, SOS reset, sequence-jump
+reinitialization, and time-shift offset cache to
+`optimized/single/logits.py`. Direct legacy construction with
+`stateful_batch1=true` now fails with an explicit migration instruction;
+`server.py` lazily selects the optimized owner only for the accepted opt-in
+flag. The graph-safe verifier now replaces pristine legacy or optimized
+processors without assuming optimized state lives on the V32 class.
+
+Local full-scan, randomized B=1/2/5, growing-prefix, SOS/sequence-jump,
+graph-safe, server-routing, import-cold, and broad `tests/` gates passed. DCC
+job `49560829` on RTX 2080 Ti passed the real one-token gate with exact top-20,
+raw logits allclose at `max_abs=1.9073486328125e-05`, and unchanged extension
+cache inventory. Report:
+`/work/imt11/Mapperatorinator/runs/optimized-single-one-token-49560829-f7d6c46/one-token.json`,
+SHA `16d6cd77ce14b2585a305ccfd0590d1c0da41b96a59937cccaf79ea3fd307f0c`.
+DCC job `49560834` passed the 8-step token/RNG/raw-logit/top-k/stop gate with
+one graph capture and seven replays. Report:
+`/work/imt11/Mapperatorinator/runs/optimized-single-short-loop-8-49560834-f7d6c46/direct-loop.json`,
+SHA `5896d61fee4f0c23d8be37f42f65d5f15ce7d3094ab5197e469e6d559c5fa34d`.
+
+Reciprocal production smoke job `49560849` compared `f7d6c46` against
+pre-migration `3f4b088`. Both orders matched all `1,084` main tokens, all `164`
+timing tokens, same-calculation metadata, and `.osu` SHA
+`ff63c232115906483a592c940e6f0fccbb8639775378d39fd86237f4191ed4ba`,
+size `4,144`. Candidate aggregate main throughput was `+1.3%` and `+1.2%`;
+timing was `+10.0%` and `+9.8%`; stage wall improved `15.5%` and `15.2%`.
+The strict job status was nonzero solely because its zero-tolerance per-window
+gate flagged jitter: the largest main model-time increase was `2.195ms` and the
+largest timing increase was `2.005ms`, while every aggregate metric improved.
+This boundary is accepted as exact and without meaningful regression; no speed
+claim is made. Comparison reports:
+`/work/imt11/Mapperatorinator/runs/v32-integration-migration-p1-smoke-49560849/control-first-compare.json`,
+SHA `bed422041409ce4d0e162e4bc7459c58779cd330e08d8938798b8e51ab7f77c9`,
+and `candidate-first-compare.json`, SHA
+`4a379632c40dd0818ffda397229ad6c6bd9f35c73fb2358cfaa6082043c11a39`.
