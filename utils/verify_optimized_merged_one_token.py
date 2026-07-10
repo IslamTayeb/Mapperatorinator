@@ -89,6 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--native-q1-self-attention", action="store_true")
     parser.add_argument("--native-q1-rope-cache-self-attention", action="store_true")
     parser.add_argument("--profile-sampling-components", action="store_true")
+    parser.add_argument("--profile-batched-processor-candidate", action="store_true")
     parser.add_argument("--sampling-profile-repeats", type=int, default=200)
     parser.add_argument("--sampling-baseline-report", type=Path)
     parser.add_argument("overrides", nargs="*", help="Hydra overrides such as audio_path=/path/song.mp3")
@@ -111,6 +112,10 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("sampling baseline must have exactness_pass=true.")
     elif sampling_baseline_report is not None:
         raise ValueError("--sampling-baseline-report requires --profile-sampling-components.")
+    if cli.profile_batched_processor_candidate and not cli.profile_sampling_components:
+        raise ValueError(
+            "--profile-batched-processor-candidate requires --profile-sampling-components."
+        )
     if cli.native_q1_rope_cache_self_attention and not cli.native_q1_self_attention:
         raise ValueError("RoPE/cache native self-attention requires --native-q1-self-attention.")
     if cli.batch_size > 1 and (
@@ -253,6 +258,9 @@ def main(argv: list[str] | None = None) -> int:
         "native_q1_self_attention": bool(cli.native_q1_self_attention),
         "native_q1_rope_cache_self_attention": bool(cli.native_q1_rope_cache_self_attention),
         "profile_sampling_components": bool(cli.profile_sampling_components),
+        "profile_batched_processor_candidate": bool(
+            cli.profile_batched_processor_candidate
+        ),
         "sampling_profile_repeats": int(cli.sampling_profile_repeats),
         "sampling_baseline_report": (
             str(cli.sampling_baseline_report.resolve())
@@ -283,6 +291,9 @@ def main(argv: list[str] | None = None) -> int:
         active_prefix_decode_length=active_prefix_decode_length,
         profile_sampling_components=bool(cli.profile_sampling_components),
         sampling_profile_repeats=cli.sampling_profile_repeats,
+        profile_batched_processor_candidate=bool(
+            cli.profile_batched_processor_candidate
+        ),
     )
     with torch.autocast(device_type="cuda", enabled=False), generation_profile_context(
             sdpa_backend=args.profile_sdpa_backend,
@@ -324,6 +335,12 @@ def main(argv: list[str] | None = None) -> int:
     else:
         report["previous_gate_scaling"] = None
         report["performance_gate_pass"] = True
+    if cli.profile_batched_processor_candidate:
+        candidate = report["batched_processor_candidate"]
+        report["batched_processor_candidate_pass"] = bool(candidate["pass"])
+        report["pass"] = bool(report["pass"] and candidate["pass"])
+    else:
+        report["batched_processor_candidate_pass"] = None
     report["total_wall_seconds"] = time.perf_counter() - total_started
     report["previous_gate_report"] = (
         str(cli.previous_gate_report.resolve())

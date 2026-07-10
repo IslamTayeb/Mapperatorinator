@@ -85,14 +85,26 @@ def test_row_seed_resolution_and_config_reject_ungraduated_shapes():
         ),
         "bounded B=8 gate",
     )
+    _assert_raises(
+        ValueError,
+        lambda: MergedOneTokenConfig(
+            batch_size=8,
+            seeds=(1,) * 8,
+            do_sample=True,
+            profile_batched_processor_candidate=True,
+        ),
+        "requires sampling component profiling",
+    )
     config = MergedOneTokenConfig(
         batch_size=8,
         seeds=(1,) * 8,
         do_sample=True,
         profile_sampling_components=True,
+        profile_batched_processor_candidate=True,
         sampling_profile_repeats=20,
     )
     assert config.profile_sampling_components is True
+    assert config.profile_batched_processor_candidate is True
     assert config.sampling_profile_repeats == 20
 
 

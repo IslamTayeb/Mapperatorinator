@@ -21,6 +21,7 @@ from ..benchmark import (
     BatchPhysicsObservation,
     MERGED_STATE_OWNERSHIP_CONTRACT,
     SamplingComponentMeasurement,
+    summarize_batched_processor_candidate,
 )
 from ..exactness import ExactnessResultClass
 from ...direct_decode import DecodeSession
@@ -46,6 +47,7 @@ class MergedOneTokenConfig:
     active_prefix_decode_length: int | None = None
     profile_sampling_components: bool = False
     sampling_profile_repeats: int = 200
+    profile_batched_processor_candidate: bool = False
 
     def __post_init__(self) -> None:
         if self.batch_size not in {1, 2, 5, 8}:
@@ -66,6 +68,10 @@ class MergedOneTokenConfig:
             raise ValueError("sampling_profile_repeats must be positive.")
         if self.profile_sampling_components and self.batch_size != 8:
             raise ValueError("sampling component profiling is currently a bounded B=8 gate.")
+        if self.profile_batched_processor_candidate and not self.profile_sampling_components:
+            raise ValueError(
+                "batched processor candidate requires sampling component profiling."
+            )
         if self.active_prefix_decode_length is not None:
             if not self.active_prefix_decode:
                 raise ValueError("active_prefix_decode_length requires active-prefix decode.")
@@ -392,6 +398,10 @@ def _profile_rowwise_sampling_components(
         ]
 
     base_processors = [base_logits_processor_factory() for _ in range(batch_size)]
+    base_processor_classes = [
+        type(processor).__name__
+        for processor in base_logits_processor_factory()
+    ]
 
     def clone_plus_logits_processors() -> None:
         holder[:] = [
@@ -516,6 +526,30 @@ def _profile_rowwise_sampling_components(
             device=device,
         ),
     ]
+    for processor_index, processor_class in enumerate(base_processor_classes):
+        row_processors = [
+            base_logits_processor_factory()[processor_index]
+            for _ in range(batch_size)
+        ]
+
+        def clone_plus_concrete_processor(
+                processors: list[Any] = row_processors,
+        ) -> None:
+            holder[:] = [
+                processors[row](
+                    input_ids[row:row + 1],
+                    raw_logits[row:row + 1].clone(memory_format=torch.contiguous_format),
+                )
+                for row in range(batch_size)
+            ]
+
+        measurements.append(_measure_cuda_component(
+            component=f"clone_plus_processor_{processor_index}_{processor_class}",
+            repeats=repeats,
+            includes=("logits_clone", processor_class),
+            operation=clone_plus_concrete_processor,
+            device=device,
+        ))
 
     def empty_python_row_loop() -> None:
         for row in range(batch_size):
@@ -537,6 +571,7 @@ def _profile_rowwise_sampling_components(
     return {
         "scope": "isolated_non_additive_fixed_b8_logits",
         "repeats": repeats,
+        "base_processor_classes": base_processor_classes,
         "required_saving_seconds_per_step": required_saving_seconds_per_step,
         "components": [
             measurement.as_dict(
@@ -548,6 +583,184 @@ def _profile_rowwise_sampling_components(
             "Component measurements are isolated and non-additive. Clone, allocator, Python launch, "
             "and final synchronization costs overlap; use only per-component fantasy-free ceilings."
         ),
+    }
+
+
+def _sample_after_base_processing(
+        *,
+        input_ids: torch.LongTensor,
+        processed_scores: torch.Tensor,
+        logits_warper: Any,
+        generator: torch.Generator,
+        do_sample: bool,
+) -> torch.LongTensor:
+    scores = logits_warper(
+        input_ids,
+        processed_scores.clone(memory_format=torch.contiguous_format),
+    )
+    if do_sample:
+        probabilities = torch.nn.functional.softmax(scores, dim=-1)
+        return torch.multinomial(probabilities, num_samples=1, generator=generator).squeeze(1)
+    return torch.argmax(scores, dim=-1)
+
+
+@torch.no_grad()
+def _verify_and_measure_batched_processor_candidate(
+        *,
+        session: DecodeSession,
+        representative_logits: torch.Tensor,
+        input_ids: torch.LongTensor,
+        full_attention_mask: torch.Tensor,
+        seeds: tuple[int, ...],
+        do_sample: bool,
+        base_logits_processor_factory: LogitsProcessorFactory,
+        logits_warper_factory: LogitsProcessorFactory,
+        config: MergedOneTokenConfig,
+        baseline_complete_tokens_per_second: float,
+        device: torch.device,
+) -> dict[str, Any]:
+    """Test one shared B8 processor pass while keeping private row RNG/warpers."""
+
+    batch_size = int(representative_logits.shape[0])
+    if batch_size != 8 or input_ids.shape[0] != 8:
+        raise ValueError("batched processor candidate requires B=8 identical-prompt tensors.")
+
+    row_processors = [base_logits_processor_factory() for _ in range(batch_size)]
+    row_warpers = [logits_warper_factory() for _ in range(batch_size)]
+    row_generators = [_new_generator(device, seed) for seed in seeds]
+    row_processed_scores = [
+        row_processors[row](
+            input_ids[row:row + 1],
+            representative_logits[row:row + 1].clone(memory_format=torch.contiguous_format),
+        )
+        for row in range(batch_size)
+    ]
+    row_tokens = [
+        _sample_after_base_processing(
+            input_ids=input_ids[row:row + 1],
+            processed_scores=row_processed_scores[row],
+            logits_warper=row_warpers[row],
+            generator=row_generators[row],
+            do_sample=do_sample,
+        )
+        for row in range(batch_size)
+    ]
+    row_rng_hashes = [_tensor_sha256(generator.get_state()) for generator in row_generators]
+
+    batched_processor = base_logits_processor_factory()
+    batched_processed_scores = batched_processor(
+        input_ids,
+        representative_logits.clone(memory_format=torch.contiguous_format),
+    )
+    candidate_warpers = [logits_warper_factory() for _ in range(batch_size)]
+    candidate_generators = [_new_generator(device, seed) for seed in seeds]
+    candidate_tokens = [
+        _sample_after_base_processing(
+            input_ids=input_ids[row:row + 1],
+            processed_scores=batched_processed_scores[row:row + 1],
+            logits_warper=candidate_warpers[row],
+            generator=candidate_generators[row],
+            do_sample=do_sample,
+        )
+        for row in range(batch_size)
+    ]
+    candidate_rng_hashes = [
+        _tensor_sha256(generator.get_state())
+        for generator in candidate_generators
+    ]
+    row_reports: list[dict[str, Any]] = []
+    for row in range(batch_size):
+        score_comparison = compare_logits(
+            row_processed_scores[row],
+            batched_processed_scores[row:row + 1],
+            atol=config.atol,
+            rtol=config.rtol,
+            top_k=config.top_k,
+        )
+        token_match = bool(torch.equal(row_tokens[row].cpu(), candidate_tokens[row].cpu()))
+        rng_match = row_rng_hashes[row] == candidate_rng_hashes[row]
+        row_reports.append({
+            "row": row,
+            "processed_scores": score_comparison,
+            "rowwise_token_id": int(row_tokens[row].detach().cpu().item()),
+            "batched_processor_token_id": int(candidate_tokens[row].detach().cpu().item()),
+            "sampled_token_match": token_match,
+            "rowwise_final_rng_state_hash": row_rng_hashes[row],
+            "batched_processor_final_rng_state_hash": candidate_rng_hashes[row],
+            "rng_state_match": rng_match,
+            "pass": bool(
+                score_comparison["allclose"]
+                and score_comparison["topk_match"]
+                and token_match
+                and rng_match
+            ),
+        })
+    exactness_pass = all(row["pass"] for row in row_reports)
+
+    timing_processor = base_logits_processor_factory()
+    timing_warpers = [logits_warper_factory() for _ in range(batch_size)]
+    timing_generators = [_new_generator(device, seed) for seed in seeds]
+    timing_holder: list[torch.Tensor] = []
+
+    def candidate_complete_step() -> None:
+        decode_result = session.decode_one_token_raw_logits(
+            full_prefix=input_ids,
+            full_attention_mask=full_attention_mask,
+            active_prefix_self_attention=config.active_prefix_decode,
+            active_prefix_self_attention_length=config.active_prefix_decode_length,
+        )
+        processed_scores = timing_processor(
+            input_ids,
+            decode_result.logits.clone(memory_format=torch.contiguous_format),
+        )
+        timing_holder[:] = [
+            _sample_after_base_processing(
+                input_ids=input_ids[row:row + 1],
+                processed_scores=processed_scores[row:row + 1],
+                logits_warper=timing_warpers[row],
+                generator=timing_generators[row],
+                do_sample=do_sample,
+            )
+            for row in range(batch_size)
+        ]
+
+    timing = _measure_cuda_component(
+        component="model_plus_batched_base_processor_plus_private_row_sampling",
+        repeats=config.timing_repeats,
+        includes=(
+            "merged_B8_model_step",
+            "one_B8_base_processor_pass",
+            "rowwise_warpers",
+            "rowwise_softmax",
+            "private_generator_multinomial",
+        ),
+        operation=candidate_complete_step,
+        device=device,
+        warmup_repeats=config.warmup_repeats,
+    )
+    candidate_tokens_per_second = (
+        batch_size * config.timing_repeats / timing.wall_seconds
+    )
+    performance = summarize_batched_processor_candidate(
+        exactness_pass=exactness_pass,
+        baseline_tokens_per_second=baseline_complete_tokens_per_second,
+        candidate_tokens_per_second=candidate_tokens_per_second,
+    )
+    return {
+        "scope": "identical_prompt_B8_control_only",
+        "request_state_status": (
+            "not_a_valid_request_state_design: one shared processor object is unproven for mixed "
+            "prompts, staggered arrivals, EOS, slot reuse, or state reset"
+        ),
+        "base_processor_classes": [
+            type(processor).__name__
+            for processor in base_logits_processor_factory()
+        ],
+        "exactness_pass": exactness_pass,
+        "rows": row_reports,
+        "timing": timing.as_dict(required_saving_seconds_per_step=0.0),
+        "performance": performance,
+        "pass": bool(performance["promotion_gate_pass"]),
     }
 
 
@@ -851,6 +1064,7 @@ def run_merged_one_token_gate(
         batch_size * config.timing_repeats / complete_wall_seconds
     )
     sampling_component_profile = None
+    batched_processor_candidate = None
     if config.profile_sampling_components:
         if base_logits_processor_factory is None or logits_warper_factory is None:
             raise ValueError(
@@ -873,6 +1087,22 @@ def run_merged_one_token_gate(
             device=device,
         )
         sampling_component_profile["baseline_gap_target"] = dict(sampling_gap_target)
+    if config.profile_batched_processor_candidate:
+        if base_logits_processor_factory is None or logits_warper_factory is None:
+            raise ValueError("batched processor candidate requires processor and warper factories.")
+        batched_processor_candidate = _verify_and_measure_batched_processor_candidate(
+            session=batched_session,
+            representative_logits=complete_result.logits,
+            input_ids=full_prefix_batched,
+            full_attention_mask=full_mask_batched,
+            seeds=config.seeds,
+            do_sample=config.do_sample,
+            base_logits_processor_factory=base_logits_processor_factory,
+            logits_warper_factory=logits_warper_factory,
+            config=config,
+            baseline_complete_tokens_per_second=complete_wall_tokens_per_second,
+            device=device,
+        )
 
     workload_contract = {
         "batch_size": batch_size,
@@ -988,6 +1218,7 @@ def run_merged_one_token_gate(
         },
         "workload_contract": workload_contract,
         "sampling_component_profile": sampling_component_profile,
+        "batched_processor_candidate": batched_processor_candidate,
         "observation": observation.as_dict(),
         "runtime_metadata": dict(runtime_metadata),
     }

@@ -9,6 +9,7 @@ from osuT5.osuT5.inference.optimized.benchmark import (
     MERGED_STATE_OWNERSHIP_CONTRACT,
     SamplingComponentMeasurement,
     compare_batch_physics_observations,
+    summarize_batched_processor_candidate,
     summarize_sampling_gap_target,
 )
 from osuT5.osuT5.inference.optimized.exactness import ExactnessResultClass
@@ -332,3 +333,28 @@ def test_sampling_component_schema_and_exact_b8_target_math():
         ),
         "cannot exceed synchronized wall_seconds",
     )
+
+
+def test_batched_processor_candidate_requires_exact_target_sized_gain():
+    accepted = summarize_batched_processor_candidate(
+        exactness_pass=True,
+        baseline_tokens_per_second=440.0,
+        candidate_tokens_per_second=520.0,
+    )
+    inexact = summarize_batched_processor_candidate(
+        exactness_pass=False,
+        baseline_tokens_per_second=440.0,
+        candidate_tokens_per_second=520.0,
+    )
+    below_target = summarize_batched_processor_candidate(
+        exactness_pass=True,
+        baseline_tokens_per_second=440.0,
+        candidate_tokens_per_second=490.0,
+    )
+
+    assert accepted["reaches_target_tokens_per_second"] is True
+    assert accepted["clears_five_percent_gain_gate"] is True
+    assert accepted["promotion_gate_pass"] is True
+    assert inexact["promotion_gate_pass"] is False
+    assert below_target["clears_five_percent_gain_gate"] is True
+    assert below_target["promotion_gate_pass"] is False

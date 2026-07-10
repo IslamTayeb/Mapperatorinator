@@ -344,6 +344,34 @@ def summarize_sampling_gap_target(
     }
 
 
+def summarize_batched_processor_candidate(
+        *,
+        exactness_pass: bool,
+        baseline_tokens_per_second: float,
+        candidate_tokens_per_second: float,
+        target_tokens_per_second: float = 500.0,
+) -> dict[str, float | bool]:
+    """Gate the identical-prompt B8 batched-processor microcandidate."""
+
+    if baseline_tokens_per_second <= 0 or candidate_tokens_per_second <= 0:
+        raise ValueError("throughput values must be positive.")
+    if target_tokens_per_second <= 0:
+        raise ValueError("target_tokens_per_second must be positive.")
+    relative_gain = candidate_tokens_per_second / baseline_tokens_per_second - 1.0
+    reaches_target = candidate_tokens_per_second >= target_tokens_per_second
+    clears_keep_bar = relative_gain >= 0.05
+    return {
+        "exactness_pass": bool(exactness_pass),
+        "baseline_complete_tokens_per_second": baseline_tokens_per_second,
+        "candidate_complete_tokens_per_second": candidate_tokens_per_second,
+        "target_tokens_per_second": target_tokens_per_second,
+        "relative_complete_throughput_gain": relative_gain,
+        "reaches_target_tokens_per_second": reaches_target,
+        "clears_five_percent_gain_gate": clears_keep_bar,
+        "promotion_gate_pass": bool(exactness_pass and reaches_target and clears_keep_bar),
+    }
+
+
 def compare_batch_physics_observations(
         baseline: BatchPhysicsObservation,
         candidate: BatchPhysicsObservation,

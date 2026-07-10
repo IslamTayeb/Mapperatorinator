@@ -18,6 +18,7 @@ EXPECTED_COMMIT=${EXPECTED_COMMIT:?Set EXPECTED_COMMIT to the pushed verifier co
 MERGED_BATCH_SIZE=${MERGED_BATCH_SIZE:?Set MERGED_BATCH_SIZE to 1, 2, or 5}
 PREVIOUS_GATE_REPORT=${PREVIOUS_GATE_REPORT:-}
 PROFILE_SAMPLING_COMPONENTS=${PROFILE_SAMPLING_COMPONENTS:-0}
+PROFILE_BATCHED_PROCESSOR_CANDIDATE=${PROFILE_BATCHED_PROCESSOR_CANDIDATE:-0}
 SAMPLING_BASELINE_REPORT=${SAMPLING_BASELINE_REPORT:-}
 COMMIT=$(git -C "$REPO" rev-parse HEAD)
 SHORT_COMMIT=$(git -C "$REPO" rev-parse --short HEAD)
@@ -54,6 +55,15 @@ if [[ "$PROFILE_SAMPLING_COMPONENTS" == 1 ]]; then
   fi
 elif [[ "$PROFILE_SAMPLING_COMPONENTS" != 0 ]]; then
   echo "PROFILE_SAMPLING_COMPONENTS must be 0 or 1" >&2
+  exit 2
+fi
+if [[ "$PROFILE_BATCHED_PROCESSOR_CANDIDATE" == 1 ]]; then
+  if [[ "$PROFILE_SAMPLING_COMPONENTS" != 1 ]]; then
+    echo "batched processor candidate requires PROFILE_SAMPLING_COMPONENTS=1" >&2
+    exit 2
+  fi
+elif [[ "$PROFILE_BATCHED_PROCESSOR_CANDIDATE" != 0 ]]; then
+  echo "PROFILE_BATCHED_PROCESSOR_CANDIDATE must be 0 or 1" >&2
   exit 2
 fi
 
@@ -97,6 +107,7 @@ echo "branch=$(git branch --show-current)"
 echo "cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-unset}"
 echo "previous_gate_report=${PREVIOUS_GATE_REPORT:-none}"
 echo "profile_sampling_components=$PROFILE_SAMPLING_COMPONENTS"
+echo "profile_batched_processor_candidate=$PROFILE_BATCHED_PROCESSOR_CANDIDATE"
 echo "sampling_baseline_report=${SAMPLING_BASELINE_REPORT:-none}"
 nvidia-smi -L
 nvidia-smi \
@@ -121,6 +132,9 @@ if [[ "$PROFILE_SAMPLING_COMPONENTS" == 1 ]]; then
     --sampling-profile-repeats 200
     --sampling-baseline-report "$SAMPLING_BASELINE_REPORT"
   )
+fi
+if [[ "$PROFILE_BATCHED_PROCESSOR_CANDIDATE" == 1 ]]; then
+  COMPONENT_ARGS+=(--profile-batched-processor-candidate)
 fi
 
 python utils/verify_optimized_merged_one_token.py \
