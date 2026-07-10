@@ -55,6 +55,7 @@
 ## DCC Operations
 
 - Run expensive profiling through Slurm on a GPU host. Verify live account, partition, GPU constraint, and tool availability; do not copy stale scheduler values.
+- Give each concurrent experiment branch its own persistent DCC Git worktree and pass that checkout explicitly to its Slurm wrapper. Never move the shared source checkout while another experiment may submit or run from it; wrappers for branch-specific scouts should fail loudly when their explicit checkout is missing.
 - Reproducible Hydra configs are mandatory. Keep the environment `bin` directory on `PATH`, and keep Hugging Face/model cache variables consistent between baseline and candidate.
 - Project source is `/hpc/group/romerolab/imt11/projects/Mapperatorinator`; the environment is `/hpc/group/romerolab/imt11/envs/mapperatorinator`; data, caches, runs, and logs belong under `/work/imt11/Mapperatorinator`.
 - Record job ID, commit, node/GPU, Slurm status, exact config/flags, run root, profile/manifest/compare paths, cache state, and telemetry/profiler availability in every experiment entry.
