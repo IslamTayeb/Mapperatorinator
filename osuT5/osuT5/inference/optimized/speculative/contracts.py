@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
+from enum import Enum
 from typing import Any, Protocol, Sequence
 
 
@@ -15,19 +17,19 @@ class TargetTokenDistribution(Protocol):
 
 @dataclass(frozen=True)
 class DraftProposal:
-    """A bounded draft suffix and optional measured draft cost."""
+    """A bounded draft suffix and optional cost; empty means target-only fallback."""
 
     token_ids: tuple[int, ...]
     cost_seconds: float | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "token_ids", tuple(int(token) for token in self.token_ids))
-        if not self.token_ids:
-            raise ValueError("A speculative draft proposal must contain at least one token.")
         if any(token < 0 for token in self.token_ids):
             raise ValueError("Draft token IDs must be non-negative.")
-        if self.cost_seconds is not None and self.cost_seconds < 0:
-            raise ValueError("Draft proposal cost_seconds must be non-negative when measured.")
+        if self.cost_seconds is not None and (
+                self.cost_seconds < 0 or not math.isfinite(self.cost_seconds)
+        ):
+            raise ValueError("Draft proposal cost_seconds must be finite and non-negative when measured.")
 
 
 @dataclass(frozen=True)
@@ -59,15 +61,21 @@ class SpeculationConfig:
             raise ValueError("eos_token_id must be non-negative.")
 
 
+class DecodeIterationKind(str, Enum):
+    SPECULATIVE_SPAN = "speculative_span"
+    TARGET_ONLY_FALLBACK = "target_only_fallback"
+
+
 @dataclass(frozen=True)
 class CacheCommitEvent:
-    """Logical prefix ownership for one evaluated speculative span.
+    """Logical prefix ownership for one speculative or target-only iteration.
 
     This does not claim a particular model KV layout.  A GPU adapter must map this
     logical commit/rollback contract to its concrete self/cross-cache representation.
     """
 
     iteration: int
+    iteration_kind: DecodeIterationKind
     prefix_length_before: int
     proposal_length: int
     target_positions_evaluated: int
@@ -81,14 +89,13 @@ class CacheCommitEvent:
     stopped_after_iteration: bool
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "iteration_kind", DecodeIterationKind(self.iteration_kind))
         object.__setattr__(self, "committed_token_ids", tuple(self.committed_token_ids))
         expected_after = self.prefix_length_before + len(self.committed_token_ids)
         if self.prefix_length_after != expected_after:
             raise ValueError("Cache event prefix_length_after does not match committed tokens.")
         if self.target_positions_sampled != len(self.committed_token_ids):
             raise ValueError("Each committed output position must consume exactly one target sample.")
-        if self.target_positions_evaluated != self.proposal_length:
-            raise ValueError("Target evaluation length must equal proposal length.")
         if self.accepted_draft_length < 0 or self.accepted_draft_length > self.proposal_length:
             raise ValueError("accepted_draft_length is outside the proposal.")
         expected_discarded = self.proposal_length - self.accepted_draft_length
@@ -98,6 +105,20 @@ class CacheCommitEvent:
             raise ValueError("Mismatch index and target fallback emission must be reported together.")
         if self.mismatch_index is not None and not 0 <= self.mismatch_index < self.proposal_length:
             raise ValueError("mismatch_index is outside the proposal.")
+        if self.iteration_kind is DecodeIterationKind.SPECULATIVE_SPAN:
+            if self.proposal_length <= 0:
+                raise ValueError("A speculative-span event requires a non-empty proposal.")
+            if self.target_positions_evaluated != self.proposal_length:
+                raise ValueError("Speculative target evaluation length must equal proposal length.")
+        else:
+            if self.proposal_length != 0 or self.accepted_draft_length != 0:
+                raise ValueError("A target-only fallback cannot propose or accept draft tokens.")
+            if self.target_positions_evaluated != 1 or self.target_positions_sampled != 1:
+                raise ValueError("A target-only fallback must evaluate and sample exactly one target position.")
+            if len(self.committed_token_ids) != 1:
+                raise ValueError("A target-only fallback must commit exactly one target token.")
+            if self.emitted_target_token_on_mismatch or self.mismatch_index is not None:
+                raise ValueError("A target-only fallback is not a speculative mismatch.")
 
 
 @dataclass(frozen=True)

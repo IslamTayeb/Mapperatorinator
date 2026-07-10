@@ -9,6 +9,7 @@ import pytest
 
 from osuT5.osuT5.inference.optimized.speculative import (
     DraftProposal,
+    DecodeIterationKind,
     EvaluatedTargetSpan,
     MissingSpeculativeScoutAdapterError,
     ProposalSourceKind,
@@ -223,6 +224,63 @@ def test_max_token_boundary_shrinks_last_block_and_does_not_oversample():
     assert [event.proposal_length for event in result.cache_events] == [4, 1]
     assert result.cache_events[-1].stopped_after_iteration is True
     assert result.unused_target_positions_evaluated == 0
+
+
+@pytest.mark.parametrize(
+    ("target", "max_new_tokens", "eos_token_id", "expected_stop", "expected_tokens"),
+    [
+        ((1, 2, 3), 3, 99, "max_new_tokens", (1, 2, 3)),
+        ((1, 99, 3), 3, 99, "eos", (1, 99)),
+    ],
+)
+def test_repeated_empty_ngram_proposals_fall_back_one_target_step_exactly(
+        target,
+        max_new_tokens,
+        eos_token_id,
+        expected_stop,
+        expected_tokens,
+):
+    def no_ngram_match(_prefix, _max_tokens, _target_tokens):
+        return ()
+
+    config = SpeculationConfig(4, max_new_tokens=max_new_tokens, eos_token_id=eos_token_id)
+    result, _ = _assert_matches_sequential(
+        ScriptedAdapter(target, proposal_function=no_ngram_match, draft_cost_seconds=0.0005),
+        ScriptedAdapter(target),
+        config,
+    )
+
+    assert result.generated_token_ids == expected_tokens
+    assert result.stop_reason == expected_stop
+    assert result.draft_calls == len(expected_tokens)
+    assert result.target_model_calls == len(expected_tokens)
+    assert result.target_model_calls_saved == 0
+    assert result.proposed_draft_tokens == 0
+    assert result.accepted_draft_tokens == 0
+    assert result.draft_acceptance_rate == 0.0
+    assert result.draft_cost_status == "measured"
+    assert result.draft_cost_seconds == pytest.approx(0.0005 * len(expected_tokens))
+    assert all(
+        event.iteration_kind is DecodeIterationKind.TARGET_ONLY_FALLBACK
+        for event in result.cache_events
+    )
+    for index, event in enumerate(result.cache_events):
+        assert event.prefix_length_before == index
+        assert event.prefix_length_after == index + 1
+        assert event.proposal_length == 0
+        assert event.target_positions_evaluated == 1
+        assert event.target_positions_sampled == 1
+        assert event.accepted_draft_length == 0
+        assert event.discarded_uncommitted_suffix_length == 0
+        assert event.emitted_target_token_on_mismatch is False
+        assert event.mismatch_index is None
+    assert result.cache_events[-1].stopped_after_iteration is True
+
+
+@pytest.mark.parametrize("non_finite_cost", [float("inf"), float("nan")])
+def test_draft_cost_must_be_finite_when_reported(non_finite_cost):
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        DraftProposal((), cost_seconds=non_finite_cost)
 
 
 def test_unmeasured_draft_cost_is_explicit_instead_of_zero():

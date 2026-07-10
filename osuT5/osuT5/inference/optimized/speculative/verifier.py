@@ -6,6 +6,7 @@ from typing import Any, Protocol, Sequence
 
 from .contracts import (
     CacheCommitEvent,
+    DecodeIterationKind,
     DraftProposal,
     EvaluatedTargetSpan,
     ExactTranscriptComparison,
@@ -30,6 +31,9 @@ class ExactSpeculativeAdapter(Protocol):
             draft_tokens: Sequence[int],
     ) -> EvaluatedTargetSpan:
         """Evaluate target positions in one call, without sampling or changing RNG."""
+
+    def evaluate_target_next(self, committed_tokens: Sequence[int]) -> TargetTokenDistribution:
+        """Evaluate one target-only fallback position without changing target RNG."""
 
     def generator_state_hash(self) -> str:
         """Hash the complete request-private generator state."""
@@ -99,7 +103,8 @@ def run_exact_speculative_decode(
     Target span evaluation may calculate K positions at once, but target sampling is
     intentionally serial.  A block ends on its first mismatch, EOS, or max-token
     boundary.  Any evaluated suffix after that point is logical rollback work and must
-    not be committed by a concrete cache adapter.
+    not be committed by a concrete cache adapter.  An empty draft takes one explicit
+    target-only step and never enters the span evaluator.
     """
 
     generated: list[int] = []
@@ -125,6 +130,42 @@ def run_exact_speculative_decode(
             raise ValueError(
                 f"Draft adapter returned {len(proposal.token_ids)} tokens for a {requested}-token bound."
             )
+        draft_costs.append(proposal.cost_seconds)
+        if not proposal.token_ids:
+            target_position = adapter.evaluate_target_next(tuple(generated))
+            if adapter.generator_state_hash() != rng_before_non_sampling_work:
+                raise RuntimeError(
+                    "Empty draft fallback evaluation advanced the baseline generator before sampling."
+                )
+            target_token = int(target_position.sample(adapter.generator))
+            if target_token < 0:
+                raise ValueError("Target sampling returned a negative token ID.")
+            generated.append(target_token)
+            target_positions_evaluated += 1
+            target_positions_sampled += 1
+            if target_token == config.eos_token_id:
+                stop_reason = "eos"
+            elif len(generated) == config.max_new_tokens:
+                stop_reason = "max_new_tokens"
+            cache_events.append(
+                CacheCommitEvent(
+                    iteration=len(cache_events),
+                    iteration_kind=DecodeIterationKind.TARGET_ONLY_FALLBACK,
+                    prefix_length_before=prefix_before,
+                    proposal_length=0,
+                    target_positions_evaluated=1,
+                    target_positions_sampled=1,
+                    accepted_draft_length=0,
+                    emitted_target_token_on_mismatch=False,
+                    mismatch_index=None,
+                    committed_token_ids=(target_token,),
+                    prefix_length_after=len(generated),
+                    discarded_uncommitted_suffix_length=0,
+                    stopped_after_iteration=stop_reason is not None,
+                )
+            )
+            continue
+
         span = adapter.evaluate_target_span(tuple(generated), proposal.token_ids)
         if len(span.positions) != len(proposal.token_ids):
             raise ValueError(
@@ -136,7 +177,6 @@ def run_exact_speculative_decode(
                 "Draft proposal or target span evaluation advanced the baseline generator before sampling."
             )
 
-        draft_costs.append(proposal.cost_seconds)
         proposed_draft_tokens += len(proposal.token_ids)
         target_positions_evaluated += len(span.positions)
         committed_this_iteration: list[int] = []
@@ -175,6 +215,7 @@ def run_exact_speculative_decode(
         cache_events.append(
             CacheCommitEvent(
                 iteration=len(cache_events),
+                iteration_kind=DecodeIterationKind.SPECULATIVE_SPAN,
                 prefix_length_before=prefix_before,
                 proposal_length=len(proposal.token_ids),
                 target_positions_evaluated=len(span.positions),

@@ -7,6 +7,7 @@ adapter is allowed to run a bounded scout.
 
 from .contracts import (
     CacheCommitEvent,
+    DecodeIterationKind,
     DraftProposal,
     EvaluatedTargetSpan,
     ExactTranscriptComparison,
@@ -33,6 +34,7 @@ from .verifier import (
 
 __all__ = [
     "CacheCommitEvent",
+    "DecodeIterationKind",
     "DraftProposal",
     "EvaluatedTargetSpan",
     "ExactTranscriptComparison",
