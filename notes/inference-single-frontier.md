@@ -55,6 +55,31 @@ Rollback validation after abandoning the batched-fast branch used job `49325496`
 /work/imt11/Mapperatorinator/runs/rollback-fastpath-smoke-49325496-f6add76/profile/beatmap13bc54a39d704a799e211e79b1f60d88.osu.profile.json
 ```
 
+### Current-main reproduction
+
+Jobs `49542937` and `49542938`, commit `a42c250`, reran the full accepted
+stack on one RTX 2080 Ti with explicit persistent compiler/cache paths. The
+second run measured `7,639 / 28.197s = 270.916 tok/s` main and
+`821 / 8.109s = 101.242 tok/s` timing. Both runs reproduced the historical
+output exactly: SHA-256
+`483483a1c29ef8a44c4a8d3a82fe0778ae306470ec3157e98969eeabd92c2631`,
+`31,709` bytes. The `+0.16%` main difference from `270.475` is run noise, not a
+promoted optimization.
+
+The paired strict comparison passed calculation metadata, token identity, and
+output bytes. Its aggregate main/timing/stage metrics improved on the second
+run, but exact zero-tolerance per-window comparison flagged sub-percent jitter;
+this is baseline variability, not candidate evidence. An earlier reproduction,
+job `49542402`, had one `10.659s` timing compile window while steady windows
+matched. That exposed an unset node-local compiler-cache ambiguity; commit
+`bb1d441` now pins and records Inductor, Triton, and CUDA cache paths.
+
+```text
+/work/imt11/Mapperatorinator/runs/inference-denominator-single_full-49542937-a42c250
+/work/imt11/Mapperatorinator/runs/inference-denominator-single_full-49542938-a42c250
+/work/imt11/Mapperatorinator/runs/inference-denominator-single_full-49542938-a42c250/compare-warm-vs-cold.json
+```
+
 ## Accepted Improvement Chain
 
 | Component | Full-song evidence | Effect | Scope |
@@ -88,7 +113,7 @@ Run root:
 /work/imt11/Mapperatorinator/runs/five-song-profile-20260702-232516-8a2de72
 ```
 
-This proves realistic cold/serial behavior and exactness for that earlier stack. It is not concurrent batching and does not replace a fresh five-song suite on the current `270.475` stack. Separate timing aggregate improved for all songs, but `timing/sequential/seq0` had a scoped first-record regression.
+This proves realistic cold/serial behavior and exactness for that earlier stack. It is not concurrent batching. The current-stack replacement denominator is recorded in [the batch frontier](inference-batch-frontier.md). Separate timing aggregate improved for all songs, but `timing/sequential/seq0` had a scoped first-record regression.
 
 ## Current Bottleneck And Ceiling
 

@@ -21,6 +21,48 @@ The primary metric is aggregate main tokens divided by wall time from the first 
 
 Never combine or average results across these modes.
 
+## Current Exact Serial Denominator
+
+Jobs `49543717` (15-second) and `49543718` (full-song), commit `a709b86`,
+ran two same-process passes over Lambada, PEGASUS, Ela ke Leitada, SALVALAI,
+and Nube Negra with the full accepted `270.475` stack. Every repeat matched
+its per-song main token hash and byte-identical `.osu` hash.
+
+| Workload/scope | Main tokens | Active main wall | Active main tok/s | First-main to last-main wall | Scheduler-wall main tok/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 15s cold/all, 10 runs | `11,910` | `43.772s` | `272.091` | `60.983s` | `195.299` |
+| 15s warmed, 5 songs | `5,955` | `20.892s` | `285.044` | `28.326s` | `210.230` |
+| Full cold/all, 10 runs | `85,268` | `328.361s` | `259.677` | `402.796s` | `211.690` |
+| Full warmed, 5 songs | `42,634` | `163.702s` | `260.437` | `196.060s` | `217.454` |
+
+For warmed full songs, the complete timing+main interval was `204.510s`:
+`208.470` main tok/s and `228.782` total timing+main tok/s. The corresponding
+warmed 15-second values were `203.457` main tok/s and `231.131` total tok/s.
+The schema-v4 strict self-compare for the 15-second manifest passed shape,
+token/output exactness, active-model, scheduler-wall, timing, segment, and
+per-song gates.
+
+This changes the target sizing. Perfectly removing serial gaps would raise the
+15-second warmed denominator only from `210.230` to the observed active-wall
+ceiling `285.044 tok/s` (`+35.6%`); reaching `500` still needs `1.75x` more
+active-generation throughput. For full songs, `500` is `2.30x` current
+scheduler-wall throughput and `1.92x` current active-wall throughput. A
+scheduler-only rewrite therefore cannot hit the objective: merged/lane
+execution or broader math/memory amortization must also win.
+
+Coarse whole-job telemetry is diagnostic only. The full job sampled nonzero
+GPU utilization `92.6%` of seconds, averaged `73.4%` utilization and `149.6W`,
+and peaked near `2,702 MiB`; this includes timing generation and does not prove
+that main decode kernels use the GPU efficiently. The 15-second job was nonzero
+only `66.3%` of samples, confirming more scheduling/setup headroom for short
+queues.
+
+```text
+/work/imt11/Mapperatorinator/runs/inference-denominator-five_smoke-49543717-a709b86/serial_multi_song-five_smoke-49543717-a709b86/suite_manifest.json
+/work/imt11/Mapperatorinator/runs/inference-denominator-five_smoke-49543717-a709b86/serial_multi_song-five_smoke-49543717-a709b86/strict-self-compare.json
+/work/imt11/Mapperatorinator/runs/inference-denominator-five_full-49543718-a709b86/serial_multi_song-five_full-49543718-a709b86/suite_manifest.json
+```
+
 ## Best Existing Measurements
 
 ### Static IPC server
@@ -154,7 +196,6 @@ Until those gates pass, call results offline-engine throughput, not server optim
 
 ## Immediate Next Decision Points
 
-- Re-establish a current five-song optimized-serial denominator using the full `270.475` stack.
 - Run the merged-batch versus lane-pool physics gate in isolated experiment worktrees.
 - Build only the execution shape that clears `5%` exact-output aggregate improvement.
 - Feed accepted single-song components, including any exact speculative verifier win, back into the offline engine and measure combined scheduler-wall throughput.
