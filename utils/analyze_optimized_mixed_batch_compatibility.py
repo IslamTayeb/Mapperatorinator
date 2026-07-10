@@ -58,6 +58,13 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Accepted repeat01 profile JSON; provide exactly five.",
     )
+    parser.add_argument(
+        "--source-run-root",
+        help=(
+            "Optional durable source run root for reports generated from fetched copies; "
+            "the report records per-song glob locators under this root instead of temp paths."
+        ),
+    )
     parser.add_argument("--report-path", type=Path, required=True)
     return parser
 
@@ -82,15 +89,23 @@ def main(argv: list[str] | None = None) -> int:
             profile_artifact_sha256=sha256,
         )
         songs.append(song)
-        artifacts.append({
+        artifact = {
             "song_id": song.song_id,
-            "path": str(resolved),
             "sha256": sha256,
             "size_bytes": resolved.stat().st_size,
-        })
+        }
+        if args.source_run_root:
+            artifact["source_locator"] = (
+                f"{args.source_run_root.rstrip('/')}/{song.song_id}/repeat01/*.profile.json"
+            )
+        else:
+            artifact["path"] = str(resolved)
+        artifacts.append(artifact)
     report = analysis.analyze_five_song_profiles(songs)
     report["analysis_git_commit"] = _git_commit()
     report["profile_artifacts"] = artifacts
+    if args.source_run_root:
+        report["profile_source_run_root"] = args.source_run_root
     args.report_path.parent.mkdir(parents=True, exist_ok=True)
     args.report_path.write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n",

@@ -675,6 +675,24 @@ def hybrid_l2_processor_ceiling(schedule: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def compact_schedule_report(schedule: Mapping[str, Any]) -> dict[str, Any]:
+    """Preserve exact schedule evidence without serializing thousands of events."""
+
+    group_events = schedule.get("group_events")
+    if not isinstance(group_events, list):
+        raise ValueError("schedule must contain group_events.")
+    compact = {
+        key: value
+        for key, value in schedule.items()
+        if key != "group_events"
+    }
+    compact.update({
+        "group_event_count": len(group_events),
+        "group_events_sha256": stable_json_hash(group_events),
+    })
+    return compact
+
+
 def conservative_scheduler_ceiling(schedule: Mapping[str, Any]) -> dict[str, Any]:
     group_events = schedule.get("group_events")
     if not isinstance(group_events, list) or not group_events:
@@ -799,9 +817,9 @@ def analyze_five_song_profiles(songs: Sequence[AcceptedSong]) -> dict[str, Any]:
             for key, value in permutation.items()
             if key not in {"forward", "reverse"}
         },
-        "schedule": schedule,
+        "schedule": compact_schedule_report(schedule),
         "policy_sensitivity": {
-            "synchronous_round_robin": synchronous["forward"],
+            "synchronous_round_robin": compact_schedule_report(synchronous["forward"]),
             "policy_independent_B8_impossibility": (
                 "Only five dependency chains can be active; no scheduling policy can form B8."
             ),

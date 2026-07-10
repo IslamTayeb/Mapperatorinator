@@ -144,6 +144,9 @@ def test_five_song_analysis_stops_without_b8_or_setup_inclusive_headroom():
     report = analyze_five_song_profiles(songs)
 
     assert report["schedule"]["max_compatible_group_size"] == 5
+    assert "group_events" not in report["schedule"]
+    assert report["schedule"]["group_event_count"] == report["schedule"]["scheduler_steps"]
+    assert len(report["schedule"]["group_events_sha256"]) == 64
     assert report["schedule"]["has_compatible_B8_group"] is False
     assert report["ceiling"]["clears_five_percent_vs_serial_scheduler_wall"] is True
     assert report["ceiling"]["clears_500_with_schedule_and_full_setup"] is False
