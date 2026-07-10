@@ -1,0 +1,372 @@
+# Optimized Single Architecture Migration Map
+
+## Scope
+
+This is a refactor-only migration from `main@3f4b088`. It must not change
+precision, model math, sampling, RNG order, stopping, output assembly,
+windowing, metadata semantics, or accepted FP32 single-song performance.
+
+The endpoint is one implementation of the accepted stack owned by
+`osuT5/osuT5/inference/optimized/`. It is selected by
+`inference_engine=optimized optimized_inference_mode=single`; the accepted
+legacy micro-flag bundle may delegate to the same implementation. Default V32
+must remain cold with respect to optimized and native-extension modules.
+
+Batching, speculative decoding, new kernels, reduced precision, schedulers,
+and performance optimization are out of scope.
+
+## Frozen Pre-Migration Evidence
+
+The accepted full-song stack is generation compile, active-prefix bucket `64`,
+CUDA graph warmup `0`/minimum step `1`, stateful batch-1 monotonic processing,
+FP32 q_len=1 BMM cross-attention, persistent per-context cache/graph/encoder
+state, native q1 self-attention, and fused native RoPE/cache self-attention.
+
+Accepted DCC job `49230082` measured `7,639` SALVALAI main tokens in
+`28.243s` synchronized model time, or `270.475 tok/s`, with exact main/timing
+tokens and byte-identical `.osu` output.
+
+The current default import baseline is not compliant. A fresh process importing
+`inference`, `server`, and `modeling_varwhisper` loads:
+
+```text
+osuT5.osuT5.inference.decode_loop
+osuT5.osuT5.inference.native_q1_attention
+torch.utils.cpp_extension
+```
+
+Compilation remains call-lazy, but ordinary V32 model import already imports
+the native implementation and extension machinery.
+
+| File | Pre-migration SHA-256 |
+| --- | --- |
+| `inference.py` | `01bffc470997a026dc5020e79632fccdc015a6c07c3bfc9b6a6c981ed5a38502` |
+| `inference/server.py` | `04652b0a9b49b0d67788dfa81e667bf8021c315c43a6e6566208722f93603782` |
+| `inference/processor.py` | `cb77f7cb90c81067dcd22b7e8a19b8204e1133ebbcf692469a7f66d17854829e` |
+| `inference/decode_loop.py` | `da0b50bb1130c642b2270481b068a7c4ef468016d6b9aeb96f0e2f3f36605358` |
+| `inference/direct_decode.py` | `cbaddf37772773a725598d7f970465d52efebe485a568697efe95b5f1a72798c` |
+| `inference/logit_processors.py` | `0c04fb70cc1a56c7415bc024db134495d08cd41fcf84c7c422277a132fffcb3b` |
+| `inference/native_q1_attention.py` | `c65438acc24d03f13fc0df694e29ddc2b21aff425cd01fef9d14814544febcd9` |
+| `runtime_profiling.py` | `1bd09e211aa6092929f288c12a8858b8fd3b07ac123ec95ca15095325668f37d` |
+| `modeling_varwhisper.py` | `ed4ccb7bd18dc43caf4e6f60ae477c1a04f8b754643b80e484f18453aa2af8c2` |
+
+## Accepted Runtime Dependency Graph
+
+```text
+config.py / Hydra defaults
+  -> inference.py validation, loader selection, requested metadata
+  -> timing Processor, then main Processor
+  -> Processor.generate_sequential, one call per song window
+  -> Processor.model_generate
+  -> server.model_generate
+     -> logits processors and persistent cache/session dictionary
+     -> generation runtime context
+     -> model.generate(custom_generate=active_prefix_decode_generate)
+  -> active-prefix prefill/decode/CUDA-graph loop
+  -> neutral VarWhisper dispatch points
+     -> q1 BMM cross, native q1 self, fused RoPE/cache native q1 self
+  -> generation stats -> Processor record -> final profile/output
+```
+
+There are two current objects described as `DecodeSession`:
+
+1. `inference/direct_decode.py:DecodeSession` is a verifier-first dataclass used
+   by diagnostic utilities and optimized batch/speculative scouts. Production
+   single-song inference does not instantiate it.
+2. The accepted runtime uses `Processor.decode_session_state`, a raw dictionary
+   filled by `server._session_cache()` and the active-prefix loop.
+
+The migration first moves the verifier ABI mechanically, then introduces a
+typed production session matching the accepted dictionary lifecycle. Moving
+the verifier class alone does not migrate the 270 TPS path.
+
+## State And Calculation Contract
+
+- Timing and main use separate `Processor` instances.
+- Session state clears at top-level `Processor.generate()`.
+- A fresh session is created for each unfinished output context and persists
+  across that context's windows.
+- Cache object identity persists, but self/cross contents and `is_updated`
+  reset before each window.
+- Graph entries/static buffers and stable encoder object identity persist;
+  each window copies new encoder data into the stable object.
+- The stateful monotonic processor is fresh for each generation window.
+- Sampling uses the global PyTorch generator and serial `torch.multinomial`.
+  No private generator or extra draw may be introduced.
+- Native q1 self and fused RoPE/cache are requested for all contexts but are
+  intentionally disabled for timing. q1 BMM cross remains enabled for timing
+  when its tensor contract matches.
+- The fused path preserves Wqkv, rotary cos/sin, initialized `StaticCache`
+  aliases, cache position, mask trim, kernel call, and
+  transpose/contiguous/view order.
+- Preserve extension name `mapperatorinator_q1_attention`, source, signatures,
+  singleton loading, mask flatten/fp32/contiguous conversion, and preload before
+  compilation/capture.
+
+## Ownership Classification
+
+### Optimized implementation to move
+
+| Current owner | Implementation | Destination |
+| --- | --- | --- |
+| `inference/native_q1_attention.py` | accepted extension source, loader, q1/fused wrappers | `optimized/kernels/q1_attention.py` |
+| `modeling_varwhisper.py` | q1 BMM math and native/fused orchestration/eligibility | `optimized/kernels/dispatch.py` plus neutral hooks |
+| `runtime_profiling.py` | optimized feature state and native preload | `optimized/single/runtime_context.py` |
+| `inference/direct_decode.py` | verifier state ABI, prefill, one-token helpers | `optimized/single/state.py` and `session.py` |
+| `inference/decode_loop.py` | active-prefix loop, stable encoder, graph capture/replay, diagnostics | `optimized/single/decode_loop.py` |
+| `inference/logit_processors.py` | stateful batch-1 monotonic specialization | `optimized/single/logits.py` |
+| `processor.py` and `server.py` | production cache/graph/encoder session lifecycle | `optimized/single/session.py` |
+| optimized branches of `server.model_generate` | runtime validation, context fallback, loop selection, effective stats | `optimized/single/engine.py` |
+| `inference/native_linear.py` | rejected verifier-only linear scout | `optimized/kernels/linear.py` |
+| `inference/native_decoder_layer.py` | rejected verifier-only layer scout | `optimized/kernels/decoder_layer.py` |
+
+### Generic shared infrastructure to retain
+
+- `inference/cache_utils.py` and normal cache construction.
+- Generic Processor prompt/context/window orchestration, event assembly, and
+  profile-record projection.
+- Generic server IPC, grouping, static batching, ordinary V32 generation,
+  forward, result splitting, and shared-RNG labels.
+- Full-scan monotonic processing and other ordinary logits processors.
+- Normal V32 SDPA, FA2, and eager attention paths.
+- Model/tokenizer loading and compile configuration.
+- NVTX/detail ranges, SDPA backend selection, profile comparison tools, EOS
+  calculation, pre/postprocessing, and `.osu` assembly.
+
+### Allowed adapters outside optimized
+
+- `config.py` and Hydra: public selectors and reproduction flags.
+- `inference.py`: validation, requested metadata, one lazy loader call.
+- `processor.py`: one default-cold engine delegation point and generic metadata
+  copying.
+- `server.py`: ordinary V32 behavior and at most one narrow lazy compatibility
+  delegation point for direct legacy callers.
+- `modeling_varwhisper.py`: neutral preinstalled callable hooks only; no
+  optimized/native imports or kernel/eligibility implementation in forward.
+- Legacy loop/session/native files: small lazy compatibility shims only.
+
+### Legacy V32 behavior to leave untouched
+
+- Default `model.generate()` math and RNG order.
+- Default cache construction and full-scan monotonic calculation.
+- Compile-only V32 behavior.
+- Static IPC server batching, grouping, splitting, queue attribution, and
+  shared-global RNG policy.
+- Timing/main context ordering and final result assembly.
+
+## Target Package Ownership
+
+```text
+osuT5/osuT5/inference/optimized/
+  adapter.py
+  contracts.py
+  single/
+    __init__.py
+    config.py
+    engine.py
+    decode_loop.py
+    session.py
+    state.py
+    logits.py
+    runtime_context.py
+  kernels/
+    __init__.py
+    dispatch.py
+    q1_attention.py
+    linear.py
+    decoder_layer.py
+  batch/
+  speculative/
+  benchmark/
+```
+
+Names may change only for a cleaner dependency direction. Ownership may not
+move back outside this package.
+
+## Public Selector And Compatibility Contract
+
+Default and compile-only V32 must not import optimized single, kernels, legacy
+native implementations, or `torch.utils.cpp_extension`.
+
+Optimized single internally selects one immutable effective configuration:
+
+```text
+precision=fp32
+attn_implementation=sdpa
+batch_size=1
+cfg_scale=1.0
+num_beams=1
+use_server=false
+parallel=false
+generation_compile=true
+active_prefix_bucket_size=64
+active_prefix_cuda_graph=true
+active_prefix_cuda_graph_warmup=0
+active_prefix_cuda_graph_min_decode_steps=1
+stateful_monotonic=true
+q1_bmm_cross_attention=true
+session_runtime=true
+session_cuda_graph=true
+native_q1_self_attention=true
+native_q1_rope_cache_self_attention=true
+```
+
+The canonical accepted legacy bundle resolves to the same effective object.
+Compile-only V32 stays generic. Unsupported partial bundles fail loudly with an
+explicit migration instruction and may not silently change calculations.
+
+`offline_batch` and `server` fail before model loading, optimized single import,
+kernel import, CUDA initialization, or extension-cache mutation. The optimized
+adapter receives an injected generic loader callable and never imports
+`inference.py` back into the package.
+
+## Metadata Contract
+
+Keep existing requested fields unchanged, including engine/mode and every
+legacy micro-flag. Add separate effective configuration/version fields rather
+than rewriting requested values.
+
+Preserve per-window generation compile, stateful monotonic, q1 BMM, native
+requested/enabled/disabled reason, session/graph/count, active-prefix settings,
+CUDA ledger/diagnostics, token IDs/counts, output SHA/size, and server
+RNG/batch-attribution fields. For the legacy bundle, top-level engine remains
+`v32` even though implementation ownership delegates.
+
+## Incremental Migration Boundaries
+
+Each boundary gets a clean commit and push. A failed exactness/performance gate
+is fixed or reverted before the next boundary.
+
+### K1: Native module ownership
+
+Move q1 extension verbatim, replace old native module with a lazy shim, remove
+model top-level native import, install neutral callable hooks before
+compile/capture, and move unused native linear/layer scouts mechanically.
+
+Gates: fresh V32 import cold; optimized kernel import does not compile; shim
+import cold; fake loader exactly once; wrapper ABI; one real native one-step.
+
+### S1: Verifier session/state ownership
+
+Move `direct_decode.py` mechanically into optimized single state/session,
+update optimized internal imports, and leave lazy compatibility re-exports.
+
+Gates: API/import identity, one-token logits/top-k/cache, no V32 import change.
+
+### S2: Production session ownership
+
+Replace the raw dictionary with a typed optimized session matching per-context
+and per-window lifetime exactly.
+
+Gates: two-window persistent parity, pointers, reset, capture count,
+token/logit/RNG equality.
+
+### L1: Active-prefix loop ownership
+
+Move loop and graph helpers byte-for-byte, update optimized internal imports,
+and replace the legacy file with a lazy shim.
+
+Gates: bucket/signature/static-input unit tests; 8-step then 256-step exact
+loop; forced EOS; graph capture/replay ledger.
+
+### P1: Optimized logits ownership
+
+Keep V32 full scan unchanged; move stateful B1 specialization to optimized
+single; optimized builder selects the subclass without warming V32 imports.
+
+Gates: randomized full-scan/stateful parity, SOS reset, sequence jump, graph
+capture, tokens.
+
+### E1: Optimized single engine
+
+Move optimized generation orchestration/effective stats from server and context
+session reset/delegation from Processor. Make adapter load a real single engine
+with compile enabled and install hooks before compile/capture.
+
+Gates: selector matrix, lazy load, engine-vs-legacy one-step/short-loop parity,
+hook restoration after success/exception.
+
+### C1: Legacy delegation and cleanup
+
+Route canonical legacy bundle to E1; reject partial bundles; remove duplicate
+optimized implementation from server, Processor, model, and legacy modules.
+
+Gates: AST ownership audit, complete local suite, fresh-process V32 import and
+metadata snapshot, unchanged server/static-server tests.
+
+## Mandatory Local Gates
+
+### Fresh-process imports
+
+- Import `inference`, Processor, server, and VarWhisper on V32.
+- Assert no optimized, legacy/optimized native kernel, or
+  `torch.utils.cpp_extension` module is loaded.
+- Default and compile-only V32 leave extension cache unchanged.
+- Importing `optimized.adapter` imports neither optimized single nor kernels.
+- Unsupported optimized modes fail before loader/import/CUDA side effects.
+
+### Control plane
+
+- Dataclass and Hydra V32/single defaults agree.
+- Optimized single supports only FP32/SDPA/B1/sequential/no-CFG/no-beam.
+- Optimized plus legacy flags remains ambiguous and rejected.
+- V32 non-single optimized modes fail.
+- Legacy bundle normalization equals optimized effective configuration.
+
+### One-step exactness
+
+Use real SALVALAI seq9 tensors and compare prefill/q1 logits, finite/nonfinite
+layout, top-20, sampled token, cache position, all active self-cache prefixes,
+cross cache/`is_updated`, timing fallback, main native path, graph signature,
+and capture count.
+
+### Short loop and session
+
+- First 8 then 256 tokens, every logits/top-k step, transcript, stop reason,
+  final CPU/CUDA RNG, and forced EOS without an extra draw.
+- Active self/cross cache prefixes, bucket sequence, capture/replay counts.
+- Two consecutive windows with cache identity/reset, stable encoder identity,
+  and graph reuse.
+
+### Server and ownership
+
+- Existing server control-plane, batch-state, batching-summary, and static
+  comparator tests remain unchanged.
+- Ordinary `server.model_generate()` never delegates.
+- Default stats keys and false/`None` values remain exact.
+- AST/source audit rejects CUDA source, `load_inline`, q1 BMM math, fused-cache
+  implementation, graph/session state machines, or optimized module-scope
+  imports outside optimized owners and enumerated lazy shims.
+- Optimized batch/speculative code imports optimized sources, not shims.
+
+## DCC Promotion Gates
+
+Use only a pushed commit in an isolated DCC worktree after live `sinfo`, account,
+GPU, checkout, cache, and environment checks.
+
+1. Exact one-step logits/top-k/self-cache/cross-cache.
+2. Exact short and 256-step token/RNG/forced-EOS.
+3. Reciprocal 15-second legacy bundle versus optimized single.
+4. Reciprocal full-song legacy bundle versus optimized single.
+5. Separate pre-migration versus candidate default-V32 reciprocal regression.
+6. Main `7,639` and timing `821` tokens, final RNG hashes, `.osu` SHA/size.
+7. Main throughput at or above `270.475 tok/s`; no meaningful timing,
+   stage-wall, cold setup, or per-window regression.
+8. Cold import, extension cache/build, graph cache/capture, first-window setup,
+   clocks/power/memory, and warm replay reporting.
+9. Static-server regression under its throughput-only shared-RNG contract.
+
+The recent full-song consistency artifact is SHA
+`483483a1c29ef8a44c4a8d3a82fe0778ae306470ec3157e98969eeabd92c2631`,
+size `31,709`, with `7,639` main and `821` timing tokens. Final evidence still
+requires same-job reciprocal controls.
+
+## Stop And Rollback Policy
+
+- Import cleanliness alone never graduates a boundary.
+- Any token, stop, RNG, cache, or output mismatch stops the boundary.
+- Any meaningful main, timing, stage-wall, cold setup, or per-window regression
+  stops the boundary until fixed or reverted.
+- No performance improvement is claimed or pursued.
+- Every boundary commit records its predecessor for isolated rollback.
+- Protected batching and decoder-layer audit branches are never merged.
