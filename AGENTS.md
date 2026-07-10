@@ -44,6 +44,7 @@
 ## Runtime And Batching Rules
 
 - Build and prove the offline optimized engine before adding an optimized server adapter. Keep encoder/prefill and token-decode scheduling separate; prefill remains serial until measured stalls exceed `5%` of scheduler wall.
+- Treat each production song's windows as one dependency chain: a later window cannot become active before the preceding window's generated output exists. Do not use synthetic probe inputs to claim mixed-queue compatibility; derive model-free schedules from accepted exact-token production profiles, and label tensor-shape compatibility unproven when those profiles do not record encoder/frame/condition shapes.
 - Compare merged fixed-slot decode at `B=1/2/5/8` against `1-4` independent B1 CUDA-graph lanes before choosing a scheduler execution shape. Do not assume larger batches improve Turing throughput.
 - Maintain explicit per-request generator, logits processors, stopping state, encoder outputs, self/cross caches, token buffer, cache position, slot generation, and graph state.
 - Add paging only after memory fragmentation or fixed-slot capacity is measured as the limiting factor. Add operation-level overlap only after merged-batch and lane-pool experiments fail or leave target-sized idle gaps.

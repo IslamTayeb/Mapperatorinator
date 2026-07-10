@@ -414,6 +414,63 @@ Primary references: [PyTorch CUDA graph memory management](https://docs.pytorch.
 [NVIDIA cuBLAS multi-stream reproducibility](https://docs.nvidia.com/cuda/archive/12.9.2/cublas/index.html),
 and [NVIDIA graph-pool concurrency warning](https://docs.nvidia.com/dl-cuda-graph/latest/troubleshooting/numerical-errors.html).
 
+### Accepted five-song compatibility ceiling
+
+Commit `ef358de` added a CPU-only analyzer for the five accepted warmed
+repeat01 smoke profiles from job `49543717`. It consumes the recorded exact
+main token IDs rather than synthesizing model inputs, keeps only one active
+window dependency per song, excludes the prefill-produced first token, and
+regroups compatible decode rows after every selected group. The primary
+`largest_compatible_first` policy breaks ties by group size, lowest current
+64-token prefix bucket, then stable compatibility-key hash; reciprocal request
+order preserved the complete schedule hash. Synchronous round-robin is
+reported separately as policy sensitivity, not as an optimal schedule.
+
+The five profiles contain `5,955` main tokens: `50` prefill-produced tokens and
+`5,905` modeled decode tokens. The primary policy produced `3,489` group events:
+`1,458` B1, `1,646` B2, and `385` B3. Thus `75.31%` of decode tokens are in
+groups larger than one, but no group can exceed five because only five song
+dependency chains exist. The synchronous sensitivity produced B1/B2/B3/B4/B5
+event counts of `2,427/703/194/155/174`.
+
+Using the fastest reviewed exact point for every partition selects the
+normalized L1 graph lane (`414.905 tok/s`) over the old eager B1/B2/B5 points.
+This optimistic bucket-extrapolated model gives `418.418` decode-only main
+tok/s and `357.146` after linearly charging the measured B8 serial-prefill and
+pack setup to all 50 windows. The latter is `+69.88%` over the accepted
+`210.230` serial scheduler-wall denominator, so it clears the relative `5%`
+gate, but it is separately below the absolute `500` objective. Only `5.17%` of
+decode rows use the measured reference bucket 128; longer-bucket reuse is an
+optimistic extrapolation.
+
+Even the physically impossible all-B8 fantasy is only `501.539` decode-only
+main tok/s and falls to `485.563` with just the initial measured setup, or
+`415.994` with full linearized setup. Stop before a mixed B8 decode, 256-step
+promotion, lifecycle scheduler, or runtime wiring. Accepted profiles prove
+prompt/token counts, bucket schedules, runtime/sampling contracts, and exact
+token transcripts; they do not record encoder/frame/condition tensor shapes.
+
+The same report authorizes one narrower verifier scout. Exact reciprocal L2
+lanes measured `2.568743 ms` model-only (`778.591 tok/s`) but `5.026351 ms`
+complete (`397.903 tok/s`), leaving a `2.457608 ms` control gap. Reaching 500
+requires a `<4.0 ms` step, or removal of `1.026351 ms` (`41.76%`) of that gap.
+The prior B8 shared-processor control removed `3.064 ms`, evidence that the
+required saving is plausible but not an additive L2 measurement. B2 accounts
+for `55.75%` of accepted decode tokens under the primary schedule. A bounded
+hybrid should therefore test two concurrent private B1 graph replays, join,
+then one coordinator batched full-scan monotonic processor while preserving
+private row warpers and generators. Capping its optimistic ceiling at the
+measured L2 model-only interval projects `616.517` decode-only queue tok/s but
+only `492.118` with full linearized setup. This authorizes only that verifier;
+it is not a 500-TPS queue claim and does not authorize scheduler/runtime code.
+
+Canonical report:
+
+```text
+notes/inference-mixed-queue-compatibility-report.json
+SHA-256 9dae2b72b96556bc6df2e4e7fd04faa0d7d992fa09ff4d903470af27dd56ef9c
+```
+
 ### CPU continuous-scheduler harness
 
 `osuT5/osuT5/inference/continuous_batching.py` models arrivals, activation, round-robin/FIFO decode, stop reasons, cache-slot acquire/release, and slot generations. Strict manifests validate token/count recomputation, lifecycle arithmetic, state hashes, active-batch histograms, and cache-slot balance.
