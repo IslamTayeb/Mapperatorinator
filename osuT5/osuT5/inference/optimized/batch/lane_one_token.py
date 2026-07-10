@@ -375,6 +375,86 @@ def summarize_lane_scaling(
     }
 
 
+def reciprocal_lane_orders(lane_count: int) -> tuple[tuple[int, ...], ...]:
+    """Return the bounded reciprocal launch-order gate for L=2."""
+
+    if lane_count != 2:
+        raise ValueError("reciprocal launch-order execution is implemented only for L=2.")
+    return ((0, 1), (1, 0))
+
+
+def validate_l2_baseline_report(
+        report: Mapping[str, Any],
+        *,
+        expected_complete_tokens_per_second: float,
+        absolute_tolerance: float = 1e-9,
+) -> None:
+    """Pin L2 graduation to the reviewed normalized L1 denominator."""
+
+    validate_lane_gate_order(2, report)
+    if not math.isfinite(expected_complete_tokens_per_second) or expected_complete_tokens_per_second <= 0:
+        raise ValueError("expected_complete_tokens_per_second must be finite and positive.")
+    if absolute_tolerance < 0:
+        raise ValueError("absolute_tolerance must be non-negative.")
+    timing = report.get("timing")
+    if not isinstance(timing, Mapping):
+        raise ValueError("L1 report is missing timing evidence.")
+    observed_tps = timing.get("complete_wall_tokens_per_second")
+    if not isinstance(observed_tps, (int, float)) or isinstance(observed_tps, bool):
+        raise ValueError("L1 report is missing complete_wall_tokens_per_second.")
+    if not math.isclose(
+            float(observed_tps),
+            expected_complete_tokens_per_second,
+            rel_tol=0.0,
+            abs_tol=absolute_tolerance,
+    ):
+        raise ValueError(
+            "L1 complete denominator differs from the reviewed value: "
+            f"{float(observed_tps)} != {expected_complete_tokens_per_second}."
+        )
+    observation = report.get("observation")
+    if not isinstance(observation, Mapping):
+        raise ValueError("L1 report is missing its normalized observation.")
+    if observation.get("execution_family") != "b1_lane_pool":
+        raise ValueError("L1 baseline observation is not a B1 lane-pool observation.")
+    if int(observation.get("parallelism", -1)) != 1:
+        raise ValueError("L1 baseline observation must have parallelism=1.")
+    if float(observation.get("scheduler_wall_tokens_per_second", -1.0)) != float(observed_tps):
+        raise ValueError("L1 timing and normalized observation throughput disagree.")
+
+
+def summarize_reciprocal_l2_performance(
+        *,
+        b1_tokens_per_second: float,
+        order_tokens_per_second: Mapping[str, float],
+) -> dict[str, Any]:
+    """Gate L2 on the slower reciprocal launch order."""
+
+    required_orders = {"0,1", "1,0"}
+    if set(order_tokens_per_second) != required_orders:
+        raise ValueError("L2 performance must contain exactly reciprocal orders 0,1 and 1,0.")
+    if any(
+            not math.isfinite(value) or value <= 0
+            for value in order_tokens_per_second.values()
+    ):
+        raise ValueError("reciprocal L2 throughput values must be finite and positive.")
+    worst_order_tps = min(order_tokens_per_second.values())
+    best_order_tps = max(order_tokens_per_second.values())
+    scaling = summarize_lane_scaling(
+        b1_tokens_per_second=b1_tokens_per_second,
+        candidate_lane_count=2,
+        candidate_tokens_per_second=worst_order_tps,
+    )
+    return {
+        **scaling,
+        "order_tokens_per_second": dict(sorted(order_tokens_per_second.items())),
+        "worst_order_tokens_per_second": worst_order_tps,
+        "best_order_tokens_per_second": best_order_tps,
+        "reciprocal_order_spread_fraction": best_order_tps / worst_order_tps - 1.0,
+        "performance_gate_uses": "worst_reciprocal_order",
+    }
+
+
 def _clone_graph_inputs(model_inputs: Mapping[str, Any]) -> dict[str, Any]:
     return {
         key: (

@@ -44,9 +44,10 @@ class BatchPhysicsPlan:
             "status": "merged_one_token_verifier_only",
             "implemented_merged_one_token_batch_sizes": [1, 2, 5, 8],
             "planned_merged_batch_sizes": [],
-            "lane_pool_status": "b1_parity_capture_verifier_only",
-            "implemented_b1_lane_counts": [1],
-            "planned_b1_lane_counts": [2, 3, 4],
+            "lane_pool_status": "l1_validated_l2_verifier_pending_gpu",
+            "validated_b1_lane_counts": [1],
+            "implemented_pending_gpu_b1_lane_counts": [2],
+            "planned_b1_lane_counts": [3, 4],
             "required_observation_fields": [
                 "execution_family",
                 "parallelism",

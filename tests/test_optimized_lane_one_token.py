@@ -13,7 +13,10 @@ from osuT5.osuT5.inference.optimized.batch.lane_one_token import (
     compare_lane_logits,
     normalized_one_token_request_ids,
     normalized_one_token_workload_contract,
+    reciprocal_lane_orders,
     summarize_lane_scaling,
+    summarize_reciprocal_l2_performance,
+    validate_l2_baseline_report,
     validate_lane_gate_order,
     validate_lane_resource_ownership,
 )
@@ -22,6 +25,12 @@ from utils.verify_optimized_b1_lane_capture import (
     _cache_position_is_zero,
     _zero_cache_position,
     build_parser,
+)
+from utils.verify_optimized_l2_lane_capture import (
+    REVIEWED_B1_COMPLETE_TPS,
+    _observation,
+    _resolve_row_seeds,
+    build_parser as build_l2_parser,
 )
 
 
@@ -132,6 +141,77 @@ def test_lane_gate_order_stops_concurrency_before_b1_parity_and_before_five_perc
     validate_lane_gate_order(3, b2_pass)
 
 
+def test_l2_baseline_is_pinned_to_reviewed_normalized_l1_report():
+    tps = 414.9046973558729
+    report = {
+        "lane_count": 1,
+        "pass": True,
+        "exactness_pass": True,
+        "resource_ownership_pass": True,
+        "capture_pass": True,
+        "timing": {"complete_wall_tokens_per_second": tps},
+        "observation": {
+            "execution_family": "b1_lane_pool",
+            "parallelism": 1,
+            "scheduler_wall_tokens_per_second": tps,
+        },
+    }
+
+    validate_l2_baseline_report(
+        report,
+        expected_complete_tokens_per_second=tps,
+    )
+    with pytest.raises(ValueError, match="differs from the reviewed value"):
+        validate_l2_baseline_report(
+            report,
+            expected_complete_tokens_per_second=tps + 0.01,
+        )
+
+
+def test_l2_reciprocal_order_gate_uses_slower_order_and_five_percent_bar():
+    assert reciprocal_lane_orders(2) == ((0, 1), (1, 0))
+    with pytest.raises(ValueError, match="only for L=2"):
+        reciprocal_lane_orders(3)
+
+    baseline = 414.9046973558729
+    result = summarize_reciprocal_l2_performance(
+        b1_tokens_per_second=baseline,
+        order_tokens_per_second={"0,1": 500.0, "1,0": 440.0},
+    )
+
+    assert result["worst_order_tokens_per_second"] == 440.0
+    assert result["best_order_tokens_per_second"] == 500.0
+    assert result["clears_five_percent_b1_keep_bar"] is True
+    below = summarize_reciprocal_l2_performance(
+        b1_tokens_per_second=baseline,
+        order_tokens_per_second={"0,1": 435.0, "1,0": 500.0},
+    )
+    assert below["clears_five_percent_b1_keep_bar"] is False
+
+
+def test_l2_serial_and_concurrent_observation_histograms_describe_same_workload():
+    common = {
+        "seeds": (12345, 23456),
+        "timing_repeats": 50,
+        "workload_contract_hash": "same-two-row-workload",
+        "token_hashes": {"row-0": "tokens-a", "row-1": "tokens-b"},
+        "rng_hashes": {"row-0": "rng-a", "row-1": "rng-b"},
+        "model_timing": {"cuda_seconds": 0.15},
+        "complete_timing": {
+            "wall_seconds": 0.20,
+            "cuda_seconds": 0.19,
+            "peak_allocated_bytes": 1024,
+        },
+    }
+    serial = _observation(parallelism=1, **common)
+    concurrent = _observation(parallelism=2, **common)
+
+    assert serial.generated_tokens == concurrent.generated_tokens == 100
+    assert serial.active_batch_size_histogram == {1: 100}
+    assert concurrent.active_batch_size_histogram == {2: 50}
+    assert serial.workload_contract_hash == concurrent.workload_contract_hash
+
+
 def test_lane_scaling_uses_b1_denominator_and_five_percent_keep_bar():
     below = summarize_lane_scaling(
         b1_tokens_per_second=300.0,
@@ -236,3 +316,19 @@ def test_cli_exposes_only_incremental_lane_gate_inputs():
     assert args.lane_count == 1
     assert args.previous_gate_report is None
     assert args.overrides == ["inference_generation_compile=false"]
+
+    l2_args = build_l2_parser().parse_args([
+        "--previous-gate-report",
+        "l1.json",
+        "--report-path",
+        "l2.json",
+        "--row-seed",
+        "12345",
+        "--row-seed",
+        "23456",
+        "inference_generation_compile=false",
+    ])
+    assert l2_args.expected_b1_complete_tps == REVIEWED_B1_COMPLETE_TPS
+    assert _resolve_row_seeds(l2_args.row_seed, 1) == (12345, 23456)
+    with pytest.raises(ValueError, match="exactly two"):
+        _resolve_row_seeds([12345], 1)
