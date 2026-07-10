@@ -57,6 +57,11 @@ Every run note must record:
 - model/HF, compiler, native-extension, and graph-cache state;
 - run, profile/manifest, comparison, telemetry, and trace paths.
 
+Use `scripts/dcc/profile_inference_denominators.sbatch` for the current
+single-full, five-song smoke, and five-song full denominator jobs. Submit it
+only after pushing and fast-forwarding the DCC checkout, and pass both the
+requested run kind and the full expected commit through `sbatch --export`.
+
 ## Current Single-Song Baseline
 
 The exact opt-in SALVALAI baseline is job `49230082`, commit `d7b8684`: `7,639` main tokens in `28.243s`, `270.475 tok/s`, main/timing token identity, and byte-identical output.
