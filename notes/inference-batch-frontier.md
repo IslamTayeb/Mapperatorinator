@@ -267,6 +267,61 @@ Packed-prefill report:
 ```text
 /work/imt11/Mapperatorinator/runs/packed-prefill-batch-loop16-49548273-8a75179/merged-b8-loop16.json
 ```
+### Independent B1 lane feasibility and first gate
+
+The lane family is still a hypothesis, not the favored execution shape. It may
+retain the accepted B1 graph/native cache shape while overlapping small kernels,
+memory latency, or sampling work across streams. It may also fail because each
+decoder graph already saturates SM/DRAM resources, concurrent requests contend
+for weight reads, CUDA serializes graph nodes, Python control remains serial, or
+private graphs/caches/workspaces consume too much VRAM.
+
+The smallest clean gate is feasible without changing `DecodeSession`, model
+code, V32, or a scheduler. `utils/verify_optimized_b1_lane_capture.py` builds an
+independent eager B1 reference and a second B1 session, warms one full prepared
+one-token call on a persistent private stream, then captures it with
+`torch.cuda.graph(..., stream=lane)` and no shared pool token. L=1 must pass:
+
+- raw FP32 logit allclose and top-k identity for prefill, eager setup, and graph
+  replay;
+- anchor/next sampled-token and final private-generator-state identity, plus an
+  eager-versus-graph transcript/final-RNG comparison for every token counted in
+  the fixed-shape complete-step timing observation;
+- a zero sentinel at the target self-cache slot before first replay, followed by
+  cache-position/shape-contract equality, self/cross-cache allclose, and
+  disjoint reference/lane cache storage;
+- recorded private stream, graph, graph-pool, session, cache, encoder, static
+  buffer, generator, processor, and self/cross-cache ownership;
+- warmed graph-only and graph-plus-sampling fixed-shape timing plus capture
+  memory. This is a component scout, not a runtime throughput claim.
+
+Do not implement or run L=2-4 until the L=1 report passes on RTX 2080/2080 Ti.
+Then run L=2 against the same L=1 complete sampled-step denominator and stop
+the lane family if exactness fails or throughput gains less than `5%`. Only an
+exact L=2 win justifies the bounded L=3/L=4 sweep. The best lane point must also
+beat merged B8 (`439.636 tok/s` complete); merely showing concurrent kernels is
+not sufficient. No lane DCC job has been submitted yet.
+
+Lane observations use the merged verifier's `row-N` request IDs and logical
+workload-contract keys. A future L=2 comparison must replay the same two-row
+workload serially on L=1 and concurrently on L=2; it must not compare different
+request counts merely because both reports are normalized observations.
+
+Every future lane must own a distinct persistent CUDA stream, graph, default
+graph-private allocator pool, session/cache/encoder state, static buffers,
+generator, and logits processor while sharing only immutable model weights.
+Never pass the same graph-pool token to concurrently replayed graphs. PyTorch
+documents cuBLAS workspaces as allocated per handle/stream combination but does
+not expose their pointers, so evidence records the unique warmed stream as the
+workspace owner plus `CUBLAS_WORKSPACE_CONFIG`; it must not fabricate a pointer.
+NVIDIA's multi-stream cuBLAS reproducibility caveat makes reciprocal L=2 launch
+order and exact token/RNG checks mandatory.
+
+Primary references: [PyTorch CUDA graph memory management](https://docs.pytorch.org/docs/main/notes/cuda.html),
+[PyTorch cuBLAS workspaces](https://github.com/pytorch/pytorch/blob/main/docs/source/notes/cuda.rst),
+[PyTorch graph stream/pool API](https://docs.pytorch.org/docs/stable/generated/torch.cuda.graph.html),
+[NVIDIA cuBLAS multi-stream reproducibility](https://docs.nvidia.com/cuda/archive/12.9.2/cublas/index.html),
+and [NVIDIA graph-pool concurrency warning](https://docs.nvidia.com/dl-cuda-graph/latest/troubleshooting/numerical-errors.html).
 
 ### CPU continuous-scheduler harness
 

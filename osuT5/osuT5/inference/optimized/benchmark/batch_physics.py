@@ -44,7 +44,9 @@ class BatchPhysicsPlan:
             "status": "merged_one_token_verifier_only",
             "implemented_merged_one_token_batch_sizes": [1, 2, 5, 8],
             "planned_merged_batch_sizes": [],
-            "lane_pool_status": "execution_not_implemented",
+            "lane_pool_status": "b1_parity_capture_verifier_only",
+            "implemented_b1_lane_counts": [1],
+            "planned_b1_lane_counts": [2, 3, 4],
             "required_observation_fields": [
                 "execution_family",
                 "parallelism",
@@ -129,9 +131,15 @@ class BatchPhysicsObservation:
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive.")
         # Model-only and complete-step timings may come from separate replay
-        # passes, so measurement noise can make model_seconds exceed the later
-        # complete-step wall slightly. CUDA time is measured inside the complete
-        # wall interval and retains the strict containment check below.
+        # passes, so small measurement jitter can make model_seconds exceed the
+        # later complete-step wall. Keep a bounded 5% consistency allowance;
+        # larger inversions indicate incompatible intervals or malformed data.
+        if self.model_seconds > self.scheduler_wall_seconds * 1.05:
+            raise ValueError(
+                "model_seconds cannot exceed scheduler_wall_seconds by more than 5%."
+            )
+        # CUDA time is measured inside the complete-step wall interval and
+        # retains strict containment.
         if self.cuda_seconds > self.scheduler_wall_seconds:
             raise ValueError("cuda_seconds cannot exceed scheduler_wall_seconds.")
         if self.peak_memory_bytes <= 0:

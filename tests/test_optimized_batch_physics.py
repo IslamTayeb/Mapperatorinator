@@ -171,7 +171,9 @@ def test_measurement_schema_records_required_gpu_and_exactness_fields():
         "status": "merged_one_token_verifier_only",
         "implemented_merged_one_token_batch_sizes": [1, 2, 5, 8],
         "planned_merged_batch_sizes": [],
-        "lane_pool_status": "execution_not_implemented",
+        "lane_pool_status": "b1_parity_capture_verifier_only",
+        "implemented_b1_lane_counts": [1],
+        "planned_b1_lane_counts": [2, 3, 4],
         "required_observation_fields": [
             "execution_family",
             "parallelism",
@@ -207,6 +209,17 @@ def test_measurement_schema_records_required_gpu_and_exactness_fields():
     comparison = compare_batch_physics_observations(observation, candidate)
     assert comparison["clears_five_percent_scout_bar"] is True
     assert comparison["decision"] == "continue_incremental_gates"
+
+    bounded_jitter_payload = observation.as_dict()
+    bounded_jitter_payload["model_seconds"] = 1.05
+    assert BatchPhysicsObservation.from_dict(bounded_jitter_payload).model_seconds == 1.05
+    inconsistent_timing_payload = observation.as_dict()
+    inconsistent_timing_payload["model_seconds"] = 1.051
+    _assert_raises(
+        ValueError,
+        lambda: BatchPhysicsObservation.from_dict(inconsistent_timing_payload),
+        "more than 5%",
+    )
 
     below_bar_payload = candidate.as_dict()
     below_bar_payload["scheduler_wall_seconds"] = 0.97

@@ -1,8 +1,9 @@
 """Plan/record schema CLI for the optimized GPU batch-physics scout.
 
 ``--describe-plan`` emits the bounded experiment matrix. Real merged one-token
-execution lives in ``verify_optimized_merged_one_token.py``; this schema CLI
-never executes CUDA, so planning output cannot be mistaken for throughput.
+execution lives in ``verify_optimized_merged_one_token.py`` and the first B1
+lane capture gate lives in ``verify_optimized_b1_lane_capture.py``. This schema
+CLI never executes CUDA, so planning output cannot be mistaken for throughput.
 """
 
 from __future__ import annotations
@@ -68,8 +69,9 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError(
             "This schema CLI does not execute CUDA. Use "
             "utils/verify_optimized_merged_one_token.py for the staged "
-            "B=1 -> B=2 -> B=5 -> B=8 merged one-token verifier. "
-            "Independent B1 lane pools remain unimplemented."
+            "B=1 -> B=2 -> B=5 -> B=8 merged one-token verifier, or "
+            "utils/verify_optimized_b1_lane_capture.py for the L=1 lane "
+            "parity/capture gate. Concurrent L=2-4 replay remains unimplemented."
         )
     rendered = json.dumps(payload, indent=2, sort_keys=True)
     if args.output_json is not None:
