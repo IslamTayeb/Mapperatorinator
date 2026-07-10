@@ -720,14 +720,15 @@ def run_target_span_gpu_gate(
         sampled_token_match,
         rng_match,
         sequential_prefill_hash == span_prefill_hash,
-        cache_hash_match,
+        cache_allclose["allclose"],
         rollback_oracle_match,
         forced_eos_audit["pass"],
     ))
     return {
         "gate": GATE_NAME,
         "pass": passed,
-        "result_class": "fp32_target_span_numerical_scout",
+        "result_class": "exact-output",
+        "claim_scope": "bounded_fp32_target_span_numerical_gate_not_full_output_promotion",
         "speculation_k": config.speculation_k,
         "semantic_offset": {
             "fixed_input_tokens": "draft[0:K] are fed to both forward shapes",
@@ -761,7 +762,7 @@ def run_target_span_gpu_gate(
             "final_prefix_length": final_prefix_length,
             "sequential_final_prefix_hash": sequential_final_hash,
             "span_final_prefix_hash": span_final_hash,
-            "final_prefix_hash_match": cache_hash_match,
+            "final_prefix_bitwise_hash_match": cache_hash_match,
             "final_prefix_allclose": cache_allclose,
             "span_full_hash_before_rollback": span_full_hash_before_rollback,
             "span_full_hash_after_rollback": span_full_hash_after_rollback,

@@ -87,6 +87,8 @@ def test_cache_prefix_comparison_reports_bitwise_hash_and_allclose_separately():
     )
     assert comparison["allclose"] is True
     assert comparison["max_abs"] == pytest.approx(1e-5)
+    # Exact-output admits this internal FP32 drift; the unequal hash is stronger
+    # bitwise-calculation-exact diagnostic evidence, not a rejection by itself.
 
 
 @pytest.mark.parametrize("speculation_k", [2, 4, 8])
