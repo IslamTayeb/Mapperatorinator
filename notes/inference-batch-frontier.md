@@ -1,6 +1,6 @@
 # Inference Batch And Offline Frontier
 
-Last consolidated: 2026-07-10. This document is the current multi-song source of truth. Static IPC results describe the legacy V32 server; the exact optimized offline engine has not yet produced a GPU throughput result.
+Last consolidated: 2026-07-10. This document is the current multi-song source of truth. Static IPC results describe the legacy V32 server. The optimized package now has exact one-token merged-batch physics evidence, but the exact offline engine has not yet produced a queue-level GPU throughput result.
 
 ## Objective
 
@@ -105,6 +105,44 @@ Branch `codex/batched-fast-decode-session` is abandoned at `a74537a` and must no
 
 This proves that pushing the batch-1 fast stack through the existing server/lockstep abstraction is not enough. Preserve the branch only as an audit trail. Revisit its ideas only if a lower-level active-prefix graph step or batched decoder runtime beats optimized serial with private per-request state.
 
+### Exact merged one-token physics
+
+Jobs `49546220`, `49546893`, `49546977`, and `49547025` measured the eager,
+batch-compatible active-prefix/q1-cross path at B1/B2/B5/B8. Each merged row
+matched an independently prefetched B1 reference for FP32 raw-logit allclose,
+top-k, anchor/next sampled token, and private final generator state. This is a
+fixed-shape one-token verifier and ceiling probe, not queue or full-output
+evidence.
+
+| Batch | Complete sampled-step tok/s | Model-only tok/s | Step wall | Peak allocated | Decision |
+| --- | ---: | ---: | ---: | ---: | --- |
+| B1 | `75.402` | `79.680` | `13.262 ms` | `1.069 GiB` | eager denominator |
+| B2 | `149.341` | `171.313` | `13.392 ms` | `1.339 GiB` | exact; advance |
+| B5 | `318.233` | `427.464` | `15.712 ms` | `2.100 GiB` | exact; advance |
+| B8 | `439.636` | `669.064` | `18.197 ms` | `2.824 GiB` | exact; stop shape expansion |
+
+B8 improves complete throughput `38.15%` over B5 and has ample VRAM, but it is
+`13.66%` below ideal B5-scaled capacity and still below the `500 tok/s` queue
+target. Model execution itself clears `500`; rowwise logits processing,
+sampling, and host/launch control add `6.240 ms/step`, `34.29%` of complete
+wall. Therefore do not expand merged batch size again or build a scheduler from
+this microbenchmark. First run a bounded active-row sampling/control or graph
+overhead scout at B8, then prove a multi-step mixed-song loop. Lane-pool
+comparison remains open.
+
+Artifacts:
+
+```text
+/work/imt11/Mapperatorinator/runs/merged-batch-physics-b1-49546220-5dd463e/merged-b1.json
+/work/imt11/Mapperatorinator/runs/merged-batch-physics-b2-49546893-e1a51b5/merged-b2.json
+/work/imt11/Mapperatorinator/runs/merged-batch-physics-b5-49546977-437c7f5/merged-b5.json
+/work/imt11/Mapperatorinator/runs/merged-batch-physics-b8-49547025-b949018/merged-b8.json
+```
+
+Job `49545900` failed in config validation before model execution because the
+stateful processor's required public active-prefix selector was missing. It is
+a harness setup failure and carries no physics evidence.
+
 ### CPU continuous-scheduler harness
 
 `osuT5/osuT5/inference/continuous_batching.py` models arrivals, activation, round-robin/FIFO decode, stop reasons, cache-slot acquire/release, and slot generations. Strict manifests validate token/count recomputation, lifecycle arithmetic, state hashes, active-batch histograms, and cache-slot balance.
@@ -196,7 +234,8 @@ Until those gates pass, call results offline-engine throughput, not server optim
 
 ## Immediate Next Decision Points
 
-- Run the merged-batch versus lane-pool physics gate in isolated experiment worktrees.
+- Profile the measured B8 rowwise sampling/control gap before any merged scheduler wiring; retain the independent-lane comparison as the alternate physics shape.
+- Run the independent B1 CUDA-graph lane comparison in its isolated experiment worktree.
 - Build only the execution shape that clears `5%` exact-output aggregate improvement.
 - Feed accepted single-song components, including any exact speculative verifier win, back into the offline engine and measure combined scheduler-wall throughput.
 - Stop for user input before reduced precision, output/RNG relaxation, or maintainer-facing changes outside the optimized package/adapter boundary.
