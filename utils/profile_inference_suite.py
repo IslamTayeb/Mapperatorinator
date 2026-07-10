@@ -223,6 +223,28 @@ def _summary_for_label(profile: dict[str, Any], label: str) -> dict[str, Any]:
     return profile.get("summary", {}).get("generation_by_label", {}).get(label, {})
 
 
+def _generation_interval(profile: dict[str, Any], label: str) -> dict[str, float] | None:
+    records = [
+        record
+        for record in profile.get("generation", [])
+        if record.get("profile_label") == label
+    ]
+    if not records:
+        return None
+    starts = [record.get("generation_started_at_perf_counter_seconds") for record in records]
+    finishes = [record.get("generation_finished_at_perf_counter_seconds") for record in records]
+    if not all(isinstance(value, (int, float)) for value in starts + finishes):
+        return None
+    started_at = min(float(value) for value in starts)
+    finished_at = max(float(value) for value in finishes)
+    if finished_at <= started_at:
+        raise ValueError(f"Invalid {label} generation interval: {started_at}..{finished_at}.")
+    return {
+        "started_at_perf_counter_seconds": started_at,
+        "finished_at_perf_counter_seconds": finished_at,
+    }
+
+
 def _flatten_token_ids(profile: dict[str, Any], label: str) -> list[int] | None:
     tokens: list[int] = []
     saw_tokens = False
@@ -404,6 +426,53 @@ def _aggregate(runs: list[dict[str, Any]], *, start_index: int) -> dict[str, Any
     return _aggregate_runs(runs[start_index:])
 
 
+def _scheduler_wall_aggregate(
+        runs: list[dict[str, Any]],
+        *,
+        include_timing_context: bool,
+) -> dict[str, Any] | None:
+    if not runs:
+        return None
+    start_fields = ["main_generation_started_at_perf_counter_seconds"]
+    finish_fields = ["main_generation_finished_at_perf_counter_seconds"]
+    definition = "first_main_start_to_last_main_finish"
+    if include_timing_context:
+        start_fields.append("timing_context_started_at_perf_counter_seconds")
+        finish_fields.append("timing_context_finished_at_perf_counter_seconds")
+        definition = "first_timing_or_main_start_to_last_timing_or_main_finish"
+
+    starts: list[float] = []
+    finishes: list[float] = []
+    for run in runs:
+        run_starts = [run.get(field) for field in start_fields if run.get(field) is not None]
+        run_finishes = [run.get(field) for field in finish_fields if run.get(field) is not None]
+        if not run_starts or not run_finishes:
+            return None
+        starts.append(min(float(value) for value in run_starts))
+        finishes.append(max(float(value) for value in run_finishes))
+
+    started_at = min(starts)
+    finished_at = max(finishes)
+    wall_seconds = finished_at - started_at
+    if wall_seconds <= 0:
+        raise ValueError(f"Invalid scheduler wall interval: {started_at}..{finished_at}.")
+    main_tokens = sum(int(run.get("main_generated_tokens") or 0) for run in runs)
+    timing_tokens = sum(int(run.get("timing_generated_tokens") or 0) for run in runs)
+    total_tokens = main_tokens + timing_tokens
+    return {
+        "definition": definition,
+        "runs": len(runs),
+        "started_at_perf_counter_seconds": started_at,
+        "finished_at_perf_counter_seconds": finished_at,
+        "wall_seconds": wall_seconds,
+        "main_generated_tokens": main_tokens,
+        "timing_generated_tokens": timing_tokens,
+        "total_generated_tokens": total_tokens,
+        "main_tokens_per_scheduler_second": main_tokens / wall_seconds,
+        "total_tokens_per_scheduler_second": total_tokens / wall_seconds,
+    }
+
+
 def _warmup_excluded_run_indices(runs: list[dict[str, Any]]) -> list[int]:
     if not any(int(run.get("repeat_index", run.get("run_index", 0))) > 0 for run in runs):
         return []
@@ -577,7 +646,7 @@ def _write_manifest(
         runs: list[dict[str, Any]],
 ) -> Path:
     manifest = {
-        "schema_version": 3,
+        "schema_version": 4,
         "suite_id": suite_id,
         "run_kind": run_kind,
         "config_name": config_name,
@@ -597,6 +666,24 @@ def _write_manifest(
         "aggregate": {
             "all_runs": _aggregate(runs, start_index=0),
             "warmed_runs": _aggregate_runs(_warmed_runs(runs)) if _warmed_runs(runs) else None,
+            "scheduler_wall": {
+                "main_generation_all_runs": _scheduler_wall_aggregate(
+                    runs,
+                    include_timing_context=False,
+                ),
+                "main_generation_warmed_runs": _scheduler_wall_aggregate(
+                    _warmed_runs(runs),
+                    include_timing_context=False,
+                ),
+                "timing_and_main_all_runs": _scheduler_wall_aggregate(
+                    runs,
+                    include_timing_context=True,
+                ),
+                "timing_and_main_warmed_runs": _scheduler_wall_aggregate(
+                    _warmed_runs(runs),
+                    include_timing_context=True,
+                ),
+            },
             "by_song": _aggregate_by_song(runs),
             "batching": _aggregate_batch_summaries(runs),
         },
@@ -732,6 +819,8 @@ def main() -> None:
         profile = json.loads(profile_path.read_text(encoding="utf-8"))
         main_summary = _summary_for_label(profile, "main_generation")
         timing_summary = _summary_for_label(profile, "timing_context")
+        main_interval = _generation_interval(profile, "main_generation") or {}
+        timing_interval = _generation_interval(profile, "timing_context") or {}
         main_record_breakdown = first_record_breakdown(profile, "main_generation")
         profile_metadata = profile.get("metadata", {})
         result_file_sha256 = profile_metadata.get("result_file_sha256")
@@ -772,12 +861,24 @@ def main() -> None:
             "main_model_elapsed_seconds": float(main_summary.get("model_elapsed_seconds", 0.0) or 0.0),
             "main_wall_seconds": float(main_summary.get("wall_seconds", 0.0) or 0.0),
             "main_tokens_per_second": float(main_summary.get("tokens_per_second", 0.0) or 0.0),
+            "main_generation_started_at_perf_counter_seconds": main_interval.get(
+                "started_at_perf_counter_seconds"
+            ),
+            "main_generation_finished_at_perf_counter_seconds": main_interval.get(
+                "finished_at_perf_counter_seconds"
+            ),
             "main_first_record": main_record_breakdown["first_record"],
             "main_remaining_records": main_record_breakdown["remaining_records"],
             "timing_generated_tokens": int(timing_summary.get("generated_tokens", 0) or 0),
             "timing_model_elapsed_seconds": float(timing_summary.get("model_elapsed_seconds", 0.0) or 0.0),
             "timing_wall_seconds": float(timing_summary.get("wall_seconds", 0.0) or 0.0),
             "timing_tokens_per_second": float(timing_summary.get("tokens_per_second", 0.0) or 0.0),
+            "timing_context_started_at_perf_counter_seconds": timing_interval.get(
+                "started_at_perf_counter_seconds"
+            ),
+            "timing_context_finished_at_perf_counter_seconds": timing_interval.get(
+                "finished_at_perf_counter_seconds"
+            ),
             "main_token_count": len(tokens) if tokens is not None else None,
             "main_token_sha256": token_sha256,
             "token_equivalence_to_song_baseline": token_equivalence,

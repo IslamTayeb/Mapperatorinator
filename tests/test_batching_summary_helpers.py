@@ -1,4 +1,9 @@
-from utils.profile_inference_suite import _aggregate_batch_summaries, _profile_batch_summary
+from utils.profile_inference_suite import (
+    _aggregate_batch_summaries,
+    _generation_interval,
+    _profile_batch_summary,
+    _scheduler_wall_aggregate,
+)
 from utils.profile_static_server_batch import _aggregate_runs as _aggregate_static_server_runs
 
 
@@ -155,3 +160,72 @@ def test_static_server_aggregate_classifies_no_batch_and_real_batch_runs():
     assert real_batch["result_class"] == "static_server_batch"
     assert real_batch["server_batch_observed"]
     assert real_batch["main_tokens_per_scheduler_second"] == 50.0
+
+
+def test_suite_scheduler_wall_uses_first_main_start_to_last_main_finish():
+    profile = {
+        "generation": [
+            {
+                "profile_label": "main_generation",
+                "generation_started_at_perf_counter_seconds": 10.0,
+                "generation_finished_at_perf_counter_seconds": 11.0,
+            },
+            {
+                "profile_label": "main_generation",
+                "generation_started_at_perf_counter_seconds": 12.0,
+                "generation_finished_at_perf_counter_seconds": 14.0,
+            },
+        ]
+    }
+    assert _generation_interval(profile, "main_generation") == {
+        "started_at_perf_counter_seconds": 10.0,
+        "finished_at_perf_counter_seconds": 14.0,
+    }
+
+    runs = [
+        {
+            "main_generated_tokens": 100,
+            "timing_generated_tokens": 10,
+            "main_generation_started_at_perf_counter_seconds": 10.0,
+            "main_generation_finished_at_perf_counter_seconds": 14.0,
+            "timing_context_started_at_perf_counter_seconds": 8.0,
+            "timing_context_finished_at_perf_counter_seconds": 9.0,
+        },
+        {
+            "main_generated_tokens": 200,
+            "timing_generated_tokens": 20,
+            "main_generation_started_at_perf_counter_seconds": 20.0,
+            "main_generation_finished_at_perf_counter_seconds": 24.0,
+            "timing_context_started_at_perf_counter_seconds": 18.0,
+            "timing_context_finished_at_perf_counter_seconds": 19.0,
+        },
+    ]
+    main = _scheduler_wall_aggregate(runs, include_timing_context=False)
+    complete = _scheduler_wall_aggregate(runs, include_timing_context=True)
+
+    assert main["definition"] == "first_main_start_to_last_main_finish"
+    assert main["wall_seconds"] == 14.0
+    assert main["main_generated_tokens"] == 300
+    assert main["main_tokens_per_scheduler_second"] == 300 / 14
+    assert complete["wall_seconds"] == 16.0
+    assert complete["total_generated_tokens"] == 330
+    assert complete["total_tokens_per_scheduler_second"] == 330 / 16
+
+
+def test_suite_scheduler_wall_refuses_partial_legacy_intervals():
+    runs = [
+        {
+            "main_generated_tokens": 100,
+            "timing_generated_tokens": 10,
+            "main_generation_started_at_perf_counter_seconds": 1.0,
+            "main_generation_finished_at_perf_counter_seconds": 2.0,
+        },
+        {
+            "main_generated_tokens": 100,
+            "timing_generated_tokens": 10,
+            "main_generation_started_at_perf_counter_seconds": None,
+            "main_generation_finished_at_perf_counter_seconds": None,
+        },
+    ]
+
+    assert _scheduler_wall_aggregate(runs, include_timing_context=False) is None

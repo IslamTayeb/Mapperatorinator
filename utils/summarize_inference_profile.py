@@ -234,6 +234,106 @@ def _suite_aggregate(manifest: dict[str, Any], scope: str) -> dict[str, Any]:
     return aggregate.get("all_runs", {})
 
 
+def _suite_scheduler_wall_block(
+        manifest: dict[str, Any],
+        *,
+        scope: str,
+        include_timing_context: bool,
+) -> dict[str, Any] | None:
+    scheduler_wall = (manifest.get("aggregate") or {}).get("scheduler_wall") or {}
+    prefix = "timing_and_main" if include_timing_context else "main_generation"
+    suffix = "warmed_runs" if scope == "warmed_runs" else "all_runs"
+    value = scheduler_wall.get(f"{prefix}_{suffix}")
+    return value if isinstance(value, dict) else None
+
+
+def _compare_suite_scheduler_wall(
+        baseline: dict[str, Any],
+        candidate: dict[str, Any],
+        *,
+        scope: str,
+        include_timing_context: bool,
+        regression_tolerance_pct: float,
+) -> dict[str, Any]:
+    baseline_block = _suite_scheduler_wall_block(
+        baseline,
+        scope=scope,
+        include_timing_context=include_timing_context,
+    )
+    candidate_block = _suite_scheduler_wall_block(
+        candidate,
+        scope=scope,
+        include_timing_context=include_timing_context,
+    )
+    required = int(baseline.get("schema_version", 0) or 0) >= 4 or int(
+        candidate.get("schema_version", 0) or 0
+    ) >= 4
+    name = "timing+main" if include_timing_context else "main-generation"
+    if baseline_block is None or candidate_block is None:
+        passed = not required and baseline_block is None and candidate_block is None
+        print(f"Suite scheduler-wall {name} ({scope})")
+        print(f"  {'PASS' if passed else 'FAIL'} (available=False, required={required})")
+        print()
+        return {
+            "pass": passed,
+            "available": False,
+            "required": required,
+            "baseline_present": baseline_block is not None,
+            "candidate_present": candidate_block is not None,
+            "metrics": {},
+        }
+
+    metric_names = ["main_tokens_per_scheduler_second", "wall_seconds"]
+    if include_timing_context:
+        metric_names.append("total_tokens_per_scheduler_second")
+    metrics = {
+        metric_name: _metric_comparison(
+            float(baseline_block.get(metric_name, 0.0) or 0.0),
+            float(candidate_block.get(metric_name, 0.0) or 0.0),
+            higher_is_better=(metric_name != "wall_seconds"),
+            tolerance_pct=regression_tolerance_pct,
+        )
+        for metric_name in metric_names
+    }
+    token_fields = ["main_generated_tokens"]
+    if include_timing_context:
+        token_fields.extend(["timing_generated_tokens", "total_generated_tokens"])
+    token_matches = {
+        field: baseline_block.get(field) == candidate_block.get(field)
+        for field in token_fields
+    }
+    definition_match = baseline_block.get("definition") == candidate_block.get("definition")
+    runs_match = baseline_block.get("runs") == candidate_block.get("runs")
+    passed = (
+        all(metric["pass"] for metric in metrics.values())
+        and all(token_matches.values())
+        and definition_match
+        and runs_match
+    )
+    print(f"Suite scheduler-wall {name} ({scope})")
+    print(f"  {'PASS' if passed else 'FAIL'}")
+    for metric_name, metric in metrics.items():
+        _compare_number(
+            metric_name,
+            metric["baseline"],
+            metric["candidate"],
+            higher_is_better=metric["higher_is_better"],
+        )
+    print(f"  token_counts_match: {all(token_matches.values())}")
+    print(f"  definition_match: {definition_match}")
+    print(f"  runs_match: {runs_match}")
+    print()
+    return {
+        "pass": passed,
+        "available": True,
+        "required": required,
+        "metrics": metrics,
+        "token_matches": token_matches,
+        "definition_match": definition_match,
+        "runs_match": runs_match,
+    }
+
+
 def _suite_runs_for_scope(manifest: dict[str, Any], scope: str) -> list[dict[str, Any]]:
     runs = manifest.get("runs", [])
     if scope == "warmed_runs":
@@ -1873,6 +1973,22 @@ def compare_suite_manifests(
         regression_tolerance_pct=regression_tolerance_pct,
     )
     _print_suite_metric_block(f"Suite no-regression ({scope})", report["performance"])
+    report["scheduler_wall"] = {
+        "main_generation": _compare_suite_scheduler_wall(
+            baseline,
+            candidate,
+            scope=scope,
+            include_timing_context=False,
+            regression_tolerance_pct=regression_tolerance_pct,
+        ),
+        "timing_and_main": _compare_suite_scheduler_wall(
+            baseline,
+            candidate,
+            scope=scope,
+            include_timing_context=True,
+            regression_tolerance_pct=regression_tolerance_pct,
+        ),
+    }
 
     report["segments"] = {
         "first_records": _compare_suite_optional_block(
@@ -2522,6 +2638,10 @@ def main() -> None:
                 and not report["output_artifact_equivalence"].get("pass", False)
             )
             or (require_no_regression and not report["performance"].get("pass", False))
+            or (
+                require_no_regression
+                and not all(block.get("pass", False) for block in report["scheduler_wall"].values())
+            )
             or (
                 require_segment_no_regression
                 and not all(block.get("pass", False) for block in report["segments"].values())

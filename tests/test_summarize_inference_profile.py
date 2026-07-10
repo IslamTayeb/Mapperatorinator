@@ -417,10 +417,62 @@ def test_compare_suite_manifests_passes_warmed_non_regression(tmp_path):
     assert report["token_equivalence"]["pass"]
     assert report["output_artifact_equivalence"]["pass"]
     assert report["performance"]["pass"]
+    assert report["scheduler_wall"]["main_generation"]["pass"]
+    assert report["scheduler_wall"]["timing_and_main"]["pass"]
+    assert not report["scheduler_wall"]["main_generation"]["available"]
     assert report["segments"]["first_records"]["pass"]
     assert report["segments"]["remaining_records"]["pass"]
     assert report["timing_context"]["pass"]
     assert report["per_song"]["pass"]
+
+
+def test_compare_suite_manifests_gates_schema4_scheduler_wall(tmp_path):
+    module = _load_module()
+    baseline_payload = _suite_manifest(warmed_tok_s=100.0)
+    candidate_payload = _suite_manifest(warmed_tok_s=120.0)
+    for payload, main_tps, main_wall, total_tps in (
+        (baseline_payload, 80.0, 1.5, 100.0),
+        (candidate_payload, 70.0, 1.8, 90.0),
+    ):
+        payload["schema_version"] = 4
+        payload["aggregate"]["scheduler_wall"] = {
+            "main_generation_warmed_runs": {
+                "definition": "first_main_start_to_last_main_finish",
+                "runs": 1,
+                "wall_seconds": main_wall,
+                "main_generated_tokens": 120,
+                "timing_generated_tokens": 30,
+                "total_generated_tokens": 150,
+                "main_tokens_per_scheduler_second": main_tps,
+                "total_tokens_per_scheduler_second": total_tps,
+            },
+            "timing_and_main_warmed_runs": {
+                "definition": "first_timing_or_main_start_to_last_timing_or_main_finish",
+                "runs": 1,
+                "wall_seconds": main_wall,
+                "main_generated_tokens": 120,
+                "timing_generated_tokens": 30,
+                "total_generated_tokens": 150,
+                "main_tokens_per_scheduler_second": main_tps,
+                "total_tokens_per_scheduler_second": total_tps,
+            },
+        }
+    baseline = tmp_path / "baseline-suite-v4.json"
+    candidate = tmp_path / "candidate-suite-v4.json"
+    baseline.write_text(module.json.dumps(baseline_payload))
+    candidate.write_text(module.json.dumps(candidate_payload))
+
+    report = module.compare_suite_manifests(baseline, candidate, scope="warmed_runs")
+
+    assert report["performance"]["pass"]
+    assert not report["scheduler_wall"]["main_generation"]["pass"]
+    assert not report["scheduler_wall"]["timing_and_main"]["pass"]
+    assert not report["scheduler_wall"]["main_generation"]["metrics"][
+        "main_tokens_per_scheduler_second"
+    ]["pass"]
+    assert not report["scheduler_wall"]["timing_and_main"]["metrics"][
+        "total_tokens_per_scheduler_second"
+    ]["pass"]
 
 
 def test_compare_suite_manifests_reports_hash_and_warmed_regressions(tmp_path):

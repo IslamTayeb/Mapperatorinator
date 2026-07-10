@@ -427,7 +427,8 @@ class Processor(object):
                         context_type=context["context_type"].value,
                     )
                 self.profiler.sync()
-                model_wall_seconds = time.perf_counter() - generation_start
+                generation_finished = time.perf_counter()
+                model_wall_seconds = generation_finished - generation_start
                 self._record_generation_stats(generation_stats)
                 if verbose:
                     self._update_tokens_per_second_meter(iterator, tokens_per_second_meter, generation_stats)
@@ -445,6 +446,8 @@ class Processor(object):
                     frame_time_ms=frame_time,
                     prompt_wall_seconds=prompt_wall_seconds,
                     wall_seconds=model_wall_seconds,
+                    generation_started_at_perf_counter_seconds=generation_start,
+                    generation_finished_at_perf_counter_seconds=generation_finished,
                     prompt_tokens_per_sample=[int(prompt.ne(self.tokenizer.pad_id).sum().item())],
                     output_tokens_per_sample=[int(result[0].ne(self.tokenizer.pad_id).sum().item())],
                     generated_tokens_per_sample=[int(predicted_tokens.ne(self.tokenizer.pad_id).sum().item())],
@@ -838,7 +841,8 @@ class Processor(object):
                     ),
                 )
             self.profiler.sync()
-            model_wall_seconds = time.perf_counter() - generation_start
+            generation_finished = time.perf_counter()
+            model_wall_seconds = generation_finished - generation_start
 
             generation_stats = None
             if isinstance(result, tuple) and len(result) == 2:
@@ -861,6 +865,8 @@ class Processor(object):
                 batch_size=int(frames_batch.shape[0]),
                 prompt_wall_seconds=prompt_stack_wall_seconds if i == 0 else 0.0,
                 wall_seconds=model_wall_seconds,
+                generation_started_at_perf_counter_seconds=generation_start,
+                generation_finished_at_perf_counter_seconds=generation_finished,
                 prompt_tokens_per_sample=cond_prompt_batch.ne(self.tokenizer.pad_id).sum(dim=-1).tolist(),
                 output_tokens_per_sample=result.ne(self.tokenizer.pad_id).sum(dim=-1).tolist(),
                 generated_token_ids_per_sample=generated_token_ids_per_sample,
