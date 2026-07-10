@@ -13,6 +13,9 @@ from osuT5.osuT5.inference.optimized.graph_safe_logits import (
     MonotonicTimeShiftLogitsProcessor,
     make_graph_safe_logits_processor_list,
 )
+from osuT5.osuT5.inference.optimized.single.logits import (
+    MonotonicTimeShiftLogitsProcessor as StatefulMonotonicTimeShiftLogitsProcessor,
+)
 
 
 class _FakeTokenizer:
@@ -114,7 +117,7 @@ def test_graph_safe_b2_matches_two_private_stateful_b1_processors_bitwise():
             )
             shared_scores = shared(input_ids.clone(), scores.clone())
             for row in range(2):
-                private = V32MonotonicTimeShiftLogitsProcessor(
+                private = StatefulMonotonicTimeShiftLogitsProcessor(
                     tokenizer,
                     stateful_batch1=True,
                 )
@@ -140,7 +143,10 @@ def test_graph_safe_source_avoids_dynamic_boolean_index_writes():
 
 def test_replacement_is_optimized_only_and_preserves_processor_contract():
     tokenizer = _FakeTokenizer()
-    legacy = V32MonotonicTimeShiftLogitsProcessor(tokenizer, stateful_batch1=True)
+    legacy = StatefulMonotonicTimeShiftLogitsProcessor(
+        tokenizer,
+        stateful_batch1=True,
+    )
     sentinel = object()
     processors = [legacy, sentinel]
 
@@ -154,7 +160,10 @@ def test_replacement_is_optimized_only_and_preserves_processor_contract():
 
 def test_replacement_fails_loudly_after_processor_state_is_initialized():
     tokenizer = _FakeTokenizer()
-    legacy = V32MonotonicTimeShiftLogitsProcessor(tokenizer, stateful_batch1=True)
+    legacy = StatefulMonotonicTimeShiftLogitsProcessor(
+        tokenizer,
+        stateful_batch1=True,
+    )
     input_ids = torch.tensor([[1, 12, 5]], dtype=torch.long)
     legacy(input_ids, torch.zeros((1, 64), dtype=torch.float32))
 

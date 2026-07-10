@@ -1,6 +1,7 @@
 import torch
 import sys
 import types
+import pytest
 from importlib import util
 from pathlib import Path
 
@@ -38,26 +39,21 @@ def _apply(processor, input_ids, scores):
     return processor(input_ids.clone(), scores.clone())
 
 
-def test_stateful_monotonic_matches_full_scan_for_growing_batch1_prefixes():
+def test_v32_monotonic_full_scan_masks_earlier_time_shifts():
     tokenizer = _FakeTokenizer()
-    full_scan = MonotonicTimeShiftLogitsProcessor(tokenizer)
-    stateful = MonotonicTimeShiftLogitsProcessor(tokenizer, stateful_batch1=True)
-    tokens = torch.tensor([[1, 12, 5, 11, 7, 15, 3, 1, 14, 9]], dtype=torch.long)
-
-    for length in range(1, tokens.shape[1] + 1):
-        input_ids = tokens[:, :length]
-        scores = torch.arange(64, dtype=torch.float32).reshape(1, 64) / 10
-        assert torch.equal(_apply(full_scan, input_ids, scores), _apply(stateful, input_ids, scores))
-
-
-def test_stateful_monotonic_reinitializes_after_sequence_jump():
-    tokenizer = _FakeTokenizer()
-    full_scan = MonotonicTimeShiftLogitsProcessor(tokenizer)
-    stateful = MonotonicTimeShiftLogitsProcessor(tokenizer, stateful_batch1=True)
-
-    first = torch.tensor([[1, 12, 5, 13]], dtype=torch.long)
-    second = torch.tensor([[1, 18, 4]], dtype=torch.long)
+    processor = MonotonicTimeShiftLogitsProcessor(tokenizer)
+    input_ids = torch.tensor([[1, 12, 5, 15, 3]], dtype=torch.long)
     scores = torch.arange(64, dtype=torch.float32).reshape(1, 64) / 10
 
-    _apply(stateful, first, scores)
-    assert torch.equal(_apply(full_scan, second, scores), _apply(stateful, second, scores))
+    result = _apply(processor, input_ids, scores)
+
+    assert torch.isneginf(result[0, 10:15]).all()
+    assert torch.equal(result[0, 15:], scores[0, 15:])
+
+
+def test_v32_monotonic_rejects_optimized_stateful_mode():
+    with pytest.raises(ValueError, match="moved to optimized single inference"):
+        MonotonicTimeShiftLogitsProcessor(
+            _FakeTokenizer(),
+            stateful_batch1=True,
+        )

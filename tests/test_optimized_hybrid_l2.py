@@ -9,7 +9,9 @@ import torch
 from transformers import LogitsProcessorList
 
 from osuT5.osuT5.event import EventType
-from osuT5.osuT5.inference.logit_processors import MonotonicTimeShiftLogitsProcessor
+from osuT5.osuT5.inference.optimized.single.logits import (
+    MonotonicTimeShiftLogitsProcessor,
+)
 from osuT5.osuT5.inference.optimized.batch.hybrid_l2 import (
     FIVE_PERCENT_KEEP_TPS,
     FIXED_ACTIVE_PREFIX_BUCKET_SIZE,

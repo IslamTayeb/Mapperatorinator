@@ -9,10 +9,15 @@ import torch
 from osuT5.osuT5.inference.logit_processors import (
     MonotonicTimeShiftLogitsProcessor as _V32MonotonicTimeShiftLogitsProcessor,
 )
+from osuT5.osuT5.inference.optimized.single.logits import (
+    MonotonicTimeShiftLogitsProcessor as _StatefulMonotonicTimeShiftLogitsProcessor,
+)
 
 
-class MonotonicTimeShiftLogitsProcessor(_V32MonotonicTimeShiftLogitsProcessor):
-    """Graph-safe full-scan variant with the V32 calculation unchanged."""
+class MonotonicTimeShiftLogitsProcessor(
+    _StatefulMonotonicTimeShiftLogitsProcessor,
+):
+    """Graph-safe optimized variant with the V32 calculation unchanged."""
 
     def _full_scan_call(
         self,
@@ -63,28 +68,41 @@ def make_graph_safe_logits_processor_list(
         if type(processor) is MonotonicTimeShiftLogitsProcessor:
             monotonic_count += 1
             continue
-        if type(processor) is not _V32MonotonicTimeShiftLogitsProcessor:
-            if isinstance(processor, _V32MonotonicTimeShiftLogitsProcessor):
-                raise TypeError(
-                    "optimized graph-safe replacement does not accept unknown "
-                    "monotonic processor subclasses."
+        if type(processor) is _StatefulMonotonicTimeShiftLogitsProcessor:
+            monotonic_count += 1
+            if (
+                processor._state_seq_len is not None
+                or processor._state_has_time_shift is not None
+                or processor._state_last_time_shift_value is not None
+                or processor._sos_ids_by_device
+                or processor._time_shift_offsets_by_device
+            ):
+                raise ValueError(
+                    "optimized graph-safe replacement requires a pristine "
+                    "monotonic processor."
                 )
-            continue
-        monotonic_count += 1
-        if (
-            processor._state_seq_len is not None
-            or processor._state_has_time_shift is not None
-            or processor._state_last_time_shift_value is not None
-            or processor._sos_ids_by_device
-            or processor._time_shift_offsets_by_device
-        ):
-            raise ValueError(
-                "optimized graph-safe replacement requires a pristine monotonic processor."
+            processors[index] = MonotonicTimeShiftLogitsProcessor(
+                processor.tokenizer,
+                stateful_batch1=processor.stateful_batch1,
             )
-        processors[index] = MonotonicTimeShiftLogitsProcessor(
-            processor.tokenizer,
-            stateful_batch1=processor.stateful_batch1,
-        )
+            continue
+        if type(processor) is _V32MonotonicTimeShiftLogitsProcessor:
+            monotonic_count += 1
+            if processor._sos_ids_by_device:
+                raise ValueError(
+                    "optimized graph-safe replacement requires a pristine "
+                    "monotonic processor."
+                )
+            processors[index] = MonotonicTimeShiftLogitsProcessor(
+                processor.tokenizer,
+                stateful_batch1=False,
+            )
+            continue
+        if isinstance(processor, _V32MonotonicTimeShiftLogitsProcessor):
+            raise TypeError(
+                "optimized graph-safe replacement does not accept unknown "
+                "monotonic processor subclasses."
+            )
     if monotonic_count != 1:
         raise ValueError(
             "optimized graph-safe processor list requires exactly one monotonic processor."

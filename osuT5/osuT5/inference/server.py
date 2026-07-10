@@ -151,9 +151,18 @@ def build_logits_processor_list(
     if cfg_scale > 1.0:
         logits_processor_list.append(ClassifierFreeGuidanceLogitsProcessor(cfg_scale))
 
-    logits_processor_list.append(
-        MonotonicTimeShiftLogitsProcessor(tokenizer, stateful_batch1=stateful_monotonic)
-    )
+    if stateful_monotonic:
+        from .optimized.single.logits import (
+            MonotonicTimeShiftLogitsProcessor as StatefulMonotonicTimeShiftLogitsProcessor,
+        )
+
+        monotonic_processor = StatefulMonotonicTimeShiftLogitsProcessor(
+            tokenizer,
+            stateful_batch1=True,
+        )
+    else:
+        monotonic_processor = MonotonicTimeShiftLogitsProcessor(tokenizer)
+    logits_processor_list.append(monotonic_processor)
 
     if timeshift_bias != 0:
         logits_processor_list.append(
