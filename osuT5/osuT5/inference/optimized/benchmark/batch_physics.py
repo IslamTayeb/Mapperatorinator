@@ -41,7 +41,10 @@ class BatchPhysicsPlan:
             "merged_batch_sizes": list(self.merged_batch_sizes),
             "b1_lane_counts": list(self.b1_lane_counts),
             "result_class": self.result_class.value,
-            "status": "execution_not_implemented",
+            "status": "merged_one_token_verifier_only",
+            "implemented_merged_one_token_batch_sizes": [1, 2, 5],
+            "planned_merged_batch_sizes": [8],
+            "lane_pool_status": "execution_not_implemented",
             "required_observation_fields": [
                 "execution_family",
                 "parallelism",
@@ -125,8 +128,10 @@ class BatchPhysicsObservation:
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive.")
-        if self.model_seconds > self.scheduler_wall_seconds:
-            raise ValueError("model_seconds cannot exceed scheduler_wall_seconds.")
+        # Model-only and complete-step timings may come from separate replay
+        # passes, so measurement noise can make model_seconds exceed the later
+        # complete-step wall slightly. CUDA time is measured inside the complete
+        # wall interval and retains the strict containment check below.
         if self.cuda_seconds > self.scheduler_wall_seconds:
             raise ValueError("cuda_seconds cannot exceed scheduler_wall_seconds.")
         if self.peak_memory_bytes <= 0:

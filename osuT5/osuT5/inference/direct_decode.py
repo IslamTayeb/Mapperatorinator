@@ -116,6 +116,7 @@ class DecodeSession:
             prompt_attention_mask=prompt_attention_mask,
             frames=frames,
             condition_kwargs=condition_kwargs,
+            batch_size=int(prompt.shape[0]),
             active_prefix_self_attention=active_prefix_self_attention,
         )
         return cls(

@@ -165,7 +165,10 @@ def test_measurement_schema_records_required_gpu_and_exactness_fields():
         "merged_batch_sizes": [1, 2, 5, 8],
         "b1_lane_counts": [1, 2, 3, 4],
         "result_class": "exact-output",
-        "status": "execution_not_implemented",
+        "status": "merged_one_token_verifier_only",
+        "implemented_merged_one_token_batch_sizes": [1, 2, 5],
+        "planned_merged_batch_sizes": [8],
+        "lane_pool_status": "execution_not_implemented",
         "required_observation_fields": [
             "execution_family",
             "parallelism",

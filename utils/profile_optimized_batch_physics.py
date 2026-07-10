@@ -1,8 +1,8 @@
-"""Plan/record scaffold for the optimized GPU batch-physics scout.
+"""Plan/record schema CLI for the optimized GPU batch-physics scout.
 
-No GPU runner is wired yet.  ``--describe-plan`` emits the bounded experiment
-matrix.  Attempting execution fails loudly so planning output cannot be mistaken
-for throughput evidence.
+``--describe-plan`` emits the bounded experiment matrix. Real merged one-token
+execution lives in ``verify_optimized_merged_one_token.py``; this schema CLI
+never executes CUDA, so planning output cannot be mistaken for throughput.
 """
 
 from __future__ import annotations
@@ -66,10 +66,9 @@ def main(argv: list[str] | None = None) -> int:
         payload = compare_batch_physics_observations(baseline, candidate)
     else:
         raise RuntimeError(
-            "GPU batch-physics execution is not implemented. Implement and verify the merged B=1 "
-            "one-token runner before merged B=2/5/8, and implement independent streams, graph "
-            "instances, buffers, per-request generators, caches, and cuBLAS workspaces before "
-            "enabling any B1 lane-pool measurement."
+            "This schema CLI does not execute CUDA. Use "
+            "utils/verify_optimized_merged_one_token.py for the staged B=1 -> B=2 -> B=5 "
+            "merged one-token verifier. B=8 and independent B1 lane pools remain unimplemented."
         )
     rendered = json.dumps(payload, indent=2, sort_keys=True)
     if args.output_json is not None:
