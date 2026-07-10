@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+#SBATCH --job-name=spec-target-span
+#SBATCH --partition=gpu-common
+#SBATCH --account=romerolab
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=48G
+#SBATCH --gres=gpu:2080:1
+#SBATCH --time=01:00:00
+#SBATCH --output=/work/imt11/Mapperatorinator/logs/%x-%j.out
+#SBATCH --error=/work/imt11/Mapperatorinator/logs/%x-%j.err
+
+set -euo pipefail
+
+ENV=/hpc/group/romerolab/imt11/envs/mapperatorinator
+REPO=/hpc/group/romerolab/imt11/projects/Mapperatorinator
+WORK=/work/imt11/Mapperatorinator
+EXPECTED_COMMIT=${EXPECTED_COMMIT:?Set EXPECTED_COMMIT to the pushed verifier commit}
+SPECULATION_K=${SPECULATION_K:-2}
+PRIOR_GATE_REPORT=${PRIOR_GATE_REPORT:-}
+COMMIT=$(git -C "$REPO" rev-parse HEAD)
+SHORT_COMMIT=$(git -C "$REPO" rev-parse --short HEAD)
+RUN_ROOT="$WORK/runs/spec-target-span-k${SPECULATION_K}-${SLURM_JOB_ID:-manual}-${SHORT_COMMIT}"
+REPORT="$RUN_ROOT/target-span-k${SPECULATION_K}.json"
+TELEMETRY="$RUN_ROOT/nvidia-smi.csv"
+
+case "$SPECULATION_K" in
+  2) ;;
+  4|8)
+    if [[ -z "$PRIOR_GATE_REPORT" ]]; then
+      echo "K=$SPECULATION_K requires PRIOR_GATE_REPORT from the immediately preceding K gate" >&2
+      exit 2
+    fi
+    ;;
+  *)
+    echo "SPECULATION_K must be 2, 4, or 8" >&2
+    exit 2
+    ;;
+esac
+
+if [[ "$COMMIT" != "$EXPECTED_COMMIT" ]]; then
+  echo "DCC checkout is $COMMIT, expected $EXPECTED_COMMIT" >&2
+  exit 2
+fi
+if [[ -n "$(git -C "$REPO" status --porcelain)" ]]; then
+  echo "DCC checkout is dirty; refusing to benchmark" >&2
+  git -C "$REPO" status --short >&2
+  exit 2
+fi
+
+mkdir -p \
+  "$WORK/logs" \
+  "$WORK/tmp" \
+  "$WORK/cache" \
+  "$WORK/cache/torch_inductor" \
+  "$WORK/cache/triton" \
+  "$WORK/cache/cuda" \
+  "$WORK/torch_extensions" \
+  "$RUN_ROOT"
+export PATH="$ENV/bin:$PATH"
+export XDG_CACHE_HOME="$WORK/cache"
+export HF_HOME="$WORK/cache/huggingface"
+export TRANSFORMERS_CACHE="$WORK/cache/huggingface"
+export TORCHINDUCTOR_CACHE_DIR="$WORK/cache/torch_inductor"
+export TRITON_CACHE_DIR="$WORK/cache/triton"
+export CUDA_CACHE_PATH="$WORK/cache/cuda"
+export TMPDIR="$WORK/tmp"
+export TOKENIZERS_PARALLELISM=false
+export TORCH_EXTENSIONS_DIR="$WORK/torch_extensions"
+
+cd "$REPO"
+
+echo "host=$(hostname)"
+echo "job_id=${SLURM_JOB_ID:-manual}"
+echo "partition=${SLURM_JOB_PARTITION:-unknown}"
+echo "commit=$COMMIT"
+echo "branch=$(git branch --show-current)"
+echo "speculation_k=$SPECULATION_K"
+echo "prior_gate_report=${PRIOR_GATE_REPORT:-none}"
+echo "run_root=$RUN_ROOT"
+echo "report=$REPORT"
+echo "telemetry=$TELEMETRY"
+echo "torch_extensions_dir=$TORCH_EXTENSIONS_DIR"
+echo "torch_extensions_entries=$(find "$TORCH_EXTENSIONS_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
+echo "inductor_cache_dir=$TORCHINDUCTOR_CACHE_DIR"
+echo "inductor_cache_entries=$(find "$TORCHINDUCTOR_CACHE_DIR" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)"
+nvidia-smi -L
+nvidia-smi \
+  --query-gpu=timestamp,uuid,utilization.gpu,memory.used,memory.total,power.draw,clocks.sm,temperature.gpu \
+  --format=csv -l 1 > "$TELEMETRY" &
+SMI_PID=$!
+trap 'kill "$SMI_PID" 2>/dev/null || true' EXIT
+
+python - <<'PY'
+import torch
+import transformers
+
+print("torch", torch.__version__)
+print("torch_cuda", torch.version.cuda)
+print("cuda_available", torch.cuda.is_available())
+print("cuda_device", torch.cuda.get_device_name() if torch.cuda.is_available() else None)
+print("cuda_capability", torch.cuda.get_device_capability() if torch.cuda.is_available() else None)
+print("transformers", transformers.__version__)
+PY
+
+python -m py_compile \
+  osuT5/osuT5/inference/optimized/speculative/target_span_gpu.py \
+  utils/verify_speculative_target_span.py
+
+COMMAND=(
+  python utils/verify_speculative_target_span.py
+  --config-name profile_salvalai_smoke15
+  --sequence-index 9
+  --speculation-k "$SPECULATION_K"
+  --timing-warmup 5
+  --timing-iters 25
+  --report-path "$REPORT"
+)
+if [[ -n "$PRIOR_GATE_REPORT" ]]; then
+  COMMAND+=(--prior-gate-report "$PRIOR_GATE_REPORT")
+fi
+COMMAND+=(
+  audio_path="$WORK/data/salvalai.mp3"
+  output_path="$RUN_ROOT/output"
+  device=cuda
+  precision=fp32
+  attn_implementation=sdpa
+  inference_engine=v32
+  optimized_inference_mode=single
+  use_server=false
+  parallel=false
+  cfg_scale=1.0
+  num_beams=1
+  seed=12345
+  inference_generation_compile=false
+  inference_stateful_monotonic_logits_processor=true
+)
+
+set +e
+"${COMMAND[@]}"
+STATUS=$?
+set -e
+
+echo "report=$REPORT"
+echo "telemetry=$TELEMETRY"
+echo "run_root=$RUN_ROOT"
+exit "$STATUS"
