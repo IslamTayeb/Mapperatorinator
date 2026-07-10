@@ -12,7 +12,7 @@
 set -euo pipefail
 
 ENV=/hpc/group/romerolab/imt11/envs/mapperatorinator
-REPO=${MAPPERATORINATOR_REPO:-/hpc/group/romerolab/imt11/projects/Mapperatorinator}
+REPO=${MAPPERATORINATOR_REPO:?Set MAPPERATORINATOR_REPO to the dedicated DCC batch worktree}
 WORK=/work/imt11/Mapperatorinator
 EXPECTED_COMMIT=${EXPECTED_COMMIT:?Set EXPECTED_COMMIT to the pushed verifier commit}
 MERGED_BATCH_SIZE=${MERGED_BATCH_SIZE:?Set MERGED_BATCH_SIZE to 1, 2, or 5}
