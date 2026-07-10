@@ -75,7 +75,6 @@ python -m py_compile \
   osuT5/osuT5/inference/optimized/batch/loop_state.py \
   osuT5/osuT5/inference/optimized/batch/merged_loop.py \
   utils/verify_optimized_merged_loop.py
-python -m pytest -q tests/test_optimized_merged_loop_state.py
 
 python utils/verify_optimized_merged_loop.py \
   --config-name profile_salvalai_smoke15 \

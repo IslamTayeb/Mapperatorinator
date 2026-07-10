@@ -195,6 +195,23 @@ Candidate report:
 /work/imt11/Mapperatorinator/runs/merged-batch-physics-b8-49547244-538bee7/merged-b8.json
 ```
 
+The next verifier-only promotion is implemented at commit `aec60c6`: a fixed
+B8, 16-step changing-prefix loop compares every active row against an
+independent B1 session at every step for raw logits/top-k, processed scores,
+sampled tokens, private RNG, and active self/cross-cache prefixes. Model-free
+tests first prove forced-EOS/max-token stopping and reject inactive or dummy
+draws. Its separate timing control compares eight private B1 processor calls
+against one shared B8 processor call with one batched host transfer per step;
+the job passes only with exact timed transcripts/RNG, `>=500 tok/s`, and a
+`>=5%` same-run gain.
+
+The first Slurm attempt, job `49547750`, reached a real RTX 2080 Ti with the
+exact clean checkout and passed the prior-report guard, but exited before model
+load because the DCC environment does not install `pytest` and the script
+redundantly invoked it. This is harness-only evidence: it says nothing about
+16-step correctness or throughput. The in-job pytest call is removed for a
+future explicitly approved corrected run; local targeted tests already pass.
+
 ### CPU continuous-scheduler harness
 
 `osuT5/osuT5/inference/continuous_batching.py` models arrivals, activation, round-robin/FIFO decode, stop reasons, cache-slot acquire/release, and slot generations. Strict manifests validate token/count recomputation, lifecycle arithmetic, state hashes, active-batch histograms, and cache-slot balance.
