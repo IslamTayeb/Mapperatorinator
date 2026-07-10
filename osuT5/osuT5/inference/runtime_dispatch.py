@@ -9,8 +9,8 @@ from typing import Any, Callable, Iterator
 
 @dataclass(frozen=True)
 class AttentionRuntimeHooks:
-    native_q1_attention: Callable[..., Any] | None = None
-    native_q1_rope_cache_attention: Callable[..., Any] | None = None
+    sdpa_attention_forward: Callable[..., Any] | None = None
+    q1_rope_cache_self_attention_forward: Callable[..., Any] | None = None
 
 
 _EMPTY_ATTENTION_RUNTIME_HOOKS = AttentionRuntimeHooks()

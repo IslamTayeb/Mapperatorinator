@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from typing import Iterator
 
 import torch
@@ -9,9 +9,6 @@ from torch.profiler import record_function
 
 _DETAIL_RANGES_ENABLED = False
 _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH: int | None = None
-_Q1_BMM_CROSS_ATTENTION_ENABLED = False
-_NATIVE_Q1_SELF_ATTENTION_ENABLED = False
-_NATIVE_Q1_ROPE_CACHE_SELF_ATTENTION_ENABLED = False
 
 _SDPA_BACKEND_ALIASES = {
     "flash": "FLASH_ATTENTION",
@@ -34,18 +31,6 @@ def active_prefix_self_attention_length() -> int | None:
     return _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH
 
 
-def q1_bmm_cross_attention_enabled() -> bool:
-    return _Q1_BMM_CROSS_ATTENTION_ENABLED
-
-
-def native_q1_self_attention_enabled() -> bool:
-    return _NATIVE_Q1_SELF_ATTENTION_ENABLED
-
-
-def native_q1_rope_cache_self_attention_enabled() -> bool:
-    return _NATIVE_Q1_ROPE_CACHE_SELF_ATTENTION_ENABLED
-
-
 @contextmanager
 def generation_profile_context(
         *,
@@ -58,35 +43,41 @@ def generation_profile_context(
 ) -> Iterator[None]:
     """Temporarily enable opt-in generation profiling controls."""
     global _DETAIL_RANGES_ENABLED, _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH
-    global _Q1_BMM_CROSS_ATTENTION_ENABLED, _NATIVE_Q1_SELF_ATTENTION_ENABLED
-    global _NATIVE_Q1_ROPE_CACHE_SELF_ATTENTION_ENABLED
 
     previous_detail_ranges = _DETAIL_RANGES_ENABLED
     previous_active_prefix_length = _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH
-    previous_q1_bmm_cross_attention = _Q1_BMM_CROSS_ATTENTION_ENABLED
-    previous_native_q1_self_attention = _NATIVE_Q1_SELF_ATTENTION_ENABLED
-    previous_native_q1_rope_cache_self_attention = _NATIVE_Q1_ROPE_CACHE_SELF_ATTENTION_ENABLED
     _DETAIL_RANGES_ENABLED = bool(detail_ranges)
     _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH = active_prefix_self_attention_length
-    _Q1_BMM_CROSS_ATTENTION_ENABLED = bool(q1_bmm_cross_attention)
-    _NATIVE_Q1_SELF_ATTENTION_ENABLED = bool(native_q1_self_attention)
-    _NATIVE_Q1_ROPE_CACHE_SELF_ATTENTION_ENABLED = bool(native_q1_rope_cache_self_attention)
     try:
-        native_runtime_context = nullcontext()
-        if native_q1_self_attention or native_q1_rope_cache_self_attention:
+        from osuT5.osuT5.inference.runtime_dispatch import (
+            AttentionRuntimeHooks,
+            attention_runtime_hooks_context,
+        )
+
+        optimized_attention_context = attention_runtime_hooks_context(
+            AttentionRuntimeHooks()
+        )
+        if (
+            q1_bmm_cross_attention
+            or native_q1_self_attention
+            or native_q1_rope_cache_self_attention
+        ):
             from osuT5.osuT5.inference.optimized.single.runtime_context import (
-                native_attention_runtime_context,
+                attention_runtime_context,
             )
 
-            native_runtime_context = native_attention_runtime_context()
-        with native_runtime_context, sdpa_backend_context(sdpa_backend):
+            optimized_attention_context = attention_runtime_context(
+                q1_bmm_cross_attention=q1_bmm_cross_attention,
+                native_q1_self_attention=native_q1_self_attention,
+                native_q1_rope_cache_self_attention=(
+                    native_q1_rope_cache_self_attention
+                ),
+            )
+        with optimized_attention_context, sdpa_backend_context(sdpa_backend):
             yield
     finally:
         _DETAIL_RANGES_ENABLED = previous_detail_ranges
         _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH = previous_active_prefix_length
-        _Q1_BMM_CROSS_ATTENTION_ENABLED = previous_q1_bmm_cross_attention
-        _NATIVE_Q1_SELF_ATTENTION_ENABLED = previous_native_q1_self_attention
-        _NATIVE_Q1_ROPE_CACHE_SELF_ATTENTION_ENABLED = previous_native_q1_rope_cache_self_attention
 
 
 @contextmanager

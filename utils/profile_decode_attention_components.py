@@ -29,7 +29,6 @@ from osuT5.osuT5.model.custom_transformers import modeling_varwhisper
 from osuT5.osuT5.runtime_profiling import (
     active_prefix_self_attention_length,
     generation_profile_context,
-    q1_bmm_cross_attention_enabled,
 )
 from osuT5.osuT5.tokenizer import ContextType
 from utils.profile_decode_linear_kernels import (
@@ -280,9 +279,17 @@ def _effective_attention_inputs(
     return query, effective_key, effective_value, effective_mask
 
 
-def _uses_q1_bmm(module, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, attention_mask: torch.Tensor | None) -> bool:
+def _uses_q1_bmm(
+        module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        *,
+        enabled: bool,
+) -> bool:
     return (
-        q1_bmm_cross_attention_enabled()
+        enabled
         and module.is_cross_attention
         and not module.training
         and query.dtype == torch.float32
@@ -510,7 +517,14 @@ def _capture_decoder_attention(
                 value=effective_value.detach(),
                 attention_mask=effective_mask.detach() if isinstance(effective_mask, torch.Tensor) else None,
                 output=outputs[0].detach(),
-                used_q1_bmm=_uses_q1_bmm(module, effective_query, effective_key, effective_value, effective_mask),
+                used_q1_bmm=_uses_q1_bmm(
+                    module,
+                    effective_query,
+                    effective_key,
+                    effective_value,
+                    effective_mask,
+                    enabled=q1_bmm_cross_attention,
+                ),
                 bs=int(bs),
                 dim=int(dim),
             )
