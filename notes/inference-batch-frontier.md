@@ -295,12 +295,62 @@ one-token call on a persistent private stream, then captures it with
 - warmed graph-only and graph-plus-sampling fixed-shape timing plus capture
   memory. This is a component scout, not a runtime throughput claim.
 
-Do not implement or run L=2-4 until the L=1 report passes on RTX 2080/2080 Ti.
-Then run L=2 against the same L=1 complete sampled-step denominator and stop
-the lane family if exactness fails or throughput gains less than `5%`. Only an
-exact L=2 win justifies the bounded L=3/L=4 sweep. The best lane point must also
-beat merged B8 (`439.636 tok/s` complete); merely showing concurrent kernels is
-not sufficient. No lane DCC job has been submitted yet.
+DCC job `49547823`, commit `08a59f5`, completed the normalized L=1 gate on
+RTX 2080 Ti:
+
+| Evidence | Result |
+| --- | ---: |
+| one-step, timed-transcript/RNG, resource, and capture gates | PASS |
+| model-only graph replay | `537.426 tok/s` (`1.861 ms/step`) |
+| complete graph-plus-sampling wall | `414.905 tok/s` (`2.410 ms/step`) |
+| complete CUDA interval | `415.099 tok/s` |
+| native context entry | `2.174s` |
+| graph warmup / capture | `11.129 ms` / `11.220 ms` |
+| graph capture allocated/reserved delta | `17,408` / `0` bytes |
+| complete-interval verifier allocation | `1,433,664,000` bytes (`1.335 GiB`) |
+
+The target self-cache position `84` was zeroed before replay, every captured
+K/V view became nonzero, cache position/shape contracts matched, and the final
+self/cross cache matched the eager reference. All 50 timed sampled tokens and
+the final generator hash matched the eager fixed-shape loop. The normalized
+observation counts only the 50 output-discarding replays inside the measured
+complete interval; setup/parity/model-only and untimed transcript replays remain
+separate in the outer graph ledger. The allocation includes the eager reference
+state retained by the verifier and is not a lane-only capacity measurement.
+
+Earlier job `49547755`, commit `718a996`, passed the same exactness/resource
+gates, but retained 50 sampled GPU output tensors inside the measured loop. Its
+`414.565 tok/s` and peak-memory fields are superseded as normalized evidence.
+The fix moved transcript capture to an untimed replay ledger, discarded sample
+outputs in the timed loop like the merged verifier, and separately checked the
+timed generator's final state. The nearly unchanged complete TPS across the two
+jobs is reassuring; the model-only microtiming varied materially and should not
+be used alone to choose the execution shape.
+
+The native extension cache was prebuilt (`10` entries before and after); the
+Inductor cache remained empty and Triton/CUDA cache entries were unchanged.
+`nsys`, `ncu`, and `dcgmi` were available inside the allocation. Coarse
+whole-job telemetry is not a utilization claim because the 46-second job was
+dominated by model load and validation.
+
+Artifacts:
+
+```text
+/work/imt11/Mapperatorinator/runs/b1-lane-capture-49547823-08a59f5/b1-lane-capture.json
+/work/imt11/Mapperatorinator/runs/b1-lane-capture-49547823-08a59f5/cache-state.txt
+/work/imt11/Mapperatorinator/runs/b1-lane-capture-49547823-08a59f5/nvidia-smi.csv
+/work/imt11/Mapperatorinator/logs/b1-lane-capture-49547823.out
+/work/imt11/Mapperatorinator/logs/b1-lane-capture-49547823.err
+```
+
+The report SHA-256 is
+`b91383f063a48be95a1174197a8c7cc389c75615dfff9d369c6ad42447dd7cc8`.
+Accept L=1 as exact verifier/denominator evidence, not a runtime win. Its
+complete result is `5.6%` below merged B8, while model-only replay is above the
+merged complete result. L=2 is justified as the cheapest concurrency
+falsification: it must preserve two private streams/graphs/pools/caches/encoders/
+processors/generators in reciprocal launch orders and exceed `435.650 tok/s`
+(`+5%` over L=1). No L=3 code or job is allowed until L=2 is reviewed.
 
 Lane observations use the merged verifier's `row-N` request IDs and logical
 workload-contract keys. A future L=2 comparison must replay the same two-row
