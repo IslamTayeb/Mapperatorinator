@@ -12,7 +12,7 @@
 set -euo pipefail
 
 ENV=/hpc/group/romerolab/imt11/envs/mapperatorinator
-REPO=/hpc/group/romerolab/imt11/projects/Mapperatorinator
+REPO=${MAPPERATORINATOR_REPO:-/hpc/group/romerolab/imt11/projects/Mapperatorinator}
 WORK=/work/imt11/Mapperatorinator
 RUN_KIND=${CAMPAIGN_RUN_KIND:?Set CAMPAIGN_RUN_KIND to single_full, five_smoke, or five_full}
 EXPECTED_COMMIT=${EXPECTED_COMMIT:?Set EXPECTED_COMMIT to the pushed commit under test}
@@ -66,6 +66,7 @@ echo "job_id=${SLURM_JOB_ID:-manual}"
 echo "run_kind=$RUN_KIND"
 echo "commit=$COMMIT"
 echo "branch=$(git branch --show-current)"
+echo "repo=$REPO"
 echo "cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-unset}"
 echo "torch_extensions_dir=$TORCH_EXTENSIONS_DIR"
 echo "torch_extensions_policy=shared_prebuilt"

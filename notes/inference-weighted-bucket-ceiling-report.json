@@ -1,0 +1,419 @@
+{
+  "decision": {
+    "first_bucket": 576,
+    "gpu_scout_scope": "B2 weighted active-prefix Phase A only",
+    "horizon": 8,
+    "phase_b_authorized": false,
+    "runtime_code_touched": false,
+    "scheduler_or_runtime_wiring_authorized": false,
+    "v32_reference_behavior_unchanged": true
+  },
+  "duplicated_ten_request_b2": {
+    "decode_pair_steps": 5905,
+    "decode_wall_budget_seconds": 18.936701000370086,
+    "main_tokens": 11910,
+    "optimistic_linearized_setup_seconds": 4.883298999629915,
+    "pair_steps_by_active_prefix_bucket": {
+      "1024": 26,
+      "128": 305,
+      "192": 304,
+      "256": 316,
+      "320": 314,
+      "384": 338,
+      "448": 612,
+      "512": 884,
+      "576": 1099,
+      "64": 21,
+      "640": 833,
+      "704": 358,
+      "768": 192,
+      "832": 164,
+      "896": 75,
+      "960": 64
+    },
+    "required_seconds_per_pair": 0.0032068926334242313,
+    "required_weighted_complete_tokens_per_second": 623.656675984333,
+    "target_tokens_per_second": 500.0,
+    "target_total_wall_seconds": 23.82
+  },
+  "five_request_ideal_k2": {
+    "algorithm": "charge each window model_elapsed_seconds uniformly over generated_tokens-1; for each dependency-chain token ordinal sort active costs descending, group adjacent K=2, and sum each group maximum",
+    "decode_chain_tokens": 5905,
+    "ideal_scheduler_wall_tokens_per_second": 495.9834100880599,
+    "ideal_wall_seconds": 12.006449971668838,
+    "interpretation": "K2 is closed only under this accepted-profile cost model",
+    "main_tokens": 5955,
+    "optimism": "coordination, tensor-shape compatibility, setup, and slot-refill costs are free",
+    "target_closed_in_accepted_profile_cost_model": true,
+    "target_tokens_per_second": 500.0
+  },
+  "five_request_ideal_k3": {
+    "algorithm": "same synchronous token-ordinal perfect-overlap model as K2 with K=3",
+    "decode_chain_tokens": 5905,
+    "ideal_scheduler_wall_tokens_per_second": 640.7674443771291,
+    "ideal_wall_seconds": 9.293543316309831,
+    "interpretation": "K3 remains open only under this accepted-profile cost model",
+    "main_tokens": 5955,
+    "target_open_in_accepted_profile_cost_model": true,
+    "target_tokens_per_second": 500.0
+  },
+  "gate": "accepted_five_song_model_free_b2_ceiling",
+  "schema_version": 1,
+  "source": {
+    "commit": "a709b86c37484c4ef9754d582e4506939273bf67",
+    "job_id": "49543717",
+    "profile_inputs": [
+      {
+        "main_records": [
+          {
+            "generated_tokens": 409,
+            "model_elapsed_seconds": 1.309956632554531,
+            "prompt_tokens": 48,
+            "sequence_index": 0
+          },
+          {
+            "generated_tokens": 89,
+            "model_elapsed_seconds": 0.3166434410959482,
+            "prompt_tokens": 400,
+            "sequence_index": 1
+          },
+          {
+            "generated_tokens": 70,
+            "model_elapsed_seconds": 0.2606559572741389,
+            "prompt_tokens": 441,
+            "sequence_index": 2
+          },
+          {
+            "generated_tokens": 73,
+            "model_elapsed_seconds": 0.28288364689797163,
+            "prompt_tokens": 446,
+            "sequence_index": 3
+          },
+          {
+            "generated_tokens": 82,
+            "model_elapsed_seconds": 0.30456521920859814,
+            "prompt_tokens": 450,
+            "sequence_index": 4
+          },
+          {
+            "generated_tokens": 79,
+            "model_elapsed_seconds": 0.290779210627079,
+            "prompt_tokens": 471,
+            "sequence_index": 5
+          },
+          {
+            "generated_tokens": 92,
+            "model_elapsed_seconds": 0.33179232105612755,
+            "prompt_tokens": 472,
+            "sequence_index": 6
+          },
+          {
+            "generated_tokens": 77,
+            "model_elapsed_seconds": 0.2865188615396619,
+            "prompt_tokens": 475,
+            "sequence_index": 7
+          },
+          {
+            "generated_tokens": 71,
+            "model_elapsed_seconds": 0.2675665561109781,
+            "prompt_tokens": 480,
+            "sequence_index": 8
+          },
+          {
+            "generated_tokens": 327,
+            "model_elapsed_seconds": 1.0420354753732681,
+            "prompt_tokens": 478,
+            "sequence_index": 9
+          }
+        ],
+        "main_records_sha256": "469efd95dfdcb8598c669cc39a487aa73619a9af3a19d8c767aedf4bac58d50d",
+        "profile_sha256": "05e49f8799fb9611c2d5974877b83fc57940edafd45940ef7ed7b504ab12145f",
+        "run_index": 5,
+        "song_id": "lambada"
+      },
+      {
+        "main_records": [
+          {
+            "generated_tokens": 1,
+            "model_elapsed_seconds": 0.044608429074287415,
+            "prompt_tokens": 56,
+            "sequence_index": 0
+          },
+          {
+            "generated_tokens": 384,
+            "model_elapsed_seconds": 1.2032544976100326,
+            "prompt_tokens": 64,
+            "sequence_index": 1
+          },
+          {
+            "generated_tokens": 95,
+            "model_elapsed_seconds": 0.3459152961149812,
+            "prompt_tokens": 374,
+            "sequence_index": 2
+          },
+          {
+            "generated_tokens": 86,
+            "model_elapsed_seconds": 0.3080654703080654,
+            "prompt_tokens": 386,
+            "sequence_index": 3
+          },
+          {
+            "generated_tokens": 82,
+            "model_elapsed_seconds": 0.3145790696144104,
+            "prompt_tokens": 479,
+            "sequence_index": 4
+          },
+          {
+            "generated_tokens": 89,
+            "model_elapsed_seconds": 0.3433594210073352,
+            "prompt_tokens": 516,
+            "sequence_index": 5
+          },
+          {
+            "generated_tokens": 95,
+            "model_elapsed_seconds": 0.3484476963058114,
+            "prompt_tokens": 522,
+            "sequence_index": 6
+          },
+          {
+            "generated_tokens": 107,
+            "model_elapsed_seconds": 0.4012872092425823,
+            "prompt_tokens": 542,
+            "sequence_index": 7
+          },
+          {
+            "generated_tokens": 90,
+            "model_elapsed_seconds": 0.3343064412474632,
+            "prompt_tokens": 554,
+            "sequence_index": 8
+          },
+          {
+            "generated_tokens": 429,
+            "model_elapsed_seconds": 1.3922818787395954,
+            "prompt_tokens": 558,
+            "sequence_index": 9
+          }
+        ],
+        "main_records_sha256": "04a98402937fc968f1f5c33867cacc076dbc4b98f8adbe5e6d58859a37ef63d0",
+        "profile_sha256": "30fc0fedbed38cca0d59f02a870852c6b567e1803e1d227559a3c49fb6c2746c",
+        "run_index": 6,
+        "song_id": "pegasus"
+      },
+      {
+        "main_records": [
+          {
+            "generated_tokens": 521,
+            "model_elapsed_seconds": 1.672109835781157,
+            "prompt_tokens": 62,
+            "sequence_index": 0
+          },
+          {
+            "generated_tokens": 88,
+            "model_elapsed_seconds": 0.3231946611776948,
+            "prompt_tokens": 506,
+            "sequence_index": 1
+          },
+          {
+            "generated_tokens": 82,
+            "model_elapsed_seconds": 0.3075771229341626,
+            "prompt_tokens": 523,
+            "sequence_index": 2
+          },
+          {
+            "generated_tokens": 96,
+            "model_elapsed_seconds": 0.3512045918032527,
+            "prompt_tokens": 526,
+            "sequence_index": 3
+          },
+          {
+            "generated_tokens": 86,
+            "model_elapsed_seconds": 0.3213674481958151,
+            "prompt_tokens": 553,
+            "sequence_index": 4
+          },
+          {
+            "generated_tokens": 98,
+            "model_elapsed_seconds": 0.3751955693587661,
+            "prompt_tokens": 549,
+            "sequence_index": 5
+          },
+          {
+            "generated_tokens": 115,
+            "model_elapsed_seconds": 0.41461365949362516,
+            "prompt_tokens": 557,
+            "sequence_index": 6
+          },
+          {
+            "generated_tokens": 104,
+            "model_elapsed_seconds": 0.3823155080899596,
+            "prompt_tokens": 582,
+            "sequence_index": 7
+          },
+          {
+            "generated_tokens": 96,
+            "model_elapsed_seconds": 0.3576575964689255,
+            "prompt_tokens": 604,
+            "sequence_index": 8
+          },
+          {
+            "generated_tokens": 238,
+            "model_elapsed_seconds": 0.7992586838081479,
+            "prompt_tokens": 606,
+            "sequence_index": 9
+          }
+        ],
+        "main_records_sha256": "b31ba9a0ba5c5691cc054540c451b439291d42a9008549545502e9417221fe03",
+        "profile_sha256": "704ac699d762b4580c4f8c3f07311a384b4071f9c5e990bfe7f3a64dee2223a7",
+        "run_index": 7,
+        "song_id": "ela-ke-leitada"
+      },
+      {
+        "main_records": [
+          {
+            "generated_tokens": 1,
+            "model_elapsed_seconds": 0.04400203563272953,
+            "prompt_tokens": 50,
+            "sequence_index": 0
+          },
+          {
+            "generated_tokens": 1,
+            "model_elapsed_seconds": 0.043931822292506695,
+            "prompt_tokens": 58,
+            "sequence_index": 1
+          },
+          {
+            "generated_tokens": 1,
+            "model_elapsed_seconds": 0.04310294520109892,
+            "prompt_tokens": 66,
+            "sequence_index": 2
+          },
+          {
+            "generated_tokens": 499,
+            "model_elapsed_seconds": 1.5614881534129381,
+            "prompt_tokens": 74,
+            "sequence_index": 3
+          },
+          {
+            "generated_tokens": 106,
+            "model_elapsed_seconds": 0.3896766332909465,
+            "prompt_tokens": 493,
+            "sequence_index": 4
+          },
+          {
+            "generated_tokens": 63,
+            "model_elapsed_seconds": 0.2478232067078352,
+            "prompt_tokens": 523,
+            "sequence_index": 5
+          },
+          {
+            "generated_tokens": 56,
+            "model_elapsed_seconds": 0.22204640600830317,
+            "prompt_tokens": 507,
+            "sequence_index": 6
+          },
+          {
+            "generated_tokens": 54,
+            "model_elapsed_seconds": 0.2143971063196659,
+            "prompt_tokens": 477,
+            "sequence_index": 7
+          },
+          {
+            "generated_tokens": 69,
+            "model_elapsed_seconds": 0.2566436240449548,
+            "prompt_tokens": 440,
+            "sequence_index": 8
+          },
+          {
+            "generated_tokens": 234,
+            "model_elapsed_seconds": 0.7148851240053773,
+            "prompt_tokens": 421,
+            "sequence_index": 9
+          }
+        ],
+        "main_records_sha256": "61ed1a12754821c786b3f12541a3382267a738f9300db26db5e4eb4718ee8208",
+        "profile_sha256": "387264c12874f1bbee9a7a635e489a809b2ac0360c3fec38b8867292f8c0f912",
+        "run_index": 8,
+        "song_id": "salvalai"
+      },
+      {
+        "main_records": [
+          {
+            "generated_tokens": 4,
+            "model_elapsed_seconds": 0.06462829932570457,
+            "prompt_tokens": 50,
+            "sequence_index": 0
+          },
+          {
+            "generated_tokens": 1,
+            "model_elapsed_seconds": 0.044237690046429634,
+            "prompt_tokens": 63,
+            "sequence_index": 1
+          },
+          {
+            "generated_tokens": 70,
+            "model_elapsed_seconds": 0.2553767189383507,
+            "prompt_tokens": 69,
+            "sequence_index": 2
+          },
+          {
+            "generated_tokens": 39,
+            "model_elapsed_seconds": 0.14957058057188988,
+            "prompt_tokens": 148,
+            "sequence_index": 3
+          },
+          {
+            "generated_tokens": 83,
+            "model_elapsed_seconds": 0.3035235311836004,
+            "prompt_tokens": 196,
+            "sequence_index": 4
+          },
+          {
+            "generated_tokens": 60,
+            "model_elapsed_seconds": 0.2312371702864766,
+            "prompt_tokens": 284,
+            "sequence_index": 5
+          },
+          {
+            "generated_tokens": 49,
+            "model_elapsed_seconds": 0.2071911646053195,
+            "prompt_tokens": 340,
+            "sequence_index": 6
+          },
+          {
+            "generated_tokens": 88,
+            "model_elapsed_seconds": 0.3239805130288005,
+            "prompt_tokens": 379,
+            "sequence_index": 7
+          },
+          {
+            "generated_tokens": 72,
+            "model_elapsed_seconds": 0.2656698636710644,
+            "prompt_tokens": 398,
+            "sequence_index": 8
+          },
+          {
+            "generated_tokens": 54,
+            "model_elapsed_seconds": 0.19706322066485882,
+            "prompt_tokens": 427,
+            "sequence_index": 9
+          }
+        ],
+        "main_records_sha256": "3c7a5497cd72ba3ce68af42f5e731d8196ebecad68e91a25b2c5d1f9b7f2c4cf",
+        "profile_sha256": "139385064872a347093d3609adf2ad4c9b24858e9d555a6eaea275e03aaf8059",
+        "run_index": 9,
+        "song_id": "nube-negra"
+      }
+    ],
+    "setup_input": {
+      "batch_size": 8,
+      "commit": "8a7517903fedd9deb692aa9b332c663bbb16537d",
+      "job_id": "49548273",
+      "linearized_window_count": 100,
+      "packer_wall_seconds_for_batch8": 0.04675073456019163,
+      "provenance_scope": "optimistic linearized synthetic setup charge",
+      "report_sha256": "93397a3cf042669ea507f343c661f1fadf2e88012c290893872b7cfa296569dd",
+      "serial_b1_prefill_wall_seconds_for_batch8": 0.34391318541020155
+    },
+    "workload": "accepted exact repeat01 five-song smoke15 profiles"
+  }
+}

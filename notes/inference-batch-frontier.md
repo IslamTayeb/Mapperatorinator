@@ -560,6 +560,59 @@ and hash the accepted Lambada repeat01 seq9 prompt/transcript. Do not run Phase
 B, setup optimization, or runtime work until this cheapest weighted gate
 survives review.
 
+### Weighted real-prefix bucket-576 Hybrid B2 rejected
+
+The reviewed source capture narrowed the next scout to an eight-step, real
+Lambada `seq9` bucket-576 state. First launch `49559647` at `432bdd0` failed
+setup-only because the H8 driver passed its four-tensor mutable view to the
+generic lane helper instead of the complete prepared model call. Its structured
+report was preserved and hashed; no graph, exactness, or timing result came
+from that job.
+
+Corrected job `49559747` at `511e0ba` passed the full Phase A verifier in both
+reciprocal orders. Raw logits, active self cache, and cross cache were bitwise
+identical to independent B1 references. Tokens, stop state, per-step/final RNG,
+static inputs, cache writes/suffixes, private monotonic state, and state feedback
+also passed before timing.
+
+| Evidence | Order `0,1` | Order `1,0` |
+| --- | ---: | ---: |
+| Hybrid B2 complete wall | `532.528 tok/s` | `507.198 tok/s` |
+| Private B1 complete wall | `352.473 tok/s` | `352.452 tok/s` |
+| Same-order gain | `+51.08%` | `+43.91%` |
+
+The weighted B2 keep bar was `>623.656676 tok/s`. The worst reciprocal result
+was `18.67%` below it and needs another `22.96%`; Phase B and the weighted
+bucket sweep therefore remain false. Seven-graph ownership and zero timed
+allocation passed. Current/peak allocated memory was about `2.161/2.163 GB`,
+reserved memory was `3.536 GB`, and the extension cache was unchanged.
+
+The report is
+`/work/imt11/Mapperatorinator/runs/weighted-h8-49559747-511e0ba/weighted-h8.json`
+with SHA-256
+`d96024181d8bf0a68f2fd74a58cb7266f4f0bddb73cec3c3ed579c72c2ab30a1`.
+Slurm exit `1:0` is the intentional absolute-performance rejection after strict
+report validation. Keep the verifier and exact physics evidence; do not rerun
+B2 for noise or wire a queue/scheduler/runtime/server from it.
+
+### Dependency-aware K3 ceiling rejected before GPU
+
+The CPU-only K3 gate binds the parent weighted report at file SHA
+`44a680ab29867e3aea8dde713127bdb154ef42a316fd2834bc75afbbc0927fc9`.
+It derives five songs with ten windows each, excludes only the five initial
+windows that can be prepared before first-main, and charges the accepted
+`0.04883298999629915s` linear setup to the remaining `45` dependency-blocked
+transitions. The transition ledger totals `2.1974845498334616s` and hashes to
+`cf60a51f1581f7d477453bd359269f5b4228c44d1c79d6ff3680f2d7513994ba`.
+
+The parent setup-free K3 fantasy is `9.293543s` / `640.767 tok/s`. Charging all
+50 setups gives `11.735193s` / `507.448 tok/s`; dependency-aware placement gives
+`11.491028s` / `518.230 tok/s`. The latter exceeds the strict `>525 tok/s`
+boundary wall of `11.342857s` by `0.148171s` and has only `3.65%` headroom over
+500. Therefore the K3 GPU scout is rejected before implementation. No
+scheduler/runtime/server work is authorized. See
+[the dated gate note](2026-07-10-dependency-aware-k3-ceiling.md).
+
 ### CPU continuous-scheduler harness
 
 `osuT5/osuT5/inference/continuous_batching.py` models arrivals, activation, round-robin/FIFO decode, stop reasons, cache-slot acquire/release, and slot generations. Strict manifests validate token/count recomputation, lifecycle arithmetic, state hashes, active-batch histograms, and cache-slot balance.
@@ -590,13 +643,14 @@ The first one-token physics comparison is complete:
    `397.903-398.291 tok/s` and are rejected;
 3. the fixed hybrid B2 bridge reached `670.026-723.633 tok/s`, and its bounded
    bucket-128 changing-prefix follow-up reached `621.893-628.868 tok/s`, but
-   exact-five ideal K2 accepted-profile replay still tops out at `495.983 tok/s`.
+   the reviewed real-prefix bucket-576 H8 dropped to `507.198-532.528 tok/s`
+   and failed the `623.657 tok/s` weighted keep bar.
 
-Do not build a production scheduler from any component result. The only
-authorized B2 work is the production-weighted ten-request bucket gate above;
-the only authorized exact-five continuation after B2 closes is a separately
-reviewed K3 physics verifier. Mixed-song lifecycle, timing/main, EOS/max-token,
-slot reuse, output assembly, setup, and scheduler work remain downstream gates.
+Do not build a production scheduler from any component result. The weighted B2
+path is rejected before Phase B. The dependency-aware K3 fantasy also reaches
+only `518.230 tok/s`, below the strict `>525` bar, so no K3 GPU shape is
+currently authorized. Mixed-song lifecycle, timing/main, EOS/max-token, slot
+reuse, output assembly, setup, and scheduler work remain downstream gates.
 
 For each shape report:
 
@@ -663,14 +717,14 @@ Until those gates pass, call results offline-engine throughput, not server optim
 
 ## Immediate Next Decision Points
 
-- Reconstruct and hash the accepted Lambada repeat01 seq9 prompt/transcript,
-  then run only the real-prefix bucket-576 B2 horizon-8 gate. Stop on any
-  token/RNG/cache/static-state mismatch or if the ten-request weighted ceiling
-  is no longer plausible.
-- Exact-five K2 is closed in the accepted-profile cost model at an optimistic
-  `495.983 tok/s`. If weighted B2 is rejected, the next bounded physics family
-  is heterogeneous K3 at bucket 576, not setup or scheduler code.
-- Keep the independent-lane and packed/merged verifiers as physics evidence;
-  do not wire them into a runtime before a setup-inclusive exact queue win.
+- Reject the weighted Hybrid-B2 bucket sweep: its reviewed bucket-576 Phase A
+  was exact but missed the absolute rate by `18.67%`. Do not run Phase B or
+  rerun for noise.
+- The dependency-aware K3 replay rejects GPU work at `518.230 tok/s`; do not
+  implement a K3 verifier unless accepted setup/decode evidence first restores
+  more than `525 tok/s` fantasy headroom.
+- Keep mixed-compatibility, packed-B8, independent-lane, and Hybrid-B2
+  verifiers as exact physics evidence with separate rejected boundaries; none
+  is a selected runtime shape.
 - Feed accepted single-song components, including any exact speculative verifier win, back into the offline engine and measure combined scheduler-wall throughput.
 - Stop for user input before reduced precision, output/RNG relaxation, or maintainer-facing changes outside the optimized package/adapter boundary.
