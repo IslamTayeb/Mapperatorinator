@@ -12,7 +12,7 @@
 set -euo pipefail
 
 ENV=/hpc/group/romerolab/imt11/envs/mapperatorinator
-REPO=/hpc/group/romerolab/imt11/projects/Mapperatorinator
+REPO=${MAPPERATORINATOR_REPO:?Set MAPPERATORINATOR_REPO to the isolated speculative DCC worktree}
 WORK=/work/imt11/Mapperatorinator
 EXPECTED_COMMIT=${EXPECTED_COMMIT:?Set EXPECTED_COMMIT to the pushed verifier commit}
 SPECULATION_K=${SPECULATION_K:-2}
