@@ -47,7 +47,7 @@ fi
 
 mkdir -p "$WORK/logs" "$WORK/tmp" "$WORK/cache" \
   "$WORK/cache/torch_inductor" "$WORK/cache/triton" "$WORK/cache/cuda" \
-  "$WORK/torch_extensions" "$RUN_ROOT"
+  "$RUN_ROOT/extensions" "$RUN_ROOT/import-audits"
 export PATH="$ENV/bin:$PATH"
 export XDG_CACHE_HOME="$WORK/cache"
 export HF_HOME="$WORK/cache/huggingface"
@@ -57,7 +57,6 @@ export TRANSFORMERS_OFFLINE=1
 export TORCHINDUCTOR_CACHE_DIR="$WORK/cache/torch_inductor"
 export TRITON_CACHE_DIR="$WORK/cache/triton"
 export CUDA_CACHE_PATH="$WORK/cache/cuda"
-export TORCH_EXTENSIONS_DIR="$WORK/torch_extensions"
 export TMPDIR="$WORK/tmp"
 export TOKENIZERS_PARALLELISM=false
 
@@ -68,8 +67,6 @@ echo "candidate_commit=$CANDIDATE_COMMIT"
 echo "song_list=$SONG_LIST"
 echo "run_root=$RUN_ROOT"
 nvidia-smi -L
-find "$TORCH_EXTENSIONS_DIR" -mindepth 1 -maxdepth 1 -printf '%f\n' \
-  | sort > "$RUN_ROOT/extension-cache-before.txt"
 nvidia-smi \
   --query-gpu=timestamp,uuid,utilization.gpu,memory.used,memory.total,power.draw,clocks.sm,temperature.gpu \
   --format=csv -l 1 > "$RUN_ROOT/nvidia-smi.csv" &
@@ -107,13 +104,58 @@ COMMON_OVERRIDES=(
   inference_native_q1_rope_cache_self_attention=false
 )
 
+audit_import_cold() {
+  local repo=$1
+  local label=$2
+  local extension_dir="$RUN_ROOT/extensions/$label"
+  local audit_path="$RUN_ROOT/import-audits/$label.json"
+  mkdir -p "$extension_dir"
+  if find "$extension_dir" -mindepth 1 -print -quit | grep -q .; then
+    echo "$label extension directory was not empty before the import audit" >&2
+    exit 2
+  fi
+  (
+    cd "$repo"
+    TORCH_EXTENSIONS_DIR="$extension_dir" python - "$audit_path" <<'PY'
+import importlib
+import json
+from pathlib import Path
+import sys
+
+audit_path = Path(sys.argv[1])
+audits = []
+for module_name in ("inference", "osuT5.osuT5.inference.server"):
+    importlib.import_module(module_name)
+    optimized_modules = sorted(
+        name
+        for name in sys.modules
+        if name.startswith("osuT5.osuT5.inference.optimized")
+        or name.startswith("mapperatorinator_q1_")
+    )
+    audits.append({"import": module_name, "optimized_modules": optimized_modules})
+    if optimized_modules:
+        raise SystemExit(
+            f"{module_name} eagerly imported optimized/native modules: {optimized_modules}"
+        )
+audit_path.write_text(json.dumps(audits, indent=2) + "\n", encoding="utf-8")
+PY
+  )
+  if find "$extension_dir" -mindepth 1 -print -quit | grep -q .; then
+    echo "$label default V32 import populated its isolated extension directory" >&2
+    find "$extension_dir" -mindepth 1 -maxdepth 2 -print >&2
+    exit 1
+  fi
+}
+
 run_suite() {
   local repo=$1
   local label=$2
   local output="$RUN_ROOT/$label"
+  local extension_dir="$RUN_ROOT/extensions/$label"
   mkdir -p "$output"
   (
     cd "$repo"
+    export TORCH_EXTENSIONS_DIR="$extension_dir"
     python utils/profile_static_server_batch.py \
       --config-name profile_salvalai_smoke15 \
       --song-list "$SONG_LIST" \
@@ -132,6 +174,8 @@ run_suite() {
   echo "$manifest" > "$RUN_ROOT/$label.manifest-path.txt"
 }
 
+audit_import_cold "$CONTROL_REPO" control
+audit_import_cold "$CANDIDATE_REPO" candidate
 run_suite "$CONTROL_REPO" control
 run_suite "$CANDIDATE_REPO" candidate
 
@@ -147,7 +191,37 @@ CANDIDATE_MANIFEST=$(<"$RUN_ROOT/candidate.manifest-path.txt")
 
 python - "$CONTROL_MANIFEST" "$CANDIDATE_MANIFEST" <<'PY'
 import json
+from pathlib import Path
 import sys
+
+expected_metadata = {
+    "inference_engine": "v32",
+    "optimized_inference_mode": "single",
+    "use_server": True,
+    "server_rng_policy": "shared_global",
+    "token_equivalence_status": "not_checked_shared_server_rng",
+    "rng_reset_policy": "server_global_rng_shared_across_concurrent_requests",
+    "server_seed_applied": False,
+}
+expected_generation = {
+    "use_server": True,
+    "server_rng_policy": "shared_global",
+    "token_equivalence_status": "not_checked_shared_server_rng",
+    "optimized_effective_config_version": None,
+    "optimized_runtime_owner": None,
+    "optimized_result_class": None,
+    "generation_compile_enabled": False,
+    "stateful_monotonic_logits_processor": False,
+    "q1_bmm_cross_attention_enabled": False,
+    "native_q1_self_attention_requested": False,
+    "native_q1_self_attention_enabled": False,
+    "native_q1_rope_cache_self_attention_requested": False,
+    "native_q1_rope_cache_self_attention_enabled": False,
+    "decode_session_runtime_enabled": False,
+    "decode_session_cuda_graph_enabled": False,
+    "active_prefix_decode_loop_enabled": False,
+    "active_prefix_decode_cuda_graph_enabled": False,
+}
 
 for name, path in zip(("control", "candidate"), sys.argv[1:]):
     with open(path, encoding="utf-8") as handle:
@@ -159,12 +233,45 @@ for name, path in zip(("control", "candidate"), sys.argv[1:]):
         raise SystemExit(f"{name}: server_batch_observed changed")
     if aggregate.get("token_equivalence_status") != "not_checked_shared_server_rng":
         raise SystemExit(f"{name}: shared server RNG label changed")
+    if manifest.get("rng_reset_policy") != "server_global_rng_shared_across_concurrent_requests":
+        raise SystemExit(f"{name}: manifest RNG reset policy changed")
+    for run_index, run in enumerate(manifest.get("runs", [])):
+        if run.get("server_seed_applied") is not False:
+            raise SystemExit(f"{name} run {run_index}: server seed was unexpectedly applied")
+        if run.get("token_equivalence_status") != "not_checked_shared_server_rng":
+            raise SystemExit(f"{name} run {run_index}: run token-equivalence label changed")
+        profile_path = Path(run.get("profile_path", ""))
+        if not profile_path.is_file():
+            raise SystemExit(f"{name} run {run_index}: missing profile {profile_path}")
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        metadata = profile.get("metadata", {})
+        for field, expected in expected_metadata.items():
+            if metadata.get(field) != expected:
+                raise SystemExit(
+                    f"{name} run {run_index}: metadata {field}="
+                    f"{metadata.get(field)!r}, expected {expected!r}"
+                )
+        generation = profile.get("generation", [])
+        if not generation:
+            raise SystemExit(f"{name} run {run_index}: profile has no generation records")
+        for record_index, record in enumerate(generation):
+            for field, expected in expected_generation.items():
+                if record.get(field) != expected:
+                    raise SystemExit(
+                        f"{name} run {run_index} generation {record_index}: {field}="
+                        f"{record.get(field)!r}, expected {expected!r}"
+                    )
 print("static_server_regression_gate=PASS")
 PY
 
-find "$TORCH_EXTENSIONS_DIR" -mindepth 1 -maxdepth 1 -printf '%f\n' \
-  | sort > "$RUN_ROOT/extension-cache-after.txt"
-cmp "$RUN_ROOT/extension-cache-before.txt" "$RUN_ROOT/extension-cache-after.txt"
+for extension_dir in "$RUN_ROOT/extensions/control" "$RUN_ROOT/extensions/candidate"; do
+  if find "$extension_dir" -mindepth 1 -print -quit | grep -q .; then
+    echo "default V32 static server populated isolated extension directory $extension_dir" >&2
+    find "$extension_dir" -mindepth 1 -maxdepth 2 -print >&2
+    exit 1
+  fi
+done
 find "$RUN_ROOT" -type f \
-  \( -name static_server_batch_manifest.json -o -name 'compare-static-server.json' \) \
+  \( -name static_server_batch_manifest.json -o -name 'compare-static-server.json' \
+     -o -path '*/import-audits/*.json' \) \
   -print0 | sort -z | xargs -0 sha256sum
