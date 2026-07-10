@@ -32,6 +32,9 @@ from transformers import LogitsProcessorList, TopKLogitsWarper, TopPLogitsWarper
 
 from inference import compile_args, load_model_with_server, setup_inference_environment
 from osuT5.osuT5.inference.decode_loop import _bucketed_prefix_length
+from osuT5.osuT5.inference.optimized.graph_safe_logits import (
+    make_graph_safe_logits_processor_list,
+)
 from osuT5.osuT5.inference.optimized.batch.hybrid_l2 import (
     FIXED_ACTIVE_PREFIX_BUCKET_SIZE,
     FIXED_ACTIVE_PREFIX_LENGTH,
@@ -668,11 +671,13 @@ def _make_factories(
         lookback_time: float,
 ) -> tuple[ProcessorFactory, ProcessorFactory, ProcessorFactory]:
     def base_processor_factory():
-        return _build_generation_logits_processors(
-            args,
-            tokenizer,
-            device,
-            lookback_time=lookback_time,
+        return make_graph_safe_logits_processor_list(
+            _build_generation_logits_processors(
+                args,
+                tokenizer,
+                device,
+                lookback_time=lookback_time,
+            )
         )
 
     def logits_warper_factory():

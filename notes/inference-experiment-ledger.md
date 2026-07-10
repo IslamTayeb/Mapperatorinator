@@ -62,6 +62,7 @@ Legend:
 | Weighted bucket-576 H8 first launch setup | `49559647` / `432bdd0` | Reviewed source passed, then a reduced four-tensor map omitted `encoder_outputs`/`past_key_values` and sent `input_features=None` into encoder `conv1d`. No graph, exactness, or timing occurred. Structured report SHA `e5b31c47b4e8587bc9300cce51da5dfb467ebb3f44e3194e3fc8a26a0ba74641`. | Setup-only failure. Preserve complete capture inputs separately from the mutable four-tensor view; no H8 claim. |
 | Weighted bucket-576 Hybrid-B2 H8 Phase A | `49559747` / `511e0ba` | Intentional performance rejection after strict report validation. Both orders passed bitwise raw logits, active self/cross caches, tokens, RNG, monotonic recurrence, state feedback, ownership, and zero timed allocation. Candidate complete wall was `532.528` and `507.198 tok/s`; minimum same-order gain `+43.91%`. Report SHA `d96024181d8bf0a68f2fd74a58cb7266f4f0bddb73cec3c3ed579c72c2ab30a1`. | Reject Phase B and the B2 weighted sweep: worst order missed required `>623.656676` by `18.67%` and needs `+22.96%`. No scheduler/runtime/server. |
 | Dependency-aware five-song K3 ceiling | local CPU-only / parent SHA `44a680a` | Strict replay charges accepted per-window setup to all 45 dependency-blocked transitions and excludes only five initial windows. Setup-free fantasy is `640.767 tok/s`; all-setup `507.448`; dependency-aware `518.230` (`11.491028s`). Transition-ledger SHA `cf60a51f1581f7d477453bd359269f5b4228c44d1c79d6ff3680f2d7513994ba`. [note](2026-07-10-dependency-aware-k3-ceiling.md) | Reject K3 GPU work: only `3.65%` fantasy headroom over 500, below strict `>525`. Revisit only after accepted in-wall setup or parent decode evidence materially improves. |
+| V32 graph-safety integration boundary | `49559982` / `9402d01`; `49560037` / `e2d8704` | Smoke and full reciprocal runs matched main/timing tokens and byte-identical `.osu` output in both orders. Full output SHA was `483483a1c29ef8a44c4a8d3a82fe0778ae306470ec3157e98969eeabd92c2631`. Full main TPS was `-0.7%` in the control-first pairing and `+0.2%` in the candidate-first pairing; timing was `-0.9%` / `+0.5%`; strict zero-tolerance per-window gates failed. Compare JSON SHAs: full control-first `62fb8144bbdc8d49926dbfed345e2e08ccd68f5a85dc8472d2872e4120f1bfc1`, candidate-first `1ca172021766f019b15f3f3cb46202de235b961143c756caa96881b02cd25ee9`. | Exact-output PASS; performance flat/noisy and below the keep bar. Reject shared V32 edits. Keep only the equivalent subclass/helper under `optimized/`; V32 source and legacy tests remain byte-identical to `main`. |
 
 ## Durable Diagnostic Infrastructure
 
@@ -121,7 +122,7 @@ These tools remain useful even though their associated experiment did not become
 | Independent B1 CUDA-graph lane pool | `49548733` / `aa662c90`; report SHA `2533d7be39a065f62fd0fa5af6cf8fbe8173c01bbfc2eb1dc43bb4ccb296332e` | exact/private L2 model-only overlap reached `778.591-786.853 tok/s`, but complete sampled-step throughput regressed to `397.903-398.291`, below both reviewed L1 `414.905` and same-job serial `405.962` | complete sampling/control or a materially different hardware/runtime stack first shows a measured L2 ceiling above `5%`; do not run L3/L4 meanwhile. |
 | Decoder-layer runtime island branch | `experiment/decoder-layer-runtime-island-do-not-merge@f9306d2` | audit-only speculative work; no accepted end-to-end win | cherry-pick only separately reviewed verifier/docs/tooling; never merge wholesale. |
 
-## Current Open Families
+## Revisit Conditions; No Candidate Is Currently Authorized
 
 ### Speculative scout status
 
@@ -143,10 +144,10 @@ Report SHA256s are `6c96678d406d7770b477c3ea0621daf98f4068fbf6a44ea0c36799bb3542
 
 This structural result justified the K4 GPU target-span gate. The subsequent eager and fixed-shape graph measurements rejected the n-gram runtime above: K8 adds only `200` full-song structural calls saved (`8,499` versus `8,299`) while nearly doubling proposed positions (`101,087` versus `55,512`), and K4 target replay still misses the current-stack cost bar. Keep these reports as acceptance evidence; do not rerun or production-wire n-grams without a listed revisit condition. Passing a suite manifest instead of a profile failed loudly with exit `1` because no per-window `generation` list was present.
 
-| Family | Required pre-production evidence |
+| Family | Status and revisit evidence |
 | --- | --- |
-| Broad FP32 decoder-layer/stack verifier | ABI and cache-slot exactness; weighted prefixes `128..768`; projected `>=1.412s`, preferably `>=2.824s`; then full correctness ladder. |
-| Merged-batch sampling/control and mixed-song loop | Profile the measured B8 rowwise sampling/control gap, then require distinct-song/permutation exactness, staggered arrival/slot reuse, complete-step TPS, VRAM, timeline, and `>5%` aggregate gain before scheduler wiring. The independent-lane alternative is rejected above. |
-| Optimized offline scheduler | B1 parity through five-song/three-seed exact queue, explicit request state, scheduler-wall target, cold/latency/memory reporting. |
+| Broad FP32 decoder-layer/stack | Rejected at job `49550902`: `1.989-2.099s` projected saving is complex and below the `2.824s` strong bar. Reopen only for a materially different candidate that clears the reciprocal whole-layer gate first. |
+| Merged-batch sampling/control and mixed-song loop | Current H8 B2 and dependency-aware K3 gates are rejected above. Reopen only when accepted complete-step or setup evidence restores more than `5%` scheduler-wall headroom before any runtime wiring. |
+| Optimized offline scheduler | Not authorized. First obtain an exact execution shape that survives the current five-song dependency/setup model and the normal `>5%` keep gate; then run B1 parity through the five-song/three-seed queue. |
 
 When an open family is accepted or cut, add the job, commit, artifact paths, exactness class, measured delta, explanation, and concrete revisit condition here before deleting or superseding its dated note.

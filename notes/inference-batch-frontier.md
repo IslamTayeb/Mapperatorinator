@@ -613,6 +613,34 @@ boundary wall of `11.342857s` by `0.148171s` and has only `3.65%` headroom over
 scheduler/runtime/server work is authorized. See
 [the dated gate note](2026-07-10-dependency-aware-k3-ceiling.md).
 
+### V32 integration boundary is now literal
+
+Reciprocal smoke job `49559982` at `9402d01` tested the two graph-safety
+calculations in the shared monotonic processor. Both launch orders matched
+`1,084` main and `164` timing token IDs and produced the same `4,144`-byte
+`.osu` artifact with SHA
+`ff63c232115906483a592c940e6f0fccbb8639775378d39fd86237f4191ed4ba`.
+Candidate aggregates were faster, but zero-tolerance per-window comparison
+failed on millisecond-scale variation, so the result authorized only the next
+incremental gate.
+
+Reciprocal full-song job `49560037` at `e2d8704` again matched all `7,639`
+main and `821` timing tokens and the `31,709`-byte output artifact with SHA
+`483483a1c29ef8a44c4a8d3a82fe0778ae306470ec3157e98969eeabd92c2631`.
+The control-first pairing measured candidate main/timing TPS at `-0.7%/-0.9%`;
+the candidate-first pairing measured `+0.2%/+0.5%`. Total stage wall likewise
+straddled `+0.4%/-0.3%`. This is exact-output evidence and flat/noisy
+performance, not a speed claim.
+
+Because the graph-safe form exists only to support optimized batch verifiers,
+the shared V32 edits were removed instead of accepting an unneeded sub-5%
+change. `osuT5/osuT5/inference/logit_processors.py` and its legacy tests are
+byte-identical to `main`. The equivalent graph-capturable subclass now lives at
+`osuT5/osuT5/inference/optimized/graph_safe_logits.py` and is installed only by
+the Hybrid verifier factory. No default/server/runtime import path uses it.
+The final local boundary gate passed `2` legacy processor tests and `116`
+optimized tests.
+
 ### CPU continuous-scheduler harness
 
 `osuT5/osuT5/inference/continuous_batching.py` models arrivals, activation, round-robin/FIFO decode, stop reasons, cache-slot acquire/release, and slot generations. Strict manifests validate token/count recomputation, lifecycle arithmetic, state hashes, active-batch histograms, and cache-slot balance.
@@ -631,7 +659,7 @@ The V32 server already demonstrates request collection and compatibility groupin
 
 New scheduler/runtime code belongs under `osuT5/osuT5/inference/optimized/`. The legacy server may later receive only a lazy adapter after the offline engine wins.
 
-## Batch Physics Result And Remaining Gate
+## Batch Physics Result And Current Stop Boundary
 
 The first one-token physics comparison is complete:
 
@@ -668,6 +696,10 @@ such a ceiling.
 ## Optimized Offline Engine Contract
 
 Start with a known offline queue. Online arrivals and IPC are deferred.
+
+This is a future contract, not an implemented runtime. H8 and dependency-aware
+K3 failed their incremental gates, so no current execution shape authorizes
+scheduler construction.
 
 Each request owns:
 

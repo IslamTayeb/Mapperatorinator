@@ -225,7 +225,7 @@ class MonotonicTimeShiftLogitsProcessor(LogitsProcessor):
         # If no time_shift token, value is 0
         last_time_shift_values = torch.where(
             last_time_shift_idx != -1,
-            input_ids[torch.arange(batch_size, device=device), last_time_shift_idx] - self.time_shift_start,
+            input_ids[torch.arange(batch_size), last_time_shift_idx] - self.time_shift_start,
             0
         )
 
@@ -242,7 +242,7 @@ class MonotonicTimeShiftLogitsProcessor(LogitsProcessor):
         # Shape: (batch_size, vocab_size)
         batch_mask = torch.full_like(scores, False, dtype=torch.bool)
         batch_mask[:, self.time_shift_start:self.time_shift_end] = invalid_mask
-        scores.masked_fill_(batch_mask & apply_mask.unsqueeze(1), -torch.inf)
+        scores[apply_mask] = scores[apply_mask].masked_fill(batch_mask[apply_mask], -torch.inf)
 
         return scores
 

@@ -5,7 +5,11 @@ import inspect
 from types import SimpleNamespace
 
 import pytest
+import torch
+from transformers import LogitsProcessorList
 
+from osuT5.osuT5.event import EventType
+from osuT5.osuT5.inference.logit_processors import MonotonicTimeShiftLogitsProcessor
 from osuT5.osuT5.inference.optimized.batch.hybrid_l2 import (
     FIVE_PERCENT_KEEP_TPS,
     FIXED_ACTIVE_PREFIX_BUCKET_SIZE,
@@ -40,11 +44,13 @@ from osuT5.osuT5.inference.optimized.batch.lane_one_token import (
     LaneResourceEvidence,
 )
 from utils.verify_optimized_hybrid_l2 import (
+    _make_factories,
     _enqueue_hybrid_steps,
     _run_complete_output_discard_timing,
     _validate_fixed_runtime_contract,
     build_parser,
 )
+import utils.verify_optimized_hybrid_l2 as hybrid_l2_verifier
 
 
 def _lane(lane_id: int, pointer_base: int) -> LaneResourceEvidence:
@@ -163,6 +169,46 @@ def _runtime_args(**overrides) -> SimpleNamespace:
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+class _FakeTokenizer:
+    sos_id = 1
+    context_sos = {}
+    event_start = {EventType.TIME_SHIFT: 10}
+    event_end = {EventType.TIME_SHIFT: 20}
+
+
+def test_make_factories_routes_only_the_verifier_to_graph_safe_processor(monkeypatch):
+    legacy = MonotonicTimeShiftLogitsProcessor(
+        _FakeTokenizer(),
+        stateful_batch1=True,
+    )
+    monkeypatch.setattr(
+        hybrid_l2_verifier,
+        "_build_generation_logits_processors",
+        lambda *_args, **_kwargs: LogitsProcessorList([legacy]),
+    )
+    monkeypatch.setattr(
+        hybrid_l2_verifier,
+        "validate_hybrid_processor_family",
+        lambda **_kwargs: None,
+    )
+
+    base_factory, warper_factory, combined_factory = _make_factories(
+        SimpleNamespace(do_sample=False, top_k=0, top_p=1.0),
+        _FakeTokenizer(),
+        torch.device("cpu"),
+        lookback_time=0.0,
+    )
+
+    base = base_factory()
+    assert len(base) == 1
+    assert type(base[0]).__module__.endswith("optimized.graph_safe_logits")
+    assert type(base[0]).__name__ == "MonotonicTimeShiftLogitsProcessor"
+    assert len(warper_factory()) == 0
+    assert type(combined_factory()[0]).__module__.endswith(
+        "optimized.graph_safe_logits"
+    )
 
 
 def _order_report(order: str, tps: float) -> dict:
