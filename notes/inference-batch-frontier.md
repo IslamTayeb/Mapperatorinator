@@ -143,6 +143,38 @@ Job `49545900` failed in config validation before model execution because the
 stateful processor's required public active-prefix selector was missing. It is
 a harness setup failure and carries no physics evidence.
 
+B8 component profile job `49547132`, commit `17fe895`, decomposed the prior
+`6.240 ms/step` complete-minus-model gap. Reaching `500 tok/s` at B8 requires
+step wall below `16.000 ms`: remove `2.196871 ms`, or `35.207%` of the measured
+gap.
+
+| Isolated non-additive component | Wall / step | Fantasy-free B8 TPS | Clears required saving? |
+| --- | ---: | ---: | --- |
+| logits clone | `0.104 ms` | `442.160` | no |
+| clone + logits processors | `3.318 ms` | `537.678` | **yes** |
+| clone + top-p/top-k warpers | `1.442 ms` | `477.467` | no |
+| softmax | `0.055 ms` | `440.976` | no |
+| private-generator multinomial | `0.753 ms` | `458.606` | no |
+| empty eight-row Python loop | `0.0003 ms` | `439.643` | no |
+| idle CUDA synchronize | `0.005 ms` | `439.766` | no |
+
+Only the logits-processor family has an individual target-sized ceiling. After
+subtracting the separately measured clone, its approximate incremental cost is
+`3.214 ms`, with a `533.950 tok/s` fantasy-free ceiling. The active processor
+list contains monotonic time-shift masking and conditional temperature; source
+inspection shows conditional temperature performs a device-to-host `.cpu()`
+lookback per row, but this job did not isolate those two processors from each
+other. The next cheapest gate is therefore a processor-only subcomponent probe,
+not an implementation. Component times overlap and must never be summed; CUDA
+event intervals include device idle between host submissions and are not
+kernel-active time.
+
+Component report:
+
+```text
+/work/imt11/Mapperatorinator/runs/merged-batch-physics-b8-49547132-17fe895/merged-b8.json
+```
+
 ### CPU continuous-scheduler harness
 
 `osuT5/osuT5/inference/continuous_batching.py` models arrivals, activation, round-robin/FIFO decode, stop reasons, cache-slot acquire/release, and slot generations. Strict manifests validate token/count recomputation, lifecycle arithmetic, state hashes, active-batch histograms, and cache-slot balance.
@@ -234,7 +266,7 @@ Until those gates pass, call results offline-engine throughput, not server optim
 
 ## Immediate Next Decision Points
 
-- Profile the measured B8 rowwise sampling/control gap before any merged scheduler wiring; retain the independent-lane comparison as the alternate physics shape.
+- Finish the bounded B8 processor/short-loop/packed-prefill evidence before any merged scheduler wiring; retain the independent-lane comparison as the alternate physics shape.
 - Run the independent B1 CUDA-graph lane comparison in its isolated experiment worktree.
 - Build only the execution shape that clears `5%` exact-output aggregate improvement.
 - Feed accepted single-song components, including any exact speculative verifier win, back into the offline engine and measure combined scheduler-wall throughput.
