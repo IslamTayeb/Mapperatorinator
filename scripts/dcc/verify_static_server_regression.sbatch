@@ -332,10 +332,10 @@ def main_batch_work(manifest_path: str) -> dict:
                     "work-normalized diagnostic requires one B1 request row and one server batch "
                     "per main record"
                 )
-            if int(sizes[0]) != 5 or int(request_counts[0]) != 5 or int(work_items[0]) != 1:
+            if int(request_counts[0]) != int(sizes[0]) or int(work_items[0]) != 1:
                 raise SystemExit(
-                    "work-normalized diagnostic requires a merged B5 server batch made from five "
-                    "independent B1 request rows"
+                    "work-normalized diagnostic requires each server batch to contain independent "
+                    "B1 request rows"
                 )
             batch_id = str(ids[0])
             batch = batches.setdefault(
@@ -360,27 +360,37 @@ def main_batch_work(manifest_path: str) -> dict:
 
     ordered = sorted(batches.values(), key=lambda batch: int(batch["batch_id"]))
     for batch in ordered:
-        if len(batch["request_generated_tokens"]) != batch["batch_size"]:
+        if len(batch["request_generated_tokens"]) != batch["request_count"]:
             raise SystemExit(
                 f"batch {batch['batch_id']} has {len(batch['request_generated_tokens'])} request records, "
-                f"expected {batch['batch_size']}"
+                f"expected {batch['request_count']}"
             )
         batch["active_decode_steps"] = max(batch["request_generated_tokens"])
         batch["generated_tokens_sum"] = sum(batch["request_generated_tokens"])
-    active_steps = sum(batch["active_decode_steps"] for batch in ordered)
-    elapsed_seconds = sum(batch["elapsed_seconds"] for batch in ordered)
+    b5_batches = [batch for batch in ordered if batch["batch_size"] == 5]
+    excluded_batches = [batch for batch in ordered if batch["batch_size"] != 5]
+    if not b5_batches:
+        raise SystemExit("work-normalized diagnostic observed no merged B5 main batches")
+    active_steps = sum(batch["active_decode_steps"] for batch in b5_batches)
+    elapsed_seconds = sum(batch["elapsed_seconds"] for batch in b5_batches)
     if active_steps <= 0 or elapsed_seconds <= 0:
         raise SystemExit("work-normalized diagnostic requires positive active steps and elapsed time")
     return {
         "git_commit": manifest.get("git_commit"),
         "manifest_path": str(manifest_path),
         "manifest_sha256": hashlib.sha256(Path(manifest_path).read_bytes()).hexdigest(),
-        "unique_main_batches": len(ordered),
+        "observed_unique_main_batches": len(ordered),
+        "unique_b5_main_batches": len(b5_batches),
+        "excluded_non_b5_batch_size_histogram": {
+            str(size): sum(batch["batch_size"] == size for batch in excluded_batches)
+            for size in sorted({batch["batch_size"] for batch in excluded_batches})
+        },
         "active_decode_steps": active_steps,
-        "unique_main_batch_elapsed_seconds": elapsed_seconds,
+        "unique_b5_main_batch_elapsed_seconds": elapsed_seconds,
         "active_decode_steps_per_second": active_steps / elapsed_seconds,
         "seconds_per_active_decode_step": elapsed_seconds / active_steps,
-        "batches": ordered,
+        "b5_batches": b5_batches,
+        "excluded_non_b5_batches": excluded_batches,
     }
 
 
@@ -392,8 +402,9 @@ report = {
     "schema_version": 1,
     "result_class": "static_server_shared_rng_work_normalized_diagnostic",
     "claim_scope": (
-        "diagnostic only: normalizes unique B5 main-batch elapsed time by the longest generated "
-        "row in each batch; it does not replace scheduler-wall throughput or prove token equivalence"
+        "diagnostic only: stratifies to unique merged B5 main batches and normalizes their elapsed "
+        "time by the longest generated B1 request row in each batch; B1-B4 tail batches are reported "
+        "but excluded, and this does not replace scheduler-wall throughput or prove token equivalence"
     ),
     "control": control,
     "candidate": candidate,
