@@ -26,10 +26,10 @@ from osuT5.osuT5.inference.direct_decode import (
 )
 from osuT5.osuT5.inference.server import get_eos_token_id
 from osuT5.osuT5.model.custom_transformers import modeling_varwhisper
-from osuT5.osuT5.runtime_profiling import (
-    active_prefix_self_attention_length,
-    generation_profile_context,
+from osuT5.osuT5.inference.optimized.kernels.dispatch import (
+    active_prefix_attention_inputs,
 )
+from osuT5.osuT5.runtime_profiling import generation_profile_context
 from osuT5.osuT5.tokenizer import ContextType
 from utils.profile_decode_linear_kernels import (
     _allclose,
@@ -264,19 +264,18 @@ def _effective_attention_inputs(
         sliding_window_mask: torch.Tensor | None,
         local_attention: tuple[int, int],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    effective_mask = sliding_window_mask if local_attention != (-1, -1) else attention_mask
-    effective_key = key
-    effective_value = value
-
-    if not module.is_cross_attention:
-        prefix_length = active_prefix_self_attention_length()
-        if prefix_length is not None and prefix_length > 0 and effective_key.shape[-2] > prefix_length:
-            effective_key = effective_key[:, :, :prefix_length, :]
-            effective_value = effective_value[:, :, :prefix_length, :]
-            if isinstance(effective_mask, torch.Tensor) and effective_mask.shape[-1] > prefix_length:
-                effective_mask = effective_mask[..., :prefix_length]
-
-    return query, effective_key, effective_value, effective_mask
+    effective_mask = (
+        sliding_window_mask
+        if local_attention != (-1, -1)
+        else attention_mask
+    )
+    return active_prefix_attention_inputs(
+        module=module,
+        query=query,
+        key=key,
+        value=value,
+        attention_mask=effective_mask,
+    )
 
 
 def _uses_q1_bmm(

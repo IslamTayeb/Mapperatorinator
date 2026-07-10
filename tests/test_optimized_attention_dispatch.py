@@ -6,6 +6,7 @@ import torch
 
 from osuT5.osuT5.inference.optimized.kernels import dispatch
 from osuT5.osuT5.inference.optimized.kernels.dispatch import (
+    active_prefix_attention_inputs,
     q1_rope_cache_self_attention_forward,
     sdpa_q1_attention_forward,
 )
@@ -40,6 +41,58 @@ def test_q1_bmm_dispatch_preserves_exact_calculation_order():
 
     assert result is not None
     assert torch.equal(result[0], expected)
+
+
+def test_active_prefix_dispatch_preserves_exact_slice_order(monkeypatch):
+    query = torch.randn((1, 2, 1, 4))
+    key = torch.randn((1, 2, 12, 4))
+    value = torch.randn((1, 2, 12, 4))
+    mask = torch.randn((1, 1, 1, 12))
+    module = SimpleNamespace(is_cross_attention=False)
+    monkeypatch.setattr(
+        dispatch,
+        "active_prefix_self_attention_length",
+        lambda: 7,
+    )
+
+    result = active_prefix_attention_inputs(
+        module=module,
+        query=query,
+        key=key,
+        value=value,
+        attention_mask=mask,
+    )
+
+    assert result[0] is query
+    assert torch.equal(result[1], key[:, :, :7, :])
+    assert torch.equal(result[2], value[:, :, :7, :])
+    assert torch.equal(result[3], mask[..., :7])
+
+
+def test_active_prefix_dispatch_leaves_cross_attention_unchanged(monkeypatch):
+    query = torch.randn((1, 2, 1, 4))
+    key = torch.randn((1, 2, 12, 4))
+    value = torch.randn((1, 2, 12, 4))
+    mask = torch.randn((1, 1, 1, 12))
+    module = SimpleNamespace(is_cross_attention=True)
+    monkeypatch.setattr(
+        dispatch,
+        "active_prefix_self_attention_length",
+        lambda: 7,
+    )
+
+    result = active_prefix_attention_inputs(
+        module=module,
+        query=query,
+        key=key,
+        value=value,
+        attention_mask=mask,
+    )
+
+    assert result[0] is query
+    assert result[1] is key
+    assert result[2] is value
+    assert result[3] is mask
 
 
 def test_dispatch_returns_none_outside_exact_q1_contract():

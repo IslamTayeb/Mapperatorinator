@@ -7,10 +7,9 @@ import torch
 from torch import nn
 from transformers.modeling_outputs import BaseModelOutput
 
-from osuT5.osuT5.runtime_profiling import (
-    active_prefix_self_attention_context,
-    profile_range,
-)
+from osuT5.osuT5.runtime_profiling import profile_range
+
+from .runtime_context import active_prefix_self_attention_context
 
 
 def _bucketed_prefix_length(cur_len: int, bucket_size: int, max_cache_len: int) -> int:

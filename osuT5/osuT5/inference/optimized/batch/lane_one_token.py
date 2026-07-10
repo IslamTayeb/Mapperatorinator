@@ -19,7 +19,7 @@ from typing import Any, Mapping, Sequence
 import torch
 
 from ..single.session import last_token_logits
-from ....runtime_profiling import active_prefix_self_attention_context
+from ..single.runtime_context import active_prefix_self_attention_context
 
 
 PYTORCH_PER_STREAM_CUBLAS_WORKSPACE = "pytorch_per_handle_and_stream_workspace"

@@ -7,10 +7,41 @@ from typing import Callable
 import torch
 from transformers.cache_utils import StaticCache
 
-from ....runtime_profiling import (
+from ....runtime_profiling import profile_range
+from ..single.runtime_context import (
     active_prefix_self_attention_length,
-    profile_range,
 )
+
+
+def active_prefix_attention_inputs(
+    *,
+    module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+]:
+    """Trim self-attention inputs without changing views or operation order."""
+    prefix_length = active_prefix_self_attention_length()
+    if (
+        not module.is_cross_attention
+        and prefix_length is not None
+        and prefix_length > 0
+        and key.shape[-2] > prefix_length
+    ):
+        key = key[:, :, :prefix_length, :]
+        value = value[:, :, :prefix_length, :]
+        if (
+            isinstance(attention_mask, torch.Tensor)
+            and attention_mask.shape[-1] > prefix_length
+        ):
+            attention_mask = attention_mask[..., :prefix_length]
+    return query, key, value, attention_mask
 
 
 def sdpa_q1_attention_forward(

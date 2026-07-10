@@ -238,6 +238,41 @@ def test_nested_default_generation_context_temporarily_disables_attention_hooks(
         assert attention_runtime_hooks() is outer_hooks
 
 
+def test_active_prefix_context_owns_state_and_preserves_other_hooks():
+    from osuT5.osuT5.inference.optimized.single.runtime_context import (
+        active_prefix_self_attention_context,
+        active_prefix_self_attention_length,
+        attention_runtime_context,
+    )
+    from osuT5.osuT5.runtime_profiling import generation_profile_context
+
+    assert active_prefix_self_attention_length() is None
+    with generation_profile_context(q1_bmm_cross_attention=True):
+        q1_hook = attention_runtime_hooks().sdpa_attention_forward
+        with active_prefix_self_attention_context(64):
+            hooks = attention_runtime_hooks()
+            assert active_prefix_self_attention_length() == 64
+            assert hooks.sdpa_attention_inputs is not None
+            assert hooks.sdpa_attention_forward is q1_hook
+            prefix_hook = hooks.sdpa_attention_inputs
+            with attention_runtime_context(
+                q1_bmm_cross_attention=True,
+                native_q1_self_attention=False,
+                native_q1_rope_cache_self_attention=False,
+            ):
+                nested_hooks = attention_runtime_hooks()
+                assert nested_hooks.sdpa_attention_inputs is prefix_hook
+                assert nested_hooks.sdpa_attention_forward is not None
+            with active_prefix_self_attention_context(None):
+                assert active_prefix_self_attention_length() is None
+                assert attention_runtime_hooks().sdpa_attention_inputs is None
+            assert active_prefix_self_attention_length() == 64
+            assert attention_runtime_hooks().sdpa_attention_inputs is not None
+        assert active_prefix_self_attention_length() is None
+        assert attention_runtime_hooks().sdpa_attention_inputs is None
+        assert attention_runtime_hooks().sdpa_attention_forward is q1_hook
+
+
 def test_fused_generation_context_installs_only_fused_hook(monkeypatch):
     from osuT5.osuT5.inference.optimized.kernels import q1_attention
     from osuT5.osuT5.runtime_profiling import generation_profile_context
@@ -265,3 +300,5 @@ def test_model_hot_path_has_no_optimized_or_native_imports():
     assert "native_q1_rope_cache_self_attention_enabled" not in source
     assert "native_q1_self_attention_enabled" not in source
     assert "q1_bmm_cross_attention_enabled" not in source
+    assert "active_prefix_self_attention_length" not in source
+    assert "key[:, :, :prefix_length" not in source

@@ -8,7 +8,8 @@ from transformers.cache_utils import EncoderDecoderCache, StaticCache
 from transformers.modeling_outputs import BaseModelOutput
 
 from osuT5.osuT5.inference.cache_utils import MapperatorinatorCache, get_cache
-from osuT5.osuT5.runtime_profiling import active_prefix_self_attention_context
+
+from .runtime_context import active_prefix_self_attention_context
 
 
 @dataclass

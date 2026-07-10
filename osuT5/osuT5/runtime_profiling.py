@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Iterator
 
 import torch
@@ -8,7 +8,6 @@ from torch.profiler import record_function
 
 
 _DETAIL_RANGES_ENABLED = False
-_ACTIVE_PREFIX_SELF_ATTENTION_LENGTH: int | None = None
 
 _SDPA_BACKEND_ALIASES = {
     "flash": "FLASH_ATTENTION",
@@ -27,10 +26,6 @@ def detail_ranges_enabled() -> bool:
     return _DETAIL_RANGES_ENABLED
 
 
-def active_prefix_self_attention_length() -> int | None:
-    return _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH
-
-
 @contextmanager
 def generation_profile_context(
         *,
@@ -42,12 +37,10 @@ def generation_profile_context(
         native_q1_rope_cache_self_attention: bool = False,
 ) -> Iterator[None]:
     """Temporarily enable opt-in generation profiling controls."""
-    global _DETAIL_RANGES_ENABLED, _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH
+    global _DETAIL_RANGES_ENABLED
 
     previous_detail_ranges = _DETAIL_RANGES_ENABLED
-    previous_active_prefix_length = _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH
     _DETAIL_RANGES_ENABLED = bool(detail_ranges)
-    _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH = active_prefix_self_attention_length
     try:
         from osuT5.osuT5.inference.runtime_dispatch import (
             AttentionRuntimeHooks,
@@ -73,24 +66,39 @@ def generation_profile_context(
                     native_q1_rope_cache_self_attention
                 ),
             )
-        with optimized_attention_context, sdpa_backend_context(sdpa_backend):
+        optimized_active_prefix_context = nullcontext()
+        if (
+            active_prefix_self_attention_length is not None
+            or q1_bmm_cross_attention
+            or native_q1_self_attention
+            or native_q1_rope_cache_self_attention
+        ):
+            from osuT5.osuT5.inference.optimized.single.runtime_context import (
+                active_prefix_self_attention_context as optimized_prefix_context,
+            )
+
+            optimized_active_prefix_context = optimized_prefix_context(
+                active_prefix_self_attention_length
+            )
+        with (
+            optimized_attention_context,
+            optimized_active_prefix_context,
+            sdpa_backend_context(sdpa_backend),
+        ):
             yield
     finally:
         _DETAIL_RANGES_ENABLED = previous_detail_ranges
-        _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH = previous_active_prefix_length
 
 
 @contextmanager
 def active_prefix_self_attention_context(prefix_length: int | None) -> Iterator[None]:
-    """Temporarily trim SDPA self-attention K/V and mask to a fixed active prefix length."""
-    global _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH
+    """Lazy compatibility adapter for optimized active-prefix state."""
+    from osuT5.osuT5.inference.optimized.single.runtime_context import (
+        active_prefix_self_attention_context as optimized_prefix_context,
+    )
 
-    previous_active_prefix_length = _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH
-    _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH = prefix_length
-    try:
+    with optimized_prefix_context(prefix_length):
         yield
-    finally:
-        _ACTIVE_PREFIX_SELF_ATTENTION_LENGTH = previous_active_prefix_length
 
 
 @contextmanager

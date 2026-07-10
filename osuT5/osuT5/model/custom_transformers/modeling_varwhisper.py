@@ -29,7 +29,6 @@ from transformers.utils import (
 )
 
 from ...runtime_profiling import (
-    active_prefix_self_attention_length,
     detail_ranges_enabled,
     profile_range,
 )
@@ -361,15 +360,18 @@ def sdpa_attention_forward(
     if local_attention != (-1, -1):
         attention_mask = sliding_window_mask
 
-    if not module.is_cross_attention:
-        prefix_length = active_prefix_self_attention_length()
-        if prefix_length is not None and prefix_length > 0 and key.shape[-2] > prefix_length:
-            key = key[:, :, :prefix_length, :]
-            value = value[:, :, :prefix_length, :]
-            if isinstance(attention_mask, torch.Tensor) and attention_mask.shape[-1] > prefix_length:
-                attention_mask = attention_mask[..., :prefix_length]
+    runtime_hooks = attention_runtime_hooks()
+    optimized_attention_inputs = runtime_hooks.sdpa_attention_inputs
+    if optimized_attention_inputs is not None:
+        query, key, value, attention_mask = optimized_attention_inputs(
+            module=module,
+            query=query,
+            key=key,
+            value=value,
+            attention_mask=attention_mask,
+        )
 
-    optimized_attention_forward = attention_runtime_hooks().sdpa_attention_forward
+    optimized_attention_forward = runtime_hooks.sdpa_attention_forward
     if optimized_attention_forward is not None:
         optimized_output = optimized_attention_forward(
             module=module,
