@@ -370,3 +370,31 @@ requires same-job reciprocal controls.
 - No performance improvement is claimed or pursued.
 - Every boundary commit records its predecessor for isolated rollback.
 - Protected batching and decoder-layer audit branches are never merged.
+
+## Boundary Evidence
+
+### K1 accepted native q1 ownership move
+
+Commit `b4e9926` moved the accepted q1 CUDA/C++ source byte-for-byte from the
+legacy module to `optimized/kernels/q1_attention.py`. The source SHA remained
+`c65438acc24d03f13fc0df694e29ddc2b21aff425cd01fef9d14814544febcd9`.
+The legacy module is now a call-lazy compatibility shim. A neutral hook registry
+is installed only by the enabled native runtime context, before model compile
+or graph capture; the VarWhisper hot path performs no import.
+
+Local gates passed `8` new import/loader/ABI/hook tests and `24` existing
+control-plane, server, and logits tests. A fresh default V32 import loaded no
+optimized, legacy-native, optimized-kernel, or `torch.utils.cpp_extension`
+module.
+
+DCC job `49560678` on RTX 2080 Ti, wrapper commit `31073f0`, passed the real
+SALVALAI seq9 q_len=1 gate with active-prefix length `128`, q1 BMM cross,
+native q1 self, fused RoPE/cache, and verifier DecodeSession enabled. Raw logits
+were allclose (`max_abs=1.9073486328125e-05`), finite/nonfinite layout matched,
+and top-20 IDs matched exactly. The report is
+`/work/imt11/Mapperatorinator/runs/optimized-single-one-token-49560678-31073f0/one-token.json`
+with SHA
+`9ea09f187bc0ae1f388029dd8bf880ce07cbda1de72dee3df7f6b2d1d54b2057`.
+The pre/post extension-cache inventories were identical with SHA
+`5c4e9fab18def3140bf8b9e447f8b5267ea613cdfd4135c4f0b4e0931e73878e`;
+the existing `mapperatorinator_q1_attention` cache entry was reused.
