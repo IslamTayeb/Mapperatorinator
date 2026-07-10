@@ -398,3 +398,20 @@ with SHA
 The pre/post extension-cache inventories were identical with SHA
 `5c4e9fab18def3140bf8b9e447f8b5267ea613cdfd4135c4f0b4e0931e73878e`;
 the existing `mapperatorinator_q1_attention` cache entry was reused.
+
+### S1 accepted verifier session ownership move
+
+Commit `caa5c00` moved the verifier session and one-token helper source
+byte-for-byte to `optimized/single/session.py`; SHA remained
+`cbaddf37772773a725598d7f970465d52efebe485a568697efe95b5f1a72798c`.
+The legacy `direct_decode.py` is now a lazy compatibility export. Optimized
+batch/speculative modules import the source owner directly. This boundary did
+not replace or modify the production session dictionary.
+
+Local session/import/batch/speculative gates passed. DCC job `49560747` on
+RTX 2080 Ti reran the same real SALVALAI seq9 path through the compatibility
+export and optimized source. Raw logits were allclose with the same
+`max_abs=1.9073486328125e-05`, finite/nonfinite layout and top-20 matched, and
+the gate completed successfully. Report:
+`/work/imt11/Mapperatorinator/runs/optimized-single-one-token-49560747-caa5c00/one-token.json`,
+SHA `942a90b9bfb0f669524a2aa11bddf2fdeacf6f6f966e6e0122050451ed65af9f`.
