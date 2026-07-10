@@ -124,18 +124,30 @@ import sys
 
 audit_path = Path(sys.argv[1])
 audits = []
-for module_name in ("inference", "osuT5.osuT5.inference.server"):
+for module_name in (
+    "inference",
+    "osuT5.osuT5.inference.processor",
+    "osuT5.osuT5.inference.server",
+    "osuT5.osuT5.model.custom_transformers.modeling_varwhisper",
+):
     importlib.import_module(module_name)
-    optimized_modules = sorted(
+    forbidden_modules = sorted(
         name
         for name in sys.modules
         if name.startswith("osuT5.osuT5.inference.optimized")
         or name.startswith("mapperatorinator_q1_")
+        or name
+        in {
+            "osuT5.osuT5.inference.native_decoder_layer",
+            "osuT5.osuT5.inference.native_linear",
+            "osuT5.osuT5.inference.native_q1_attention",
+            "torch.utils.cpp_extension",
+        }
     )
-    audits.append({"import": module_name, "optimized_modules": optimized_modules})
-    if optimized_modules:
+    audits.append({"import": module_name, "forbidden_modules": forbidden_modules})
+    if forbidden_modules:
         raise SystemExit(
-            f"{module_name} eagerly imported optimized/native modules: {optimized_modules}"
+            f"{module_name} eagerly imported optimized/native modules: {forbidden_modules}"
         )
 audit_path.write_text(json.dumps(audits, indent=2) + "\n", encoding="utf-8")
 PY
