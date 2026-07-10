@@ -135,6 +135,93 @@ The K4 graph projects the five-full target path from `163.088s` / `~261.4 tok/s`
 
 Keep the numeric/graph verifier, but do not build the n-gram runtime, run K8, or spend on rollback integration. Revisit only if the accepted q1 denominator materially slows, proposal/acceptance structure changes, or a new fixed-shape target kernel first demonstrates K4 below `5.480ms`. The physical `StaticCache` rollback API remains absent. The mock-only logical stale-suffix oracle in historical commit `cdfb577` never received a GPU gate and was removed by `b21109c` after the cost ceiling killed the family; do not treat it as retained runtime or verifier evidence.
 
+### v32-mini bounded feasibility gate
+
+The mini draft is a fresh proposal family, not a revival of the rejected n-gram
+call structure. No mini GPU result exists yet. The following artifact audit and
+cost surface are permission for one real-window feasibility scout only.
+
+Artifact audit on the current Hugging Face revisions:
+
+- `OliBomby/Mapperatorinator-v32-mini@7807f0dc70cab671be012e1f5ddf945b0b8b7278`
+- `OliBomby/Mapperatorinator-v32@74f22583400d259bf424819e11027c17933efe54`
+- root tokenizer SHA-256 is byte-identical:
+  `737148191316146ba76b6b7b0c59646baff6002ef834734dd113a8eb1e5036da`;
+  `gamemode=0` also matches at
+  `6b98be0fc04a95a9e9d4feb8e8b67cc48728a6667e3091dcd5cc528baeca18bd`,
+  and gamemodes `1`/`3` match the root hash. The target repository has no
+  `gamemode=2` subfolder, so the loader falls back to target root; mini
+  `gamemode=2` is itself byte-identical to mini root;
+- generation configs are byte-identical at
+  `10b901beeb3c982c16c53cd5b37a4f9b3d4674fc70cbc3e64c7b20fdb0433f51`;
+- all non-capacity model-config fields match. The mini is the base backbone
+  (`d_model=512`, six encoder/decoder layers, eight heads); the target is small
+  (`d_model=768`, twelve encoder/decoder layers, twelve heads). They can share
+  token IDs and prompt construction, but not encoder output, weights, KV cache,
+  graph buffers, or workspaces;
+- both local v32 training configs use the same data/token schema. Their only
+  differences are backbone and training schedule. The inference configs use
+  the same `temperature=0.9` and `top_p=0.9`, but the first mini scout must use
+  an explicit greedy draft policy with no target RNG access. Target sampling
+  remains the accepted production sampler.
+
+The target denominator is `q=3.825303748ms` per committed q1 output token and
+the measured safe K4 target replay is `T=8.4637517ms`. Let `h_j` count K4 calls
+that accepted exactly `j` draft tokens before the first mismatch, with `h_4`
+meaning full acceptance. The actual closed-loop committed length is:
+
+```text
+L = (sum(j=0..3, h_j * (j + 1)) + 4 * h_4) / sum(j=0..4, h_j)
+```
+
+This is deliberately not marginal draft-token acceptance. A mismatch emits one
+target token and immediately ends the span. For steady draft cost `D` per K4
+proposal call:
+
+```text
+break even: D < 1.00 * q * L - T
+5% keep bar: D < 0.95 * q * L - T
+```
+
+| Effective committed `L` | Break-even `D` | Strict 5% `D` |
+| ---: | ---: | ---: |
+| `1` | impossible (`-4.638ms`) | impossible (`-4.830ms`) |
+| `2` | impossible (`-0.813ms`) | impossible (`-1.196ms`) |
+| `3` | `<3.012ms` | `<2.438ms` |
+| `4` | `<6.837ms` | `<6.072ms` |
+
+Even a zero-cost draft therefore needs `L>2.329`, or more than `58.23%`
+committed-span efficiency. `mini_feasibility.py` computes the same surface from
+an empirical accepted-prefix histogram and charges fixed per-window draft
+overhead. It rejects a marginal-acceptance-only projection.
+
+The next and only approved shape is a one-window, seed-`12345`, FP32/SDPA,
+`profile_salvalai_smoke15`, main `sequence_index=9`, `max_new_tokens=256` scout:
+
+1. Capture the accepted target-only sampled transcript and final target RNG
+   hash. Do not use a standalone mini transcript as evidence.
+2. At every proposal boundary, feed the mini the real prompt plus the exact
+   committed target transcript, then greedily propose at most four tokens. On
+   the first mismatch, commit the captured target token and build the next mini
+   proposal from that corrected transcript. Record the committed-prefix hash
+   supplied to every proposal so reconditioning is auditable.
+3. Record `h_0..h_4`, short EOS/max boundary proposals separately, accepted
+   draft tokens, committed tokens per target call, full-accept fraction, and
+   the exact target-call structure. Replaying the closed loop must reproduce the
+   captured target transcript and stop reason exactly; the mini never consumes
+   target RNG.
+4. Measure cold and warmed mini encoder time, prefix-cache construction or
+   rebuild time, sequential four-token greedy proposal CUDA time, combined
+   target+mini peak VRAM, and steady draft cost on the exact corrected prefixes.
+   Report both an optimistic steady-cache lower bound and the actually runnable
+   rebuild-inclusive cost; do not implement cache rollback.
+5. Apply the finite-window projection, including mini encoder/rebuild overhead.
+   Stop if the measured point does not strictly clear `5%`. A passing point only
+   authorizes a multi-window acceptance/cost repeat, not runtime wiring.
+
+Do not submit this GPU scout until the root campaign agent explicitly approves
+the bounded experiment and its isolated DCC checkout.
+
 ## Current Bottleneck And Ceiling
 
 Post-frontier diagnostics show that another narrow wrapper or launch tweak cannot reach `500`:

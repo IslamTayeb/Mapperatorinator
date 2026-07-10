@@ -40,6 +40,16 @@ from .ngram_acceptance import (
     run_generated_prefix_ngram_profile_scout,
     simulate_generated_prefix_ngram_acceptance,
 )
+from .mini_feasibility import (
+from .mini_feasibility import (
+    ACCEPTED_TARGET_Q1_MS,
+    CAMPAIGN_MINIMUM_IMPROVEMENT_FRACTION,
+    DEFAULT_SPECULATION_K,
+    MEASURED_TARGET_K4_GRAPH_MS,
+    ClosedLoopAcceptanceHistogram,
+    MiniDraftProjection,
+    draft_cost_surface_ms,
+)
 from .verifier import (
     ExactSpeculativeAdapter,
     SequentialTargetAdapter,
@@ -50,16 +60,22 @@ from .verifier import (
 
 __all__ = [
     "CacheCommitEvent",
+    "ACCEPTED_TARGET_Q1_MS",
     "CAMPAIGN_SPECULATION_K",
+    "CAMPAIGN_MINIMUM_IMPROVEMENT_FRACTION",
+    "ClosedLoopAcceptanceHistogram",
     "DEFAULT_ADVANCE_THRESHOLD",
     "DEFAULT_MAX_NGRAM_LENGTH",
     "DecodeIterationKind",
+    "DEFAULT_SPECULATION_K",
     "DraftProposal",
     "EvaluatedTargetSpan",
     "ExactTranscriptComparison",
     "ExactSpeculativeAdapter",
     "GeneratedPrefixNgramProposal",
     "MissingSpeculativeScoutAdapterError",
+    "MEASURED_TARGET_K4_GRAPH_MS",
+    "MiniDraftProjection",
     "NgramAcceptanceMetrics",
     "ProfileTokenWindow",
     "ProposalSourceKind",
@@ -75,6 +91,7 @@ __all__ = [
     "TargetTokenDistribution",
     "compare_exact_transcript",
     "aggregate_ngram_acceptance_metrics",
+    "draft_cost_surface_ms",
     "find_generated_prefix_ngram_proposal",
     "load_profile_token_windows",
     "load_scout_adapter_factory",
