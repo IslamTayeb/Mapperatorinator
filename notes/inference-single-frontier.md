@@ -159,8 +159,8 @@ The next production-facing experiment must first be verifier-only and must:
 
 Current ranked scouts:
 
-1. a broad FP32 whole-layer/stack native or cuBLASLt verifier;
-2. `OliBomby/Mapperatorinator-v32-mini` speculative verification only if measured draft cost and target-call structure first project above `5%` on the accepted stack;
+1. a bounded `OliBomby/Mapperatorinator-v32-mini` draft-cost and closed-loop acceptance scout, with no runtime work unless its weighted projection clears `5%` on the accepted stack;
+2. a broad FP32 whole-layer/stack native or cuBLASLt verifier;
 3. a whole-step device-controlled graph only if refreshed profiling still shows more than `5%` exclusive headroom and exact early EOS/RNG rollback is proven.
 
 Speculation must consume target RNG exactly one output position at a time, commit only matching draft tokens, discard uncommitted cache suffixes on mismatch, and preserve final token/RNG/output identity. Stop before production if draft cost plus verified target calls saved project below `5%`.
