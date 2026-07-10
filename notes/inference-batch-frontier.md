@@ -515,6 +515,50 @@ row indexing in the existing full-scan processor. Branch commits `79c644f` and
 bitwise CPU parity. Those existing-file changes remain experiment-branch-only
 until normal V32 exactness and no-regression gates pass.
 
+### Changing-prefix hybrid B2 and weighted next gate
+
+Job `49555060`, commit `2b6e690`, ran the separately reviewed bucket-128
+changing-prefix gate on an RTX 2080 Ti. Phase A reached `619.208 tok/s` in the
+slower reciprocal order. Phase B (16 changing steps, five reset-separated
+trials per order) reached `621.893 tok/s` worst and `628.868 tok/s` best.
+Tokens, per-step/final private RNG, raw logits, bitwise processed scores,
+static inputs, active/future self cache, cross cache, neutral padding, stop
+state, pointer/reset ownership, and reciprocal launch orders passed. Timed
+allocated/reserved deltas were zero. The same-job private-B1 gain was
+`+49.26%`; the changing-prefix result was `-7.18%` versus the fixed-prefix
+`670.026 tok/s` datum.
+
+```text
+/work/imt11/Mapperatorinator/runs/hybrid-changing-prefix-49555060-2b6e690/hybrid-changing-prefix.json
+SHA-256 365c9ffa99878ee68d45d8152634398b254ab731f2d75bb01d3d86dfdc8f6a6b
+```
+
+This proves only one identical-input, two-seed SALVALAI seq9 bucket-128 shape.
+No EOS occurred, and bucket 128 accounts for only `305 / 5,905` accepted decode
+tokens. The deliberately invalid all-bucket extrapolation is `542.663 tok/s`
+decode-only but `443.896 tok/s` with the current full setup charge, requiring
+`61.65%` setup removal. It is not queue evidence and authorizes no setup,
+scheduler, runtime, server, or offline-engine wiring.
+
+A follow-up CPU replay now closes B2 as the exact-five execution shape before
+more GPU work. It distributes each accepted window's full model time uniformly
+over its decode positions, assumes free coordination and perfect heterogeneous
+overlap, and even drops three zero-decode windows. Despite those optimistic
+assumptions, ideal all-ready K2 reaches only `495.983 tok/s`; ideal K3 reaches
+`640.767 tok/s`. The exact-five path therefore requires a K3 physics gate.
+
+The cheaper remaining B2 question is a ten-request queue containing two exact,
+isolated copies of each of the five accepted songs. With no singleton rows and
+the current `4.883299s` linearized setup charge, its production-weighted B2
+decode must sustain at least `623.657 tok/s` (`<=3.206893 ms` per pair) to reach
+`500` scheduler-wall main tok/s. Bucket 128 already straddles this bar, so the
+next authorized work is a real accepted-prefix, horizon-8 bucket-576 gate.
+Only an exact and still-plausible bucket-576 result may advance to bucket 640,
+then 512. Do not synthesize long prefixes by padding the old seq9 probe; rebuild
+and hash the accepted Lambada repeat01 seq9 prompt/transcript. Do not run Phase
+B, setup optimization, or runtime work until this cheapest weighted gate
+survives review.
+
 ### CPU continuous-scheduler harness
 
 `osuT5/osuT5/inference/continuous_batching.py` models arrivals, activation, round-robin/FIFO decode, stop reasons, cache-slot acquire/release, and slot generations. Strict manifests validate token/count recomputation, lifecycle arithmetic, state hashes, active-batch histograms, and cache-slot balance.
@@ -542,13 +586,16 @@ The first one-token physics comparison is complete:
    complete step;
 2. two independent B1 CUDA-graph lanes retained exact transcripts/private state
    and overlapped model work, but regressed complete throughput to
-   `397.903-398.291 tok/s` and are rejected.
+   `397.903-398.291 tok/s` and are rejected;
+3. the fixed hybrid B2 bridge reached `670.026-723.633 tok/s`, and its bounded
+   bucket-128 changing-prefix follow-up reached `621.893-628.868 tok/s`, but
+   exact-five ideal K2 replay still tops out at `495.983 tok/s`.
 
-Do not build a production scheduler from either one-token component result. The
-remaining merged-family gate is to profile the measured B8 rowwise
-sampling/control gap, then prove a multi-step mixed-song loop with distinct
-songs, request-order permutations, timing/main contexts, prefix buckets,
-EOS/max-token stops, cache-slot release/reuse, and output assembly.
+Do not build a production scheduler from any component result. The only
+authorized B2 work is the production-weighted ten-request bucket gate above;
+the only authorized exact-five continuation after B2 closes is a separately
+reviewed K3 physics verifier. Mixed-song lifecycle, timing/main, EOS/max-token,
+slot reuse, output assembly, setup, and scheduler work remain downstream gates.
 
 For each shape report:
 
@@ -615,11 +662,14 @@ Until those gates pass, call results offline-engine throughput, not server optim
 
 ## Immediate Next Decision Points
 
-- Fixed-slot packed B8 is the selected execution shape after its exact `+13.42%`
-  complete-step gain and the lane rejection. Run exactly one mixed eight-row,
-  at-least-five-song 16-step gate before any longer loop or scheduler wiring;
-  require exact private behavior, `>=5%`, and `>=500 tok/s`.
-- Keep the independent-lane verifier as rejected physics evidence; do not build
-  L=3/L=4 or lane runtime wiring.
+- Reconstruct and hash the accepted Lambada repeat01 seq9 prompt/transcript,
+  then run only the real-prefix bucket-576 B2 horizon-8 gate. Stop on any
+  token/RNG/cache/static-state mismatch or if the ten-request weighted ceiling
+  is no longer plausible.
+- Exact-five K2 is closed at an optimistic `495.983 tok/s`. If weighted B2 is
+  rejected, the next bounded physics family is heterogeneous K3 at bucket 576,
+  not setup or scheduler code.
+- Keep the independent-lane and packed/merged verifiers as physics evidence;
+  do not wire them into a runtime before a setup-inclusive exact queue win.
 - Feed accepted single-song components, including any exact speculative verifier win, back into the offline engine and measure combined scheduler-wall throughput.
 - Stop for user input before reduced precision, output/RNG relaxation, or maintainer-facing changes outside the optimized package/adapter boundary.
