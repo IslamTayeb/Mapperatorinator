@@ -2,6 +2,12 @@
 
 Last consolidated: 2026-07-10. This is the canonical decision index. Dated notes remain the detailed evidence archive and must not be deleted until a separate audit confirms every needed job, commit, artifact, conclusion, and revisit condition is represented here.
 
+The 2026-07-10 deletion audit found only two fully superseded notes and removed
+them: `2026-07-04-current-exact-optimization-frontier.md` and
+`2026-07-07-batched-fast-branch-abandoned.md`. The remaining dated notes retain
+unique evidence and stay until a self-contained historical evidence index
+captures it; a link back to a note does not count as preservation.
+
 Legend:
 
 - **accepted**: retained default-off runtime component or durable verifier/measurement infrastructure;
