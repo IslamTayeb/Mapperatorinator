@@ -105,7 +105,7 @@ These tools remain useful even though their associated experiment did not become
 
 ## Current Open Families
 
-### Generated-prefix n-gram structural acceptance
+### Speculative scout status
 
 CPU-only replay at analysis commit `05005e8` used exact repeat01 main-token profiles from five-song schema-4 jobs `49543717` (15s smoke) and `49543718` (full song), produced at `a709b86`. With max n-gram length `4`, the token-weighted structural target-call reductions were:
 
@@ -123,7 +123,7 @@ Full-song per-song accepted-token coverage was Lambada `21.40%`, PEGASUS `17.77%
 
 Report SHA256s are `6c96678d406d7770b477c3ea0621daf98f4068fbf6a44ea0c36799bb3542c16f` (smoke) and `18ecf61be605d939e0c1b5362c3ea968b34ec3472c0dec21bf4d293114998098` (full).
 
-Advance generated-prefix n-grams to the GPU q_len=K numeric/cache/cost gate; start with K=4 because K=8 adds only `200` full-song structural calls saved (`8,499` versus `8,299`) while nearly doubling proposed positions (`101,087` versus `55,512`). This is a structural ceiling, not TPS: prompt history, target numerics, cache commit/rollback, and proposal/target costs remain unmeasured. Passing a suite manifest instead of a profile failed loudly with exit `1` because no per-window `generation` list was present.
+This structural result justified the K4 GPU target-span gate. The subsequent eager and fixed-shape graph measurements rejected the n-gram runtime above: K8 adds only `200` full-song structural calls saved (`8,499` versus `8,299`) while nearly doubling proposed positions (`101,087` versus `55,512`), and K4 target replay still misses the current-stack cost bar. Keep these reports as acceptance evidence; do not rerun or production-wire n-grams without a listed revisit condition. Passing a suite manifest instead of a profile failed loudly with exit `1` because no per-window `generation` list was present.
 
 | Family | Required pre-production evidence |
 | --- | --- |
