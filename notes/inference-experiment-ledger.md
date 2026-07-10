@@ -102,9 +102,29 @@ These tools remain useful even though their associated experiment did not become
 
 ## Current Open Families
 
+### Generated-prefix n-gram structural acceptance
+
+CPU-only replay at analysis commit `05005e8` used exact repeat01 main-token profiles from five-song schema-4 jobs `49543717` (15s smoke) and `49543718` (full song), produced at `a709b86`. With max n-gram length `4`, the token-weighted structural target-call reductions were:
+
+| Scope | K=2 | K=4 | K=8 | Accepted-token coverage |
+| --- | ---: | ---: | ---: | ---: |
+| smoke, `5,955` tokens / `50` windows | `15.18%` | `20.96%` | `21.34%` | `21.41%` |
+| full, `42,634` tokens / `448` windows | `14.72%` | `19.47%` | `19.93%` | `20.05-20.08%` |
+
+Full-song per-song accepted-token coverage was Lambada `21.40%`, PEGASUS `17.77%`, Ela ke Leitada `20.45%`, SALVALAI `18.59%`, and Nube Negra `22.19-22.35%`; smoke coverage was `19.03-22.86%`. Exact reports:
+
+```text
+/work/imt11/Mapperatorinator/runs/inference-denominator-five_smoke-49543717-a709b86/ngram-generated-prefix-warmed-repeat01-smoke-main05005e8.json
+/work/imt11/Mapperatorinator/runs/inference-denominator-five_full-49543718-a709b86/ngram-generated-prefix-warmed-repeat01-full-main05005e8.json
+```
+
+Report SHA256s are `6c96678d406d7770b477c3ea0621daf98f4068fbf6a44ea0c36799bb3542c16f` (smoke) and `18ecf61be605d939e0c1b5362c3ea968b34ec3472c0dec21bf4d293114998098` (full).
+
+Advance generated-prefix n-grams to the GPU q_len=K numeric/cache/cost gate; start with K=4 because K=8 adds only `200` full-song structural calls saved (`8,499` versus `8,299`) while nearly doubling proposed positions (`101,087` versus `55,512`). This is a structural ceiling, not TPS: prompt history, target numerics, cache commit/rollback, and proposal/target costs remain unmeasured. Passing a suite manifest instead of a profile failed loudly with exit `1` because no per-window `generation` list was present.
+
 | Family | Required pre-production evidence |
 | --- | --- |
-| Exact speculative verification | n-gram and v32-mini drafts at `K=2/4/8`; sequential-vs-q_len=K numerics; exact target RNG consumption; EOS/cache rollback; acceptance and target-call savings; weighted projection `>5%`. |
+| Exact speculative verification | Generated-prefix acceptance clears structural triage; next prove K=4 sequential-vs-q_len=K numerics, exact target RNG consumption, EOS/cache rollback, and measured proposal/target cost before any TPS claim. Keep K=2 as the lower-cost control and test K=8 only if K=4 retains a target-sized measured signal. The v32-mini draft remains unmeasured. |
 | Broad FP32 decoder-layer/stack verifier | ABI and cache-slot exactness; weighted prefixes `128..768`; projected `>=1.412s`, preferably `>=2.824s`; then full correctness ladder. |
 | Batch physics: merged B vs independent B1 lanes | distinct-song and permutation exactness, staggered arrival/slot reuse, model-only and complete-step TPS, VRAM, timeline, and `>5%` aggregate gain over optimized serial. |
 | Optimized offline scheduler | B1 parity through five-song/three-seed exact queue, explicit request state, scheduler-wall target, cold/latency/memory reporting. |
