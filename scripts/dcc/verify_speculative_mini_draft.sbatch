@@ -15,6 +15,8 @@ ENV=/hpc/group/romerolab/imt11/envs/mapperatorinator
 REPO=${MAPPERATORINATOR_REPO:?Set MAPPERATORINATOR_REPO to the isolated v32-mini DCC worktree}
 WORK=/work/imt11/Mapperatorinator
 EXPECTED_COMMIT=${EXPECTED_COMMIT:?Set EXPECTED_COMMIT to the pushed v32-mini verifier commit}
+LOADER_PREFLIGHT_REPORT="$WORK/runs/spec-mini-loaders-cpu-49548759-00f68e7/v32-mini-loader-preflight.json"
+EXPECTED_LOADER_PREFLIGHT_SHA256=3babbc7f5feb5293af206d53fd8506c21b7e4d94c0dd02397291702feebaef96
 if [[ ! -d "$REPO" ]]; then
   echo "Explicit DCC worktree is missing: $REPO" >&2
   exit 2
@@ -34,6 +36,25 @@ if [[ -n "$(git -C "$REPO" status --porcelain)" ]]; then
   git -C "$REPO" status --short >&2
   exit 2
 fi
+if [[ ! -f "$LOADER_PREFLIGHT_REPORT" ]]; then
+  echo "Pinned CPU loader preflight is missing: $LOADER_PREFLIGHT_REPORT" >&2
+  exit 2
+fi
+ACTUAL_LOADER_PREFLIGHT_SHA256=$(sha256sum "$LOADER_PREFLIGHT_REPORT" | cut -d' ' -f1)
+if [[ "$ACTUAL_LOADER_PREFLIGHT_SHA256" != "$EXPECTED_LOADER_PREFLIGHT_SHA256" ]]; then
+  echo "Pinned CPU loader preflight SHA changed: $ACTUAL_LOADER_PREFLIGHT_SHA256" >&2
+  exit 2
+fi
+jq -e '
+  .gate == "v32_mini_loader_preflight"
+  and .pass == true
+  and .result_class == "loader_preflight"
+  and .metadata.git_commit == "00f68e7ee87867a55d3567cf8eafb1e396e490c1"
+  and .artifacts.compatibility.pass == true
+  and .artifacts.target.requested_revision == "74f22583400d259bf424819e11027c17933efe54"
+  and .artifacts.mini.requested_revision == "7807f0dc70cab671be012e1f5ddf945b0b8b7278"
+  and .not_run.gpu_feasibility_gate == true
+' "$LOADER_PREFLIGHT_REPORT" >/dev/null
 
 mkdir -p \
   "$WORK/logs" \
@@ -66,6 +87,8 @@ echo "run_root=$RUN_ROOT"
 echo "report=$REPORT"
 echo "telemetry=$TELEMETRY"
 echo "contract=SALVALAI-smoke15-main-seq9-seed12345-fp32-sdpa-K4-max256"
+echo "loader_preflight_report=$LOADER_PREFLIGHT_REPORT"
+echo "loader_preflight_sha256=$ACTUAL_LOADER_PREFLIGHT_SHA256"
 echo "torch_extensions_dir=$TORCH_EXTENSIONS_DIR"
 echo "torch_extensions_entries=$(find "$TORCH_EXTENSIONS_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
 echo "inductor_cache_dir=$TORCHINDUCTOR_CACHE_DIR"
