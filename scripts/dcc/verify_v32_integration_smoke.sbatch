@@ -17,8 +17,10 @@ CONTROL_REPO=${CONTROL_REPO:?Set CONTROL_REPO to the clean current-main worktree
 CANDIDATE_REPO=${CANDIDATE_REPO:?Set CANDIDATE_REPO to the clean integration worktree}
 CONTROL_COMMIT=${CONTROL_COMMIT:?Set CONTROL_COMMIT}
 CANDIDATE_COMMIT=${CANDIDATE_COMMIT:?Set CANDIDATE_COMMIT}
+PROFILE_CONFIG=${PROFILE_CONFIG:-profile_salvalai_smoke15}
+RUN_LABEL=${RUN_LABEL:-smoke}
 AUDIO="$WORK/data/salvalai.mp3"
-RUN_ROOT="$WORK/runs/v32-integration-smoke-${SLURM_JOB_ID:-manual}"
+RUN_ROOT="$WORK/runs/v32-integration-${RUN_LABEL}-${SLURM_JOB_ID:-manual}"
 
 for repo in "$CONTROL_REPO" "$CANDIDATE_REPO"; do
   if [[ ! -d "$repo/.git" && ! -f "$repo/.git" ]]; then
@@ -64,6 +66,7 @@ echo "host=$(hostname)"
 echo "job_id=${SLURM_JOB_ID:-manual}"
 echo "control_commit=$CONTROL_COMMIT"
 echo "candidate_commit=$CANDIDATE_COMMIT"
+echo "profile_config=$PROFILE_CONFIG"
 echo "run_root=$RUN_ROOT"
 nvidia-smi -L
 nvidia-smi \
@@ -109,7 +112,7 @@ run_profile() {
   mkdir -p "$output"
   (
     cd "$repo"
-    python inference.py --config-name profile_salvalai_smoke15 \
+    python inference.py --config-name "$PROFILE_CONFIG" \
       output_path="$output" \
       "${COMMON_OVERRIDES[@]}"
   )
@@ -160,6 +163,6 @@ find "$RUN_ROOT" -type f \
 echo "control_first_compare_status=$CONTROL_FIRST_STATUS"
 echo "candidate_first_compare_status=$CANDIDATE_FIRST_STATUS"
 if (( CONTROL_FIRST_STATUS != 0 || CANDIDATE_FIRST_STATUS != 0 )); then
-  echo "legacy V32 reciprocal strict smoke gate failed" >&2
+  echo "legacy V32 reciprocal strict $RUN_LABEL gate failed" >&2
   exit 1
 fi
