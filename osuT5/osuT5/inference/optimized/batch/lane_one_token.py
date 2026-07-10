@@ -197,6 +197,7 @@ class CapturedB1Lane:
     graph: torch.cuda.CUDAGraph
     graph_outputs: Any
     static_inputs: dict[str, Any]
+    warmup_seconds: float
     capture_seconds: float
     capture_memory_allocated_delta_bytes: int
     capture_memory_reserved_delta_bytes: int
@@ -409,6 +410,7 @@ def capture_prepared_b1_lane(
     current_stream = torch.cuda.current_stream(device)
     lane_stream = torch.cuda.Stream(device=device)
     static_inputs = _clone_graph_inputs(prepared_inputs)
+    warmup_started = time.perf_counter()
     lane_stream.wait_stream(current_stream)
     with torch.cuda.stream(lane_stream):
         for _ in range(capture_warmup_repeats):
@@ -416,6 +418,7 @@ def capture_prepared_b1_lane(
                 model(**static_inputs, return_dict=True)
     current_stream.wait_stream(lane_stream)
     torch.cuda.synchronize(device)
+    warmup_seconds = time.perf_counter() - warmup_started
 
     allocated_before = torch.cuda.memory_allocated(device)
     reserved_before = torch.cuda.memory_reserved(device)
@@ -430,6 +433,7 @@ def capture_prepared_b1_lane(
         graph=graph,
         graph_outputs=graph_outputs,
         static_inputs=static_inputs,
+        warmup_seconds=warmup_seconds,
         capture_seconds=capture_seconds,
         capture_memory_allocated_delta_bytes=max(
             0,

@@ -382,12 +382,15 @@ def run_one_lane_gate(
         return processors
 
     device = torch.device(model.device)
+    native_context_started = time.perf_counter()
+    native_context_enter_seconds = 0.0
     with torch.autocast(device_type="cuda", enabled=False), generation_profile_context(
             sdpa_backend=args.profile_sdpa_backend,
             q1_bmm_cross_attention=q1_bmm_cross_attention,
             native_q1_self_attention=native_q1_self_attention,
             native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
     ):
+        native_context_enter_seconds = time.perf_counter() - native_context_started
         reference_processor = logits_processor_factory()
         reference_generator = _new_generator(device, seed)
         reference_session = DecodeSession.prefill(
@@ -841,6 +844,8 @@ def run_one_lane_gate(
             "complete_interval_replay_count": (
                 gate_config.timing_repeats if timing is not None else 0
             ),
+            "native_context_enter_seconds": native_context_enter_seconds,
+            "warmup_seconds": lane.warmup_seconds,
             "capture_seconds": lane.capture_seconds,
             "private_pool_id": graph_pool_id,
             "pool_sharing_requested": False,
