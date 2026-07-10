@@ -210,7 +210,32 @@ exact clean checkout and passed the prior-report guard, but exited before model
 load because the DCC environment does not install `pytest` and the script
 redundantly invoked it. This is harness-only evidence: it says nothing about
 16-step correctness or throughput. The in-job pytest call is removed for a
-future explicitly approved corrected run; local targeted tests already pass.
+corrected run; local targeted tests pass.
+
+Corrected job `49547779`, commit `82b7d32`, completed the real verifier but
+failed the configured strict cache gate. Across all 16 steps and all eight
+rows, raw logits/top-k, processed scores/top-k, sampled token transcripts,
+private final RNG, stops, and self-cache prefixes matched; maximum raw-logit,
+processed-score, and self-cache absolute differences were `2.594e-4`,
+`2.899e-4`, and `3.815e-5`. The cross-attention cache created by independent
+B1 encoder/prefill passes versus merged B8 encoder/prefill missed
+`atol=rtol=1e-4` from step 0 onward, with maximum absolute difference
+`1.369e-3`. It was constant across decode steps.
+
+The separate changing-prefix timing control preserved all 128 tokens and final
+RNG while measuring `488.324 -> 547.760 tok/s` (`+12.17%`) and therefore still
+shows a target-sized processor-sharing ceiling. Do not call this a promoted
+exact result: top-level `pass=false`, and the job correctly exited nonzero.
+Before any 256-step, mixed-song, lifecycle, or scheduler work, classify the
+cross-cache B1-vs-B8 numeric drift under the campaign exactness policy or find a
+stricter merged encoder/cross-cache construction. Do not loosen the gate after
+seeing this result without explicit approval.
+
+Corrected report:
+
+```text
+/work/imt11/Mapperatorinator/runs/merged-batch-loop16-49547779-82b7d32/merged-b8-loop16.json
+```
 
 ### CPU continuous-scheduler harness
 
