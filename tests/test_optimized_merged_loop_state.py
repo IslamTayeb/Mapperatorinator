@@ -1,9 +1,14 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from osuT5.osuT5.inference.optimized.batch import ActiveRowLedger, ActiveRowState
-from osuT5.osuT5.inference.optimized.batch.merged_loop import compare_active_session_caches
+from osuT5.osuT5.inference.optimized.batch.merged_loop import (
+    MergedLoopConfig,
+    compare_active_session_caches,
+    summarize_prefill_gate,
+)
 
 
 def _assert_raises(exc_type, fn, message_fragment):
@@ -122,3 +127,40 @@ def test_active_cache_comparison_selects_rows_and_used_prefix():
     assert report["pass"] is True
     assert report["active_rows"] == [0, 2]
     assert report["parts"]["self_attention"]["sequence_length_match"] is True
+
+
+def test_packed_prefill_report_is_explicit_and_required_for_exact_run():
+    report = summarize_prefill_gate(
+        mode="packed_b1",
+        serial_b1_prefill={"wall_seconds": 1.0, "cuda_seconds": 0.9},
+        merged_session_setup={
+            "wall_seconds": 0.2,
+            "cuda_seconds": 0.1,
+            "cache": {"pass": True},
+            "encoder_rows_bitwise_equal_after_pack": True,
+            "prefill_logits_bitwise_equal_after_pack": True,
+            "pass": True,
+        },
+        packed_prefill_gate={"cache": {"pass": True}, "prefill_logits": [], "pass": True},
+    )
+
+    assert report["pass"] is True
+    assert report["excluded_from_decode_timing"] is True
+    assert report["serial_B1"]["wall_seconds"] == 1.0
+    assert report["merged_session"]["encoder_rows_bitwise_equal_after_pack"] is True
+    with pytest.raises(ValueError, match="requires an explicit"):
+        summarize_prefill_gate(
+            mode="packed_b1",
+            serial_b1_prefill={"wall_seconds": 1.0},
+            merged_session_setup={"pass": True},
+            packed_prefill_gate=None,
+        )
+
+
+def test_merged_loop_config_keeps_strict_gate_and_validates_prefill_mode():
+    config = MergedLoopConfig(seeds=(12345,) * 8, merged_prefill_mode="packed_b1")
+
+    assert config.atol == 1e-4
+    assert config.rtol == 1e-4
+    with pytest.raises(ValueError, match="merged_prefill_mode"):
+        MergedLoopConfig(seeds=(12345,) * 8, merged_prefill_mode="relaxed")

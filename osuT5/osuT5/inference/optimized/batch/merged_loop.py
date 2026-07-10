@@ -22,8 +22,8 @@ from .merged_one_token import (
     compare_logits,
     repeat_batch_kwargs,
     repeat_batch_tensor,
-    slice_batch_kwargs,
 )
+from .packed_prefill import pack_b1_prefill_sessions
 
 
 LogitsProcessorFactory = Callable[[], Any]
@@ -43,6 +43,7 @@ class MergedLoopConfig:
     active_prefix_prefill: bool = False
     active_prefix_decode: bool = True
     active_prefix_decode_length: int | None = 64
+    merged_prefill_mode: str = "batched"
 
     def __post_init__(self) -> None:
         if len(self.seeds) != 8:
@@ -55,6 +56,8 @@ class MergedLoopConfig:
             raise ValueError("top_k must be positive.")
         if self.active_prefix_decode_length is not None and not self.active_prefix_decode:
             raise ValueError("active_prefix_decode_length requires active-prefix decode.")
+        if self.merged_prefill_mode not in {"batched", "packed_b1"}:
+            raise ValueError("merged_prefill_mode must be 'batched' or 'packed_b1'.")
 
 
 def _cache_parts(session: DecodeSession) -> dict[str, Any]:
@@ -243,6 +246,93 @@ def _decode_logits(
     ).logits
 
 
+def _clone_b1_kwargs(values: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: (
+            value.clone(memory_format=torch.contiguous_format)
+            if isinstance(value, torch.Tensor)
+            else value
+        )
+        for key, value in values.items()
+    }
+
+
+@torch.no_grad()
+def _prefill_b1_sessions(
+        model: Any,
+        *,
+        prompt: torch.LongTensor,
+        prompt_attention_mask: torch.Tensor,
+        frames: torch.Tensor,
+        condition_kwargs: Mapping[str, Any],
+        active_prefix_prefill: bool,
+) -> tuple[list[DecodeSession], dict[str, Any]]:
+    device = torch.device(model.device)
+    torch.cuda.synchronize(device)
+    started = torch.cuda.Event(enable_timing=True)
+    finished = torch.cuda.Event(enable_timing=True)
+    wall_started = time.perf_counter()
+    started.record()
+    sessions = [
+        DecodeSession.prefill(
+            model,
+            prompt=prompt.clone(memory_format=torch.contiguous_format),
+            prompt_attention_mask=prompt_attention_mask.clone(memory_format=torch.contiguous_format),
+            frames=frames.clone(memory_format=torch.contiguous_format),
+            condition_kwargs=_clone_b1_kwargs(condition_kwargs),
+            active_prefix_self_attention=active_prefix_prefill,
+        )
+        for _ in range(8)
+    ]
+    finished.record()
+    finished.synchronize()
+    return sessions, {
+        "strategy": "eight_serial_private_B1_prefills",
+        "request_count": 8,
+        "wall_seconds": time.perf_counter() - wall_started,
+        "cuda_seconds": started.elapsed_time(finished) / 1000.0,
+    }
+
+
+@torch.no_grad()
+def _build_merged_prefill_session(
+        model: Any,
+        *,
+        reference_sessions: Sequence[DecodeSession],
+        prompt: torch.LongTensor,
+        prompt_attention_mask: torch.Tensor,
+        frames: torch.Tensor,
+        condition_kwargs: Mapping[str, Any],
+        config: MergedLoopConfig,
+) -> tuple[DecodeSession, dict[str, Any]]:
+    if config.merged_prefill_mode == "packed_b1":
+        return pack_b1_prefill_sessions(model, reference_sessions)
+    device = torch.device(model.device)
+    prompt_batched = repeat_batch_tensor(prompt, 8, name="decoder_input_ids")
+    mask_batched = repeat_batch_tensor(prompt_attention_mask, 8, name="decoder_attention_mask")
+    torch.cuda.synchronize(device)
+    started = torch.cuda.Event(enable_timing=True)
+    finished = torch.cuda.Event(enable_timing=True)
+    wall_started = time.perf_counter()
+    started.record()
+    session = DecodeSession.prefill(
+        model,
+        prompt=prompt_batched,
+        prompt_attention_mask=mask_batched,
+        frames=repeat_batch_tensor(frames, 8, name="frames"),
+        condition_kwargs=repeat_batch_kwargs(condition_kwargs, 8),
+        active_prefix_self_attention=config.active_prefix_prefill,
+    )
+    finished.record()
+    finished.synchronize()
+    return session, {
+        "strategy": "one_merged_B8_prefill",
+        "wall_seconds": time.perf_counter() - wall_started,
+        "cuda_seconds": started.elapsed_time(finished) / 1000.0,
+        "pass": True,
+    }
+
+
 @torch.no_grad()
 def _run_timed_merged_loop(
         model: Any,
@@ -257,18 +347,32 @@ def _run_timed_merged_loop(
         config: MergedLoopConfig,
         shared_base_processor: bool,
 ) -> dict[str, Any]:
-    prompt_batched = repeat_batch_tensor(prompt, 8, name="decoder_input_ids")
-    mask_batched = repeat_batch_tensor(prompt_attention_mask, 8, name="decoder_attention_mask")
-    session = DecodeSession.prefill(
+    if config.merged_prefill_mode == "packed_b1":
+        reference_sessions, serial_prefill = _prefill_b1_sessions(
+            model,
+            prompt=prompt,
+            prompt_attention_mask=prompt_attention_mask,
+            frames=frames,
+            condition_kwargs=condition_kwargs,
+            active_prefix_prefill=config.active_prefix_prefill,
+        )
+    else:
+        reference_sessions = []
+        serial_prefill = None
+    session, merged_setup = _build_merged_prefill_session(
         model,
-        prompt=prompt_batched,
-        prompt_attention_mask=mask_batched,
-        frames=repeat_batch_tensor(frames, 8, name="frames"),
-        condition_kwargs=repeat_batch_kwargs(condition_kwargs, 8),
-        active_prefix_self_attention=config.active_prefix_prefill,
+        reference_sessions=reference_sessions,
+        prompt=prompt,
+        prompt_attention_mask=prompt_attention_mask,
+        frames=frames,
+        condition_kwargs=condition_kwargs,
+        config=config,
     )
-    prefix = prompt_batched
-    attention_mask = mask_batched
+    prefix = session.static_inputs.prompt
+    attention_mask = session.static_inputs.prompt_attention_mask
+    if attention_mask is None:
+        raise RuntimeError("merged timing session lost its prompt attention mask.")
+    del reference_sessions
     ledger = _new_ledger(eos_token_ids, max_new_tokens=config.max_new_tokens)
     processors = (
         [base_logits_processor_factory()]
@@ -332,6 +436,11 @@ def _run_timed_merged_loop(
     token_count = sum(int(row["draw_count"]) for row in row_report if row is not None)
     return {
         "base_processor_shape": "shared_B8" if shared_base_processor else "eight_private_B1",
+        "setup": {
+            "serial_prefill": serial_prefill,
+            "merged_session": merged_setup,
+            "excluded_from_decode_timing": True,
+        },
         "rows": row_report,
         "final_rng_state_hashes": [_tensor_sha256(generator.get_state()) for generator in generators],
         "aggregate_main_tokens": token_count,
@@ -340,6 +449,36 @@ def _run_timed_merged_loop(
         "wall_tokens_per_second": token_count / wall_seconds,
         "cuda_tokens_per_second": token_count / cuda_seconds,
         "complete_steps": max((len(row["generated_token_ids"]) for row in row_report if row), default=0),
+    }
+
+
+def summarize_prefill_gate(
+        *,
+        mode: str,
+        serial_b1_prefill: Mapping[str, Any],
+        merged_session_setup: Mapping[str, Any],
+        packed_prefill_gate: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if mode not in {"batched", "packed_b1"}:
+        raise ValueError("unknown merged prefill mode.")
+    if mode == "packed_b1" and packed_prefill_gate is None:
+        raise ValueError("packed_b1 mode requires an explicit packed prefill gate.")
+    passed = bool(
+        packed_prefill_gate["pass"]
+        if packed_prefill_gate is not None
+        else merged_session_setup.get("pass", False)
+    )
+    return {
+        "mode": mode,
+        "serial_B1": dict(serial_b1_prefill),
+        "merged_session": dict(merged_session_setup),
+        "packed_prefill_gate": (
+            dict(packed_prefill_gate)
+            if packed_prefill_gate is not None
+            else None
+        ),
+        "excluded_from_decode_timing": True,
+        "pass": passed,
     }
 
 
@@ -367,33 +506,32 @@ def run_merged_loop_gate(
     if prompt.ndim != 2 or prompt.shape[0] != 1:
         raise ValueError("prompt must be a B1 rank-2 tensor.")
 
-    condition_batched = repeat_batch_kwargs(condition_kwargs, 8)
-    reference_sessions = [
-        DecodeSession.prefill(
-            model,
-            prompt=prompt,
-            prompt_attention_mask=prompt_attention_mask,
-            frames=frames,
-            condition_kwargs=slice_batch_kwargs(condition_batched, row),
-            active_prefix_self_attention=config.active_prefix_prefill,
-        )
-        for row in range(8)
-    ]
-    prompt_batched = repeat_batch_tensor(prompt, 8, name="decoder_input_ids")
-    mask_batched = repeat_batch_tensor(prompt_attention_mask, 8, name="decoder_attention_mask")
-    merged_session = DecodeSession.prefill(
+    reference_sessions, serial_prefill_setup = _prefill_b1_sessions(
         model,
-        prompt=prompt_batched,
-        prompt_attention_mask=mask_batched,
-        frames=repeat_batch_tensor(frames, 8, name="frames"),
-        condition_kwargs=condition_batched,
-        active_prefix_self_attention=config.active_prefix_prefill,
+        prompt=prompt,
+        prompt_attention_mask=prompt_attention_mask,
+        frames=frames,
+        condition_kwargs=condition_kwargs,
+        active_prefix_prefill=config.active_prefix_prefill,
+    )
+    merged_session, merged_prefill_setup = _build_merged_prefill_session(
+        model,
+        reference_sessions=reference_sessions,
+        prompt=prompt,
+        prompt_attention_mask=prompt_attention_mask,
+        frames=frames,
+        condition_kwargs=condition_kwargs,
+        config=config,
     )
 
-    reference_prefixes = [prompt.clone() for _ in range(8)]
-    reference_masks = [prompt_attention_mask.clone() for _ in range(8)]
-    merged_prefix = prompt_batched
-    merged_mask = mask_batched
+    reference_prefixes = [session.static_inputs.prompt for session in reference_sessions]
+    reference_masks = [session.static_inputs.prompt_attention_mask for session in reference_sessions]
+    if any(mask is None for mask in reference_masks):
+        raise RuntimeError("a B1 reference session lost its prompt attention mask.")
+    merged_prefix = merged_session.static_inputs.prompt
+    merged_mask = merged_session.static_inputs.prompt_attention_mask
+    if merged_mask is None:
+        raise RuntimeError("merged session lost its prompt attention mask.")
     reference_ledger = _new_ledger(eos_token_ids, max_new_tokens=config.max_new_tokens)
     merged_ledger = _new_ledger(eos_token_ids, max_new_tokens=config.max_new_tokens)
     reference_processors = [base_logits_processor_factory() for _ in range(8)]
@@ -403,8 +541,60 @@ def run_merged_loop_gate(
     reference_generators = [_new_generator(device, seed) for seed in config.seeds]
     merged_generators = [_new_generator(device, seed) for seed in config.seeds]
 
+    packed_prefill_gate = None
+    if config.merged_prefill_mode == "packed_b1":
+        initial_cache = compare_active_session_caches(
+            reference_sessions,
+            merged_session,
+            active_rows=tuple(range(8)),
+            self_sequence_length=int(prompt.shape[-1]),
+            atol=config.atol,
+            rtol=config.rtol,
+        )
+        merged_prefill_logits = merged_session.cache_state.prefill_logits
+        if not isinstance(merged_prefill_logits, torch.Tensor):
+            raise RuntimeError("packed merged session lost its prefill logits.")
+        logit_rows = []
+        for row, session in enumerate(reference_sessions):
+            reference_prefill_logits = session.cache_state.prefill_logits
+            if not isinstance(reference_prefill_logits, torch.Tensor):
+                raise RuntimeError(f"B1 row {row} lost its prefill logits.")
+            comparison = compare_logits(
+                reference_prefill_logits,
+                merged_prefill_logits[row:row + 1],
+                atol=config.atol,
+                rtol=config.rtol,
+                top_k=config.top_k,
+            )
+            bitwise = bool(torch.equal(
+                reference_prefill_logits,
+                merged_prefill_logits[row:row + 1],
+            ))
+            logit_rows.append({
+                "row": row,
+                "comparison": comparison,
+                "bitwise": bitwise,
+                "pass": bool(comparison["allclose"] and comparison["topk_match"] and bitwise),
+            })
+        packed_prefill_gate = {
+            "cache": initial_cache,
+            "prefill_logits": logit_rows,
+            "packer": merged_prefill_setup,
+            "pass": bool(
+                initial_cache["pass"]
+                and all(row["pass"] for row in logit_rows)
+                and merged_prefill_setup["pass"]
+            ),
+        }
+
+    prefill_report = summarize_prefill_gate(
+        mode=config.merged_prefill_mode,
+        serial_b1_prefill=serial_prefill_setup,
+        merged_session_setup=merged_prefill_setup,
+        packed_prefill_gate=packed_prefill_gate,
+    )
     step_reports: list[dict[str, Any]] = []
-    exactness_pass = True
+    exactness_pass = bool(prefill_report["pass"])
     for step in range(config.max_new_tokens):
         active_rows = reference_ledger.active_indices()
         if active_rows != merged_ledger.active_indices():
@@ -602,15 +792,21 @@ def run_merged_loop_gate(
     }
     return {
         "schema_version": 1,
-        "scope": "identical_prompt_B8_16_step_verifier_only",
+        "scope": (
+            "identical_prompt_B8_16_step_packed_prefill_verifier_only"
+            if config.merged_prefill_mode == "packed_b1"
+            else "identical_prompt_B8_16_step_verifier_only"
+        ),
         "request_state_status": (
             "not_a_valid_request_state_design: one shared processor object remains unproven for "
             "mixed prompts, staggered arrivals, slot reuse, or state reset"
         ),
         "batch_size": 8,
         "max_new_tokens": config.max_new_tokens,
+        "merged_prefill_mode": config.merged_prefill_mode,
         "result_class": "exact-output",
         "runtime": dict(runtime_metadata),
+        "prefill": prefill_report,
         "steps": step_reports,
         "reference_rows": reference_rows,
         "merged_rows": merged_rows,

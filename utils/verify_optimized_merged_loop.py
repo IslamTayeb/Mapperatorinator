@@ -69,6 +69,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config-name", default="profile_salvalai_smoke15")
     parser.add_argument("--sequence-index", type=int, default=9)
     parser.add_argument("--loop-steps", type=int, choices=(16,), default=16)
+    parser.add_argument(
+        "--merged-prefill-mode",
+        choices=("batched", "packed_b1"),
+        default="batched",
+    )
     parser.add_argument("--previous-control-report", type=Path, required=True)
     parser.add_argument("--report-path", type=Path, required=True)
     parser.add_argument("--row-seed", action="append", type=int, default=[])
@@ -190,6 +195,7 @@ def main(argv: list[str] | None = None) -> int:
         "active_prefix_decode_length": active_prefix_decode_length,
         "active_prefix_bucket_size": cli.active_prefix_bucket_size,
         "q1_bmm_cross_attention": bool(cli.q1_bmm_cross_attention),
+        "merged_prefill_mode": cli.merged_prefill_mode,
         "eos_token_ids": [int(token_id) for token_id in eos_token_ids],
         "probe": probe_metadata,
         "previous_control_report": str(cli.previous_control_report.resolve()),
@@ -209,6 +215,7 @@ def main(argv: list[str] | None = None) -> int:
         active_prefix_prefill=bool(cli.active_prefix_prefill),
         active_prefix_decode=active_prefix_decode,
         active_prefix_decode_length=active_prefix_decode_length,
+        merged_prefill_mode=cli.merged_prefill_mode,
     )
     with torch.autocast(device_type="cuda", enabled=False), generation_profile_context(
         sdpa_backend=args.profile_sdpa_backend,

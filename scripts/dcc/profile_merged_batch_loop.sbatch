@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=merged-batch-loop16
+#SBATCH --job-name=packed-prefill-loop16
 #SBATCH --partition=gpu-common
 #SBATCH --account=romerolab
 #SBATCH --cpus-per-task=8
@@ -18,7 +18,7 @@ EXPECTED_COMMIT=${EXPECTED_COMMIT:?Set EXPECTED_COMMIT to the pushed verifier co
 PREVIOUS_CONTROL_REPORT=${PREVIOUS_CONTROL_REPORT:?Set PREVIOUS_CONTROL_REPORT to job 49547244 report}
 COMMIT=$(git -C "$REPO" rev-parse HEAD)
 SHORT_COMMIT=$(git -C "$REPO" rev-parse --short HEAD)
-RUN_ROOT="$WORK/runs/merged-batch-loop16-${SLURM_JOB_ID:-manual}-${SHORT_COMMIT}"
+RUN_ROOT="$WORK/runs/packed-prefill-batch-loop16-${SLURM_JOB_ID:-manual}-${SHORT_COMMIT}"
 REPORT="$RUN_ROOT/merged-b8-loop16.json"
 TELEMETRY="$RUN_ROOT/nvidia-smi.csv"
 
@@ -74,12 +74,14 @@ trap 'kill "$SMI_PID" 2>/dev/null || true' EXIT
 python -m py_compile \
   osuT5/osuT5/inference/optimized/batch/loop_state.py \
   osuT5/osuT5/inference/optimized/batch/merged_loop.py \
+  osuT5/osuT5/inference/optimized/batch/packed_prefill.py \
   utils/verify_optimized_merged_loop.py
 
 python utils/verify_optimized_merged_loop.py \
   --config-name profile_salvalai_smoke15 \
   --sequence-index 9 \
   --loop-steps 16 \
+  --merged-prefill-mode packed_b1 \
   --previous-control-report "$PREVIOUS_CONTROL_REPORT" \
   --report-path "$REPORT" \
   --active-prefix-decode \
