@@ -540,12 +540,13 @@ decode-only but `443.896 tok/s` with the current full setup charge, requiring
 `61.65%` setup removal. It is not queue evidence and authorizes no setup,
 scheduler, runtime, server, or offline-engine wiring.
 
-A follow-up CPU replay now closes B2 as the exact-five execution shape before
-more GPU work. It distributes each accepted window's full model time uniformly
+A follow-up CPU replay closes B2 for the exact-five accepted-profile cost model
+before more GPU work. It distributes each accepted window's full model time uniformly
 over its decode positions, assumes free coordination and perfect heterogeneous
 overlap, and even drops three zero-decode windows. Despite those optimistic
 assumptions, ideal all-ready K2 reaches only `495.983 tok/s`; ideal K3 reaches
-`640.767 tok/s`. The exact-five path therefore requires a K3 physics gate.
+`640.767 tok/s`. Under this model, the exact-five path therefore requires a K3
+physics gate; this is not a hardware upper bound.
 
 The cheaper remaining B2 question is a ten-request queue containing two exact,
 isolated copies of each of the five accepted songs. With no singleton rows and
@@ -589,7 +590,7 @@ The first one-token physics comparison is complete:
    `397.903-398.291 tok/s` and are rejected;
 3. the fixed hybrid B2 bridge reached `670.026-723.633 tok/s`, and its bounded
    bucket-128 changing-prefix follow-up reached `621.893-628.868 tok/s`, but
-   exact-five ideal K2 replay still tops out at `495.983 tok/s`.
+   exact-five ideal K2 accepted-profile replay still tops out at `495.983 tok/s`.
 
 Do not build a production scheduler from any component result. The only
 authorized B2 work is the production-weighted ten-request bucket gate above;
@@ -666,9 +667,9 @@ Until those gates pass, call results offline-engine throughput, not server optim
   then run only the real-prefix bucket-576 B2 horizon-8 gate. Stop on any
   token/RNG/cache/static-state mismatch or if the ten-request weighted ceiling
   is no longer plausible.
-- Exact-five K2 is closed at an optimistic `495.983 tok/s`. If weighted B2 is
-  rejected, the next bounded physics family is heterogeneous K3 at bucket 576,
-  not setup or scheduler code.
+- Exact-five K2 is closed in the accepted-profile cost model at an optimistic
+  `495.983 tok/s`. If weighted B2 is rejected, the next bounded physics family
+  is heterogeneous K3 at bucket 576, not setup or scheduler code.
 - Keep the independent-lane and packed/merged verifiers as physics evidence;
   do not wire them into a runtime before a setup-inclusive exact queue win.
 - Feed accepted single-song components, including any exact speculative verifier win, back into the offline engine and measure combined scheduler-wall throughput.
