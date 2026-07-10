@@ -571,3 +571,55 @@ Reports:
 SHA `e416b81cd5907d6683573abbe0fc9846712c1a75307c1e99185e04c480e6c9d5`,
 and `optimized-first-compare.json`, SHA
 `fcc11af93d7a3e527632eb88c760d87e9ff52852514e2f8dc2e56e870642e992`.
+
+### C1 accepted legacy delegation and server cleanup
+
+Commit `efaa4a6` made the canonical legacy micro-flag bundle construct the same
+`OptimizedSingleRuntime` and frozen config as the public optimized selector.
+The compatibility adapter is default-cold; compile-only V32 does not trigger
+it. Any partial optimized legacy bundle fails with an explicit instruction to
+use the complete accepted bundle or `inference_engine=optimized`.
+
+The same boundary removed active-prefix loop selection, production session
+reset/graph/encoder ownership, stateful optimized logits construction, q1
+activation, native eligibility, and optimized stats calculation from
+`server.py`. Ordinary V32 still reports the same false/`None` optimized
+metadata keys and calls ordinary `model.generate()`. Optimized batch and
+speculative modules now obtain stateful processor implementations from
+`optimized/single/logits.py`, not the server. The complete local `tests/` tree
+passed, including source ownership, default-cold compile-only, server/static
+state, selector, and partial-bundle failure gates.
+
+DCC reciprocal job `49561276` compared the canonical legacy selector with the
+public optimized selector after delegation. All main/timing tokens and `.osu`
+bytes matched in both orders. Optimized main throughput was `+1.9%` and
+`+0.0%`; timing was `+10.2%` and `+1.7%`; stage wall improved `15.7%` and
+`12.3%`. Reports:
+`/work/imt11/Mapperatorinator/runs/optimized-single-engine-c1-reciprocal-49561276/legacy-first-compare.json`,
+SHA `f89a16b06753a75e8bb5e1fb4847e63ede473d944b5ed62bb747d9bde6c71203`,
+and `optimized-first-compare.json`, SHA
+`0d5e99fddd23dddf8c17c0c0b38de93b54c086ce7447e2f73fbbf1b42e027a37`.
+
+Default-V32 reciprocal job `49561279` compared candidate C1 against
+pre-migration `3f4b088` with generation compile and every optimized flag off.
+Both orders matched all `1,084` main tokens, all `164` timing tokens,
+same-calculation metadata, and `.osu` SHA
+`ff63c232115906483a592c940e6f0fccbb8639775378d39fd86237f4191ed4ba`,
+size `4,144`. Candidate default V32 aggregate main improved `1.6%` and `1.9%`,
+timing improved `0.7%` and `1.6%`, and stage wall improved `1.7%` in both
+orders. Zero-tolerance strict status was nonzero only for isolated window
+jitter. Reports:
+`/work/imt11/Mapperatorinator/runs/v32-integration-default-v32-c1-49561279/control-first-compare.json`,
+SHA `70776976015f1fa81544326fd707970a234e8c9845428583fea762a6b47735e3`,
+and `candidate-first-compare.json`, SHA
+`8dc3fcfde4bde9becc6fdd641b184604361a0db1c005e7777bd4b58aae236e66`.
+
+Compile-only V32 reciprocal job `49561361` also matched every main/timing token
+and `.osu` byte. The candidate-first reciprocal pair was performance-neutral
+(`-0.03%` main, `-0.16%` timing, `-0.11%` stage); the other order exposed only
+compile/cache-order benefit. Compile-only therefore remains generic and does
+not dispatch to optimized single. Reports:
+`/work/imt11/Mapperatorinator/runs/v32-integration-compile-only-v32-c1-49561361/control-first-compare.json`,
+SHA `9ea7d3cd1f8464cee86a55991017d93d0a3d8b390d54e1e2c930c78e604eb465`,
+and `candidate-first-compare.json`, SHA
+`57e1dc12321d0ba5b02e50a16bdb53fa77a8cd70a56e55f8e15a672adf7485b2`.
