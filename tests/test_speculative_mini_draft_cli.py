@@ -5,12 +5,14 @@ from types import SimpleNamespace
 
 import pytest
 
+from inference import compile_args
 from utils.verify_speculative_mini_draft import (
     EXPECTED_GAMEMODE0_TOKENIZER_SHA256,
     MINI_REVISION,
     TARGET_REPO,
     TARGET_REVISION,
     _artifact_compatibility,
+    _load_args,
     _validate_approved_contract,
 )
 
@@ -80,6 +82,7 @@ def test_cli_contract_rejects_any_second_shape_or_runtime_drift():
         top_p=0.9,
         top_k=0,
         inference_generation_compile=False,
+        inference_active_prefix_decode_loop=True,
         inference_stateful_monotonic_logits_processor=True,
         start_time=71000,
         end_time=86000,
@@ -89,3 +92,39 @@ def test_cli_contract_rejects_any_second_shape_or_runtime_drift():
     cli.max_new_tokens = 255
     with pytest.raises(ValueError, match="contract changed"):
         _validate_approved_contract(cli, args)
+
+
+def test_exact_sbatch_hydra_contract_passes_runtime_flag_validation(tmp_path):
+    audio_path = tmp_path / "salvalai.mp3"
+    audio_path.touch()
+    args = _load_args(
+        "profile_salvalai_smoke15",
+        [
+            f"audio_path={audio_path}",
+            f"output_path={tmp_path / 'output'}",
+            "device=cuda",
+            "precision=fp32",
+            "attn_implementation=sdpa",
+            "inference_engine=v32",
+            "optimized_inference_mode=single",
+            "use_server=false",
+            "parallel=false",
+            "cfg_scale=1.0",
+            "num_beams=1",
+            "seed=12345",
+            "inference_generation_compile=false",
+            "inference_active_prefix_decode_loop=true",
+            "inference_stateful_monotonic_logits_processor=true",
+        ],
+    )
+    cli = Namespace(
+        config_name="profile_salvalai_smoke15",
+        sequence_index=9,
+        speculation_k=4,
+        max_new_tokens=256,
+        target_revision=TARGET_REVISION,
+        mini_revision=MINI_REVISION,
+    )
+
+    _validate_approved_contract(cli, args)
+    compile_args(args, verbose=False)

@@ -114,6 +114,7 @@ def _validate_approved_contract(cli: argparse.Namespace, args) -> None:
         "top_p": 0.9,
         "top_k": 0,
         "inference_generation_compile": False,
+        "inference_active_prefix_decode_loop": True,
         "inference_stateful_monotonic_logits_processor": True,
         "start_time": 71000,
         "end_time": 86000,
