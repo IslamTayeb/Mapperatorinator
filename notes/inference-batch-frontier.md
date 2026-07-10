@@ -359,8 +359,12 @@ Until those gates pass, call results offline-engine throughput, not server optim
 
 ## Immediate Next Decision Points
 
-- Finish the bounded B8 processor/short-loop/packed-prefill evidence before any merged scheduler wiring; retain the independent-lane comparison as the alternate physics shape.
-- Run the independent B1 CUDA-graph lane comparison in its isolated experiment worktree.
+- Treat the exact packed B8 result as a stopped verifier signal: `497.328 tok/s`
+  cleared the relative keep bar but missed the absolute queue microgate, so do
+  not advance it to 256 steps, mixed songs, lifecycle, or scheduler wiring.
+- Finish the reciprocal independent-B1 CUDA-graph lane comparison in its
+  isolated experiment worktree; advance only if exact private state and the
+  measured keep gate both pass.
 - Build only the execution shape that clears `5%` exact-output aggregate improvement.
 - Feed accepted single-song components, including any exact speculative verifier win, back into the offline engine and measure combined scheduler-wall throughput.
 - Stop for user input before reduced precision, output/RNG relaxation, or maintainer-facing changes outside the optimized package/adapter boundary.
