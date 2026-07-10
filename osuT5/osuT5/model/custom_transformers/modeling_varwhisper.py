@@ -36,7 +36,7 @@ from ...runtime_profiling import (
     profile_range,
     q1_bmm_cross_attention_enabled,
 )
-from ...inference.native_q1_attention import native_q1_attention, native_q1_rope_cache_attention
+from ...inference.runtime_dispatch import attention_runtime_hooks
 from .configuration_varwhisper import VarWhisperConfig
 
 if is_flash_attn_2_available():
@@ -372,6 +372,7 @@ def sdpa_attention_forward(
             if isinstance(attention_mask, torch.Tensor) and attention_mask.shape[-1] > prefix_length:
                 attention_mask = attention_mask[..., :prefix_length]
 
+    runtime_hooks = attention_runtime_hooks()
     use_q1_bmm_cross_attention = (
         q1_bmm_cross_attention_enabled()
         and module.is_cross_attention
@@ -387,6 +388,7 @@ def sdpa_attention_forward(
     )
     use_native_q1_self_attention = (
         native_q1_self_attention_enabled()
+        and runtime_hooks.native_q1_attention is not None
         and not module.is_cross_attention
         and not module.training
         and query.dtype == torch.float32
@@ -398,7 +400,9 @@ def sdpa_attention_forward(
         and value.shape[0] == 1
     )
     if use_native_q1_self_attention:
-        attn_output = native_q1_attention(query, key, value, attention_mask).transpose(1, 2).contiguous()
+        attn_output = runtime_hooks.native_q1_attention(
+            query, key, value, attention_mask
+        ).transpose(1, 2).contiguous()
     elif use_q1_bmm_cross_attention:
         num_heads = query.shape[1]
         head_dim = query.shape[-1]
@@ -631,8 +635,10 @@ class VarWhisperAttention(nn.Module):
                     )
             else:
                 prefix_length = active_prefix_self_attention_length()
+                runtime_hooks = attention_runtime_hooks()
                 use_native_q1_rope_cache_self_attention = (
                     native_q1_rope_cache_self_attention_enabled()
+                    and runtime_hooks.native_q1_rope_cache_attention is not None
                     and not is_varlen
                     and not self.training
                     and hidden_states.dtype == torch.float32
@@ -672,7 +678,7 @@ class VarWhisperAttention(nn.Module):
                         attention_mask_for_native = attention_mask_for_native[..., :prefix_length]
                     if profile_ranges:
                         with profile_range(f"{range_prefix}.rope_cache_native_q1"):
-                            hidden_states = native_q1_rope_cache_attention(
+                            hidden_states = runtime_hooks.native_q1_rope_cache_attention(
                                 qkv,
                                 cache_layer.keys,
                                 cache_layer.values,
@@ -683,7 +689,7 @@ class VarWhisperAttention(nn.Module):
                                 int(prefix_length),
                             )
                     else:
-                        hidden_states = native_q1_rope_cache_attention(
+                        hidden_states = runtime_hooks.native_q1_rope_cache_attention(
                             qkv,
                             cache_layer.keys,
                             cache_layer.values,

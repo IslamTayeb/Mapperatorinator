@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Iterator
 
 import torch
@@ -72,11 +72,14 @@ def generation_profile_context(
     _NATIVE_Q1_SELF_ATTENTION_ENABLED = bool(native_q1_self_attention)
     _NATIVE_Q1_ROPE_CACHE_SELF_ATTENTION_ENABLED = bool(native_q1_rope_cache_self_attention)
     try:
+        native_runtime_context = nullcontext()
         if native_q1_self_attention or native_q1_rope_cache_self_attention:
-            from osuT5.osuT5.inference.native_q1_attention import preload_native_q1_attention
+            from osuT5.osuT5.inference.optimized.single.runtime_context import (
+                native_attention_runtime_context,
+            )
 
-            preload_native_q1_attention()
-        with sdpa_backend_context(sdpa_backend):
+            native_runtime_context = native_attention_runtime_context()
+        with native_runtime_context, sdpa_backend_context(sdpa_backend):
             yield
     finally:
         _DETAIL_RANGES_ENABLED = previous_detail_ranges
