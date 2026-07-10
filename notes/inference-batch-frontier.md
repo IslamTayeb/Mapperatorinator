@@ -237,6 +237,37 @@ Corrected report:
 /work/imt11/Mapperatorinator/runs/merged-batch-loop16-49547779-82b7d32/merged-b8-loop16.json
 ```
 
+Job `49548273`, commit `8a75179`, tested the engine-shaped alternative without
+relaxing `atol=rtol=1e-4`: prefill eight private B1 requests serially, allocate
+a fresh B8 static cache/session, and pack encoder output, self/cross K/V rows,
+cross-cache update flags, prefill logits/positions, prompt/mask/frames, and
+condition state into stable slots before merged decode.
+
+The pack and all 16 decode steps passed. Packed cache rows, encoder outputs,
+prefill logits, and input state were bitwise-equal before step 0. Across all
+eight rows, raw logits/top-k, processed scores/top-k, 128 sampled tokens, final
+private RNG, stop behavior, and self/cross caches passed at every step. Maximum
+absolute differences were `2.899e-4` raw, `3.204e-4` processed,
+`2.289e-5` self cache, and exactly `0` cross cache. This confirms the earlier
+cross-cache failure came from separately reordered B8 encoder/prefill math, not
+merged decode.
+
+Setup was measured separately and excluded from decode TPS: the correctness
+run spent `0.343913s` wall (`0.343808s` CUDA) on eight serial B1 prefills and
+`0.046751s` wall (`0.046739s` CUDA) on allocation/pack/bitwise verification.
+The changing-prefix decode control preserved timed transcripts/RNG and measured
+`438.481 -> 497.328 tok/s` (`+13.42%`). This is a strong exact physics signal
+but missed the explicit `500 tok/s` job gate by `0.53%`, so top-level
+`pass=false`. Do not rerun for noise, call it a target hit, or production-wire
+it. Retain the verifier and exact serial-prefill/pack design; wait for review
+before any 256-step, mixed-song, lifecycle, or scheduler gate.
+
+Packed-prefill report:
+
+```text
+/work/imt11/Mapperatorinator/runs/packed-prefill-batch-loop16-49548273-8a75179/merged-b8-loop16.json
+```
+
 ### CPU continuous-scheduler harness
 
 `osuT5/osuT5/inference/continuous_batching.py` models arrivals, activation, round-robin/FIFO decode, stop reasons, cache-slot acquire/release, and slot generations. Strict manifests validate token/count recomputation, lifecycle arithmetic, state hashes, active-batch histograms, and cache-slot balance.
