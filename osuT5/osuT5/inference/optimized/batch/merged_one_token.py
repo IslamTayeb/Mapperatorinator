@@ -20,6 +20,7 @@ from ..benchmark import (
     BatchPhysicsExecutionFamily,
     BatchPhysicsObservation,
     MERGED_STATE_OWNERSHIP_CONTRACT,
+    SamplingComponentMeasurement,
 )
 from ..exactness import ExactnessResultClass
 from ...direct_decode import DecodeSession
@@ -43,6 +44,8 @@ class MergedOneTokenConfig:
     active_prefix_prefill: bool = False
     active_prefix_decode: bool = False
     active_prefix_decode_length: int | None = None
+    profile_sampling_components: bool = False
+    sampling_profile_repeats: int = 200
 
     def __post_init__(self) -> None:
         if self.batch_size not in {1, 2, 5, 8}:
@@ -59,6 +62,10 @@ class MergedOneTokenConfig:
             raise ValueError("warmup_repeats must be non-negative.")
         if self.timing_repeats <= 0:
             raise ValueError("timing_repeats must be positive.")
+        if self.sampling_profile_repeats <= 0:
+            raise ValueError("sampling_profile_repeats must be positive.")
+        if self.profile_sampling_components and self.batch_size != 8:
+            raise ValueError("sampling component profiling is currently a bounded B=8 gate.")
         if self.active_prefix_decode_length is not None:
             if not self.active_prefix_decode:
                 raise ValueError("active_prefix_decode_length requires active-prefix decode.")
@@ -305,6 +312,245 @@ def _session_cache_metadata(session: DecodeSession) -> dict[str, Any]:
     return metadata
 
 
+def _measure_cuda_component(
+        *,
+        component: str,
+        repeats: int,
+        includes: tuple[str, ...],
+        operation: Callable[[], Any],
+        device: torch.device,
+        warmup_repeats: int = 5,
+) -> SamplingComponentMeasurement:
+    for _ in range(warmup_repeats):
+        operation()
+    torch.cuda.synchronize(device)
+    started = torch.cuda.Event(enable_timing=True)
+    finished = torch.cuda.Event(enable_timing=True)
+    wall_started = time.perf_counter()
+    started.record()
+    for _ in range(repeats):
+        operation()
+    finished.record()
+    finished.synchronize()
+    wall_seconds = time.perf_counter() - wall_started
+    cuda_seconds = started.elapsed_time(finished) / 1000.0
+    return SamplingComponentMeasurement(
+        component=component,
+        repeats=repeats,
+        wall_seconds=wall_seconds,
+        cuda_seconds=cuda_seconds,
+        includes=includes,
+    )
+
+
+def _measure_host_component(
+        *,
+        component: str,
+        repeats: int,
+        includes: tuple[str, ...],
+        operation: Callable[[], Any],
+) -> SamplingComponentMeasurement:
+    wall_started = time.perf_counter()
+    for _ in range(repeats):
+        operation()
+    wall_seconds = time.perf_counter() - wall_started
+    return SamplingComponentMeasurement(
+        component=component,
+        repeats=repeats,
+        wall_seconds=wall_seconds,
+        cuda_seconds=0.0,
+        includes=includes,
+    )
+
+
+@torch.no_grad()
+def _profile_rowwise_sampling_components(
+        *,
+        raw_logits: torch.Tensor,
+        input_ids: torch.LongTensor,
+        seeds: tuple[int, ...],
+        do_sample: bool,
+        combined_logits_processor_factory: LogitsProcessorFactory,
+        base_logits_processor_factory: LogitsProcessorFactory,
+        logits_warper_factory: LogitsProcessorFactory,
+        repeats: int,
+        required_saving_seconds_per_step: float,
+        device: torch.device,
+) -> dict[str, Any]:
+    """Isolate B8 sampling components with non-additive event/wall probes."""
+
+    batch_size = int(raw_logits.shape[0])
+    if batch_size != 8 or input_ids.shape[0] != 8:
+        raise ValueError("rowwise sampling component profiler requires B=8 tensors.")
+    raw_logits = raw_logits.detach()
+    holder: list[torch.Tensor] = []
+
+    def clone_rows() -> None:
+        holder[:] = [
+            raw_logits[row:row + 1].clone(memory_format=torch.contiguous_format)
+            for row in range(batch_size)
+        ]
+
+    base_processors = [base_logits_processor_factory() for _ in range(batch_size)]
+
+    def clone_plus_logits_processors() -> None:
+        holder[:] = [
+            base_processors[row](
+                input_ids[row:row + 1],
+                raw_logits[row:row + 1].clone(memory_format=torch.contiguous_format),
+            )
+            for row in range(batch_size)
+        ]
+
+    prepared_base_scores = [
+        base_logits_processor_factory()(
+            input_ids[row:row + 1],
+            raw_logits[row:row + 1].clone(memory_format=torch.contiguous_format),
+        ).detach()
+        for row in range(batch_size)
+    ]
+    warpers = [logits_warper_factory() for _ in range(batch_size)]
+
+    def clone_plus_warpers() -> None:
+        holder[:] = [
+            warpers[row](
+                input_ids[row:row + 1],
+                prepared_base_scores[row].clone(memory_format=torch.contiguous_format),
+            )
+            for row in range(batch_size)
+        ]
+
+    prepared_warped_scores = [
+        logits_warper_factory()(
+            input_ids[row:row + 1],
+            prepared_base_scores[row].clone(memory_format=torch.contiguous_format),
+        ).detach()
+        for row in range(batch_size)
+    ]
+
+    def rowwise_softmax() -> None:
+        holder[:] = [
+            torch.nn.functional.softmax(prepared_warped_scores[row], dim=-1)
+            for row in range(batch_size)
+        ]
+
+    prepared_probabilities = [
+        torch.nn.functional.softmax(prepared_warped_scores[row], dim=-1)
+        for row in range(batch_size)
+    ]
+    multinomial_generators = [_new_generator(device, seed) for seed in seeds]
+
+    def private_multinomial_draws() -> None:
+        holder[:] = [
+            torch.multinomial(
+                prepared_probabilities[row],
+                num_samples=1,
+                generator=multinomial_generators[row],
+            )
+            for row in range(batch_size)
+        ]
+
+    combined_processors = [combined_logits_processor_factory() for _ in range(batch_size)]
+    combined_generators = [_new_generator(device, seed) for seed in seeds]
+
+    def combined_rowwise_sampling() -> None:
+        holder[:] = [
+            _sample_next_token(
+                input_ids=input_ids[row:row + 1],
+                raw_logits=raw_logits[row:row + 1],
+                logits_processor=combined_processors[row],
+                generator=combined_generators[row],
+                do_sample=do_sample,
+            )
+            for row in range(batch_size)
+        ]
+
+    measurements = [
+        _measure_cuda_component(
+            component="rowwise_logits_clone",
+            repeats=repeats,
+            includes=("eight_row_slices", "eight_contiguous_logits_clones"),
+            operation=clone_rows,
+            device=device,
+        ),
+        _measure_cuda_component(
+            component="clone_plus_logits_processors",
+            repeats=repeats,
+            includes=("logits_clone", "temperature_and_stateful_logits_processors"),
+            operation=clone_plus_logits_processors,
+            device=device,
+        ),
+        _measure_cuda_component(
+            component="clone_plus_sampling_warpers",
+            repeats=repeats,
+            includes=("processed_scores_clone", "top_k_top_p_warpers"),
+            operation=clone_plus_warpers,
+            device=device,
+        ),
+        _measure_cuda_component(
+            component="rowwise_softmax",
+            repeats=repeats,
+            includes=("eight_rowwise_softmax_calls",),
+            operation=rowwise_softmax,
+            device=device,
+        ),
+        _measure_cuda_component(
+            component="private_generator_multinomial",
+            repeats=repeats,
+            includes=("eight_private_generators", "eight_multinomial_draws"),
+            operation=private_multinomial_draws,
+            device=device,
+        ),
+        _measure_cuda_component(
+            component="combined_rowwise_sampling",
+            repeats=repeats,
+            includes=(
+                "logits_clone",
+                "logits_processors",
+                "sampling_warpers",
+                "softmax",
+                "private_generator_multinomial",
+                "python_row_loop",
+            ),
+            operation=combined_rowwise_sampling,
+            device=device,
+        ),
+    ]
+
+    def empty_python_row_loop() -> None:
+        for row in range(batch_size):
+            _ = row
+
+    measurements.append(_measure_host_component(
+        component="empty_python_row_loop",
+        repeats=repeats,
+        includes=("eight_python_loop_iterations",),
+        operation=empty_python_row_loop,
+    ))
+    torch.cuda.synchronize(device)
+    measurements.append(_measure_host_component(
+        component="idle_cuda_synchronize",
+        repeats=repeats,
+        includes=("one_idle_torch_cuda_synchronize_per_repeat",),
+        operation=lambda: torch.cuda.synchronize(device),
+    ))
+    return {
+        "scope": "isolated_non_additive_fixed_b8_logits",
+        "repeats": repeats,
+        "required_saving_seconds_per_step": required_saving_seconds_per_step,
+        "components": [
+            measurement.as_dict(
+                required_saving_seconds_per_step=required_saving_seconds_per_step
+            )
+            for measurement in measurements
+        ],
+        "interpretation_guard": (
+            "Component measurements are isolated and non-additive. Clone, allocator, Python launch, "
+            "and final synchronization costs overlap; use only per-component fantasy-free ceilings."
+        ),
+    }
+
+
 @torch.no_grad()
 def run_merged_one_token_gate(
         model: Any,
@@ -314,9 +560,12 @@ def run_merged_one_token_gate(
         frames: torch.Tensor,
         condition_kwargs: Mapping[str, Any],
         logits_processor_factory: LogitsProcessorFactory,
+        base_logits_processor_factory: LogitsProcessorFactory | None = None,
+        logits_warper_factory: LogitsProcessorFactory | None = None,
         eos_token_ids: Sequence[int],
         config: MergedOneTokenConfig,
         runtime_metadata: Mapping[str, Any],
+        sampling_gap_target: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run exact row gates and a warmed fixed-shape merged-step measurement."""
 
@@ -601,6 +850,29 @@ def run_merged_one_token_gate(
     complete_wall_tokens_per_second = (
         batch_size * config.timing_repeats / complete_wall_seconds
     )
+    sampling_component_profile = None
+    if config.profile_sampling_components:
+        if base_logits_processor_factory is None or logits_warper_factory is None:
+            raise ValueError(
+                "sampling component profiling requires separate processor and warper factories."
+            )
+        if sampling_gap_target is None:
+            raise ValueError("sampling component profiling requires a baseline gap target.")
+        sampling_component_profile = _profile_rowwise_sampling_components(
+            raw_logits=complete_result.logits,
+            input_ids=full_prefix_batched,
+            seeds=config.seeds,
+            do_sample=config.do_sample,
+            combined_logits_processor_factory=logits_processor_factory,
+            base_logits_processor_factory=base_logits_processor_factory,
+            logits_warper_factory=logits_warper_factory,
+            repeats=config.sampling_profile_repeats,
+            required_saving_seconds_per_step=float(
+                sampling_gap_target["required_saving_seconds_per_step"]
+            ),
+            device=device,
+        )
+        sampling_component_profile["baseline_gap_target"] = dict(sampling_gap_target)
 
     workload_contract = {
         "batch_size": batch_size,
@@ -715,6 +987,7 @@ def run_merged_one_token_gate(
             "peak_reserved_bytes": peak_reserved,
         },
         "workload_contract": workload_contract,
+        "sampling_component_profile": sampling_component_profile,
         "observation": observation.as_dict(),
         "runtime_metadata": dict(runtime_metadata),
     }

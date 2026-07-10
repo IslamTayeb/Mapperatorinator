@@ -17,7 +17,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import torch
 import transformers
-from transformers import TopKLogitsWarper, TopPLogitsWarper
+from transformers import LogitsProcessorList, TopKLogitsWarper, TopPLogitsWarper
 
 from inference import compile_args, load_model_with_server, setup_inference_environment
 from osuT5.osuT5.inference.decode_loop import _bucketed_prefix_length
@@ -28,6 +28,7 @@ from osuT5.osuT5.inference.optimized.batch.merged_one_token import (
     summarize_previous_gate_scaling,
     validate_previous_gate,
 )
+from osuT5.osuT5.inference.optimized.benchmark import summarize_sampling_gap_target
 from osuT5.osuT5.inference.server import get_eos_token_id
 from osuT5.osuT5.runtime_profiling import generation_profile_context
 from osuT5.osuT5.tokenizer import ContextType
@@ -87,6 +88,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--q1-bmm-cross-attention", action="store_true")
     parser.add_argument("--native-q1-self-attention", action="store_true")
     parser.add_argument("--native-q1-rope-cache-self-attention", action="store_true")
+    parser.add_argument("--profile-sampling-components", action="store_true")
+    parser.add_argument("--sampling-profile-repeats", type=int, default=200)
+    parser.add_argument("--sampling-baseline-report", type=Path)
     parser.add_argument("overrides", nargs="*", help="Hydra overrides such as audio_path=/path/song.mp3")
     return parser
 
@@ -95,6 +99,18 @@ def main(argv: list[str] | None = None) -> int:
     cli = build_parser().parse_args(argv)
     previous_report = _load_previous_report(cli.previous_gate_report)
     validate_previous_gate(cli.batch_size, previous_report)
+    sampling_baseline_report = _load_previous_report(cli.sampling_baseline_report)
+    if cli.profile_sampling_components:
+        if cli.batch_size != 8:
+            raise ValueError("sampling component profiling is a bounded B=8-only gate.")
+        if sampling_baseline_report is None:
+            raise ValueError("--profile-sampling-components requires --sampling-baseline-report.")
+        if int(sampling_baseline_report.get("batch_size", -1)) != 8:
+            raise ValueError("sampling baseline must be a B=8 report.")
+        if not bool(sampling_baseline_report.get("exactness_pass")):
+            raise ValueError("sampling baseline must have exactness_pass=true.")
+    elif sampling_baseline_report is not None:
+        raise ValueError("--sampling-baseline-report requires --profile-sampling-components.")
     if cli.native_q1_rope_cache_self_attention and not cli.native_q1_self_attention:
         raise ValueError("RoPE/cache native self-attention requires --native-q1-self-attention.")
     if cli.batch_size > 1 and (
@@ -167,19 +183,41 @@ def main(argv: list[str] | None = None) -> int:
         default_seed=int(args.seed),
     )
 
-    def logits_processor_factory():
-        processors = _build_generation_logits_processors(
+    def base_logits_processor_factory():
+        return _build_generation_logits_processors(
             args,
             tokenizer,
             model.device,
             lookback_time=float(probe_metadata["lookback_time"]),
         )
+
+    def logits_warper_factory():
+        warpers = LogitsProcessorList()
         if args.do_sample:
             if args.top_k > 0:
-                processors.append(TopKLogitsWarper(top_k=int(args.top_k)))
+                warpers.append(TopKLogitsWarper(top_k=int(args.top_k)))
             if 0.0 < args.top_p < 1.0:
-                processors.append(TopPLogitsWarper(top_p=float(args.top_p)))
+                warpers.append(TopPLogitsWarper(top_p=float(args.top_p)))
+        return warpers
+
+    def logits_processor_factory():
+        processors = base_logits_processor_factory()
+        processors.extend(logits_warper_factory())
         return processors
+
+    sampling_gap_target = None
+    if sampling_baseline_report is not None:
+        baseline_timing = sampling_baseline_report["timing"]
+        sampling_gap_target = summarize_sampling_gap_target(
+            batch_size=8,
+            target_tokens_per_second=500.0,
+            complete_wall_seconds_per_step=float(
+                baseline_timing["complete_sampled_step_wall_seconds_per_step"]
+            ),
+            model_seconds_per_step=float(
+                baseline_timing["model_only_cuda_seconds_per_step"]
+            ),
+        )
 
     device_index = model.device.index if model.device.index is not None else torch.cuda.current_device()
     device_properties = torch.cuda.get_device_properties(device_index)
@@ -214,6 +252,13 @@ def main(argv: list[str] | None = None) -> int:
         "q1_bmm_cross_attention": bool(cli.q1_bmm_cross_attention),
         "native_q1_self_attention": bool(cli.native_q1_self_attention),
         "native_q1_rope_cache_self_attention": bool(cli.native_q1_rope_cache_self_attention),
+        "profile_sampling_components": bool(cli.profile_sampling_components),
+        "sampling_profile_repeats": int(cli.sampling_profile_repeats),
+        "sampling_baseline_report": (
+            str(cli.sampling_baseline_report.resolve())
+            if cli.sampling_baseline_report is not None
+            else None
+        ),
         "eos_token_ids": [int(token_id) for token_id in eos_token_ids],
         "probe": probe_metadata,
         "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
@@ -236,6 +281,8 @@ def main(argv: list[str] | None = None) -> int:
         active_prefix_prefill=bool(cli.active_prefix_prefill),
         active_prefix_decode=active_prefix_decode,
         active_prefix_decode_length=active_prefix_decode_length,
+        profile_sampling_components=bool(cli.profile_sampling_components),
+        sampling_profile_repeats=cli.sampling_profile_repeats,
     )
     with torch.autocast(device_type="cuda", enabled=False), generation_profile_context(
             sdpa_backend=args.profile_sdpa_backend,
@@ -250,9 +297,12 @@ def main(argv: list[str] | None = None) -> int:
             frames=model_inputs["frames"],
             condition_kwargs=condition_kwargs,
             logits_processor_factory=logits_processor_factory,
+            base_logits_processor_factory=base_logits_processor_factory,
+            logits_warper_factory=logits_warper_factory,
             eos_token_ids=eos_token_ids,
             config=gate_config,
             runtime_metadata=runtime_metadata,
+            sampling_gap_target=sampling_gap_target,
         )
     report["exactness_pass"] = bool(report["pass"])
     if previous_report is not None:

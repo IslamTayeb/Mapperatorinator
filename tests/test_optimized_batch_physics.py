@@ -7,7 +7,9 @@ from osuT5.osuT5.inference.optimized.benchmark import (
     BatchPhysicsPlan,
     LANE_STATE_OWNERSHIP_CONTRACT,
     MERGED_STATE_OWNERSHIP_CONTRACT,
+    SamplingComponentMeasurement,
     compare_batch_physics_observations,
+    summarize_sampling_gap_target,
 )
 from osuT5.osuT5.inference.optimized.exactness import ExactnessResultClass
 
@@ -285,4 +287,48 @@ def test_measurement_schema_records_required_gpu_and_exactness_fields():
         ValueError,
         lambda: compare_batch_physics_observations(bitwise_baseline, bitwise_candidate),
         "cache_state_hashes",
+    )
+
+
+def test_sampling_component_schema_and_exact_b8_target_math():
+    target = summarize_sampling_gap_target(
+        batch_size=8,
+        target_tokens_per_second=500.0,
+        complete_wall_seconds_per_step=0.018196870647370814,
+        model_seconds_per_step=0.011957005615234375,
+    )
+    measurement = SamplingComponentMeasurement(
+        component="private_generator_multinomial",
+        repeats=200,
+        wall_seconds=0.6,
+        cuda_seconds=0.5,
+        includes=("eight_private_generators", "eight_multinomial_draws"),
+    )
+    rendered = measurement.as_dict(
+        required_saving_seconds_per_step=target["required_saving_seconds_per_step"]
+    )
+
+    assert target["target_step_seconds"] == 0.016
+    assert abs(target["required_saving_seconds_per_step"] - 0.002196870647370814) < 1e-15
+    assert abs(
+        target["baseline_complete_minus_model_gap_seconds_per_step"]
+        - 0.006239865032136439
+    ) < 1e-15
+    assert abs(target["required_saving_fraction_of_measured_gap"] - 0.352070219) < 1e-9
+    assert target["model_only_ceiling_clears_target"] is True
+    assert rendered["wall_seconds_per_step"] == 0.003
+    assert rendered["cuda_seconds_per_step"] == 0.0025
+    assert rendered["fantasy_free_wall_clears_required_saving"] is True
+    assert rendered["fantasy_free_cuda_clears_required_saving"] is True
+
+    _assert_raises(
+        ValueError,
+        lambda: SamplingComponentMeasurement(
+            component="bad",
+            repeats=1,
+            wall_seconds=0.1,
+            cuda_seconds=0.2,
+            includes=("impossible",),
+        ),
+        "cannot exceed synchronized wall_seconds",
     )

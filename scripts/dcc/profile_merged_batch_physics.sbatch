@@ -17,6 +17,8 @@ WORK=/work/imt11/Mapperatorinator
 EXPECTED_COMMIT=${EXPECTED_COMMIT:?Set EXPECTED_COMMIT to the pushed verifier commit}
 MERGED_BATCH_SIZE=${MERGED_BATCH_SIZE:?Set MERGED_BATCH_SIZE to 1, 2, or 5}
 PREVIOUS_GATE_REPORT=${PREVIOUS_GATE_REPORT:-}
+PROFILE_SAMPLING_COMPONENTS=${PROFILE_SAMPLING_COMPONENTS:-0}
+SAMPLING_BASELINE_REPORT=${SAMPLING_BASELINE_REPORT:-}
 COMMIT=$(git -C "$REPO" rev-parse HEAD)
 SHORT_COMMIT=$(git -C "$REPO" rev-parse --short HEAD)
 RUN_ROOT="$WORK/runs/merged-batch-physics-b${MERGED_BATCH_SIZE}-${SLURM_JOB_ID:-manual}-${SHORT_COMMIT}"
@@ -41,6 +43,19 @@ case "$MERGED_BATCH_SIZE" in
     exit 2
     ;;
 esac
+if [[ "$PROFILE_SAMPLING_COMPONENTS" == 1 ]]; then
+  if [[ "$MERGED_BATCH_SIZE" != 8 ]]; then
+    echo "sampling component profiling requires MERGED_BATCH_SIZE=8" >&2
+    exit 2
+  fi
+  if [[ -z "$SAMPLING_BASELINE_REPORT" || ! -f "$SAMPLING_BASELINE_REPORT" ]]; then
+    echo "sampling component profiling requires an existing SAMPLING_BASELINE_REPORT" >&2
+    exit 2
+  fi
+elif [[ "$PROFILE_SAMPLING_COMPONENTS" != 0 ]]; then
+  echo "PROFILE_SAMPLING_COMPONENTS must be 0 or 1" >&2
+  exit 2
+fi
 
 if [[ "$COMMIT" != "$EXPECTED_COMMIT" ]]; then
   echo "DCC checkout is $COMMIT, expected $EXPECTED_COMMIT" >&2
@@ -81,6 +96,8 @@ echo "commit=$COMMIT"
 echo "branch=$(git branch --show-current)"
 echo "cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-unset}"
 echo "previous_gate_report=${PREVIOUS_GATE_REPORT:-none}"
+echo "profile_sampling_components=$PROFILE_SAMPLING_COMPONENTS"
+echo "sampling_baseline_report=${SAMPLING_BASELINE_REPORT:-none}"
 nvidia-smi -L
 nvidia-smi \
   --query-gpu=timestamp,uuid,utilization.gpu,memory.used,memory.total,power.draw,clocks.sm,temperature.gpu \
@@ -97,6 +114,14 @@ PREVIOUS_ARGS=()
 if [[ -n "$PREVIOUS_GATE_REPORT" ]]; then
   PREVIOUS_ARGS=(--previous-gate-report "$PREVIOUS_GATE_REPORT")
 fi
+COMPONENT_ARGS=()
+if [[ "$PROFILE_SAMPLING_COMPONENTS" == 1 ]]; then
+  COMPONENT_ARGS=(
+    --profile-sampling-components
+    --sampling-profile-repeats 200
+    --sampling-baseline-report "$SAMPLING_BASELINE_REPORT"
+  )
+fi
 
 python utils/verify_optimized_merged_one_token.py \
   --config-name profile_salvalai_smoke15 \
@@ -109,6 +134,7 @@ python utils/verify_optimized_merged_one_token.py \
   --active-prefix-bucket-size 64 \
   --q1-bmm-cross-attention \
   "${PREVIOUS_ARGS[@]}" \
+  "${COMPONENT_ARGS[@]}" \
   audio_path="$WORK/data/salvalai.mp3" \
   output_path="$RUN_ROOT/output" \
   device=cuda \

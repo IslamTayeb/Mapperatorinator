@@ -75,6 +75,25 @@ def test_row_seed_resolution_and_config_reject_ungraduated_shapes():
         ),
         "support B=1, B=2, B=5, or B=8",
     )
+    _assert_raises(
+        ValueError,
+        lambda: MergedOneTokenConfig(
+            batch_size=5,
+            seeds=(1,) * 5,
+            do_sample=True,
+            profile_sampling_components=True,
+        ),
+        "bounded B=8 gate",
+    )
+    config = MergedOneTokenConfig(
+        batch_size=8,
+        seeds=(1,) * 8,
+        do_sample=True,
+        profile_sampling_components=True,
+        sampling_profile_repeats=20,
+    )
+    assert config.profile_sampling_components is True
+    assert config.sampling_profile_repeats == 20
 
 
 def test_previous_gate_enforces_b1_then_b2_then_b5_then_b8():

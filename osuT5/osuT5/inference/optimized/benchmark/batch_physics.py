@@ -248,6 +248,102 @@ class BatchPhysicsObservation:
             )
 
 
+@dataclass(frozen=True)
+class SamplingComponentMeasurement:
+    """One isolated, non-additive rowwise sampling component measurement."""
+
+    component: str
+    repeats: int
+    wall_seconds: float
+    cuda_seconds: float
+    includes: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "includes", tuple(self.includes))
+        if not self.component:
+            raise ValueError("component must be non-empty.")
+        if self.repeats <= 0:
+            raise ValueError("repeats must be positive.")
+        if not math.isfinite(self.wall_seconds) or self.wall_seconds <= 0:
+            raise ValueError("wall_seconds must be finite and positive.")
+        if not math.isfinite(self.cuda_seconds) or self.cuda_seconds < 0:
+            raise ValueError("cuda_seconds must be finite and non-negative.")
+        if self.cuda_seconds > self.wall_seconds:
+            raise ValueError("cuda_seconds cannot exceed synchronized wall_seconds.")
+        if not self.includes or any(not item for item in self.includes):
+            raise ValueError("includes must contain non-empty operation labels.")
+
+    @property
+    def wall_seconds_per_step(self) -> float:
+        return self.wall_seconds / self.repeats
+
+    @property
+    def cuda_seconds_per_step(self) -> float:
+        return self.cuda_seconds / self.repeats
+
+    @property
+    def host_launch_and_sync_seconds_per_step(self) -> float:
+        return max(0.0, self.wall_seconds_per_step - self.cuda_seconds_per_step)
+
+    def as_dict(self, *, required_saving_seconds_per_step: float) -> dict[str, object]:
+        return {
+            "component": self.component,
+            "repeats": self.repeats,
+            "includes": list(self.includes),
+            "wall_seconds": self.wall_seconds,
+            "cuda_seconds": self.cuda_seconds,
+            "wall_seconds_per_step": self.wall_seconds_per_step,
+            "cuda_seconds_per_step": self.cuda_seconds_per_step,
+            "host_launch_and_sync_seconds_per_step": (
+                self.host_launch_and_sync_seconds_per_step
+            ),
+            "fantasy_free_wall_clears_required_saving": (
+                self.wall_seconds_per_step >= required_saving_seconds_per_step
+            ),
+            "fantasy_free_cuda_clears_required_saving": (
+                self.cuda_seconds_per_step >= required_saving_seconds_per_step
+            ),
+        }
+
+
+def summarize_sampling_gap_target(
+        *,
+        batch_size: int,
+        target_tokens_per_second: float,
+        complete_wall_seconds_per_step: float,
+        model_seconds_per_step: float,
+) -> dict[str, float | int | bool]:
+    """Compute the exact step-time saving required to reach the B8 target."""
+
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive.")
+    if target_tokens_per_second <= 0:
+        raise ValueError("target_tokens_per_second must be positive.")
+    if complete_wall_seconds_per_step <= 0 or model_seconds_per_step <= 0:
+        raise ValueError("step times must be positive.")
+    if model_seconds_per_step > complete_wall_seconds_per_step:
+        raise ValueError("model step cannot exceed complete step for the same baseline.")
+    target_step_seconds = batch_size / target_tokens_per_second
+    required_saving = max(0.0, complete_wall_seconds_per_step - target_step_seconds)
+    measured_gap = complete_wall_seconds_per_step - model_seconds_per_step
+    return {
+        "batch_size": batch_size,
+        "target_tokens_per_second": target_tokens_per_second,
+        "target_step_seconds": target_step_seconds,
+        "baseline_complete_wall_seconds_per_step": complete_wall_seconds_per_step,
+        "baseline_model_seconds_per_step": model_seconds_per_step,
+        "baseline_complete_minus_model_gap_seconds_per_step": measured_gap,
+        "required_saving_seconds_per_step": required_saving,
+        "required_saving_fraction_of_measured_gap": (
+            required_saving / measured_gap if measured_gap > 0 else math.inf
+        ),
+        "model_only_ceiling_tokens_per_second": batch_size / model_seconds_per_step,
+        "model_only_ceiling_clears_target": (
+            batch_size / model_seconds_per_step >= target_tokens_per_second
+        ),
+    }
+
+
 def compare_batch_physics_observations(
         baseline: BatchPhysicsObservation,
         candidate: BatchPhysicsObservation,
