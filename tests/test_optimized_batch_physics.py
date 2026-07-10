@@ -1,0 +1,220 @@
+from __future__ import annotations
+
+from osuT5.osuT5.inference.optimized.batch import BatchPhysicsRequest, BatchPhysicsScheduler
+from osuT5.osuT5.inference.optimized.benchmark import (
+    BatchPhysicsExecutionFamily,
+    BatchPhysicsObservation,
+    BatchPhysicsPlan,
+    LANE_STATE_OWNERSHIP_CONTRACT,
+    MERGED_STATE_OWNERSHIP_CONTRACT,
+    compare_batch_physics_observations,
+)
+from osuT5.osuT5.inference.optimized.exactness import ExactnessResultClass
+
+
+def _scores(*favored_tokens: int, vocabulary_size: int = 6) -> tuple[tuple[float, ...], ...]:
+    rows = []
+    for token_id in favored_tokens:
+        row = [0.0] * vocabulary_size
+        row[token_id] = 1.0
+        rows.append(tuple(row))
+    return tuple(rows)
+
+
+def _request(
+        request_id: str,
+        tokens: tuple[int, ...],
+        *,
+        seed: int,
+        max_new_tokens: int | None = None,
+        eos_token_ids: tuple[int, ...] = (),
+        arrival_step: int = 0,
+) -> BatchPhysicsRequest:
+    return BatchPhysicsRequest(
+        request_id=request_id,
+        seed=seed,
+        score_steps=_scores(*tokens),
+        max_new_tokens=max_new_tokens or len(tokens),
+        eos_token_ids=eos_token_ids,
+        arrival_step=arrival_step,
+    )
+
+
+def _observable(results):
+    return {
+        result.request_id: (
+            result.generated_token_ids,
+            result.stop_reason,
+            result.final_rng_state_hash,
+            result.sample_calls,
+        )
+        for result in results
+    }
+
+
+def _assert_raises(exc_type, fn, message_fragment):
+    try:
+        fn()
+    except exc_type as exc:
+        assert message_fragment in str(exc)
+    else:
+        raise AssertionError(f"Expected {exc_type.__name__}")
+
+
+def test_request_order_does_not_change_tokens_stops_or_per_request_rng():
+    requests = [
+        _request("song-a", (1, 2, 3), seed=12345),
+        _request("song-b", (4, 1), seed=23456),
+        _request("song-c", (2, 5, 0, 1), seed=34567),
+    ]
+    forward = BatchPhysicsScheduler(requests, max_active_sequences=2).run_until_idle()
+    reverse = BatchPhysicsScheduler(reversed(requests), max_active_sequences=2).run_until_idle()
+
+    assert _observable(forward) == _observable(reverse)
+
+
+def test_finished_and_empty_rows_never_advance_rng():
+    scheduler = BatchPhysicsScheduler(
+        [
+            _request("early-eos", (5, 1, 2), seed=12345, eos_token_ids=(5,)),
+            _request("long", (1, 2, 3), seed=23456),
+        ],
+        max_active_sequences=5,
+    )
+    scheduler.step()
+    finished_hash = scheduler.rng_state_hash("early-eos")
+    assert scheduler.sample_calls("early-eos") == 1
+
+    scheduler.step()
+    scheduler.step()
+    assert scheduler.rng_state_hash("early-eos") == finished_hash
+    assert scheduler.sample_calls("early-eos") == 1
+    results = {result.request_id: result for result in scheduler.results()}
+    assert results["early-eos"].generated_token_ids == (5,)
+    assert results["early-eos"].stop_reason == "eos"
+    assert results["early-eos"].exactness_evidence().generated_token_ids == (5,)
+    assert results["long"].sample_calls == 3
+
+
+def test_eos_max_token_staggered_arrival_and_slot_generation_reuse():
+    scheduler = BatchPhysicsScheduler(
+        [
+            _request("eos", (5, 1), seed=1, eos_token_ids=(5,)),
+            _request("max", (2, 3, 4), seed=2, max_new_tokens=2),
+            _request("late", (4,), seed=3, arrival_step=3),
+        ],
+        max_active_sequences=1,
+    )
+    results = {result.request_id: result for result in scheduler.run_until_idle()}
+
+    assert results["eos"].stop_reason == "eos"
+    assert results["max"].generated_token_ids == (2, 3)
+    assert results["max"].stop_reason == "max_new_tokens"
+    assert results["late"].activation_step == 3
+    assert results["eos"].slot_id == results["max"].slot_id == results["late"].slot_id == 0
+    assert [results[name].slot_generation for name in ("eos", "max", "late")] == [1, 2, 3]
+    assert scheduler.active_batch_size_histogram == {1: 4}
+
+
+def test_independent_generators_isolate_a_request_from_unrelated_work():
+    target = BatchPhysicsRequest(
+        request_id="target",
+        seed=12345,
+        score_steps=((0.1, 0.2, 0.3, 0.4),) * 4,
+        max_new_tokens=4,
+    )
+    alone = BatchPhysicsScheduler([target], max_active_sequences=1).run_until_idle()
+    crowded = BatchPhysicsScheduler(
+        [
+            _request("noise-a", (1, 1, 1), seed=9),
+            target,
+            _request("noise-b", (2, 2), seed=10),
+        ],
+        max_active_sequences=2,
+    ).run_until_idle()
+
+    assert _observable(alone)["target"] == _observable(crowded)["target"]
+
+
+def test_measurement_schema_records_required_gpu_and_exactness_fields():
+    observation = BatchPhysicsObservation(
+        execution_family=BatchPhysicsExecutionFamily.MERGED_BATCH,
+        parallelism=5,
+        state_ownership_contract=MERGED_STATE_OWNERSHIP_CONTRACT,
+        workload_contract_hash="five-song-three-seed-contract",
+        result_class=ExactnessResultClass.EXACT_OUTPUT,
+        seeds={"a": 12345, "b": 23456},
+        generated_tokens=500,
+        scheduler_wall_seconds=1.0,
+        model_seconds=0.8,
+        cuda_seconds=0.7,
+        peak_memory_bytes=1024,
+        active_batch_size_histogram={5: 100},
+        token_hashes={"a": "token-a", "b": "token-b"},
+        final_rng_state_hashes={"a": "rng-a", "b": "rng-b"},
+        stop_reasons={"a": "max_new_tokens", "b": "eos"},
+    )
+
+    assert observation.scheduler_wall_tokens_per_second == 500.0
+    assert observation.as_dict()["active_batch_size_histogram"] == {"5": 100}
+    assert BatchPhysicsPlan().as_dict() == {
+        "merged_batch_sizes": [1, 2, 5, 8],
+        "b1_lane_counts": [1, 2, 3, 4],
+        "result_class": "exact-output",
+        "status": "execution_not_implemented",
+        "required_observation_fields": [
+            "execution_family",
+            "parallelism",
+            "state_ownership_contract",
+            "workload_contract_hash",
+            "result_class",
+            "seeds",
+            "generated_tokens",
+            "scheduler_wall_seconds",
+            "model_seconds",
+            "cuda_seconds",
+            "peak_memory_bytes",
+            "active_batch_size_histogram",
+            "token_hashes",
+            "final_rng_state_hashes",
+            "stop_reasons",
+        ],
+    }
+
+    candidate_payload = observation.as_dict()
+    candidate_payload["execution_family"] = "b1_lane_pool"
+    candidate_payload["parallelism"] = 2
+    candidate_payload["state_ownership_contract"] = LANE_STATE_OWNERSHIP_CONTRACT
+    candidate_payload["active_batch_size_histogram"] = {"2": 100}
+    candidate_payload["scheduler_wall_seconds"] = 0.9
+    candidate = BatchPhysicsObservation.from_dict(candidate_payload)
+    comparison = compare_batch_physics_observations(observation, candidate)
+    assert comparison["clears_five_percent_scout_bar"] is True
+    assert comparison["decision"] == "continue_incremental_gates"
+
+    below_bar_payload = candidate.as_dict()
+    below_bar_payload["scheduler_wall_seconds"] = 0.97
+    below_bar = BatchPhysicsObservation.from_dict(below_bar_payload)
+    _assert_raises(
+        ValueError,
+        lambda: compare_batch_physics_observations(observation, below_bar),
+        "below 5%",
+    )
+
+    wrong_class_payload = candidate.as_dict()
+    wrong_class_payload["result_class"] = "bitwise-calculation-exact"
+    wrong_class = BatchPhysicsObservation.from_dict(wrong_class_payload)
+    _assert_raises(
+        ValueError,
+        lambda: compare_batch_physics_observations(observation, wrong_class),
+        "result classes differ",
+    )
+
+    wrong_contract_payload = candidate.as_dict()
+    wrong_contract_payload["workload_contract_hash"] = "different-workload"
+    wrong_contract = BatchPhysicsObservation.from_dict(wrong_contract_payload)
+    _assert_raises(
+        ValueError,
+        lambda: compare_batch_physics_observations(observation, wrong_contract),
+        "workload contracts differ",
+    )
