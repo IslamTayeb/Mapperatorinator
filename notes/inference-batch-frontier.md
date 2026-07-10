@@ -127,8 +127,8 @@ target. Model execution itself clears `500`; rowwise logits processing,
 sampling, and host/launch control add `6.240 ms/step`, `34.29%` of complete
 wall. Therefore do not expand merged batch size again or build a scheduler from
 this microbenchmark. First run a bounded active-row sampling/control or graph
-overhead scout at B8, then prove a multi-step mixed-song loop. Lane-pool
-comparison remains open.
+overhead scout at B8, then prove a multi-step mixed-song loop. The lane-pool
+comparison below is now closed after its L=2 complete-step rejection.
 
 Artifacts:
 
@@ -267,14 +267,12 @@ Packed-prefill report:
 ```text
 /work/imt11/Mapperatorinator/runs/packed-prefill-batch-loop16-49548273-8a75179/merged-b8-loop16.json
 ```
-### Independent B1 lane feasibility and first gate
+### Independent B1 lane physics: rejected after L=2
 
-The lane family is still a hypothesis, not the favored execution shape. It may
-retain the accepted B1 graph/native cache shape while overlapping small kernels,
-memory latency, or sampling work across streams. It may also fail because each
-decoder graph already saturates SM/DRAM resources, concurrent requests contend
-for weight reads, CUDA serializes graph nodes, Python control remains serial, or
-private graphs/caches/workspaces consume too much VRAM.
+The lane family was tested as a hypothesis, not assumed to be the favored
+execution shape. L=2 proved that private B1 streams and graphs can overlap the
+model-only interval, but complete exact sampling/control erased that gain. The
+family therefore stops at L=2 under the campaign's `5%` keep rule.
 
 The smallest clean gate is feasible without changing `DecodeSession`, model
 code, V32, or a scheduler. `utils/verify_optimized_b1_lane_capture.py` builds an
@@ -347,17 +345,60 @@ The report SHA-256 is
 `b91383f063a48be95a1174197a8c7cc389c75615dfff9d369c6ad42447dd7cc8`.
 Accept L=1 as exact verifier/denominator evidence, not a runtime win. Its
 complete result is `5.6%` below merged B8, while model-only replay is above the
-merged complete result. L=2 is justified as the cheapest concurrency
-falsification: it must preserve two private streams/graphs/pools/caches/encoders/
-processors/generators in reciprocal launch orders and exceed `435.650 tok/s`
-(`+5%` over L=1). No L=3 code or job is allowed until L=2 is reviewed.
+merged complete result. That justified exactly one L=2 concurrency
+falsification with two private streams/graphs/pools/caches/encoders/processors/
+generators, reciprocal launch orders, and a required `435.650 tok/s` (`+5%`)
+complete-step result.
+
+DCC job `49548733`, commit `aa662c90`, ran that L=2 gate on the same RTX 2080
+Ti. Both reciprocal orders passed one-step parity, zero-sentinel cache rewrite,
+exact 50-token-per-row transcripts and final private RNG hashes, resource
+ownership, and graph capture. The Slurm job intentionally exited `1` because
+the performance gate failed:
+
+| Evidence | Result |
+| --- | ---: |
+| exactness / private-resource ownership / capture | PASS / PASS / PASS |
+| reviewed L=1 complete denominator / required `+5%` bar | `414.905` / `435.650 tok/s` |
+| same-job serial model-only / complete | `556.778` / `405.962 tok/s` |
+| concurrent model-only, order `0,1` / `1,0` | `778.591` / `786.853 tok/s` |
+| concurrent complete, order `0,1` / `1,0` | `397.903` / `398.291 tok/s` |
+| worst gain versus reviewed L=1 / same-job serial | `-4.098%` / `-1.985%` |
+| reciprocal complete-throughput spread | `0.097%` |
+| verifier peak allocated / reserved | `1,981,775,360` / `2,183,135,232` bytes |
+
+The model-only interval improved by `39.8-41.3%` against same-job serial, so
+CUDA stream/graph overlap is real. The complete sampled step was nevertheless
+slower in both orders. This is the decision metric, and the result is also
+`37.36-37.75 tok/s` short of the fixed keep threshold. Peak memory is
+verifier-wide (`1.846 GiB` allocated, `2.033 GiB` reserved), including retained
+reference and lane state; it is not a two-lane production capacity estimate.
+
+Artifacts:
+
+```text
+/work/imt11/Mapperatorinator/runs/l2-lane-capture-49548733-aa662c9/l2-lane-capture.json
+/work/imt11/Mapperatorinator/runs/l2-lane-capture-49548733-aa662c9/cache-state.txt
+/work/imt11/Mapperatorinator/runs/l2-lane-capture-49548733-aa662c9/nvidia-smi.csv
+/work/imt11/Mapperatorinator/logs/l2-lane-capture-49548733.out
+/work/imt11/Mapperatorinator/logs/l2-lane-capture-49548733.err
+```
+
+The report SHA-256 is
+`2533d7be39a065f62fd0fa5af6cf8fbe8173c01bbfc2eb1dc43bb4ccb296332e`.
+Extension caches were unchanged before/after. Retain the L=1/L=2 verifier as
+exact physics evidence, but do not build L=3/L=4 or lane-pool runtime wiring.
+Revisit only after measured complete sampling/control changes, or a materially
+different hardware/runtime stack, gives the L=2 complete path a projected
+ceiling above `5%`.
 
 Lane observations use the merged verifier's `row-N` request IDs and logical
-workload-contract keys. A future L=2 comparison must replay the same two-row
-workload serially on L=1 and concurrently on L=2; it must not compare different
-request counts merely because both reports are normalized observations.
+workload-contract keys. The L=2 comparison replayed the same two-row workload
+serially and concurrently; it did not compare different request counts merely
+because both reports were normalized observations.
 
-Every future lane must own a distinct persistent CUDA stream, graph, default
+The retained verifier requires every lane to own a distinct persistent CUDA
+stream, graph, default
 graph-private allocator pool, session/cache/encoder state, static buffers,
 generator, and logits processor while sharing only immutable model weights.
 Never pass the same graph-pool token to concurrently replayed graphs. PyTorch
@@ -391,14 +432,22 @@ The V32 server already demonstrates request collection and compatibility groupin
 
 New scheduler/runtime code belongs under `osuT5/osuT5/inference/optimized/`. The legacy server may later receive only a lazy adapter after the offline engine wins.
 
-## Batch Physics Gate
+## Batch Physics Result And Remaining Gate
 
-Do not build a production scheduler before comparing the two plausible exact execution shapes on current `main`:
+The first one-token physics comparison is complete:
 
-1. merged one-token decode at `B=1/2/5/8` with fixed slots;
-2. `1-4` independent B1 CUDA-graph lanes sharing immutable weights but owning private streams, graph instances, input/output buffers, generators, caches, cuBLAS workspaces, and request state.
+1. merged one-token decode reached `439.636` complete tok/s at B8 and retained
+   exact row behavior, but rowwise sampling/control consumed `34.29%` of the
+   complete step;
+2. two independent B1 CUDA-graph lanes retained exact transcripts/private state
+   and overlapped model work, but regressed complete throughput to
+   `397.903-398.291 tok/s` and are rejected.
 
-Use distinct songs as well as identical-song controls. Cover request-order permutations, staggered arrivals, timing/main contexts, different prefix buckets, EOS/max-token stops, cache-slot release/reuse, and output assembly.
+Do not build a production scheduler from either one-token component result. The
+remaining merged-family gate is to profile the measured B8 rowwise
+sampling/control gap, then prove a multi-step mixed-song loop with distinct
+songs, request-order permutations, timing/main contexts, prefix buckets,
+EOS/max-token stops, cache-slot release/reuse, and output assembly.
 
 For each shape report:
 
@@ -408,9 +457,10 @@ For each shape report:
 - graph capture/replay count, active-batch histogram, queue wait, and tail behavior;
 - GPU timeline, clocks/power, memory traffic indicators, and useful idle gaps.
 
-Choose a lane pool if concurrent B1 graphs are the best exact result, fixed-slot merged batching if small B scales, and reject both if neither improves optimized serial by at least `5%`.
-
-If both fail, profile B1/2/4/8 component scaling before writing more runtime code. Only a measured target-sized ceiling can justify request-major multi-vector linear work, broader fusion, or operation-level/nano-batch overlap.
+Only a measured target-sized complete-step ceiling can justify merged scheduler
+wiring, request-major multi-vector linear work, broader fusion, or
+operation-level/nano-batch overlap. The model-only L=2 lane signal alone is not
+such a ceiling.
 
 ## Optimized Offline Engine Contract
 
@@ -464,12 +514,11 @@ Until those gates pass, call results offline-engine throughput, not server optim
 
 ## Immediate Next Decision Points
 
-- Treat the exact packed B8 result as a stopped verifier signal: `497.328 tok/s`
-  cleared the relative keep bar but missed the absolute queue microgate, so do
-  not advance it to 256 steps, mixed songs, lifecycle, or scheduler wiring.
-- Finish the reciprocal independent-B1 CUDA-graph lane comparison in its
-  isolated experiment worktree; advance only if exact private state and the
-  measured keep gate both pass.
-- Build only the execution shape that clears `5%` exact-output aggregate improvement.
+- Fixed-slot packed B8 is the selected execution shape after its exact `+13.42%`
+  complete-step gain and the lane rejection. Run exactly one mixed eight-row,
+  at-least-five-song 16-step gate before any longer loop or scheduler wiring;
+  require exact private behavior, `>=5%`, and `>=500 tok/s`.
+- Keep the independent-lane verifier as rejected physics evidence; do not build
+  L=3/L=4 or lane runtime wiring.
 - Feed accepted single-song components, including any exact speculative verifier win, back into the offline engine and measure combined scheduler-wall throughput.
 - Stop for user input before reduced precision, output/RNG relaxation, or maintainer-facing changes outside the optimized package/adapter boundary.

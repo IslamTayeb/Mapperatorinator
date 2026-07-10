@@ -18,7 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from osuT5.osuT5.inference.optimized.benchmark import (
+from osuT5.osuT5.inference.optimized.benchmark import (  # noqa: E402
     BatchPhysicsObservation,
     BatchPhysicsPlan,
     compare_batch_physics_observations,
@@ -73,7 +73,8 @@ def main(argv: list[str] | None = None) -> int:
             "B=1 -> B=2 -> B=5 -> B=8 merged one-token verifier, or "
             "utils/verify_optimized_b1_lane_capture.py for the L=1 lane "
             "parity/capture gate, or utils/verify_optimized_l2_lane_capture.py "
-            "for the reviewed reciprocal-order L=2 gate. L=3-4 remains unimplemented."
+            "for the reviewed reciprocal-order L=2 gate. The lane family was "
+            "rejected at L=2, so L=3-4 are intentionally cut."
         )
     rendered = json.dumps(payload, indent=2, sort_keys=True)
     if args.output_json is not None:

@@ -26,7 +26,7 @@ class BatchPhysicsPlan:
     """The bounded execution-shape matrix required before scheduler work."""
 
     merged_batch_sizes: tuple[int, ...] = (1, 2, 5, 8)
-    b1_lane_counts: tuple[int, ...] = (1, 2, 3, 4)
+    b1_lane_counts: tuple[int, ...] = (1, 2)
     result_class: ExactnessResultClass = ExactnessResultClass.EXACT_OUTPUT
 
     def __post_init__(self) -> None:
@@ -44,10 +44,12 @@ class BatchPhysicsPlan:
             "status": "merged_one_token_verifier_only",
             "implemented_merged_one_token_batch_sizes": [1, 2, 5, 8],
             "planned_merged_batch_sizes": [],
-            "lane_pool_status": "l1_validated_l2_verifier_pending_gpu",
+            "lane_pool_status": "rejected_after_l2_complete_step_gate",
             "validated_b1_lane_counts": [1],
-            "implemented_pending_gpu_b1_lane_counts": [2],
-            "planned_b1_lane_counts": [3, 4],
+            "measured_rejected_b1_lane_counts": [2],
+            "implemented_pending_gpu_b1_lane_counts": [],
+            "planned_b1_lane_counts": [],
+            "cut_b1_lane_counts": [3, 4],
             "required_observation_fields": [
                 "execution_family",
                 "parallelism",
