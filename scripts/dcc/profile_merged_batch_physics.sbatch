@@ -122,6 +122,8 @@ python utils/verify_optimized_merged_one_token.py \
   num_beams=1 \
   seed=12345 \
   inference_generation_compile=false \
+  inference_active_prefix_decode_loop=true \
+  inference_active_prefix_decode_bucket_size=64 \
   inference_stateful_monotonic_logits_processor=true
 
 echo "report=$REPORT"
