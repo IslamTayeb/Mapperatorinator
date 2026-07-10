@@ -12,6 +12,7 @@ from osuT5.osuT5.inference.optimized.speculative.target_span_gpu import (
     compare_cache_prefixes,
     hash_cache,
     load_and_validate_prior_gate,
+    project_k4_current_stack,
     zero_static_self_cache_suffix,
 )
 
@@ -100,3 +101,13 @@ def test_rollback_oracle_rejects_out_of_bounds_intervals():
     cache = _fake_cache()
     with pytest.raises(ValueError, match="exceeds"):
         zero_static_self_cache_suffix(cache, start_position=7, end_position=9)
+
+
+def test_k4_current_stack_projection_uses_strict_five_percent_threshold():
+    passing = project_k4_current_stack(5.479)
+    boundary = project_k4_current_stack(5.480)
+
+    assert passing["clears_five_percent"] is True
+    assert boundary["clears_five_percent"] is False
+    assert passing["accepted_q1_allowance_ms"] == pytest.approx(3.825303748)
+    assert passing["strict_campaign_q4_threshold_ms"] == 5.480

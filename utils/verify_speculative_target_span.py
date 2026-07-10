@@ -49,6 +49,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--timing-warmup", type=int, default=5)
     parser.add_argument("--timing-iters", type=int, default=25)
+    parser.add_argument(
+        "--fixed-shape-cuda-graph-ceiling",
+        action="store_true",
+        help="Run the one authorized K=4 fixed-shape CUDA-graph replay ceiling.",
+    )
     parser.add_argument("--report-path", type=Path, required=True)
     parser.add_argument("overrides", nargs="*", help="Hydra overrides, e.g. model_path=/path/to/model")
     return parser.parse_args()
@@ -64,6 +69,7 @@ def main() -> int:
         top_k=cli.top_k,
         timing_warmup=cli.timing_warmup,
         timing_iters=cli.timing_iters,
+        fixed_shape_cuda_graph_ceiling=cli.fixed_shape_cuda_graph_ceiling,
     )
     args = _load_args(cli.config_name, cli.overrides)
     _assert_supported_probe(args)

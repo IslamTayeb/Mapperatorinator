@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -40,6 +41,7 @@ class TargetSpanGateConfig:
     top_k: int = 20
     timing_warmup: int = 5
     timing_iters: int = 25
+    fixed_shape_cuda_graph_ceiling: bool = False
 
     def __post_init__(self) -> None:
         if self.speculation_k not in SUPPORTED_K:
@@ -486,6 +488,282 @@ def _peak_cuda_memory(
     }
 
 
+def project_k4_current_stack(replay_ms: float) -> dict[str, Any]:
+    """Project the K=4 span onto the current five-full structural denominator."""
+
+    baseline_seconds = 163.088
+    serial_tokens = 42_634
+    empty_q1_calls = 20_078
+    q4_span_calls = 14_257
+    accepted_q1_ms = baseline_seconds * 1000.0 / serial_tokens
+    projected_seconds = (
+        empty_q1_calls * accepted_q1_ms + q4_span_calls * replay_ms
+    ) / 1000.0
+    improvement_fraction = (baseline_seconds - projected_seconds) / baseline_seconds
+    calculated_threshold_ms = (
+        0.95 * baseline_seconds * 1000.0 - empty_q1_calls * accepted_q1_ms
+    ) / q4_span_calls
+    strict_campaign_threshold_ms = 5.480
+    return {
+        "baseline_seconds": baseline_seconds,
+        "serial_main_tokens": serial_tokens,
+        "accepted_q1_allowance_ms": accepted_q1_ms,
+        "empty_q1_calls": empty_q1_calls,
+        "q4_span_calls": q4_span_calls,
+        "q4_replay_ms": replay_ms,
+        "projected_seconds": projected_seconds,
+        "projected_main_tokens_per_second": serial_tokens / projected_seconds,
+        "projected_improvement_fraction": improvement_fraction,
+        "calculated_five_percent_q4_threshold_ms": calculated_threshold_ms,
+        "strict_campaign_q4_threshold_ms": strict_campaign_threshold_ms,
+        "clears_five_percent": replay_ms < strict_campaign_threshold_ms,
+    }
+
+
+def _pointer_manifest(
+        prepared_inputs: Mapping[str, Any],
+        cache: MapperatorinatorCache,
+) -> dict[str, Any]:
+    prepared_tensors: dict[str, Any] = {}
+    for key, value in sorted(prepared_inputs.items()):
+        tensor = value if isinstance(value, torch.Tensor) else getattr(value, "last_hidden_state", None)
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        tensor_name = key if isinstance(value, torch.Tensor) else f"{key}.last_hidden_state"
+        prepared_tensors[tensor_name] = {
+            "data_ptr": int(tensor.data_ptr()),
+            "shape": list(tensor.shape),
+            "dtype": str(tensor.dtype),
+        }
+    return {
+        "prepared_tensors": prepared_tensors,
+        "cache_tensors": {
+            name: {
+                "data_ptr": int(value.data_ptr()),
+                "shape": list(value.shape),
+                "dtype": str(value.dtype),
+            }
+            for name, value in _cache_tensors(cache, self_prefix_length=None)
+        },
+    }
+
+
+def _timed_cuda_graph_replays(
+        graph: torch.cuda.CUDAGraph,
+        reset_cache: Callable[[], None],
+        *,
+        warmup: int,
+        iters: int,
+) -> float:
+    for _ in range(warmup):
+        reset_cache()
+        graph.replay()
+    torch.cuda.synchronize()
+    event_pairs: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+    for _ in range(iters):
+        reset_cache()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        graph.replay()
+        end.record()
+        event_pairs.append((start, end))
+    torch.cuda.synchronize()
+    return sum(start.elapsed_time(end) for start, end in event_pairs) / iters
+
+
+@torch.no_grad()
+def _fixed_shape_k4_cuda_graph_ceiling(
+        args,
+        model,
+        tokenizer,
+        *,
+        prompt: torch.LongTensor,
+        draft_tokens: torch.LongTensor,
+        span_prepared: Mapping[str, Any],
+        span_state: OneTokenDecodeState,
+        sequential_state: OneTokenDecodeState,
+        eager_span_logits: torch.Tensor,
+        sampling_start_rng: RngState,
+        production_end_rng: RngState,
+        lookback_time: float,
+        final_prefix_length: int,
+        config: TargetSpanGateConfig,
+        compare_logits: Callable[..., dict[str, Any]],
+) -> dict[str, Any]:
+    """One fixed-shape CUDA-graph ceiling, isolated from runtime integration."""
+
+    if config.speculation_k != 4:
+        raise ValueError("The fixed-shape CUDA-graph ceiling is authorized only for K=4.")
+    if span_prepared["decoder_input_ids"].shape != (1, 4):
+        raise RuntimeError(
+            "K4 graph capture requires a stable [1,4] decoder_input_ids tensor, "
+            f"got {tuple(span_prepared['decoder_input_ids'].shape)}."
+        )
+    prompt_length = int(prompt.shape[-1])
+
+    def reset_span_cache() -> None:
+        zero_static_self_cache_suffix(
+            span_state.cache,
+            start_position=prompt_length,
+            end_position=final_prefix_length,
+        )
+
+    pointers_before = _pointer_manifest(span_prepared, span_state.cache)
+    warmup_started = torch.cuda.Event(enable_timing=True)
+    warmup_finished = torch.cuda.Event(enable_timing=True)
+    warmup_wall_started = time.perf_counter()
+    warmup_started.record()
+    with generation_profile_context(sdpa_backend=args.profile_sdpa_backend):
+        for _ in range(config.timing_warmup):
+            reset_span_cache()
+            model(**span_prepared, return_dict=True)
+    warmup_finished.record()
+    torch.cuda.synchronize()
+    warmup_wall_seconds = time.perf_counter() - warmup_wall_started
+    warmup_cuda_ms = warmup_started.elapsed_time(warmup_finished)
+
+    reset_span_cache()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    capture_wall_started = time.perf_counter()
+    with torch.cuda.graph(graph):
+        with generation_profile_context(sdpa_backend=args.profile_sdpa_backend):
+            graph_outputs = model(**span_prepared, return_dict=True)
+    torch.cuda.synchronize()
+    capture_wall_seconds = time.perf_counter() - capture_wall_started
+    if not isinstance(graph_outputs.logits, torch.Tensor):
+        raise RuntimeError("Captured K4 graph did not expose a stable logits tensor.")
+    output_data_ptr_after_capture = int(graph_outputs.logits.data_ptr())
+
+    pointers_after_capture = _pointer_manifest(span_prepared, span_state.cache)
+    pointer_stability_after_capture = pointers_before == pointers_after_capture
+    reset_span_cache()
+    rng_before_replay = _rng_state()
+    graph.replay()
+    torch.cuda.synchronize()
+    rng_after_replay = _rng_state()
+    replay_logits = graph_outputs.logits.detach().to(torch.float32, copy=True)
+    output_data_ptr_after_replay = int(graph_outputs.logits.data_ptr())
+    pointers_after_replay = _pointer_manifest(span_prepared, span_state.cache)
+    pointer_stability_after_replay = pointers_before == pointers_after_replay
+
+    logits_comparisons = [
+        compare_logits(
+            eager_span_logits[:, index, :],
+            replay_logits[:, index, :],
+            atol=config.atol,
+            rtol=config.rtol,
+            top_k=config.top_k,
+        )
+        for index in range(config.speculation_k)
+    ]
+    replay_verification_logits = [
+        span_state.prefill_logits,
+        *[replay_logits[:, index, :] for index in range(config.speculation_k - 1)],
+    ]
+    replay_samples, replay_final_rng, _ = _sample_verification_logits(
+        args,
+        tokenizer,
+        prompt=prompt,
+        draft_tokens=draft_tokens,
+        verification_logits=replay_verification_logits,
+        start_rng_state=sampling_start_rng,
+        lookback_time=lookback_time,
+    )
+    draft_token_ids = [int(token) for token in draft_tokens[0].tolist()]
+    cache_comparison = compare_cache_prefixes(
+        sequential_state.cache,
+        span_state.cache,
+        self_prefix_length=final_prefix_length,
+        atol=config.atol,
+        rtol=config.rtol,
+    )
+    cache_bitwise_match = (
+        hash_cache(sequential_state.cache, self_prefix_length=final_prefix_length)
+        == hash_cache(span_state.cache, self_prefix_length=final_prefix_length)
+    )
+    replay_ms = _timed_cuda_graph_replays(
+        graph,
+        reset_span_cache,
+        warmup=config.timing_warmup,
+        iters=config.timing_iters,
+    )
+    projection = project_k4_current_stack(replay_ms)
+    numeric_pass = all(
+        item["allclose"] and item["topk_match"]
+        for item in logits_comparisons
+    )
+    sampled_exact = replay_samples == draft_token_ids and _rng_states_equal(
+        replay_final_rng,
+        production_end_rng,
+    )
+    graph_forward_rng_unchanged = _rng_states_equal(rng_before_replay, rng_after_replay)
+    stable_output_buffer = output_data_ptr_after_capture == output_data_ptr_after_replay
+    graph_safety_pass = (
+        pointer_stability_after_capture
+        and pointer_stability_after_replay
+        and stable_output_buffer
+        and graph_forward_rng_unchanged
+    )
+    passed = (
+        numeric_pass
+        and sampled_exact
+        and cache_comparison["allclose"]
+        and graph_safety_pass
+        and projection["clears_five_percent"]
+    )
+    return {
+        "enabled": True,
+        "pass": passed,
+        "scope": "verifier_only_fixed_shape_k4_cuda_graph_ceiling",
+        "graph_count": 1,
+        "capture": {
+            "pre_capture_warmup_calls": config.timing_warmup,
+            "pre_capture_warmup_cuda_ms": warmup_cuda_ms,
+            "pre_capture_warmup_wall_seconds": warmup_wall_seconds,
+            "capture_wall_seconds": capture_wall_seconds,
+        },
+        "replay": {
+            "warmup_replays": config.timing_warmup,
+            "measured_replays": config.timing_iters,
+            "cuda_ms_per_replay": replay_ms,
+            "cache_reset_outside_timed_region": True,
+        },
+        "graph_safety": {
+            "pass": graph_safety_pass,
+            "fixed_decoder_input_shape": list(span_prepared["decoder_input_ids"].shape),
+            "prepared_and_cache_pointers_stable_after_capture": pointer_stability_after_capture,
+            "prepared_and_cache_pointers_stable_after_replay": pointer_stability_after_replay,
+            "output_buffer_data_ptr_after_capture": output_data_ptr_after_capture,
+            "output_buffer_data_ptr_after_replay": output_data_ptr_after_replay,
+            "output_buffer_stable": stable_output_buffer,
+            "model_forward_rng_unchanged": graph_forward_rng_unchanged,
+        },
+        "numeric": {
+            "pass": numeric_pass,
+            "logit_topk_comparisons": logits_comparisons,
+            "sampled_token_ids": replay_samples,
+            "captured_production_token_ids": draft_token_ids,
+            "sampled_tokens_and_final_rng_exact": sampled_exact,
+            "replay_final_rng_hash": _hash_rng_state(replay_final_rng),
+            "production_final_rng_hash": _hash_rng_state(production_end_rng),
+            "active_prefix_cache_allclose": cache_comparison,
+            "active_prefix_cache_bitwise_hash_match": cache_bitwise_match,
+        },
+        "current_stack_projection": projection,
+        "decision": (
+            "ceiling_clears_5pct_continue_verifier_only"
+            if passed
+            else "reject_ngram_speculative_runtime_below_current_stack_keep_bar"
+        ),
+        "revisit_conditions": (
+            "Revisit only if the accepted q1 denominator materially slows, the proposal structure changes, "
+            "or a new fixed-shape target kernel/graph ceiling demonstrates q4 below the recorded threshold."
+        ),
+    }
+
+
 @torch.no_grad()
 def run_target_span_gpu_gate(
         args,
@@ -698,6 +976,27 @@ def run_target_span_gpu_gate(
         "sequential": _peak_cuda_memory(sequential_call, reset_sequential),
         "span": _peak_cuda_memory(span_call, reset_span),
     }
+    fixed_shape_cuda_graph = (
+        _fixed_shape_k4_cuda_graph_ceiling(
+            args,
+            model,
+            tokenizer,
+            prompt=prompt,
+            draft_tokens=draft_tokens,
+            span_prepared=span_prepared,
+            span_state=span_state,
+            sequential_state=sequential_state,
+            eager_span_logits=span_logits,
+            sampling_start_rng=sampling_start_rng,
+            production_end_rng=production_end_rng,
+            lookback_time=lookback_time,
+            final_prefix_length=final_prefix_length,
+            config=config,
+            compare_logits=compare_logits,
+        )
+        if config.fixed_shape_cuda_graph_ceiling
+        else {"enabled": False, "pass": None}
+    )
 
     draft_token_ids = [int(token) for token in draft_tokens[0].tolist()]
     q_len_pass = all(item["allclose"] and item["topk_match"] for item in q_len_comparisons)
@@ -723,6 +1022,7 @@ def run_target_span_gpu_gate(
         cache_allclose["allclose"],
         rollback_oracle_match,
         forced_eos_audit["pass"],
+        fixed_shape_cuda_graph["pass"] if fixed_shape_cuda_graph["enabled"] else True,
     ))
     return {
         "gate": GATE_NAME,
@@ -786,6 +1086,7 @@ def run_target_span_gpu_gate(
             "span_ms_per_scored_position": span_ms / config.speculation_k,
         },
         "peak_vram": memory,
+        "fixed_shape_cuda_graph_ceiling": fixed_shape_cuda_graph,
         "prepared_shapes": {
             "sequential_decoder_input_ids": [
                 list(prepared["decoder_input_ids"].shape)

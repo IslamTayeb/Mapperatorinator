@@ -17,6 +17,7 @@ WORK=/work/imt11/Mapperatorinator
 EXPECTED_COMMIT=${EXPECTED_COMMIT:?Set EXPECTED_COMMIT to the pushed verifier commit}
 SPECULATION_K=${SPECULATION_K:-2}
 PRIOR_GATE_REPORT=${PRIOR_GATE_REPORT:-}
+ENABLE_FIXED_SHAPE_GRAPH=${ENABLE_FIXED_SHAPE_GRAPH:-false}
 COMMIT=$(git -C "$REPO" rev-parse HEAD)
 SHORT_COMMIT=$(git -C "$REPO" rev-parse --short HEAD)
 RUN_ROOT="$WORK/runs/spec-target-span-k${SPECULATION_K}-${SLURM_JOB_ID:-manual}-${SHORT_COMMIT}"
@@ -76,6 +77,7 @@ echo "commit=$COMMIT"
 echo "branch=$(git branch --show-current)"
 echo "speculation_k=$SPECULATION_K"
 echo "prior_gate_report=${PRIOR_GATE_REPORT:-none}"
+echo "enable_fixed_shape_graph=$ENABLE_FIXED_SHAPE_GRAPH"
 echo "run_root=$RUN_ROOT"
 echo "report=$REPORT"
 echo "telemetry=$TELEMETRY"
@@ -117,6 +119,12 @@ COMMAND=(
 )
 if [[ -n "$PRIOR_GATE_REPORT" ]]; then
   COMMAND+=(--prior-gate-report "$PRIOR_GATE_REPORT")
+fi
+if [[ "$ENABLE_FIXED_SHAPE_GRAPH" == true ]]; then
+  COMMAND+=(--fixed-shape-cuda-graph-ceiling)
+elif [[ "$ENABLE_FIXED_SHAPE_GRAPH" != false ]]; then
+  echo "ENABLE_FIXED_SHAPE_GRAPH must be true or false" >&2
+  exit 2
 fi
 COMMAND+=(
   audio_path="$WORK/data/salvalai.mp3"
