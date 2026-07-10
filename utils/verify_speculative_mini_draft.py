@@ -7,6 +7,7 @@ import copy
 import hashlib
 import json
 import os
+import resource
 import socket
 import subprocess
 import sys
@@ -78,6 +79,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--encoder-timing-iters", type=int, default=8)
     parser.add_argument("--steady-cache-warmup", type=int, default=2)
     parser.add_argument("--steady-cache-timing-iters", type=int, default=8)
+    parser.add_argument(
+        "--loaders-only",
+        action="store_true",
+        help=(
+            "CPU-only pinned-artifact/model/tokenizer preflight. Stops before input preparation, "
+            "target sampling, draft proposals, CUDA timing, or any feasibility decision."
+        ),
+    )
     parser.add_argument("--report-path", type=Path, required=True)
     parser.add_argument("overrides", nargs="*", help="Hydra overrides; only the audio/output paths vary.")
     return parser.parse_args()
@@ -118,6 +127,7 @@ def _validate_approved_contract(cli: argparse.Namespace, args) -> None:
         "inference_stateful_monotonic_logits_processor": True,
         "start_time": 71000,
         "end_time": 86000,
+        "device": "cpu" if getattr(cli, "loaders_only", False) else "cuda",
     }
     mismatches.update({
         name: {"expected": expected, "actual": getattr(args, name)}
@@ -221,6 +231,44 @@ def _public_artifact_manifest(item: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in item.items() if key != "config"}
 
 
+def _load_pinned_models(
+        args,
+        target_artifact: dict[str, Any],
+        mini_artifact: dict[str, Any],
+        *,
+        loader=load_model_with_server,
+):
+    """Load the already-resolved local gamemode paths without shared loader changes."""
+
+    common_kwargs = {
+        "t5_args": args.train,
+        "device": args.device,
+        "max_batch_size": args.max_batch_size,
+        "use_server": False,
+        "precision": args.precision,
+        "attn_implementation": args.attn_implementation,
+        "lora_path": None,
+        "gamemode": args.gamemode,
+        # The pinned paths already name gamemode=0. Re-selecting a local
+        # gamemode directory returns subfolder=None, which Transformers 4.57.3
+        # cannot normalize in config loading.
+        "auto_select_gamemode_model": False,
+        "generation_compile": False,
+    }
+    target = loader(Path(target_artifact["resolved_path"]), **common_kwargs)
+    mini = loader(Path(mini_artifact["resolved_path"]), **common_kwargs)
+    return target, mini
+
+
+def _model_loader_manifest(model) -> dict[str, Any]:
+    return {
+        "class": f"{type(model).__module__}.{type(model).__qualname__}",
+        "device": str(model.device),
+        "dtype": str(model.dtype),
+        "parameter_count": sum(parameter.numel() for parameter in model.parameters()),
+    }
+
+
 def main() -> int:
     cli = _parse_args()
     started = time.perf_counter()
@@ -233,6 +281,7 @@ def main() -> int:
         "target_revision": cli.target_revision,
         "mini_repo": MINI_REPO,
         "mini_revision": cli.mini_revision,
+        "execution_mode": "loader_preflight" if cli.loaders_only else "gpu_feasibility",
         "hostname": socket.gethostname(),
         "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
         "slurm_partition": os.environ.get("SLURM_JOB_PARTITION"),
@@ -270,31 +319,10 @@ def main() -> int:
             "compatibility": compatibility,
         }
 
-        target_model, target_tokenizer = load_model_with_server(
-            Path(target_artifact["snapshot_path"]),
-            args.train,
-            args.device,
-            max_batch_size=args.max_batch_size,
-            use_server=False,
-            precision=args.precision,
-            attn_implementation=args.attn_implementation,
-            lora_path=None,
-            gamemode=args.gamemode,
-            auto_select_gamemode_model=True,
-            generation_compile=False,
-        )
-        mini_model, mini_tokenizer = load_model_with_server(
-            Path(mini_artifact["snapshot_path"]),
-            args.train,
-            args.device,
-            max_batch_size=args.max_batch_size,
-            use_server=False,
-            precision=args.precision,
-            attn_implementation=args.attn_implementation,
-            lora_path=None,
-            gamemode=args.gamemode,
-            auto_select_gamemode_model=True,
-            generation_compile=False,
+        (target_model, target_tokenizer), (mini_model, mini_tokenizer) = _load_pinned_models(
+            args,
+            target_artifact,
+            mini_artifact,
         )
         runtime_tokenizer_ids = {
             name: {
@@ -306,56 +334,107 @@ def main() -> int:
         if any(item["target"] != item["mini"] for item in runtime_tokenizer_ids.values()):
             raise ValueError(f"Runtime tokenizer special IDs differ: {runtime_tokenizer_ids}")
         artifact_manifest["runtime_tokenizer_special_ids"] = runtime_tokenizer_ids
-        model_inputs = _move_kwargs_for_model(
-            target_model,
-            _build_probe_inputs(
+        if cli.loaders_only:
+            result = {
+                "gate": "v32_mini_loader_preflight",
+                "pass": True,
+                "result_class": "loader_preflight",
+                "claim_scope": (
+                    "CPU-only pinned artifact and loader validation; no input preparation, target "
+                    "sampling, transcript replay, CUDA timing, VRAM, or performance evidence"
+                ),
+                "artifacts": artifact_manifest,
+                "loaders": {
+                    "target_model": _model_loader_manifest(target_model),
+                    "mini_model": _model_loader_manifest(mini_model),
+                    "target_tokenizer_class": (
+                        f"{type(target_tokenizer).__module__}.{type(target_tokenizer).__qualname__}"
+                    ),
+                    "mini_tokenizer_class": (
+                        f"{type(mini_tokenizer).__module__}.{type(mini_tokenizer).__qualname__}"
+                    ),
+                    "runtime_special_ids_match": True,
+                },
+                "not_run": {
+                    "gpu_feasibility_gate": True,
+                    "target_transcript_capture": True,
+                    "closed_loop_acceptance": True,
+                    "draft_cost": True,
+                    "performance_projection": True,
+                    "peak_vram": True,
+                },
+            }
+            metadata.update({
+                "precision": args.precision,
+                "attn_implementation": args.attn_implementation,
+                "seed": args.seed,
+                "gamemode": args.gamemode,
+                "device": args.device,
+                "generation_compile_requested": args.inference_generation_compile,
+            })
+            exit_code = 0
+        else:
+            model_inputs = _move_kwargs_for_model(
+                target_model,
+                _build_probe_inputs(
+                    args,
+                    target_model,
+                    target_tokenizer,
+                    sequence_index=cli.sequence_index,
+                ),
+            )
+            gate_config = MiniDraftGpuScoutConfig(
+                speculation_k=cli.speculation_k,
+                max_new_tokens=cli.max_new_tokens,
+                encoder_warmup=cli.encoder_warmup,
+                encoder_timing_iters=cli.encoder_timing_iters,
+                steady_cache_warmup=cli.steady_cache_warmup,
+                steady_cache_timing_iters=cli.steady_cache_timing_iters,
+            )
+            result = run_mini_draft_gpu_scout(
                 args,
                 target_model,
                 target_tokenizer,
-                sequence_index=cli.sequence_index,
-            ),
-        )
-        gate_config = MiniDraftGpuScoutConfig(
-            speculation_k=cli.speculation_k,
-            max_new_tokens=cli.max_new_tokens,
-            encoder_warmup=cli.encoder_warmup,
-            encoder_timing_iters=cli.encoder_timing_iters,
-            steady_cache_warmup=cli.steady_cache_warmup,
-            steady_cache_timing_iters=cli.steady_cache_timing_iters,
-        )
-        result = run_mini_draft_gpu_scout(
-            args,
-            target_model,
-            target_tokenizer,
-            mini_model,
-            mini_tokenizer,
-            model_inputs,
-            gate_config,
-            artifact_manifest=artifact_manifest,
-        )
-        metadata.update({
-            "precision": args.precision,
-            "attn_implementation": args.attn_implementation,
-            "profile_sdpa_backend": args.profile_sdpa_backend,
-            "seed": args.seed,
-            "gamemode": args.gamemode,
-            "start_time": args.start_time,
-            "end_time": args.end_time,
-            "cuda_device_name": torch.cuda.get_device_name(target_model.device),
-            "cuda_device_capability": list(torch.cuda.get_device_capability(target_model.device)),
-            "generation_compile_requested": args.inference_generation_compile,
-        })
-        exit_code = 0 if result["pass"] else 1
+                mini_model,
+                mini_tokenizer,
+                model_inputs,
+                gate_config,
+                artifact_manifest=artifact_manifest,
+            )
+            metadata.update({
+                "precision": args.precision,
+                "attn_implementation": args.attn_implementation,
+                "profile_sdpa_backend": args.profile_sdpa_backend,
+                "seed": args.seed,
+                "gamemode": args.gamemode,
+                "start_time": args.start_time,
+                "end_time": args.end_time,
+                "cuda_device_name": torch.cuda.get_device_name(target_model.device),
+                "cuda_device_capability": list(torch.cuda.get_device_capability(target_model.device)),
+                "generation_compile_requested": args.inference_generation_compile,
+            })
+            exit_code = 0 if result["pass"] else 1
     except Exception as exc:
         traceback.print_exc()
-        result = {
-            "gate": "v32_mini_closed_loop_feasibility",
-            "pass": False,
-            "result_class": "bounded_v32_mini_feasibility_blocked",
-            "blocker": {"type": type(exc).__name__, "message": str(exc)},
-        }
+        if cli.loaders_only:
+            result = {
+                "gate": "v32_mini_loader_preflight",
+                "pass": False,
+                "result_class": "loader_preflight_blocked",
+                "claim_scope": "CPU-only loader preflight; no performance or GPU evidence",
+                "blocker": {"type": type(exc).__name__, "message": str(exc)},
+                "not_run": {"gpu_feasibility_gate": True, "performance_projection": True},
+            }
+        else:
+            result = {
+                "gate": "v32_mini_closed_loop_feasibility",
+                "pass": False,
+                "result_class": "bounded_v32_mini_feasibility_blocked",
+                "blocker": {"type": type(exc).__name__, "message": str(exc)},
+            }
         exit_code = 1
     metadata["wall_seconds"] = time.perf_counter() - started
+    metadata["process_max_rss_kb"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     result["metadata"] = metadata
     cli.report_path.parent.mkdir(parents=True, exist_ok=True)
     cli.report_path.write_text(json.dumps(result, indent=2), encoding="utf-8")

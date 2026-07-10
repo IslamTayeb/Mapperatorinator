@@ -12,6 +12,7 @@ from utils.verify_speculative_mini_draft import (
     TARGET_REPO,
     TARGET_REVISION,
     _artifact_compatibility,
+    _load_pinned_models,
     _load_args,
     _validate_approved_contract,
 )
@@ -86,10 +87,81 @@ def test_cli_contract_rejects_any_second_shape_or_runtime_drift():
         inference_stateful_monotonic_logits_processor=True,
         start_time=71000,
         end_time=86000,
+        device="cuda",
     )
 
     _validate_approved_contract(cli, args)
     cli.max_new_tokens = 255
+    with pytest.raises(ValueError, match="contract changed"):
+        _validate_approved_contract(cli, args)
+
+
+def test_pinned_models_use_exact_resolved_paths_and_disable_local_gamemode_reselection(tmp_path):
+    target_path = tmp_path / "target" / "gamemode=0"
+    mini_path = tmp_path / "mini" / "gamemode=0"
+    calls = []
+
+    def fake_loader(path, **kwargs):
+        calls.append((path, kwargs))
+        return f"model-{len(calls)}", f"tokenizer-{len(calls)}"
+
+    args = SimpleNamespace(
+        train="train-config",
+        device="cpu",
+        max_batch_size=1,
+        precision="fp32",
+        attn_implementation="sdpa",
+        gamemode=0,
+    )
+    loaded = _load_pinned_models(
+        args,
+        {"resolved_path": str(target_path)},
+        {"resolved_path": str(mini_path)},
+        loader=fake_loader,
+    )
+
+    assert loaded == (("model-1", "tokenizer-1"), ("model-2", "tokenizer-2"))
+    assert [call[0] for call in calls] == [target_path, mini_path]
+    assert all(call[1]["auto_select_gamemode_model"] is False for call in calls)
+    assert all(call[1]["gamemode"] == 0 for call in calls)
+
+
+def test_loader_preflight_contract_requires_cpu_and_remains_distinct_from_gpu_gate():
+    cli = Namespace(
+        config_name="profile_salvalai_smoke15",
+        sequence_index=9,
+        speculation_k=4,
+        max_new_tokens=256,
+        target_revision=TARGET_REVISION,
+        mini_revision=MINI_REVISION,
+        loaders_only=True,
+    )
+    args = SimpleNamespace(
+        model_path=TARGET_REPO,
+        seed=12345,
+        precision="fp32",
+        attn_implementation="sdpa",
+        inference_engine="v32",
+        optimized_inference_mode="single",
+        gamemode=0,
+        use_server=False,
+        parallel=False,
+        cfg_scale=1.0,
+        num_beams=1,
+        do_sample=True,
+        temperature=0.9,
+        top_p=0.9,
+        top_k=0,
+        inference_generation_compile=False,
+        inference_active_prefix_decode_loop=True,
+        inference_stateful_monotonic_logits_processor=True,
+        start_time=71000,
+        end_time=86000,
+        device="cpu",
+    )
+
+    _validate_approved_contract(cli, args)
+    args.device = "cuda"
     with pytest.raises(ValueError, match="contract changed"):
         _validate_approved_contract(cli, args)
 
