@@ -1,96 +1,75 @@
-# Inference Profiling
+# Inference Profiling Runbook
 
-Profiling is opt-in. Normal inference does not write profile artifacts unless `profile_inference=true`.
+This is the operational runbook for exact FP32 inference experiments on one RTX 2080/2080 Ti. Current results and historical decisions live in:
 
-## SALVALAI profile run
+- [single-song frontier](../notes/inference-single-frontier.md)
+- [batch/offline frontier](../notes/inference-batch-frontier.md)
+- [experiment ledger](../notes/inference-experiment-ledger.md)
 
-Run this on a GPU host, not on a local MacBook:
+Profiling is opt-in. Normal V32 inference must not write profile artifacts, import optimized/native modules, or change behavior.
 
-```bash
-python inference.py --config-name profile_salvalai \
-  audio_path="/path/to/SALVALAI [Music Video] (_VmnBu3IZ9s).mp3" \
-  output_path="/path/to/profile-output"
-```
+## Result Classes And Metrics
 
-The config targets osu standard, 6 stars, 2015 style, and stream-focused descriptors:
+Use one explicit result class:
 
-- `skillset/streams`
-- `streams/flow aim`
-- `streams/spaced streams`
-- `streams/bursts`
+- `bitwise-calculation-exact`: required intermediate values and caches are bitwise identical, and all output gates pass.
+- `exact-output`: intermediate FP32 values may be allclose, but token IDs/counts, stop behavior, final RNG, timing/main semantics, and `.osu` bytes match.
+- `documented-drift`: any of those observable gates differs. Keep it in a separate table; never present it as an exact speedup.
 
-Each generated beatmap gets a sibling profile JSON by default:
+Use synchronized, untraced `model_elapsed_seconds` for single-song main-generation TPS. Use scheduler wall from first main-generation start to last main-generation finish for offline/batch aggregate TPS. Torch/Nsight traced time and per-request attributed server time are diagnostic only.
 
-```text
-beatmap<uuid>.osu.profile.json
-```
+Keep these modes separate:
 
-Summarize the result:
+1. cold single song;
+2. same-process warm repeat;
+3. serial multi-song;
+4. static IPC server batch;
+5. static window batch;
+6. optimized offline batch/continuous scheduling;
+7. online optimized server.
 
-```bash
-python utils/summarize_inference_profile.py /path/to/beatmap.osu.profile.json
-```
+## DCC Setup
 
-## DCC GPU Run Notes
-
-Use persistent project/env storage under `/hpc/group/...` and write audio, caches, logs, runs, and generated artifacts under `/work/...`. The conda env `bin` directory must be on `PATH`, otherwise `pydub` may not find `ffmpeg`/`ffprobe` even when they are installed in the env.
-
-For DCC Slurm jobs, keep the Hugging Face cache path consistent between warmup and measured runs:
+Verify live Slurm account, partition, GPU constraint, and profiling-tool permissions before submission. Do not reuse a stale scheduler directive from an old note.
 
 ```bash
+REPO=/hpc/group/romerolab/imt11/projects/Mapperatorinator
 ENV=/hpc/group/romerolab/imt11/envs/mapperatorinator
 WORK=/work/imt11/Mapperatorinator
+
+cd "$REPO"
 export PATH="$ENV/bin:$PATH"
 export XDG_CACHE_HOME="$WORK/cache"
 export HF_HOME="$WORK/cache/huggingface"
 export TRANSFORMERS_CACHE="$WORK/cache/huggingface"
 export TMPDIR="$WORK/tmp"
 export TOKENIZERS_PARALLELISM=false
-
-python inference.py --config-name profile_salvalai \
-  audio_path="$WORK/data/salvalai.mp3" \
-  output_path="$WORK/runs/profile-full-${SLURM_JOB_ID}" \
-  device=cuda \
-  precision=fp32 \
-  attn_implementation=sdpa \
-  use_server=false
 ```
 
-`configs/inference/profile_salvalai.yaml` pins `seed=12345` and `profile_record_token_ids=true` so full-song accepted runs can be compared for fixed-token equivalence just like smoke runs.
+Keep model/Hugging Face cache state identical across a comparison. If a claim includes compiler/native cold start, isolate and record `TORCH_EXTENSIONS_DIR`; otherwise use the same persistent extension cache for baseline and candidate and report whether it was prebuilt.
 
-Validated on DCC `gpu-common` with `--gres=gpu:2080:1`; the allocated node exposed an `NVIDIA GeForce RTX 2080 Ti`.
+Every run note must record:
 
-Observed full SALVALAI run on 2026-06-30:
+- commit and branch;
+- Slurm job/status and node/GPU;
+- Hydra config and all changed flags;
+- seed, precision, attention backend, server/parallel mode;
+- model/HF, compiler, native-extension, and graph-cache state;
+- run, profile/manifest, comparison, telemetry, and trace paths.
 
-- Slurm elapsed: 3m20s for a 156.992s MP3.
-- Sequence count: 87.
-- Map generation: 137.324s stage wall, 8,816 generated tokens, 64.6 tok/s.
-- Timing generation: 21.094s stage wall, 821 generated tokens, 39.5 tok/s.
-- Model load: 10.152s main model, 8.489s timing model from cache.
-- Audio load and postprocessing were sub-second to low-subsecond and not the bottleneck.
+## Current Single-Song Baseline
 
-The dominant bottleneck is autoregressive map generation. The first map window was the slowest record in this run at 7.655s for 520 generated tokens; most other slow windows were around 2.0-2.4s.
-
-## Same-Calculation Optimization Goal
-
-The current RTX 2080/2080 Ti retained cold single-song baseline is SDPA plus `inference_generation_compile=true`, with active-prefix disabled: full-song job `49113713` generated `7,639` SALVALAI main tokens in `82.615s` synchronized model time, `92.465 tok/s`, with fixed-seed token equivalence PASS against the compile-disabled baseline. Use these targets:
-
-- Starter success target: `100 tok/s` on a cold full-song run.
-- Strong first milestone: `120 tok/s` on a cold full-song run.
-- Stretch target: `150+ tok/s`.
-- Historical active long-range research target: `200 tok/s`, reached by the default-off exact opt-in stack below.
-- Current single-song research target: `500 tok/s`, same-calculation only, not batching or multi-process aggregate throughput.
-
-The first 100 tok/s loop ended below target by the documented stop condition because profiling showed no remaining plausible current-architecture quick win of `>=10%`. A renewed runtime pass found exact active-prefix and CUDA graph evidence, then job `49168188` added a stateful monotonic logits processor on top of that default-off path, job `49204568` reduced active-graph capture warmup to zero, job `49206207` reduced the active graph bucket size, job `49213490` added q_len=1 BMM cross-attention for the simple fp32 active-graph path, job `49223294` added persistent DecodeSession graph/cache reuse, job `49225493` added a narrow native q_len=1 self-attention kernel for non-timing/map generation, and job `49230082` fused post-`Wqkv` RoPE/cache/native attention setup. The current fastest accepted exact opt-in path reaches `270.475 tok/s` with fixed-seed token equivalence and byte-identical `.osu` output. Reaching `200 tok/s` from the retained `92.465 tok/s` conservative baseline required cutting full-song synchronized main-generation model time from `82.615s` to about `38.195s`; the accepted fused RoPE/cache self-attention opt-in path now measures `28.243s`. The conservative cold default remains compile-only SDPA unless the user explicitly opts into the active-prefix graph stack.
-
-### 500 tok/s single-song campaign
-
-The post-200 campaign is explicitly about normal single-song inference speed on RTX 2080/2080 Ti. Do not count batching, multiple processes, multiple songs in parallel, precision changes, quantization, sampling-policy changes, RNG changes, output-policy changes, generated-token changes, or output-length changes as equivalent single-song speedups.
-
-Use the fastest exact opt-in path as the campaign baseline unless a new full-song exact-equivalent single-song run beats it:
+The exact opt-in SALVALAI baseline is job `49230082`, commit `d7b8684`: `7,639` main tokens in `28.243s`, `270.475 tok/s`, main/timing token identity, and byte-identical output.
 
 ```bash
 python inference.py --config-name profile_salvalai \
+  audio_path="$WORK/data/salvalai.mp3" \
+  output_path="$WORK/runs/single-full-${SLURM_JOB_ID}" \
+  device=cuda \
+  precision=fp32 \
+  attn_implementation=sdpa \
+  use_server=false \
+  parallel=false \
   inference_generation_compile=true \
   inference_active_prefix_decode_loop=true \
   inference_active_prefix_decode_bucket_size=64 \
@@ -106,1911 +85,174 @@ python inference.py --config-name profile_salvalai \
   inference_native_q1_rope_cache_self_attention=true
 ```
 
-For full-song candidate promotion, compare both main generation and timing context in one strict gate:
+These flags are a validated default-off combination, not a new default and not a server/batch configuration. Record requested and context-enabled flags separately; timing contexts intentionally do not use the native self-attention path.
 
-```bash
-python utils/summarize_inference_profile.py \
-  --compare "$BASELINE/profile.json" "$CANDIDATE/profile.json" \
-  --strict-full-song \
-  --json-output "$RUN_DIR/compare-full-song.json"
-```
+## Smoke-To-Full Ladder
 
-`--strict-full-song` is equivalent to strict comparison for `main_generation` and `timing_context`, plus generated output artifact hash equivalence. `profile_inference` writes `result_file_sha256` and `result_file_size_bytes` after the output artifact is written, so full-song promotion should fail if token IDs match but the final `.osu` bytes differ. It should be the default full-song promotion command so timing-context regressions, token drift, output-byte drift, total-stage wall regressions, and per-window regressions are not checked by hand after the fact. For one-token decoder gates, `utils/verify_one_token_decode.py` defaults to `--sequence-index 9`, the post-warmup smoke window used by the 500 tok/s runtime probes.
+Before writing runtime code, record the current-stack profile, hypothesis, avoidable target, physical/fantasy floor, projected end-to-end ceiling, and falsification condition. Then advance only one evidence level at a time:
 
-For SALVALAI's `7,639` main tokens, `500 tok/s` implies about `15.278s` synchronized main-generation model time, a further `45.9%` reduction from the accepted fused RoPE/cache self-attention path (`28.243s`). Treat this as a runtime/kernel campaign, not a quick-tweak loop. Re-profile the accepted stack first, use untraced `profile_inference` for speed claims, and use Nsight/torch profiler only for diagnosis.
+1. component microbenchmark or roofline;
+2. captured real-tensor/logit/cache verifier;
+3. short and then 256-step exact token/logit/RNG loop;
+4. 15-second smoke;
+5. reciprocal-order full-song main/timing/output comparison;
+6. five-song or batch suite.
 
-Cold-start remains part of the single-song objective. Warmed replay, same-process repeat, or post-capture CUDA graph timings can identify targets, but they do not replace cold full-song evidence. For runtime candidates, record first-window compile/capture/setup time, graph-cache state, model/HF cache state when relevant, cold all-window throughput, timing-context impact, output hashes, and any warmed-repeat numbers as separate result classes. Do not promote a cold single-song change unless it is exact and non-regressing against the retained cold baseline or the current accepted opt-in baseline for the claim scope. See `notes/2026-07-04-cold-start-considerations.md`.
+A microbenchmark or verifier may authorize the next gate, never production integration. If the signal falls below `5%`, exactness fails, or a broader metric regresses, stop immediately, remove candidate runtime wiring, retain only reusable measurement/verifier code, and add the result plus revisit condition to the experiment ledger.
 
-Current-stack cold-start audit jobs `49246259` and `49246261` on RTX 2080 Ti, commit `52d6f19`, showed the main cold-start issue is native extension build/setup wall time, not synchronized decoder throughput. With isolated empty `TORCH_EXTENSIONS_DIR`, the clean full-song opt-in run matched output bytes and measured `271.456 tok/s` main model time, but first map-window outer wall was `63.372s` and main stage wall was `90.247s`. With persistent extension cache initially cold, the first clean run still paid `68.961s` first-window outer wall; later same-process/persistent-cache runs dropped first-window map wall to about `1.89-4.26s` while staying around `267 tok/s` main model time. Treat extension prebuild/cache persistence as a user-visible cold stage-wall concern, not a `tok/s` optimization, unless a future claim explicitly targets total cold wall time.
-
-The current DecodeSession runtime flags are default-off and accepted only for the simple single-song active-prefix graph + stateful + q1-BMM path:
-
-- `inference_decode_session_runtime=true`
-- `inference_decode_session_cuda_graph=true`
-- `inference_decode_session_chunk_size=1`
-- `inference_native_decode_kernels=true`
-- `inference_native_q1_self_attention=true`
-- `inference_native_q1_rope_cache_self_attention=true`
-- `utils/verify_one_token_decode.py --candidate-decode-session`
-
-`DecodeSession` verifier helpers live in `osuT5.osuT5.inference.direct_decode` and delegate to the existing exact static-cache one-token helpers. Use them before broadening the production path. Future DecodeSession changes still need generated-token identity, raw-logit/top-k equality, final RNG-state identity, and output/map behavior proven across multiple sampled decode steps and windows.
-
-Normal inference intentionally raises if DecodeSession/native-kernel flags are enabled in unsupported combinations. `inference_native_decode_kernels=true` is only an umbrella; it must be paired with a validated native subflag and remains default-off. Use `utils/verify_one_token_decode.py --candidate-decode-session`, `utils/verify_direct_decode_loop.py --candidate-decode-session`, and `utils/verify_persistent_decode_session.py` before expanding the production runtime.
-
-`DecodeSession` also has a multi-step direct-loop verifier path. DCC job `49222209` on RTX 2080 Ti, commit `c440416`, ran `utils/verify_direct_decode_loop.py --candidate-decode-session` for 64 sampled decode steps with active-prefix bucket64, CUDA graph replay, and q1 BMM cross-attention. The gate passed generated-token identity, raw-logit/top-k equality, and final CPU+CUDA RNG-state equality against HF `generate()`. This is verifier infrastructure only, not a throughput claim. See `notes/2026-07-03-decode-session-direct-loop-verifier.md`.
-
-Prefer PyTorch built-ins first, then isolated C++/CUDA/CUTLASS/cuBLASLt kernels for measured dominant hotspots. Avoid Triton-first work unless there is no stable practical alternative and the path is default-off, isolated, exact, and strongly measured. Do not implement a PyTorch q1 BMM branch for active-prefix self-attention, even thresholded to long buckets, unless new full-song evidence changes the ceiling. Jobs `49222759`, `49222781`, and production-prefix sweep `49222883` showed self-attention BMM is slower than SDPA through `L=576`, only mildly faster at `L>=640`, and projects to only about `0.463s` saved on full-song SALVALAI (`201.125 -> ~203.6 tok/s`, `~1.2%`). q1 BMM remains justified for long unmasked cross-attention.
-
-Fresh post-q1 500 tok/s profiling, DCC jobs `49221975` through `49221977` on RTX 2080 Ti, commit `b0ec059`, confirmed the then-current q1 exact opt-in path remained around `200 tok/s` but did not improve it. Full-song untraced throughput was `200.646 tok/s` for `7,639` main tokens (`38.072s` model time), with main token equivalence PASS against job `49213490`; that q1 baseline was later superseded by DecodeSession job `49223294` at `216.173 tok/s`, by native self-attention job `49225493` at `237.111 tok/s`, and by fused RoPE/cache self-attention job `49230082` at `270.475 tok/s`. Job `49221975` is marked Slurm `FAILED` only because the strict comparison command returned nonzero after detecting no-regression failures; the profile itself is valid. The torch diagnostic for `main_generation.seq9` classified actual kernel self-CUDA, excluding profiling ranges and CUDA API calls, as `36.0%` one-token GEMV/GEMM linear work, `32.9%` FMHA attention, `13.9%` elementwise, `10.1%` copy/index/cat, `3.1%` layernorm, and `1.7%` softmax. This supports prioritizing one-token linear launch reduction and q_len=1 active-prefix attention/cache layout before fused sampling. See `notes/2026-07-03-post-q1-500tps-profiling.md`.
-
-The first post-q1 linear microprobe rejected simple PyTorch call-form cleanup. `utils/profile_decode_linear_kernels.py` captures actual one-token decoder linear inputs through the direct decode verifier path and compares equivalent call forms. DCC job `49222623` on RTX 2080 Ti, commit `41a1af0`, captured `73` decoder linears for `profile_salvalai_smoke15` seq9 with active-prefix length `128`, q1 BMM enabled, and logits replay `max_abs=0.0`. The captured one-token linears were `12x` self-attn `768 -> 2304`, `36x` `768 -> 768` projection linears, `12x` MLP `768 -> 3072`, `12x` MLP `3072 -> 768`, and `1x` output projection `768 -> 4069`. Rewriting individual `F.linear` calls to `matmul`, `addmm`, or `mv` was flat to tiny: the best per-signature isolated gains project to only about `0.22s` over full-song SALVALAI. A synthetic `fc1 -> GELU -> fc2` MLP block improved only `1.074x` isolated, about `1%` projected full-song. Do not pursue individual linears one by one; future linear work must be fused/native decoder-block or cuBLASLt/CUDA work with verifier gates. See `notes/2026-07-03-decode-linear-kernel-probe.md`.
-
-The first post-q1 attention component probe rejected a PyTorch q1 BMM branch for active-prefix self-attention. `utils/profile_decode_attention_components.py` captures actual one-token decoder self/cross attention tensors through the direct decode verifier path and compares SDPA against explicit q1 `bmm -> softmax -> bmm`. DCC jobs `49222759`, `49222781`, and `49222883` on RTX 2080 Ti, commit `989359f`, showed the accepted cross-attention BMM shape remains `~2.4-2.6x` faster than SDPA, but self-attention BMM is slower through active-prefix `L=576` and only mildly faster at `L>=640`. Using full-song active64 replay counts from job `49207288`, a thresholded self-attention BMM policy projects to only `0.463s` saved over SALVALAI full-song main generation, or `201.125 -> ~203.6 tok/s`. Do not add this PyTorch branch; future self-attention work must improve the common `128..640` buckets through a real cache/layout/native-kernel path. See `notes/2026-07-03-decode-attention-component-probe.md`.
-
-The first persistent DecodeSession verifier proved graph/cache reuse is exact across multiple windows. Full-song q1 diagnostic job `49223017` on RTX 2080 Ti, commit `976b0eb`, measured `198` CUDA graph captures, `11` normalized graph shapes, `7,552` decode replays, and a duplicate-capture ceiling of `2.866s` (`7.610%` of main model time), projecting `202.830 -> 219.537 tok/s` if duplicate captures disappeared with all else unchanged. `utils/verify_persistent_decode_session.py` then reused one `MapperatorinatorCache`, a stable encoder-output buffer, and one shared graph cache across smoke windows. Job `49223121` passed two windows x `64` tokens with exact generated tokens, raw logits/top-k, and final RNG, capturing `2` graphs for `2` prefixes. Job `49223151` passed four windows x `256` tokens, capturing `5` graphs for `5` prefixes and replaying them `1,020` times.
-
-Production integration job `49223294` on RTX 2080 Ti, commit `768b50f`, accepted this as a default-off opt-in runtime. Against the same-job q1 control, full-song SALVALAI main generation improved `203.000 -> 216.173 tok/s` (`37.631s -> 35.337s`, `+6.5%`), timing-context improved `83.231 -> 100.553 tok/s`, and total timing+map stage improved `52.374s -> 48.493s`. Fixed-seed generated token IDs matched for main (`7,639 / 7,639`) and timing (`821 / 821`). Strict main per-window no-regression failed on 3 tiny windows totaling about `2.477ms` model-time overhead, versus `2.293s` aggregate main savings; timing strict no-regression passed. Keep this in the 5-10% strategic band because it is exact, default-off, improves total stage time, and supplies stable graph/cache state for future native-runtime work. See `notes/2026-07-03-persistent-decode-session-runtime.md`.
-
-Post-DecodeSession diagnostics, DCC job `49223379` on RTX 2080 Ti, commit `80adf86`, re-profiled the new opt-in stack with torch profiler on `main_generation.seq9` and an Nsight Systems smoke trace. Duplicate graph capture is now small: active-prefix diagnostics measured `24` graph captures, `10` normalized graph shapes, `1,074` decode replays, and a duplicate-capture ceiling of about `0.103s`, or `~2%` of smoke main model time. The torch diagnostic projected only `212.6 -> 217.0 tok/s` if duplicate captures disappeared; the Nsight diagnostic projected `196.1 -> 200.0 tok/s`. Excluding ranges and CUDA API calls, torch seq9 self-CUDA classified as `32.4%` GEMV/GEMM linear work, `29.6%` FMHA attention, `12.9%` elementwise/GELU/fill, `9.6%` copy/index/cat, `9.4%` other kernels, `3.3%` sampling sort/softmax, and `2.9%` layernorm. Nsight whole-smoke kernel buckets were `39.8%` GEMV/GEMM linear work, `24.7%` FMHA attention, `17.2%` elementwise/GELU/fill/reduce, `10.8%` sampling sort/softmax, `4.9%` copy/index/cat, `2.0%` other, and `0.6%` layernorm. Treat this as diagnostic only; it shifts the next work away from graph-cache cleanup and toward one-token linear/MLP launch reduction or q_len=1 active-prefix self-attention/cache layout. See `notes/2026-07-03-post-decode-session-profiling.md`.
-
-Native q_len=1 self-attention, DCC jobs `49224045`, `49224965`, `49225227`, and `49225493` on RTX 2080 Ti, commit `c563af0`, is the first accepted native CUDA kernel in the 500 tok/s campaign. The diagnostic probe showed a narrow fp32 kernel for active-prefix self-attention beat SDPA across production bucket lengths while keeping captured outputs allclose. It is integrated only behind `inference_native_decode_kernels=true` plus `inference_native_q1_self_attention=true`, and only for non-timing/map-generation contexts in the simple batch-1 DecodeSession active-prefix graph path. Timing contexts stay on the normal path because the first smoke showed timing regression when native self-attention was enabled there.
-
-Full-song validation accepted the candidate: same-job native-off DecodeSession control `207.226 -> 237.111 tok/s` main generation (`36.863s -> 32.217s`, `+14.4%`), timing-context `93.785 -> 100.822 tok/s`, and total timing+map stage `50.736s -> 48.527s`. Fixed-seed generated token IDs matched for main (`7,639 / 7,639`) and timing (`821 / 821`), and the generated `.osu` files were byte-identical. Strict no-regression failed only on `seq0` outer wall due native extension setup plus three tiny main windows totaling `1.511ms` model-time overhead, and one timing window totaling `0.347ms`; treat these as scoped setup/micro-regressions. See `notes/2026-07-03-native-q1-self-attention.md`.
-
-Post-native profiling, DCC job `49227916` on RTX 2080 Ti, commit `06eb637`, re-profiled the accepted native opt-in stack. The untraced 15s smoke measured `1,084` main tokens in `4.156s`, `260.840 tok/s`, with seq9 at `295.260 tok/s`; torch profiler and Nsight preserved main/timing token IDs but added heavy overhead and are diagnostic-only. Torch profiler on `main_generation.seq9` classified filtered self-CUDA as `40.0%` GEMV/GEMM/linear, `17.7%` elementwise/reduce/GELU/fill, `16.5%` attention, `11.1%` copy/index/cat/memcpy, `3.6%` sampling/sort/softmax, and `3.2%` layernorm. Nsight whole-smoke kernel attribution was `40.7%` GEMV/GEMM/linear, `25.1%` attention, `17.6%` elementwise/reduce/GELU/fill, `10.0%` sampling/sort/softmax, and `4.9%` copy/index/cat. No optimization graduated from this diagnostic pass. The next candidate should start with a captured-tensor probe for fused/native one-token linear/MLP/projection islands and require a projected `>5%` full-song saving before production code. See `notes/2026-07-03-post-native-q1-self-profiling.md`.
-
-The current-native linear/MLP probe, DCC job `49228126` on RTX 2080 Ti, commit `dd62e84`, produced valid JSON despite the Slurm job failing in a shell summary step. It used the accepted native opt-in stack, passed logits replay (`max_abs=0.0`), and captured the same `73` one-token decoder linear calls. Simple PyTorch call-form rewrites are still too small: the best per-signature `F.linear -> matmul/addmm/mv` alternatives project to only about `0.2-0.3s` full-song, and the best synthetic one-layer MLP variant projects to about `0.25s`. Do not implement individual decoder linear call-form rewrites; only revisit linear work as a fused/native decoder island with a measured `>5%` projected full-song saving. See `notes/2026-07-03-native-linear-probe.md`.
-
-A later native one-token decoder `Linear` production attempt was rejected and reverted. Diagnostic jobs `49230317`, `49230412`, and `49230428` added native CUDA block/warp-group variants to `utils/profile_decode_linear_kernels.py`; the best grouped warp variant barely crossed the diagnostic threshold, projecting about `1.419s` saved and `284.779 tok/s`. Production commits `51a2c2e` and `9937caa` wired this as default-off `inference_native_one_token_linear`, but full-song DCC job `49230859` showed the real exact win was only same-job control `273.563 -> 281.743 tok/s` (`+2.990%`, `27.924s -> 27.113s`) with main/timing token equivalence PASS and byte-identical `.osu`. The 15s gate job `49230641` also passed one-token logits and direct-loop token/logit/RNG gates, but smoke model-time gain was only `+4.902%` and stage wall regressed. Because this is below the `5%` keep threshold for native/model-call-site complexity, production wiring was reverted in commits `09cda4f` and `55a80cb`. Keep the native-linear extension and probe only as diagnostic infrastructure; do not retry the per-linear wrapper unless new profiling explains why these results are stale. See `notes/2026-07-03-native-one-token-linear-production.md`.
-
-cuBLAS SGEMV is also rejected as a per-linear production path. Diagnostic branch `experiment/cublas-sgemv-linear-probe`, commit `3f64e23`, DCC job `49235621` on RTX 2080 Ti, added a separate diagnostic fp32 `cublasSgemv` extension behind `utils/profile_decode_linear_kernels.py --cublas-linear-variant`. Prefix128 and prefix640 reports both passed logits replay and per-linear allclose (`max_abs=0.0`, `73` captured linears), but CUDA graph replay projected only `0.126-0.129s` full-song saving versus `F.linear`. Because SGEMV did not show a meaningful raw multiply win, do not pursue cuBLASLt bias-epilogue work for individual decoder linears unless new profiling shows the target size has changed. Future vendor/C++/CUDA work should target broader decoder-layer/runtime islands or multiple operation classes together. See `notes/2026-07-03-cublas-sgemv-linear-probe.md`.
-
-The compiled MLP island probe, DCC job `49228228` on RTX 2080 Ti, commit `356fb8a`, also rejected a PyTorch-compiled MLP island. The captured one-layer MLP replay stayed exact locally, but `torch.compile(mode="reduce-overhead")` was slower (`0.118ms` vs `0.060ms`). The best simple MLP variant in that run still projected to only `0.451s` saved over full-song SALVALAI main generation, below the `5%` threshold. Do not pursue compiled MLP wrapping; future MLP work needs a real native/CUTLASS/cuBLASLt fused block with a measured `>5%` ceiling. See `notes/2026-07-03-compiled-mlp-island-probe.md`.
-
-The linear/MLP CUDA graph replay probe confirmed those simple rewrites are still too small under the runtime discipline that matters. `utils/profile_decode_linear_kernels.py --cuda-graph-replay` now benchmarks captured linear/MLP variants under CUDA graph replay. DCC job `49228407` on RTX 2080 Ti, commit `4aa5ab9`, passed logits replay (`max_abs=0.0`) with native q1 self-attention enabled. Graph-replayed one-layer MLP was `0.041098ms`, or about `3.724s` over `12` layers and `7,552` decode replays; addmm/mv MLP variants changed that by only `~0.005s`. All captured decoder linears total about `7.18s` full-song but overlap with the self-attention island because self-attn qkv/out linears are counted in both. Do not implement per-linear or compiled-MLP rewrites; future native/CUTLASS/cuBLASLt work should target a broader decoder-block island and first show a `>5%` graph-replayed full-song ceiling. See `notes/2026-07-03-linear-graph-replay-probe.md`.
-
-Native q1 attention block-size tuning was also rejected. `utils/profile_decode_attention_components.py` now has a diagnostic-only `--native-q1-block-sizes=64,128,256` flag. DCC job `49228161` on RTX 2080 Ti, commit `b2cd395`, wrote valid per-length JSONs but failed in the shell reducer because it globbed `.stdout.json` files; the primary JSONs are valid. Block256 helped the long-prefix tail, but weighting by active64 full-song replay counts from job `49207288` projects only `0.0216s` saved over full-song SALVALAI main generation, or `237.111 -> 237.270 tok/s` (`~0.067%`). Keep the production native q1 attention block128 path. Future attention work should target a larger fused projection/RoPE/cache/attention island and must project to `>5%` before production integration. See `notes/2026-07-03-native-q1-block-variants.md`.
-
-The self-attention island probe also rejected a simple manual/Python rewrite and sized the remaining attention-side ceiling. `utils/profile_decode_self_attention_island.py` captures the real one-token decoder self-attention module boundary and can benchmark the same variants under CUDA graph replay. DCC job `49228373` on RTX 2080 Ti, commit `9381b25`, passed logits replay (`max_abs=0.0`) with active-prefix length `128` and measured CUDA graph replay per-layer timings: repo module `0.067031ms`, manual native island `0.067020ms`, pre-attention setup `0.049950ms`, native q1 attention `0.009563ms`, and output projection `0.007050ms`. Projected over `12` decoder layers and `7,552` one-token decode replays, the full self-attention island is about `6.075s`, or `18.9%` of the accepted `32.217s` full-song model time. Making the entire island free would only raise full-song main-generation throughput to about `292 tok/s`, so self-attention work alone cannot reach `500 tok/s`. The next major path needs broader decoder-block linear/MLP/projection/cache/layout work, measured with CUDA graph replay before production integration. See `notes/2026-07-03-self-attention-island-probe.md`.
-
-The cross-attention island probe sized the q_len=1 encoder-cache attention path and rejected a narrow manual rewrite. `utils/profile_decode_cross_attention_island.py --cuda-graph-replay` captures the real one-token decoder cross-attention module boundary under `q1_bmm_cross_attention=true`. DCC job `49228434` on RTX 2080 Ti, commit `bc2a356`, passed logits replay (`max_abs=0.0`) with K/V shape `[1, 12, 1024, 64]`. CUDA graph replay per-layer timings were: repo module `0.037054ms`, manual q1 BMM island `0.036868ms`, q projection `0.007521ms`, q1 BMM attention `0.020390ms`, and output projection `0.007431ms`. Projected over the full song, the cross-attention island is about `3.358s`, or `10.4%` of model time; making it free would only reach about `265 tok/s`, and the manual rewrite projects to only `~0.017s` saved. The next useful diagnostic is a whole decoder-layer graph replay island to size layernorm/residual/control overhead. See `notes/2026-07-03-cross-attention-island-probe.md`.
-
-The existing native q_len=1 self-attention kernel should not be reused for cross-attention. Diagnostic branch `experiment/native-cross-q1-attn-probe`, commit `ec47b34`, DCC job `49236047` on RTX 2080 Ti, added `--native-q1-attention-variant` to the cross-attention island utility. Prefix128 and prefix640 reports passed logits replay (`max_abs=0.0`) and native attention allclose (`max_abs<=4.41e-06`), but the native kernel was much slower than the accepted q1 BMM reduction under CUDA graph replay: q1 BMM attention `~0.0179ms/layer` versus native q1 attention `~0.0665ms/layer`, and the manual native-q1 cross island `~0.081ms/layer` versus repo q1 BMM cross module `~0.0325ms/layer`. Future cross-attention work needs a new fused cross-attention residual island with a projected full-song saving above the keep threshold. See `notes/2026-07-03-native-cross-q1-attention-probe.md`.
-
-The whole decoder-layer island probe sized the broadest one-token decoder boundary so far. `utils/profile_decode_decoder_layer_island.py --cuda-graph-replay` captures a full decoder layer under active-prefix/native-q1/q1-BMM settings. DCC job `49228458` on RTX 2080 Ti, commit `df21b90`, passed logits replay (`max_abs=0.0`) and measured the full decoder layer at `0.172552ms/layer`. Projected over `12` layers and `7,552` one-token decode replays, that is `15.637s`, or `48.5%` of accepted full-song model time. Making every captured one-token decoder layer free would still only reach about `461 tok/s`, so `500 tok/s` requires near-total decoder-layer acceleration plus outside-layer savings. The next profiling target is the non-layer remainder: decoder final norm, output projection, logits processors/sampling, prefill/first-token paths, and remaining runtime overhead. See `notes/2026-07-03-decoder-layer-island-probe.md`.
-
-Full-song active-prefix diagnostics, DCC job `49228590` on RTX 2080 Ti, commit `225dd04`, sized that non-layer remainder without torch profiler. The run was token-equivalent against accepted job `49225493` for main (`7,639 / 7,639`) and timing (`821 / 821`), but remains diagnostic-only because strict per-window checks still had tiny/noisy failures. Main aggregate measured `31.222s` model time and `244.666 tok/s`; timing measured `8.071s` and `101.726 tok/s`. The useful attribution is negative: duplicate CUDA graph capture was only `0.154s` (`0.494%`) and prefill-forward CPU span was `1.166s`, so graph-cache cleanup and repeated prefill are not major 500 tok/s levers. Large active-prefix diagnostic spans such as token append/stop (`15.216s`) and stopping criteria (`14.752s`) are CPU-side spans around asynchronous work and synchronization, not exclusive additive kernel time. Do not optimize those counters without a follow-up trace/probe that proves a real synchronized model-time saving. See `notes/2026-07-03-full-active-diagnostics-native.md`.
-
-Direct-loop tail diagnostics, DCC job `49229277` on RTX 2080 Ti, commit `4f1420f`, added a verifier-only `utils/verify_direct_decode_loop.py --tail-diagnostics` path and measured logits processors, sampling, append, and stopping inside the exact candidate direct loop. The gate still passed generated-token identity, raw-logit/top-k equality, and final RNG-state identity for `256` sampled steps. The candidate processor list was verifier capture, stateful monotonic mask, temperature, and HF `TopPLogitsWarper`. Excluding the verifier capture hook and non-exclusive processor total, production-like CUDA-event tail time was about `205.242us/token`, projecting to `1.568s` over `7,639` full-song main tokens, just below the `~1.61s` 5% threshold. CPU wall projected to `8.054s`, but it is not exclusive synchronized model time. Do not start standalone fused sampling/top-p work from this evidence; keep tail work only as part of a broader DecodeSession/runtime project that preserves exact multinomial RNG and top-p behavior. See `notes/2026-07-03-direct-loop-tail-diagnostics.md`.
-
-Weighted full-forward accounting, DCC jobs `49229391` and `49229433` on RTX 2080 Ti, commit `e70b871`, closed the main one-token decode accounting gap using full-song active64 replay counts from job `49228590`. `utils/profile_decode_full_forward_island.py` measured weighted full `model(**prepared_inputs)` CUDA-graph replay at `20.090s`, or `62.4%` of the accepted `32.217s` full-song model time; making the entire one-token model forward free would idealize to about `630 tok/s`. Weighted decoder-layer replay was `18.918s`, or `58.7%`; making all one-token decoder layers free would idealize to about `574 tok/s`. The inside-model non-layer residual was only `1.172s` (`3.6%`), so decoder final norm/projection/model wrapper work is not a standalone target. Follow-up self-attention bucket job `49229477` measured weighted self-attention at `8.806s`: `4.378s` pre-attention qkv/RoPE/cache/setup, `3.075s` native q1 attention, and `0.630s` output projection. Cross-attention bucket job `49229539` measured weighted cross-attention at `3.124s`, with `1.713s` in q1 BMM attention and about `1.286s` in q/out projections. Combined layer split is roughly self-attention `8.806s`, MLP `3.724s`, cross-attention `3.124s`, RMSNorms `1.181s`, and residual/glue/probe-boundary remainder `2.083s`. Freeing all self-attention would only reach about `326 tok/s`. To reach `500 tok/s` (`15.278s` for `7,639` tokens), the project needs broad decoder-layer/native runtime savings, not tail cleanup or final-projection work. See `notes/2026-07-03-weighted-full-forward-accounting.md`.
-
-Weighted decoder-stack diagnostic, DCC job `49233687` on RTX 2080 Ti, commit `1e4e1d5`, repeated `utils/profile_decode_decoder_stack_island.py --cuda-graph-replay` across the active-prefix replay-count buckets after the current `270.475 tok/s` stack. All prefix reports passed allclose. Weighted graph replay was: full model forward `17.120s`, decoder stack hidden `16.666s`, decoder stack plus projection `17.063s`, and output projection `0.192s` out of the accepted `28.243s` model time. The full-forward minus stack+projection gap is only `56ms`, so a Python/model-wrapper bypass and final projection cleanup are not useful next targets. The result reinforces the same conclusion: the next plausible implementation-class project is a broad decoder-layer/native runtime island that reduces real decoder-stack compute plus surrounding per-token control. See `notes/2026-07-03-weighted-decoder-stack-diagnostic.md`.
-
-The fixed production fast-prepare retry was rejected. `prepare_one_token_decode_inputs_fast` first passed verifier-only checks, then an attempted production flag failed timing generation in job `49231829` because wrapper-only kwargs such as `negative_prompt` leaked into the model forward. A fixed branch (`experiment/fast-prepare-fixed`, commit `7213058`) excluded those kwargs and routed the default-off `inference_active_prefix_fast_prepare` flag through `inference.py`, `server.py:model_generate()`, and profile metadata. DCC job `49232069` passed the direct-loop token/logit/RNG gate for 256 sampled steps, and job `49232092` passed 15s smoke token equivalence. Full-song paired job `49232174` then failed the promotion gate despite exact main/timing token IDs: averaged main generation regressed `273.150 -> 267.683 tok/s` (`-2.0%`), timing context was flat/slightly worse (`100.893 -> 100.777 tok/s`), and total timing+map stage wall regressed `87.077s -> 87.805s` (`+0.8%`). The 15s outer-wall hint did not transfer to full-song synchronized model time. Do not merge this flag or retry fast prepare unless fresh profiling shows `prepare_inputs_for_generation` has become target-sized under a different runtime. See `notes/2026-07-03-fast-prepare-fixed-probe.md`.
-
-Post-270 gap diagnostics, DCC job `49232331` on RTX 2080 Ti, commit `840dbc4`, reran the current accepted stack on the 15s smoke and paired it with active-prefix diagnostic counters plus full-forward/decoder-layer island probes. The control smoke measured `1,084` main tokens in `3.727s` model time (`290.864 tok/s`) and `164` timing tokens in `2.965s` (`55.318 tok/s`). The diagnostic smoke preserved main/timing token IDs, but diagnostic ranges regressed main model time to `276.267 tok/s`; use it only for attribution. The full-forward island at seq9/prefix128 passed allclose and measured `1.866ms` CUDA graph replay per one-token model forward, projecting `14.095s` of the accepted `28.243s` full-song model time and leaving `14.148s` outside that isolated replay boundary. The decoder-layer island passed logits replay and measured `13.018s` projected layer replay: self-attention residual `4.167s`, cross-attention residual `3.272s`, MLP residual `4.222s`, and unexplained layer glue `1.356s`. The manual Python decoder-runtime island was effectively flat, saving only `0.038s` projected. This confirms that `500 tok/s` cannot come from a narrow manual layer wrapper; it needs broad native decoder-layer compute savings plus runtime/control-boundary savings.
-
-Post-270 direct-loop tail diagnostics, DCC job `49232344` on the same RTX 2080 Ti and commit, passed generated-token, raw-logit/top-k, final RNG, and stop-reason gates for `256` sampled steps. Excluding the verifier raw-logit capture hook and non-exclusive processor total, production-like CUDA tail was about `207.8us/token`, projecting to `~1.59s` over `7,639` full-song main tokens. Even deleting the whole tail would only move the accepted `28.243s` model time to roughly `26.65s`, about `286 tok/s`, and a real graph/native tail would still pay top-p, softmax, multinomial, masks, and stop checks. Standalone tail fusion remains below the main 500 tok/s path; keep it only as part of a broader exact `DecodeSession` runtime island. See `notes/2026-07-03-post270-gap-tail-diagnostics.md`.
-
-Post-270 MLP breakdown, DCC jobs `49232374` and `49232386` on RTX 2080 Ti, commit `59b622a`, extended `utils/profile_decode_decoder_layer_island.py` with diagnostic-only MLP component variants. The exact MLP residual segment is real but not obviously enough by itself: seq9/prefix128 projected MLP residual at about `4.22-4.27s` full-song, with fc1 and fc2 around `1.75-1.87s` each. A production MLP-only kernel would need to save roughly `~1.4s` to clear the full-song `5%` keep bar. The manual decoder-runtime island saving was unstable across jobs (`0.038s`, `1.578s`, then `0.756-0.787s` on repeat), so no production direction graduated. Keep the component breakdown as profiling infrastructure and require a stable verifier-only projected saving before native MLP/CUTLASS/cuBLASLt production work. See `notes/2026-07-03-post270-mlp-breakdown.md`.
-
-Native MLP residual island probe, DCC job `49233007` on RTX 2080 Ti, commit `14a077c`, tested a temporary fp32 CUDA helper for `RMSNorm -> fc1 -> GELU -> fc2 -> residual` under the seq9/prefix128 decoder-layer island. The native variants passed allclose for the isolated MLP boundary (`max_abs=7.63e-06`) and logits replay stayed exact (`max_abs=0.0`), but the projected full-song saving was only `0.756-0.822s`, moving the accepted `270.475 tok/s` baseline to about `278 tok/s`. This is below the `5%` keep threshold and below the `~1.4s` MLP-only target, so the native code was removed. Do not retry a narrow MLP residual replacement without new evidence that it can save target-sized time; broader decoder-layer/runtime islands remain the plausible kernel direction. See `notes/2026-07-03-native-mlp-residual-probe.md`.
-
-Native-linear self-attention island probe, DCC job `49233393` on RTX 2080 Ti, branch `experiment/self-attn-native-linear-island` commit `4206d28`, tested native one-token linear kernels for `Wqkv` and `Wo` wrapped around the existing fused RoPE/cache/native self-attention island. It was verifier-clean (`pass=True`, logits replay allclose, `max_abs=1.91e-05`), but not a speed candidate. Explicit prefix128 and prefix640 repeats projected regressions: prefix128 best warp4 saved `-0.109s`, projected `269.433 tok/s`; prefix640 best warp4 saved `-0.278s`, projected `267.837 tok/s`. The default first-run case had only a tiny positive `+0.035s` projected saving, below noise and far below the `~1.4s` 5% keep threshold. Do not merge this branch or pursue this narrow Wqkv/Wo native-linear wrapper composition; future kernel work needs a broader decoder-layer/native runtime island or a materially better native linear strategy. See `notes/2026-07-03-self-attn-native-linear-island-probe.md`.
-
-Native self-attention residual island probe, DCC job `49235105` on RTX 2080 Ti, branch `experiment/native-self-attn-residual-island` commit `6d9fc4d`, tested a broader temporary native CUDA boundary that fused `RMSNorm -> Wqkv` and `Wo -> residual` around the accepted native q1 RoPE/cache self-attention kernel. The probe was verifier-clean: logits replay passed with `max_abs=0.0`, and the native residual boundary was allclose with `max_abs=8.34e-07`. It still failed the performance gate under CUDA graph replay: prefix640 repo self-attention residual projected `7.0257s` full-song, while the best native variant projected `7.0662s`, a `-0.0405s` regression and `270.087 tok/s` projected TPS. The ungraphed event timing was faster for native wrappers, so the branch only removed eager launch overhead; the current fastest DecodeSession path already removes that overhead with CUDA graphs. Do not merge this branch. Future native kernels must improve real graph-replayed math/memory behavior, not just eager launch count. See `notes/2026-07-03-native-self-attn-residual-probe.md`.
-
-Fixed-token K-step CUDA graph ceiling probes, DCC jobs `49235335` and `49235341` on RTX 2080 Ti, branch `experiment/kstep-forward-graph-ceiling` commit `2c4fd6b`, measured whether grouping known-token one-step decoder forwards could amortize graph replay overhead. This is diagnostic-only and not a production inference path because it does not solve EOS early-exit or RNG rollback/overdraw. All fixed-token graph replays passed allclose with `max_abs=0.0`. K=4 projected `1.214s` saved versus one-step graph replay, K=8 was best at `1.543s`, and K=16 dropped to `0.513s`. This is at best barely around the 5% line before exactness complexity, so do not pursue production multi-token graphing as the next path. Keep it only as a later `DecodeSession` runtime idea if a design first proves exact EOS/RNG behavior and projects comfortably above `~1.6s`, preferably near a 10% full-song win. See `notes/2026-07-03-kstep-graph-ceiling-probe.md`.
-
-Active-loop total diagnostics, DCC job `49232548` on RTX 2080 Ti, commit `5d08f8a`, added a runtime gap ledger under the existing diagnostic flag. Job `49232537` failed before profiling because the first patch called the CUDA-event helper when diagnostics were disabled; the fixed job completed. Generated-token identity passed for main (`1,084 / 1,084`) and timing (`164 / 164`), but diagnostic overhead regressed main model time (`267.946 -> 242.199 tok/s`), so this is attribution-only. Main-generation smoke CUDA-event totals were: loop total `4.147s`, decode-forward graph `2.631s`, graph replay `2.221s`, graph capture `0.172s`, graph input copy `0.084s`, graph signature lookup `0.053s`, prepare inputs `0.569s`, logits processors `0.109s`, multinomial `0.047s`, and stopping criteria `0.302s`. Static input copying is not a standalone target: scaling the `84ms` smoke event to full-song is roughly `0.6s`, below the keep threshold. Keep the ledger for diagnosis, but do not restart graph-copy cleanup, fast-prepare, or tail-fusion work from this evidence. See `notes/2026-07-03-active-loop-total-diagnostics.md`.
-
-Decoder-stack island diagnostics, DCC job `49232726` on RTX 2080 Ti, commit `75fc8da`, added `utils/profile_decode_decoder_stack_island.py`. The utility is diagnostic-only: it prepares the exact seq9 one-token active-prefix input, reproduces Mapperatorinator's outer decoder embedding step, then compares full model forward, VarWhisper model-core forward, direct decoder stack, output projection, and decoder-stack-plus-projection boundaries under CUDA graph replay. The pass result was exact: decoder hidden matched model core (`max_abs=0.0`), projected logits matched full-model logits (`max_abs=0.0`), and every graph replay allclose check passed. The result rejects a simple wrapper-bypass target: graph-replayed full model forward projected `13.959s` full-song, model-core plus projection `14.222s`, decoder-stack plus projection `14.096s`, and output projection alone only `0.192s`. The remaining `~14.3s` gap to accepted production model time is therefore not explained by VarWhisper/Mapperatorinator forward wrapper overhead. Keep the utility for future broad decoder-stack probes, but do not pursue a decoder-stack bypass as an optimization. See `notes/2026-07-03-decoder-stack-island-probe.md`.
-
-Nsight Compute hardware-counter profiling is currently blocked on the tested DCC RTX 2080 Ti node for normal user jobs. Job `49232763`, commit `7a74b53`, ran `/opt/apps/rhel9/cuda-12.8/bin/ncu` against the decoder-stack utility, but NCU failed with `ERR_NVGPUCTRPERM` before collecting SpeedOfLight/MemoryWorkload/Occupancy counters. The utility JSON from that job was written under profiler perturbation and must not be used for timing. Use Nsight Systems/NVTX, torch profiler, CUDA-event utilities, or arrange counter permissions before retrying NCU. See `notes/2026-07-03-ncu-decoder-stack-permission.md`.
-
-For normal total-stage comparisons, do not isolate Hugging Face/model-download caches unless the claim explicitly includes model-cache cold cost. Isolating compiler/TorchInductor/CUDA caches is useful for cold compile checks, but invalidating model caches can make total-stage wall comparisons fail for reasons unrelated to generation speed.
-
-Only count a speedup as equivalent when fixed-seed generated token IDs match the baseline for the same audio/config slice. Do not claim wins from changed precision, sampling policy, output policy, model quality, windowing/overlap, or generated-token behavior unless the run is explicitly labeled non-equivalent.
-
-If default Mapperatorinator generation nondeterminism makes exact token identity too strict for a valuable runtime or batch candidate, use a separate `documented-drift` result class instead of weakening the same-calculation gate. A documented-drift candidate must prove the config and generation semantics are otherwise unchanged, characterize baseline-vs-baseline drift separately from baseline-vs-candidate drift, preserve generated-token counts/output policy, and justify the review with a large operational speedup. Do not mix documented-drift numbers into same-calculation speedup tables or use them to replace the retained baseline without explicit approval.
-
-Always verify that performance has not degraded before accepting a change. For full-song candidates, compare main generation, timing context, total profiled stage time, generated-token counts, token equivalence, and per-window main-generation timings against the current retained baseline. If any meaningful same-config metric regresses, document it as a scoped regression and do not promote it without explicit approval.
-
-Keep SDPA as the current baseline unless profiler evidence strongly contradicts it. Torch profiler wall time is diagnostic only; compare normal `profile_inference` model elapsed time and token throughput.
-
-Keep future batch and multiple-song results in separate reporting classes:
-
-- `cold_single_song`: current acceptance gate. Fresh process/job, one song, fixed seed, full token equivalence, main/timing/total/per-window non-regression.
-- `warm_repeat`: same loaded model process, same song repeated. Report the first run separately from runs 2..N; compare warmed results only to warmed results.
-- `serial_multi_song` or `batched_multi_request`: operational throughput. Report per-song token equivalence, first-song cold cost, warmed subsequent-song cost, aggregate wall/model throughput, batch-size distribution, RNG reset policy, and any batching/windowing behavior changes.
-
-Do not use warmed-cache, multi-song, or server-batch wins as cold single-song speedups. They can still matter for future batch inference and the planned autoregressive encoder-decoder component, but label them by result class.
-
-Use the same-process suite harness for warm-repeat and future serial multi-song scouting:
-
-```bash
-python utils/profile_inference_suite.py \
-  --config-name profile_salvalai \
-  --repeats 3 \
-  --run-kind warm_repeat \
-  --output-root "$RUN_DIR" \
-  inference_active_prefix_decode_loop=true \
-  inference_active_prefix_decode_bucket_size=512
-```
-
-For 5+ song operational scouting, use `serial_multi_song` with an explicit song list:
-
-```bash
-python utils/profile_inference_suite.py \
-  --config-name profile_salvalai \
-  --repeats 2 \
-  --run-kind serial_multi_song \
-  --song-list "$RUN_DIR/songs.yaml" \
-  --output-root "$RUN_DIR" \
-  inference_active_prefix_decode_loop=true \
-  inference_active_prefix_decode_bucket_size=512
-```
-
-`serial_multi_song` requires at least 5 songs by default because 5+ songs is the expected operational workload. Use `--allow-short-suite` only for harness smoke tests that are not performance evidence.
-
-The song list can be YAML/JSON with a top-level `songs` list, or a plain text file with one audio path per line. YAML/JSON entries can be strings or mappings. Mapping entries support per-song `song_id`/`id`, `audio_path`, `beatmap_path`, `seed`, `start_time`, `end_time`, and `output_subdir`:
-
-```yaml
-songs:
-  - song_id: salvalai
-    audio_path: /work/imt11/Mapperatorinator/data/salvalai.mp3
-  - song_id: second-song
-    audio_path: /work/imt11/Mapperatorinator/data/second.mp3
-    beatmap_path: /work/imt11/Mapperatorinator/data/second.osu
-    seed: 12345
-    start_time: null
-    end_time: null
-```
-
-The harness loads the model once, resets RNG before every `generate()` call, writes one profile JSON per run, and writes `suite_manifest.json` with first-run, warmed-run, aggregate throughput, per-song throughput, profile paths, token hashes, and token-equivalence status. Manifest schema v3 also records `main_first_record`, `main_remaining_records`, aggregate first-record/remaining-record metrics, timing-context metrics, and runtime cache/env metadata (`TORCHINDUCTOR_CACHE_DIR`, `TRITON_CACHE_DIR`, `CUDA_CACHE_PATH`, `HF_HOME`, `TORCH_LOGS`, etc.). This makes active-prefix first-window cold tax visible instead of letting warmed aggregate numbers hide setup or graph-capture cost. `warm_repeat` compares token IDs against run 0. `serial_multi_song` compares token IDs against each song's first repeat, so every song has its own equivalence baseline. Its warmed and multi-song results are useful operational evidence, but they are not cold single-song acceptance evidence.
-
-Compare suite manifests with:
-
-```bash
-python utils/summarize_inference_profile.py \
-  --compare-suite "$BASE_SUITE/suite_manifest.json" "$CANDIDATE_SUITE/suite_manifest.json" \
-  --suite-scope warmed_runs \
-  --strict \
-  --json-output "$RUN_DIR/compare-suite-warmed.json"
-```
-
-Use `--suite-scope warmed_runs` for warmed-repeat or long-lived process claims. Use `--suite-scope all_runs` only when claiming all-run aggregate performance. In suite mode, `--strict` checks schema/shape/run contract, paired token hashes/token counts, selected-scope aggregate main-generation non-regression, selected-scope first-record and remaining-record segment non-regression, selected-scope timing-context non-regression, and per-song main-generation non-regression. It also prints cold run0 diagnostics. Add `--gate-cold-run0` only when the suite claim includes cold run0 non-regression; cold single-song promotion still requires normal full-song profile strict gates against the retained cold baseline.
-
-First smoke result, DCC job `49154124` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti, commit `d20f26a`:
-
-| suite | cold run | warmed runs | cross-suite equivalence | interpretation |
-| --- | ---: | ---: | --- | --- |
-| compile-only | `48.730 tok/s` | `101.040 tok/s` aggregate | baseline | retained path warms substantially |
-| active512 | `36.107 tok/s` | `148.298 tok/s` aggregate | PASS vs compile-only for runs 0, 1, and 2 | exact warmed-repeat win, cold regression |
-
-Run dir: `/work/imt11/Mapperatorinator/runs/warm-repeat-smoke15-49154124-d20f26a`. This is `warm_repeat` evidence only. It strengthens the case for fixing active-prefix first-window/specialization cost and for future batch/serving work, but it does not replace the cold single-song baseline.
-
-Full-song warm-repeat validation, DCC job `49154643` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti, driver `595.71.05`, torch `2.10.0+cu128`, Transformers `4.57.3`, commit `b394a9d`:
-
-| suite | run 0 | warmed runs | cross-suite equivalence | interpretation |
-| --- | ---: | ---: | --- | --- |
-| compile-only | `84.335 tok/s` | `92.207 tok/s` aggregate | baseline | retained path warms to roughly the accepted cold baseline |
-| active512 | `95.698 tok/s` | `128.585 tok/s` aggregate | PASS vs compile-only for runs 0, 1, and 2 | exact warmed full-song win, still warm/batch evidence only |
-
-Run dir: `/work/imt11/Mapperatorinator/runs/warm-repeat-full-49154643-b394a9d`. Active512 improved warmed full-song main generation by `+39.5%` over warmed compile-only (`128.585` vs `92.207 tok/s`) with `7,639 / 7,639` generated main tokens matching on each paired run. The same job also showed active512 run 0 at `95.698 tok/s`, but this is not a cold single-song baseline replacement because the active suite ran after a compile suite in the same process/job context and earlier cold-first active-prefix validation remained order-sensitive. Keep active-prefix default-off and use this only as `warm_repeat`/future batch-serving evidence.
-
-Order-flipped full-song warm-repeat validation, DCC job `49155778` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti, driver `595.71.05`, torch `2.10.0+cu128`, Transformers `4.57.3`, commit `19e74a9`:
-
-| suite | run 0 | warmed runs | paired equivalence | interpretation |
-| --- | ---: | ---: | --- | --- |
-| active512 | `95.242 tok/s` | `128.026 tok/s` aggregate | PASS vs compile-only for runs 0, 1, and 2 | exact warmed full-song win, measured active-first |
-| compile-only | `83.820 tok/s` | `91.982 tok/s` aggregate | baseline | retained path, isolated cache after active512 |
-
-Run dir: `/work/imt11/Mapperatorinator/runs/warm-repeat-active-first-49155778-19e74a9`. This repeated the full-song test with active512 first and separate TorchInductor/CUDA caches for each suite. Active512 improved warmed main generation by `+39.2%` (`128.026` vs `91.982 tok/s`), improved warmed timing generation (`98.324` vs `73.690 tok/s`), and reduced paired main/timing stage wall time on every run. Generated main-token IDs matched compile-only for all three paired runs (`7,639 / 7,639`). This strengthens active-prefix as a warm-repeat, long-lived process, and future batch-serving candidate, but it still does not replace the cold single-song baseline.
-
-Targeted cold-overhead attribution, DCC jobs `49156700`, `49156749`, and `49157290` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti, commit `daa1828`:
-
-| run | main tok/s | seq0 | seq1+ | token equivalence | interpretation |
-| --- | ---: | ---: | ---: | --- | --- |
-| cold compile-only | `84.608` | `16.413s`, `35.703 tok/s` | `95.473 tok/s` | baseline | retained path in this matrix was slower than clean baseline |
-| cold active512 | `96.247` | `25.531s`, `22.953 tok/s` | `131.003 tok/s` | PASS vs cold compile | cold tax is front-loaded |
-| warm active512 run 1 | `127.877` | `3.809s`, `153.829 tok/s` | `126.109 tok/s` | PASS vs run 0 and cold compile | warmed first window is fixed |
-| warm active512 run 2 | `126.610` | `3.871s`, `151.393 tok/s` | `124.911 tok/s` | PASS vs run 0 and cold compile | warmed signal repeats |
-
-Run dirs:
-
-- Full-song matrix: `/work/imt11/Mapperatorinator/runs/active-prefix-cold-matrix-49156700-daa1828`
-- Torch logs, Nsight, and torch-profiler diagnostics: `/work/imt11/Mapperatorinator/runs/active-prefix-diagnostics-49156749-daa1828`
-- Nsight post-processing: `/work/imt11/Mapperatorinator/runs/active-prefix-diagnostics-49156749-daa1828/nsys_active512_smoke15`
-
-Conclusion: active-prefix is weak or unstable cold because the first long generation window pays extra graph/capture/specialization cost. It is not weak in steady state: the same cold active512 run is already `131.003 tok/s` after `seq0`, and warmed repeats reduce `seq0` from about `25-26s` to about `3.8s`. Torch logs support this attribution: diagnostic job `49156749` recorded `244` recompilation lines, `3,441` graph-recording lines, `8,665` CUDA graph/cudagraph log matches, and a `cache_utils.py:update` `recompile_limit` warning keyed on `layer_idx`. The focused post-warmup torch-profiler trace is diagnostic only; it still showed graph/runtime overhead alongside kernels (`20,504` TorchDynamo cache lookups, `16,310` `cudaGraphLaunch` calls, `131` `CUDAGraphNode.record` events, and `5,628` FMHA kernels with `1.063s` self CUDA). Nsight Systems exported `ap512.nsys-rep` and `ap512.sqlite`, but the smoke15 trace generated only one token for early map windows and had heavy diagnostic overhead, so use it for qualitative NVTX availability rather than throughput or full-song seq0 timing.
-
-Next implementation target: graph/runtime stabilization for active-prefix bucket512. Good candidates are explicit graph/cache priming with setup cost honestly included, reducing cache-update specialization by decoder layer, or a bufferized/direct decode loop that avoids repeated HF compiled graph variants. Do not hide prewarm cost outside cold single-song timing; cold claims must include setup/timing/main/total non-regression. For warm-repeat or future batch serving, report first-song cold cost and warmed amortized throughput separately.
-
-Multi-token direct decode loop correctness gate, DCC job `49161597` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti, torch `2.10.0+cu128`, Transformers `4.57.3`, dirty test patch on commit `cb874ee`:
-
-| gate | token match | RNG match | raw-logit steps | max_abs | wall |
-| --- | --- | --- | ---: | ---: | ---: |
-| compile false, plain loop | PASS | PASS | 8 | `0.0` | `8.110s` |
-| compile true, plain loop | PASS | PASS | 8 | `0.0` | `40.794s` |
-| compile false, buffered active512 | PASS | PASS | 8 | `0.0` | `7.713s` |
-| compile true, buffered active512 | PASS | PASS | 8 | `0.0` | `49.090s` |
-
-Run dir: `/work/imt11/Mapperatorinator/runs/direct-loop-gate-49161597-cb874ee`.
-
-This is a testing-suite improvement, not an inference speed result. `utils/verify_direct_decode_loop.py` compares normal HF `generate()` against a candidate loop passed through `custom_generate`, so HF still constructs the final `logits_processor`, `stopping_criteria`, cache, and generation config for both paths. It resets CPU/CUDA RNG state before each path, captures raw logits before in-place processors, compares generated token IDs, compares per-step raw logits/top-k, and verifies final RNG state. Use it before 15s smoke for direct/custom decode loop changes, especially when touching buffering, active-prefix decode, sampling, or stopping behavior.
-
-Direct CUDA graph replay gate, DCC job `49165810` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti, commit `0602d32`:
-
-| gate | token match | RNG match | raw-logit steps | max_abs | graph replays | wall |
-| --- | --- | --- | ---: | ---: | ---: | ---: |
-| compile false, direct active512 | PASS | PASS | 8 | `0.0` | n/a | `17.989s` |
-| compile true, direct active512 | PASS | PASS | 8 | `0.0` | n/a | `47.984s` |
-| compile false, graph active512 | PASS | PASS | 8 | `0.0` | `7` | `7.415s` |
-| compile true, graph active512 | PASS | PASS | 8 | `1.068e-4` | `7` | `18.623s` |
-
-Run dir: `/work/imt11/Mapperatorinator/runs/direct-graph-gate-49165810-0602d32`.
-
-This remains a verifier-only result. It proves that `utils/verify_direct_decode_loop.py --candidate-cuda-graph-forward` can replay a captured active-prefix bucket512 one-token forward across changing sampled tokens and `cache_position` while preserving generated-token identity, final RNG state, logits allclose, and top-k order for this 8-token gate. It does not prove inference throughput because the verifier still pays short-run setup, input preparation, tensor-copy, and reporting overhead. Before any speed claim, extend the graph gate to a longer direct-loop sample, then run 15s smoke token equivalence and untraced `profile_inference` throughput.
-
-Follow-up 64-token graph gate, DCC job `49165980` on `dcc-dhvimdcore-gpu-ferc-s-p15-10`, RTX 2080 Ti, commit `26ec057`:
-
-| gate | token match | RNG match | raw-logit steps | max_abs | graph replays | wall |
-| --- | --- | --- | ---: | ---: | ---: | ---: |
-| compile false, graph active512 | PASS | PASS | 64 | `0.0` | `63` | `28.448s` |
-| compile true, graph active512 | PASS | PASS | 64 | `1.068e-4` | `63` | `70.252s` |
-
-Run dir: `/work/imt11/Mapperatorinator/runs/direct-graph-gate64-49165980-26ec057`. This strengthens the correctness signal for graph replay across longer sampled-token/RNG progression, but it still stayed inside one active-prefix bucket and is not a throughput result.
-
-Bucket-transition CUDA graph gate, DCC jobs `49166191` and `49166213` on `dcc-dhvimdcore-gpu-ferc-s-p15-12`, RTX 2080 Ti, commit `13335e5`:
-
-| gate | token match | RNG match | raw-logit steps | max_abs | graph captures | graph replays | buckets | wall |
-| --- | --- | --- | ---: | ---: | ---: | ---: | --- | ---: |
-| compile false, graph active512 | PASS | PASS | 512 | `0.0` | `2` | `511` | `512:414`, `1024:97` | `66.538s` |
-| compile true, graph active512 | PASS | PASS | 512 | `1.373e-4` | `2` | `511` | `512:414`, `1024:97` | `82.194s` |
-
-Run dirs: `/work/imt11/Mapperatorinator/runs/direct-graph-transition-seq0-49166191-13335e5` and `/work/imt11/Mapperatorinator/runs/direct-graph-transition-seq0-compile-49166213-13335e5`. This proves the verifier can recapture graph buckets when active-prefix decode crosses from `512` to `1024`, with generated tokens, final RNG state, logits allclose, and top-k order still matching. It remains a verifier-only result, not throughput: `prepare_inputs_for_generation()`, tensor copies, short-run setup, and report overhead are still outside the captured graph.
-
-Production active-prefix CUDA graph loop validation, DCC jobs `49166771` and `49167356` on RTX 2080 Ti, commit `8e8757b`:
-
-| run | main tokens | main model time | main tok/s | total timing+map stage | token equivalence | strict status |
-| --- | ---: | ---: | ---: | ---: | --- | --- |
-| retained compile-only baseline, job `49113713` | `7,639` | `82.615s` | `92.465` | `113.928s` | baseline | baseline |
-| active512 graph full-song, job `49167356` | `7,639` | `71.981s` | `106.125` | `101.481s` | PASS, `7,639 / 7,639` | aggregate PASS, per-window FAIL |
-
-Run dirs:
-
-- 15s smoke: `/work/imt11/Mapperatorinator/runs/active-graph-immediate-smoke-49166771-8e8757b`
-- Full song: `/work/imt11/Mapperatorinator/runs/active-graph-immediate-full-49167356-8e8757b`
-
-The 15s smoke compared immediate-capture active512 graph against compile-only with isolated compiler/CUDA caches. It passed same-calculation metadata, token equivalence (`1,084 / 1,084`), and strict per-window no-regression, with main-generation throughput `29.556 -> 110.451 tok/s` in that paired run. This promoted the candidate to full-song validation.
-
-The full-song current-branch validation improved main generation by `+14.8%` (`92.465 -> 106.125 tok/s`) and total timing+map profiled stage time by `-10.9%` (`113.928s -> 101.481s`) while preserving exact fixed-seed main-token IDs. The compare metadata contract failed only because the retained baseline profile predates newer metadata keys (`temperature`, `top_p`, `cfg_scale`, `lookback`, etc.); there were no mismatched metadata values.
-
-The strict per-window zero-regression gate still failed on 11/87 map windows. The failing windows totaled `128ms` of model-time overhead, compared with `10.634s` total main-generation model-time savings. Treat this as a scoped micro-regression, not a strict-pass result. Do not silently use it as the cold default; it is an accepted default-off opt-in performance path for explicit profiling or user-enabled fast inference.
-
-Use:
-
-```bash
-python inference.py --config-name profile_salvalai \
-  inference_generation_compile=true \
-  inference_active_prefix_decode_loop=true \
-  inference_active_prefix_decode_bucket_size=512 \
-  inference_active_prefix_decode_cuda_graph=true \
-  inference_active_prefix_decode_cuda_graph_warmup=0 \
-  inference_active_prefix_decode_cuda_graph_min_decode_steps=1
-```
-
-Keep the hard restrictions from the implementation: batch size 1, `use_server=false`, `parallel=false`, `cfg_scale=1`, `num_beams=1`, static cache, and decode-only active-prefix. Sampling, logits processors, RNG consumption, EOS behavior, generated-token accounting, and timing generation remain outside the captured graph path.
-
-Stateful monotonic processor validation on top of active512 graph, DCC jobs `49167587`, `49168158`, and `49168188`:
-
-| run | main tokens | main model time | main tok/s | total timing+map stage | token equivalence | strict status |
-| --- | ---: | ---: | ---: | ---: | --- | --- |
-| retained compile-only baseline, job `49113713` | `7,639` | `82.615s` | `92.465` | `113.928s` | baseline | baseline |
-| active512 graph baseline, job `49167356` | `7,639` | `71.981s` | `106.125` | `101.481s` | PASS, `7,639 / 7,639` | aggregate PASS, per-window micro-regression |
-| active512 graph + stateful monotonic, job `49168188` | `7,639` | `56.639s` | `134.873` | `78.473s` | PASS, `7,639 / 7,639` | PASS, `87 / 87` |
-
-Run dirs:
-
-- Logits processor diagnostic: `/work/imt11/Mapperatorinator/runs/active-graph-logitdiag-smoke-49167587-269f7ea`
-- 15s smoke: `/work/imt11/Mapperatorinator/runs/stateful-monotonic-smoke-49168158-a980c8d`
-- Full song: `/work/imt11/Mapperatorinator/runs/stateful-monotonic-full-49168188-a980c8d`
-
-Job `49167587` used diagnostic counters, not throughput claims, and showed `MonotonicTimeShiftLogitsProcessor` dominated active-graph logits-processor time (`5.373s / 5.602s`) on the 15s smoke. Job `49168158` then passed same-calculation metadata, fixed-seed token equivalence (`1,084 / 1,084`), and improved active512 graph smoke throughput from `132.593` to `149.321 tok/s`; the only per-window regression was a `0.299ms` one-token window. Job `49168188` promoted the change to full song on RTX 2080 Ti, torch `2.10.0+cu128`, Transformers `4.57.3`, and passed token equivalence against both the retained compile-only baseline and the active512 graph baseline.
-
-Use:
-
-```bash
-python inference.py --config-name profile_salvalai \
-  inference_generation_compile=true \
-  inference_active_prefix_decode_loop=true \
-  inference_active_prefix_decode_bucket_size=512 \
-  inference_active_prefix_decode_cuda_graph=true \
-  inference_active_prefix_decode_cuda_graph_warmup=0 \
-  inference_active_prefix_decode_cuda_graph_min_decode_steps=1 \
-  inference_stateful_monotonic_logits_processor=true
-```
-
-Keep this path default-off and scoped to the active-prefix CUDA graph/simple batch-1 mode until fresh profiling validates broader modes. The older pre-graph stateful monotonic attempt stayed rejected for normal generation because it regressed smoke throughput; the new result was accepted only after active-graph diagnostics made the logits processor a target-sized cost.
-
-Active graph zero-warmup validation, DCC jobs `49204447` and `49204568` on RTX 2080 Ti, commit `f56f2f5`:
-
-| run | main tokens | main model time | main tok/s | timing tok/s | total timing+map stage | token equivalence | strict status |
-| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
-| active512 graph + stateful, prior control job `49204317` | `7,639` | `55.230s` | `138.311` | `58.753` | `74.376s` | baseline | baseline |
-| active512 graph + stateful, isolated warmup3 job `49204568` | `7,639` | `55.732s` | `137.066` | `58.616` | `74.685s` | baseline | baseline |
-| active512 graph + stateful, isolated warmup0 job `49204568` | `7,639` | `52.107s` | `146.602` | `75.130` | `68.283s` | PASS, `7,639 / 7,639` | aggregate PASS, per-window micro-regression |
-
-Run dirs:
-
-- 15s warmup sweep: `/work/imt11/Mapperatorinator/runs/active-warmup-sweep-49204447-f56f2f5`
-- Full-song isolated validation: `/work/imt11/Mapperatorinator/runs/active-warmup0-full-isolated-49204568-f56f2f5`
-- Previous untraced control: `/work/imt11/Mapperatorinator/runs/stateful-bottleneck-49204317-94fcb31`
-
-The 15s smoke sweep compared active512 graph + stateful with `inference_active_prefix_decode_cuda_graph_warmup=3`, `1`, and `0` after a compile-only control. All active variants were exact against warmup3 and compile-only (`1,084 / 1,084` main tokens). Warmup0 was fastest on that smoke (`153.030 -> 162.401 tok/s`, `+6.1%` versus warmup3), so it promoted to full-song validation.
-
-The full-song isolated run used separate TorchInductor, Triton, CUDA, and HF cache directories for warmup0 and warmup3. Warmup0 improved main generation by `+7.0%` versus same-job warmup3 and `+6.0%` versus the previous untraced active512 graph + stateful control. Timing context also improved by `+28.2%` versus same-job warmup3 and `+27.9%` versus the previous control, with `821 / 821` timing tokens matching. Total timing+map profiled stage time improved `74.376s -> 68.283s` versus the previous control.
-
-Strict zero-tolerance per-window gates still failed on tiny late one-token windows: versus same-job warmup3, one map window regressed by `0.128ms` model time; versus the previous control, two map windows regressed by `0.126ms` and `0.487ms`, and one timing window regressed only in outer wall by `0.150ms` while model time improved. Treat these as scoped micro-regressions, not a strict-pass result. Because this is a simple default-off active-graph setting, exact, faster on main/timing/total aggregates, and strategically useful for the 200 tok/s runtime path, keep `inference_active_prefix_decode_cuda_graph_warmup=0` as the active graph default.
-
-Use:
-
-```bash
-python inference.py --config-name profile_salvalai \
-  inference_generation_compile=true \
-  inference_active_prefix_decode_loop=true \
-  inference_active_prefix_decode_bucket_size=512 \
-  inference_active_prefix_decode_cuda_graph=true \
-  inference_active_prefix_decode_cuda_graph_warmup=0 \
-  inference_active_prefix_decode_cuda_graph_min_decode_steps=1 \
-  inference_stateful_monotonic_logits_processor=true
-```
-
-Post-warmup0 attribution, DCC job `49204765`, commit `bb11d9f`:
-
-| run | main tokens | main model time | main tok/s | timing tok/s | token equivalence | note |
-| --- | ---: | ---: | ---: | ---: | --- | --- |
-| full default omission control | `7,639` | `51.979s` | `146.963` | `70.061` | PASS vs warmup0 | validates default `warmup=0`; not a new accepted baseline because total stage/timing context differed under fresh cache/load state |
-| full default diagnostic | `7,639` | `52.510s` | `145.476` | `75.020` | PASS vs control | diagnostic overhead about `1%` on main |
-
-Run dir: `/work/imt11/Mapperatorinator/runs/active-w0-nextdiag-49204765-bb11d9f`.
-
-The diagnostic counters ruled out several easy next targets:
-
-| counter | full diagnostic wall time |
-| --- | ---: |
-| `token_append_stop_wall_cpu_s` | `35.276s` |
-| `stopping_criteria_wall_cpu_s` | `34.826s` |
-| `logits_processor_wall_cpu_s` | `4.452s` |
-| `prepare_inputs_wall_cpu_s` | `3.874s` |
-| `decode_forward_wall_cpu_s` | `3.444s` |
-| `sampling_wall_cpu_s` | `1.167s` |
-| `compile_lookup_wall_cpu_s` | `0.0106s` |
-
-`compile_lookup_wall_cpu_s` is too small to optimize. The captured graph input shapes were already minimal (`decoder_input_ids`, `decoder_attention_mask`, `decoder_position_ids`, and `cache_position`), so pruning dead encoder/static inputs from graph replay is not target-sized. The seq9 torch-profiler trace showed `aten::_local_scalar_dense`/`aten::isin` around stopping, but the wall bucket overlaps required per-token synchronization/control; do not treat it as pure Python-loop overhead.
-
-Rejected simple active-prefix stopping specialization, DCC job `49204960`, dirty local patch on top of commit `bb11d9f`:
-
-| run | main tokens | main model time | main tok/s | timing tok/s | token equivalence | status |
-| --- | ---: | ---: | ---: | ---: | --- | --- |
-| active512 graph + stateful + warmup0 smoke baseline | `1,084` | `6.675s` | `162.401` | `47.556` | baseline | baseline |
-| simple stopping candidate | `1,084` | `6.433s` | `168.512` | `48.209` | PASS, `1,084 / 1,084` | rejected |
-
-Run dir: `/work/imt11/Mapperatorinator/runs/simple-stop-smoke-49204960-bb11d9f-simple-stop-dirty`. The 64-step direct-loop graph gate passed for generated tokens, raw logits, final RNG state, and stop reason. The candidate still improved main generation by only `+3.76%`, below the keep threshold for a custom stopping path, and the diagnostic run still reported `stopping_criteria_wall_cpu_s=4.265s` of `6.450s` main model time. The patch was reverted without full-song promotion. See `notes/2026-07-02-simple-stopping-scout.md`.
-
-Accepted active-prefix graph bucket-size reduction, DCC jobs `49205143`, `49205622`, and `49206207` on RTX 2080 Ti, commit `39e85e4`:
-
-| bucket | main tokens | main model time | main tok/s | timing tok/s | total timing+map stage | token equivalence vs bucket512 | status |
-| ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
-| `512` | `7,639` | `51.887s` | `147.223` | `75.016` | `67.773s` | baseline | historical active control |
-| `192` | `7,639` | `49.369s` | `154.733` | `77.070` | `65.225s` | PASS main and timing | safer fallback |
-| `64` | `7,639` | `49.101s` | `155.578` | `76.524` | `64.946s` | PASS main and timing | fastest opt-in |
-
-Run dirs:
-
-- Broad 15s smoke sweep: `/work/imt11/Mapperatorinator/runs/active-bucket-sweep-49205143-39e85e4`
-- Low-bucket 15s smoke sweep: `/work/imt11/Mapperatorinator/runs/active-low-bucket-sweep-49205622-39e85e4`
-- Full-song validation: `/work/imt11/Mapperatorinator/runs/active-bucket-full-49206207-39e85e4`
-
-All smoke candidates tested from bucket64 through bucket1024 matched bucket512 generated token IDs for both main and timing. Full-song bucket64 improved same-job main generation by `+5.7%` over bucket512 (`147.223 -> 155.578 tok/s`), improved aggregate timing by `+2.0%`, and reduced total timing+map stage wall by `4.2%`. Full-song bucket192 improved same-job main by `+5.1%`, improved aggregate timing by `+2.7%`, and reduced total stage by `3.8%`.
-
-Strict per-window checks still failed with scoped small regressions. Bucket64 failed `12 / 87` main windows with `67ms` total failed-window model overhead and `29 / 87` timing windows with `185ms` total failed-window model overhead. Bucket192 failed the same `12 / 87` main windows with `71ms` failed-window overhead but only `3 / 87` timing windows with `25ms` failed-window overhead. Because bucket64 is config-only, exact, improves full-song main/timing/total aggregates, and has small absolute failed-window overhead relative to `2.786s` main model-time savings and `2.828s` total-stage savings, keep it as the fastest opt-in setting. Use bucket192 as the safer fallback when timing-context per-window stability is more important than maximum main-generation throughput. See `notes/2026-07-02-active-bucket-size-sweep.md`.
-
-Use the fastest exact opt-in path:
-
-```bash
-python inference.py --config-name profile_salvalai \
-  inference_generation_compile=true \
-  inference_active_prefix_decode_loop=true \
-  inference_active_prefix_decode_bucket_size=64 \
-  inference_active_prefix_decode_cuda_graph=true \
-  inference_active_prefix_decode_cuda_graph_warmup=0 \
-  inference_active_prefix_decode_cuda_graph_min_decode_steps=1 \
-  inference_stateful_monotonic_logits_processor=true \
-  inference_q1_bmm_cross_attention=true
-```
-
-Accepted q_len=1 BMM cross-attention, DCC jobs `49212482`, `49212884`, `49213018`, `49213078`, and `49213490` on RTX 2080 Ti, commit `3af8d69`:
-
-| run | main tokens | main model time | main tok/s | timing tok/s | total timing+map stage | token equivalence | status |
-| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
-| active64 graph + stateful control | `7,639` | `49.279s` | `155.014` | `75.652` | `65.200s` | baseline | control |
-| q1 BMM cross-attention candidate | `7,639` | `37.981s` | `201.125` | `84.160` | `52.638s` | PASS main and timing | superseded opt-in |
-
-Run dirs:
-
-- BMM attention microbench: `/work/imt11/Mapperatorinator/runs/attn-bmm-sm75-49212482`
-- One-token logits gate: `/work/imt11/Mapperatorinator/runs/q1bmm-logit-gate-49212884-3af8d69-len128`
-- Direct-loop token/logit/RNG gate: `/work/imt11/Mapperatorinator/runs/q1bmm-direct-gate-49213018-3af8d69`
-- 15s smoke: `/work/imt11/Mapperatorinator/runs/q1bmm-smoke15-49213078-3af8d69`
-- Full-song validation: `/work/imt11/Mapperatorinator/runs/q1bmm-full-49213490-3af8d69`
-
-The trigger was the active64 no-graph trace showing repeated unmasked cross-attention SDPA calls with Q shape `[1, 12, 1, 64]` and K/V shape `[1, 12, 1024, 64]`. The isolated SM75 microbench showed explicit fp32 `bmm -> softmax -> bmm` was much faster than SDPA for that exact q_len=1 cross-attention shape (`0.1486ms -> 0.0548ms`, `2.71x`, max abs `1.64e-7`). Longer q_len=1 lengths favored BMM even more (`L=2560`: `0.3643ms -> 0.0565ms`), while small lengths such as `64` and `96` favored SDPA; therefore the accepted production hook is cross-attention-only, not a broad self-attention replacement.
-
-Correctness gates passed before the speed claim. The one-token direct static-cache logits gate passed with matching top-k and `max_abs=4.196e-05`. The 64-token direct-loop gate passed generated-token identity, final RNG-state identity, logits allclose, and top-k equality with active-prefix bucket64 plus CUDA graph replay. The 15s smoke matched `1,084 / 1,084` main tokens and improved active64 graph main generation `168.853 -> 224.910 tok/s`; timing-context also improved `44.143 -> 48.686 tok/s`.
-
-Full-song validation reached the long-range `200 tok/s` target for this default-off exact opt-in path: active64 graph + stateful control `155.014 -> 201.125 tok/s` (`+29.7%`), main model time `49.279s -> 37.981s`, timing-context `75.652 -> 84.160 tok/s`, and total timing+map stage `65.200s -> 52.638s`. Fixed-seed generated token IDs matched for main (`7,639 / 7,639`) and timing (`821 / 821`).
-
-Strict zero-tolerance per-window gates still failed on tiny late one-token windows. Main generation failed `4 / 87` windows with only `4.4ms` total failed-window model overhead, versus `11.298s` aggregate main model-time savings. Timing failed `1 / 87` windows with `1.0ms` failed-window model overhead, versus `1.097s` aggregate timing model-time savings. Treat this as a scoped micro-regression, not a strict-pass result. Because the candidate is default-off, exact at the generated-token level, improves main/timing/total aggregates, and crosses the target, keep it as an accepted opt-in component. It is superseded by persistent DecodeSession graph/cache reuse below. See `notes/2026-07-03-q1-bmm-cross-attention.md`.
-
-Accepted persistent DecodeSession graph/cache reuse, DCC jobs `49223253` and `49223294` on RTX 2080 Ti, commit `768b50f`:
-
-| run | main tokens | main model time | main tok/s | timing tok/s | total timing+map stage | token equivalence | status |
-| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
-| q1 opt-in control | `7,639` | `37.631s` | `203.000` | `83.231` | `52.374s` | baseline | control |
-| DecodeSession runtime candidate | `7,639` | `35.337s` | `216.173` | `100.553` | `48.493s` | PASS main and timing | superseded opt-in |
-
-Run dirs:
-
-- 15s smoke: `/work/imt11/Mapperatorinator/runs/decode-session-runtime-smoke-49223253-768b50f`
-- Full-song validation: `/work/imt11/Mapperatorinator/runs/decode-session-runtime-full-49223294-768b50f`
-
-The production path keeps `inference_decode_session_runtime=false` and `inference_decode_session_cuda_graph=false` by default. When explicitly enabled with the simple batch-1 active-prefix graph + stateful + q1-BMM stack, it reuses one `MapperatorinatorCache`, a stable `BaseModelOutput` encoder buffer, and a shared CUDA graph cache across sequential generation windows within each context. This removes repeated captures of the same active-prefix graph shapes while preserving the normal token sampling and stopping behavior.
-
-The 15s smoke matched main tokens (`1,084 / 1,084`) and timing tokens (`164 / 164`). Main improved `227.445 -> 235.504 tok/s` (`+3.5%`) and timing improved `47.261 -> 58.839 tok/s` (`+24.5%`). Strict main per-window no-regression failed on two tiny early map records, so the smoke was only a promotion signal, not an accepted result.
-
-Full-song validation accepted the candidate: main improved `203.000 -> 216.173 tok/s` (`+6.5%`), timing improved `83.231 -> 100.553 tok/s` (`+20.8%`), and total timing+map stage improved `52.374s -> 48.493s` (`+7.4%` less wall time). Fixed-seed generated tokens matched for main (`7,639 / 7,639`) and timing (`821 / 821`). Strict timing per-window no-regression passed. Strict main per-window no-regression failed on only 3 tiny windows: `seq0` by `2.173ms`, `seq45` by `0.005ms`, and `seq85` by `0.298ms` model time, totaling about `2.477ms` failed-window overhead versus `2.293s` aggregate main savings.
-
-Keep this as an accepted exact single-song opt-in component because it is default-off, exact, improves main/timing/total aggregates, and strategically establishes stable graph/cache state for future native-kernel/runtime work. It is superseded by native q_len=1 self-attention below. See `notes/2026-07-03-persistent-decode-session-runtime.md`.
-
-Accepted native q_len=1 self-attention, DCC jobs `49224045`, `49224965`, `49225227`, and `49225493` on RTX 2080 Ti, commit `c563af0`:
-
-| run | main tokens | main model time | main tok/s | timing tok/s | total timing+map stage | token/map equivalence | status |
-| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
-| DecodeSession native-off control | `7,639` | `36.863s` | `207.226` | `93.785` | `50.736s` | baseline | control |
-| Native q1 self-attn candidate | `7,639` | `32.217s` | `237.111` | `100.822` | `48.527s` | PASS main/timing, byte-identical `.osu` | accepted opt-in |
-
-Run dirs:
-
-- Native attention microprobe: `/work/imt11/Mapperatorinator/runs/native-q1-attn-probe-49224045-b45d5f3`
-- First 15s smoke with timing enabled, later scoped off for timing: `/work/imt11/Mapperatorinator/runs/native-q1-self-gates-49224965-2ee1d68`
-- Scoped 15s smoke: `/work/imt11/Mapperatorinator/runs/native-q1-self-gates-49225227-c563af0`
-- Full-song validation: `/work/imt11/Mapperatorinator/runs/native-q1-self-full-49225493-c563af0`
-
-The diagnostic native probe showed the fp32 q_len=1 self-attention kernel was `1.3x-2.5x` faster than SDPA across active-prefix lengths `128..1024` with captured output allclose. Using full-song active64 replay counts from job `49207288`, the projected self-attention-only saving was about `4.943s`, or `216.173 -> ~251 tok/s` if integration held perfectly. Full-song integration landed below that projection but still cleared the strategic native-kernel gate.
-
-Correctness gates passed before the full-song speed claim. The one-token logits gate passed (`max_abs=2.67e-05`). The 64-token direct-loop gate passed generated-token identity, raw-logit/top-k checks, and final RNG-state equality. The scoped 15s smoke matched main tokens (`1,084 / 1,084`) and timing tokens (`164 / 164`), improved main `234.594 -> 262.900 tok/s`, and kept timing flat (`55.229 -> 55.238 tok/s`) after disabling native self-attention for timing contexts.
-
-Full-song validation accepted the candidate: same-job native-off DecodeSession control `207.226 -> 237.111 tok/s` (`+14.4%`), main model time `36.863s -> 32.217s`, timing-context `93.785 -> 100.822 tok/s`, and total timing+map stage `50.736s -> 48.527s`. Fixed-seed generated token IDs matched for main (`7,639 / 7,639`) and timing (`821 / 821`), and the generated `.osu` files were byte-identical.
-
-Strict zero-tolerance per-window gates still failed in scoped places. Main generation failed `4 / 87` windows: `seq0` improved model time by `244ms` but had `+2.411s` outer-wall setup cost from native extension load/setup, while `seq44`, `seq45`, and `seq84` totaled only `1.511ms` model-time overhead. Timing failed `1 / 87` window with `0.347ms` model-time overhead. Because the candidate is default-off, exact, byte-identical at output, improves main/timing/total aggregates, and is a measured native kernel win that should carry to future autoregressive decoder work, keep it as an accepted exact single-song opt-in path. It is superseded as the fastest path by fused RoPE/cache self-attention below. See `notes/2026-07-03-native-q1-self-attention.md`.
-
-Accepted fused RoPE/cache q_len=1 self-attention, DCC jobs `49230011`, `49230035`, and `49230082` on RTX 2080 Ti, commit `d7b8684`:
-
-| run | main tokens | main model time | main tok/s | timing tok/s | token/map equivalence | status |
-| --- | ---: | ---: | ---: | ---: | --- | --- |
-| Fused-off same-job control | `7,639` | `30.801s` | `248.015` | `101.706` | baseline | control |
-| Fused RoPE/cache candidate | `7,639` | `28.243s` | `270.475` | `101.988` | PASS main/timing, byte-identical `.osu` | fastest opt-in |
-
-Run dirs:
-
-- Correctness gates: `/work/imt11/Mapperatorinator/runs/fused-rope-cache-gates3-49230011-d7b8684`
-- 15s smoke: `/work/imt11/Mapperatorinator/runs/fused-rope-cache-smoke15-49230035-d7b8684`
-- Full-song validation: `/work/imt11/Mapperatorinator/runs/fused-rope-cache-full-49230082-d7b8684`
-
-The weighted diagnostic probe projected `2.505s` full-song savings by replacing the post-`Wqkv` self-attention setup/cache/layout path, not by making the attention math faster. The production flag `inference_native_q1_rope_cache_self_attention=true` fuses current-token RoPE, direct StaticCache K/V write, active-prefix cache access, and native q_len=1 attention for the simple fp32 batch-1 DecodeSession active-prefix map-generation path. Timing contexts remain on the normal path unless separately validated.
-
-Correctness gates passed before the speed claim. The one-token logits gate passed at sequence index 9 with active-prefix decode length `640` (`max_abs=1.91e-05`, allclose PASS, top-k order PASS). The 64-token direct-loop gate passed generated-token identity, raw-logit/top-k checks, and final RNG-state equality. The 15s smoke matched main tokens (`1,084 / 1,084`) and improved main `259.168 -> 287.257 tok/s` (`+10.8%`), then full-song validation matched main tokens (`7,639 / 7,639`) and timing tokens (`821 / 821`).
-
-Full-song validation accepted the candidate: same-job fused-off control `248.015 -> 270.475 tok/s` (`+9.1%`), main model time `30.801s -> 28.243s`, and timing-context `101.706 -> 101.988 tok/s`. The generated `.osu` files were byte-identical. Against the prior retained native q1 self-attention result, the new stack improves `237.111 -> 270.475 tok/s` and saves `3.974s` synchronized main-generation model time.
-
-Strict zero-tolerance per-window gates still failed in scoped places. Main generation failed `3 / 87` windows (`seq45`, `seq84`, `seq85`) totaling `4.738ms` model-time overhead versus `2.558s` aggregate main model-time savings. Timing had tiny per-window jitter but improved aggregate timing model time by `22.3ms`. Because the candidate is default-off, exact, byte-identical at output, improves main/timing aggregates, and is a narrow kernel/runtime change that clears the strategic 5-10% keep band, keep it as the current fastest exact single-song opt-in path. See `notes/2026-07-03-fused-self-attention-cache-probe.md`.
-
-Post-fused weighted accounting, DCC job `49230173` on RTX 2080 Ti, commit `e63e022`, re-profiled the accepted fused stack before starting another kernel. It used the full-song active64 replay count distribution and all probes passed their logits/allclose gates. Weighted CUDA graph replay projected:
-
-| island | projected full-song seconds | share of `28.243s` | ideal tok/s if free | note |
-| --- | ---: | ---: | ---: | --- |
-| full model forward | `17.000s` | `60.2%` | `679.4` | production synchronized model time has a large outside-forward/control gap |
-| decoder layers | `16.319s` | `57.8%` | `640.6` | only broad decoder/runtime work is large enough for the remaining 500 tok/s gap |
-| self-attention modules | `6.403s` | `22.7%` | `349.8` | fused RoPE/cache removed the clean self-attention setup win |
-| q1 cross-attention modules | `2.956s` | `10.5%` | `302.1` | target-sized for small wins, not for 500 |
-| standalone one-token linears | `7.321s` | `25.9%` | `365.1` | individual call-form rewrites remain rejected |
-| MLP module | `3.780s` | `13.4%` | `312.3` | not enough alone unless a native block is dramatically faster |
-
-The key gap is `28.243s` accepted production model time versus `17.000s` weighted full-forward replay, or about `11.2s` outside isolated forward replay. Do not start a broad native decoder-layer rewrite until a prototype or diagnostic explains how it will reduce both real decoder compute and the surrounding per-token control/synchronization cost. See `notes/2026-07-03-post-fused-weighted-accounting.md`.
-
-Post-fused active-prefix diagnostics, DCC job `49230249` on RTX 2080 Ti, commit `e63e022`, reran full-song SALVALAI with `profile_active_prefix_decode_diagnostics=true`. It was token-equivalent against accepted job `49230082` for main (`7,639 / 7,639`) and timing (`821 / 821`), while main model time stayed effectively flat (`28.243s -> 28.274s`). The large outer-wall increase was diagnostic overhead and is not a throughput claim. Main diagnostics showed token append/stop `13.036s`, stopping criteria `12.591s`, logits processors `4.489s`, prepare inputs `2.682s`, and sampling `1.142s`, but these are CPU-side spans around asynchronous work and synchronization, not exclusive CUDA kernels. Duplicate graph capture is no longer a target: only `0.117s`, `0.412%` of model time, projecting `270.176 -> 271.294 tok/s` if removed. Generated lengths vary widely (`1..586` main tokens per window), so a fixed-count GPU loop that trims later would change EOS/output behavior. See `notes/2026-07-03-post-fused-active-diagnostics.md`.
-
-Active-prefix CUDA-event diagnostic job `49231413` on RTX 2080 Ti, commit `6f126d3`, added queued CUDA-event timings to the same diagnostic path on the 15s SALVALAI smoke slice. The diagnostic/control run was token-equivalent for main and timing and produced byte-identical `.osu` output, but the diagnostic timing is not a throughput claim because event recording and final synchronization perturb the run. Main-generation event attribution showed `decode_forward.cuda_graph` still dominates the 15s diagnostic slice (`2464.025ms`, `2294.250us/decode-step`), followed by `prepare_inputs` (`542.224ms`), `stopping_criteria` (`298.459ms`), `prefill_forward` (`237.011ms`), `logits_processor` (`107.854ms`), and `sampling.multinomial` (`46.728ms`). This confirms the CPU wall `decode_forward` span undercounts real graph replay work because CUDA graph replay is asynchronous. Tail/control work is visible but not target-sized as a standalone kernel project; the next plausible large win must reduce broad one-token decoder compute and per-token synchronization/runtime cost together. See `notes/2026-07-03-active-prefix-cuda-event-diagnostics.md`.
-
-Compiled decoder-layer diagnostic job `49231529` on commit `25d18e2` tested `torch.compile(mode="reduce-overhead")` on the captured one-token decoder-layer island at active prefix `640`. The diagnostic replay was correct (`max_abs=0.0`; compiled-layer output max abs `1.43e-06`), but CUDA graph replay of the compiled layer failed with `RuntimeError: Cannot prepare for replay during capturing stage`, and Dynamo warned it could not trace the current native pybind `q1_rope_cache_attention` op. The ungraphed compiled layer was faster (`0.805842ms -> 0.644417ms` per layer), but the accepted runtime depends on graph replay (`0.201039ms` per layer for the repo layer). Do not pursue regional `torch.compile` around the current native decoder layer unless native ops are first registered as traceable/capturable custom ops; use broader native decoder-runtime probes instead. See `notes/2026-07-03-compiled-decoder-layer-probe.md`.
-
-Post-fused direct-loop tail diagnostics, DCC job `49230279` on RTX 2080 Ti, commit `e63e022`, reran `utils/verify_direct_decode_loop.py --tail-diagnostics` with the actual accepted stateful monotonic flag. The verifier passed `token_match=true`, `rng_match=true`, raw-logit allclose, and top-k checks over `256` sampled steps. Excluding the verifier-only raw-logit capture hook, projected CUDA-event tail cost over `7,639` full-song tokens is about `1.61s`: stateful monotonic `0.285s`, temperature `0.030s`, top-p `0.504s`, softmax `0.051s`, multinomial `0.346s`, EOS mask `0.075s`, append `0.036s`, stopping `0.182s`, finished check `0.071s`, and logits extract `0.030s`. This barely clears the new `5%` bar only in aggregate and is split across exact RNG/stopping semantics. Do not start standalone top-p/sampling fusion from this evidence; revisit tail work only inside a broader DecodeSession/runtime island that preserves exact `torch.multinomial` RNG, EOS stopping, generated-token counts, and output bytes. Job `49230274` is explicitly non-current evidence because it omitted `inference_stateful_monotonic_logits_processor=true`. See `notes/2026-07-03-post-fused-tail-diagnostics.md`.
-
-Five-song before/after validation, DCC jobs `49218365` through `49218368` on RTX 2080 Ti, commit `8a2de72`, compared original-repo-equivalent flags disabled against the current optimized opt-in stack on Lambada, PEGASUS, Ela ke Leitada, SALVALAI, and Nube Negra. Official TPS came from untraced `profile_inference`; each job also wrote 1s `nvidia-smi` telemetry and an Nsight Systems diagnostic report.
-
-| class | before main tok/s | after main tok/s | speedup | equivalence | note |
-| --- | ---: | ---: | ---: | --- | --- |
-| separate cold, five fresh processes | `64.802` | `195.545` | `+201.8%` | PASS, all five songs | cold single-song evidence |
-| together first run | `64.614` | `201.749` | `+212.2%` | PASS | first song in long-lived process |
-| together all runs | `60.541` | `194.791` | `+221.8%` | PASS | serial multi-song, two repeats |
-| together warmed runs | `56.834` | `194.116` | `+241.5%` | PASS | batch-adjacent evidence, not true batching |
-
-All five separate cold main-generation strict comparisons passed, and suite `all_runs`, `warmed_runs`, and `all_runs --gate-cold-run0` strict comparisons passed. Separate timing-context aggregate throughput improved on every song, but `timing/sequential/seq0` regressed for each song, so keep that as a scoped first-record timing caveat. See `notes/2026-07-03-five-song-before-after-profile.md`.
-
-Post-bucket64 diagnostics, DCC jobs `49207288` and `49208036` on RTX 2080 Ti, commit `cf4f87e`:
-
-| diagnostic run | main tokens | main model time | main tok/s | timing tok/s | note |
-| --- | ---: | ---: | ---: | ---: | --- |
-| active64 diagnostic full song | `7,639` | `48.914s` | `156.171` | `75.903` | close to accepted active64 throughput |
-| active64 seq66 torch profile | `7,639` | `53.156s` | `143.709` | `63.175` | diagnostic only; torch profiler overhead |
-
-Run dir: `/work/imt11/Mapperatorinator/runs/active64-nextdiag-49207288-cf4f87e`. The diagnostic full-song run showed:
-
-| counter | wall time |
-| --- | ---: |
-| `token_append_stop_wall_cpu_s` | `30.269s` |
-| `stopping_criteria_wall_cpu_s` | `29.823s` |
-| `decode_forward_wall_cpu_s` | `4.990s` |
-| `logits_processor_wall_cpu_s` | `4.426s` |
-| `prepare_inputs_wall_cpu_s` | `3.848s` |
-| `sampling_wall_cpu_s` | `1.156s` |
-| `compile_lookup_wall_cpu_s` | `0.010s` |
-
-CUDA graph diagnostics reported `198` captured graphs, `3.328s` total capture time, `7,552` decode replays, and `115` bucket transitions. Normalizing by active-prefix length and static tensor input shapes collapses those captures to only `11` graph shapes. The duplicate-capture ceiling is `3.153s`, or `6.446%` of active64 main model time; if duplicate capture disappeared with all other costs unchanged, estimated throughput would be about `166.9 tok/s`. This capture tax is now a real target-sized cost. The current `graph_cache` is local to each `active_prefix_decode_generate()` call, so captures repeat across generation windows; however, replay also closes over per-window cache and encoder-output objects, so persistent cross-window graph reuse requires a bufferized direct runtime rather than a small dictionary hoist.
-
-The seq66 trace again showed no single embarrassing small-kernel cleanup. Fused attention and one-token linear/GEMV-heavy decoder work dominate CUDA time: `mapperatorinator.active_prefix.decode_forward.cuda_graph` had `694.950ms` self CUDA, the SM75 FMHA kernel had `379.462ms` self CUDA, and GEMV/GEMM families contributed tens of milliseconds each in that one traced window. CPU-side `stopping_criteria` and `cudaStreamSynchronize` remain synchronization/control symptoms, consistent with the rejected simple stopping specialization.
-
-Tiny-bucket smoke job `49208036`, run dir `/work/imt11/Mapperatorinator/runs/active-tiny-bucket-sweep-49208036-cf4f87e`, tested buckets `16`, `32`, `48`, `80`, and `96` against bucket64. All were token-equivalent on the 15s smoke, but none deserved full-song promotion: bucket16/32/48 regressed main generation, bucket80 was flat, and bucket96 improved smoke main by only `+0.7%`. Keep bucket64 as the current full-song opt-in bucket. See `notes/2026-07-02-active64-post-bucket-diagnostics.md`.
-
-Follow-up tiny-bucket duplicate-capture diagnostic job `49209984`, run dir `/work/imt11/Mapperatorinator/runs/active-tiny-bucket-diag-49209984-24342d0`, repeated buckets `16`, `32`, `48`, `64`, `96`, `128`, and `192` with `profile_active_prefix_decode_diagnostics=true` and isolated compiler/cache dirs. All candidates matched bucket64 main tokens (`1,084 / 1,084`). Bucket96 was fastest on aggregate but only `+1.0%` over bucket64 (`169.290 -> 170.973 tok/s`) and still had strict per-window noise failures. The duplicate-capture projections were more important: bucket96 projected only `176.136 tok/s` without duplicate captures, while bucket64 projected `175.853 tok/s`; smaller buckets had larger duplicate-capture ceilings but worse actual throughput. This confirms that persistent graph/cache reuse may be a 5-10% cleanup or future batch-serving project, but it is not enough to reach `200 tok/s` by itself and should start as a verifier-only multi-window runtime, not production wiring. See `notes/2026-07-03-tiny-bucket-duplicate-capture-diagnostics.md`.
-
-Active64 kernel attribution jobs `49207288` and `49210611` make the next target clearer. In the accepted CUDA-graph trace, classified kernel self-CUDA after excluding the graph replay range was `57.4%` FMHA attention, `17.2%` GEMV linear, `4.3%` SGEMM linear, `9.9%` elementwise, `6.7%` device copies, `2.0%` layernorm, `1.9%` top-p sort, and `0.1%` softmax. A no-graph component trace of `main_generation.seq9` was directionally similar: `63.6%` FMHA attention, `18.0%` GEMV/SGEMM linear, `9.3%` elementwise, and `6.0%` device copies. Treat this as diagnostic-only attribution, but it strongly argues that the next `200 tok/s` path is q_len=1 attention/cache-layout/backend work plus one-token linear/GEMV launch reduction, not fused sampling. See `notes/2026-07-03-active64-kernel-attribution.md`.
-
-FlashInfer SM75 feasibility jobs `49212042` and `49212270`, run dirs `/work/imt11/Mapperatorinator/runs/flashinfer-sm75-light-49212042` and `/work/imt11/Mapperatorinator/runs/flashinfer-fp32-h12-49212270`, rejected FlashInfer as a current same-calculation fp32 backend. An isolated target with `flashinfer-python==0.6.14`, `apache-tvm-ffi==0.1.12`, and `nvidia-ml-py==13.610.43` imported on RTX 2080 Ti, but q_len=1 `torch.float32` `single_decode_with_kv_cache` failed before timing with `KeyError(torch.float32)`, including the actual traced model head shape `H=12`, `D=64`. The fp16 path then required JIT tooling and would be non-equivalent to the current fp32 objective regardless. Do not integrate or retry FlashInfer as a quick attention swap unless a future isolated probe first proves fp32 decode support on SM75 and a static-bucket valid-length/mask story that can pass the one-token logits gate. See `notes/2026-07-03-flashinfer-sm75-feasibility.md`.
-
-Rejected delayed-capture variant, DCC job `49166715`, commit `f712b59`: setting `inference_active_prefix_decode_cuda_graph_min_decode_steps=16` remained token-equivalent on 15s smoke but failed per-window no-regression on 5/10 windows and reduced graph-path aggregate throughput versus immediate capture. Keep `min_decode_steps=1` as the default. Only revisit delayed capture if a future profiler trace shows graph capture itself has become the dominant cost and a better adaptive policy can avoid medium-window regressions.
-
-Rejected active-prefix mask fast path, DCC jobs `49158276` and `49158365` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti:
-
-| run | main tokens | main model time | tok/s | token equivalence | status |
-| --- | ---: | ---: | ---: | --- | --- |
-| cold compile-only | `1,084` | `22.369s` | `48.461` | baseline | baseline |
-| active512 mask fast path | `1,084` | `30.544s` | `35.490` | PASS | rejected |
-
-The candidate moved active-prefix decode input preparation under the active-prefix context and capped static-cache mask construction to bucket length. One-token logits gates passed for compile disabled and enabled (`seq9`, active-prefix decode length `512`), and the 15s smoke matched all `1,084 / 1,084` generated main-token IDs. It still regressed cold main generation by `-26.8%`: the first long map window worsened (`seq3 16.259s -> 26.186s`) despite faster post-warm windows (`seq9 103.007 -> 150.046 tok/s`). The patch was reverted. See `notes/2026-07-01-active-prefix-mask-fastpath.md`.
-
-Rejected simple measured active-prefix primer, DCC job `49159121` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti:
-
-| run | main tokens | main model time | tok/s | token equivalence | status |
-| --- | ---: | ---: | ---: | --- | --- |
-| cold compile-only | `1,084` | `22.599s` | `47.967` | baseline | baseline |
-| active512 | `1,084` | `30.266s` | `35.816` | PASS | baseline active-prefix candidate |
-| active512 + measured primer | `1,084` | `31.477s` | `34.438` | PASS | rejected |
-
-The primer used a scratch cache, fresh logits processors, and an RNG fork. It moved work out of the first long active-prefix map window (`seq3 25.909s -> 14.923s`) but paid setup in earlier records (`seq0=11.705s`) and regressed the active512 aggregate by `-3.8%`. The code was reverted. This supports the graph/capture/specialization diagnosis but shows that naive throwaway-generate priming is not enough; future priming needs better bucket/shape coverage and explicit profile schema support. See `notes/2026-07-01-active-prefix-primer.md`.
-
-Rejected active-prefix direct per-layer static-cache update dispatch bypass, DCC job `49160690` on `dcc-core-ferc-s-z25-21`, RTX 2080 Ti:
-
-| run | main tokens | main model time | tok/s | token equivalence | status |
-| --- | ---: | ---: | ---: | --- | --- |
-| cold compile-only | `1,084` | `22.406s` | `48.380` | baseline | baseline |
-| active512 old path | `1,084` | `30.906s` | `35.074` | PASS | baseline active-prefix candidate |
-| active512 direct-layer update | `1,084` | `31.330s` | `34.599` | PASS | rejected |
-
-The candidate bypassed `Cache.update(..., layer_idx, ...)` dispatch by calling the selected static-cache layer update directly during active-prefix VarWhisper SDPA self-attention decode. One-token logits gates passed with compile disabled (`max_abs=0.0`) and compile enabled (`max_abs=2.2888e-05`), and the 15s smoke matched all `1,084 / 1,084` generated main-token IDs. It still regressed active512 by `-1.4%`, did not improve the first long map window (`seq3 26.539s -> 26.926s`), and slightly worsened a post-warm window (`seq9 1.574s -> 1.599s`). The code was reverted. See `notes/2026-07-01-active-prefix-direct-layer-cache-update.md`.
-
-Rejected active-prefix buffered input-id preallocation, DCC job `49162138` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti:
-
-| run | main tokens | main model time | tok/s | token equivalence | status |
-| --- | ---: | ---: | ---: | --- | --- |
-| cold compile-only | `1,084` | `21.460s` | `50.513` | baseline | baseline |
-| active512 old path | `1,084` | `29.006s` | `37.372` | PASS | baseline active-prefix candidate |
-| active512 buffered input IDs | `1,084` | `29.802s` | `36.373` | PASS | rejected |
-
-The candidate preallocated the generated `input_ids` buffer inside the active-prefix custom decode loop to avoid per-token `torch.cat`. The multi-token direct-loop gate had already shown this can preserve token/logit/RNG semantics, but 15s profile evidence showed it regressed active512 main generation by `-2.7%` and remained `-28.0%` below the compile-only smoke baseline. Timing generation improved in this specific run (`4.4 -> 7.0 tok/s`), but the objective is main-generation throughput and the main path got worse. The code was reverted. See `notes/2026-07-01-active-prefix-buffered-input-ids.md`.
-
-Rejected naive TorchInductor cudagraph-tree disabling, DCC jobs `49162564`, `49162714`, and `49162877` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti:
-
-| run | main tokens | main model time | tok/s | timing model time | token equivalence | status |
-| --- | ---: | ---: | ---: | ---: | --- | --- |
-| compile-only baseline | `1,084` | `21.855s` | `49.600` | `34.243s` | baseline | baseline |
-| active512 default | `1,084` | `29.820s` | `36.352` | `39.420s` | PASS | baseline active-prefix candidate |
-| active512 global no-cudagraph-trees | `1,084` | `16.755s` | `64.696` | `73.607s` | PASS | rejected, timing regression |
-| active512 MAP-only no-cudagraph-trees | `1,084` | `63.546s` | `17.059` | `37.651s` | PASS | rejected |
-
-`torch._inductor.config.triton.cudagraph_trees=False` is diagnostic evidence, not an accepted optimization. Setting it globally from process start made active-prefix main generation exact and much faster on the 15s smoke (`+30.4%` vs compile-only main generation), but it more than doubled timing-context model time. A follow-up default-off scoped patch that limited active-prefix/no-cudagraph-trees to `MAP` preserved token equivalence and kept timing closer to baseline, but it catastrophically regressed main generation (`-64.5%`). The code was reverted. The useful conclusion is that active-prefix still needs deeper graph-state isolation, likely bucket-scoped compiled calls or a direct decode runtime, not a naive global or per-call cudagraph-tree switch. See `notes/2026-07-01-active-prefix-cudagraph-trees.md`.
-
-Rejected bucket-scoped active-prefix `torch.compile` wrappers, DCC job `49163585` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti, commit `b4f3f11` with the code reverted in `ea1c422`:
-
-| variant | main tokens | main model time | tok/s | token equivalence | decision |
-| --- | ---: | ---: | ---: | --- | --- |
-| compile-only | `1,084` | `21.773s` | `49.786` | baseline | retained smoke baseline |
-| active512 shared compile | `1,084` | `29.741s` | `36.448` | PASS vs bucket | existing active-prefix path |
-| active512 bucket-scoped compile | `1,084` | `31.946s` | `33.933` | PASS | rejected |
-
-The direct-loop gate passed first (`token_match=true`, `logits_pass=true`, `rng_match=true`, `max_abs=0.0`, `8` steps), so the wrapper was exact. It still made cold 15s smoke performance worse: `-6.9%` main-generation throughput versus active512 shared compile and `-31.8%` versus compile-only, with strict per-window non-regression failing for all active-shared-vs-bucket main records. This means simply giving each active-prefix bucket its own compiled wrapper adds more compile/graph overhead than it removes. See `notes/2026-07-01-active-prefix-bucket-compile-scope.md`.
-
-## Smoke-To-Full Profiling Loop
-
-Start with the middle 15s SALVALAI smoke config for fastest iteration:
+Start with the 15-second middle slice:
 
 ```bash
 python inference.py --config-name profile_salvalai_smoke15 \
   audio_path="$WORK/data/salvalai.mp3" \
-  output_path="$WORK/runs/profile-smoke15-${SLURM_JOB_ID}" \
-  device=cuda \
-  precision=fp32 \
-  attn_implementation=sdpa \
-  use_server=false
+  output_path="$WORK/runs/smoke15-${SLURM_JOB_ID}" \
+  device=cuda precision=fp32 attn_implementation=sdpa \
+  use_server=false parallel=false
 ```
 
-`configs/inference/profile_salvalai_smoke15.yaml` sets `start_time=71000`, `end_time=86000`, `seed=12345`, `attn_implementation=sdpa`, `use_server=false`, `inference_generation_compile=true`, `inference_active_prefix_decode_loop=false`, and `profile_record_token_ids=true`. Use this for first-pass scouting; promote to the 30s smoke or full-song configs only when the 15s result is token-equivalent and plausibly meaningful. For compile/runtime changes with one-time specialization costs, inspect post-warmup windows before rejecting a token-equivalent candidate, but full-song non-regression is still required before acceptance.
+For a decoder/cache/kernel candidate, run the correctness gates before speed profiling:
 
-Reference 15s smoke profiles from commit `ce92ebb` on RTX 2080 Ti node `dcc-core-ferc-s-z25-21`:
+```bash
+python utils/verify_one_token_decode.py \
+  --config-name profile_salvalai_smoke15 \
+  --sequence-index 9 \
+  --report-path "$WORK/runs/one-token-${SLURM_JOB_ID}.json" \
+  audio_path="$WORK/data/salvalai.mp3" \
+  output_path="$WORK/runs/one-token-output-${SLURM_JOB_ID}" \
+  device=cuda precision=fp32 attn_implementation=sdpa \
+  use_server=false parallel=false cfg_scale=1.0 num_beams=1
 
-| run | job | profile | main tokens | main model time | tok/s |
-| --- | --- | --- | ---: | ---: | ---: |
-| compile-disabled | `49132862` | `/work/imt11/Mapperatorinator/runs/smoke15-nocompile-49132862-ce92ebb/beatmap3ccc5112a05940db8fdd747994c4bef2.osu.profile.json` | 1,084 | 22.068s | 49.1 |
-| retained compile baseline | `49132861` | `/work/imt11/Mapperatorinator/runs/smoke15-compile-49132861-ce92ebb/beatmapfb8360ef206b41f4a6cc1fe7a6a735ed.osu.profile.json` | 1,084 | 13.335s | 81.3 |
+python utils/verify_direct_decode_loop.py \
+  --config-name profile_salvalai_smoke15 \
+  --max-new-tokens 256 \
+  --report-path "$WORK/runs/direct-loop-${SLURM_JOB_ID}.json" \
+  audio_path="$WORK/data/salvalai.mp3" \
+  output_path="$WORK/runs/direct-loop-output-${SLURM_JOB_ID}" \
+  device=cuda precision=fp32 attn_implementation=sdpa \
+  use_server=false parallel=false cfg_scale=1.0 num_beams=1
+```
 
-Use the comparison helper as a real gate, not only a readable summary:
+Add candidate-specific verifier switches shown by `--help`; do not copy switches from an old experiment without checking the current CLI. The direct-loop gate must compare tokens, raw logits/top-k, and final RNG state. Cache-writing whole-layer candidates must also use `profile_decode_decoder_layer_island.py --verify-cache-write-candidates` and the current ABI/cache validator.
+
+Compare smoke profiles:
 
 ```bash
 python utils/summarize_inference_profile.py \
   --compare "$BASELINE_PROFILE" "$CANDIDATE_PROFILE" \
   --label main_generation \
   --strict \
-  --json-output "$WORK/runs/profile-compare-${SLURM_JOB_ID}.json"
+  --json-output "$WORK/runs/smoke-compare-${SLURM_JOB_ID}.json"
 ```
 
-`--strict` exits nonzero when same-calculation metadata differs, generated token IDs are missing or different, generated-token or record counts change, aggregate throughput/model/wall/stage time regresses, or any selected-label per-window record regresses. For full-song promotion, prefer `--strict-full-song`; it runs strict checks for both `main_generation` and `timing_context` in one report and requires matching `result_file_sha256`/`result_file_size_bytes`.
-
-`utils/profile_inference_suite.py` copies output artifact hashes into `suite_manifest.json` for each run. Suite comparisons always report `output_artifact_equivalence`; add `--require-output-equivalence` when a warmed-repeat, serial multi-song, server, or future batch-throughput claim also requires byte-identical outputs.
-
-`utils/summarize_inference_profile.py --compare` reported token equivalence PASS for all `1,084` generated main-token IDs. This short slice is warmup-sensitive: the retained compile baseline is `+65.5%` over compile-disabled overall, while post-warmup map windows are mostly around `94-105 tok/s`.
-
-Use the middle 30s SALVALAI smoke config when a longer smoke slice is needed before full-song promotion:
-
-```bash
-python inference.py --config-name profile_salvalai_smoke \
-  audio_path="$WORK/data/salvalai.mp3" \
-  output_path="$WORK/runs/profile-smoke-${SLURM_JOB_ID}" \
-  device=cuda \
-  precision=fp32 \
-  attn_implementation=sdpa \
-  use_server=false
-```
-
-`configs/inference/profile_salvalai_smoke.yaml` sets `start_time=63500`, `end_time=93500`, `seed=12345`, and `profile_record_token_ids=true`. This keeps scouting runs short while allowing token-equivalence checks.
-
-Compare baseline and candidate smoke profiles:
+Only promote a token-equivalent candidate with a credible current-stack projection above `5%`. Full-song promotion uses both main and timing plus output hashes:
 
 ```bash
 python utils/summarize_inference_profile.py \
-  --compare /path/to/baseline.profile.json /path/to/candidate.profile.json
+  --compare "$BASELINE_PROFILE" "$CANDIDATE_PROFILE" \
+  --strict-full-song \
+  --json-output "$WORK/runs/full-compare-${SLURM_JOB_ID}.json"
 ```
 
-The comparer now prints a same-calculation metadata contract before token comparison. A candidate is not promotable if it differs from the baseline in model, audio, seed, precision, sampling policy, windowing, context/output policy, server/parallel mode, or token-recording setup unless the run is explicitly labeled non-equivalent.
+Reciprocal run order is required when compile, graph, thermal, or cache order could bias the result. Report cold run 0 separately from warmed repeats.
 
-Before any custom decoder-step, CUDA graph, backend, or kernel path is treated as a candidate, run the one-token logits gate on the same 15s smoke config:
+## Five-Song And Serial Suites
+
+Use `utils/profile_inference_suite.py` for warm-repeat or serial multi-song evidence. Pass an explicit YAML/JSON/text song list for `serial_multi_song`; the established DCC list is under `$WORK/data/five-song-profile/songs.yaml`.
+
+Suite manifests must preserve cold-run, warmed/all aggregate, timing, per-song, output hashes, and runtime cache/environment metadata. Compare warmed claims with:
 
 ```bash
-python utils/verify_one_token_decode.py \
-  --config-name profile_salvalai_smoke15 \
-  --sequence-index 9 \
-  --report-path "$WORK/runs/one-token-decode-${SLURM_JOB_ID}.json" \
-  audio_path="$WORK/data/salvalai.mp3" \
-  output_path="$WORK/runs/profile-smoke15-${SLURM_JOB_ID}" \
-  device=cuda \
-  precision=fp32 \
-  attn_implementation=sdpa \
-  use_server=false \
-  parallel=false \
-  cfg_scale=1.0 \
-  num_beams=1
+python utils/summarize_inference_profile.py \
+  --compare-suite "$BASE_MANIFEST" "$CANDIDATE_MANIFEST" \
+  --suite-scope warmed_runs \
+  --strict \
+  --require-output-equivalence \
+  --json-output "$WORK/runs/suite-compare-${SLURM_JOB_ID}.json"
 ```
 
-This gate compares a direct static-cache `q_len=1` decode step against captured raw logits from HF cached
-`generate(max_new_tokens=2)` on the real SALVALAI prompt-building path. The capture processor clones logits before
-Mapperatorinator logits processors can mutate them in-place, and HF's first generated token becomes the probe token for
-the direct candidate step. Add `--include-no-cache-diagnostics` only when debugging the ABI; it runs slower no-cache
-full-prefix forwards that are not part of the pass condition. Passing this gate is
-necessary for decoder-runtime work, but not sufficient for a speed claim; still require fixed-seed 15s generated-token
-equivalence and full-song equivalence.
+Use `--suite-scope all_runs` for an all-run claim and `--gate-cold-run0` only when cold run 0 is part of the claim. Five-song serial results are not concurrent batch results.
 
-The reusable one-token ABI lives in `osuT5.osuT5.inference.direct_decode`. DCC job `49139917` validated the ABI on
-`main_generation.seq9` after extraction:
+## Static IPC Server Profiles
 
-- Compile disabled: `/work/imt11/Mapperatorinator/runs/one-token-abi-gate-49139917-8cb1160/one_token_decode_seq9_compile_false.json`, PASS, `max_abs=0.0`, candidate prepared shape `[1, 1]`.
-- Compile enabled: `/work/imt11/Mapperatorinator/runs/one-token-abi-gate-49139917-8cb1160/one_token_decode_seq9_compile_true.json`, PASS, `max_abs=2.2888e-05`, top-k match, candidate prepared shape `[1, 1]`.
+Use `utils/profile_static_server_batch.py` for the existing V32 server. Generation compile remains unsupported with `use_server=true`, and `use_server=true` must not be combined with `parallel=true`.
 
-Use this helper as the starting point for manual CUDA graph or narrow `torch.compile(mode="reduce-overhead")`
-experiments. Do not maintain a second direct-step path unless this ABI is proven wrong or insufficient.
+The server socket path must be derived from the explicit runtime key, including device, precision, attention backend, generation compile, `max_batch_size`, and `server_batch_timeout`, and hash-shortened when necessary for AF_UNIX limits. Refuse stale/existing sockets by default unless the run explicitly documents compatible reuse.
 
-For post-warmup diagnosis, use detailed internal ranges only in torch-profiler or Nsight runs:
+The primary metric is scheduler-wall aggregate throughput. Per-request server/model time is attributed because a merged server batch is replicated into multiple request records; never sum attributed times as independent GPU work.
 
-```bash
-python inference.py --config-name profile_salvalai_smoke15 \
-  audio_path="$WORK/data/salvalai.mp3" \
-  output_path="$WORK/runs/profile-smoke15-trace-${SLURM_JOB_ID}" \
-  device=cuda \
-  precision=fp32 \
-  attn_implementation=sdpa \
-  use_server=false \
-  profile_torch_generation=true \
-  profile_torch_generation_limit=1 \
-  profile_torch_generation_label_filter=main_generation \
-  profile_generation_detail_ranges=true
-```
-
-`profile_generation_detail_ranges=true` adds NVTX and `record_function` ranges inside VarWhisper decoder self-attention, cross-attention, MLP `fc1`/activation/`fc2`, final norm, and output projection. These traces are diagnostic only; do not use traced wall time for throughput claims.
-
-For active-prefix cold-overhead attribution, add:
-
-```bash
-profile_active_prefix_decode_diagnostics=true
-```
-
-This is default-off and only records diagnostics when `inference_active_prefix_decode_loop=true`. It adds an `active_prefix_decode_diagnostics` object to each generation profile record with CPU-side wall counters for compile lookup, prepare inputs, prefill, decode forward, cache/model-kwargs update, logits processors, sampling, token append, and stopping checks, plus `decode_steps`, `bucket_lengths_seen`, and `bucket_transition_count`. On CUDA inputs it also records diagnostic CUDA-event timing totals and call counts for the same active-prefix ranges. The CUDA-event ranges are nested/non-exclusive and include queued GPU work between range entry and exit on the current stream; finalizing them synchronizes the device. Pair this with `profile_generation_detail_ranges=true` when NVTX/`record_function` ranges are needed; otherwise it still writes JSON counters without enabling the broader VarWhisper detail ranges. This mode is diagnostic only and should not be used for throughput claims.
-
-Use `python utils/summarize_active_prefix_diagnostics.py PROFILE.json --label main_generation --json-output active_diagnostics.json` to aggregate per-record active-prefix counters, CUDA-event timing totals, CUDA graph capture/replay counts, duplicate-capture ceiling by normalized graph shape, bucket usage, per-logits-processor wall time, and per-CUDA-event single-range ceilings without writing ad hoc parsers for every DCC run. The single-range ceiling answers "if this one measured range vanished, what is the fantasy tok/s?" and is useful for rejecting sub-5% kernel ideas. Do not add the ceilings together; CUDA-event ranges are nested/non-exclusive and diagnostic-only.
-
-For production `model.generate()` runtime attribution, add:
-
-```bash
-profile_model_generate_cuda_ledger=true
-```
-
-Generation profile records then include a low-overhead `model.generate()` CUDA
-event ledger when `profile_inference=true`, `profile_sync_cuda=true`, and
-`device=cuda`:
-`model_generate_cpu_elapsed_seconds`, `model_generate_cuda_event_seconds`, and
-`model_generate_host_gap_seconds`. Use these to reconcile the full-song
-production `model_elapsed_seconds` against queued CUDA work before choosing
-between a host/runtime-control project and broader decoder CUDA kernel work.
-This flag is default-off so normal throughput profiles stay comparable to
-retained baselines. These fields are diagnostic attribution; official
-throughput claims still use the synchronized `model_elapsed_seconds` recorded by
-`profile_inference`.
-
-DCC jobs `49234401` and `49234699` on RTX 2080 Ti, commit `a6309f8`, validated
-the ledger on full-song SALVALAI against the accepted fused/active baseline.
-The repeat run matched main generated tokens (`7,639 / 7,639`) and timing
-tokens (`821 / 821`). Main generation recorded `27.855s` synchronized model
-time, `27.848s` CUDA-event time, and only `7.2ms` host gap, while aggregate
-main throughput was noise-better than the retained `270.475 tok/s` baseline
-(`274.241 tok/s`). Timing-context aggregate was slightly slower
-(`101.988 -> 101.146 tok/s`) and strict per-window checks still failed on small
-noise, so the ledger is not a promoted performance change. The useful
-conclusion is target selection: current main-generation time is overwhelmingly
-queued CUDA/decoder work, not host-loop overhead. See
-`notes/2026-07-03-model-generate-cuda-ledger.md`.
-
-DCC validation job `49164750` on `dcc-core-ferc-s-z25-20`, RTX 2080 Ti, commit `c7ab3b8`, compared active512 15s smoke with and without `profile_active_prefix_decode_diagnostics=true`. The Slurm job exited `FAILED` because the final ad-hoc report snippet had a quoting bug, but both profiles and compare reports were written under `/work/imt11/Mapperatorinator/runs/active-prefix-diagnostics-smoke-49164750-c7ab3b8`. Main-generation token equivalence passed (`1,084 / 1,084`) and diagnostics changed aggregate main-generation throughput only `34.629 -> 34.623 tok/s` (`-0.02%`). Timing-context token equivalence also passed (`164 / 164`). Zero-tolerance per-window no-regression failed on sub-percent to about `1.3%` noise, so treat this as diagnostic validation rather than a throughput claim.
-
-The useful attribution from that run: across 20 generation records, `decode_forward_wall_cpu_s` summed to `54.791s`, with `first_decode_forward_wall_cpu_s=30.560s` and `steady_decode_forward_wall_cpu_s=24.231s`. For map records specifically, first decode forward was `11.657s`, steady decode forward was `12.296s`, logits processors were `5.250s`, and sampling was `0.243s`. The first long map window (`seq3`) paid `11.538s` in first decode forward, while later map windows reached about `116-138 tok/s`. This supports graph/runtime stabilization as the next active-prefix target before fused sampling/logits work.
-
-For Nsight Systems timeline work, add `profile_nvtx_generation_ranges=true` to emit top-level `generation.<label>.seqN` NVTX ranges without enabling `torch.profiler`. This makes cold `main_generation.seq0` and warmed windows such as `main_generation.seq9` visible in the timeline while keeping torch-profiler overhead out of the run. The resulting Nsight wall times are still diagnostic; use normal `profile_inference` model timings for throughput claims.
-
-For SDPA dispatch audits, force one PyTorch SDPA backend at a time:
-
-```bash
-python inference.py --config-name profile_salvalai_smoke15 \
-  audio_path="$WORK/data/salvalai.mp3" \
-  output_path="$WORK/runs/profile-smoke15-sdpa-flash-${SLURM_JOB_ID}" \
-  device=cuda \
-  precision=fp32 \
-  attn_implementation=sdpa \
-  use_server=false \
-  profile_sdpa_backend=flash
-```
-
-Valid backend values are `flash`, `efficient`, `math`, and `cudnn` when the installed PyTorch exposes them. Record PyTorch warnings, actual profiler kernel names, token equivalence, and untraced speed. A forced backend micro-result does not replace the retained SDPA baseline without full-song token-equivalent evidence.
-
-RTX 2080 Ti SDPA backend audit result:
-
-- Smoke job `49139404` found forced `profile_sdpa_backend=math` was token-equivalent and much faster on the 15s aggregate (`78.862 tok/s` vs `50.850 tok/s`), while forced `efficient` was noise and forced `flash` failed on SM75 with no available kernel.
-- The full-song paired validation job `49139420` rejected forced `math` for main generation: `/work/imt11/Mapperatorinator/runs/full-sdpa-math-49139420-9d92c34/beatmap8241a2b3f0be495592a5cf2b9bb9d6a2.osu.profile.json` produced `7,639` main tokens in `85.177s`, `89.684 tok/s`, token equivalence PASS, which was slower than the retained compile-only `92.465 tok/s` baseline.
-- Conclusion: keep default SDPA plus `inference_generation_compile=true` as the baseline. Do not promote forced `math` from smoke-only evidence; use it only as a diagnostic if a future trace shows a backend-specific reason.
-
-TorchDynamo cache-limit scout result:
-
-- Compile-health job `49139485` showed CUDA graph recordings across smoke map windows and recompiles from
-  `decoder_input_ids` stride changes plus timing-model to map-model `proj_out.weight` size changes.
-- Raising `torch._dynamo.config.recompile_limit` and `torch._dynamo.config.cache_size_limit` to `32` in job `49139564`
-  was token-equivalent but not a main-generation win: `50.850 -> 50.867 tok/s` on the 15s smoke. Do not promote this
-  as an optimization; keep it as evidence that the missing gain is not solved by a larger Dynamo cache.
-
-Direct-step CUDA graph and attention ceiling results:
-
-- Direct-step graph POC job `49139948` used `utils/profile_direct_decode_step.py` on `main_generation.seq9`. It was
-  logits-exact and measured fixed one-token eager forward at `12.18-12.36ms` vs manual CUDA graph replay at about
-  `8.09ms`, `1.5x` faster. This is a diagnostic ceiling only: `8.09ms` is about `124 tok/s` before real sampling,
-  token-copy, EOS, and loop control work, so graphing the current forward alone is not a `200 tok/s` path.
-- SM75 fp32 SDPA microprofile job `49139966` wrote
-  `/work/imt11/Mapperatorinator/runs/attn-sm75-fp32-49139966-596f221/attention_kernel_profile.json`.
-  q_len=1 `decode_self_kv512` repo-like SDPA was `0.0686ms`; `decode_self_kv2048` was `0.2884ms`; and
-  `cross_attn_kv2048` was `0.2892ms`.
-- Focused mask-length job `49139981` wrote `/work/imt11/Mapperatorinator/runs/sdpa-mask-2560-49139981.json`.
-  q_len=1 `kv2560` was `0.3576ms` maskless and `0.3739ms` with a static position-84 mask. The mask overhead is small;
-  the full static self-attention length is the large cost.
-- Interpretation: the next plausible `200 tok/s` lever is exact active-prefix self-attention/cache layout that avoids
-  full `max_target_positions` work without the rejected per-token slicing path. Manual CUDA graphing remains useful for
-  a likely `120 tok/s`-class runtime path but needs an attention/cache-layout win to approach `200 tok/s`.
-
-Promote a change to a full-song SALVALAI run only when smoke results are stable, token IDs match, and the speedup is plausibly meaningful. For compile-like changes with one-time first-window costs, inspect post-warmup per-window throughput before rejecting a weak total smoke result. Keep changes that improve RTX 2080 full-song main-generation throughput by about 10% or more. Keep 5-10% wins only when they are simple and well-contained or strategically de-risk the custom runtime path. Remove 1-3% complexity by default.
-
-Historical pre-q1-BMM 200 tok/s phase stop rule: stop the long-running optimization loop only when either the full-song RTX 2080/2080 Ti run reaches at least `200 tok/s` with identical fixed-seed tokens, or profiling across multiple exact-calculation optimization families shows no remaining plausible major exact-calculation path. This rule is now historical because job `49213490` reached `201.125 tok/s` on the default-off exact opt-in path; use the `500 tok/s single-song campaign` section for current work.
-
-Historical status after active-prefix validation, before q1-BMM cross-attention:
-
-- Retained cold single-song baseline: SDPA plus `inference_generation_compile=true`, active-prefix disabled. Full-song job `49113713` generated `7,639` main tokens in `82.615s`, `92.465 tok/s`, token equivalence PASS against the compile-disabled baseline. Same-commit paired job `49150185` measured compile-only at `92.998 tok/s`.
-- Current retained flags: `attn_implementation=sdpa`, `inference_generation_compile=true`, `inference_active_prefix_decode_loop=false`, `seed=12345`, `profile_record_token_ids=true`.
-- Active-prefix is an opt-in strategic candidate, not the retained cold baseline. Bucket `256` in job `49150185` looked like a large exact win (`92.998 -> 121.926 tok/s`), but later full-song runs showed order/warm-state sensitivity. Job `49151748` measured bucket `256` cold at `88.699 tok/s`, bucket `128` at `81.396 tok/s`, and bucket `512` warm at `108.313 tok/s`, all token-equivalent against bucket `256`.
-- Bucket `512` cold-first validation job `49152465` generated `7,639` main tokens in `78.108s`, `97.800 tok/s`, token equivalence PASS against a same-job compile-only run. That is only about `+5.8%` against the retained `92.465 tok/s` compile-only baseline and it still regressed the first main-generation window and timing/total stage against clean retained runs, so it stays default-off.
-- At this checkpoint, reaching `200 tok/s` from the retained `92.465 tok/s` baseline required reducing main-generation model time to `38.195s`, so about `44.420s` or `53.8%` of retained model time remained to remove. The later q1-BMM path reached `37.981s`.
-
-For that historical 200 tok/s phase, the next experiments were ranked this way:
-
-1. Preflight exactness and measurement infrastructure: metadata contract checks, one-token raw-logits gate, detailed decoder-step ranges, and SDPA backend dispatch audits.
-2. Exact custom decode-loop prototype with CUDA graph discipline, gated to local batch-one static-cache generation first.
-3. Attention/cache backend spike only if detailed ranges show `q_len=1` self-attention or cross-attention is target-sized after PyTorch graph work.
-4. Linear/GEMV launch-reduction work only if detailed ranges show MLP/projection launches dominate after attention/cache work.
-5. Fused sampling/logits-processor work only if sampling grows to at least `10%` of synchronized main-generation time.
-6. Torch-TensorRT / TensorRT-RTX feasibility only after a toy FP32 graph proves real engine execution with fallback disabled.
-
-Custom runtime work must prove token identity in stages before any speed claim graduates: compile-disabled 15s smoke equivalence, compile-enabled 15s smoke equivalence, then full-song equivalence.
-
-Torch-TensorRT/TensorRT environment probe:
-
-- Job `49134026` on `dcc-core-ferc-s-z25-21`, RTX 2080 Ti capability `(7, 5)`, commit `a2cf83a`, log `/work/imt11/Mapperatorinator/logs/trt-probe-49134026.out`.
-- DCC env `/hpc/group/romerolab/imt11/envs/mapperatorinator` has `torch 2.10.0+cu128` with CUDA `12.8`, but `torch_tensorrt`, `tensorrt`, `onnx`, `onnxruntime`, and `polygraphy` are not installed on the GPU node.
-- Treat TensorRT as a separate environment-install feasibility project, not the immediate runnable optimization path. Do not spend runtime-spike time on TensorRT until the stack exists in an isolated env and can compile the repeated one-token decoder forward with logits/token equivalence checks.
-
-Post-warmup torch-profiler diagnostic for the 15s retained baseline:
-
-- Job `49133341`, profile `/work/imt11/Mapperatorinator/runs/smoke15-trace-seq9-49133341-ce92ebb/beatmap574d4d0acdf84cef8c7efd2758fb74bb.osu.profile.json`.
-- Traced label: `generation.main_generation.seq9`, `234` generated tokens.
-- Normal synchronized model time for the traced record was `2.562s` (`91.3 tok/s`); torch-profiler/export inflated outer wall to `24.207s`, so use the trace only for event mix.
-- Top CUDA self-time events were the compiled forward region and f32 memory-efficient attention on SM75: `Torch-Compiled Region: 0/2` `1.717s`, `fmha_cutlassF_f32_aligned_64x64_rf_sm75` `1.476s`.
-- Sampling/logits overhead was visible but not target-sized in this trace: `aten::sort` `234` calls, `7.601ms` CUDA total; `aten::_softmax` `468` calls, `1.759ms` self CUDA; `aten::cat` `542` calls, `1.433ms` self CUDA. Do not prioritize a fused sampler unless a future trace shows it has grown to at least `10%` of synchronized main-generation time.
-
-## Historical 100 tok/s Goal Prompt
-
-Superseded by the 200 tok/s and then 500 tok/s campaigns. Keep this only as campaign history.
+Static server RNG is currently shared-global. Required manifest labels are:
 
 ```text
-Optimize Mapperatorinator inference on RTX 2080/2080 Ti for same-calculation speedups only. Current baseline is roughly 65-78 tok/s; first success target is 100 tok/s main-generation throughput, strong milestone is 120 tok/s, and 150+ tok/s is stretch. Do not claim speedups from changed precision, sampling policy, output policy, model quality, windowing/overlap, or generated-token behavior unless explicitly labeled non-equivalent.
-
-Use a profiling-first loop. Start with a middle-30-second song smoke slice, prove fixed-seed generated tokens match baseline, and only promote promising changes to full-song SALVALAI runs. Use full-song runs for accepted results. Keep SDPA as the baseline unless profiler evidence strongly contradicts it. Separate true model time from torch.profiler overhead.
-
-Scout improvement ideas with subagents and web research as useful, but accept only measured wins. Prioritize big wins in generation-loop structure, cache behavior, mask construction, logits processors, repeated small kernels, memory movement, and avoidable per-token setup. Keep changes that improve RTX 2080 full-song main-generation throughput by >=10%; keep 5-10% only if very simple; remove 1-3% complexity. Commit and push clean checkpoints for accepted wins, document why each win worked or failed in docs/inference_profiling.md, update AGENTS.md with durable conventions, write notes under notes/, and stop when the 100 tok/s goal is reached or profiling shows no remaining plausible >=10% exact-calculation improvement.
+same_calculation=false
+server_rng_policy=shared_global
+token_equivalence_status=not_checked_shared_server_rng
+throughput_claim_scope=static_ipc_concurrent_full_song_requests
 ```
 
-## Historical 200 tok/s Goal Prompt
-
-Superseded by the accepted `201.125 tok/s` exact opt-in path and the current 500 tok/s single-song campaign. Keep this only as campaign history.
-
-```text
-Optimize Mapperatorinator inference toward 200 tok/s main-generation throughput on RTX 2080/2080 Ti, same-calculation only. Current retained baseline is SDPA + inference_generation_compile=true with active-prefix disabled: 7,639 full-song SALVALAI main tokens, 82.615s synchronized model time, 92.465 tok/s, fixed-seed token equivalence PASS against the compile-disabled full-song baseline.
-
-Use a PyTorch-first, bounded opt-in runtime/kernel plan. Start with measurement and exactness infrastructure: preflight equivalence checks, one-token decoder logits equivalence against the current raw-logits path, 15s middle-song SALVALAI smoke token equivalence, and untraced profile_inference model-time throughput. Treat torch profiler and Nsight traces as diagnostic only.
-
-Prioritize changes that could reduce real one-token decoder forward cost: SDPA backend dispatch audit, static one-token decode ABI, CUDA graph discipline, q_len=1 self-attention and cross-attention cache/layout work, and only then isolated FlashInfer or narrow native CUDA/CUTLASS kernels for measured dominant hotspots. Keep SDPA + generation compile as the baseline unless full-song token-equivalent evidence justifies replacement.
-
-Do not claim wins from changed precision, sampling policy, output policy, model quality, windowing/overlap, generated-token behavior, output length, or non-equivalent RNG behavior unless explicitly labeled non-equivalent. Do not restart rejected quick tweaks unless new profiling evidence explains why old negative or non-equivalent results no longer apply.
-
-Use configs/inference/profile_salvalai_smoke15.yaml for first-pass scouting with seed=12345, use_server=false, attn_implementation=sdpa, inference_generation_compile=true, inference_active_prefix_decode_loop=false, and profile_record_token_ids=true. Promote only after one-token logits gate PASS and 15s fixed-seed generated-token equivalence PASS. Full-song SALVALAI token equivalence, untraced throughput, and no performance degradation in timing generation or total profiled stage time are required for accepted cold single-song results.
-
-Keep full-song RTX 2080/2080 Ti wins >=10%; keep 5-10% only if simple or strategically unlocks the runtime path; revert 1-3% complexity by default. Commit and push clean checkpoints for accepted wins, document accepted and rejected experiments in docs/inference_profiling.md and notes/, update AGENTS.md with durable conventions, and stop only when 200 tok/s is reached or profiling shows no remaining plausible exact-calculation path to a major gain.
-
-Improvements that help future batch inference or multiple-song throughput matter too, but report them separately from cold single-song speedups: first-song cold cost, warmed subsequent-song cost, aggregate multi-song throughput, token equivalence per song, RNG reset policy, and any batching/windowing behavior changes.
-```
-
-## Attention Kernel Profiling
-
-Use `utils/profile_attention_kernels.py` to isolate SDPA vs FlashAttention 2 without loading model weights or audio. The script uses fixed random tensors with VarWhisper small v3-like shapes (`6` heads, `64` head dimension) and reports both raw attention-call timing and a repo-like layout path that includes output reshaping and FlashAttention packing overhead.
-
-Run on a GPU Slurm allocation:
-
-```bash
-ENV=/hpc/group/romerolab/imt11/envs/mapperatorinator
-WORK=/work/imt11/Mapperatorinator
-REPO=/hpc/group/romerolab/imt11/projects/Mapperatorinator
-LOCAL_TMP="/tmp/imt11-attn-kernels-${SLURM_JOB_ID}"
-
-export PATH="$ENV/bin:$PATH"
-export LD_LIBRARY_PATH="$ENV/targets/x86_64-linux/lib:$ENV/lib:${LD_LIBRARY_PATH:-}"
-export TMPDIR="$LOCAL_TMP"
-export TEMP="$LOCAL_TMP"
-export TMP="$LOCAL_TMP"
-export TRITON_CACHE_DIR="$LOCAL_TMP/triton"
-export XDG_CACHE_HOME="$WORK/cache"
-export HF_HOME="$WORK/cache/huggingface"
-export TRANSFORMERS_CACHE="$WORK/cache/huggingface"
-export TOKENIZERS_PARALLELISM=false
-
-mkdir -p "$LOCAL_TMP" "$WORK/runs" "$WORK/logs"
-cd "$REPO"
-
-python utils/profile_attention_kernels.py \
-  --output-dir "$WORK/runs/attn-kernels-${SLURM_JOB_ID}" \
-  --dtype fp16 \
-  --warmup 50 \
-  --iters 200 \
-  --repeats 3 \
-  --profile-iters 20
-```
-
-Outputs:
-
-- `attention_kernel_profile.json`: metadata, per-case timings, tensor shapes, CUDA memory peaks, and top profiler events.
-- `attention_kernel_profile.txt`: readable timing table, FA2/SDPA ratios, and profiler tables.
-- `*.trace.json`: Chrome trace files for representative decode, cross-attention, prefill, and batch cases.
-
-The default cases cover single-token cached decode, cross-attention against encoder-like lengths up to `2048`, prefill-like self-attention up to `2048`, and a few batch-size-8 what-if cases. Keep this as a microprofile: it does not replace full inference profiling because it does not include model GEMMs, cache updates, tokenizer/server overhead, or sampling.
-
-Observed A5000 kernel microprofile on 2026-06-30:
-
-- Job: `49097689` on `dcc-rental-gpu-07`, `NVIDIA RTX A5000`.
-- Artifacts: `/work/imt11/Mapperatorinator/runs/attn-kernels-49097689/attention_kernel_profile.json`, matching `.txt`, and 20 Chrome traces.
-- Runtime: `torch==2.10.0+cu128`, `flash-attn==2.8.3.post1`, CUDA runtime `12.8`.
-
-Representative timings:
-
-| case | mode | SDPA | FA2 | FA2/SDPA |
-| --- | --- | ---: | ---: | ---: |
-| `decode_self_kv512` | attention only | 0.0407ms | 0.1229ms | 3.02x |
-| `decode_self_kv512` | repo-like layout | 0.0465ms | 0.1695ms | 3.65x |
-| `cross_attn_kv2048` | attention only | 0.0391ms | 0.1237ms | 3.16x |
-| `cross_attn_kv2048` | repo-like layout | 0.0453ms | 0.1668ms | 3.69x |
-| `prefill_self_len512` | attention only | 0.0389ms | 0.1270ms | 3.26x |
-| `prefill_self_len2048` | attention only | 0.1088ms | 0.1131ms | 1.04x |
-| `prefill_self_len2048` | repo-like layout | 0.1167ms | 0.2098ms | 1.80x |
-| `batch8_cross_attn_kv2048` | attention only | 0.0500ms | 0.1245ms | 2.49x |
-| `batch8_cross_attn_kv2048` | repo-like layout | 0.0501ms | 0.1973ms | 3.94x |
-
-Kernel traces showed SDPA dispatching to `aten::_scaled_dot_product_flash_attention` and `pytorch_flash::flash_fwd*` kernels, so SDPA is already using fused flash-style kernels on A5000. FA2 used `flash_attn::_flash_attn_forward` and `flash::flash_fwd*` kernels. For long prefill, raw attention kernel time was close; for single-token decode and cross-attention, FA2 lost mostly to wrapper/launch gaps and repo-like packing overhead. In repo-like FA2 traces, `aten::cat`/`CatArrayBatchedCopy` was a visible extra cost, especially for batch-size what-if cases.
-
-## Full Generation Torch Traces
-
-For full-model kernel traces around actual `model.generate` calls, enable the opt-in torch profiler:
-
-```bash
-python inference.py --config-name profile_salvalai \
-  audio_path="$WORK/data/salvalai.mp3" \
-  output_path="$WORK/runs/profile-torch-${SLURM_JOB_ID}" \
-  device=cuda \
-  precision=fp16 \
-  attn_implementation=sdpa \
-  use_server=false \
-  profile_torch_generation=true \
-  profile_torch_output_dir="$WORK/runs/profile-torch-${SLURM_JOB_ID}/torch_profiles" \
-  profile_torch_generation_limit=3 \
-  profile_torch_generation_label_filter=main_generation
-```
-
-This writes Chrome traces for the first selected `model.generate` calls and adds a `torch_profiles` section to the normal `.profile.json`. Use `profile_torch_generation_label_filter=main_generation` to skip timing-context windows and trace map generation directly, or leave it unset to trace the first generation calls of any label. Keep `profile_torch_generation_limit` small for full songs; each trace includes CPU/CUDA activities, shapes, memory events, NVTX/record-function ranges, and the top profiler events by self CUDA time.
-
-Validated on DCC job `49098455` with a short SALVALAI slice, `precision=fp16`, `attn_implementation=sdpa`, and `profile_torch_generation_label_filter=main_generation`. It produced:
-
-- Profile JSON: `/work/imt11/Mapperatorinator/runs/profile-main-trace-49098455/beatmap9c39eb98ff514d8da459a90cd1238ca3.osu.profile.json`
-- Chrome trace: `/work/imt11/Mapperatorinator/runs/profile-main-trace-49098455/torch_profiles/000_generation_main_generation_seq0.trace.json`
-
-The trace file was about `1.33 GB`; the traced first map window took `211s` under `torch.profiler`, while the remaining untraced map windows returned to normal speed. Use this mode for selected windows only. For smoke tests, either trace timing-context windows or lower `train.data.tgt_seq_len`; for bottleneck work, prefer one representative `main_generation` window and inspect the `torch_profiles[0].events` summary before opening the full Chrome trace.
-
-## FlashAttention 2 On DCC
-
-FlashAttention 2 is the relevant package for A5000/5000 Ada testing through the normal Transformers `flash_attention_2` path. FlashAttention 3 is Hopper-focused and should be treated as a separate H100/H800-class ablation, not as a replacement for A5000 runs.
-
-The DCC env at `/hpc/group/romerolab/imt11/envs/mapperatorinator` has been validated with `flash-attn==2.8.3.post1` on an `NVIDIA RTX A5000`:
-
-- `torch==2.10.0+cu128`
-- CUDA runtime: 12.8
-- GPU capability: `(8, 6)`
-- `transformers.utils.is_flash_attn_2_available()` returned `True` on the A5000 allocation.
-- A tiny `flash_attn_func` fp16 call returned finite output.
-
-Build source wheels on node-local temp storage. A `/work`-backed build reached 73/73 CUDA compile steps but failed during wheel packaging with an `egg-info` directory cleanup error. The successful build used:
-
-```bash
-ENV=/hpc/group/romerolab/imt11/envs/mapperatorinator
-export PATH="$ENV/bin:$PATH"
-export CUDA_HOME="$ENV"
-export CUDA_PATH="$ENV"
-export TMPDIR="/tmp/imt11-flash-attn-${SLURM_JOB_ID}"
-export TEMP="$TMPDIR"
-export TMP="$TMPDIR"
-export FLASH_ATTN_CUDA_ARCHS=80
-export MAX_JOBS=2
-export LD_LIBRARY_PATH="$ENV/targets/x86_64-linux/lib:$ENV/lib:${LD_LIBRARY_PATH:-}"
-export CPATH="$ENV/targets/x86_64-linux/include:$ENV/lib/python3.10/site-packages/nvidia/cuda_runtime/include:${CPATH:-}"
-
-python -m pip install ninja packaging "wheel<0.46" "setuptools<81"
-python -m pip install flash-attn==2.8.3.post1 --no-build-isolation --no-cache-dir -v
-```
-
-Do not use a login-node `is_flash_attn_2_available()` result as the final check; it can return `False` because CUDA is unavailable even when `import flash_attn` works. Validate inside a GPU Slurm allocation.
-
-For FlashAttention profiling runs, keep Triton temp and cache directories on node-local storage too:
-
-```bash
-export TMPDIR="/tmp/imt11-profile-fa2-${SLURM_JOB_ID}"
-export TEMP="$TMPDIR"
-export TMP="$TMPDIR"
-export TRITON_CACHE_DIR="$TMPDIR/triton"
-```
-
-A `/work`-backed `TMPDIR` hit a Triton temporary-directory cleanup failure before map generation.
-
-Observed A5000 SALVALAI ablation on 2026-06-30 with `precision=fp16`, `seed=12345`, full-song input, and `use_server=false`:
-
-| attention | main generation | map tokens | map tok/s | timing generation | timing tok/s |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `sdpa` | 110.956s | 6,992 | 63.4 | 29.376s | 28.3 |
-| `flash_attention_2` | 187.007s | 8,554 | 45.9 | 31.656s | 26.2 |
-
-FlashAttention 2 did not improve this single-song profile. It generated more map tokens despite the same seed, so raw wall time is partly output-length-dependent, but normalized map throughput was still lower than SDPA.
-
-## Accepted Exact-Calculation Optimizations
-
-### Transformers generation compile
-
-Accepted in commit `3e9033c` after smoke and full-song profiling. The change adds `inference_generation_compile`, which leaves the global default disabled but allows profiling/long inference runs to opt into the Transformers generation compile path by setting `model.generation_config.disable_compile = False`.
-
-RTX 2080 Ti full-song comparison on DCC `gpu-common`, node `dcc-core-ferc-s-z25-21`:
-
-| run | commit | job | profile | main tokens | main model time | tok/s |
-| --- | --- | --- | --- | ---: | ---: | ---: |
-| baseline | `3e9033c` | `49113712` | `/work/imt11/Mapperatorinator/runs/full-base-49113712-3e9033c/beatmap9024531ea69844218e3c15e53ad2972c.osu.profile.json` | 7,639 | 121.410s | 62.9 |
-| candidate | `3e9033c` | `49113713` | `/work/imt11/Mapperatorinator/runs/full-compile-49113713-3e9033c/beatmapcfb70d0020da473c90f6c1acb32d6bbf.osu.profile.json` | 7,639 | 82.615s | 92.5 |
-
-`utils/summarize_inference_profile.py --compare` reported token equivalence PASS for all `7,639` generated main-generation token IDs. Throughput improved by `+47.0%`; synchronized model time dropped by `38.795s` (`-32.0%`). Smoke profiling was only `+1.3%` overall because the first compiled main-generation window paid a one-time compile cost, but post-warmup smoke windows ran around `94-96 tok/s` compared with `68-69 tok/s` baseline. This win should carry to future Mapperatorinator-like autoregressive encoder-decoder cores because it improves the repeated single-token decode loop rather than beatmap-specific output logic.
-
-Keep `inference_generation_compile=true` for full-song profiling baselines. For very short one-off inference, the global default remains `false` so callers can choose whether the compile warmup cost is worthwhile.
-
-### Bucketed active-prefix decode loop
-
-Implemented in commit `821fb41` as an opt-in batch-1 decode loop, but not retained as the cold single-song baseline after follow-up validation. The global default and `profile_salvalai` retained config keep active-prefix disabled.
-
-Why it is still useful: the loop leaves prefill unchanged, then applies active-prefix self-attention only during one-token decode. One-token gates showed decode-only active-prefix can preserve logits, while active-prefix prefill is non-equivalent. Bucketed active-prefix lengths preserve causal-mask equivalence while avoiding the full static-cache self-attention length for most decode steps.
-
-The first full-song validation looked very strong but was later shown to be order/warm-state sensitive:
-
-| job | run | main tokens | main model time | tok/s | token equivalence | status |
-| --- | --- | ---: | ---: | ---: | --- | --- |
-| `49150185` | compile-only baseline | 7,639 | 82.142s | 92.998 | baseline | clean compile-only comparison |
-| `49150185` | active-prefix bucket 256 | 7,639 | 62.653s | 121.926 | PASS, 7,639 / 7,639 | over-promoted; later validation did not reproduce as cold baseline |
-| `49151748` | active-prefix bucket 256, first in bucket sweep | 7,639 | 86.122s | 88.699 | PASS vs bucket 128 | rejected for cold baseline |
-| `49151748` | active-prefix bucket 512, third in bucket sweep | 7,639 | 70.527s | 108.313 | PASS vs bucket 256 | warm/order-sensitive candidate |
-| `49152465` | active-prefix bucket 512, cold-first validation | 7,639 | 78.108s | 97.800 | PASS vs same-job compile-only | strategic opt-in candidate, not retained |
-
-Job `49152465` compared bucket `512` against a same-job compile-only run and passed token equivalence. However, the same-job compile-only baseline was anomalously slow (`84.984 tok/s`) compared with the retained clean compile-only baseline (`92.465-92.998 tok/s`). Against the retained clean baseline, bucket `512` is only about a `5-6%` main-generation gain, and it still regressed first-window behavior and timing/total stage time versus clean retained runs. This does not meet the normal cold single-song graduation bar.
-
-Keep this path scoped to the validated simple generation mode: batch size `1`, `use_server=false`, `parallel=false`, `cfg_scale=1.0`, `num_beams=1`, static cache, SDPA, and no active-prefix during prefill. Any broader scope, bucket-size change, warmed-repeat claim, or batch/multi-song claim requires new one-token logits gates, 15s token-equivalent smoke, full-song token equivalence, and result-class-specific non-regression checks.
-
-Post-active-prefix attribution job `49150687` traced the bucket-256 path with detailed ranges and `TORCH_LOGS=recompiles,cudagraphs`. It is diagnostic only, because torch profiler/logging inflated the traced `seq9` wall time to `107.836s`. The useful evidence at that point was that sampling/logits processors remained small, while graph/runtime churn was large: `1,058` graph-recording log lines, `20,504` TorchDynamo cache lookups, `16,310` CUDA graph launches, and a visible `sdpa_attention_forward` recompile from full static key length `2560` to active length `1024`. See `notes/2026-07-01-post-active-prefix-attribution.md`.
-
-The later manual CUDA graph path changed the cost mix enough that logits processors became target-sized. Job `49168188` accepted `inference_stateful_monotonic_logits_processor=true` only in that active512 graph context; it should not be generalized back to normal generation without new evidence.
-
-## Rejected Exact-Calculation Experiments
-
-### Historical pre-graph stateful monotonic time-shift masking
-
-This rejection applies to the old normal-generation/pre-graph implementation. It was superseded in the active-prefix CUDA graph context by job `49168188`, where diagnostics showed monotonic masking had become a dominant CPU-side cost and the new default-off flag passed full-song token equivalence and non-regression.
-
-Attempted in commit `9d7e5b7` and reverted after smoke profiling. The change replaced the per-token full-prefix scan in `MonotonicTimeShiftLogitsProcessor` with a stateful batch-size-1 path that tracks the last time-shift token after the last SOS token.
-
-RTX 2080 Ti smoke comparison on DCC `gpu-common`, node `dcc-core-ferc-s-z25-21`:
-
-| run | commit | job | profile | main tokens | main model time | tok/s |
-| --- | --- | --- | --- | ---: | ---: | ---: |
-| baseline | `01c18d6` | `49109301` | `/work/imt11/Mapperatorinator/runs/smoke-base-49109301-01c18d6/beatmap6f980906005d441fb87edde94f269b83.osu.profile.json` | 2,894 | 41.707s | 69.4 |
-| candidate | `9d7e5b7` | `49109743` | `/work/imt11/Mapperatorinator/runs/smoke-cand-49109743-9d7e5b7/beatmapd81b370ad0ac422cb1b5a01b3d3a093d.osu.profile.json` | 2,894 | 43.487s | 66.5 |
-
-`utils/summarize_inference_profile.py --compare` reported token equivalence PASS for all `2,894` generated main-generation token IDs, but throughput was `-4.1%` worse. The likely reason is that removing `torch.isin`/full-prefix work also added per-token state, mask, slice, `masked_fill`, and `torch.where` work; this did not pay back in normal generation. Do not reintroduce this shape of stateful logits processor in normal generation without profiler evidence that the replacement removes more work than it adds.
-
-### Last-position generation logits
-
-Attempted in commits `1011c1d` and `786a5fd` and reverted after smoke profiling. The change passed `logits_to_keep=1` during generation for VarWhisper so the LM head projected only the last decoder position instead of all positions.
-
-RTX 2080 Ti smoke comparison on DCC `gpu-common`, node `dcc-core-ferc-s-z25-21`:
-
-| run | commit | job | profile | main tokens | main model time | tok/s |
-| --- | --- | --- | --- | ---: | ---: | ---: |
-| baseline | `01c18d6` | `49109301` | `/work/imt11/Mapperatorinator/runs/smoke-base-49109301-01c18d6/beatmap6f980906005d441fb87edde94f269b83.osu.profile.json` | 2,894 | 41.707s | 69.4 |
-| candidate | `786a5fd` | `49110976` | `/work/imt11/Mapperatorinator/runs/smoke-logits2-49110976-786a5fd/beatmapac03a230f58f4de5a23bf66b2074c844.osu.profile.json` | 2,894 | 53.091s | 54.5 |
-
-`utils/summarize_inference_profile.py --compare` reported token equivalence PASS for all `2,894` generated main-generation token IDs, but throughput was `-21.4%` worse. The likely reason is that the smaller LM-head projection shape loses the efficient larger GEMM path or causes less favorable per-token kernel behavior, despite doing less nominal arithmetic. Do not reintroduce final-logit-only projection for VarWhisper generation without profiler evidence that the GEMM/kernel path has changed.
-
-### Static-cache SDPA prefix trim
-
-Attempted in commit `aac2c4b` and reverted after smoke profiling. The change reduced the static-cache SDPA decode attention length from `max_target_positions` to the current decoder mask length by building a shorter 4D mask and slicing self-attention K/V tensors to that valid prefix.
-
-RTX 2080 Ti smoke comparison on DCC `gpu-common`, node `dcc-core-ferc-s-z25-21`:
-
-| run | commit | job | profile | main tokens | main model time | tok/s |
-| --- | --- | --- | --- | ---: | ---: | ---: |
-| baseline | `01c18d6` | `49109301` | `/work/imt11/Mapperatorinator/runs/smoke-base-49109301-01c18d6/beatmap6f980906005d441fb87edde94f269b83.osu.profile.json` | 2,894 | 41.707s | 69.4 |
-| candidate | `aac2c4b` | `49112400` | `/work/imt11/Mapperatorinator/runs/smoke-prefix-49112400-aac2c4b/beatmapdd5d12b22215462a973be40cd9143954.osu.profile.json` | 2,894 | 43.398s | 66.7 |
-
-`utils/summarize_inference_profile.py --compare` reported token equivalence PASS for all `2,894` generated main-generation token IDs, but throughput was `-3.9%` worse. The likely reason is that the shorter attention shape saved masked attention work but added slicing and less favorable SDPA/kernel dispatch behavior. Do not reintroduce this exact static-cache K/V prefix trim unless a new trace shows max-cache attention is still dominant and the replacement avoids per-token slicing overhead.
-
-### Persistent static causal-mask buffer
-
-Attempted in commit `2d807c1` and reverted after 15s smoke profiling. The change added a default-off `inference_persistent_static_mask` path that reused a full-size 4D static-cache causal mask buffer for the guarded SDPA, batch-size-1, one-token decode path. Unlike the rejected prefix trim, it kept the full static-cache attention shape and tried to stabilize the mask data pointer for compiled decode.
-
-RTX 2080 Ti middle-15s SALVALAI comparison on DCC `gpu-common`, node `dcc-core-ferc-s-z25-21`:
-
-| run | commit | job | profile | main tokens | main model time | tok/s |
-| --- | --- | --- | --- | ---: | ---: | ---: |
-| baseline | `2d807c1` | `49137140` | `/work/imt11/Mapperatorinator/runs/smoke15-mask-base-2d807c1/beatmap4438946a6a864548b8d968d4a3a24682.osu.profile.json` | 1,084 | 21.093s | 51.4 |
-| candidate | `2d807c1` | `49137141` | `/work/imt11/Mapperatorinator/runs/smoke15-mask-cand-2d807c1/beatmap63be4f635c7147cd9b127038054db1d2.osu.profile.json` | 1,084 | 25.590s | 42.4 |
-
-Token equivalence PASS: all `1,084` generated main-generation token IDs matched, and profile records showed `persistent_static_mask_enabled=true` for the candidate. Throughput was `-17.6%` worse overall and post-warmup seq9 fell from `104.6 tok/s` to `91.5 tok/s`, so the regression was not just first-window compile noise. The likely reason is that stable buffer reuse still added per-token `fill_`, boolean mask construction, and `masked_fill_` work, while the existing mask path is already efficient enough relative to the compiled forward. Do not reintroduce persistent mask mutation unless a future trace shows mask construction itself is target-sized and the replacement avoids extra per-token kernels.
-
-### Dynamic/default cache generation
-
-Attempted in commit `52b8871` and reverted after smoke profiling. The change added an `inference_static_cache=false` path that skipped the preallocated `StaticCache` and let generation use the default/dynamic cache behavior while keeping `inference_generation_compile=true`.
-
-RTX 2080 Ti smoke comparison on DCC `gpu-common`, node `dcc-core-ferc-s-z25-21`:
-
-| run | commit | job | profile | main tokens | main model time | tok/s |
-| --- | --- | --- | --- | ---: | ---: | ---: |
-| baseline | `3e9033c` | `49113275` | `/work/imt11/Mapperatorinator/runs/smoke-compile-49113275-3e9033c/beatmapa00e6b0a1f394a05a1bc95ab28a1dac4.osu.profile.json` | 2,894 | 41.190s | 70.3 |
-| candidate | `52b8871` | `49114897` | `/work/imt11/Mapperatorinator/runs/smoke-dyncache-49114897-52b8871/beatmap36600487b37a414b9f239d9a8f6e9586.osu.profile.json` | 1,633 | 23.522s | 69.4 |
-
-`utils/summarize_inference_profile.py --compare` reported token equivalence FAIL: baseline generated `2,894` main-generation token IDs, candidate generated `1,633`, and the first mismatch was at token `0`. This is not an equivalent speed result. Do not use dynamic/default-cache generation for accepted same-calculation claims unless a future implementation proves fixed-seed token equivalence first.
-
-### Static generation compile config
-
-Attempted in commit `d6ce772` and reverted after smoke profiling. The change kept `inference_generation_compile=true` but forced `model.generation_config.compile_config = CompileConfig(dynamic=False, mode="reduce-overhead")`.
-
-RTX 2080 Ti smoke comparison on DCC `gpu-common`, node `dcc-core-ferc-s-z25-21`:
-
-| run | commit | job | profile | main tokens | main model time | tok/s |
-| --- | --- | --- | --- | ---: | ---: | ---: |
-| baseline | `3e9033c` | `49113275` | `/work/imt11/Mapperatorinator/runs/smoke-compile-49113275-3e9033c/beatmapa00e6b0a1f394a05a1bc95ab28a1dac4.osu.profile.json` | 2,894 | 41.190s | 70.3 |
-| candidate | `d6ce772` | `49116934` | `/work/imt11/Mapperatorinator/runs/smoke-compilecfg-49116934-d6ce772/beatmap9c4f9667e17a4de8a00b5e3a86400669.osu.profile.json` | 2,894 | 53.836s | 53.8 |
-
-`utils/summarize_inference_profile.py --compare` reported token equivalence PASS for all `2,894` generated main-generation token IDs, but throughput was `-23.5%` worse. Slurm stderr showed TorchDynamo hit its recompile limit in `modeling_mapperatorinator.py:139`; the last reason was a `decoder_input_ids` stride mismatch, expected `24` but actual `25`. This likely defeated the useful stable decode-loop compile behavior. Do not force `CompileConfig(dynamic=False)` for generation unless a future Transformers/PyTorch version fixes the recompile pattern and a fresh smoke run proves a win.
-
-### Dynamic generation compile config
-
-Attempted in commit `96aecec` and reverted after smoke profiling. The change kept `inference_generation_compile=true` but forced `model.generation_config.compile_config = CompileConfig(dynamic=True, mode="reduce-overhead")`.
-
-RTX 2080 Ti smoke comparison on DCC `gpu-common`, node `dcc-core-ferc-s-z25-21`:
-
-| run | commit | job | profile | main tokens | main model time | tok/s |
-| --- | --- | --- | --- | ---: | ---: | ---: |
-| baseline | `3e9033c` | `49113275` | `/work/imt11/Mapperatorinator/runs/smoke-compile-49113275-3e9033c/beatmapa00e6b0a1f394a05a1bc95ab28a1dac4.osu.profile.json` | 2,894 | 41.190s | 70.3 |
-| candidate | `96aecec` | `49118947` | `/work/imt11/Mapperatorinator/runs/smoke-dyncfg-49118947-96aecec/beatmapff0b384d836c47d0b502e73f79a16e26.osu.profile.json` | 2,894 | 45.772s | 63.2 |
-
-`utils/summarize_inference_profile.py --compare` reported token equivalence PASS for all `2,894` generated main-generation token IDs, but throughput was `-10.0%` worse. Slurm stderr showed repeated cudagraph partition messages and a large first-window setup cost. Do not force `CompileConfig(dynamic=True)` for this workload unless a future PyTorch/Transformers version changes the compile behavior and a fresh smoke run proves a win.
-
-### Max-autotune generation compile config
-
-Attempted in commit `0cccf36` and reverted after 15s smoke profiling. The change added a default-off `inference_generation_compile_mode` scout flag and tested `model.generation_config.compile_config = CompileConfig(mode="max-autotune")` while leaving `dynamic=None`, `fullgraph=False`, and the retained SDPA/static-cache generation path unchanged.
-
-RTX 2080 Ti middle-15s SALVALAI comparison on DCC `gpu-common`, node `dcc-core-ferc-s-z25-21`:
-
-| run | commit | job | profile | main tokens | main model time | tok/s |
-| --- | --- | --- | --- | ---: | ---: | ---: |
-| baseline | `0cccf36` | `49136379` | `/work/imt11/Mapperatorinator/runs/smoke15-compile-default-0cccf36/beatmap1572085922b24c95b60ecf1f5abe5ec4.osu.profile.json` | 1,084 | 21.422s | 50.6 |
-| candidate | `0cccf36` | `49136380` | `/work/imt11/Mapperatorinator/runs/smoke15-compile-maxautotune-0cccf36/beatmapf92dca264acf4af3bd5a08b78880c75a.osu.profile.json` | 1,084 | 34.126s | 31.8 |
-
-Token equivalence PASS: all `1,084` generated main-generation token IDs matched. Throughput was `-37.2%` worse overall and post-warmup windows were also slower, for example seq9 fell from `104.1 tok/s` to `88.9 tok/s`. Stderr showed autotuning selected some Triton kernels, but that did not improve this Turing/SM75 single-token decode workload. Do not force `CompileConfig(mode="max-autotune")` for this baseline unless a future PyTorch/Transformers version changes the kernel choices and a fresh smoke run proves a win.
-
-### Fullgraph generation compile config
-
-Attempted in commit `149fe88` and reverted after 15s smoke profiling. The change forced `model.generation_config.compile_config = CompileConfig(fullgraph=True, mode="reduce-overhead")` while keeping the retained SDPA/static-cache generation path.
-
-RTX 2080 Ti middle-15s SALVALAI comparison on DCC `gpu-common`, node `dcc-core-ferc-s-z25-21`:
-
-| run | commit | job | profile | main tokens | main model time | tok/s |
-| --- | --- | --- | --- | ---: | ---: | ---: |
-| baseline | `2d807c1` | `49137140` | `/work/imt11/Mapperatorinator/runs/smoke15-mask-base-2d807c1/beatmap4438946a6a864548b8d968d4a3a24682.osu.profile.json` | 1,084 | 21.093s | 51.4 |
-| candidate | `149fe88` | `49137638` | `/work/imt11/Mapperatorinator/runs/smoke15-fullgraph-149fe88/beatmapa2f8469fd07e475aaa4d7f68477dd5ca.osu.profile.json` | 1,084 | 21.258s | 51.0 |
-
-Token equivalence PASS: all `1,084` generated main-generation token IDs matched. The candidate was only `-0.8%` overall and post-warmup windows were mixed, with no plausible `>=10%` signal. Per the keep/revert policy, do not keep this complexity or force `CompileConfig(fullgraph=True)` unless a future PyTorch/Transformers version changes generation compile behavior and a fresh smoke run shows a meaningful win.
-
-### Preallocated sample loop
-
-Attempted in commits `6d6ba7c` and `f7b5222` and reverted after smoke profiling. The change added an opt-in Mapperatorinator override for Hugging Face `_sample` that preallocated `input_ids` and `decoder_attention_mask` buffers to avoid per-token `torch.cat` in the generation loop while preserving the compiled one-token forward path.
-
-RTX 2080 Ti smoke comparison on DCC `gpu-common`:
-
-| run | commit | job | node | profile | main tokens | main model time | tok/s |
-| --- | --- | --- | --- | --- | ---: | ---: | ---: |
-| baseline | `f7b5222` | `49121863` | `dcc-core-ferc-s-z25-21` | `/work/imt11/Mapperatorinator/runs/smoke-pairbase-49121863-f7b5222/beatmap93c5d8f5a9504f92af53f1698a535fa8.osu.profile.json` | 2,894 | 31.368s | 92.3 |
-| candidate | `f7b5222` | `49121864` | `dcc-core-gpu-ferc-s-h36-6` | `/work/imt11/Mapperatorinator/runs/smoke-prealloc2-49121864-f7b5222/beatmape999b779433b4f8395818898648fd657.osu.profile.json` | 3,000 | 32.367s | 92.7 |
-
-`utils/summarize_inference_profile.py --compare` reported token equivalence FAIL: baseline generated `2,894` main-generation token IDs, candidate generated `3,000`, and the first mismatch was at token `1,350`. Instrumented profile records confirmed the preallocated path actually ran in all `20` candidate main-generation windows. Throughput was only `+0.5%` by token-normalized rate while model time was `+3.2%` worse, so this is both non-equivalent and too small. The candidate also logged one TorchDynamo recompile caused by timing/main model parameter shape mismatch. Do not reintroduce a mutable preallocated `_sample` loop unless a future prototype first proves exact token identity with compile disabled and then with compile enabled.
-
-### Copy-compatible custom sample hook
-
-Attempted in commit `07b36a5` and reverted after 15s smoke profiling. The change added an opt-in `inference_custom_decode_loop` path that temporarily replaced Hugging Face's internal `_sample` method with a local copy-compatible loop while still letting `model.generate()` perform its normal generation setup, logits-processor construction, stopping criteria, static-cache wiring, and generation compile checks.
-
-RTX 2080 Ti middle-15s SALVALAI smoke comparisons on DCC `gpu-common`, node `dcc-core-ferc-s-z25-21`:
-
-| gate | run | commit | job | profile | main tokens | main model time | tok/s |
-| --- | --- | --- | --- | --- | ---: | ---: | ---: |
-| compile disabled | baseline | `07b36a5` | `49135145` | `/work/imt11/Mapperatorinator/runs/smoke15-loop-base2-compileoff-07b36a5/beatmapba4408b7bf2e444e9a7c761640053d40.osu.profile.json` | 1,084 | 17.564s | 61.7 |
-| compile disabled | candidate | `07b36a5` | `49135146` | `/work/imt11/Mapperatorinator/runs/smoke15-loop-custom2-compileoff-07b36a5/beatmapcba4ff105a834900bb11cb79e288b873.osu.profile.json` | 1,084 | 19.711s | 55.0 |
-| compile enabled | baseline | `07b36a5` | `49135380` | `/work/imt11/Mapperatorinator/runs/smoke15-loop-base-compileon-07b36a5/beatmap2dcd0585607145de8553c8d57889c856.osu.profile.json` | 1,084 | 21.390s | 50.7 |
-| compile enabled | candidate | `07b36a5` | `49135381` | `/work/imt11/Mapperatorinator/runs/smoke15-loop-custom-compileon-07b36a5/beatmapc7f1c08725d445aaaf73d0e57e40eaa6.osu.profile.json` | 1,084 | 25.079s | 43.2 |
-
-Token equivalence passed in both gates: `1,084 / 1,084` generated main-generation token IDs matched with compile disabled and with compile enabled. The path also recorded `custom_decode_loop_enabled=true`, so the candidate did exercise the local loop. It was still slower by `-10.9%` with compile disabled and `-14.7%` with compile enabled. Post-warmup compile-enabled windows were slower too, for example seq9 fell from `104.8 tok/s` to `93.5 tok/s`, so this was not only first-window compile noise.
-
-Interpretation: a conservative local `_sample` hook is useful evidence that the HF sampling loop can be replaced without changing tokens, but a copy-compatible Python loop by itself adds overhead rather than removing it. Do not keep or retry a copy-only `_sample` monkeypatch as an optimization. Future custom runtime work must attack a real cost center such as CUDA graph capture discipline, stable preallocated buffers that preserve RNG/token identity, or compiled/exported one-token decoder forward execution.
-
-### `torch.inference_mode` generation wrapper
-
-Attempted in commit `02b2437` and reverted after full-song profiling. The change replaced `@torch.no_grad()` with `@torch.inference_mode()` around `model_generate` and `model_forward`.
-
-RTX 2080 Ti full-song comparison on DCC `gpu-common`, node `dcc-core-ferc-s-z25-21`:
-
-| run | commit | job | profile | main tokens | main model time | tok/s |
-| --- | --- | --- | --- | ---: | ---: | ---: |
-| baseline | `3e9033c` | `49113713` | `/work/imt11/Mapperatorinator/runs/full-compile-49113713-3e9033c/beatmapcfb70d0020da473c90f6c1acb32d6bbf.osu.profile.json` | 7,639 | 82.615s | 92.5 |
-| candidate | `02b2437` | `49115936` | `/work/imt11/Mapperatorinator/runs/full-infermode-49115936-02b2437/beatmapd3e6077d36ea49e795275451d96d09d8.osu.profile.json` | 7,639 | 80.780s | 94.6 |
-
-Smoke profiling looked promising (`+31.9%`), but the accepted full-song comparison was only `+2.3%` with token equivalence PASS for all `7,639` generated main-generation token IDs. This is below the keep threshold, so the change was reverted. Do not reintroduce inference-mode wrapping unless a future full-song result clears the acceptance threshold.
-
-## Active-Prefix Decode Isolation
-
-This section records the diagnostic evidence that led to the opt-in bucketed active-prefix decode loop. The full generated-token loop produced useful exact, post-warmup speed signals, but later validation kept it out of the retained cold single-song baseline; see "Bucketed active-prefix decode loop" above.
-
-Commit `51f189f` added diagnostic switches to isolate active-prefix self-attention during direct-cache prefill vs the one-token decode step. This is not a production inference path and not a throughput claim; it is a correctness and fixed-step ceiling test.
-
-DCC job `49140082`, node `dcc-core-ferc-s-z25-20`, RTX 2080 Ti, commit `51f189f`:
-
-- Run dir: `/work/imt11/Mapperatorinator/runs/active-prefix-isolate-49140082-51f189f`
-- Logs: `/work/imt11/Mapperatorinator/logs/active-prefix-isolate-49140082.out` and `.err`
-- Config: `profile_salvalai_smoke15`, `seq9`, `precision=fp32`, `attn_implementation=sdpa`, `use_server=false`, `parallel=false`, `cfg_scale=1.0`, `num_beams=1`
-
-Correctness split:
-
-| Variant | Compile | Result |
-| --- | --- | --- |
-| baseline | false | PASS, `max_abs=0.0`, top-k match |
-| active-prefix prefill only | false | FAIL, `max_abs=15.413055`, top-k mismatch |
-| active-prefix decode only | false | PASS, `max_abs=0.0`, top-k match |
-| active-prefix prefill + decode | false | FAIL, `max_abs=15.413055`, top-k mismatch |
-| baseline | true | PASS, `max_abs=2.2888e-05`, top-k match |
-| active-prefix prefill only | true | FAIL, `max_abs=15.413059`, top-k mismatch |
-| active-prefix decode only | true | PASS, `max_abs=2.2888e-05`, top-k match |
-| active-prefix prefill + decode | true | FAIL, `max_abs=15.413059`, top-k mismatch |
-
-Fixed-step graph timing for the passing decode-only variant:
-
-| Compile | Report | Eager ms/step | Graph ms/step | Speedup |
-| --- | --- | ---: | ---: | ---: |
-| false | `graph_decode_compile_false.json` | `11.4996ms` | `3.7891ms` | `3.035x` |
-| true | `graph_decode_compile_true.json` | `11.7837ms` | `3.7899ms` | `3.109x` |
-
-Bucketed active-prefix follow-up job `49140217`, node `dcc-core-ferc-s-z25-21`, RTX 2080 Ti, commit `fb2b2ae`:
-
-- Run dir: `/work/imt11/Mapperatorinator/runs/active-prefix-buckets-49140217-fb2b2ae`
-- Logs: `/work/imt11/Mapperatorinator/logs/active-prefix-buckets-49140217.out` and `.err`
-
-All tested graph-reusable decode bucket lengths preserved the one-token logits gate:
-
-| Bucket | Compile | Gate max_abs | Gate top-k | Graph ms/step |
-| ---: | --- | ---: | --- | ---: |
-| 128 | false | `0.0` | PASS | `3.8920ms` |
-| 256 | false | `0.0` | PASS | `4.1022ms` |
-| 512 | false | `0.0` | PASS | `4.4178ms` |
-| 128 | true | `2.2888e-05` | PASS | `3.7597ms` |
-| 256 | true | `2.2888e-05` | PASS | `3.9840ms` |
-| 512 | true | `2.2888e-05` | PASS | `4.4166ms` |
-
-Interpretation:
-
-- Do not apply active-prefix self-attention during static-cache prefill; it is not equivalent in the current model path.
-- One-token decode-only active-prefix is logits-equivalent for this gate and gives a fixed-step graph ceiling near `264 tok/s` before real loop overhead.
-- This is the first measured exact-calculation path with plausible arithmetic for a `200 tok/s` runtime project, but it still needs a real generated-token loop. The current graph POC replays one prepared `[1, 1]` step and does not handle changing tokens, changing prefix lengths, logits processors, sampling/RNG, EOS, or generated-token accounting.
-- Bucketed decode is the preferred next strategy over exact-prefix graph captures because buckets preserve exact logits in the tested gate while giving reusable shape families.
-
-Next implementation direction: leave prefill unchanged, then build an opt-in batch-1 direct decode loop using `osuT5.osuT5.inference.direct_decode` with active-prefix applied only around the one-token model forward. Use bucketed active-prefix lengths first, e.g. `ceil(prefix_length / bucket_size) * bucket_size`, because bucketed graph shapes are reusable and already passed the one-token gate.
-
-## Runtime Backend Feasibility Notes
-
-### Torch-TensorRT and TensorRT-RTX
-
-The current DCC Mapperatorinator environment does not include Torch-TensorRT, TensorRT, ONNX, ONNX Runtime, or Polygraphy. The initial GPU-node probe was job `49134026` on `dcc-core-ferc-s-z25-21` with RTX 2080 Ti capability `(7, 5)`, PyTorch `2.10.0+cu128`, and repo commit `a2cf83a`. Its log is `/work/imt11/Mapperatorinator/logs/trt-probe-49134026.out`.
-
-Package dry-runs on 2026-07-01 show that TensorRT work should use a separate isolated env rather than mutating `/hpc/group/romerolab/imt11/envs/mapperatorinator`:
-
-| path | dry-run evidence | key resolved packages | concern |
-| --- | --- | --- | --- |
-| standard Torch-TensorRT | `/work/imt11/Mapperatorinator/logs/torch_tensorrt_210_unpinned_dryrun_report.json` | `torch_tensorrt==2.10.0`, `tensorrt==10.14.1.48.post1`, `cuda-toolkit==13.3.1`, `nvidia-cuda-runtime==13.3.29` | current DCC driver probe reported CUDA `13.2`, so import/runtime needs GPU-node validation |
-| Torch-TensorRT-RTX | `/work/imt11/Mapperatorinator/logs/torch_tensorrt_rtx_dryrun_report.json` | `torch-tensorrt-rtx==2.12.1`, `torch==2.12.1`, `tensorrt_rtx==1.4.0.76`, CUDA `13.0` package family, `executorch==1.3.1` | changes the PyTorch line and pulls a large runtime stack |
-
-Official docs describe Torch-TensorRT-RTX as experimental and installed via `torch-tensorrt-rtx`; the Python import remains `torch_tensorrt`, and NVIDIA's PyTorch walkthrough uses `torch.compile(..., backend="tensorrt")`. NVIDIA's TensorRT-RTX support matrix lists Turing/RTX 2080Ti compute capability `7.5` support, but its TensorRT-RTX 1.5 footnote says Turing does not support FP32 GEMMs in that release. Since the retained Mapperatorinator baseline is same-calculation FP32-style inference on RTX 2080 Ti, do not assume TensorRT-RTX accelerates the dominant decoder GEMMs without direct logits and token-equivalence evidence.
-
-Follow-up isolated TensorRT-RTX validation created `/hpc/group/romerolab/imt11/envs/mapperatorinator-trt-rtx` without modifying the retained env. GPU import passed in job `49138760` on `dcc-core-ferc-s-z25-21`: `torch==2.12.1+cu130`, `torch_tensorrt==2.12.1`, `tensorrt_rtx==1.4.0.76`, RTX 2080 Ti capability `(7, 5)`, driver `595.71.05`.
-
-That import success did not become a TensorRT optimization path. The first toy `torch.compile(..., backend="tensorrt")` smoke skipped lowering because the graph was below `min_block_size=5`. A stricter lowering smoke in job `49138769` tested a larger FP32 MLP and a tiny FP32 MLP with `min_block_size=1`; both produced correct outputs only after TensorRT conversion failed and the backend returned GraphModule/PyTorch fallback. Stderr included `MyelinCheckException: cudnn_graph_utils.h:405: CHECK(false) failed. cuDNN graph compilation failed`, `Unable to create TensorRT execution context`, and `Returning GraphModule forward instead`.
-
-Current status: Torch-TensorRT-RTX is importable in an isolated env on the 2080 Ti, but it is rejected as a current same-calculation FP32 acceleration path because true TensorRT lowering failed before Mapperatorinator model work. Do not proceed to one-token decoder export until a toy graph proves real engine creation. Future TensorRT tests must fail loudly on fallback, for example with `pass_through_build_failures=True` or equivalent stderr/module-type checks.
-
-The next TensorRT gate, if revisited with another package/CUDA/runtime combination, is engine validation before any inference speed claim:
-
-1. Build an isolated DCC env such as `/hpc/group/romerolab/imt11/envs/mapperatorinator-trt`.
-2. Run a Slurm GPU import/compile smoke on RTX 2080 Ti that prints driver, CUDA, PyTorch, `torch_tensorrt`, and TensorRT versions.
-3. Compile a tiny fixed-shape CUDA module with `torch.compile(..., backend="tensorrt")`.
-4. Compile/export only the repeated one-token decoder forward.
-5. Compare logits, then run 15s smoke token-equivalence, then full-song token-equivalence before any speed claim can graduate.
-
-See `notes/2026-07-01-tensorrt-packaging-probe.md` for the full resolver details.
-
-## 200 tok/s Quick-Tweak Stop Decision
-
-The first current-architecture 200 tok/s scouting loop stopped on 2026-07-01 by the documented stop condition. This is a historical stop decision for quick-tweak work before the renewed active-prefix runtime pass. The target was not reached, and the measured quick-tweak candidate families no longer showed a plausible remaining major full-song win on RTX 2080/2080 Ti.
-
-The retained baseline at that time was SDPA plus `inference_generation_compile=true`: full-song job `49113713`, `7,639` main-generation tokens, `82.615s` synchronized model time, `92.465 tok/s`, and fixed-seed token equivalence PASS against the compile-disabled full-song baseline. After active-prefix follow-up validation, this remains the retained cold single-song baseline.
-
-The final rejection set includes copy-compatible custom `_sample` hook, preallocated `_sample` loop, persistent static-mask mutation, compile-config variants (`dynamic=False`, `dynamic=True`, `mode="max-autotune"`, `fullgraph=True`), TensorRT-RTX current-env lowering, static-cache prefix trim, dynamic/default cache generation, final-position logits, old pre-graph stateful monotonic masking, and `torch.inference_mode` wrapping. Sampling/logits fusion stayed below the profiling threshold in the post-warmup trace, and batching/parallel/server/window changes are non-equivalent unless separately proven token-identical. Later active-prefix CUDA graph diagnostics changed the cost mix and justified reintroducing stateful monotonic masking only as a default-off active-graph path.
-
-Final read-only subagent `019f1c3b-a844-73d1-8e67-858ad3b51732` agreed with stopping: no remaining exact-calculation path was both plausible for a `>=10%` full-song win and worth running before the stop decision.
-
-See `notes/2026-07-01-200tps-stop-decision.md` for the closure summary. Future attempts toward `200 tok/s` should start from the retained compile-only baseline and new profiling evidence, not by rerunning the documented failed scouts.
-
-The renewed runtime/kernel pass later found new evidence in job `49140082`: decode-only active-prefix self-attention passed the one-token logits gate and cut fixed graph replay to about `3.79ms`, while active-prefix prefill failed. That evidence led to the opt-in generated-loop candidate, but full-song follow-up kept it as strategic runtime evidence rather than the retained cold single-song baseline.
-
-## What The Profile Captures
-
-Top-level `stages` report wall time for setup, model loading, audio loading, segmentation, timing generation, main generation, diffusion, postprocessing, and file writes.
-
-The `generation` records report per-window or per-batch details:
-
-- `profile_label`
-- `context_type`
-- `mode`
-- `sequence_index` or `batch_start_index`
-- `prompt_wall_seconds`
-- `wall_seconds`
-- `model_elapsed_seconds`
-- `prompt_tokens_per_sample`
-- `output_tokens_per_sample`
-- `generated_tokens_per_sample`
-- `tokens_per_second`
-- `sync_model_timing`
-- `torch_profiled`
-- `torch_trace_index`, `torch_trace_path`, and `torch_trace_wall_seconds` when a torch profiler trace covered that generation window
-- CUDA memory counters when CUDA is available
-
-Torch profiler records include a bounded key-average event summary in the profile JSON. Use
-`profile_torch_event_limit=<N>` to keep more than the default top 50 events, or `profile_torch_event_limit=0` to keep
-all events. The bounded summary is sorted by the largest self/total CUDA or self CPU signal so nested semantic
-`record_function` ranges are not dropped only because their self CUDA time is low. This changes only profile artifact
-size; it is diagnostic and must not be used as a throughput claim.
-
-Use `wall_seconds - model_elapsed_seconds` to spot server/IPC/queue overhead. Use token counts and `tokens_per_second` to separate model throughput problems from unusually long outputs. When `profile_sync_cuda=true`, profiling requests synchronized model timing inside `model_generate` so `model_elapsed_seconds` includes pending CUDA work. Do not use `wall_seconds` from records with `torch_profiled=true` as normal throughput; the profiler can inflate traced windows by orders of magnitude.
-
-Profile metadata also captures reproducibility context when profiling is enabled: seed, hostname, Slurm job id/partition, git commit/branch, torch/CUDA versions, CUDA device name/capability, and cache/temp environment paths. Report the profile path plus this metadata when accepting or rejecting an optimization.
-
-## Decoder-Layer Segment Diagnostics
-
-Use `utils/profile_decode_decoder_layer_island.py --cuda-graph-replay` for diagnostic target sizing before planning broad decoder-layer/native runtime work. It captures a real one-token decoder step, verifies logits replay, benchmarks the whole decoder layer, and can split the layer into self-attention residual, cross-attention residual, MLP residual, and norm-only diagnostic segments.
-
-DCC job `49231614` on RTX 2080 Ti, commit `ccfebec`, used the current fastest exact fused stack and passed logits replay with `max_abs=0.0`. It projected the whole decoder-layer CUDA graph replay cost at `15.961s` of the accepted `28.243s` full-song model time. The residual split was self-attention `7.001s`, cross-attention `3.320s`, MLP `4.248s`, and unexplained layer glue `1.392s`.
-
-These numbers are ceilings, not throughput claims. They show that `500 tok/s` cannot come from one small kernel in isolation: self-attention, cross-attention, and MLP are each target-sized, but the realistic path needs broad `DecodeSession`/decoder-layer runtime work that also reduces per-token control/synchronization overhead. See `notes/2026-07-03-decoder-layer-segment-probe.md`.
-
-`utils/profile_decode_decoder_layer_island.py --candidate-decoder-runtime-island` adds a verifier-only whole-layer replacement boundary for future native/runtime candidates. DCC job `49231993` on RTX 2080 Ti, commit `5d62ec7`, passed logits replay (`max_abs=0.0`) and showed the manual island is effectively identical to the repo layer (`15.974s -> 15.972s` projected replay, only `0.003s` saved), so Python/module reorganization is not a speed path. A follow-up in-place residual variant, job `49232003` on commit `59a3f19`, was exact but slower (`18.068s -> 18.114s` projected replay) and was removed. Keep the manual island only as profiling/verifier infrastructure for broad native/CUDA/CUTLASS candidates; do not claim it as an inference optimization. See `notes/2026-07-03-decoder-runtime-island-probe.md`.
-
-Current-main prefix640 manual island rerun, DCC job `49250163` on RTX 2080 Ti, commit `d051721`, closed the remaining ambiguity at the dominant long bucket. The verifier passed (`pass=True`, logits max abs `0.0`, all replayed boundaries allclose), but the manual whole-layer island regressed CUDA graph replay: repo decoder layer `15.924s`, manual decoder runtime island `16.491s`, saved `-0.567s`, projected `265.155 tok/s`. Do not treat broad Python/module-boundary layer rewrites as the next `500 tok/s` path; future broad decoder-layer work must improve real native math or memory behavior. See `notes/2026-07-04-decoder-layer-candidate-prefix640.md`.
-
-Current-main self-attention prefix640 split, DCC job `49250169` on RTX 2080 Ti, commit `439f135`, reran `utils/profile_decode_self_attention_island.py` on the accepted stack. The verifier passed (`pass=True`, logits max abs `1.907e-05`, graph replay allclose for repo/fused/native/component paths). CUDA graph replay projected the repo self-attention island at `6.640s` full-song, with an ideal-free ceiling of only `353.615 tok/s`; the accepted fused RoPE/cache island was effectively identical to repo (`6.655s`, `-0.014s` delta), and fused post-`Wqkv` attention-only stayed slightly worse than native attention-only (`3.250s` vs `3.223s`). `utils/profile_decode_self_attention_island.py` now emits graph-replay component projections so future notes do not rely on ungraphed component ceilings. Do not retry standalone self-attention wrapper/post-`Wqkv` kernels; any further self-attention work must be part of a broader decoder-layer native math/memory island. See `notes/2026-07-04-self-attention-prefix640-split.md`.
-
-Native `fc1 + GELU` fusion is not target-sized by itself. DCC job `49232032` on RTX 2080 Ti, commit `0a89cf7`, added a temporary diagnostic `one_token_linear_gelu_warp_group` probe and measured the best MLP CUDA graph replay variant at `0.041363ms -> 0.037185ms` per layer, allclose with `max_abs=1.91e-06`. Projected over `12` layers and `7,552` decode steps, that is only about `0.379s` saved, or `270.475 -> 274.149 tok/s` (`+1.36%`) against the accepted baseline. The kernel code was removed. Do not pursue narrow `fc1+activation` fusion unless new profiling makes the activation launch much larger; MLP work needs a broader fused MLP/decoder-layer runtime to clear the threshold. See `notes/2026-07-03-native-linear-gelu-probe.md`.
-
-Native full-MLP residual replacement is still below threshold as a standalone kernel. DCC job `49233007` on RTX 2080 Ti, commit `14a077c`, temporarily added a diagnostic fp32 CUDA helper for `RMSNorm -> fc1 -> GELU -> fc2 -> residual` and benchmarked it through `utils/profile_decode_decoder_layer_island.py`. The native path passed allclose (`max_abs=7.63e-06`) and decoder logits replay stayed exact (`max_abs=0.0`), but repeated seq9/prefix128 projections saved only `0.756-0.822s` full-song, about `270.475 -> 278 tok/s`. The native code was removed. Treat this as evidence that MLP-only native work is too small unless paired with broader decoder-layer/runtime savings. See `notes/2026-07-03-native-mlp-residual-probe.md`.
-
-`utils/summarize_decode_linear_roofline.py` adds a roofline-style parser for
-`utils/profile_decode_linear_kernels.py` JSON reports. It estimates FLOPs,
-minimum fp32 bytes, achieved minimum-byte bandwidth, projected full-song seconds,
-and a nominal RTX 2080 Ti memory-bandwidth floor for captured one-token decoder
-linear calls. DCC job `49250117` on RTX 2080 Ti, branch
-`experiment/current-linear-roofline` commit `407edbf`, reran the linear graph
-probe on the current fastest fused stack and passed logits replay exactly
-(`max_abs=0.0`). Captured decoder linears project to `7.156s` over the accepted
-full-song decode count, but a nominal `616 GB/s` bandwidth floor is already
-`5.027s`, leaving only `2.129s` fantasy removable headroom above that floor.
-Zeroing all captured linears would reach only about `362 tok/s`, and the
-bandwidth-floor case is about `292.5 tok/s`. This confirms that the large
-linear/GEMV kernel bucket is real model math, not an easy per-linear wrapper
-target. Do not start standalone per-linear CUDA/cuBLAS/CUTLASS production work
-from category share alone; any future linear work should be fused with adjacent
-decoder-layer/runtime work and must show a current-stack projected saving above
-the keep threshold. See `notes/2026-07-04-current-linear-roofline.md`.
-
-## CUDA Graph Sampling RNG Diagnostics
-
-Before graphing any sampling/tail work, verify token sequence and final RNG state. DCC jobs `49231654` and `49231667` showed that one-token CUDA graph replay of `torch.multinomial(probs, 1)` matches eager sampling on the RTX 2080 Ti stack for the default CUDA generator: sampled token sequence, final CUDA RNG state, and the next eager sample all matched. Explicit CUDA generators must be registered with `CUDAGraph.register_generator_state` before capture.
-
-This only clears one-token graph replay. Fixed multi-token graph blocks are not automatically equivalent: if a graph samples after an EOS/stopping point where HF eager generation would have stopped, final RNG state diverges unless exact rollback or true device-side early exit is implemented and verified. See `notes/2026-07-03-cudagraph-multinomial-rng-probe.md`.
-
-DCC job `49232592` on RTX 2080 Ti, commit `11fd14c`, added that forced-EOS verifier. `utils/verify_direct_decode_loop.py --force-eos-at-generated-token 2 --fixed-k-tail-graph-audit --tail-graph-k 4` passed the normal forced-EOS direct-loop token/logit/RNG gate, proved no-EOS fixed-K graph replay can match eager samples/final RNG/next eager samples, and showed the naive forced-EOS block problem: the graph output prefix through EOS matched, but final CUDA RNG diverged because graph replay consumed extra samples after the eager stop point. Keep this as verifier infrastructure only; any future fixed-K tail graph needs exact rollback or true device-side early exit before it can be equivalent. See `notes/2026-07-03-fixed-k-tail-graph-audit.md`.
-
-One-step tail graph ceiling diagnostics are now available through `utils/verify_direct_decode_loop.py --tail-graph-ceiling`. DCC job `49236164` on RTX 2080 Ti, commit `d22fcf4`, used the current fastest exact opt-in stack and passed direct-loop generated-token, raw-logit/top-k, final RNG-state, and one-step graph correctness checks. The verifier captured the exact production-like tail at generated step `64`, excluded the verifier-only raw-logit capture hook from timing, and measured eager tail `1.0499565ms/token` versus graph replay `0.1872870ms/token`, a projected `6.5899s` ceiling over `7,639` full-song SALVALAI main tokens.
-
-Treat this as target sizing only. It does not prove a production speedup because the capture is a single fixed `cur_len` shape. A production candidate needs a stable-shape DecodeSession tail graph with preallocated buffers and exact multi-step generated-token, raw-logit/top-k, final RNG-state, EOS/stopping, generated-count, and output-byte gates before any TPS claim can graduate. See `notes/2026-07-03-tail-graph-ceiling-verifier.md`.
-
-The multistep tail graph verifier extends that gate. DCC job `49246243` on RTX 2080 Ti, branch `experiment/multistep-tail-graph-verifier` commit `c35dbe7`, ran the current fastest opt-in stack on `profile_salvalai_smoke15` seq9 for `256` sampled steps with both `--tail-graph-ceiling` and `--tail-graph-multistep-ceiling`. Top-level generated-token, raw-logit/top-k, final RNG-state, and stop-reason gates passed. The one-step graph replay again passed (`1.0488226ms -> 0.1875217ms`, projected `6.579s` full-song ceiling). The four-step fixed-start graph replay passed with actual/eager/graph generated tokens `[2143, 2631, 3915, 3992]`, matching output buffer, unfinished state, continue values, final RNG state, and next eager CUDA samples; it measured `3.8633123ms/block -> 0.6514345ms/block`, or `0.9658281ms/token -> 0.1628586ms/token`, projecting a `6.134s` full-song ceiling. This remains verifier-only target sizing, not a throughput claim, and future production tail graphs must still solve exact EOS/early-stop behavior and cold-start first-window costs. See `notes/2026-07-04-multistep-tail-graph-verifier.md`.
-
-The first production one-step DecodeSession tail graph attempt is rejected. Branch `experiment/tail-graph-runtime`, commit `7891398`, added a default-off `inference_decode_session_tail_cuda_graph` path routed through `inference.py`, `server.py:model_generate()`, and the active-prefix loop. DCC job `49250043` on RTX 2080 Ti was exact on the 15s smoke: same-calculation metadata PASS, output artifact hash PASS, and generated-token identity PASS (`1,084 / 1,084`). It did not hit the real bottleneck: main model time improved only `3.740091s -> 3.726128s` (`289.832 -> 290.919 tok/s`, `+0.375%`) and strict per-window no-regression failed on 7 map windows. The apparent stage-wall improvement is not a retained speed claim because the candidate ran second in the same allocation and benefited from warmed setup/cache state. The runtime code was reverted in commit `aac5b7f`; do not retry this one-step tail graph path unless fresh profiling shows a real steady model-time `>=5%` full-song saving. See `notes/2026-07-04-tail-graph-runtime-rejection.md`.
-
-Current-stack runtime-gap smoke job `49250056` on RTX 2080 Ti, commit `9374133`, reran the accepted opt-in stack with `profile_model_generate_cuda_ledger=true` and `profile_active_prefix_decode_diagnostics=true`. It was diagnostic-only and intentionally slower (`287.257 -> 264.763 tok/s` on the 15s smoke) but preserved main generated-token identity (`1,084 / 1,084`). The model-generate ledger again showed negligible host gap: main generation recorded `4.094230s` synchronized model time, `4.093284s` CUDA-event time, and only `0.000946s` host gap. Active-prefix CUDA-event totals ranked `decode_forward.cuda_graph` at `2.516996s`, `graph.replay` at `2.211618s`, then much smaller buckets: `prepare_inputs=0.424733s`, `stopping_criteria=0.250799s`, `prefill_forward=0.227785s`, `logits_processor=0.104347s`, `graph.input_copy=0.062701s`, and `sampling.multinomial=0.045403s`. Duplicate graph capture was only `0.052020s`. This confirms the next target is broad graph-replayed decoder compute/runtime, not Python outside `model.generate`, graph-cache cleanup, graph input copy, sampling fusion, or standalone prepare/stopping cleanup. See `notes/2026-07-04-current-gap-smoke-diagnostic.md`.
-
-`utils/summarize_decode_runtime_gap.py` is now the default lightweight auditor before another broad runtime/kernel branch. It combines a production profile, active-prefix diagnostic summary, optional graph-replay island or weighted-stack reports, optional `--linear-roofline-report` data, and optional `--decode-replay-gap-report` data into one bottleneck/ceiling report. Validation on the latest DCC artifacts reproduced the current target ordering: projected full-song `graph.replay=15.585s`, `prepare_inputs=2.993s`, `stopping_criteria=1.767s`, `prefill_forward=1.605s`, `logits_processor=0.735s`, `graph.input_copy=0.442s`, and `sampling.multinomial=0.320s`. With weighted decoder-stack and replay-gap inputs, it reports weighted full-forward replay at `17.120s` (`446.214 tok/s` ceiling), decoder stack hidden at `16.666s` (`458.350 tok/s` ceiling), decoder layers at `13.018s` (`586.784 tok/s` ceiling), production-minus-full-forward replay gap at only `0.082s`, and static input copy at only `0.220s`. With the current linear roofline report, it also shows captured linears at `7.156s` but only `2.129s` removable above a nominal RTX 2080 Ti bandwidth floor, for a `292.526 tok/s` bandwidth-floor ceiling. The script labels aggregate/composite CUDA-event ranges, separates graph-replayed decoder compute from control/setup ranges, emits a `candidate_ledger` with idealized saving, 5%/10% bars, target-TPS reachability, and caveats, and repeats the host-gap check so future work does not chase stale, non-exclusive, or mathematically required buckets. See `notes/2026-07-04-runtime-gap-auditor.md`, `notes/2026-07-04-current-linear-roofline.md`, and `notes/2026-07-04-combined-bottleneck-ledger.md`.
-
-Use this bottleneck proof before production optimization work, not after a candidate already exists. The proof should name the current accepted baseline, the measured exclusive or overlap-aware target time, the avoidable fraction, any graph-replay or hardware/roofline floor, the fantasy-free and fantasy-floor TPS, the 5%/10% keep bars, and why the target is not just necessary decoder math. If the current-stack ceiling is below the keep threshold, or if the only apparent win is setup/cache/wall behavior rather than synchronized steady decoder model time, stop at diagnostics and document the rejection instead of iterating on runtime or kernel code.
-
-The July 4 bottleneck-first refresh keeps that gate active for all 500 tok/s work. Current-stack evidence leaves only one measured 500-capable boundary: broad one-token decoder-layer compute (`13.018s` idealized replay, `586.784 tok/s` ceiling). This is an idealized production-time-collapse boundary, not proof that decoder math is removable. The pressure audit now reports that `500 tok/s` requires saving `12.965s` (`45.9%` of current model time); a graph-replay-only path would need `83.2%` of that projected bucket removed, and even the weighted full-forward replay boundary (`17.120s`, `446.214 tok/s`) remains `1.842s` short. Decoder-stack hidden replay (`16.666s`, `458.350 tok/s`), graph replay shell (`0.082s`), static input copy (`0.220s`), standalone sampling/logits/tail work, per-linear work, self-attention-only work, and manual Python/module recomposition are not enough. The next bounded diagnostic, if any, should replace the whole decoder-layer math/memory boundary and stop unless CUDA-graph replay projects at least `~1.35-1.4s` full-song synchronized model-time saving, preferably `>=2.6s`. See `notes/2026-07-04-bottleneck-first-stop-go.md`.
-
-`utils/summarize_decoder_layer_roofline.py` adds the physical-floor check for that broad layer boundary. On the current decoder-layer report, the captured `D=768`, `12`-layer, prefix-`128` one-token decoder-layer bucket has an optimistic nominal RTX 2080 Ti roofline floor of `5.928s` (`0.135s` compute floor, `5.928s` bandwidth floor) versus `13.018s` measured replay. The above-floor headroom is `7.090s`, which is target-sized for a verifier-only whole-layer experiment, but if the decoder layer alone reached that floor and everything else stayed fixed, full-song main generation would be about `361.132 tok/s`, not `500 tok/s`. Treat this as permission for one bounded whole-layer math/memory verifier, not for narrow kernels or a production speed claim. See `notes/2026-07-04-decoder-layer-roofline.md`.
-
-`utils/summarize_weighted_decoder_stack_roofline.py` extends that physical-floor check to the actual full-song active-prefix bucket distribution. It reads the weighted decoder-stack summary rows, uses the decoder-layer ABI report for the model contract, and sums lower-bound FLOP/byte estimates across prefix buckets. The July 4 DCC run `/work/imt11/Mapperatorinator/runs/weighted-stack-roofline-20260704135313-721b4c3`, using weighted stack job `49233687` and the cache-fingerprint ABI report, measured weighted decoder-stack replay at `16.666s` and estimated an optimistic bandwidth roofline floor of `6.348s`. That leaves `10.319s` above-floor headroom and keeps a verifier-only broad stack/layer candidate target-sized, but the model would still be about `426.179 tok/s` if only the weighted stack reached that floor. So broad decoder-stack work alone is still not a full `500 tok/s` plan; a true path needs stack math/memory gains plus additional runtime/control or architecture-level savings. See `notes/2026-07-04-weighted-decoder-stack-roofline.md`.
-
-`utils/profile_decode_decoder_layer_island.py` also emits a `native_decoder_layer_abi` manifest for the captured representative layer. DCC job `49250220` on RTX 2080 Ti, commit `069217a`, validated this on the real `profile_salvalai_smoke15` seq9 path: logits replay remained exact (`max_abs=0.0`), `12` decoder layers were captured, the representative ABI was fp32 batch-1 with hidden `[1,1,768]`, mask `[1,1,1,2560]`, self cache `[1,12,2560,64]`, cross cache `[1,12,1024,64]`, and guardrails requiring static cache, cross-K/V reuse, output match, and cache-write preservation. Use this ABI as the contract for any future whole-layer native verifier. DCC utility runs need `audio_path=/work/imt11/Mapperatorinator/data/salvalai.mp3` and the Mapperatorinator env `bin` directory on `PATH` for `ffprobe`. See `notes/2026-07-04-decoder-layer-abi-manifest.md`.
-
-`utils/validate_decoder_layer_abi.py` makes that ABI an executable pre-kernel gate. It checks logits replay metadata, required guardrails, fp32 batch-1 tensor layout, head/MLP dimensions, static-cache layout, cross-K/V reuse, and cache-write/output requirements. Validation against DCC job `49250220` passed with one signature, `12` members, `D=768`, `ffn=3072`, `heads=12`, prefix `128`, encoder length `1024`, and zero failures/warnings. Run it before CUDA coding for a whole-layer native decoder experiment; passing it is necessary but not sufficient for a speed claim. See `notes/2026-07-04-decoder-layer-abi-validator.md`.
-
-The decoder-layer ABI can now include an explicit self-cache write fingerprint. `utils/profile_decode_decoder_layer_island.py --include-cache-write-fingerprint` records SHA256 hashes and tensor metadata for only the q_len=1 K/V slot written at `cache_position`; `utils/validate_decoder_layer_abi.py --require-cache-write-fingerprint` makes that metadata mandatory. DCC job `49250272` on RTX 2080 Ti, branch `codex/decoder-layer-cache-fingerprint` commit `7f633ef`, passed logits replay (`max_abs=0.0`) and strict fingerprint validation for `profile_salvalai_smoke15` seq9: cache position `84`, active prefix `128`, slot shape `[1,12,1,64]`, and zero validator failures/warnings. This is a correctness gate, not a speed claim. The same run measured the manual whole-layer island at only `15.768982s -> 15.697874s` projected full-song replay (`0.071108s` saved), so Python/module recomposition remains below the keep threshold. Future whole-layer native candidates must pass this cache-write gate and prove a current-stack projected saving above the bottleneck bar before production integration. See `notes/2026-07-04-decoder-layer-cache-fingerprint.md`.
-
-Candidate cache-write checks are now part of the decoder-layer verifier. `utils/profile_decode_decoder_layer_island.py --verify-cache-write-candidates` resets the q_len=1 self-cache K/V slot to `NaN`, runs each cache-writing candidate once, fingerprints the actual written slot, and restores the reference slot before timing. `utils/validate_decoder_layer_abi.py --require-candidate-cache-write-checks` requires the repo layer, self-attention residual segment, manual decoder runtime island, and any present compiled layer to reproduce both the hidden output and cache-slot SHA256s. DCC job `49253972` on RTX 2080 Ti, branch `codex/candidate-cache-write-checks` commit `7044278`, passed the report and strict validation on `profile_salvalai_smoke15` seq9: candidate checks passed for `repo_decoder_layer`, `self_attn_residual_segment`, and `manual_decoder_runtime_island`, with zero validation failures. This is verifier-only. The same diagnostic projected the manual decoder runtime island at `15.739054s -> 15.058896s` CUDA graph replay, only `0.680159s` saved and `277.148 tok/s`, below the production keep threshold. Do not promote manual module-boundary recomposition from this; use the gate before any native whole-layer math/memory candidate. See `notes/2026-07-04-decoder-layer-candidate-cache-write-checks.md`.
-
-The native self+cross prefix verifier keeps the bottleneck focus on a
-multi-segment decoder-layer boundary. Branch
-`codex/native-self-cross-prefix-verifier` commit `e370bd5` added
-`utils/profile_decode_decoder_layer_island.py --candidate-native-self-cross-prefix`
-and cache-slot allclose/max-abs diagnostics for cache-writing candidates. DCC
-job `49258712` on RTX 2080 Ti showed the approximate native self+cross prefix is
-target-sized but not strict-cache exact: logits replay passed (`max_abs=0.0`),
-layer output allclose passed (`max_abs=7.63e-06`), cache K/V allclose passed
-(`<=7.15e-07` max abs), and projected savings were about `4.93-4.96s`
-(`~328 tok/s` projected), but cache-slot SHA checks failed, so this is not a
-same-calculation speed claim and must not be production-wired. The same report
-showed the exact manual decoder runtime island cache/output checks passing with
-`3.537833s` projected saved time, but a manual-only confirmation is the cleaner
-number: DCC job `49258725` completed with ABI validation PASS, logits replay
-PASS, cache-write checks PASS, and projected the manual decoder runtime island
-at `17.847813s -> 16.022411s`, `1.825402s` saved, `289.163 tok/s`. Treat this
-as verifier-only evidence that broad decoder-layer runtime structure remains a
-current bottleneck candidate above the 5% bar. Because earlier manual-island
-runs were flat or negative, the next step is weighted/full-bucket confirmation
-and a source-of-gap audit before any production flag through `inference.py` /
-`server.py`. See
-`notes/2026-07-04-native-self-cross-prefix-verifier.md`.
-
-Weighted full-bucket confirmation closed that manual-island ambiguity. Branch
-`codex/weighted-manual-layer-confirmation` commit `fc66274` added
-`utils/summarize_weighted_decoder_layer_island.py`, which combines per-prefix
-decoder-layer reports with full-song replay counts from weighted stack job
-`49233687`. DCC job `49262108` on RTX 2080 Ti reran the exact manual decoder
-runtime island across prefixes `128..768` with candidate cache-write checks and
-summarized the result in
-`/work/imt11/Mapperatorinator/runs/weighted-layer-manual-49262108-fc66274/weighted_decoder_layer_manual_summary.json`.
-The weighted report passed (`failures=[]`), but the manual island saved only
-`0.616916s` over the weighted repo decoder layer (`16.512013s -> 15.895097s`),
-projecting `270.474 -> 276.514 tok/s`. That is below the `1.412150s` 5% keep
-bar, so manual Python/module recomposition remains rejected as a production
-speed path. Keep the weighted summarizer as bottleneck/verifier infrastructure:
-single-prefix excitement must be confirmed on the actual bucket distribution
-before runtime or kernel work graduates. See
-`notes/2026-07-04-weighted-manual-decoder-layer-confirmation.md`.
-
-Native self+cross exactness classification confirms that this candidate is not
-a same-calculation path today. Branch
-`codex/native-prefix-exactness-classifier` commit `b71c275` extended
-`utils/profile_decode_decoder_layer_island.py --verify-cache-write-candidates`
-with expected-slot bit-pattern mismatch counts for cache-writing candidates.
-DCC job `49266140` on RTX 2080 Ti reran prefix640 native self+cross and produced
-`/work/imt11/Mapperatorinator/runs/native-prefix-exactness2-49266140-b71c275/native_self_cross_prefix_exactness.json`.
-The report JSON is valid even though the Slurm wrapper is `FAILED`, because the
-strict verifier exits nonzero when cache-write checks fail. The result shows
-real numeric fp32 drift, not signed-zero or NaN-payload noise: every native
-self+cross warp variant had `456` key and `595` value numeric bit mismatches,
-`0` signed-zero mismatches, cache max_abs `7.15e-07`/`4.77e-07`, and layer output
-max_abs `7.63e-06`. Do not production-wire native self+cross for exact
-same-calculation inference; only revisit it under explicit documented-drift
-policy with direct-loop token/logit/RNG, full-song output, and large operational
-speedup gates. See `notes/2026-07-04-native-prefix-exactness-classifier.md`.
-
-Current exact-frontier audit: after the weighted manual-island rejection and the
-native self+cross drift classifier, the only remaining exact target-sized class
-is a broad decoder-layer or decoder-stack math/memory verifier. The weighted
-decoder layer/stack remains large enough to justify one bounded verifier, but a
-candidate must preserve the decoder-layer ABI, cache-write SHA, logits/top-k,
-direct-loop token/RNG, smoke/full-song generated-token IDs, output bytes, and
-no-regression gates before production wiring. External vendor docs are
-consistent with this caution: cuBLAS can be repeatable on a fixed toolkit/GPU
-stack, but repeatability of a new native reduction is not the same thing as
-matching PyTorch/HF byte-for-byte. Do not start another narrow production flag,
-tail graph, cold-start package pass, or documented-drift native path as an exact
-optimization. See `notes/2026-07-04-current-exact-optimization-frontier.md`.
-
-`utils/profile_decode_decoder_layer_island.py --candidate-native-cross-mlp-tail`
-is the first post-frontier multi-segment verifier that clears the 5% weighted
-bar while preserving the reference self-cache write. The candidate keeps normal
-self-attention/cache behavior, then replaces the cross-attention residual and
-MLP residual tail with native one-token helpers. DCC single-prefix job
-`49266324` passed logits replay, cache-write SHA, and ABI validation at
-prefix128; the Slurm state was `FAILED` only because a final summary helper
-misquoted `$RUN_DIR` after valid artifacts were written. DCC weighted job
-`49266355` produced all 11 bucket reports; its original Slurm summary failed
-because the weighted summarizer still required the default manual-island variant
-when explicit `--require-variant` values were passed. Commit `02813ee` fixed
-that harness issue, and
-`/work/imt11/Mapperatorinator/runs/native-cross-mlp-weighted-49266355-b022e86/weighted_native_cross_mlp_tail_summary.fixed.json`
-passes with `7,552` weighted decode replays. Best variant
-`native_cross_mlp_tail_warp8` projects weighted decoder-layer graph replay
-`16.766751s -> 15.045932s`, saving `1.720819s` and projecting
-`270.474 -> 288.023 tok/s`. This is target-sized verifier evidence, not a
-throughput claim. A production spike is allowed only as a default-off path after
-the standard one-token, direct-loop token/logit/RNG, 15s smoke, full-song
-strict token/output/no-regression gates, and it must be rejected if the
-untraced `profile_inference` gain lands below the 5% keep bar or regresses
-stage wall. See `notes/2026-07-04-native-cross-mlp-tail-verifier.md`.
-
-The bounded production spike was attempted on branch
-`codex/native-cross-mlp-production`, commits `f9bf235` and `4e7c73f`, and is
-rejected. DCC job `49266703` passed the one-token logits/top-k gate, job
-`49266798` passed the 256-step direct-loop token/logit/RNG gate, and reciprocal
-15s smoke job `49266821` preserved token/output equivalence. Full-song
-reciprocal job `49266934` also preserved exact output bytes
-(`sha256=483483a1c29ef8a44c4a8d3a82fe0778ae306470ec3157e98969eeabd92c2631`,
-`size_bytes=31709`) and all main/timing token IDs, but the speedup was only
-borderline: `271.597 -> 284.780 tok/s` (`28.126s -> 26.824s`) in control-first
-order and `268.733 -> 284.103 tok/s` (`28.426s -> 26.888s`) in candidate-first
-order. Both strict full-song comparisons failed no-regression checks, and the
-candidate-first pair regressed timing context `100.805 -> 99.725 tok/s` despite
-the candidate path being disabled for timing. Leave the production branch
-unmerged; keep only the verifier infrastructure, and do not retry this
-cross+MLP production flag without new bottleneck evidence that is comfortably
-above the keep bar and explains the timing/stage sensitivity. See
-`notes/2026-07-04-native-cross-mlp-tail-production-rejection.md`.
-
-`utils/summarize_decoder_layer_segment_pressure.py` is the segment-level stop/go auditor for native decoder-layer work. It reads a decoder-layer island report, uses captured ABI dimensions, compares measured CUDA-graph segment replay against optimistic fp32 compute/bandwidth floors, and reports whether each segment has above-floor headroom above the 5%/10% bars. DCC run `/work/imt11/Mapperatorinator/runs/decoder-layer-segment-pressure-20260704141703-0a28a3e` on the candidate-cache report showed self-attention residual `5.430s` measured / `1.513s` floor / `3.917s` above-floor, cross-attention residual `4.024s` / `1.626s` / `2.397s`, MLP residual `4.692s` / `2.789s` / `1.903s`, and whole decoder layer `15.739s` / `5.928s` / `9.811s`. All three major residual segments clear the 5% verifier bar, but no single segment reaches `500 tok/s` at its floor, and even this representative whole layer at floor projects only `414.435 tok/s`. The next implementation-worthy scope remains a multi-segment or whole-layer native math/memory verifier, not another narrow production path. See `notes/2026-07-04-decoder-layer-segment-pressure.md`.
-
-`utils/summarize_torch_trace_kernels.py` is the lightweight Chrome-trace kernel
-summarizer for deep torch-profiler diagnosis. It reads a torch-profiler trace
-JSON and buckets GPU kernel/memcpy/memset events into linear/GEMV, native q1
-attention, SDPA/FMHA, elementwise/reduce, copy/index/memcpy, layernorm,
-sampling/sort/softmax, and other categories. DCC job `49250089` on RTX 2080 Ti,
-branch `experiment/post270-kernel-trace` commit `376898e`, traced
-`profile_salvalai_smoke15` `main_generation.seq9` on the current fastest opt-in
-stack. Main tokens and output bytes matched the current-stack smoke baseline
-(`1,084 / 1,084` generated token IDs, output hash
-`ff63c232115906483a592c940e6f0fccbb8639775378d39fd86237f4191ed4ba`). The trace
-showed `593.186ms` of seq9 GPU work: `48.8%` `gemv_gemm_linear`, `18.5%`
-`attention_native_q1`, `13.1%` elementwise/reduce, `8.5%` copy/index/memcpy,
-`4.4%` layernorm, `3.5%` sampling/sort/softmax, `2.8%` residual SDPA/FMHA, and
-`0.4%` other. This is diagnostic-only and not a throughput claim; the traced
-window's outer wall regressed from profiler overhead. The result confirms that
-the next target is broad decoder compute/runtime or an exclusive
-production-vs-replay gap, not standalone sampling, copy, graph-cache cleanup, or
-SDPA work. See `notes/2026-07-04-post270-kernel-trace.md`.
-
-`utils/profile_decode_replay_gap.py` is the stop/go verifier for that
-exclusive production-vs-replay question. It builds the real seq9 one-token
-prepared inputs, then compares production-style `_capture_decode_cuda_graph()`
-replay against isolated same-input full-forward graph replay,
-decoder-stack-plus-projection graph replay, static input copy, and an optional
-empty graph shell. DCC job `49250100` on RTX 2080 Ti, branch
-`experiment/decode-replay-gap-probe` commit `3257f57`, passed all raw-logit
-correctness gates (`max_abs=0.0` for production graph, full-forward graph, and
-decoder-stack-plus-projection graph). It measured production graph replay at
-`1.811697ms/call`, isolated full-forward graph replay at `1.800818ms/call`, and
-decoder-stack-plus-projection graph replay at `1.801175ms/call`. The projected
-full-song production-minus-full-forward gap is only `0.082158s`, and static
-input copy is only `0.220091s`, both far below the `1.412s` 5% keep bar. This
-rules out standalone `_capture_decode_cuda_graph()` wrapper cleanup, static
-input-copy cleanup, or module-boundary graph replay rewrites as serious 500
-tok/s paths on the current stack. See
-`notes/2026-07-04-decode-replay-gap-probe.md`.
-
-## Decode Prepare Oracle
-
-Use `utils/verify_decode_prepare_oracle.py` before replacing `prepare_inputs_for_generation` in any decode runtime path. The verifier drives the real model with the HF-prepared inputs while comparing a conservative fast post-prefill one-token builder against HF's prepared tensors at every checked decode step.
-
-DCC job `49231765` on RTX 2080 Ti, commit `8cb1fd6`, passed on `profile_salvalai_smoke15` seq9 for `31` checked post-prefill decode steps. The fast builder matched HF for `decoder_input_ids`, `decoder_position_ids`, `cache_position`, full static-cache `decoder_attention_mask`, `frames`, `past_key_values` identity, `encoder_outputs` identity, and `use_cache`. Diagnostic CPU wall was `16.127ms` for HF prepare vs `9.144ms` for the fast builder over the verifier. Treat this as target sizing only; production use still needs direct-loop token/logit/RNG gates, 15s smoke token equivalence, and full-song untraced throughput. See `notes/2026-07-03-decode-prepare-oracle.md`.
-
-Follow-up direct-loop gate `49231798` on commit `912bdf7` passed with `--candidate-fast-prepare` over `256` sampled decode steps: generated tokens matched, raw logits/top-k matched, and final RNG state matched. The first production smoke, job `49231829`, then failed before producing a speed result. `control_a` completed, but `fast_a` crashed in timing generation while capturing the active-prefix CUDA graph because the fast builder copied wrapper-level `negative_prompt` into the model forward, which does not accept it. The attempted `inference_active_prefix_fast_prepare` production flag was backed out. Keep `prepare_one_token_decode_inputs_fast` verifier-only until the input-builder contract is fixed through the normal `inference.py`/`server.py` routing surface.
-
-## Native MLP Tail Rejection
-
-The first production attempt from the native decoder-layer verifier was a narrow native fp32 decoder-layer MLP tail. It passed the corrected exactness gates on branch `codex/native-decoder-layer-verifier`, commit `7e89f17`: one-token logits/top-k gate `49258638` passed with normal prefill plus active-prefix decode length `128`, and direct-loop gate `49258622` passed `256` sampled steps with generated-token, raw-logit/top-k, and final RNG equality.
-
-The untraced 15s smoke promotion gate did not justify keeping the production flag. DCC job `49258644` compared the accepted opt-in stack against the same stack plus the native MLP tail:
-
-| metric | control | native MLP tail | result |
-| --- | ---: | ---: | --- |
-| main tokens | 1,084 | 1,084 | token equivalence PASS |
-| main model time | 3.833s | 3.728s | -0.105s |
-| main tok/s | 282.783 | 290.752 | +2.8% |
-| output bytes/hash | 4,144 | 4,144 | artifact equivalence PASS |
-| outer wall | 67.468s | 70.036s | +3.8% worse |
-| total stage wall | 74.777s | 76.930s | +2.9% worse |
-| per-window no-regression | - | - | FAIL on `seq0` and `seq2` |
-
-The strict comparison failed despite exact tokens and byte-identical output. The observed model-time saving projects to roughly `0.74s` over full-song SALVALAI if it scales perfectly, below the `5%` keep threshold and far below the 500 tok/s target. Production wiring commits `127f246`, `7bf0c68`, and `7e89f17` were reverted; keep only the verifier/profiler infrastructure. Do not retry a narrow MLP-tail production flag without new current-stack bottleneck evidence. See `notes/2026-07-04-native-mlp-tail-production-rejection.md`.
-
-## Runtime Control Plane
-
-Treat `inference.py` and `osuT5/osuT5/inference/server.py:model_generate()` as the inference runtime control plane. User-facing optimization flags should be declared in `config.py` and Hydra defaults, validated in `inference.py`, routed through `server.py:model_generate()` where practical, and recorded in profile metadata. Low-level modules may hold helpers, direct-loop verifiers, or native kernels, but they should not become a second public mode-selection surface without a measured and documented reason.
-
-Use `main` as the integration branch for accepted inference work. Risky runtime, profiler, or kernel probes should start from current `main` on a short-lived experiment branch, then merge or cherry-pick into `main` only after the equivalence, no-regression, docs, and push gates pass. Rejected experiment branches should leave a note/result and not remain as shadow production paths.
-
-The current fastest exact opt-in stack is still single-song, batch-1, non-server, sequential-only: active-prefix bucket64 CUDA graph, stateful monotonic, q1 BMM cross-attention, DecodeSession graph/cache reuse, native q1 self-attention, and fused RoPE/cache self-attention. `inference.py` now validates these constraints before model load so unsupported combinations fail before reaching lower-level runtime code.
-
-DCC guardrail job `49231914` on RTX 2080 Ti, commit `12cfdf3`, validated the control-plane checks without running inference. The retained fast stack passed config validation on GPU with `attn_implementation=auto` normalized to `sdpa`. `use_server=true`, `parallel=true`, and missing native subflag dependencies failed early with `inference.py` validation errors. The backed-out `inference_active_prefix_fast_prepare=true` override failed as an unknown Hydra key.
-
-Follow-up control-plane audit on commit `36403e6` found that the accepted fast path routes through the intended surfaces, but `inference_generation_compile` was not consistently forwarded outside the main `inference.py` entry point and local/custom checkpoint loads could leave `generation_config.disable_compile=True` even when compile was requested. Branch `experiment/control-plane-compile-routing` fixed this by applying `generation_compile` after every `load_model_loaders()` model-load path, forwarding it through `web-ui.py`, `mai_mod.py`, and `calc_fid.py`, and recording explicit native-q1 timing-context disable reasons in per-generation profile rows. Local verification used `py_compile`, diff checks, source-level routing checks, and the lightweight profile/summarizer pytest subset with plugin autoload disabled; run GPU/env validation before using this as performance evidence.
-
-Existing throughput paths are separate:
-
-- `use_server=true` uses `InferenceServer` static IPC request batching. The server groups requests by identical generation kwargs, pads/collates model kwargs, calls `server.py:model_generate()`, then splits outputs and aggregates token counts.
-- `parallel=true` uses `InferenceProcessor._batched_inference` for static window batching inside one song/context. It stacks prompts/windows up to `max_batch_size` and records `mode=parallel` profile rows.
-- The accepted DecodeSession/native stack rejects both `use_server=true` and `parallel=true`; do not report it as a batching win.
-
-The current mergeable batching/server track is separate from the never-merge
-decoder-layer runtime island. Work from current `main` for mergeable batching
-infrastructure, and keep `experiment/decoder-layer-runtime-island-do-not-merge`
-out of `main` unless a generally useful verifier/docs/tooling change is
-separately approved and cherry-picked.
-
-Static server batching profile infrastructure should fail loudly on stale or
-ambiguous server state. The harness records server socket paths, a server-loading
-configuration fingerprint, request/server/suite timeouts, and whether an
-existing socket was explicitly allowed. Worker clients are connect-only; they
-must not auto-start replacement servers if the owner server dies or a socket is
-missing.
-
-`server_batch_timeout` is now a public inference config field for the static IPC
-server coalescing wait. Its default remains `0.2s`, matching the historical
-server behavior. Lower values may reduce queue wait and scheduler wall time, but
-they can also reduce actual batch size or change shared-RNG scheduling. Treat it
-as an opt-in batching throughput knob, not a single-song or exact-output win
-unless a later per-request RNG/token/output protocol proves equivalence.
-
-For static server batching, report scheduler-wall aggregate throughput as the
-primary TPS metric. Server/model elapsed time attached to individual request
-records is attributed because a single merged server batch can be copied back to
-multiple requests. Keep both `main_tokens_per_scheduler_second` and explicitly
-named attributed metrics, and use deduped server batch IDs/histograms to decide
-whether a run actually observed multi-request batching. If no batch size above
-one is observed, classify it as `static_server_no_batch_observed`.
-
-Use the static-server comparator before promoting batching infrastructure or
-scheduler-knob changes:
+Compare two manifests with the knob-specific allowance only when that knob is the experiment:
 
 ```bash
 python utils/summarize_inference_profile.py \
-  --compare-static-server BASE/static_server_batch_manifest.json CAND/static_server_batch_manifest.json \
+  --compare-static-server "$BASE_MANIFEST" "$CANDIDATE_MANIFEST" \
   --strict \
-  --json-output compare-static-server.json
+  --json-output "$WORK/runs/static-server-compare-${SLURM_JOB_ID}.json"
+
+# Add exactly one when applicable:
+# --allow-server-batch-timeout-change
+# --allow-server-max-batch-size-change
 ```
 
-When the only intended config change is the coalescing wait, add
-`--allow-server-batch-timeout-change`. The comparator checks the request/server
-contract, real `static_server_batch` observation on both sides, preserved
-`not_checked_shared_server_rng` labeling, scheduler-wall throughput/wall
-non-regression, and no aggregate generated-token shrinkage. This gate is
-operational throughput evidence only under the current shared server RNG policy.
-When the intended config change is the static server capacity cap, add
-`--allow-server-max-batch-size-change`.
+The comparator self-validates aggregate fields and the unique server-batch ledger. A malformed manifest is invalid evidence, not a performance regression. Current capacity evidence rejects lowering `server_batch_timeout` below `0.2s` and increasing `max_batch_size` beyond `10`; see the batch frontier.
 
-DCC timeout sweep job `49268950` on RTX 2080 Ti, commit `68b63d3`, tested the
-five-song 15s static server harness with default `0.2s` versus lower coalescing
-waits:
+## Continuous-Scheduler Dry Runs
 
-| `server_batch_timeout` | main tokens | scheduler wall | scheduler-wall main tok/s | gate result |
-| ---: | ---: | ---: | ---: | --- |
-| `0.2` | `7,474` | `65.541s` | `114.035` | baseline |
-| `0.05` | `6,392` | `62.639s` | `102.046` | FAIL: `-10.5%` scheduler tok/s and generated-token shrinkage |
-| `0.02` | `7,163` | `91.372s` | `78.394` | FAIL: `-31.3%` scheduler tok/s and wall regression |
-
-Both candidates observed real static server batches and kept
-`token_equivalence_status=not_checked_shared_server_rng`, but the lower wait
-fragmented batches enough to lose throughput. Keep `0.2s` as the current static
-server default unless a new workload/profile overturns this result. Artifacts:
-`/work/imt11/Mapperatorinator/runs/static-server-timeout-20260704-200509-68b63d3-rerun/summary.json`;
-comparisons `compare-timeout020-vs-050.json` and
-`compare-timeout020-vs-020.json`.
-
-DCC max-batch sweep job `49268989` on RTX 2080 Ti, commit `195dfd7`, tested ten
-concurrent requests (`repeats=2`, `max_workers=10`) with the same five-song 15s
-static server harness:
-
-| `max_batch_size` | main tokens | scheduler wall | scheduler-wall main tok/s | result |
-| ---: | ---: | ---: | ---: | --- |
-| `5` | `13,436` | `99.687s` | `134.781` | baseline |
-| `10` | `14,068` | `93.159s` | `151.011` | `+12.0%`, real static batches observed |
-
-This is a useful operational batching setting: for static server workloads with
-around ten concurrent requests, set `max_batch_size` high enough to cover the
-active request count when memory allows. It is not exact same-calculation
-evidence because static server RNG remains shared-global and request scheduling
-can change generated tokens. Artifacts:
-`/work/imt11/Mapperatorinator/runs/static-server-maxbatch-20260704-201718-195dfd7/summary.json`.
-
-DCC validation job `49269123` on RTX 2080 Ti, commit `0e6346d`, reran the same
-static-server max-batch workload after adding stricter batching ledgers. It wrote
-manifests and real static batches for both settings, and the operational runtime
-metrics still favored `max_batch_size=10`: scheduler-wall main throughput
-`156.175 -> 163.201 tok/s` (`+4.5%`), scheduler wall `106.028s -> 92.138s`
-(`-13.1%`), p95 request wall `105.790s -> 91.758s`, and timing scheduler
-throughput `15.298 -> 18.603 tok/s`. The strict comparator intentionally failed
-because generated main tokens shrank under shared server RNG (`16,559 -> 15,037`).
-Do not treat this as a new accepted batching speedup; treat it as functional
-validation that the stricter metadata still runs real static IPC batches and
-correctly blocks promotion when output-length drift is large. Artifacts:
-`/work/imt11/Mapperatorinator/runs/static-server-ledger-20260704-0e6346d/compare-maxbatch5-vs-10.json`.
-
-DCC capacity job `49269905` on RTX 2080 Ti, commit `b4039b0`, tested whether
-larger static batches help a 20-concurrent-request five-song 15s smoke
-(`repeats=4`, `max_workers=20`) after runtime-keyed server socket guardrails.
-They did not:
-
-| `max_batch_size` | main tokens | scheduler wall | scheduler-wall main tok/s | request p95 | main unique batch sizes | result |
-| ---: | ---: | ---: | ---: | ---: | --- | --- |
-| `10` | `31,420` | `198.706s` | `158.123` | `191.490s` | `10:18, 9:2, 1:2` | baseline |
-| `20` | `29,858` | `199.888s` | `149.374` | `199.500s` | `20:2, 19:4, 17:1, 16:1, 13:1, 9:1, 7:1, 4:2, 2:2, 1:10` | FAIL, `-5.5%` scheduler TPS |
-
-Both manifests self-validated, but strict static compare failed because
-`max_batch_size=20` regressed scheduler throughput and generated fewer main
-tokens (`31,420 -> 29,858`). Job telemetry across the whole run averaged
-`60.19%` GPU utilization and peaked at `9,334 MiB` memory. The same job's serial
-multi-song denominator measured `23,820` main tokens in `346.984s` model time
-(`68.649 tok/s`) with repeat token-equivalence PASS after each song baseline.
-Do not keep sweeping larger static `max_batch_size` values without new evidence;
-next batching work should target tail scheduling, per-request RNG/equivalence,
-or an explicit continuous-batching prototype. Artifacts:
-`/work/imt11/Mapperatorinator/runs/static-server-capacity20-20260704-194727-b4039b0/summary.json`;
-note: `notes/2026-07-04-static-server-capacity20-profile.md`.
-
-Static server batching currently uses shared global server RNG. Until an
-explicit per-request reseed/replay protocol exists, concurrent server token
-hashes are throughput diagnostics only; do not compare them against cold
-single-song token IDs as exact same-calculation evidence. Equivalent continuous
-or static server claims need same-policy per-request token/output hashes and RNG
-state reporting.
-Raw `use_server=true` profile metadata labels this explicitly with
-`server_rng_policy=shared_global` and
-`token_equivalence_status=not_checked_shared_server_rng`. Static-server
-manifests and aggregates also set `same_calculation=false` and
-`throughput_claim_scope=static_ipc_concurrent_full_song_requests`.
-
-The CPU-only continuous-batching scheduler harness is verifier infrastructure,
-not a runtime path. It now records the config and state surfaces a future model
-runtime must preserve: max active sequences, wait/prefill/decode/RNG policy,
-enqueue/activation/finish steps, queue-wait/decode/latency steps, cache
-slot/generation events, stop reasons, generated-token counts, and placeholder
-RNG/logits/cache state hashes. These fields are useful for designing continuous
-server gates, but missing or synthetic hashes still mean the result is
-`scheduler_only` evidence rather than exact model-backed continuous batching.
-Dry-run requests now require RNG/logits/cache state hashes by default; use
-`--allow-missing-state-hashes` only for planning manifests that should fail
-strict equivalence comparison.
-The dry-run request format supports `arrival_step` / `planned_arrival_step`, so
-future scheduler tests can model staggered arrivals, idle service periods,
-queued requests, and cache-slot reuse without running model generation.
-Use `utils/profile_continuous_scheduler.py` to emit
-`continuous_scheduler_manifest.json` files, and compare them with:
+`osuT5/osuT5/inference/continuous_batching.py` is CPU-only and model-free. Use it to validate request lifecycle, planned arrivals, state hashes, slot acquire/release, and slot generations—not to claim TPS.
 
 ```bash
+python utils/profile_continuous_scheduler.py \
+  --output-root /tmp/mapperatorinator-continuous-scheduler \
+  --suite-id local-state-gate
+
 python utils/summarize_inference_profile.py \
-  --compare-continuous-scheduler BASE/continuous_scheduler_manifest.json CAND/continuous_scheduler_manifest.json \
+  --compare-continuous-scheduler \
+  /tmp/mapperatorinator-continuous-scheduler/continuous_scheduler_manifest.json \
+  /tmp/mapperatorinator-continuous-scheduler/continuous_scheduler_manifest.json \
   --strict \
-  --json-output compare-continuous-scheduler.json
+  --json-output /tmp/mapperatorinator-continuous-scheduler/compare-self.json
 ```
 
-Strict mode checks the dry-run/result-class contract, scripted token hashes and
-stop reasons, lifecycle/state ledger fields, scheduling shape, and manifest
-self-validation. The ledger check covers RNG hashes, logits-processor state
-hash, cache state hash, enqueue/activation/finish steps, queue wait,
-decode/latency steps, cache slot id, and slot generation. Self-validation
-recomputes generated-token hashes/counts, active-batch histograms, aggregate
-counts, cache-slot acquire/release balance, slot-generation monotonicity, and
-request lifecycle ordering. CPU scheduler wall time is recorded for auditability
-only; require it explicitly with `--require-no-regression` when a CPU-harness
-change is the thing being measured.
+Strict dry-run evidence must include RNG, logits-processor, and cache hashes. `--allow-missing-state-hashes` is planning-only and cannot pass the strict promotion gate.
 
-Do not combine `use_server=true` with `inference_generation_compile=true` on the
-current static IPC server. DCC job `49267683` on RTX 2080 Ti reached generation
-but failed inside TorchInductor cudagraph tree setup with an `AssertionError`
-because the server executes generation in a background batch thread. The
-control plane now rejects this combination; server batching profiles should use
-`inference_generation_compile=false` until a server-specific compile path is
-validated.
+## Diagnostic Profiling
 
-The first compile-disabled five-song 15s batching smoke on commit `1475062`
-used Lambada, PEGASUS, Ela ke Leitada, SALVALAI, and Nube Negra with fp32/SDPA,
-`profile_record_token_ids=true`, and `generate_positions=false`:
+Throughput claims must come from untraced profiles. Use diagnostics only to prove a current target and its avoidable ceiling.
 
-| mode | job | main tokens | primary tok/s | equivalence/status |
-| --- | ---: | ---: | ---: | --- |
-| serial multi-song | `49267816` | `5,955` | `69.727` model-time tok/s | baseline for this smoke |
-| static server batch | `49267768` | `7,234` | `120.568` scheduler-wall tok/s | real multi-request batches observed; throughput evidence only under shared server RNG |
-| `parallel=true` static window | `49267817` | `3,524` | `58.749` model-time tok/s | strict serial comparison FAIL; token/output mismatches for all five songs |
+- `profile_generation_detail_ranges=true`: decoder attention/MLP/final-projection NVTX and torch ranges.
+- `profile_active_prefix_decode_diagnostics=true`: active-prefix CPU/CUDA-event counters and graph/bucket behavior.
+- `profile_model_generate_cuda_ledger=true`: production `model.generate()` CUDA-event and host-gap accounting.
+- `utils/summarize_active_prefix_diagnostics.py`: active-prefix aggregates and non-additive fantasy ceilings.
+- `utils/summarize_torch_trace_kernels.py`: kernel-family shares from torch Chrome traces.
+- `utils/profile_decode_linear_kernels.py`: captured one-token linear signatures and replay.
+- `utils/profile_decode_attention_components.py`: real q_len=1 self/cross attention components.
+- `utils/profile_decode_full_forward_island.py` and `profile_decode_decoder_stack_island.py`: broad forward/stack ceilings.
+- `utils/profile_decode_replay_gap.py`: production graph shell and input-copy gap.
+- roofline/pressure summarizers under `utils/summarize_*roofline.py` and `summarize_decoder_layer_segment_pressure.py`.
 
-Static server unique main-generation batches were `8x size 5`, `2x size 4`,
-and `2x size 1`; timing batches were `9x size 5`, `1x size 4`, and `1x size 1`.
-The static server run averaged `58.06%` GPU util over active-memory telemetry
-samples, versus `55.35%` for serial and `46.8%` for `parallel=true`. Treat this
-as evidence that current static IPC batching can improve aggregate service
-throughput, not as a single-song or exact token-equivalent speedup. The strict
-serial-vs-parallel report is
-`/work/imt11/Mapperatorinator/runs/batching-compare-smoke-20260704-142810-1475062/serial-vs-parallel-strict-compare.json`.
+Do not add overlapping profiler ranges together. Distinguish required model math from avoidable launch/layout/cache/control/movement cost, and compute fantasy-free and fantasy-floor TPS before implementation.
 
-Future continuous batching work is a separate throughput-mode project, not a single-song TPS path. The reserved control-plane flags are now present in `config.py`, `configs/inference/default.yaml`, and profile metadata: `inference_continuous_batching`, `inference_continuous_batching_mode`, `continuous_batch_max_active_sequences`, `continuous_batch_max_wait_ms`, `continuous_batch_prefill_policy`, `continuous_batch_decode_order_policy`, `continuous_batch_rng_policy`, `inference_batch_decode_session_runtime`, and `inference_batch_native_decode_kernels`. They intentionally fail loudly in `inference.py` until an explicit server scheduler exists.
+For useful-utilization diagnosis, prefer Nsight Systems timelines plus CUDA events and power/clock/memory telemetry. Probe Nsight Compute/DCGM permission; if unavailable, record that fact. A high `nvidia-smi` utilization percentage can include padding, rejected speculative work, or inefficient batches and is not a promotion criterion.
 
-Continuous batching needs gates for cold single-song, warm repeat, static server batch, static window batch, and continuous server batch. Exact-equivalent continuous batching must preserve each request's generated-token IDs, stopping state, cache state, logits-processor state, RNG behavior, output policy, and generated-token accounting. If that cannot be proven, report it only as `documented-drift`/non-equivalent and keep it out of retained same-calculation baselines. The existing single-song DecodeSession/native flags should keep failing loudly for `use_server=true` and `parallel=true` until batch-specific verifiers prove equivalent behavior.
+## Acceptance Checklist
 
-Do not combine `use_server=true` with `parallel=true` until a dedicated mixed-mode
-harness exists. Static IPC request batching and static window batching are
-separate modes with separate claims and gates.
+Before merging an optimization:
 
-The server static batching queue now uses an explicit `generation_compatibility_key()` plus `StaticServerRequest`/`StaticServerRequestGroup` state instead of grouping by `frozenset(generate_kwargs.items())`. This is infrastructure only: it preserves static IPC request batching behavior while making future continuous-batching state boundaries explicit. Mutable runtime objects such as tensors in `generate_kwargs` fail loudly rather than crashing the batch thread or silently fragmenting batches.
+1. Current accepted baseline and same-config candidate were run on the target GPU.
+2. The candidate clears the `<5%` reject policy or has explicit approval for a smaller infrastructure-only change.
+3. Main/timing tokens, counts, stops, RNG, output SHA/size, and touched caches pass the relevant exactness class.
+4. Main model time/TPS, timing context, total stage wall, per-window behavior, and cold/warm costs are reported.
+5. Batch claims additionally pass per-request order, arrival, EOS/max-token, slot reuse, and state isolation gates.
+6. The result note contains commit, job, GPU, config, artifacts, decision, why it worked, and a concrete revisit condition.
+7. Rejected runtime code is removed; accepted code remains default-off unless separately approved.
+8. The canonical frontier and experiment ledger are updated.
 
-Paired DCC smoke jobs on `dcc-core-ferc-s-z25-21` validated this as static-server infrastructure only. Control `main@46ccc50`, job `49268405`, completed with real batches and `62.368s` scheduler wall; branch `41de52c`, job `49268272`, completed with real batches and `59.428s` scheduler wall. Generated main-token counts differed (`7,172` control, `6,681` branch) under the known shared-global server RNG, so do not use this pair as an exact token-equivalent throughput claim. Treat it as a no-crash/no-wall-regression smoke for the request-state refactor.
-
-The first continuous-batching scheduler harness is CPU-only and not wired into `InferenceServer`. `osuT5/osuT5/inference/continuous_batching.py` models request lifecycle, compatibility-key grouping, active slot acquisition/release, slot generations, scripted token emission, stop reasons, active batch-size histograms, and deterministic reports. It intentionally does not run model forward passes, sample, consume RNG, mutate logits processors, write KV cache tensors, or claim throughput. Use it to build lifecycle/equivalence scaffolding before any real continuous server mode.
-
-Static server manifest comparison now includes manifest self-validation.
-`utils/summarize_inference_profile.py --compare-static-server ... --strict`
-recomputes run counts, token totals, request wall aggregates, scheduler tok/s,
-request-attributed model tok/s, result class, token-status labels, and aggregate
-batching summaries from the manifest's `runs`. It also validates each
-`server_batches` ledger entry shape and requires observed unique batch size
-`>1` for `static_server_batch`. This is validation infrastructure only; it does
-not change the shared-RNG throughput-only status of static server batching. See
-`notes/2026-07-04-static-server-manifest-self-validation.md`.
-
-Static IPC server control-plane guardrails were tightened after auditing the
-mergeable Track B path. `load_model_with_server()` now fails loudly for
-`use_server=true` plus `inference_generation_compile=true`, and server socket
-paths include `get_server_runtime_key()` so normal inference, the web UI server
-owner, and static-server profiling do not attach to stale IPC servers with a
-different `max_batch_size`, `server_batch_timeout`, device, precision, attention
-backend, or generation-compile setting. Overlong Unix socket names are
-hash-shortened after DCC job `49269896` failed before profiling with
-`OSError: AF_UNIX path too long`. `InferenceConfig.use_server` now matches the
-Hydra default (`false`). This is guardrail infrastructure only, not a throughput
-result. See `notes/2026-07-04-static-server-control-plane-guardrails.md`.
-
-Suggested future profile metadata: `result_class`, `throughput_claim_scope`, `batching_mode`, scheduler policy, request/window IDs, batch IDs, active batch-size histogram, queue wait, per-request latency, prefill/decode timing split, per-sample token hashes, stop reasons, RNG policy/state hashes, cache slot/reorder events, graph capture/replay counts, and effective fast-path flags.
-
-Post-main branch `codex/batched-fast-decode-session` is abandoned at commit
-`a74537a` and should not be merged. Its best exact compiled server lockstep
-result was B=5 identical SALVALAI at `263.544` unique main tok/s, below the
-accepted full-song single-song fast path (`270.475` tok/s) and below the paired
-15s non-server fast reference (`288.703` tok/s). The B=10 check regressed to
-`199.721` unique main tok/s and was non-equivalent. For 5+ songs on one RTX
-2080 Ti, prefer the optimized single-song path serially in one long-lived
-process unless a future lower-level active-prefix graph-step or batched decoder
-runtime proves exact per-request output behavior and beats optimized serial
-throughput. See `notes/2026-07-07-batched-fast-branch-abandoned.md`.
-
-Rollback smoke job `49325496` then validated that `main@f6add76` still has the
-accepted fast single-song path: `profile_salvalai_smoke15`, fp32 SDPA,
-`use_server=false`, and the fast opt-in flags produced `1,084` main tokens in
-`3.867s` synchronized model time (`280.3` tok/s) with output SHA
-`ff63c232115906483a592c940e6f0fccbb8639775378d39fd86237f4191ed4ba`.
+Never commit generated outputs, profiles, manifests, traces, model weights, audio, or native build artifacts.
