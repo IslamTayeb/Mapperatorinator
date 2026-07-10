@@ -481,3 +481,50 @@ claim is made. Comparison reports:
 SHA `bed422041409ce4d0e162e4bc7459c58779cd330e08d8938798b8e51ab7f77c9`,
 and `candidate-first-compare.json`, SHA
 `4a379632c40dd0818ffda397229ad6c6bd9f35c73fb2358cfaa6082043c11a39`.
+
+### S2 accepted production session ownership move
+
+Commit `29bff1f` replaced the production raw state dictionary with
+`optimized/single/state.py:ProductionDecodeSession`. The typed owner contains
+only the persistent cache, graph cache, and stable encoder holder. It allocates
+the cache once per unfinished output context, resets self-attention then
+cross-attention then `is_updated` before subsequent windows, and preserves
+object identity. RNG, logits processors, stopping state, cache positions, and
+tokens remain outside the persistent session exactly as before. Processor owns
+only a branch-local lazy factory and the existing context reset points;
+`server.py` now uses a narrow typed-state protocol and no longer implements
+cache reset or graph/encoder dictionary ownership.
+
+The full local `tests/` tree passed, with the isolated legacy-stub logits test
+run in its own process. DCC job `49560908` passed the real one-token regression
+gate at the same raw-logit tolerance and exact top-20. Report:
+`/work/imt11/Mapperatorinator/runs/optimized-single-one-token-49560908-29bff1f/one-token.json`,
+SHA `b044083d86e298bb18dc755cac63b45a891fce913386d25bb2555a618320b801`.
+
+DCC job `49560943` exercised four consecutive SALVALAI windows for 64 tokens
+each through the production state owner. All tokens, logits/top-k steps, stop
+reasons, and final RNG matched; one cache identity was reused; the stable
+encoder shape remained `[1, 1024, 768]`; and two unique prefix buckets produced
+exactly two graph captures with `252` replays. Report:
+`/work/imt11/Mapperatorinator/runs/optimized-single-session-64-49560943-29bff1f/persistent-session.json`,
+SHA `65e2683de32519afbe69c59b0001c17fe69d06f7a40fd7a119e9196af094eea8`.
+The promoted 256-token job `49560951` also passed all four windows (`1,024`
+candidate tokens total), exact final RNG, stable identities/shape, and five
+captures for five unique prefix buckets with `1,020` replays. Report:
+`/work/imt11/Mapperatorinator/runs/optimized-single-session-256-49560951-29bff1f/persistent-session.json`,
+SHA `5a0e11f48a1d8c825df6666d222654d9da7d07980ecd2ecdd984a74574204367`.
+
+Reciprocal production smoke job `49560956` compared the accumulated migration
+through S2 against pre-migration `3f4b088`. Both orders matched all `1,084`
+main tokens, all `164` timing tokens, same-calculation metadata, and `.osu` SHA
+`ff63c232115906483a592c940e6f0fccbb8639775378d39fd86237f4191ed4ba`,
+size `4,144`. Candidate aggregate main throughput was `+1.3%` and `+0.8%`;
+timing was `+8.6%` and `+3.6%`; stage wall improved `13.8%` and `11.9%`.
+The zero-tolerance strict status was nonzero only for window jitter. The largest
+isolated main model-time increase was `7.649ms` and timing increase was
+`15.417ms`, while every aggregate metric improved. No speed claim is made.
+Comparison reports:
+`/work/imt11/Mapperatorinator/runs/v32-integration-migration-s2-smoke-49560956/control-first-compare.json`,
+SHA `35148f9cf59880ea1099c09fbc98e25fbc0c77a0e4bf24c9ed422971c6e8afa2`,
+and `candidate-first-compare.json`, SHA
+`6b8d3b554712478b6a5a9e27412593560b74e9fc8ca4dd1e2ea8e2f2f8299769`.
