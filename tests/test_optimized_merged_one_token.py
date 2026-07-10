@@ -5,7 +5,10 @@ from unittest.mock import patch
 import torch
 from transformers.modeling_outputs import BaseModelOutput
 
-from osuT5.osuT5.inference.direct_decode import DecodeSession, OneTokenDecodeState
+from osuT5.osuT5.inference.optimized.single.session import (
+    DecodeSession,
+    OneTokenDecodeState,
+)
 from osuT5.osuT5.inference.optimized.batch.merged_one_token import (
     MergedOneTokenConfig,
     compare_logits,
@@ -180,7 +183,7 @@ def test_decode_session_prefill_allocates_cache_for_prompt_batch_size():
         )
 
         with patch(
-                "osuT5.osuT5.inference.direct_decode.prefill_static_cache",
+                "osuT5.osuT5.inference.optimized.single.session.prefill_static_cache",
                 return_value=fake_state,
         ) as prefill:
             session = DecodeSession.prefill(

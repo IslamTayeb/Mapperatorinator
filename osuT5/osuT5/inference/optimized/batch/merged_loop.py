@@ -13,7 +13,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 import torch
 
-from ...direct_decode import DecodeSession
+from ..single.session import DecodeSession
 from .loop_state import ActiveRowLedger, ActiveRowState
 from .merged_one_token import (
     _new_generator,

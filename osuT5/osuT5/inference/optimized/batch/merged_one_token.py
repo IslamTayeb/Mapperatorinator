@@ -24,7 +24,7 @@ from ..benchmark import (
     summarize_batched_processor_candidate,
 )
 from ..exactness import ExactnessResultClass
-from ...direct_decode import DecodeSession
+from ..single.session import DecodeSession
 
 
 LogitsProcessorFactory = Callable[[], Any]

@@ -18,7 +18,7 @@ from typing import Any, Mapping, Sequence
 
 import torch
 
-from ...direct_decode import last_token_logits
+from ..single.session import last_token_logits
 from ....runtime_profiling import active_prefix_self_attention_context
 
 

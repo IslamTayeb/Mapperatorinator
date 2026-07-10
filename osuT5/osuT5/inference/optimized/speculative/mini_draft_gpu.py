@@ -18,7 +18,7 @@ from transformers.generation.logits_process import TopKLogitsWarper, TopPLogitsW
 from transformers.modeling_outputs import BaseModelOutput
 
 from osuT5.osuT5.inference.cache_utils import get_cache
-from osuT5.osuT5.inference.direct_decode import (
+from osuT5.osuT5.inference.optimized.single.session import (
     OneTokenDecodeState,
     decode_one_token_raw_logits,
     last_token_logits,

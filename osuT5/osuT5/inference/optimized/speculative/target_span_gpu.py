@@ -19,7 +19,7 @@ from transformers.generation.logits_process import (
 )
 
 from osuT5.osuT5.inference.cache_utils import MapperatorinatorCache, get_cache
-from osuT5.osuT5.inference.direct_decode import (
+from osuT5.osuT5.inference.optimized.single.session import (
     OneTokenDecodeState,
     decode_one_token_raw_logits,
     prefill_static_cache,

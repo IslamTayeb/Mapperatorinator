@@ -9,7 +9,7 @@ import torch
 from transformers.modeling_outputs import BaseModelOutput
 
 from ...cache_utils import get_cache
-from ...direct_decode import (
+from ..single.session import (
     DecodeSession,
     DecoderCacheState,
     EncoderState,
