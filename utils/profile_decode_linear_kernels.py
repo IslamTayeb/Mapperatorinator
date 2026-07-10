@@ -153,7 +153,7 @@ def _linear_variants(
         "mv": mv_linear,
     }
     if native_linear_variant:
-        from osuT5.osuT5.inference.native_linear import (
+        from osuT5.osuT5.inference.optimized.kernels.linear import (
             native_one_token_linear,
             native_one_token_linear_warp_group,
             preload_native_linear,

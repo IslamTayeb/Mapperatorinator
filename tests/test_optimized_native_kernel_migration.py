@@ -59,14 +59,21 @@ for name in sys.modules:
     assert completed.returncode == 0, completed.stderr
 
 
-def test_legacy_native_shim_import_has_no_optimized_or_cpp_extension_side_effect():
+def test_legacy_native_shims_have_no_optimized_or_cpp_extension_side_effect():
     completed = _run_fresh_python(
         """
 import importlib
 import sys
 
-importlib.import_module("osuT5.osuT5.inference.native_q1_attention")
+for name in (
+    "osuT5.osuT5.inference.native_q1_attention",
+    "osuT5.osuT5.inference.native_linear",
+    "osuT5.osuT5.inference.native_decoder_layer",
+):
+    importlib.import_module(name)
 assert "osuT5.osuT5.inference.optimized.kernels.q1_attention" not in sys.modules
+assert "osuT5.osuT5.inference.optimized.kernels.linear" not in sys.modules
+assert "osuT5.osuT5.inference.optimized.kernels.decoder_layer" not in sys.modules
 assert "torch.utils.cpp_extension" not in sys.modules
 """
     )

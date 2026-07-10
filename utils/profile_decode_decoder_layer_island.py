@@ -756,7 +756,7 @@ def _native_self_cross_prefix_variants(
     if capture.active_prefix_length <= 0:
         raise ValueError("native self+cross prefix candidate requires an active prefix")
 
-    from osuT5.osuT5.inference.native_decoder_layer import (
+    from osuT5.osuT5.inference.optimized.kernels.decoder_layer import (
         native_one_token_linear_residual,
         native_one_token_rmsnorm_linear,
         preload_native_decoder_layer,
@@ -849,7 +849,7 @@ def _native_decoder_layer_mlp_tail_variants(
     if activation_name not in {"GELUActivation", "gelu"}:
         raise ValueError(f"native decoder-layer MLP-tail candidate requires exact GELU, got {activation_name}")
 
-    from osuT5.osuT5.inference.native_decoder_layer import (
+    from osuT5.osuT5.inference.optimized.kernels.decoder_layer import (
         native_one_token_mlp_residual,
         preload_native_decoder_layer,
     )
@@ -904,7 +904,7 @@ def _native_cross_mlp_tail_variants(
     if activation_name not in {"GELUActivation", "gelu"}:
         raise ValueError(f"native cross+MLP tail candidate requires exact GELU, got {activation_name}")
 
-    from osuT5.osuT5.inference.native_decoder_layer import (
+    from osuT5.osuT5.inference.optimized.kernels.decoder_layer import (
         native_one_token_linear_residual,
         native_one_token_mlp_residual,
         native_one_token_rmsnorm_linear,
