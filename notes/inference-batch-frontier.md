@@ -471,6 +471,50 @@ notes/inference-mixed-queue-compatibility-report.json
 SHA-256 9dae2b72b96556bc6df2e4e7fd04faa0d7d992fa09ff4d903470af27dd56ef9c
 ```
 
+### Fixed-shape hybrid L2 control-gap result
+
+Job `49552768`, commit `682abdc`, measured the one authorized fixed-shape
+hybrid: two private B1 model graphs feed one captured B2 monotonic/temperature
+processor graph, followed by private captured TopP/softmax/multinomial tails
+with registered generators. The SALVALAI seq9, prefix-128, seeds
+`12345/23456`, 50-repeat gate passed bitwise processed scores/top-k, exact
+50-token transcripts, exact final RNG for both observed and output-discard
+timing runs, private resource ownership, five distinct graph pools, and both
+reciprocal orders.
+
+| Order | Complete output-discard wall | CUDA | Result |
+| --- | ---: | ---: | --- |
+| `0,1` | `670.026 tok/s` | `670.079 tok/s` | exact PASS |
+| `1,0` | `723.633 tok/s` | `723.691 tok/s` | exact PASS |
+
+The strict worst order is `+61.49%` over the reviewed L1 `414.905 tok/s` and
+`+68.39%` over the rejected original L2 `397.903 tok/s`; it clears both the
+`435.650` keep bar and the local `500` gate. Peak verifier allocation/reservation
+was `1,981,775,360 / 2,147,483,648` bytes, with zero timed-loop allocation
+delta. Report:
+
+```text
+/work/imt11/Mapperatorinator/runs/hybrid-l2-49552768-682abdc/hybrid-l2.json
+SHA-256 d7f47e5c174a8f3504401ec0d428b0070f4724e95971efc150c3d13007f343ef
+```
+
+This is not a queue or runtime result: it repeats one fixed prefix/cache
+position and excludes prefill/pack. Applying the worst fixed-shape point to the
+accepted five-song B1/B2/B3 event schedule gives an optimistic `566.904 tok/s`
+decode-only ceiling but only `459.985 tok/s` after the existing full linearized
+setup charge. Reaching setup-inclusive `500` would require reducing that
+`2.442s` setup datum by about `1.036s` (`42.43%`), assuming the fixed-shape
+decode rate survives changing prefixes and longer buckets. The next authorized
+step is one changing-prefix B2 verifier only; no scheduler, prefill optimization,
+or runtime wiring is authorized yet.
+
+Jobs `49552299` and `49552651` were setup-only CUDA-capture failures before any
+report or timing evidence. They exposed a CPU batch index and boolean advanced
+row indexing in the existing full-scan processor. Branch commits `79c644f` and
+`3c7a16f` made those two operations device-local/fixed-shape with randomized
+bitwise CPU parity. Those existing-file changes remain experiment-branch-only
+until normal V32 exactness and no-regression gates pass.
+
 ### CPU continuous-scheduler harness
 
 `osuT5/osuT5/inference/continuous_batching.py` models arrivals, activation, round-robin/FIFO decode, stop reasons, cache-slot acquire/release, and slot generations. Strict manifests validate token/count recomputation, lifecycle arithmetic, state hashes, active-batch histograms, and cache-slot balance.
