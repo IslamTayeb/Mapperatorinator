@@ -55,6 +55,7 @@ def test_optimized_engine_is_fp32_only():
 def test_optimized_engine_rejects_legacy_experiment_flags():
     args = InferenceConfig(
         inference_engine="optimized",
+        use_server=False,
         inference_generation_compile=True,
     )
 

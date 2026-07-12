@@ -88,7 +88,7 @@ class InferenceConfig:
     inference_native_decode_kernels: bool = False  # Reserved default-off native C++/CUDA/CUTLASS decode-kernel experiments
     inference_native_q1_self_attention: bool = False  # Experimental native fp32 q_len=1 active-prefix self-attention
     inference_native_q1_rope_cache_self_attention: bool = False  # Experimental fused RoPE/cache q_len=1 self-attention
-    use_server: bool = False  # Use server for optimized multiprocess inference
+    use_server: bool = True  # Use server for optimized multiprocess inference
     server_batch_timeout: float = 0.2  # Seconds the static inference server waits to coalesce queued requests
     max_batch_size: int = 16  # Maximum batch size for inference (only used for parallel sampling or super timing)
     profile_inference: bool = False  # Write stage and generation timing profile JSON
