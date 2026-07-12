@@ -142,7 +142,7 @@ interfaces, and `270.475 tok/s` remains the single-song frontier.
 | Native q1 self-attention | `49225493`, `c563af0` | `207.226 -> 237.111 tok/s`, exact output | map/main context only |
 | Fused RoPE/cache/native self-attention | `49230082`, `d7b8684` | `248.015 -> 270.475 tok/s`, exact output | current frontier |
 
-Detailed artifacts and scoped regression notes are indexed in [the experiment ledger](inference-experiment-ledger.md).
+Detailed artifacts and scoped regression notes are indexed in [the experiment ledger](../inference-experiment-ledger.md).
 
 ## Realistic Multi-Song Serial Evidence
 
@@ -348,4 +348,4 @@ Do not restart these without new current-stack evidence:
 - cold native-extension compilation as a synchronized model-TPS target;
 - documented-drift/native reordering without explicit approval.
 
-See [the experiment ledger](inference-experiment-ledger.md) for the representative job, commit, artifact, and revisit condition for each family.
+See [the experiment ledger](../inference-experiment-ledger.md) for the representative job, commit, artifact, and revisit condition for each family.

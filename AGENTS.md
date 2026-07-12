@@ -2,7 +2,7 @@
 
 ## Safety
 
-- Fail loudly, preserve unrelated changes, and avoid backward compatibility unless requested.
+- Fail loudly, preserve unrelated changes, and avoid compatibility work outside declared compatibility surfaces unless requested.
 - Never commit generated beatmaps, audio, weights, profiles, traces, caches, native builds, or other run artifacts.
 - Keep profiling and optimized/native imports opt-in. Default inference must remain quiet and cold.
 - Use short-lived branches and persistent worktrees for experiments. Commit and push reproducible checkpoints before remote jobs.
@@ -17,7 +17,7 @@
 ## Evidence and promotion
 
 - Exact claims preserve token IDs/counts, stopping, RNG, timing/main semantics, request-local mutable state, and final `.osu` bytes. Any relaxation is documented drift, not exactness.
-- Compare like with like. Single-song claims use synchronized untraced model time; queue claims use direct first-main-to-last-main wall. Keep single, serial queue, offline batch, and server modes separate.
+- Compare like with like. Single-song claims use synchronized untraced model time; batch promotion requires both first-main-to-last-main scheduler wall and complete request-to-output wall. Keep single, serial queue, offline batch, and server modes separate.
 - Start from a current profile and a falsifiable end-to-end hypothesis. Prove at least `5%` realistic headroom before production work.
 - Promote one gate at a time: component -> real tensors -> short loop -> smoke -> full song -> queue.
 - Stop on the first exactness, ownership, memory, negative-wall, or insufficient-gain failure. Remove candidate runtime wiring, keep reusable verifier infrastructure, and record the lesson and revisit condition.

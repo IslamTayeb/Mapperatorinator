@@ -8,7 +8,7 @@ revisit conditions live in the
 ## Metrics
 
 - Single song: synchronized, untraced main-generation model time.
-- Offline queue: aggregate main tokens divided by direct wall from first main start to last main finish.
+- Offline queue: report both aggregate main tokens over first-main-to-last-main scheduler wall and complete request-to-final-output wall.
 - Traces, CUDA events, projections, and component timings are diagnostic; they are not end-to-end throughput.
 - Keep cold, warm, serial queue, offline batch, and server measurements separate.
 
@@ -47,7 +47,7 @@ wrapper receives that checkout explicitly.
 Canonical locations:
 
 ```bash
-REPO=/hpc/group/romerolab/imt11/projects/Mapperatorinator
+BASE_REPO=/hpc/group/romerolab/imt11/projects/Mapperatorinator
 ENV=/hpc/group/romerolab/imt11/envs/mapperatorinator
 WORK=/work/imt11/Mapperatorinator
 
@@ -57,6 +57,9 @@ export HF_HOME="$WORK/cache/huggingface"
 export TMPDIR="$WORK/tmp"
 export TOKENIZERS_PARALLELISM=false
 ```
+
+`BASE_REPO` is the shared main checkout. Experiment wrappers must use their
+explicit branch worktree instead.
 
 Keep model, compiler, extension, graph, and Hugging Face cache state identical
 within a comparison. Push the exact commit before submission and make wrappers
@@ -78,7 +81,7 @@ Then advance one boundary at a time:
 3. short, then 256-step token/logit/RNG loop;
 4. 15-second smoke;
 5. reciprocal full-song comparison;
-6. direct multi-song queue wall.
+6. direct multi-song scheduler and complete request wall.
 
 A lower gate authorizes only the next gate. Stop immediately when exactness,
 ownership, memory, direct wall, or the `5%` signal fails.
@@ -95,7 +98,7 @@ For every retained result, record:
 - artifact paths and hashes;
 - accept/reject decision and the evidence required to revisit it.
 
-Use `utils/summarize_inference_profile.py --compare BASE CANDIDATE
---strict-full-song` for full-song comparisons. Run tracing separately from
+Use `utils/summarize_inference_profile.py --compare BASE CANDIDATE --strict-full-song`
+for full-song comparisons. Run tracing separately from
 primary timing. Never use stale server sockets, sample stopped/dummy rows, or
 share mutable request state in an exact batch claim.
