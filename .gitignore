@@ -1,17 +1,59 @@
-.venv
-__pycache__
-logs
-logs_fid
-multirun
-tensorboard_logs
-.idea
-test
-test_inference.py
-test_inference_mai_mod.py
-*.lck
+# Local environments, secrets, and editor state
+.venv/
 .env
-.vscode
+.idea/
+.vscode/
+.cursor/
+
+# Python and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Builds and native artifacts
+build/
+dist/
+*.egg-info/
+*.so
+*.o
+*.a
+
+# Runtime output and caches
+logs/
+logs_fid/
+multirun/
+tensorboard_logs/
+runs/
+outputs/
+profiles/
+traces/
+cache/
+.cache/
+.hydra/
+*.lck
+*.log
+*.tmp
+slurm-*.out
+
+# Profilers
 *.profile.json
 *.trace.json
+*.nsys-rep
+*.ncu-rep
 attention_kernel_profile*.json
 attention_kernel_profile*.txt
+
+# Model weights must be fetched, not committed
+*.safetensors
+*.ckpt
+*.pth
+*.pt
+
+# Local inference scratch retained from upstream conventions
+test/
+test_inference.py
+test_inference_mai_mod.py

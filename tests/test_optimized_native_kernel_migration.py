@@ -67,13 +67,9 @@ import sys
 
 for name in (
     "osuT5.osuT5.inference.native_q1_attention",
-    "osuT5.osuT5.inference.native_linear",
-    "osuT5.osuT5.inference.native_decoder_layer",
 ):
     importlib.import_module(name)
 assert "osuT5.osuT5.inference.optimized.kernels.q1_attention" not in sys.modules
-assert "osuT5.osuT5.inference.optimized.kernels.linear" not in sys.modules
-assert "osuT5.osuT5.inference.optimized.kernels.decoder_layer" not in sys.modules
 assert "torch.utils.cpp_extension" not in sys.modules
 """
     )

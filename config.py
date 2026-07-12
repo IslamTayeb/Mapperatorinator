@@ -88,15 +88,6 @@ class InferenceConfig:
     inference_native_decode_kernels: bool = False  # Reserved default-off native C++/CUDA/CUTLASS decode-kernel experiments
     inference_native_q1_self_attention: bool = False  # Experimental native fp32 q_len=1 active-prefix self-attention
     inference_native_q1_rope_cache_self_attention: bool = False  # Experimental fused RoPE/cache q_len=1 self-attention
-    inference_continuous_batching: bool = False  # Reserved server-side continuous batching mode; not implemented yet
-    inference_continuous_batching_mode: str = "disabled"  # Reserved scheduler mode for future continuous batching
-    continuous_batch_max_active_sequences: int = 0  # Reserved max active decode sequences for future continuous batching
-    continuous_batch_max_wait_ms: int = 0  # Reserved scheduler wait budget for future continuous batching
-    continuous_batch_prefill_policy: str = "serial"  # Reserved prefill policy for future continuous batching
-    continuous_batch_decode_order_policy: str = "serial"  # Reserved decode ordering policy for future continuous batching
-    continuous_batch_rng_policy: str = "serial_global"  # Reserved RNG policy for future continuous batching
-    inference_batch_decode_session_runtime: bool = False  # Reserved batch-specific DecodeSession runtime flag
-    inference_batch_native_decode_kernels: bool = False  # Reserved batch-specific native kernel flag
     use_server: bool = False  # Use server for optimized multiprocess inference
     server_batch_timeout: float = 0.2  # Seconds the static inference server waits to coalesce queued requests
     max_batch_size: int = 16  # Maximum batch size for inference (only used for parallel sampling or super timing)
