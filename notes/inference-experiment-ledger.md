@@ -1,8 +1,8 @@
 # Inference Decision Ledger
 
 This is a family-level decision index, not a chronological lab notebook.
-Detailed experiment narratives and artifact references remain in
-[`archive/`](archive/) and Git history.
+Deleted experiment narratives remain available through Git history; large
+reports and traces remain in their recorded DCC locations while retained.
 
 | Family | Decision | Durable lesson | Revisit only when |
 | --- | --- | --- | --- |
@@ -26,5 +26,5 @@ evidence that invalidates a family-level revisit condition. Do not rerun an old
 idea merely because its isolated number was promising.
 
 Historical artifact hashes, intermediate failures, and per-job commands are
-evidence, not standing instructions. Consult the archive only when auditing a
-specific decision.
+evidence, not standing instructions. Use Git history only when auditing a
+specific old decision.

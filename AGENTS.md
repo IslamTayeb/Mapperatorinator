@@ -34,4 +34,3 @@
 - Operations: `docs/inference_profiling.md`
 - Current state: `notes/inference-status.md`
 - Decisions: `notes/inference-experiment-ledger.md`
-- Old experiment narratives: `notes/archive/` (evidence only; do not treat as current guidance)
