@@ -107,9 +107,14 @@ def _load_args(config_name: str, overrides: list[str]):
     import hydra
     from omegaconf import DictConfig, OmegaConf
 
-    config_dir = REPO_ROOT / "configs" / "inference"
+    config_dir = REPO_ROOT / "configs"
+    resolved_name = (
+        config_name
+        if config_name.startswith("inference/")
+        else f"inference/{config_name}"
+    )
     with hydra.initialize_config_dir(config_dir=str(config_dir), version_base="1.1"):
-        cfg = hydra.compose(config_name=config_name, overrides=overrides)
+        cfg = hydra.compose(config_name=resolved_name, overrides=overrides)
     return OmegaConf.to_object(cfg) if isinstance(cfg, DictConfig) else cfg
 
 
@@ -1032,14 +1037,9 @@ def profile_native_prefix_dtype_scout(
     from osuT5.osuT5.inference.optimized.scout.q1_attention import (
         preload_native_q1_attention,
     )
-    from osuT5.osuT5.inference.optimized.scout.native_linear import (
-        preload_scout_native_linear,
-    )
-
     torch.cuda.synchronize()
     extension_started = time.perf_counter()
     preload_native_q1_attention()
-    preload_scout_native_linear()
     torch.cuda.synchronize()
     extension_preload_seconds = time.perf_counter() - extension_started
 

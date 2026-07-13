@@ -20,11 +20,6 @@ from ...runtime_dispatch import (
     attention_runtime_hooks,
     attention_runtime_hooks_context,
 )
-from .native_linear import (
-    preload_scout_native_linear,
-    scout_one_token_linear_residual,
-    scout_one_token_rmsnorm_linear,
-)
 from .q1_attention import (
     native_q1_attention,
     native_q1_rope_cache_attention,
@@ -146,11 +141,6 @@ def _norm(module: torch.nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
     return fp32_rms_norm(hidden_states, weight, getattr(module, "eps", None))
 
 
-def _norm_eps(module: torch.nn.Module, dtype: torch.dtype) -> float:
-    eps = getattr(module, "eps", None)
-    return float(torch.finfo(dtype).eps if eps is None else eps)
-
-
 def _validate_prefix_inputs(
     module: torch.nn.Module,
     *,
@@ -252,10 +242,8 @@ def _prefix(
     cache_position: torch.Tensor,
     position_ids: torch.Tensor,
     active_prefix_length: int,
-    native_linear: bool,
     self_attention_fn: Callable[..., torch.Tensor] | None,
     cross_attention_fn: Callable[..., torch.Tensor] | None,
-    outputs_per_block: int,
 ) -> torch.Tensor:
     dtype, _, self_keys, self_values, cross_keys, cross_values = _validate_prefix_inputs(
         module,
@@ -271,22 +259,12 @@ def _prefix(
     active_mask = _trim_mask(attention_mask, active_prefix_length)
 
     residual = hidden_states
-    if native_linear:
-        qkv_projection = scout_one_token_rmsnorm_linear(
-            hidden_states,
-            module.self_attn_layer_norm.weight,
-            self_attn.Wqkv.weight,
-            self_attn.Wqkv.bias,
-            eps=_norm_eps(module.self_attn_layer_norm, dtype),
-            outputs_per_block=outputs_per_block,
-        )
-    else:
-        normalized = _norm(module.self_attn_layer_norm, hidden_states)
-        qkv_projection = F.linear(
-            normalized,
-            self_attn.Wqkv.weight,
-            self_attn.Wqkv.bias,
-        )
+    normalized = _norm(module.self_attn_layer_norm, hidden_states)
+    qkv_projection = F.linear(
+        normalized,
+        self_attn.Wqkv.weight,
+        self_attn.Wqkv.bias,
+    )
     qkv = qkv_projection.view(1, 1, 3, self_attn.num_heads, self_attn.head_dim)
     cos, sin = self_attn.rotary_emb(qkv, position_ids=position_ids)
     if self_attention_fn is not None:
@@ -316,34 +294,15 @@ def _prefix(
     self_output = self_output.transpose(1, 2).contiguous().view(
         1, 1, self_attn.all_head_size
     )
-    if native_linear:
-        hidden_states = scout_one_token_linear_residual(
-            self_output,
-            residual,
-            self_attn.Wo.weight,
-            self_attn.Wo.bias,
-            outputs_per_block=outputs_per_block,
-        )
-    else:
-        hidden_states = residual + F.linear(
-            self_output,
-            self_attn.Wo.weight,
-            self_attn.Wo.bias,
-        )
+    hidden_states = residual + F.linear(
+        self_output,
+        self_attn.Wo.weight,
+        self_attn.Wo.bias,
+    )
 
     residual = hidden_states
-    if native_linear:
-        query = scout_one_token_rmsnorm_linear(
-            hidden_states,
-            module.cross_attn_layer_norm.weight,
-            cross_attn.Wq.weight,
-            cross_attn.Wq.bias,
-            eps=_norm_eps(module.cross_attn_layer_norm, dtype),
-            outputs_per_block=outputs_per_block,
-        )
-    else:
-        normalized = _norm(module.cross_attn_layer_norm, hidden_states)
-        query = F.linear(normalized, cross_attn.Wq.weight, cross_attn.Wq.bias)
+    normalized = _norm(module.cross_attn_layer_norm, hidden_states)
+    query = F.linear(normalized, cross_attn.Wq.weight, cross_attn.Wq.bias)
     query = query.view(1, 1, cross_attn.num_heads, cross_attn.head_dim).transpose(1, 2)
     cross_output = (
         cross_attention_fn(query, cross_keys, cross_values, None)
@@ -353,20 +312,11 @@ def _prefix(
     cross_output = cross_output.transpose(1, 2).contiguous().view(
         1, 1, cross_attn.all_head_size
     )
-    if native_linear:
-        hidden_states = scout_one_token_linear_residual(
-            cross_output,
-            residual,
-            cross_attn.Wo.weight,
-            cross_attn.Wo.bias,
-            outputs_per_block=outputs_per_block,
-        )
-    else:
-        hidden_states = residual + F.linear(
-            cross_output,
-            cross_attn.Wo.weight,
-            cross_attn.Wo.bias,
-        )
+    hidden_states = residual + F.linear(
+        cross_output,
+        cross_attn.Wo.weight,
+        cross_attn.Wo.bias,
+    )
     output = _mlp_tail(module, hidden_states)
     if output.dtype != dtype:
         raise RuntimeError("native-prefix scout changed the storage dtype")
@@ -393,10 +343,8 @@ def framework_prefix(
         cache_position=cache_position,
         position_ids=position_ids,
         active_prefix_length=active_prefix_length,
-        native_linear=False,
         self_attention_fn=None,
         cross_attention_fn=None,
-        outputs_per_block=4,
     )
 
 
@@ -424,10 +372,8 @@ def accepted_fp32_prefix(
         cache_position=cache_position,
         position_ids=position_ids,
         active_prefix_length=active_prefix_length,
-        native_linear=False,
         self_attention_fn=accepted_self,
         cross_attention_fn=None,
-        outputs_per_block=4,
     )
 
 
@@ -441,9 +387,7 @@ def native_prefix(
     cache_position: torch.Tensor,
     position_ids: torch.Tensor,
     active_prefix_length: int,
-    outputs_per_block: int = 4,
 ) -> torch.Tensor:
-    preload_scout_native_linear()
     return _prefix(
         module,
         hidden_states=hidden_states,
@@ -453,10 +397,8 @@ def native_prefix(
         cache_position=cache_position,
         position_ids=position_ids,
         active_prefix_length=active_prefix_length,
-        native_linear=True,
         self_attention_fn=native_q1_rope_cache_attention,
         cross_attention_fn=native_q1_attention,
-        outputs_per_block=outputs_per_block,
     )
 
 
