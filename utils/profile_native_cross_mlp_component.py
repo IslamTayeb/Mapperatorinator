@@ -3,13 +3,18 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 import time
 from typing import Any
 
-import torch
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-from osuT5.osuT5.runtime_profiling import generation_profile_context
-from utils.profile_native_prefix_dtype_scout import (
+import torch  # noqa: E402
+
+from osuT5.osuT5.runtime_profiling import generation_profile_context  # noqa: E402
+from utils.profile_native_prefix_dtype_scout import (  # noqa: E402
     CapturedGraph,
     _accepted_main_session_run,
     _all_cache_snapshots,
