@@ -13,7 +13,7 @@
 - Put optimized runtimes, schedulers, exactness logic, kernels, batching, and speculative work under `osuT5/osuT5/inference/optimized/`.
 - Outside that package, allow only lazy selectors, validation, metadata, shared preparation/assembly, and narrow dispatch hooks.
 - `inference.py` is the selector. `Processor` owns shared window preparation and output assembly. `server.py` remains V32-only until a separately approved optimized-server plan exists.
-- The fork exposes only `inference_engine=v32|optimized` and `profile_inference`. The optimized engine is one immutable accepted preset; do not add combinable tuning flags or legacy shims.
+- The fork exposes only `inference_engine=v32|optimized` and `profile_inference`. Keep profiling false by default, enable it for inference development and before/after verification, and treat the optimized engine as one immutable preset without combinable tuning flags or legacy shims.
 
 ## Evidence and promotion
 
