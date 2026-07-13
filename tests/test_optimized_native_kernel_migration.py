@@ -98,18 +98,45 @@ def test_q1_kernel_import_does_not_build_and_loader_is_singleton(monkeypatch):
     assert "#include <cuda_fp16.h>" in source
     assert "#include <c10/cuda/CUDAGuard.h>" in source
     assert source.count("c10::cuda::CUDAGuard") == 2
-    assert "q1_attention_kernel<block_size>" in source
-    assert "q1_rope_cache_attention_kernel<block_size>" in source
-    assert "q1_attention_half_kernel<block_size>" in source
-    assert "q1_rope_cache_attention_half_kernel<block_size>" in source
+    assert source.count("__global__ void q1_attention_kernel(") == 1
+    assert source.count("__global__ void q1_rope_cache_attention_kernel(") == 1
+    assert "q1_attention_half_kernel" not in source
+    assert "q1_rope_cache_attention_half_kernel" not in source
+    assert "q1_attention_kernel<float, block_size>" in source
+    assert "q1_attention_kernel<__half, block_size>" in source
+    assert "q1_rope_cache_attention_kernel<float, block_size>" in source
+    assert "q1_rope_cache_attention_kernel<__half, block_size>" in source
     assert "q.scalar_type() == torch::kFloat32 || q.scalar_type() == torch::kFloat16" in source
     assert "qkv.scalar_type() == torch::kFloat32 || qkv.scalar_type() == torch::kFloat16" in source
-    assert "float score = 0.0f" in source
-    assert "float denom = 0.0f" in source
-    assert "float numer = 0.0f" in source
-    assert "__half2float" in source
-    assert "__float2half_rn" in source
-    assert source.count('asm("trap;")') == 2
+    float_traits_start = source.index("struct Q1ScalarTraits<float>")
+    half_traits_start = source.index("struct Q1ScalarTraits<__half>")
+    q1_body_start = source.index("__global__ void q1_attention_kernel(")
+    q1_wrapper_start = source.index("torch::Tensor q1_attention(")
+    fused_body_start = source.index("__global__ void q1_rope_cache_attention_kernel(")
+    fused_wrapper_start = source.index("torch::Tensor q1_rope_cache_attention(")
+    float_traits = source[float_traits_start:half_traits_start]
+    half_traits = source[half_traits_start:q1_body_start]
+    q1_body = source[q1_body_start:q1_wrapper_start]
+    fused_body = source[fused_body_start:fused_wrapper_start]
+
+    assert float_traits.count("return value;") == 2
+    assert "__half2float" not in float_traits
+    assert "__float2half_rn" not in float_traits
+    assert "return __half2float(value);" in half_traits
+    assert "return __float2half_rn(value);" in half_traits
+    assert source.count("__half2float") == 1
+    assert source.count("__float2half_rn") == 1
+    for body in (q1_body, fused_body):
+        assert "using Traits = Q1ScalarTraits<scalar_t>;" in body
+        assert "Traits::load" in body
+        assert "Traits::store" in body
+        assert "__half2float" not in body
+        assert "__float2half_rn" not in body
+        assert "float score = 0.0f" in body
+        assert "float denom = 0.0f" in body
+        assert "float numer = 0.0f" in body
+        assert "extern __shared__ float shared_mem[]" in body
+    assert source.count('asm("trap;")') == 1
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])

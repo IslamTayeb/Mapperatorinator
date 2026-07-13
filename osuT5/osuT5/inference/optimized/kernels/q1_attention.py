@@ -138,13 +138,38 @@ def _load_native_q1_attention():
 #include <cuda_runtime.h>
 #include <cfloat>
 
-template<int BLOCK_SIZE>
+template<typename scalar_t>
+struct Q1ScalarTraits;
+
+template<>
+struct Q1ScalarTraits<float> {
+    __device__ __forceinline__ static float load(float value) {
+        return value;
+    }
+
+    __device__ __forceinline__ static float store(float value) {
+        return value;
+    }
+};
+
+template<>
+struct Q1ScalarTraits<__half> {
+    __device__ __forceinline__ static float load(__half value) {
+        return __half2float(value);
+    }
+
+    __device__ __forceinline__ static __half store(float value) {
+        return __float2half_rn(value);
+    }
+};
+
+template<typename scalar_t, int BLOCK_SIZE>
 __global__ void q1_attention_kernel(
-        const float* __restrict__ q,
-        const float* __restrict__ k,
-        const float* __restrict__ v,
+        const scalar_t* __restrict__ q,
+        const scalar_t* __restrict__ k,
+        const scalar_t* __restrict__ v,
         const float* __restrict__ mask,
-        float* __restrict__ out,
+        scalar_t* __restrict__ out,
         int heads,
         int kv_len,
         int head_dim,
@@ -163,9 +188,10 @@ __global__ void q1_attention_kernel(
         return;
     }
 
-    const float* qh = q + head * q_head_stride;
-    const float* kh = k + head * k_head_stride;
-    const float* vh = v + head * v_head_stride;
+    using Traits = Q1ScalarTraits<scalar_t>;
+    const scalar_t* qh = q + head * q_head_stride;
+    const scalar_t* kh = k + head * k_head_stride;
+    const scalar_t* vh = v + head * v_head_stride;
     const float scale = rsqrtf(static_cast<float>(head_dim));
     extern __shared__ float shared_mem[];
     float* scores = shared_mem;
@@ -174,94 +200,10 @@ __global__ void q1_attention_kernel(
     float max_score = -FLT_MAX;
     for (int pos = tid; pos < kv_len; pos += BLOCK_SIZE) {
         float score = 0.0f;
-        const float* kp = kh + pos * k_len_stride;
+        const scalar_t* kp = kh + pos * k_len_stride;
         for (int d = 0; d < head_dim; ++d) {
-            score += qh[d * q_dim_stride] * kp[d * k_dim_stride];
-        }
-        score *= scale;
-        if (has_mask) {
-            score += mask[pos];
-        }
-        scores[pos] = score;
-        max_score = fmaxf(max_score, score);
-    }
-
-    scratch[tid] = max_score;
-    __syncthreads();
-    for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
-        }
-        __syncthreads();
-    }
-    max_score = scratch[0];
-
-    float denom = 0.0f;
-    for (int pos = tid; pos < kv_len; pos += BLOCK_SIZE) {
-        float weight = expf(scores[pos] - max_score);
-        scores[pos] = weight;
-        denom += weight;
-    }
-
-    scratch[tid] = denom;
-    __syncthreads();
-    for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            scratch[tid] += scratch[tid + stride];
-        }
-        __syncthreads();
-    }
-    denom = scratch[0];
-
-    for (int dim = tid; dim < head_dim; dim += BLOCK_SIZE) {
-        float numer = 0.0f;
-        for (int pos = 0; pos < kv_len; ++pos) {
-            numer += scores[pos] * vh[pos * v_len_stride + dim * v_dim_stride];
-        }
-        out[head * head_dim + dim] = numer / denom;
-    }
-}
-
-template<int BLOCK_SIZE>
-__global__ void q1_attention_half_kernel(
-        const __half* __restrict__ q,
-        const __half* __restrict__ k,
-        const __half* __restrict__ v,
-        const float* __restrict__ mask,
-        __half* __restrict__ out,
-        int heads,
-        int kv_len,
-        int head_dim,
-        long long q_head_stride,
-        long long q_dim_stride,
-        long long k_head_stride,
-        long long k_len_stride,
-        long long k_dim_stride,
-        long long v_head_stride,
-        long long v_len_stride,
-        long long v_dim_stride,
-        int has_mask) {
-    int head = blockIdx.x;
-    int tid = threadIdx.x;
-    if (head >= heads) {
-        return;
-    }
-
-    const __half* qh = q + head * q_head_stride;
-    const __half* kh = k + head * k_head_stride;
-    const __half* vh = v + head * v_head_stride;
-    const float scale = rsqrtf(static_cast<float>(head_dim));
-    extern __shared__ float shared_mem[];
-    float* scores = shared_mem;
-    float* scratch = shared_mem + kv_len;
-
-    float max_score = -FLT_MAX;
-    for (int pos = tid; pos < kv_len; pos += BLOCK_SIZE) {
-        float score = 0.0f;
-        const __half* kp = kh + pos * k_len_stride;
-        for (int d = 0; d < head_dim; ++d) {
-            score += __half2float(qh[d * q_dim_stride])
-                    * __half2float(kp[d * k_dim_stride]);
+            score += Traits::load(qh[d * q_dim_stride])
+                    * Traits::load(kp[d * k_dim_stride]);
         }
         score *= scale;
         if (has_mask) {
@@ -302,9 +244,9 @@ __global__ void q1_attention_half_kernel(
         float numer = 0.0f;
         for (int pos = 0; pos < kv_len; ++pos) {
             numer += scores[pos]
-                    * __half2float(vh[pos * v_len_stride + dim * v_dim_stride]);
+                    * Traits::load(vh[pos * v_len_stride + dim * v_dim_stride]);
         }
-        out[head * head_dim + dim] = __float2half_rn(numer / denom);
+        out[head * head_dim + dim] = Traits::store(numer / denom);
     }
 }
 
@@ -344,7 +286,7 @@ torch::Tensor q1_attention(torch::Tensor q, torch::Tensor k, torch::Tensor v, c1
     size_t shared_bytes = static_cast<size_t>(kv_len + block_size) * sizeof(float);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     if (q.scalar_type() == torch::kFloat32) {
-        q1_attention_kernel<block_size><<<grid, block, shared_bytes, stream>>>(
+        q1_attention_kernel<float, block_size><<<grid, block, shared_bytes, stream>>>(
             q.data_ptr<float>(),
             k.data_ptr<float>(),
             v.data_ptr<float>(),
@@ -364,7 +306,7 @@ torch::Tensor q1_attention(torch::Tensor q, torch::Tensor k, torch::Tensor v, c1
             has_mask
         );
     } else {
-        q1_attention_half_kernel<block_size><<<grid, block, shared_bytes, stream>>>(
+        q1_attention_kernel<__half, block_size><<<grid, block, shared_bytes, stream>>>(
             reinterpret_cast<const __half*>(q.data_ptr()),
             reinterpret_cast<const __half*>(k.data_ptr()),
             reinterpret_cast<const __half*>(v.data_ptr()),
@@ -388,16 +330,16 @@ torch::Tensor q1_attention(torch::Tensor q, torch::Tensor k, torch::Tensor v, c1
     return output;
 }
 
-template<int BLOCK_SIZE>
+template<typename scalar_t, int BLOCK_SIZE>
 __global__ void q1_rope_cache_attention_kernel(
-        const float* __restrict__ qkv,
-        float* __restrict__ cache_keys,
-        float* __restrict__ cache_values,
-        const float* __restrict__ cos,
-        const float* __restrict__ sin,
+        const scalar_t* __restrict__ qkv,
+        scalar_t* __restrict__ cache_keys,
+        scalar_t* __restrict__ cache_values,
+        const scalar_t* __restrict__ cos,
+        const scalar_t* __restrict__ sin,
         const int64_t* __restrict__ cache_position,
         const float* __restrict__ mask,
-        float* __restrict__ out,
+        scalar_t* __restrict__ out,
         int heads,
         int active_prefix_len,
         int max_cache_len,
@@ -417,6 +359,7 @@ __global__ void q1_rope_cache_attention_kernel(
         return;
     }
 
+    using Traits = Q1ScalarTraits<scalar_t>;
     int write_pos = static_cast<int>(cache_position[0]);
     if (write_pos < 0 || write_pos >= active_prefix_len || write_pos >= max_cache_len) {
         asm("trap;");
@@ -432,131 +375,18 @@ __global__ void q1_rope_cache_attention_kernel(
     for (int dim = tid; dim < head_dim; dim += BLOCK_SIZE) {
         const int rotated_dim = dim < half_dim ? dim + half_dim : dim - half_dim;
         const float sign = dim < half_dim ? -1.0f : 1.0f;
-        const float cos_v = cos[dim * cos_dim_stride];
-        const float sin_v = sin[dim * sin_dim_stride];
+        const float cos_v = Traits::load(cos[dim * cos_dim_stride]);
+        const float sin_v = Traits::load(sin[dim * sin_dim_stride]);
         const long long q_base = head * qkv_head_stride;
-        const float q_raw = qkv[q_base + 0 * qkv_qkv_stride + dim * qkv_dim_stride];
-        const float q_rot_raw = qkv[q_base + 0 * qkv_qkv_stride + rotated_dim * qkv_dim_stride];
-        const float k_raw = qkv[q_base + 1 * qkv_qkv_stride + dim * qkv_dim_stride];
-        const float k_rot_raw = qkv[q_base + 1 * qkv_qkv_stride + rotated_dim * qkv_dim_stride];
-        const float v_raw = qkv[q_base + 2 * qkv_qkv_stride + dim * qkv_dim_stride];
-        const float q_value = q_raw * cos_v + sign * q_rot_raw * sin_v;
-        const float k_value = k_raw * cos_v + sign * k_rot_raw * sin_v;
-        query_shared[dim] = q_value;
-        cache_keys[head * cache_head_stride + write_pos * cache_len_stride + dim * cache_dim_stride] = k_value;
-        cache_values[head * cache_head_stride + write_pos * cache_len_stride + dim * cache_dim_stride] = v_raw;
-    }
-    __syncthreads();
-
-    float max_score = -FLT_MAX;
-    for (int pos = tid; pos < active_prefix_len; pos += BLOCK_SIZE) {
-        float score = 0.0f;
-        const float* kp = cache_keys + head * cache_head_stride + pos * cache_len_stride;
-        for (int dim = 0; dim < head_dim; ++dim) {
-            score += query_shared[dim] * kp[dim * cache_dim_stride];
-        }
-        score *= scale;
-        if (has_mask) {
-            score += mask[pos];
-        }
-        scores[pos] = score;
-        max_score = fmaxf(max_score, score);
-    }
-
-    scratch[tid] = max_score;
-    __syncthreads();
-    for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
-        }
-        __syncthreads();
-    }
-    max_score = scratch[0];
-
-    float denom = 0.0f;
-    for (int pos = tid; pos < active_prefix_len; pos += BLOCK_SIZE) {
-        float weight = expf(scores[pos] - max_score);
-        scores[pos] = weight;
-        denom += weight;
-    }
-
-    scratch[tid] = denom;
-    __syncthreads();
-    for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            scratch[tid] += scratch[tid + stride];
-        }
-        __syncthreads();
-    }
-    denom = scratch[0];
-
-    for (int dim = tid; dim < head_dim; dim += BLOCK_SIZE) {
-        float numer = 0.0f;
-        for (int pos = 0; pos < active_prefix_len; ++pos) {
-            numer += scores[pos] * cache_values[
-                head * cache_head_stride + pos * cache_len_stride + dim * cache_dim_stride
-            ];
-        }
-        out[head * head_dim + dim] = numer / denom;
-    }
-}
-
-template<int BLOCK_SIZE>
-__global__ void q1_rope_cache_attention_half_kernel(
-        const __half* __restrict__ qkv,
-        __half* __restrict__ cache_keys,
-        __half* __restrict__ cache_values,
-        const __half* __restrict__ cos,
-        const __half* __restrict__ sin,
-        const int64_t* __restrict__ cache_position,
-        const float* __restrict__ mask,
-        __half* __restrict__ out,
-        int heads,
-        int active_prefix_len,
-        int max_cache_len,
-        int head_dim,
-        long long qkv_qkv_stride,
-        long long qkv_head_stride,
-        long long qkv_dim_stride,
-        long long cache_head_stride,
-        long long cache_len_stride,
-        long long cache_dim_stride,
-        long long cos_dim_stride,
-        long long sin_dim_stride,
-        int has_mask) {
-    int head = blockIdx.x;
-    int tid = threadIdx.x;
-    if (head >= heads) {
-        return;
-    }
-
-    int write_pos = static_cast<int>(cache_position[0]);
-    if (write_pos < 0 || write_pos >= active_prefix_len || write_pos >= max_cache_len) {
-        asm("trap;");
-        return;
-    }
-    const int half_dim = head_dim / 2;
-    const float scale = rsqrtf(static_cast<float>(head_dim));
-    extern __shared__ float shared_mem[];
-    float* scores = shared_mem;
-    float* scratch = shared_mem + active_prefix_len;
-    float* query_shared = scratch + BLOCK_SIZE;
-
-    for (int dim = tid; dim < head_dim; dim += BLOCK_SIZE) {
-        const int rotated_dim = dim < half_dim ? dim + half_dim : dim - half_dim;
-        const float sign = dim < half_dim ? -1.0f : 1.0f;
-        const float cos_v = __half2float(cos[dim * cos_dim_stride]);
-        const float sin_v = __half2float(sin[dim * sin_dim_stride]);
-        const long long q_base = head * qkv_head_stride;
-        const float q_raw = __half2float(
+        const float q_raw = Traits::load(
             qkv[q_base + 0 * qkv_qkv_stride + dim * qkv_dim_stride]);
-        const float q_rot_raw = __half2float(
+        const float q_rot_raw = Traits::load(
             qkv[q_base + 0 * qkv_qkv_stride + rotated_dim * qkv_dim_stride]);
-        const float k_raw = __half2float(
+        const float k_raw = Traits::load(
             qkv[q_base + 1 * qkv_qkv_stride + dim * qkv_dim_stride]);
-        const float k_rot_raw = __half2float(
+        const float k_rot_raw = Traits::load(
             qkv[q_base + 1 * qkv_qkv_stride + rotated_dim * qkv_dim_stride]);
-        const float v_raw = __half2float(
+        const float v_raw = Traits::load(
             qkv[q_base + 2 * qkv_qkv_stride + dim * qkv_dim_stride]);
         const float q_value = q_raw * cos_v + sign * q_rot_raw * sin_v;
         const float k_value = k_raw * cos_v + sign * k_rot_raw * sin_v;
@@ -565,21 +395,22 @@ __global__ void q1_rope_cache_attention_half_kernel(
             head * cache_head_stride
             + write_pos * cache_len_stride
             + dim * cache_dim_stride
-        ] = __float2half_rn(k_value);
+        ] = Traits::store(k_value);
         cache_values[
             head * cache_head_stride
             + write_pos * cache_len_stride
             + dim * cache_dim_stride
-        ] = __float2half_rn(v_raw);
+        ] = Traits::store(v_raw);
     }
     __syncthreads();
 
     float max_score = -FLT_MAX;
     for (int pos = tid; pos < active_prefix_len; pos += BLOCK_SIZE) {
         float score = 0.0f;
-        const __half* kp = cache_keys + head * cache_head_stride + pos * cache_len_stride;
+        const scalar_t* kp = cache_keys + head * cache_head_stride + pos * cache_len_stride;
         for (int dim = 0; dim < head_dim; ++dim) {
-            score += query_shared[dim] * __half2float(kp[dim * cache_dim_stride]);
+            score += query_shared[dim]
+                    * Traits::load(kp[dim * cache_dim_stride]);
         }
         score *= scale;
         if (has_mask) {
@@ -619,11 +450,11 @@ __global__ void q1_rope_cache_attention_half_kernel(
     for (int dim = tid; dim < head_dim; dim += BLOCK_SIZE) {
         float numer = 0.0f;
         for (int pos = 0; pos < active_prefix_len; ++pos) {
-            numer += scores[pos] * __half2float(cache_values[
+            numer += scores[pos] * Traits::load(cache_values[
                 head * cache_head_stride + pos * cache_len_stride + dim * cache_dim_stride
             ]);
         }
-        out[head * head_dim + dim] = __float2half_rn(numer / denom);
+        out[head * head_dim + dim] = Traits::store(numer / denom);
     }
 }
 
@@ -684,7 +515,7 @@ torch::Tensor q1_rope_cache_attention(
     size_t shared_bytes = static_cast<size_t>(active_prefix_len + block_size + head_dim) * sizeof(float);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     if (qkv.scalar_type() == torch::kFloat32) {
-        q1_rope_cache_attention_kernel<block_size><<<grid, block, shared_bytes, stream>>>(
+        q1_rope_cache_attention_kernel<float, block_size><<<grid, block, shared_bytes, stream>>>(
             qkv.data_ptr<float>(),
             cache_keys.data_ptr<float>(),
             cache_values.data_ptr<float>(),
@@ -708,7 +539,7 @@ torch::Tensor q1_rope_cache_attention(
             has_mask
         );
     } else {
-        q1_rope_cache_attention_half_kernel<block_size><<<grid, block, shared_bytes, stream>>>(
+        q1_rope_cache_attention_kernel<__half, block_size><<<grid, block, shared_bytes, stream>>>(
             reinterpret_cast<const __half*>(qkv.data_ptr()),
             reinterpret_cast<__half*>(cache_keys.data_ptr()),
             reinterpret_cast<__half*>(cache_values.data_ptr()),
