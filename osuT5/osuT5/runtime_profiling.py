@@ -146,4 +146,3 @@ def profile_range(name: str) -> Iterator[None]:
         finally:
             if pushed:
                 torch.cuda.nvtx.range_pop()
-
