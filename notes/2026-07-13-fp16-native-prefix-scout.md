@@ -58,6 +58,23 @@ At the matched one-layer boundary, FP32 native is `20.15%` slower than FP32
 framework and FP16 native is `6.40%` slower than FP16 framework. Neither clears
 the required `5%` native-retention advantage.
 
+### Auxiliary fused-linear result
+
+A concurrent run on the separately rejectable original scout branch also
+enabled the pre-existing fused native RMSNorm/linear-residual kernels, beyond
+the framework-linear-first v2 scope. Job `49715718` showed a real local FP16
+native advantage of `13.73%` over FP16 framework at the matched layer boundary.
+It still failed the end-to-end component target:
+
+- fused FP16 native projected main: `29.956s` / `256.5 tok/s`;
+- fused FP32 native projected main: `30.299s` / `253.6 tok/s`;
+- accepted current main: `28.243949s` / `272.1 tok/s`;
+- required target: `25.419s`.
+
+Thus custom half linear kernels clear the local `5%` retention test but do not
+clear the full-model sizing gate. They are not imported into the clean v2 scout
+and do not authorize a fixed-work or runtime experiment.
+
 ## Correctness and drift
 
 All variants pass the relevant component gates:
@@ -89,6 +106,8 @@ Artifacts:
 - `/work/imt11/Mapperatorinator/runs/fp16-prefix-sentinel-measure2-49715303/projection.json`
 - `/work/imt11/Mapperatorinator/runs/fp16-prefix-sentinel-measure2-49715303/baseline-capture/`
 - `/work/imt11/Mapperatorinator/runs/fp16-prefix-sentinel-measure2-49715303/nvidia-smi.csv`
+- `/work/imt11/Mapperatorinator/runs/fp16-prefix-fused-component-49715718/component.json`
+- `/work/imt11/Mapperatorinator/runs/fp16-prefix-fused-component-49715718/projection-corrected.json`
 
 Revisit only if a materially different half-precision linear/attention
 implementation first demonstrates at least `5%` weighted full-model component
