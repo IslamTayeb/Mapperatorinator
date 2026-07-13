@@ -90,8 +90,13 @@ class ProfileNativePrefixDtypeScoutTest(unittest.TestCase):
                 }
                 converted = convert_static_inputs_dtype(inputs, target)
                 self.assertEqual(converted["hidden_states"].dtype, target)
-                self.assertEqual(converted["attention_mask"].dtype, torch.float32)
-                self.assertTrue(torch.equal(converted["attention_mask"], inputs["attention_mask"]))
+                self.assertEqual(converted["attention_mask"].dtype, target)
+                self.assertTrue(
+                    torch.equal(
+                        converted["attention_mask"].float(),
+                        inputs["attention_mask"].float(),
+                    )
+                )
                 self.assertEqual(converted["cache_position"].dtype, torch.long)
                 self.assertEqual(cache.self_attention_cache.layers[0].keys.dtype, target)
                 self.assertEqual(cache.cross_attention_cache.layers[0].values.dtype, target)

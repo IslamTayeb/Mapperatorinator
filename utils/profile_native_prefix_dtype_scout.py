@@ -278,7 +278,7 @@ def convert_static_value_dtype(
     if dtype not in (torch.float32, torch.float16):
         raise TypeError(f"scout supports float32/float16, got {dtype}")
     if isinstance(value, torch.Tensor):
-        if not value.is_floating_point() or "mask" in key.lower():
+        if not value.is_floating_point():
             return value
         return value.to(dtype=dtype)
     if hasattr(value, "self_attention_cache") and hasattr(value, "cross_attention_cache"):
