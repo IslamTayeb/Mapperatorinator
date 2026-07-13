@@ -33,12 +33,15 @@ from utils.profile_native_prefix_dtype_scout import (  # noqa: E402
     _cache_from_static_inputs,
     _load_args,
     _restore_all_cache,
+    _time_graph,
     validate_accepted_graph_cache,
 )
 
 
 SCHEMA_VERSION = 1
 REQUIRED_HEADROOM_SECONDS = 1.412
+GRAPH_WARMUP = 100
+GRAPH_ITERATIONS = 1_000
 REGIONS = (
     "self_norm_qkv",
     "fused_self_attention",
@@ -172,6 +175,7 @@ def _profile_bucket(
     model: torch.nn.Module,
     *,
     prefix: int,
+    accepted_graph: torch.cuda.CUDAGraph,
     static_inputs: dict[str, Any],
     warmup: int,
     iterations: int,
@@ -184,6 +188,14 @@ def _profile_bucket(
     if not isinstance(cache_position, torch.Tensor):
         raise TypeError("real static inputs do not expose tensor cache_position")
     snapshots = _all_cache_snapshots(cache, cache_position)
+
+    _restore_and_synchronize(cache, snapshots)
+    production_graph = _time_graph(
+        accepted_graph,
+        warmup=GRAPH_WARMUP,
+        iters=GRAPH_ITERATIONS,
+    )
+    _restore_and_synchronize(cache, snapshots)
 
     with _accepted_context(prefix, detail_ranges=False):
         for _ in range(warmup):
@@ -224,13 +236,22 @@ def _profile_bucket(
     )
     event_mean = sum(elapsed_ms) / len(elapsed_ms)
     assigned = sum(regions_ms.values())
+    production_graph_ms = float(production_graph["ms_per_call"])
+    calibration_scale = production_graph_ms / event_mean
+    calibrated_regions = {
+        region: value * calibration_scale for region, value in regions_ms.items()
+    }
     return {
+        "production_graph_ms_per_call": production_graph_ms,
+        "production_graph_timing": production_graph,
         "cuda_event_ms_per_call": {
             "mean": event_mean,
             "minimum": min(elapsed_ms),
             "maximum": max(elapsed_ms),
         },
         "regions_ms_per_call": regions_ms,
+        "production_calibrated_regions_ms_per_call": calibrated_regions,
+        "eager_to_production_graph_scale": calibration_scale,
         "assigned_region_ms_per_call": assigned,
         "unattributed_ms_per_call": max(0.0, event_mean - assigned),
         "over_attributed_ms_per_call": max(0.0, assigned - event_mean),
@@ -267,7 +288,11 @@ def summarize_weighted_ceiling(
     weighted_regions = {
         region: sum(
             live_counts[prefix]
-            * float(buckets[str(prefix)]["regions_ms_per_call"][region])
+            * float(
+                buckets[str(prefix)]["production_calibrated_regions_ms_per_call"][
+                    region
+                ]
+            )
             / 1_000.0
             for prefix in measured
         )
@@ -275,19 +300,21 @@ def summarize_weighted_ceiling(
     }
     weighted_total = sum(
         live_counts[prefix]
-        * float(buckets[str(prefix)]["cuda_event_ms_per_call"]["mean"])
+        * float(buckets[str(prefix)]["production_graph_ms_per_call"])
         / 1_000.0
         for prefix in measured
     )
     weighted_unattributed = sum(
         live_counts[prefix]
         * float(buckets[str(prefix)]["unattributed_ms_per_call"])
+        * float(buckets[str(prefix)]["eager_to_production_graph_scale"])
         / 1_000.0
         for prefix in measured
     )
     weighted_over_attributed = sum(
         live_counts[prefix]
         * float(buckets[str(prefix)]["over_attributed_ms_per_call"])
+        * float(buckets[str(prefix)]["eager_to_production_graph_scale"])
         / 1_000.0
         for prefix in measured
     )
@@ -303,7 +330,7 @@ def summarize_weighted_ceiling(
             }
             for region, seconds in weighted_regions.items()
         },
-        "measured_cuda_seconds": weighted_total,
+        "measured_production_graph_seconds": weighted_total,
         "weighted_unattributed_seconds": weighted_unattributed,
         "weighted_over_attributed_seconds": weighted_over_attributed,
         "optimistic_removable_seconds": removable,
@@ -315,9 +342,9 @@ def summarize_weighted_ceiling(
         ),
         "unmeasured_buckets_assumed_seconds": 0.0,
         "interpretation": (
-            "overall optimistic ceiling assumes every mapped operation in measured sentinel "
-            "buckets is free, but the gate is based on the largest concrete region; "
-            "unmeasured buckets contribute zero savings"
+            "eager detail-range shares are scaled to matched production CUDA-graph replay; "
+            "the gate is based on the largest concrete calibrated region and unmeasured "
+            "buckets contribute zero savings"
         ),
     }
 
@@ -343,17 +370,23 @@ def _validate_report(report: dict[str, Any]) -> None:
     for prefix in SENTINEL_BUCKETS:
         entry = buckets[str(prefix)]
         regions = entry.get("regions_ms_per_call")
-        if not isinstance(regions, dict) or tuple(regions) != REGIONS:
+        calibrated = entry.get("production_calibrated_regions_ms_per_call")
+        if (
+            not isinstance(regions, dict)
+            or tuple(regions) != REGIONS
+            or not isinstance(calibrated, dict)
+            or tuple(calibrated) != REGIONS
+        ):
             raise ValueError(f"bucket {prefix} does not expose the exact region order")
-        numbers = list(regions.values()) + [
+        numbers = list(regions.values()) + list(calibrated.values()) + [
             entry["cuda_event_ms_per_call"][name]
             for name in ("mean", "minimum", "maximum")
-        ]
+        ] + [entry["production_graph_ms_per_call"]]
         if not all(
             math.isfinite(float(value)) and float(value) >= 0 for value in numbers
         ):
             raise ValueError(f"bucket {prefix} contains invalid timings")
-        if any(float(value) <= 0 for value in regions.values()):
+        if any(float(value) <= 0 for value in (*regions.values(), *calibrated.values())):
             raise ValueError(f"bucket {prefix} contains an empty mapped region")
     required = float(weighted["required_headroom_seconds"])
     removable = float(weighted["optimistic_removable_seconds"])
@@ -418,6 +451,7 @@ def profile_accepted_decoder_regions(
         result = _profile_bucket(
             model,
             prefix=prefix,
+            accepted_graph=entry["graph"],
             static_inputs=entry["static_inputs"],
             warmup=warmup,
             iterations=iterations,

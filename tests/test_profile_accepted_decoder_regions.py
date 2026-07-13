@@ -15,16 +15,27 @@ from utils.profile_accepted_decoder_regions import (
 from utils.profile_native_prefix_dtype_scout import SENTINEL_BUCKETS
 
 
-def _bucket(*, region_ms: float = 0.1, event_ms: float = 1.0):
+def _bucket(
+    *,
+    region_ms: float = 0.1,
+    event_ms: float = 1.0,
+    production_graph_ms: float = 0.5,
+):
     regions = {name: region_ms for name in REGIONS}
+    scale = production_graph_ms / event_ms
     assigned = sum(regions.values())
     return {
+        "production_graph_ms_per_call": production_graph_ms,
         "cuda_event_ms_per_call": {
             "mean": event_ms,
             "minimum": event_ms - 0.1,
             "maximum": event_ms + 0.1,
         },
         "regions_ms_per_call": regions,
+        "production_calibrated_regions_ms_per_call": {
+            name: value * scale for name, value in regions.items()
+        },
+        "eager_to_production_graph_scale": scale,
         "assigned_region_ms_per_call": assigned,
         "unattributed_ms_per_call": max(0.0, event_ms - assigned),
         "over_attributed_ms_per_call": max(0.0, assigned - event_ms),
@@ -155,21 +166,27 @@ def test_aggregation_fails_when_a_required_region_is_missing_or_invalid():
 
 def test_weighted_ceiling_uses_live_sentinel_counts_and_declared_threshold():
     buckets = {
-        str(prefix): _bucket(region_ms=0.1 * index, event_ms=2.0)
+        str(prefix): _bucket(
+            region_ms=0.1 * index,
+            event_ms=2.0,
+            production_graph_ms=0.5,
+        )
         for index, prefix in enumerate(SENTINEL_BUCKETS, start=1)
     }
     counts = {128: 2, 576: 3, 640: 5, 832: 99}
 
     weighted = summarize_weighted_ceiling(buckets, live_counts=counts)
 
-    per_region = (2 * 0.1 + 3 * 0.2 + 5 * 0.3) / 1_000.0
+    per_region = (2 * 0.025 + 3 * 0.05 + 5 * 0.075) / 1_000.0
     assert weighted["regions_seconds"] == pytest.approx(
         {region: per_region for region in REGIONS}
     )
     assert weighted["optimistic_removable_seconds"] == pytest.approx(
         len(REGIONS) * per_region
     )
-    assert weighted["measured_cuda_seconds"] == pytest.approx((2 + 3 + 5) * 2 / 1_000)
+    assert weighted["measured_production_graph_seconds"] == pytest.approx(
+        (2 + 3 + 5) * 0.5 / 1_000
+    )
     assert weighted["required_headroom_seconds"] == REQUIRED_HEADROOM_SECONDS
     assert weighted["unmeasured_buckets_assumed_seconds"] == 0.0
     assert weighted["clears_required_headroom"] is False
