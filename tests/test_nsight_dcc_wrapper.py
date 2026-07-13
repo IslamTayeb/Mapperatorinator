@@ -26,6 +26,19 @@ def test_wrapper_is_valid_bash_and_pins_clean_pushed_worktree() -> None:
     assert "2080 Ti" in source
 
 
+def test_help_capability_probes_accept_nonzero_only_with_captured_output() -> None:
+    source = _source()
+
+    assert "capture_capability()" in source
+    assert '[[ ! -s "$output" && ! -s "$output.stderr.txt" ]]' in source
+    assert 'require_successful_capability "$CAPABILITIES/nsys-version.txt"' in source
+    assert 'require_successful_capability "$CAPABILITIES/ncu-version.txt"' in source
+    assert (
+        'capture_capability "$CAPABILITIES/nsys-analyze-help.txt" '
+        '"$NSYS" analyze --help'
+    ) in source
+
+
 def test_wrapper_collects_fp32_first_and_isolates_all_passes() -> None:
     source = _source()
 

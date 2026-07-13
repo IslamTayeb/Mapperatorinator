@@ -20,6 +20,26 @@ require_nonempty() {
   [[ -s "$1" ]] || die "required artifact is missing or empty: $1"
 }
 
+capture_capability() {
+  local output=$1
+  shift
+  set +e
+  "$@" > "$output" 2> "$output.stderr.txt"
+  local exit_code=$?
+  set -e
+  printf '%s\n' "$exit_code" > "$output.exit-code.txt"
+  if [[ ! -s "$output" && ! -s "$output.stderr.txt" ]]; then
+    die "capability probe produced no output: $*"
+  fi
+}
+
+require_successful_capability() {
+  local output=$1
+  local exit_code
+  exit_code=$(<"$output.exit-code.txt")
+  [[ "$exit_code" == 0 ]] || die "required capability probe failed with exit code $exit_code: $output"
+}
+
 SLURM_JOB_ID=${SLURM_JOB_ID:?Run this wrapper inside a Slurm allocation}
 PYTHON=${MAPPERATORINATOR_PYTHON:-/hpc/group/romerolab/imt11/envs/mapperatorinator/bin/python}
 REPO=${MAPPERATORINATOR_REPO:?Set MAPPERATORINATOR_REPO to the clean profiler worktree}
@@ -69,16 +89,21 @@ NSYS=$(command -v nsys)
 NCU=$(command -v ncu)
 DCGMI=$(command -v dcgmi)
 
-"$NSYS" --version > "$CAPABILITIES/nsys-version.txt"
-"$NSYS" profile --help > "$CAPABILITIES/nsys-profile-help.txt"
-"$NSYS" stats --help > "$CAPABILITIES/nsys-stats-help.txt"
-"$NSYS" stats --help-reports > "$CAPABILITIES/nsys-help-reports.txt"
-"$NSYS" analyze --help > "$CAPABILITIES/nsys-analyze-help.txt"
-"$NCU" --version > "$CAPABILITIES/ncu-version.txt"
-"$NCU" --help > "$CAPABILITIES/ncu-help.txt"
-"$NCU" --list-sets > "$CAPABILITIES/ncu-sets.txt"
-"$NCU" --list-sections > "$CAPABILITIES/ncu-sections.txt"
-"$DCGMI" --version > "$CAPABILITIES/dcgmi-version.txt" 2>&1
+capture_capability "$CAPABILITIES/nsys-version.txt" "$NSYS" --version
+require_successful_capability "$CAPABILITIES/nsys-version.txt"
+capture_capability "$CAPABILITIES/nsys-profile-help.txt" "$NSYS" profile --help
+capture_capability "$CAPABILITIES/nsys-stats-help.txt" "$NSYS" stats --help
+capture_capability "$CAPABILITIES/nsys-help-reports.txt" "$NSYS" stats --help-reports
+# Nsight Systems 2025.6 exits nonzero for this help request while still
+# returning the complete supported-rule interface.  Nonempty captured output
+# is authoritative for help probes; actual profiler commands remain fail-loud.
+capture_capability "$CAPABILITIES/nsys-analyze-help.txt" "$NSYS" analyze --help
+capture_capability "$CAPABILITIES/ncu-version.txt" "$NCU" --version
+require_successful_capability "$CAPABILITIES/ncu-version.txt"
+capture_capability "$CAPABILITIES/ncu-help.txt" "$NCU" --help
+capture_capability "$CAPABILITIES/ncu-sets.txt" "$NCU" --list-sets
+capture_capability "$CAPABILITIES/ncu-sections.txt" "$NCU" --list-sections
+capture_capability "$CAPABILITIES/dcgmi-version.txt" "$DCGMI" --version
 set +e
 "$NSYS" recipe --help > "$CAPABILITIES/nsys-recipe-help.txt" 2>&1
 NSYS_RECIPE_EXIT=$?
