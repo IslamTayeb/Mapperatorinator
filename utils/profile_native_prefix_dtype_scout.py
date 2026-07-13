@@ -316,6 +316,7 @@ def _full_model_variant_context(
     variant: str,
 ) -> Iterator[None]:
     from osuT5.osuT5.inference.optimized.scout.native_prefix import (
+        fp32_rms_norm,
         framework_prefix,
         native_prefix,
     )
@@ -330,6 +331,7 @@ def _full_model_variant_context(
         raise ValueError("full-model scout variant must be framework or native")
     candidate = native_prefix if variant == "native" else framework_prefix
     originals: list[tuple[torch.nn.Module, Any]] = []
+    final_originals: list[tuple[torch.nn.Module, Any]] = []
 
     def replacement(layer):
         def forward(
@@ -368,11 +370,38 @@ def _full_model_variant_context(
             module.forward = replacement(module)
     if not originals:
         raise RuntimeError("native-prefix scout found no decoder layers to patch")
+    decoder = getattr(getattr(model, "model", None), "decoder", None)
+    decoder_norm = getattr(decoder, "layer_norm", None)
+    projection = getattr(model, "proj_out", None)
+    if not isinstance(decoder_norm, torch.nn.Module) or not isinstance(
+        projection,
+        torch.nn.Module,
+    ):
+        raise RuntimeError("native-prefix scout could not locate final norm/projection")
+    final_originals.extend(
+        ((decoder_norm, decoder_norm.forward), (projection, projection.forward))
+    )
+
+    def final_norm_forward(self, hidden_states):
+        return fp32_rms_norm(hidden_states, self.weight, getattr(self, "eps", None))
+
+    def projection_forward(self, hidden_states):
+        bias = getattr(self, "bias", None)
+        return torch.nn.functional.linear(
+            hidden_states.float(),
+            self.weight.float(),
+            None if bias is None else bias.float(),
+        )
+
+    decoder_norm.forward = MethodType(final_norm_forward, decoder_norm)
+    projection.forward = MethodType(projection_forward, projection)
     try:
         with active_prefix_self_attention_context(prefix):
             yield
     finally:
         for module, original in originals:
+            module.forward = original
+        for module, original in final_originals:
             module.forward = original
 
 
@@ -1304,7 +1333,7 @@ def main() -> None:
     parser.add_argument("--config-name", default="profile_salvalai")
     parser.add_argument("--report-path", type=Path, required=True)
     parser.add_argument("--output-path", type=Path, required=True)
-    parser.add_argument("--bucket-mode", choices=("sentinel", "all"), default="all")
+    parser.add_argument("--bucket-mode", choices=("sentinel", "all"), default="sentinel")
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--iters", type=int, default=1000)
     parser.add_argument("overrides", nargs="*")

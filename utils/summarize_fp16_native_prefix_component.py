@@ -37,7 +37,8 @@ Each variant must contain either exactly the sentinel buckets 128, 576, and
 for bounded sizing but can never promote a candidate.  All variants must cover
 the same buckets.
 
-``full_model_replay_ms_per_call`` is the median CUDA-graph replay time for one
+``full_model_replay_ms_per_call`` is the worst reciprocal CUDA-graph replay
+time for one
 complete one-token model forward; it already includes all decoder layers.
 ``capture_setup_seconds`` is the aggregate once-per-production-signature setup
 and capture wall for that prefix, not a per-replay average.  The projection
@@ -46,9 +47,9 @@ charges its baseline-to-candidate delta separately so flat setup is not hidden.
 to compare native against framework operations separately within FP32 and
 FP16.  A native variant is retained only when it is at least five percent
 faster than its same-dtype framework variant.  Its weighted total is multiplied
-by the twelve decoder layers.  Only FP16 variants can promote; the shared FP32
-variants are comparison evidence, while ``fp32_accepted`` remains the current
-production-dispatch anchor for the 28.243-second baseline.
+by the twelve decoder layers.  ``fp32_native_prefix`` and both FP16 variants may
+promote, while ``fp32_accepted`` remains the current production-dispatch anchor
+for the 28.243-second baseline.
 
 The full-bucket projection is::
 
@@ -56,7 +57,7 @@ The full-bucket projection is::
     setup_v = sum(capture_setup_seconds[v, b])
     projected_main_v = 28.243
         + (replay_v - replay_fp32)
-        + (setup_v - setup_fp32)
+        + max(0, setup_v - setup_fp32)
 
 For sentinel-only sizing, unmeasured replay and setup deltas are conservatively
 set to zero.  That result can authorize collection of the remaining buckets,
@@ -314,8 +315,8 @@ def summarize(payload: Any) -> dict[str, Any]:
     for variant in VARIANTS[1:]:
         values = weighted[variant]
         replay_delta = (
-            values["prefix_replay_seconds_12_layers"]
-            - baseline["prefix_replay_seconds_12_layers"]
+            values["full_model_replay_seconds"]
+            - baseline["full_model_replay_seconds"]
         )
         capture_delta = max(
             0.0,

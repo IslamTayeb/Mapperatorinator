@@ -115,7 +115,7 @@ def test_all_bucket_projection_promotes_both_passing_candidates():
     )
     assert report["native_prefix_comparisons"]["fp32"]["retained"]
     assert report["projections"]["fp16_framework"]["projected_main_seconds"] == pytest.approx(
-        28.243 + 12 * 7_552 * (0.09 - 0.12) / 1_000 + 0.11
+        28.243 + 7_552 * (0.6 - 1.0) / 1_000 + 0.11
     )
     assert report["candidate_decisions"]["fp16_framework"]["promotion_pass"]
     assert report["candidate_decisions"]["fp16_native_prefix"]["promotion_pass"]
