@@ -373,9 +373,10 @@ def _full_model_variant_context(
             module.forward = replacement(module)
     if not originals:
         raise RuntimeError("native-prefix scout found no decoder layers to patch")
-    decoder = getattr(getattr(model, "model", None), "decoder", None)
+    backbone = getattr(model, "transformer", model)
+    decoder = getattr(getattr(backbone, "model", None), "decoder", None)
     decoder_norm = getattr(decoder, "layer_norm", None)
-    projection = getattr(model, "proj_out", None)
+    projection = getattr(backbone, "proj_out", None)
     if not isinstance(decoder_norm, torch.nn.Module) or not isinstance(
         projection,
         torch.nn.Module,
