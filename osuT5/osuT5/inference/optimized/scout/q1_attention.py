@@ -147,7 +147,6 @@ def _load_native_q1_attention():
 #include <torch/extension.h>
 
 #include <ATen/cuda/CUDAContext.h>
-#include <ATen/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 #include <cuda.h>
 #include <cuda_fp16.h>
@@ -390,7 +389,6 @@ torch::Tensor q1_attention(
     TORCH_CHECK(q.scalar_type() == k.scalar_type() && q.scalar_type() == v.scalar_type(), "q/k/v dtype mismatch");
     TORCH_CHECK(q.scalar_type() == torch::kFloat32 || q.scalar_type() == torch::kFloat16,
         "q/k/v must be fp32 or fp16");
-    at::cuda::CUDAGuard device_guard(q.device());
     auto output = torch::empty({1, q.size(1), 1, q.size(3)}, q.options());
     torch::Tensor mask_contiguous;
     const float* mask_ptr = nullptr;
@@ -448,7 +446,6 @@ torch::Tensor q1_rope_cache_attention(
             && qkv.scalar_type() == sin.scalar_type(), "qkv/cache/cos/sin dtype mismatch");
     TORCH_CHECK(qkv.scalar_type() == torch::kFloat32 || qkv.scalar_type() == torch::kFloat16,
         "qkv/cache must be fp32 or fp16");
-    at::cuda::CUDAGuard device_guard(qkv.device());
     auto output = torch::empty({1, qkv.size(3), 1, qkv.size(4)}, qkv.options());
     torch::Tensor mask_contiguous;
     const float* mask_ptr = nullptr;
