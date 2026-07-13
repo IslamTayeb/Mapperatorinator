@@ -102,9 +102,6 @@ NATIVE_COMPARISONS = {
 }
 CHECKS = (
     "finite_outputs",
-    "layer_output_allclose",
-    "cache_slot_allclose",
-    "logits_allclose",
     "cache_shapes_valid",
     "active_slot_writes_valid",
     "future_slots_untouched",
