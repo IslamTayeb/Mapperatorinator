@@ -17,6 +17,8 @@ from osuT5.osuT5.inference.runtime_dispatch import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
 def _run_fresh_python(source: str) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(REPO_ROOT)
@@ -46,6 +48,23 @@ for name in (
 for name in sys.modules:
     assert not name.startswith("osuT5.osuT5.inference.optimized"), name
     assert not name.startswith("osuT5.osuT5.inference.native"), name
+    assert not name.startswith("torch.utils.cpp_extension"), name
+"""
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_fresh_optimized_engine_import_keeps_native_extensions_cold():
+    completed = _run_fresh_python(
+        """
+import importlib
+import sys
+
+importlib.import_module("osuT5.osuT5.inference.optimized.single.engine")
+
+for name in sys.modules:
+    assert not name.endswith(".optimized.kernels.cross_mlp"), name
+    assert not name.endswith(".optimized.kernels.decoder_layer"), name
     assert not name.startswith("torch.utils.cpp_extension"), name
 """
     )

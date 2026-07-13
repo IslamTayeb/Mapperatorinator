@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import time
 from functools import partial
 from typing import Any
@@ -22,33 +21,19 @@ from .logits import build_single_logits_processor_list
 from .state import ProductionDecodeSession
 
 
-OPTIMIZED_CONFIG_VERSION = "accepted-fp32-270.475-v1"
-NATIVE_CROSS_MLP_SCOUT_CONFIG_VERSION = "experimental-fp32-native-cross-mlp-v1"
-NATIVE_CROSS_MLP_SCOUT_ENV = "MAPPERATORINATOR_NATIVE_CROSS_MLP_SCOUT"
-OPTIMIZED_RESULT_CLASS = "exact-output"
-NATIVE_CROSS_MLP_SCOUT_RESULT_CLASS = "candidate-unverified"
+OPTIMIZED_CONFIG_VERSION = "accepted-fp32-native-cross-mlp-289-v2"
+OPTIMIZED_RESULT_CLASS = "documented-drift"
 OPTIMIZED_PRECISION = "fp32"
 OPTIMIZED_ATTN_IMPLEMENTATION = "sdpa"
 ACTIVE_PREFIX_BUCKET_SIZE = 64
 
 
-def _optimized_config_metadata(
-    *,
-    native_cross_mlp_tail: bool = False,
-) -> dict[str, Any]:
+def _optimized_config_metadata() -> dict[str, Any]:
     """Describe the immutable accepted engine preset for profiles."""
 
     return {
-        "version": (
-            NATIVE_CROSS_MLP_SCOUT_CONFIG_VERSION
-            if native_cross_mlp_tail
-            else OPTIMIZED_CONFIG_VERSION
-        ),
-        "result_class": (
-            NATIVE_CROSS_MLP_SCOUT_RESULT_CLASS
-            if native_cross_mlp_tail
-            else OPTIMIZED_RESULT_CLASS
-        ),
+        "version": OPTIMIZED_CONFIG_VERSION,
+        "result_class": OPTIMIZED_RESULT_CLASS,
         "precision": OPTIMIZED_PRECISION,
         "attn_implementation": OPTIMIZED_ATTN_IMPLEMENTATION,
         "decoder_loop_backend": "active_prefix_cuda_graph",
@@ -68,11 +53,7 @@ def _optimized_config_metadata(
         "native_decode_kernels": True,
         "native_q1_self_attention": True,
         "native_q1_rope_cache_self_attention": True,
-        **(
-            {"native_cross_mlp_tail": True}
-            if native_cross_mlp_tail
-            else {}
-        ),
+        "native_cross_mlp_tail": True,
     }
 
 
@@ -106,10 +87,9 @@ def _build_logits_processor_list(
 
 def _native_cross_mlp_tail_enabled(
     *,
-    requested: bool,
     context_type: ContextType | None,
 ) -> bool:
-    return requested and context_type != ContextType.TIMING
+    return context_type != ContextType.TIMING
 
 
 @torch.no_grad()
@@ -120,7 +100,6 @@ def _generate_window(
     generate_kwargs: dict[str, Any],
     *,
     context_state: ProductionDecodeSession,
-    native_cross_mlp_tail_requested: bool = False,
 ):
     model_kwargs = {
         key: value.to(model.device) if isinstance(value, torch.Tensor) else value
@@ -168,7 +147,6 @@ def _generate_window(
     native_q1_self_attention = context_type != ContextType.TIMING
     native_q1_rope_cache_self_attention = native_q1_self_attention
     native_cross_mlp_tail = _native_cross_mlp_tail_enabled(
-        requested=native_cross_mlp_tail_requested,
         context_type=context_type,
     )
     processors = _build_logits_processor_list(
@@ -245,16 +223,12 @@ def _generate_window(
         "context_type": context_type.value if context_type is not None else None,
         "decoder_loop_backend": "active_prefix_cuda_graph",
         "torch_compile_enabled": False,
-        "optimized_effective_config_version": (
-            NATIVE_CROSS_MLP_SCOUT_CONFIG_VERSION
-            if native_cross_mlp_tail_requested
-            else OPTIMIZED_CONFIG_VERSION
-        ),
-        "native_cross_mlp_tail_requested": native_cross_mlp_tail_requested,
+        "optimized_effective_config_version": OPTIMIZED_CONFIG_VERSION,
+        "native_cross_mlp_tail_requested": True,
         "native_cross_mlp_tail_enabled": native_cross_mlp_tail,
         "native_cross_mlp_tail_disabled_reason": (
             "timing_context"
-            if native_cross_mlp_tail_requested and not native_cross_mlp_tail
+            if not native_cross_mlp_tail
             else None
         ),
     })
@@ -262,8 +236,6 @@ def _generate_window(
 
 
 class OptimizedSingleRuntime:
-    native_cross_mlp_tail_requested = False
-
     def new_context_state(self) -> ProductionDecodeSession:
         return ProductionDecodeSession()
 
@@ -286,34 +258,17 @@ class OptimizedSingleRuntime:
             model_kwargs,
             dict(generate_kwargs),
             context_state=context_state,
-            native_cross_mlp_tail_requested=(
-                self.native_cross_mlp_tail_requested
-            ),
         )
 
     def profile_metadata(self) -> dict[str, Any]:
         return {
-            "optimized_effective_config_version": (
-                NATIVE_CROSS_MLP_SCOUT_CONFIG_VERSION
-                if self.native_cross_mlp_tail_requested
-                else OPTIMIZED_CONFIG_VERSION
-            ),
-            "optimized_effective_config": _optimized_config_metadata(
-                native_cross_mlp_tail=self.native_cross_mlp_tail_requested,
-            ),
+            "optimized_effective_config_version": OPTIMIZED_CONFIG_VERSION,
+            "optimized_effective_config": _optimized_config_metadata(),
             "optimized_runtime_owner": (
                 "osuT5.osuT5.inference.optimized.single.engine"
             ),
-            "optimized_result_class": (
-                NATIVE_CROSS_MLP_SCOUT_RESULT_CLASS
-                if self.native_cross_mlp_tail_requested
-                else OPTIMIZED_RESULT_CLASS
-            ),
+            "optimized_result_class": OPTIMIZED_RESULT_CLASS,
         }
-
-
-class NativeCrossMlpScoutRuntime(OptimizedSingleRuntime):
-    native_cross_mlp_tail_requested = True
 
 
 def load_optimized_single_engine(
@@ -327,12 +282,6 @@ def load_optimized_single_engine(
         raise ValueError("optimized single loader requires attn_implementation=sdpa.")
     if loader_kwargs.get("use_server"):
         raise ValueError("optimized single loader requires use_server=false.")
-
-    scout_value = os.environ.get(NATIVE_CROSS_MLP_SCOUT_ENV, "0")
-    if scout_value not in {"0", "1"}:
-        raise ValueError(
-            f"{NATIVE_CROSS_MLP_SCOUT_ENV} must be 0 or 1, got {scout_value!r}."
-        )
 
     effective_loader_kwargs = dict(loader_kwargs)
     effective_loader_kwargs.update(
@@ -355,15 +304,10 @@ def load_optimized_single_engine(
             "optimized single loader requested the custom generation path, but "
             "the raw model reports it disabled."
         )
-    runtime = (
-        NativeCrossMlpScoutRuntime()
-        if scout_value == "1"
-        else OptimizedSingleRuntime()
-    )
     return (
         InferenceEngineBinding(
             raw_model=raw_model,
-            runtime=runtime,
+            runtime=OptimizedSingleRuntime(),
         ),
         tokenizer,
     )

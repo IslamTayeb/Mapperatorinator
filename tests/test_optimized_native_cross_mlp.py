@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -129,9 +130,7 @@ def test_native_decoder_extension_is_cold_singleton_and_uses_device_guard(
     assert source.count("c10::cuda::CUDAGuard") == 3
 
 
-def test_scout_runtime_is_explicit_and_default_preset_is_unchanged(
-    monkeypatch,
-) -> None:
+def test_native_cross_mlp_is_the_single_accepted_optimized_preset() -> None:
     raw_model = SimpleNamespace(
         generation_config=SimpleNamespace(disable_compile=False),
     )
@@ -142,54 +141,195 @@ def test_scout_runtime_is_explicit_and_default_preset_is_unchanged(
         "use_server": False,
     }
 
-    monkeypatch.delenv(engine.NATIVE_CROSS_MLP_SCOUT_ENV, raising=False)
     accepted, _ = engine.load_optimized_single_engine(
         model_loader=loader,
         loader_kwargs=kwargs,
     )
     assert type(accepted.runtime) is engine.OptimizedSingleRuntime
-    assert "native_cross_mlp_tail" not in accepted.runtime.profile_metadata()[
-        "optimized_effective_config"
-    ]
-
-    monkeypatch.setenv(engine.NATIVE_CROSS_MLP_SCOUT_ENV, "1")
-    candidate, _ = engine.load_optimized_single_engine(
-        model_loader=loader,
-        loader_kwargs=kwargs,
-    )
-    assert type(candidate.runtime) is engine.NativeCrossMlpScoutRuntime
-    assert candidate.runtime.profile_metadata()["optimized_effective_config"][
+    assert accepted.runtime.profile_metadata()["optimized_effective_config"][
         "native_cross_mlp_tail"
     ] is True
     assert (
-        candidate.runtime.profile_metadata()["optimized_result_class"]
-        == "candidate-unverified"
+        accepted.runtime.profile_metadata()["optimized_result_class"]
+        == "documented-drift"
     )
 
-    monkeypatch.setenv(engine.NATIVE_CROSS_MLP_SCOUT_ENV, "invalid")
-    with pytest.raises(ValueError, match="must be 0 or 1"):
-        engine.load_optimized_single_engine(
-            model_loader=lambda **kwargs: (_ for _ in ()).throw(
-                AssertionError("invalid selector must fail before model load")
-            ),
-            loader_kwargs=kwargs,
-        )
 
-
-def test_scout_tail_is_disabled_only_for_timing_context() -> None:
+def test_accepted_tail_is_disabled_only_for_timing_context() -> None:
     assert engine._native_cross_mlp_tail_enabled(
-        requested=True,
         context_type=ContextType.MAP,
     )
     assert engine._native_cross_mlp_tail_enabled(
-        requested=True,
         context_type=None,
     )
     assert not engine._native_cross_mlp_tail_enabled(
-        requested=True,
         context_type=ContextType.TIMING,
     )
-    assert not engine._native_cross_mlp_tail_enabled(
-        requested=False,
-        context_type=ContextType.MAP,
+
+
+def test_ordinary_generate_window_installs_promoted_dispatch(monkeypatch) -> None:
+    captured: list[dict[str, object]] = []
+
+    @contextmanager
+    def fake_profile_context(**kwargs):
+        captured.append(kwargs)
+        yield
+
+    class FakeSession:
+        @staticmethod
+        def cache_for_window(*args, **kwargs):
+            return object()
+
+        @staticmethod
+        def active_prefix_decode_kwargs():
+            return {}
+
+    model = SimpleNamespace(
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        generate=lambda **kwargs: torch.tensor([[1, 2]]),
     )
+    tokenizer = SimpleNamespace(pad_id=0, eos_id=2, context_eos={})
+    model_kwargs = {
+        "inputs": torch.zeros(1, 1),
+        "decoder_input_ids": torch.tensor([[1]]),
+        "decoder_attention_mask": torch.tensor([[1]]),
+    }
+    monkeypatch.setattr(engine, "generation_profile_context", fake_profile_context)
+    monkeypatch.setattr(engine, "_build_logits_processor_list", lambda *args, **kwargs: [])
+
+    _, main_stats = engine._generate_window(
+        model,
+        tokenizer,
+        model_kwargs,
+        {"context_type": ContextType.MAP, "pad_token_id": 0},
+        context_state=FakeSession(),
+    )
+    _, timing_stats = engine._generate_window(
+        model,
+        tokenizer,
+        model_kwargs,
+        {"context_type": ContextType.TIMING, "pad_token_id": 0},
+        context_state=FakeSession(),
+    )
+
+    assert captured[0] == {
+        "q1_bmm_cross_attention": True,
+        "native_q1_self_attention": True,
+        "native_q1_rope_cache_self_attention": True,
+        "native_cross_mlp_tail": True,
+    }
+    assert captured[1] == {
+        "q1_bmm_cross_attention": True,
+        "native_q1_self_attention": False,
+        "native_q1_rope_cache_self_attention": False,
+        "native_cross_mlp_tail": False,
+    }
+    assert main_stats["native_cross_mlp_tail_enabled"] is True
+    assert timing_stats["native_cross_mlp_tail_enabled"] is False
+    assert timing_stats["native_cross_mlp_tail_disabled_reason"] == "timing_context"
+
+
+def test_native_tail_preserves_accepted_cross_bmm_operation_order(monkeypatch) -> None:
+    from osuT5.osuT5.inference.optimized.kernels import cross_mlp
+
+    events: list[str] = []
+
+    class FakeTensor:
+        device = SimpleNamespace(type="cuda")
+        dtype = torch.float32
+        shape = (1, 1, 4)
+
+        def view(self, *shape):
+            self.shape = shape
+            return self
+
+        def transpose(self, *args):
+            return self
+
+        def reshape(self, *shape):
+            self.shape = shape
+            return self
+
+        def __mul__(self, other):
+            return self
+
+    class FakeCache:
+        pass
+
+    hidden = FakeTensor()
+    cache_tensor = FakeTensor()
+    cache_layer = SimpleNamespace(
+        is_initialized=True,
+        keys=cache_tensor,
+        values=cache_tensor,
+    )
+    cache = FakeCache()
+    cache.is_updated = {0: True}
+    cache.cross_attention_cache = SimpleNamespace(layers=[cache_layer])
+    weight = object()
+    module = SimpleNamespace(
+        training=False,
+        activation_dropout=0.0,
+        dropout=0.0,
+        cross_attn=SimpleNamespace(
+            layer_idx=0,
+            num_heads=2,
+            head_dim=2,
+            Wq=SimpleNamespace(weight=weight, bias=None),
+            Wo=SimpleNamespace(weight=weight, bias=None),
+        ),
+        cross_attn_layer_norm=SimpleNamespace(weight=weight, eps=1e-5),
+        final_layer_norm=SimpleNamespace(weight=weight, eps=1e-5),
+        fc1=SimpleNamespace(weight=weight, bias=None),
+        fc2=SimpleNamespace(weight=weight, bias=None),
+    )
+
+    def rmsnorm_linear(*args, **kwargs):
+        events.append("cross_rmsnorm_q")
+        return FakeTensor()
+
+    def bmm(*args, **kwargs):
+        events.append("bmm")
+        return FakeTensor()
+
+    def softmax(*args, **kwargs):
+        events.append("softmax")
+        return FakeTensor()
+
+    def linear_residual(*args, **kwargs):
+        events.append("cross_out_residual")
+        return FakeTensor()
+
+    def mlp_residual(*args, **kwargs):
+        events.append("mlp")
+        return FakeTensor()
+
+    monkeypatch.setattr(cross_mlp, "EncoderDecoderCache", FakeCache)
+    monkeypatch.setattr(cross_mlp, "native_one_token_rmsnorm_linear", rmsnorm_linear)
+    monkeypatch.setattr(cross_mlp, "native_one_token_linear_residual", linear_residual)
+    monkeypatch.setattr(cross_mlp, "native_one_token_mlp_residual", mlp_residual)
+    monkeypatch.setattr(cross_mlp.torch, "bmm", bmm)
+    monkeypatch.setattr(cross_mlp.torch, "softmax", softmax)
+
+    result = cross_mlp.native_cross_mlp_tail_forward(
+        module=module,
+        hidden_states=hidden,
+        encoder_hidden_states=FakeTensor(),
+        past_key_value=cache,
+        self_attn_outputs=(hidden,),
+        output_attentions=False,
+        cu_seqlens=None,
+        encoder_cu_seqlens=None,
+        layer_name="decoder.layer0",
+    )
+
+    assert result is not None
+    assert events == [
+        "cross_rmsnorm_q",
+        "bmm",
+        "softmax",
+        "bmm",
+        "cross_out_residual",
+        "mlp",
+    ]

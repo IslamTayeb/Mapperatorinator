@@ -44,8 +44,8 @@ def _loader_kwargs(**overrides):
 
 def test_accepted_runtime_metadata_is_one_fixed_preset():
     assert OptimizedSingleRuntime().profile_metadata()["optimized_effective_config"] == {
-        "version": "accepted-fp32-270.475-v1",
-        "result_class": "exact-output",
+        "version": "accepted-fp32-native-cross-mlp-289-v2",
+        "result_class": "documented-drift",
         "precision": "fp32",
         "attn_implementation": "sdpa",
         "decoder_loop_backend": "active_prefix_cuda_graph",
@@ -65,6 +65,7 @@ def test_accepted_runtime_metadata_is_one_fixed_preset():
         "native_decode_kernels": True,
         "native_q1_self_attention": True,
         "native_q1_rope_cache_self_attention": True,
+        "native_cross_mlp_tail": True,
     }
 
 

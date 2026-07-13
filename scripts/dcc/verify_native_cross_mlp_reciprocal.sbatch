@@ -140,7 +140,6 @@ run_profile() {
   local repo=$1
   local engine=$2
   local label=$3
-  local scout=$4
   local output="$RUN_ROOT/$label"
   local legacy_reset=()
   if [[ "$engine" == optimized ]] && grep -q 'inference_generation_compile:' "$repo/config.py"; then
@@ -149,8 +148,8 @@ run_profile() {
   mkdir -p "$output"
   (
     cd "$repo"
-    MAPPERATORINATOR_NATIVE_CROSS_MLP_SCOUT="$scout" \
-    "$PYTHON" inference.py --config-name "$PROFILE_CONFIG" \
+    env -u MAPPERATORINATOR_NATIVE_CROSS_MLP_SCOUT \
+      "$PYTHON" inference.py --config-name "$PROFILE_CONFIG" \
       output_path="$output" \
       inference_engine="$engine" \
       "${COMMON_OVERRIDES[@]}" \
@@ -165,10 +164,10 @@ run_profile() {
   printf '%s\n' "$profile" > "$RUN_ROOT/$label.profile-path.txt"
 }
 
-run_profile "$BASELINE_REPO" "$BASELINE_ENGINE" baseline_first 0
-run_profile "$CANDIDATE_REPO" "$CANDIDATE_ENGINE" candidate_second 1
-run_profile "$CANDIDATE_REPO" "$CANDIDATE_ENGINE" candidate_first 1
-run_profile "$BASELINE_REPO" "$BASELINE_ENGINE" baseline_second 0
+run_profile "$BASELINE_REPO" "$BASELINE_ENGINE" baseline_first
+run_profile "$CANDIDATE_REPO" "$CANDIDATE_ENGINE" candidate_second
+run_profile "$CANDIDATE_REPO" "$CANDIDATE_ENGINE" candidate_first
+run_profile "$BASELINE_REPO" "$BASELINE_ENGINE" baseline_second
 
 BASELINE_FIRST=$(<"$RUN_ROOT/baseline_first.profile-path.txt")
 CANDIDATE_SECOND=$(<"$RUN_ROOT/candidate_second.profile-path.txt")

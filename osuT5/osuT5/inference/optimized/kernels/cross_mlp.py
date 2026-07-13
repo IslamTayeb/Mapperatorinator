@@ -1,4 +1,4 @@
-"""Opt-in FP32 native cross-attention and MLP tail dispatch."""
+"""Accepted FP32 native cross-attention and MLP tail dispatch."""
 
 from __future__ import annotations
 
