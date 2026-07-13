@@ -26,6 +26,7 @@ _MODULE = util.module_from_spec(_SPEC)
 assert _SPEC.loader is not None
 _SPEC.loader.exec_module(_MODULE)
 MonotonicTimeShiftLogitsProcessor = _MODULE.MonotonicTimeShiftLogitsProcessor
+ConditionalTemperatureLogitsWarper = _MODULE.ConditionalTemperatureLogitsWarper
 
 
 class _FakeTokenizer:
@@ -57,3 +58,52 @@ def test_v32_monotonic_rejects_optimized_stateful_mode():
             _FakeTokenizer(),
             stateful_batch1=True,
         )
+
+
+def test_conditional_temperature_is_batch_correct_with_first_match_precedence():
+    processor = ConditionalTemperatureLogitsWarper(
+        temperature=1.0,
+        timing_temperature=2.0,
+        mania_column_temperature=4.0,
+        taiko_hit_temperature=8.0,
+        types_first=True,
+        beat_type_tokens=(10, 11),
+        mania_type_tokens=(20,),
+        scroll_speed_tokens=(30,),
+    )
+    input_ids = torch.tensor(
+        [
+            [0, 0, 10],
+            [20, 0, 0],
+            [0, 0, 30],
+            [20, 0, 10],
+            [0, 0, 0],
+        ],
+        dtype=torch.long,
+    )
+    scores = torch.full((5, 4), 8.0)
+
+    result = processor(input_ids, scores)
+
+    assert torch.equal(
+        result[:, 0],
+        torch.tensor([4.0, 2.0, 1.0, 4.0, 8.0]),
+    )
+
+
+def test_conditional_temperature_preserves_batch1_calculation():
+    processor = ConditionalTemperatureLogitsWarper(
+        temperature=1.0,
+        timing_temperature=2.0,
+        mania_column_temperature=1.0,
+        taiko_hit_temperature=1.0,
+        types_first=True,
+        beat_type_tokens=(10,),
+        mania_type_tokens=(),
+        scroll_speed_tokens=(),
+    )
+    scores = torch.tensor([[3.0, 5.0]])
+    assert torch.equal(
+        processor(torch.tensor([[0, 10]]), scores),
+        scores / 2.0,
+    )

@@ -1,3 +1,5 @@
+import hashlib
+
 import numpy as np
 import numpy.typing as npt
 from scipy.ndimage import gaussian_filter1d
@@ -11,6 +13,19 @@ from ..tokenizer import ContextType, EventType, Event
 from .preprocessor import Preprocessor
 from .processor import Processor, GenerationConfig, MILISECONDS_PER_SECOND
 from ..tokenizer import MILISECONDS_PER_STEP
+
+
+def _array_profile(value: npt.ArrayLike) -> dict[str, object]:
+    array = np.ascontiguousarray(np.asarray(value))
+    return {
+        "shape": list(array.shape),
+        "dtype": str(array.dtype),
+        "sha256": hashlib.sha256(array.tobytes()).hexdigest(),
+        "count": int(array.size),
+        "nonzero": int(np.count_nonzero(array)),
+        "sum": float(array.sum()) if array.size else 0.0,
+        "max": float(array.max()) if array.size else None,
+    }
 
 
 class SuperTimingGenerator:
@@ -34,6 +49,8 @@ class SuperTimingGenerator:
         self.bpm_change_threshold = args.timer_bpm_threshold
         self.types_first = args.train.data.types_first
         self.iterations = args.timer_iterations
+        self.profile_audio_offsets: list[int] | None = None
+        self.last_profile_diagnostics: dict[str, object] | None = None
 
         self.frame_seq_len = args.train.data.src_seq_len - 1
         self.frame_size = args.train.model.spectrogram.hop_length
@@ -59,10 +76,31 @@ class SuperTimingGenerator:
             print("Generating timing")
 
         iterations = self.iterations
+        if self.profile_audio_offsets is not None:
+            if not self.processor.profiler.enabled:
+                raise RuntimeError(
+                    "fixed super-timing offsets are profiling-only"
+                )
+            if len(self.profile_audio_offsets) != iterations:
+                raise ValueError(
+                    "super-timing offset schedule must match timer_iterations"
+                )
+        audio_offsets: list[int] = []
         tokens_per_second_meter = self.processor._create_tokens_per_second_meter()
         iterator = tqdm(list(range(iterations)), smoothing=0.1, dynamic_ncols=True) if verbose else range(iterations)
-        for _ in iterator:
-            audio_offset = np.random.randint(-(self.miliseconds_per_sequence // 2), self.miliseconds_per_sequence // 2)
+        for iteration in iterator:
+            self.processor.super_timing_iteration = int(iteration)
+            audio_offset = (
+                int(self.profile_audio_offsets[iteration])
+                if self.profile_audio_offsets is not None
+                else int(
+                    np.random.randint(
+                        -(self.miliseconds_per_sequence // 2),
+                        self.miliseconds_per_sequence // 2,
+                    )
+                )
+            )
+            audio_offsets.append(audio_offset)
             begin_pad = max(0, audio_offset * self.sample_rate // MILISECONDS_PER_SECOND)
             begin_remove = max(0, -audio_offset * self.sample_rate // MILISECONDS_PER_SECOND)
             sequences = self.preprocessor.segment(audio[begin_remove:], begin_pad, 0)
@@ -114,10 +152,32 @@ class SuperTimingGenerator:
                 last_beat_time = time
                 last_group_type = group.event_type
 
+        if self.processor.profiler.enabled:
+            self.last_profile_diagnostics = {
+                "audio_offsets_ms": audio_offsets,
+                "raw_histograms": {
+                    "beats": _array_profile(beats_hist),
+                    "measures": _array_profile(measures_hist),
+                    "timing_points": _array_profile(timing_points_hist),
+                },
+                "tpbs": _array_profile(
+                    np.asarray(tpbs, dtype=np.int64).reshape(-1, 2)
+                ),
+                "measure_counts": _array_profile(
+                    np.asarray(measure_counts, dtype=np.int64).reshape(-1, 2)
+                ),
+            }
+
         # Smooth and normalize histograms
         beats_hist = gaussian_filter1d(beats_hist.astype(float), 10) / iterations * 50
         measures_hist = gaussian_filter1d(measures_hist.astype(float), 10) / iterations * 50
         timing_points_hist = gaussian_filter1d(timing_points_hist.astype(float), 10) / iterations * 50
+        if self.last_profile_diagnostics is not None:
+            self.last_profile_diagnostics["smoothed_histograms"] = {
+                "beats": _array_profile(beats_hist),
+                "measures": _array_profile(measures_hist),
+                "timing_points": _array_profile(timing_points_hist),
+            }
 
         # Sort the ticks per beats points
         tpbs = sorted(tpbs, key=lambda x: x[0])
@@ -358,4 +418,13 @@ class SuperTimingGenerator:
         #
         # plot()
 
+        if self.last_profile_diagnostics is not None:
+            self.last_profile_diagnostics["final_events"] = [
+                [event.type.value, event.value]
+                for event in events
+            ]
+            self.last_profile_diagnostics["final_event_times"] = [
+                int(value) for value in event_times
+            ]
+        self.processor.super_timing_iteration = None
         return events, event_times

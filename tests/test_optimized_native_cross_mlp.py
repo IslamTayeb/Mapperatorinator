@@ -330,6 +330,119 @@ def test_ordinary_generate_window_installs_shared_specialized_dispatch(monkeypat
     assert timing_dispatch_counts == timing_stats["optimized_dispatch_capture_hits"]
 
 
+def test_experimental_batched_window_deliberately_disables_all_native_dispatch(
+    monkeypatch,
+) -> None:
+    captured: list[dict[str, object]] = []
+
+    @contextmanager
+    def fake_profile_context(**kwargs):
+        captured.append(kwargs)
+        yield
+
+    class FakeSession:
+        @staticmethod
+        def cache_for_window(*args, **kwargs):
+            return object()
+
+        @staticmethod
+        def active_prefix_decode_kwargs():
+            return {}
+
+    model = SimpleNamespace(
+        device=torch.device("cpu"),
+        dtype=torch.float16,
+        generate=lambda **kwargs: torch.tensor([[1, 2], [1, 2]]),
+    )
+    tokenizer = SimpleNamespace(pad_id=0, eos_id=2, context_eos={})
+    model_kwargs = {
+        "inputs": torch.zeros(2, 1),
+        "decoder_input_ids": torch.tensor([[1], [1]]),
+        "decoder_attention_mask": torch.tensor([[1], [1]]),
+    }
+    monkeypatch.setattr(engine, "generation_profile_context", fake_profile_context)
+    monkeypatch.setattr(
+        engine,
+        "_build_logits_processor_list",
+        lambda *args, **kwargs: [],
+    )
+
+    _, stats = engine._generate_window(
+        model,
+        tokenizer,
+        model_kwargs,
+        {"context_type": ContextType.MAP, "pad_token_id": 0},
+        context_state=FakeSession(),
+        preset=engine.OPTIMIZED_PRESETS["fp16"],
+        allow_batched_decode=True,
+    )
+
+    dispatch_counts = captured[0].pop("optimized_dispatch_counts")
+    assert captured[0] == {
+        "q1_bmm_cross_attention": False,
+        "native_q1_self_attention": False,
+        "native_q1_rope_cache_self_attention": False,
+        "native_cross_mlp_tail": False,
+        "optimized_expected_dtype": torch.float16,
+    }
+    assert dispatch_counts == stats["optimized_dispatch_capture_hits"] == {
+        "native_q1_rope_cache_self_attention": 0,
+        "native_q1_self_attention": 0,
+        "q1_bmm_cross_attention": 0,
+        "native_cross_mlp_tail": 0,
+    }
+    assert stats["optimized_dispatch_mode"] == "framework_batch"
+    assert {
+        row["disabled_reason"]
+        for row in stats["optimized_dispatch_policy"].values()
+    } == {"batch_gt_1"}
+
+
+def test_nominal_batched_policy_keeps_a_one_row_tail_on_framework(monkeypatch):
+    captured = []
+
+    @contextmanager
+    def fake_profile_context(**kwargs):
+        captured.append(kwargs)
+        yield
+
+    context_state = SimpleNamespace(
+        cache_for_window=lambda *args, **kwargs: object(),
+        active_prefix_decode_kwargs=lambda: {},
+    )
+    model = SimpleNamespace(
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        generate=lambda **kwargs: torch.tensor([[1, 2]]),
+    )
+    monkeypatch.setattr(engine, "generation_profile_context", fake_profile_context)
+    monkeypatch.setattr(
+        engine,
+        "_build_logits_processor_list",
+        lambda *args, **kwargs: [],
+    )
+
+    _, stats = engine._generate_window(
+        model,
+        SimpleNamespace(pad_id=0, eos_id=2, context_eos={}),
+        {
+            "inputs": torch.zeros(1, 1),
+            "decoder_input_ids": torch.tensor([[1]]),
+            "decoder_attention_mask": torch.tensor([[1]]),
+        },
+        {"context_type": ContextType.MAP, "pad_token_id": 0},
+        context_state=context_state,
+        preset=engine.OPTIMIZED_PRESETS["fp32"],
+        allow_batched_decode=True,
+        specialized_dispatch_batch_size=4,
+    )
+
+    dispatch_counts = captured[0].pop("optimized_dispatch_counts")
+    assert all(value is False for value in captured[0].values() if isinstance(value, bool))
+    assert all(value == 0 for value in dispatch_counts.values())
+    assert stats["optimized_dispatch_mode"] == "framework_batch"
+
+
 @pytest.mark.parametrize(
     ("precision", "wrong_dtype"),
     (("fp32", torch.float16), ("fp16", torch.float32)),

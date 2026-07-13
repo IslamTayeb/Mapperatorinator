@@ -17,6 +17,7 @@ from osuT5.osuT5.inference.generation_utils import (
 )
 from osuT5.osuT5.inference.optimized.single import engine as engine_module
 from osuT5.osuT5.inference.optimized.single.engine import (
+    ExperimentalBatchedSuperTimingRuntime,
     OPTIMIZED_PRESETS,
     OptimizedPreset,
     OptimizedSingleRuntime,
@@ -79,6 +80,20 @@ def test_runtime_metadata_exposes_two_fixed_accepted_presets():
             "native_q1_rope_cache_self_attention": True,
             "native_cross_mlp_tail": True,
         }
+
+
+def test_experimental_batched_runtime_persists_one_private_session():
+    runtime = ExperimentalBatchedSuperTimingRuntime(
+        OPTIMIZED_PRESETS["fp32"],
+        nominal_batch_size=4,
+    )
+    first = runtime.new_context_state()
+    second = runtime.new_context_state()
+    assert first is second
+    assert runtime.profile_metadata()["public_wiring"] is False
+    assert runtime.profile_metadata()["optimized_effective_config"][
+        "framework_dispatch_batch_gt_1"
+    ] is True
 
 
 def test_precision_presets_and_bound_runtime_are_immutable():

@@ -4,12 +4,15 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
 from transformers.modeling_outputs import BaseModelOutput
+from transformers.generation.stopping_criteria import StoppingCriteriaList
 
 from osuT5.osuT5.inference.optimized.single.decode_loop import (
+    active_prefix_decode_generate,
     _bucketed_prefix_length,
     _clone_static_graph_inputs,
     _copy_static_graph_inputs,
@@ -110,3 +113,183 @@ assert "osuT5.osuT5.inference.optimized.single.decode_loop" not in sys.modules
 """
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_framework_batch_prefix_context_does_not_load_native_extensions():
+    completed = _run_fresh_python(
+        """
+import sys
+from osuT5.osuT5.inference.optimized.single.runtime_context import (
+    active_prefix_self_attention_context,
+)
+
+with active_prefix_self_attention_context(64):
+    pass
+
+for name in (
+    "osuT5.osuT5.inference.optimized.kernels.q1_attention",
+    "osuT5.osuT5.inference.optimized.kernels.cross_mlp",
+    "osuT5.osuT5.inference.optimized.kernels.decoder_layer",
+    "torch.utils.cpp_extension",
+):
+    assert name not in sys.modules, name
+"""
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+class _PerRowEosCriteria:
+    eos_token_id = 2
+
+    def __call__(self, input_ids, scores):
+        del scores
+        return input_ids[:, -1].eq(self.eos_token_id)
+
+
+class _BatchLoopModel:
+    def __init__(self, scheduled_tokens):
+        self.scheduled_tokens = [torch.tensor(row) for row in scheduled_tokens]
+        self.call_index = 0
+        self.prepared_masks = []
+        self.config = SimpleNamespace(
+            is_encoder_decoder=False,
+            _attn_implementation="sdpa",
+        )
+
+    def _get_initial_cache_position(self, cur_len, device, model_kwargs):
+        del cur_len, device
+        return model_kwargs
+
+    def _valid_auto_compile_criteria(self, model_kwargs, generation_config):
+        del model_kwargs, generation_config
+        return False
+
+    def _has_unfinished_sequences(self, finished, synced_gpus, device):
+        del synced_gpus, device
+        return not bool(finished)
+
+    def prepare_inputs_for_generation(self, input_ids, **model_kwargs):
+        mask = model_kwargs["decoder_attention_mask"]
+        self.prepared_masks.append(mask.clone())
+        return {
+            "input_ids": input_ids[:, -1:],
+            "decoder_attention_mask": mask,
+        }
+
+    def __call__(self, **kwargs):
+        del kwargs
+        tokens = self.scheduled_tokens[self.call_index]
+        self.call_index += 1
+        logits = torch.full((len(tokens), 1, 8), -1000.0)
+        logits[torch.arange(len(tokens)), 0, tokens] = 1000.0
+        return SimpleNamespace(logits=logits)
+
+    def _update_model_kwargs_for_generation(
+        self,
+        outputs,
+        model_kwargs,
+        is_encoder_decoder,
+    ):
+        del outputs, is_encoder_decoder
+        mask = model_kwargs["decoder_attention_mask"]
+        model_kwargs["decoder_attention_mask"] = torch.cat(
+            (mask, torch.ones((mask.shape[0], 1), dtype=mask.dtype)),
+            dim=1,
+        )
+        return model_kwargs
+
+
+def _generation_config():
+    return SimpleNamespace(
+        return_dict_in_generate=False,
+        output_attentions=False,
+        output_hidden_states=False,
+        output_scores=False,
+        output_logits=False,
+        prefill_chunk_size=None,
+        _pad_token_tensor=torch.tensor(0),
+        max_length=16,
+        do_sample=False,
+    )
+
+
+def test_fixed_batch_loop_pads_finished_rows_and_waits_for_all_rows():
+    model = _BatchLoopModel(
+        (
+            (2, 5, 5),
+            (7, 2, 5),
+            (7, 7, 2),
+        )
+    )
+    input_ids = torch.tensor(((0, 9), (8, 9), (0, 9)))
+    mask = input_ids.ne(0)
+
+    result = active_prefix_decode_generate(
+        model,
+        input_ids,
+        logits_processor=lambda ids, scores: scores,
+        stopping_criteria=StoppingCriteriaList([_PerRowEosCriteria()]),
+        generation_config=_generation_config(),
+        decoder_attention_mask=mask,
+    )
+
+    assert torch.equal(
+        result[:, -3:],
+        torch.tensor(((2, 0, 0), (5, 2, 0), (5, 5, 2))),
+    )
+    assert model.call_index == 3
+    assert torch.equal(model.prepared_masks[0], mask)
+    assert model.prepared_masks[1].shape == (3, 3)
+    assert model.prepared_masks[2].shape == (3, 4)
+
+
+def test_batched_loop_rejects_missing_mask_and_wrong_stopping_shape():
+    model = _BatchLoopModel(((2, 2),))
+    input_ids = torch.tensor(((1,), (1,)))
+    with pytest.raises(ValueError, match="requires decoder_attention_mask"):
+        active_prefix_decode_generate(
+            model,
+            input_ids,
+            logits_processor=lambda ids, scores: scores,
+            stopping_criteria=StoppingCriteriaList([_PerRowEosCriteria()]),
+            generation_config=_generation_config(),
+        )
+
+    class ScalarCriteria:
+        eos_token_id = 2
+
+        def __call__(self, input_ids, scores):
+            del input_ids, scores
+            return torch.tensor(False)
+
+    class ScalarCriteriaList(list):
+        def __call__(self, input_ids, scores):
+            return self[0](input_ids, scores)
+
+    model = _BatchLoopModel(((2, 2),))
+    with pytest.raises(RuntimeError, match="one value per row"):
+        active_prefix_decode_generate(
+            model,
+            input_ids,
+            logits_processor=lambda ids, scores: scores,
+            stopping_criteria=ScalarCriteriaList([ScalarCriteria()]),
+            generation_config=_generation_config(),
+            decoder_attention_mask=torch.ones_like(input_ids),
+        )
+
+
+def test_graph_signature_separates_batch_and_prefix_bucket():
+    owner = object()
+    b1 = _cuda_graph_signature(
+        64,
+        {"token": torch.ones((1, 1), dtype=torch.long), "owner": owner},
+    )
+    b2 = _cuda_graph_signature(
+        64,
+        {"token": torch.ones((2, 1), dtype=torch.long), "owner": owner},
+    )
+    b2_larger_prefix = _cuda_graph_signature(
+        128,
+        {"token": torch.ones((2, 1), dtype=torch.long), "owner": owner},
+    )
+    assert len({b1, b2, b2_larger_prefix}) == 3

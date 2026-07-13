@@ -57,6 +57,11 @@ def _copy_static_graph_inputs(
                 f"CUDA graph input {key} dtype changed from "
                 f"{static_value.dtype} to {value.dtype}"
             )
+        if static_value.device != value.device:
+            raise RuntimeError(
+                f"CUDA graph input {key} device changed from "
+                f"{static_value.device} to {value.device}"
+            )
         static_value.copy_(value)
 
 
@@ -73,7 +78,12 @@ def _stable_encoder_outputs(
     if not isinstance(source, torch.Tensor):
         raise RuntimeError("encoder_outputs.last_hidden_state must be a tensor")
     current = holder.get("encoder_outputs")
-    if current is None or current.last_hidden_state.shape != source.shape:
+    if (
+        current is None
+        or current.last_hidden_state.shape != source.shape
+        or current.last_hidden_state.dtype != source.dtype
+        or current.last_hidden_state.device != source.device
+    ):
         holder["encoder_outputs"] = BaseModelOutput(
             last_hidden_state=source.clone(memory_format=torch.contiguous_format),
             hidden_states=encoder_outputs.hidden_states,
@@ -146,7 +156,7 @@ def active_prefix_decode_generate(
     stable_encoder_holder: dict[str, BaseModelOutput] | None = None,
     **model_kwargs,
 ) -> torch.LongTensor:
-    """Batch-1 HF loop with persistent active-prefix CUDA graphs."""
+    """Fixed-batch HF loop with persistent active-prefix CUDA graphs."""
 
     if synced_gpus:
         raise ValueError("active_prefix_decode_generate does not support synced_gpus")
@@ -173,8 +183,18 @@ def active_prefix_decode_generate(
         hasattr(criteria, "eos_token_id") for criteria in stopping_criteria
     )
     batch_size, cur_len = input_ids.shape[:2]
-    if batch_size != 1:
-        raise ValueError("active_prefix_decode_generate requires batch_size=1")
+    if batch_size > 1:
+        decoder_attention_mask = model_kwargs.get("decoder_attention_mask")
+        if not isinstance(decoder_attention_mask, torch.Tensor):
+            raise ValueError(
+                "batched active-prefix decode requires decoder_attention_mask"
+            )
+        if decoder_attention_mask.ndim != 2 or tuple(
+            decoder_attention_mask.shape
+        ) != (batch_size, cur_len):
+            raise ValueError(
+                "batched decoder_attention_mask must match input_ids shape"
+            )
     if cuda_graph_forward and input_ids.device.type != "cuda":
         raise RuntimeError("active-prefix CUDA graph decode requires CUDA inputs")
     if cuda_graph_min_decode_steps <= 0:
@@ -285,7 +305,14 @@ def active_prefix_decode_generate(
         if has_eos:
             next_tokens = next_tokens * unfinished + pad_token_id * (1 - unfinished)
         input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
-        unfinished = unfinished & ~stopping_criteria(input_ids, scores)
+        stopped = stopping_criteria(input_ids, scores)
+        if not isinstance(stopped, torch.Tensor) or tuple(stopped.shape) != (
+            batch_size,
+        ):
+            raise RuntimeError(
+                "batched stopping criteria must return one value per row"
+            )
+        unfinished = unfinished & ~stopped.to(dtype=torch.bool)
         this_peer_finished = unfinished.max() == 0
         cur_len += 1
         del outputs

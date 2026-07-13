@@ -70,13 +70,51 @@ class ConditionalTemperatureLogitsWarper(LogitsProcessor):
             self.conditionals = []
 
         self.max_offset = max([offset for _, _, offset in self.conditionals], default=0)
+        self._tokens_by_device: dict[tuple[int, torch.device], torch.Tensor] = {}
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.Tensor:
-        if len(self.conditionals) > 0:
+        if len(self.conditionals) > 0 and input_ids.shape[0] == 1:
             lookback = input_ids[0, -self.max_offset:].cpu()
             for temperature, tokens, offset in self.conditionals:
                 if len(lookback) >= offset and lookback[-offset] in tokens:
                     return scores / temperature
+
+        if len(self.conditionals) > 0 and input_ids.shape[0] > 1:
+            temperatures = torch.full(
+                (scores.shape[0],),
+                self.temperature,
+                dtype=scores.dtype,
+                device=scores.device,
+            )
+            assigned = torch.zeros(
+                scores.shape[0],
+                dtype=torch.bool,
+                device=input_ids.device,
+            )
+            for index, (temperature, tokens, offset) in enumerate(self.conditionals):
+                if input_ids.shape[1] < offset:
+                    continue
+                cache_key = (index, input_ids.device)
+                token_tensor = self._tokens_by_device.get(cache_key)
+                if token_tensor is None:
+                    token_tensor = torch.tensor(
+                        tokens,
+                        dtype=input_ids.dtype,
+                        device=input_ids.device,
+                    )
+                    self._tokens_by_device[cache_key] = token_tensor
+                matches = torch.isin(input_ids[:, -offset], token_tensor) & ~assigned
+                temperatures = torch.where(
+                    matches,
+                    torch.as_tensor(
+                        temperature,
+                        dtype=scores.dtype,
+                        device=scores.device,
+                    ),
+                    temperatures,
+                )
+                assigned |= matches
+            return scores / temperatures.unsqueeze(1)
 
         return scores / self.temperature
 

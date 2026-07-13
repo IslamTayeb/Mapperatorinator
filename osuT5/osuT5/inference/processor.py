@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -164,6 +165,7 @@ class Processor(object):
         self.last_generation_stats: dict[str, float | int] | None = None
         self.decode_session_state: Any | None = None
         self.profiler = profiler or InferenceProfiler()
+        self.super_timing_iteration: int | None = None
 
     def _new_decode_session_state(self):
         if self.inference_runtime is None:
@@ -817,6 +819,7 @@ class Processor(object):
 
             self._record_generation_stats(generation_stats)
             generated_token_ids_per_sample = None
+            raw_generated_token_ids_per_sample = None
             if self.profiler.enabled:
                 maybe_generated_token_ids = [
                     self._generated_token_ids(row, prompt)
@@ -824,6 +827,11 @@ class Processor(object):
                 ]
                 if all(tokens is not None for tokens in maybe_generated_token_ids):
                     generated_token_ids_per_sample = maybe_generated_token_ids
+                if not torch.is_floating_point(result):
+                    raw_generated_token_ids_per_sample = [
+                        [int(token) for token in row[max_len:].detach().cpu().tolist()]
+                        for row in result
+                    ]
             self._record_generation_profile(
                 profile_label=profile_label,
                 mode="parallel",
@@ -835,8 +843,19 @@ class Processor(object):
                 generation_started_at_perf_counter_seconds=generation_start,
                 generation_finished_at_perf_counter_seconds=generation_finished,
                 prompt_tokens_per_sample=cond_prompt_batch.ne(self.tokenizer.pad_id).sum(dim=-1).tolist(),
+                prompt_width=int(cond_prompt_batch.shape[1]),
+                prompt_sha256_per_sample=[
+                    hashlib.sha256(
+                        row.detach().contiguous().cpu().numpy().tobytes()
+                    ).hexdigest()
+                    for row in cond_prompt_batch
+                ],
                 output_tokens_per_sample=result.ne(self.tokenizer.pad_id).sum(dim=-1).tolist(),
                 generated_token_ids_per_sample=generated_token_ids_per_sample,
+                raw_generated_token_ids_per_sample=(
+                    raw_generated_token_ids_per_sample
+                ),
+                super_timing_iteration=self.super_timing_iteration,
                 stats=generation_stats,
             )
             if verbose:
@@ -1506,10 +1525,18 @@ class Processor(object):
         if stats.get("torch_compile_enabled") is not None:
             record["torch_compile_enabled"] = stats["torch_compile_enabled"]
         for key in (
+            "experimental_batched_super_timing",
+            "optimized_dispatch_mode",
+            "optimized_dispatch_policy",
             "native_cross_mlp_tail_requested",
             "native_cross_mlp_tail_enabled",
             "native_cross_mlp_tail_disabled_reason",
             "optimized_dispatch_capture_hits",
+            "decode_graph_count_before",
+            "decode_graph_count_after",
+            "decode_graph_count_delta",
+            "decode_graph_capture_seconds_delta",
+            "decode_graph_replays_delta",
         ):
             if stats.get(key) is not None:
                 record[key] = stats[key]

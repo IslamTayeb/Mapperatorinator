@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from types import MappingProxyType
 from typing import Any
@@ -94,6 +94,7 @@ def _build_logits_processor_list(
     taiko_hit_temperature: float,
     lookback_time: float,
     device,
+    stateful_monotonic: bool = True,
 ):
     return build_single_logits_processor_list(
         tokenizer,
@@ -106,7 +107,7 @@ def _build_logits_processor_list(
         taiko_hit_temperature=taiko_hit_temperature,
         lookback_time=lookback_time,
         device=device,
-        stateful_monotonic=True,
+        stateful_monotonic=stateful_monotonic,
     )
 
 
@@ -126,6 +127,8 @@ def _generate_window(
     *,
     context_state: ProductionDecodeSession,
     preset: OptimizedPreset,
+    allow_batched_decode: bool = False,
+    specialized_dispatch_batch_size: int | None = None,
 ):
     expected_dtype = preset.torch_dtype
     if model.dtype != expected_dtype:
@@ -171,15 +174,27 @@ def _generate_window(
         context_type = ContextType(context_type)
     if precision != preset.precision or cfg_scale != 1.0:
         raise ValueError("optimized single runtime configuration changed after validation.")
-    if batch_size != 1:
+    if batch_size != 1 and not allow_batched_decode:
         raise ValueError("optimized single runtime requires batch_size=1.")
     if int(generate_kwargs.get("num_beams", 1)) != 1:
         raise ValueError("optimized single runtime requires num_beams=1.")
 
-    native_q1_self_attention = context_type != ContextType.TIMING
+    if specialized_dispatch_batch_size is not None and (
+        specialized_dispatch_batch_size <= 0
+    ):
+        raise ValueError("specialized dispatch batch size must be positive")
+    specialized_batch = (
+        batch_size == 1
+        and specialized_dispatch_batch_size in {None, 1}
+    )
+    q1_bmm_cross_attention = specialized_batch
+    native_q1_self_attention = (
+        specialized_batch and context_type != ContextType.TIMING
+    )
     native_q1_rope_cache_self_attention = native_q1_self_attention
-    native_cross_mlp_tail = _native_cross_mlp_tail_enabled(
-        context_type=context_type,
+    native_cross_mlp_tail = (
+        specialized_batch
+        and _native_cross_mlp_tail_enabled(context_type=context_type)
     )
     processors = _build_logits_processor_list(
         tokenizer,
@@ -192,6 +207,7 @@ def _generate_window(
         taiko_hit_temperature=taiko_hit_temperature,
         lookback_time=lookback_time,
         device=model.device,
+        stateful_monotonic=specialized_batch,
     )
     cache = context_state.cache_for_window(
         model,
@@ -211,6 +227,13 @@ def _generate_window(
         cuda_graph_min_decode_steps=1,
         **context_state.active_prefix_decode_kwargs(),
     )
+    graph_count_before = int(getattr(context_state, "graph_count", 0))
+    graph_capture_seconds_before = float(
+        getattr(context_state, "graph_capture_seconds", 0.0)
+    )
+    graph_decode_replays_before = int(
+        getattr(context_state, "graph_decode_replays", 0)
+    )
     dispatch_counts = {
         "native_q1_rope_cache_self_attention": 0,
         "native_q1_self_attention": 0,
@@ -223,7 +246,7 @@ def _generate_window(
         dtype=torch.bfloat16,
         enabled=precision == "amp",
     ), generation_profile_context(
-        q1_bmm_cross_attention=True,
+        q1_bmm_cross_attention=q1_bmm_cross_attention,
         native_q1_self_attention=native_q1_self_attention,
         native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
         native_cross_mlp_tail=native_cross_mlp_tail,
@@ -264,14 +287,76 @@ def _generate_window(
         "decoder_loop_backend": "active_prefix_cuda_graph",
         "torch_compile_enabled": False,
         "optimized_effective_config_version": preset.version,
-        "native_cross_mlp_tail_requested": True,
+        "experimental_batched_super_timing": allow_batched_decode,
+        "optimized_dispatch_mode": (
+            "accepted_batch1" if specialized_batch else "framework_batch"
+        ),
+        "optimized_dispatch_policy": {
+            "q1_bmm_cross_attention": {
+                "requested": specialized_batch,
+                "enabled": q1_bmm_cross_attention,
+                "disabled_reason": (
+                    None if q1_bmm_cross_attention else "batch_gt_1"
+                ),
+            },
+            "native_q1_self_attention": {
+                "requested": specialized_batch,
+                "enabled": native_q1_self_attention,
+                "disabled_reason": (
+                    None
+                    if native_q1_self_attention
+                    else "batch_gt_1"
+                    if not specialized_batch
+                    else "timing_context"
+                ),
+            },
+            "native_q1_rope_cache_self_attention": {
+                "requested": specialized_batch,
+                "enabled": native_q1_rope_cache_self_attention,
+                "disabled_reason": (
+                    None
+                    if native_q1_rope_cache_self_attention
+                    else "batch_gt_1"
+                    if not specialized_batch
+                    else "timing_context"
+                ),
+            },
+            "native_cross_mlp_tail": {
+                "requested": specialized_batch,
+                "enabled": native_cross_mlp_tail,
+                "disabled_reason": (
+                    None
+                    if native_cross_mlp_tail
+                    else "batch_gt_1"
+                    if not specialized_batch
+                    else "timing_context"
+                ),
+            },
+        },
+        "native_cross_mlp_tail_requested": specialized_batch,
         "native_cross_mlp_tail_enabled": native_cross_mlp_tail,
         "native_cross_mlp_tail_disabled_reason": (
-            "timing_context"
+            "batch_gt_1"
+            if not specialized_batch
+            else "timing_context"
             if not native_cross_mlp_tail
             else None
         ),
         "optimized_dispatch_capture_hits": dict(dispatch_counts),
+        "decode_graph_count_before": graph_count_before,
+        "decode_graph_count_after": int(getattr(context_state, "graph_count", 0)),
+        "decode_graph_count_delta": (
+            int(getattr(context_state, "graph_count", 0))
+            - graph_count_before
+        ),
+        "decode_graph_capture_seconds_delta": (
+            float(getattr(context_state, "graph_capture_seconds", 0.0))
+            - graph_capture_seconds_before
+        ),
+        "decode_graph_replays_delta": (
+            int(getattr(context_state, "graph_decode_replays", 0))
+            - graph_decode_replays_before
+        ),
     })
     return result, stats
 
@@ -325,6 +410,91 @@ class OptimizedSingleRuntime:
             ),
             "optimized_result_class": self.preset.result_class,
         }
+
+
+@dataclass(slots=True)
+class ExperimentalBatchedSuperTimingRuntime:
+    """Private profiling runtime; never selected by public inference config."""
+
+    preset: OptimizedPreset
+    nominal_batch_size: int
+    _session: ProductionDecodeSession = field(
+        default_factory=ProductionDecodeSession,
+        init=False,
+        repr=False,
+    )
+
+    def __post_init__(self):
+        if not any(
+            self.preset is candidate
+            for candidate in OPTIMIZED_PRESETS.values()
+        ):
+            raise ValueError(
+                "experimental batched runtime requires a registered preset"
+            )
+        if self.nominal_batch_size <= 0:
+            raise ValueError("experimental nominal batch size must be positive")
+
+    def new_context_state(self) -> ProductionDecodeSession:
+        return self._session
+
+    def generate_window(
+        self,
+        *,
+        model,
+        tokenizer,
+        model_kwargs: dict[str, Any],
+        generate_kwargs: dict[str, Any],
+        context_state: ProductionDecodeSession,
+    ):
+        if context_state is not self._session:
+            raise RuntimeError(
+                "experimental batched runtime requires its persistent session"
+            )
+        return _generate_window(
+            model,
+            tokenizer,
+            model_kwargs,
+            dict(generate_kwargs),
+            context_state=context_state,
+            preset=self.preset,
+            allow_batched_decode=True,
+            specialized_dispatch_batch_size=self.nominal_batch_size,
+        )
+
+    def profile_metadata(self) -> dict[str, Any]:
+        return {
+            "optimized_effective_config_version": self.preset.version,
+            "optimized_effective_config": {
+                **_optimized_config_metadata(self.preset),
+                "batch_size": "profile_selected",
+                "nominal_batch_size": self.nominal_batch_size,
+                "specialized_dispatch_batch_size": 1,
+                "framework_dispatch_batch_gt_1": True,
+            },
+            "optimized_runtime_owner": (
+                "osuT5.osuT5.inference.optimized.single.engine"
+            ),
+            "optimized_result_class": "component-scout",
+            "public_wiring": False,
+        }
+
+
+def build_experimental_batched_super_timing_runtime(
+    precision: str,
+    *,
+    nominal_batch_size: int,
+) -> ExperimentalBatchedSuperTimingRuntime:
+    try:
+        preset = OPTIMIZED_PRESETS[precision]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(
+            "batched super-timing runtime requires precision in: fp16, fp32"
+        ) from exc
+    return ExperimentalBatchedSuperTimingRuntime(
+        preset,
+        nominal_batch_size=nominal_batch_size,
+    )
 
 
 def load_optimized_single_engine(
