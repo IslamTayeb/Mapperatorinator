@@ -1,10 +1,11 @@
-"""Accepted FP32 native cross-attention and MLP tail dispatch."""
+"""Accepted dtype-aware native cross-attention and MLP tail dispatch."""
 
 from __future__ import annotations
 
 from typing import Any
 
 import torch
+from transformers.activations import GELUActivation
 from transformers.cache_utils import EncoderDecoderCache
 
 from ....runtime_profiling import profile_range
@@ -13,11 +14,73 @@ from .decoder_layer import (
     native_one_token_mlp_residual,
     native_one_token_rmsnorm_linear,
 )
+from .dispatch import _q1_bmm_cross_attention
+
+
+_SUPPORTED_DTYPES = (torch.float32, torch.float16)
 
 
 def _norm_eps(module: torch.nn.Module, dtype: torch.dtype) -> float:
     eps = getattr(module, "eps", None)
     return float(torch.finfo(dtype).eps if eps is None else eps)
+
+
+def _require_matching_tensor(
+    name: str,
+    value: Any,
+    reference: torch.Tensor,
+) -> torch.Tensor:
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(f"{name} must be a tensor")
+    if value.dtype != reference.dtype:
+        raise TypeError(
+            f"{name} dtype {value.dtype} does not match hidden dtype "
+            f"{reference.dtype}"
+        )
+    if value.device != reference.device:
+        raise ValueError(
+            f"{name} device {value.device} does not match hidden device "
+            f"{reference.device}"
+        )
+    return value
+
+
+def _validate_cross_mlp_tensors(
+    module: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    cache_layer: Any,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if hidden_states.dtype not in _SUPPORTED_DTYPES:
+        raise TypeError(
+            "native cross+MLP tail supports only float32 or float16 storage"
+        )
+
+    key_states = _require_matching_tensor(
+        "cross cache keys",
+        getattr(cache_layer, "keys", None),
+        hidden_states,
+    )
+    value_states = _require_matching_tensor(
+        "cross cache values",
+        getattr(cache_layer, "values", None),
+        hidden_states,
+    )
+    tensors = (
+        ("cross RMSNorm weight", module.cross_attn_layer_norm.weight),
+        ("cross query weight", module.cross_attn.Wq.weight),
+        ("cross query bias", module.cross_attn.Wq.bias),
+        ("cross output weight", module.cross_attn.Wo.weight),
+        ("cross output bias", module.cross_attn.Wo.bias),
+        ("MLP RMSNorm weight", module.final_layer_norm.weight),
+        ("MLP FC1 weight", module.fc1.weight),
+        ("MLP FC1 bias", module.fc1.bias),
+        ("MLP FC2 weight", module.fc2.weight),
+        ("MLP FC2 bias", module.fc2.bias),
+    )
+    for name, tensor in tensors:
+        if tensor is not None:
+            _require_matching_tensor(name, tensor, hidden_states)
+    return key_states, value_states
 
 
 def native_cross_mlp_tail_forward(
@@ -31,8 +94,9 @@ def native_cross_mlp_tail_forward(
     cu_seqlens: torch.Tensor | None,
     encoder_cu_seqlens: torch.Tensor | None,
     layer_name: str,
+    dispatch_counts: dict[str, int] | None = None,
 ) -> tuple[Any, ...] | None:
-    """Run the historical exact FP32 cross+MLP island when decode inputs qualify."""
+    """Run the dtype-aware native cross+MLP island when decode inputs qualify."""
 
     if (
         encoder_hidden_states is None
@@ -40,8 +104,8 @@ def native_cross_mlp_tail_forward(
         or module.activation_dropout != 0
         or module.dropout != 0
         or hidden_states.device.type != "cuda"
-        or hidden_states.dtype != torch.float32
         or hidden_states.shape[:2] != (1, 1)
+        or not isinstance(getattr(module, "activation_fn", None), GELUActivation)
         or not isinstance(past_key_value, EncoderDecoderCache)
         or output_attentions
         or cu_seqlens is not None
@@ -57,6 +121,11 @@ def native_cross_mlp_tail_forward(
         and getattr(cache_layer, "is_initialized", False)
     ):
         return None
+    key_states, value_states = _validate_cross_mlp_tensors(
+        module,
+        hidden_states,
+        cache_layer,
+    )
 
     outputs_per_block = 8
     with profile_range(f"{layer_name}.native_cross_mlp_tail.cross_q"):
@@ -74,18 +143,13 @@ def native_cross_mlp_tail_forward(
             module.cross_attn.head_dim,
         ).transpose(1, 2)
 
-    key_states, value_states = cache_layer.keys, cache_layer.values
-    num_heads = query_states.shape[1]
-    head_dim = query_states.shape[-1]
-    q = query_states.reshape(num_heads, 1, head_dim)
-    k = key_states.reshape(num_heads, -1, head_dim)
-    v = value_states.reshape(num_heads, -1, head_dim)
     with profile_range(f"{layer_name}.native_cross_mlp_tail.cross_bmm"):
-        scores = torch.bmm(q, k.transpose(1, 2)) * (head_dim ** -0.5)
-        cross_attention_output = torch.bmm(
-            torch.softmax(scores, dim=-1),
-            v,
-        ).view(1, num_heads, 1, head_dim)
+        cross_attention_output = _q1_bmm_cross_attention(
+            query_states,
+            key_states,
+            value_states,
+            expected_dtype=hidden_states.dtype,
+        )
 
     with profile_range(f"{layer_name}.native_cross_mlp_tail.cross_out"):
         hidden_states = native_one_token_linear_residual(
@@ -108,6 +172,9 @@ def native_cross_mlp_tail_forward(
             outputs_per_block=outputs_per_block,
         )
 
+    if dispatch_counts is not None:
+        dispatch_counts["native_cross_mlp_tail"] += 1
+        dispatch_counts["q1_bmm_cross_attention"] += 1
     return (hidden_states,) + self_attn_outputs[1:] + (past_key_value,)
 
 

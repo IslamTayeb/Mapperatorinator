@@ -26,6 +26,10 @@ OPTIMIZED_RESULT_CLASS = "documented-drift"
 OPTIMIZED_PRECISION = "fp32"
 OPTIMIZED_ATTN_IMPLEMENTATION = "sdpa"
 ACTIVE_PREFIX_BUCKET_SIZE = 64
+_OPTIMIZED_TORCH_DTYPES = {
+    "fp32": torch.float32,
+    "fp16": torch.float16,
+}
 
 
 def _optimized_config_metadata() -> dict[str, Any]:
@@ -101,6 +105,12 @@ def _generate_window(
     *,
     context_state: ProductionDecodeSession,
 ):
+    expected_dtype = _OPTIMIZED_TORCH_DTYPES[OPTIMIZED_PRECISION]
+    if model.dtype != expected_dtype:
+        raise TypeError(
+            f"optimized {OPTIMIZED_PRECISION} runtime loaded model dtype "
+            f"{model.dtype}, expected {expected_dtype}"
+        )
     model_kwargs = {
         key: value.to(model.device) if isinstance(value, torch.Tensor) else value
         for key, value in model_kwargs.items()
@@ -179,6 +189,12 @@ def _generate_window(
         cuda_graph_min_decode_steps=1,
         **context_state.active_prefix_decode_kwargs(),
     )
+    dispatch_counts = {
+        "native_q1_rope_cache_self_attention": 0,
+        "native_q1_self_attention": 0,
+        "q1_bmm_cross_attention": 0,
+        "native_cross_mlp_tail": 0,
+    }
 
     with torch.autocast(
         device_type=model.device.type,
@@ -189,6 +205,8 @@ def _generate_window(
         native_q1_self_attention=native_q1_self_attention,
         native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
         native_cross_mlp_tail=native_cross_mlp_tail,
+        optimized_expected_dtype=expected_dtype,
+        optimized_dispatch_counts=dispatch_counts,
     ):
         if sync_model_timing:
             sync_cuda_for_model(model)
@@ -231,6 +249,7 @@ def _generate_window(
             if not native_cross_mlp_tail
             else None
         ),
+        "optimized_dispatch_capture_hits": dict(dispatch_counts),
     })
     return result, stats
 

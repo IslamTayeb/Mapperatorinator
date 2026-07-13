@@ -13,6 +13,70 @@ from ..single.runtime_context import (
 )
 
 
+def _q1_bmm_cross_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    expected_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Run the accepted q1 cross-attention math for one storage dtype."""
+
+    if expected_dtype not in (torch.float32, torch.float16):
+        raise TypeError("q1 BMM cross attention supports only float32 or float16")
+    if not all(isinstance(tensor, torch.Tensor) for tensor in (query, key, value)):
+        raise TypeError("q1 BMM query, key, and value must be tensors")
+    if (
+        query.dtype != expected_dtype
+        or key.dtype != expected_dtype
+        or value.dtype != expected_dtype
+    ):
+        raise TypeError(
+            "q1 BMM query, key, and value must match the expected storage dtype"
+        )
+    if query.device != key.device or query.device != value.device:
+        raise ValueError("q1 BMM query, key, and value must use one device")
+    if query.dim() != 4 or query.shape[0] != 1 or query.shape[-2] != 1:
+        raise ValueError("q1 BMM query must have shape [1, heads, 1, head_dim]")
+    if key.dim() != 4 or value.dim() != 4 or key.shape != value.shape:
+        raise ValueError("q1 BMM key and value must have matching 4D shapes")
+    if (
+        key.shape[0] != 1
+        or key.shape[1] != query.shape[1]
+        or key.shape[3] != query.shape[3]
+        or key.shape[2] <= 0
+    ):
+        raise ValueError("q1 BMM key/value shapes must match the query heads")
+
+    num_heads = query.shape[1]
+    head_dim = query.shape[-1]
+    q = query.reshape(num_heads, 1, head_dim)
+    k = key.reshape(num_heads, -1, head_dim)
+    v = value.reshape(num_heads, -1, head_dim)
+    if expected_dtype == torch.float32:
+        # Preserve the accepted FP32 calculation order exactly.
+        scores = torch.bmm(q, k.transpose(1, 2)) * (head_dim ** -0.5)
+        output = torch.bmm(
+            torch.softmax(scores, dim=-1),
+            v,
+        )
+    else:
+        if query.device.type == "cuda":
+            scores = torch.bmm(
+                q,
+                k.transpose(1, 2),
+                out_dtype=torch.float32,
+            )
+        else:
+            scores = torch.bmm(q.float(), k.float().transpose(1, 2))
+        scores.mul_(head_dim ** -0.5)
+        output = torch.bmm(
+            torch.softmax(scores, dim=-1),
+            v.float(),
+        ).to(dtype=torch.float16)
+    return output.view(1, num_heads, 1, head_dim)
+
+
 def active_prefix_attention_inputs(
     *,
     module,
@@ -57,6 +121,7 @@ def sdpa_q1_attention_forward(
     native_q1_self_attention: bool,
     native_q1_attention: Callable[..., torch.Tensor] | None,
     expected_dtype: torch.dtype = torch.float32,
+    dispatch_counts: dict[str, int] | None = None,
 ) -> tuple[torch.Tensor] | None:
     use_q1_bmm_cross_attention = (
         q1_bmm_cross_attention
@@ -91,38 +156,18 @@ def sdpa_q1_attention_forward(
             value,
             attention_mask,
         ).transpose(1, 2).contiguous()
+        if dispatch_counts is not None:
+            dispatch_counts["native_q1_self_attention"] += 1
     elif use_q1_bmm_cross_attention:
-        num_heads = query.shape[1]
-        head_dim = query.shape[-1]
-        q = query.reshape(num_heads, 1, head_dim)
-        k = key.reshape(num_heads, -1, head_dim)
-        v = value.reshape(num_heads, -1, head_dim)
-        if expected_dtype == torch.float32:
-            # Preserve the accepted FP32 calculation order exactly.
-            scores = torch.bmm(q, k.transpose(1, 2)) * (head_dim ** -0.5)
-            attn_output = torch.bmm(
-                torch.softmax(scores, dim=-1),
-                v,
-            ).view(1, num_heads, 1, head_dim)
-        elif expected_dtype == torch.float16:
-            if query.device.type == "cuda":
-                scores = torch.bmm(
-                    q,
-                    k.transpose(1, 2),
-                    out_dtype=torch.float32,
-                )
-            else:
-                scores = torch.bmm(q.float(), k.float().transpose(1, 2))
-            scores.mul_(head_dim ** -0.5)
-            attn_output = torch.bmm(
-                torch.softmax(scores, dim=-1),
-                v.float(),
-            ).to(dtype=torch.float16).view(1, num_heads, 1, head_dim)
-        else:
-            raise TypeError(
-                "q1 attention dispatch supports only float32 or float16"
-            )
+        attn_output = _q1_bmm_cross_attention(
+            query,
+            key,
+            value,
+            expected_dtype=expected_dtype,
+        )
         attn_output = attn_output.transpose(1, 2).contiguous()
+        if dispatch_counts is not None:
+            dispatch_counts["q1_bmm_cross_attention"] += 1
     else:
         return None
     return (attn_output.view(bs, -1, dim),)
@@ -143,6 +188,7 @@ def q1_rope_cache_self_attention_forward(
     sliding_window_mask: torch.Tensor | None,
     native_q1_rope_cache_attention: Callable[..., torch.Tensor] | None,
     expected_dtype: torch.dtype = torch.float32,
+    dispatch_counts: dict[str, int] | None = None,
 ) -> tuple[torch.Tensor] | None:
     prefix_length = active_prefix_self_attention_length()
     use_native_q1_rope_cache_self_attention = (
@@ -226,4 +272,6 @@ def q1_rope_cache_self_attention_forward(
         )
     output = output.transpose(1, 2).contiguous()
     output = output.view(bs, -1, module.all_head_size)
+    if dispatch_counts is not None:
+        dispatch_counts["native_q1_rope_cache_self_attention"] += 1
     return (output,)

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from transformers.activations import GELUActivation
 
 from osuT5.osuT5.inference import runtime_dispatch
 from osuT5.osuT5.inference.optimized.single import engine
@@ -128,6 +129,96 @@ def test_native_decoder_extension_is_cold_singleton_and_uses_device_guard(
     source = calls[0]["cuda_sources"]
     assert "#include <c10/cuda/CUDAGuard.h>" in source
     assert source.count("c10::cuda::CUDAGuard") == 3
+    assert source.count("AT_DISPATCH_FLOATING_TYPES_AND_HALF") == 3
+    assert "template<typename scalar_t, int BLOCK_SIZE>" in source
+    assert source.count("template<typename scalar_t, int OUTPUTS_PER_BLOCK>") == 4
+    assert "input must be fp32 or fp16" in source
+    assert "dtype must match input" in source
+    assert "static_cast<float>(input[idx])" in source
+    assert "static_cast<scalar_t>(exact_gelu(sum))" in source
+    assert "float local_sum = 0.0f" in source
+    assert "float local_dot = 0.0f" in source
+    assert "float sum = 0.0f" in source
+
+
+def test_native_decoder_wrappers_preserve_fp16_storage_and_argument_order(
+    monkeypatch,
+) -> None:
+    from osuT5.osuT5.inference.optimized.kernels import decoder_layer
+
+    calls = []
+
+    class _Extension:
+        def one_token_mlp_residual(self, *args):
+            calls.append(("mlp", args))
+            return args[0]
+
+        def one_token_rmsnorm_linear(self, *args):
+            calls.append(("rmsnorm_linear", args))
+            return args[0]
+
+        def one_token_linear_residual(self, *args):
+            calls.append(("linear_residual", args))
+            return args[0]
+
+    monkeypatch.setattr(decoder_layer, "_NATIVE_DECODER_LAYER", _Extension())
+    hidden = torch.zeros((1, 1, 4), dtype=torch.float16)
+    norm = torch.ones(4, dtype=torch.float16)
+    square = torch.eye(4, dtype=torch.float16)
+    bias = torch.zeros(4, dtype=torch.float16)
+
+    assert decoder_layer.native_one_token_rmsnorm_linear(
+        hidden,
+        norm,
+        square,
+        bias,
+        eps=1e-5,
+        outputs_per_block=8,
+    ).dtype == torch.float16
+    kind, args = calls.pop(0)
+    assert kind == "rmsnorm_linear"
+    assert all(
+        actual is expected
+        for actual, expected in zip(args[:4], (hidden, norm, square, bias), strict=True)
+    )
+    assert args[4:] == (1e-5, 8)
+
+    assert decoder_layer.native_one_token_linear_residual(
+        hidden,
+        hidden,
+        square,
+        bias,
+        outputs_per_block=8,
+    ).dtype == torch.float16
+    kind, args = calls.pop(0)
+    assert kind == "linear_residual"
+    assert all(
+        actual is expected
+        for actual, expected in zip(args[:4], (hidden, hidden, square, bias), strict=True)
+    )
+    assert args[4:] == (8,)
+
+    assert decoder_layer.native_one_token_mlp_residual(
+        hidden,
+        norm,
+        square,
+        bias,
+        square,
+        bias,
+        eps=1e-5,
+        outputs_per_block=8,
+    ).dtype == torch.float16
+    kind, args = calls.pop(0)
+    assert kind == "mlp"
+    assert all(
+        actual is expected
+        for actual, expected in zip(
+            args[:6],
+            (hidden, norm, square, bias, square, bias),
+            strict=True,
+        )
+    )
+    assert args[6:] == (1e-5, 8)
 
 
 def test_native_cross_mlp_is_the_single_accepted_optimized_preset() -> None:
@@ -213,21 +304,40 @@ def test_ordinary_generate_window_installs_promoted_dispatch(monkeypatch) -> Non
         context_state=FakeSession(),
     )
 
+    main_dispatch_counts = captured[0].pop("optimized_dispatch_counts")
+    timing_dispatch_counts = captured[1].pop("optimized_dispatch_counts")
     assert captured[0] == {
         "q1_bmm_cross_attention": True,
         "native_q1_self_attention": True,
         "native_q1_rope_cache_self_attention": True,
         "native_cross_mlp_tail": True,
+        "optimized_expected_dtype": torch.float32,
     }
     assert captured[1] == {
         "q1_bmm_cross_attention": True,
         "native_q1_self_attention": False,
         "native_q1_rope_cache_self_attention": False,
         "native_cross_mlp_tail": False,
+        "optimized_expected_dtype": torch.float32,
     }
     assert main_stats["native_cross_mlp_tail_enabled"] is True
     assert timing_stats["native_cross_mlp_tail_enabled"] is False
     assert timing_stats["native_cross_mlp_tail_disabled_reason"] == "timing_context"
+    assert main_dispatch_counts == main_stats["optimized_dispatch_capture_hits"]
+    assert timing_dispatch_counts == timing_stats["optimized_dispatch_capture_hits"]
+
+
+def test_optimized_runtime_rejects_model_dtype_that_disagrees_with_metadata() -> None:
+    model = SimpleNamespace(device=torch.device("cpu"), dtype=torch.float16)
+
+    with pytest.raises(TypeError, match="runtime loaded model dtype"):
+        engine._generate_window(
+            model,
+            SimpleNamespace(),
+            {},
+            {},
+            context_state=SimpleNamespace(),
+        )
 
 
 def test_native_tail_preserves_accepted_cross_bmm_operation_order(monkeypatch) -> None:
@@ -272,6 +382,7 @@ def test_native_tail_preserves_accepted_cross_bmm_operation_order(monkeypatch) -
         training=False,
         activation_dropout=0.0,
         dropout=0.0,
+        activation_fn=GELUActivation(),
         cross_attn=SimpleNamespace(
             layer_idx=0,
             num_heads=2,
@@ -289,12 +400,8 @@ def test_native_tail_preserves_accepted_cross_bmm_operation_order(monkeypatch) -
         events.append("cross_rmsnorm_q")
         return FakeTensor()
 
-    def bmm(*args, **kwargs):
-        events.append("bmm")
-        return FakeTensor()
-
-    def softmax(*args, **kwargs):
-        events.append("softmax")
+    def cross_bmm(*args, **kwargs):
+        events.extend(("bmm", "softmax", "bmm"))
         return FakeTensor()
 
     def linear_residual(*args, **kwargs):
@@ -309,8 +416,12 @@ def test_native_tail_preserves_accepted_cross_bmm_operation_order(monkeypatch) -
     monkeypatch.setattr(cross_mlp, "native_one_token_rmsnorm_linear", rmsnorm_linear)
     monkeypatch.setattr(cross_mlp, "native_one_token_linear_residual", linear_residual)
     monkeypatch.setattr(cross_mlp, "native_one_token_mlp_residual", mlp_residual)
-    monkeypatch.setattr(cross_mlp.torch, "bmm", bmm)
-    monkeypatch.setattr(cross_mlp.torch, "softmax", softmax)
+    monkeypatch.setattr(cross_mlp, "_q1_bmm_cross_attention", cross_bmm)
+    monkeypatch.setattr(
+        cross_mlp,
+        "_validate_cross_mlp_tensors",
+        lambda *args: (cache_tensor, cache_tensor),
+    )
 
     result = cross_mlp.native_cross_mlp_tail_forward(
         module=module,
@@ -333,3 +444,60 @@ def test_native_tail_preserves_accepted_cross_bmm_operation_order(monkeypatch) -
         "cross_out_residual",
         "mlp",
     ]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_native_tail_tensor_validation_accepts_one_shared_storage_dtype(dtype) -> None:
+    from osuT5.osuT5.inference.optimized.kernels import cross_mlp
+
+    hidden = torch.zeros((1, 1, 4), dtype=dtype)
+    weight = torch.zeros((4, 4), dtype=dtype)
+    bias = torch.zeros(4, dtype=dtype)
+    module = SimpleNamespace(
+        cross_attn_layer_norm=SimpleNamespace(weight=bias),
+        cross_attn=SimpleNamespace(
+            Wq=SimpleNamespace(weight=weight, bias=bias),
+            Wo=SimpleNamespace(weight=weight, bias=bias),
+        ),
+        final_layer_norm=SimpleNamespace(weight=bias),
+        fc1=SimpleNamespace(weight=weight, bias=bias),
+        fc2=SimpleNamespace(weight=weight, bias=bias),
+    )
+    cache_layer = SimpleNamespace(
+        keys=torch.zeros((1, 2, 3, 2), dtype=dtype),
+        values=torch.zeros((1, 2, 3, 2), dtype=dtype),
+    )
+
+    keys, values = cross_mlp._validate_cross_mlp_tensors(
+        module,
+        hidden,
+        cache_layer,
+    )
+
+    assert keys.dtype == dtype
+    assert values.dtype == dtype
+
+
+def test_native_tail_tensor_validation_rejects_mixed_storage_dtype() -> None:
+    from osuT5.osuT5.inference.optimized.kernels import cross_mlp
+
+    hidden = torch.zeros((1, 1, 4), dtype=torch.float16)
+    half_weight = torch.zeros((4, 4), dtype=torch.float16)
+    half_bias = torch.zeros(4, dtype=torch.float16)
+    module = SimpleNamespace(
+        cross_attn_layer_norm=SimpleNamespace(weight=half_bias),
+        cross_attn=SimpleNamespace(
+            Wq=SimpleNamespace(weight=half_weight.float(), bias=half_bias),
+            Wo=SimpleNamespace(weight=half_weight, bias=half_bias),
+        ),
+        final_layer_norm=SimpleNamespace(weight=half_bias),
+        fc1=SimpleNamespace(weight=half_weight, bias=half_bias),
+        fc2=SimpleNamespace(weight=half_weight, bias=half_bias),
+    )
+    cache_layer = SimpleNamespace(
+        keys=torch.zeros((1, 2, 3, 2), dtype=torch.float16),
+        values=torch.zeros((1, 2, 3, 2), dtype=torch.float16),
+    )
+
+    with pytest.raises(TypeError, match="cross query weight dtype"):
+        cross_mlp._validate_cross_mlp_tensors(module, hidden, cache_layer)

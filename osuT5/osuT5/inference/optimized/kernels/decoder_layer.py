@@ -21,17 +21,17 @@ def _load_native_decoder_layer():
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-template<int BLOCK_SIZE>
+template<typename scalar_t, int BLOCK_SIZE>
 __global__ void rmsnorm_one_token_kernel(
-        const float* __restrict__ input,
-        const float* __restrict__ weight,
-        float* __restrict__ normalized,
+        const scalar_t* __restrict__ input,
+        const scalar_t* __restrict__ weight,
+        scalar_t* __restrict__ normalized,
         int hidden_dim,
         float eps) {
     int tid = threadIdx.x;
     float local_sum = 0.0f;
     for (int idx = tid; idx < hidden_dim; idx += BLOCK_SIZE) {
-        float value = input[idx];
+        float value = static_cast<float>(input[idx]);
         local_sum += value * value;
     }
 
@@ -47,7 +47,10 @@ __global__ void rmsnorm_one_token_kernel(
 
     float inv_rms = rsqrtf(scratch[0] / static_cast<float>(hidden_dim) + eps);
     for (int idx = tid; idx < hidden_dim; idx += BLOCK_SIZE) {
-        normalized[idx] = input[idx] * inv_rms * weight[idx];
+        normalized[idx] = static_cast<scalar_t>(
+            static_cast<float>(input[idx])
+            * inv_rms
+            * static_cast<float>(weight[idx]));
     }
 }
 
@@ -55,13 +58,13 @@ __device__ __forceinline__ float exact_gelu(float value) {
     return 0.5f * value * (1.0f + erff(value * 0.7071067811865475244f));
 }
 
-template<int OUTPUTS_PER_BLOCK>
+template<typename scalar_t, int OUTPUTS_PER_BLOCK>
 __global__ void rmsnorm_linear_warp_group_kernel(
-        const float* __restrict__ input,
-        const float* __restrict__ norm_weight,
-        const float* __restrict__ linear_weight,
-        const float* __restrict__ linear_bias,
-        float* __restrict__ output,
+        const scalar_t* __restrict__ input,
+        const scalar_t* __restrict__ norm_weight,
+        const scalar_t* __restrict__ linear_weight,
+        const scalar_t* __restrict__ linear_bias,
+        scalar_t* __restrict__ output,
         int hidden_dim,
         int output_dim,
         int has_bias,
@@ -73,13 +76,15 @@ __global__ void rmsnorm_linear_warp_group_kernel(
         return;
     }
 
-    const float* w = linear_weight + out_idx * hidden_dim;
+    const scalar_t* w = linear_weight + out_idx * hidden_dim;
     float local_sq = 0.0f;
     float local_dot = 0.0f;
     for (int idx = lane; idx < hidden_dim; idx += 32) {
-        float x = input[idx];
+        float x = static_cast<float>(input[idx]);
         local_sq += x * x;
-        local_dot += x * norm_weight[idx] * w[idx];
+        local_dot += x
+            * static_cast<float>(norm_weight[idx])
+            * static_cast<float>(w[idx]);
     }
 
     unsigned mask = 0xffffffffu;
@@ -91,19 +96,19 @@ __global__ void rmsnorm_linear_warp_group_kernel(
         float inv_rms = rsqrtf(local_sq / static_cast<float>(hidden_dim) + eps);
         float value = local_dot * inv_rms;
         if (has_bias) {
-            value += linear_bias[out_idx];
+            value += static_cast<float>(linear_bias[out_idx]);
         }
-        output[out_idx] = value;
+        output[out_idx] = static_cast<scalar_t>(value);
     }
 }
 
-template<int OUTPUTS_PER_BLOCK>
+template<typename scalar_t, int OUTPUTS_PER_BLOCK>
 __global__ void linear_residual_warp_group_kernel(
-        const float* __restrict__ input,
-        const float* __restrict__ residual,
-        const float* __restrict__ weight,
-        const float* __restrict__ bias,
-        float* __restrict__ output,
+        const scalar_t* __restrict__ input,
+        const scalar_t* __restrict__ residual,
+        const scalar_t* __restrict__ weight,
+        const scalar_t* __restrict__ bias,
+        scalar_t* __restrict__ output,
         int hidden_dim,
         int has_bias) {
     int warp_id = threadIdx.x / 32;
@@ -113,10 +118,10 @@ __global__ void linear_residual_warp_group_kernel(
         return;
     }
 
-    const float* w = weight + out_idx * hidden_dim;
+    const scalar_t* w = weight + out_idx * hidden_dim;
     float sum = 0.0f;
     for (int idx = lane; idx < hidden_dim; idx += 32) {
-        sum += input[idx] * w[idx];
+        sum += static_cast<float>(input[idx]) * static_cast<float>(w[idx]);
     }
 
     unsigned mask = 0xffffffffu;
@@ -125,18 +130,19 @@ __global__ void linear_residual_warp_group_kernel(
     }
     if (lane == 0) {
         if (has_bias) {
-            sum += bias[out_idx];
+            sum += static_cast<float>(bias[out_idx]);
         }
-        output[out_idx] = residual[out_idx] + sum;
+        output[out_idx] = static_cast<scalar_t>(
+            static_cast<float>(residual[out_idx]) + sum);
     }
 }
 
-template<int OUTPUTS_PER_BLOCK>
+template<typename scalar_t, int OUTPUTS_PER_BLOCK>
 __global__ void fc1_gelu_warp_group_kernel(
-        const float* __restrict__ input,
-        const float* __restrict__ weight,
-        const float* __restrict__ bias,
-        float* __restrict__ output,
+        const scalar_t* __restrict__ input,
+        const scalar_t* __restrict__ weight,
+        const scalar_t* __restrict__ bias,
+        scalar_t* __restrict__ output,
         int hidden_dim,
         int intermediate_dim,
         int has_bias) {
@@ -147,10 +153,10 @@ __global__ void fc1_gelu_warp_group_kernel(
         return;
     }
 
-    const float* w = weight + out_idx * hidden_dim;
+    const scalar_t* w = weight + out_idx * hidden_dim;
     float sum = 0.0f;
     for (int idx = lane; idx < hidden_dim; idx += 32) {
-        sum += input[idx] * w[idx];
+        sum += static_cast<float>(input[idx]) * static_cast<float>(w[idx]);
     }
 
     unsigned mask = 0xffffffffu;
@@ -159,19 +165,19 @@ __global__ void fc1_gelu_warp_group_kernel(
     }
     if (lane == 0) {
         if (has_bias) {
-            sum += bias[out_idx];
+            sum += static_cast<float>(bias[out_idx]);
         }
-        output[out_idx] = exact_gelu(sum);
+        output[out_idx] = static_cast<scalar_t>(exact_gelu(sum));
     }
 }
 
-template<int OUTPUTS_PER_BLOCK>
+template<typename scalar_t, int OUTPUTS_PER_BLOCK>
 __global__ void fc2_residual_warp_group_kernel(
-        const float* __restrict__ input,
-        const float* __restrict__ weight,
-        const float* __restrict__ bias,
-        const float* __restrict__ residual,
-        float* __restrict__ output,
+        const scalar_t* __restrict__ input,
+        const scalar_t* __restrict__ weight,
+        const scalar_t* __restrict__ bias,
+        const scalar_t* __restrict__ residual,
+        scalar_t* __restrict__ output,
         int hidden_dim,
         int intermediate_dim,
         int has_bias) {
@@ -182,10 +188,10 @@ __global__ void fc2_residual_warp_group_kernel(
         return;
     }
 
-    const float* w = weight + out_idx * intermediate_dim;
+    const scalar_t* w = weight + out_idx * intermediate_dim;
     float sum = 0.0f;
     for (int idx = lane; idx < intermediate_dim; idx += 32) {
-        sum += input[idx] * w[idx];
+        sum += static_cast<float>(input[idx]) * static_cast<float>(w[idx]);
     }
 
     unsigned mask = 0xffffffffu;
@@ -194,9 +200,10 @@ __global__ void fc2_residual_warp_group_kernel(
     }
     if (lane == 0) {
         if (has_bias) {
-            sum += bias[out_idx];
+            sum += static_cast<float>(bias[out_idx]);
         }
-        output[out_idx] = residual[out_idx] + sum;
+        output[out_idx] = static_cast<scalar_t>(
+            static_cast<float>(residual[out_idx]) + sum);
     }
 }
 
@@ -215,10 +222,16 @@ torch::Tensor one_token_mlp_residual(
     TORCH_CHECK(norm_weight.device() == input.device(), "norm_weight/input device mismatch");
     TORCH_CHECK(fc1_weight.device() == input.device(), "fc1_weight/input device mismatch");
     TORCH_CHECK(fc2_weight.device() == input.device(), "fc2_weight/input device mismatch");
-    TORCH_CHECK(input.scalar_type() == torch::kFloat32, "input must be fp32");
-    TORCH_CHECK(norm_weight.scalar_type() == torch::kFloat32, "norm_weight must be fp32");
-    TORCH_CHECK(fc1_weight.scalar_type() == torch::kFloat32, "fc1_weight must be fp32");
-    TORCH_CHECK(fc2_weight.scalar_type() == torch::kFloat32, "fc2_weight must be fp32");
+    TORCH_CHECK(
+            input.scalar_type() == torch::kFloat32
+            || input.scalar_type() == torch::kFloat16,
+            "input must be fp32 or fp16");
+    TORCH_CHECK(norm_weight.scalar_type() == input.scalar_type(),
+            "norm_weight dtype must match input");
+    TORCH_CHECK(fc1_weight.scalar_type() == input.scalar_type(),
+            "fc1_weight dtype must match input");
+    TORCH_CHECK(fc2_weight.scalar_type() == input.scalar_type(),
+            "fc2_weight dtype must match input");
     TORCH_CHECK(input.dim() == 3 && input.size(0) == 1 && input.size(1) == 1,
             "input must have shape [1, 1, hidden_dim]");
     TORCH_CHECK(norm_weight.dim() == 1, "norm_weight must have shape [hidden_dim]");
@@ -231,6 +244,8 @@ torch::Tensor one_token_mlp_residual(
     TORCH_CHECK(fc1_weight.size(1) == hidden_dim, "fc1_weight hidden_dim mismatch");
     TORCH_CHECK(fc2_weight.size(0) == hidden_dim, "fc2_weight hidden_dim mismatch");
     TORCH_CHECK(fc2_weight.size(1) == intermediate_dim, "fc2_weight intermediate_dim mismatch");
+    TORCH_CHECK(outputs_per_block == 2 || outputs_per_block == 4 || outputs_per_block == 8,
+            "unsupported outputs_per_block; expected 2, 4, or 8");
 
     c10::cuda::CUDAGuard device_guard(input.device());
 
@@ -240,28 +255,30 @@ torch::Tensor one_token_mlp_residual(
     auto fc2_weight_contiguous = fc2_weight.contiguous();
 
     torch::Tensor fc1_bias_contiguous;
-    const float* fc1_bias_ptr = nullptr;
+    const void* fc1_bias_ptr = nullptr;
     int has_fc1_bias = 0;
     if (fc1_bias.has_value()) {
         fc1_bias_contiguous = fc1_bias.value().contiguous();
         TORCH_CHECK(fc1_bias_contiguous.is_cuda(), "fc1_bias must be CUDA");
         TORCH_CHECK(fc1_bias_contiguous.device() == input.device(), "fc1_bias/input device mismatch");
-        TORCH_CHECK(fc1_bias_contiguous.scalar_type() == torch::kFloat32, "fc1_bias must be fp32");
+        TORCH_CHECK(fc1_bias_contiguous.scalar_type() == input.scalar_type(),
+                "fc1_bias dtype must match input");
         TORCH_CHECK(fc1_bias_contiguous.numel() == intermediate_dim, "fc1_bias/intermediate_dim mismatch");
-        fc1_bias_ptr = fc1_bias_contiguous.data_ptr<float>();
+        fc1_bias_ptr = fc1_bias_contiguous.data_ptr();
         has_fc1_bias = 1;
     }
 
     torch::Tensor fc2_bias_contiguous;
-    const float* fc2_bias_ptr = nullptr;
+    const void* fc2_bias_ptr = nullptr;
     int has_fc2_bias = 0;
     if (fc2_bias.has_value()) {
         fc2_bias_contiguous = fc2_bias.value().contiguous();
         TORCH_CHECK(fc2_bias_contiguous.is_cuda(), "fc2_bias must be CUDA");
         TORCH_CHECK(fc2_bias_contiguous.device() == input.device(), "fc2_bias/input device mismatch");
-        TORCH_CHECK(fc2_bias_contiguous.scalar_type() == torch::kFloat32, "fc2_bias must be fp32");
+        TORCH_CHECK(fc2_bias_contiguous.scalar_type() == input.scalar_type(),
+                "fc2_bias dtype must match input");
         TORCH_CHECK(fc2_bias_contiguous.numel() == hidden_dim, "fc2_bias/hidden_dim mismatch");
-        fc2_bias_ptr = fc2_bias_contiguous.data_ptr<float>();
+        fc2_bias_ptr = fc2_bias_contiguous.data_ptr();
         has_fc2_bias = 1;
     }
 
@@ -270,78 +287,81 @@ torch::Tensor one_token_mlp_residual(
     auto output = torch::empty({1, 1, hidden_dim}, input.options());
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    rmsnorm_one_token_kernel<256><<<1, 256, 0, stream>>>(
-        input_contiguous.data_ptr<float>(),
-        norm_weight_contiguous.data_ptr<float>(),
-        normalized.data_ptr<float>(),
-        hidden_dim,
-        static_cast<float>(eps));
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+            input.scalar_type(), "one_token_mlp_residual", [&] {
+        const auto* fc1_bias = static_cast<const scalar_t*>(fc1_bias_ptr);
+        const auto* fc2_bias = static_cast<const scalar_t*>(fc2_bias_ptr);
+        rmsnorm_one_token_kernel<scalar_t, 256><<<1, 256, 0, stream>>>(
+            input_contiguous.data_ptr<scalar_t>(),
+            norm_weight_contiguous.data_ptr<scalar_t>(),
+            normalized.data_ptr<scalar_t>(),
+            hidden_dim,
+            static_cast<float>(eps));
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    if (outputs_per_block == 2) {
-        fc1_gelu_warp_group_kernel<2><<<(intermediate_dim + 1) / 2, 64, 0, stream>>>(
-            normalized.data_ptr<float>(),
-            fc1_weight_contiguous.data_ptr<float>(),
-            fc1_bias_ptr,
-            activated.data_ptr<float>(),
-            hidden_dim,
-            intermediate_dim,
-            has_fc1_bias);
-    } else if (outputs_per_block == 4) {
-        fc1_gelu_warp_group_kernel<4><<<(intermediate_dim + 3) / 4, 128, 0, stream>>>(
-            normalized.data_ptr<float>(),
-            fc1_weight_contiguous.data_ptr<float>(),
-            fc1_bias_ptr,
-            activated.data_ptr<float>(),
-            hidden_dim,
-            intermediate_dim,
-            has_fc1_bias);
-    } else if (outputs_per_block == 8) {
-        fc1_gelu_warp_group_kernel<8><<<(intermediate_dim + 7) / 8, 256, 0, stream>>>(
-            normalized.data_ptr<float>(),
-            fc1_weight_contiguous.data_ptr<float>(),
-            fc1_bias_ptr,
-            activated.data_ptr<float>(),
-            hidden_dim,
-            intermediate_dim,
-            has_fc1_bias);
-    } else {
-        TORCH_CHECK(false, "unsupported outputs_per_block; expected 2, 4, or 8");
-    }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+        if (outputs_per_block == 2) {
+            fc1_gelu_warp_group_kernel<scalar_t, 2><<<(intermediate_dim + 1) / 2, 64, 0, stream>>>(
+                normalized.data_ptr<scalar_t>(),
+                fc1_weight_contiguous.data_ptr<scalar_t>(),
+                fc1_bias,
+                activated.data_ptr<scalar_t>(),
+                hidden_dim,
+                intermediate_dim,
+                has_fc1_bias);
+        } else if (outputs_per_block == 4) {
+            fc1_gelu_warp_group_kernel<scalar_t, 4><<<(intermediate_dim + 3) / 4, 128, 0, stream>>>(
+                normalized.data_ptr<scalar_t>(),
+                fc1_weight_contiguous.data_ptr<scalar_t>(),
+                fc1_bias,
+                activated.data_ptr<scalar_t>(),
+                hidden_dim,
+                intermediate_dim,
+                has_fc1_bias);
+        } else {
+            fc1_gelu_warp_group_kernel<scalar_t, 8><<<(intermediate_dim + 7) / 8, 256, 0, stream>>>(
+                normalized.data_ptr<scalar_t>(),
+                fc1_weight_contiguous.data_ptr<scalar_t>(),
+                fc1_bias,
+                activated.data_ptr<scalar_t>(),
+                hidden_dim,
+                intermediate_dim,
+                has_fc1_bias);
+        }
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    if (outputs_per_block == 2) {
-        fc2_residual_warp_group_kernel<2><<<(hidden_dim + 1) / 2, 64, 0, stream>>>(
-            activated.data_ptr<float>(),
-            fc2_weight_contiguous.data_ptr<float>(),
-            fc2_bias_ptr,
-            input_contiguous.data_ptr<float>(),
-            output.data_ptr<float>(),
-            hidden_dim,
-            intermediate_dim,
-            has_fc2_bias);
-    } else if (outputs_per_block == 4) {
-        fc2_residual_warp_group_kernel<4><<<(hidden_dim + 3) / 4, 128, 0, stream>>>(
-            activated.data_ptr<float>(),
-            fc2_weight_contiguous.data_ptr<float>(),
-            fc2_bias_ptr,
-            input_contiguous.data_ptr<float>(),
-            output.data_ptr<float>(),
-            hidden_dim,
-            intermediate_dim,
-            has_fc2_bias);
-    } else {
-        fc2_residual_warp_group_kernel<8><<<(hidden_dim + 7) / 8, 256, 0, stream>>>(
-            activated.data_ptr<float>(),
-            fc2_weight_contiguous.data_ptr<float>(),
-            fc2_bias_ptr,
-            input_contiguous.data_ptr<float>(),
-            output.data_ptr<float>(),
-            hidden_dim,
-            intermediate_dim,
-            has_fc2_bias);
-    }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+        if (outputs_per_block == 2) {
+            fc2_residual_warp_group_kernel<scalar_t, 2><<<(hidden_dim + 1) / 2, 64, 0, stream>>>(
+                activated.data_ptr<scalar_t>(),
+                fc2_weight_contiguous.data_ptr<scalar_t>(),
+                fc2_bias,
+                input_contiguous.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                hidden_dim,
+                intermediate_dim,
+                has_fc2_bias);
+        } else if (outputs_per_block == 4) {
+            fc2_residual_warp_group_kernel<scalar_t, 4><<<(hidden_dim + 3) / 4, 128, 0, stream>>>(
+                activated.data_ptr<scalar_t>(),
+                fc2_weight_contiguous.data_ptr<scalar_t>(),
+                fc2_bias,
+                input_contiguous.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                hidden_dim,
+                intermediate_dim,
+                has_fc2_bias);
+        } else {
+            fc2_residual_warp_group_kernel<scalar_t, 8><<<(hidden_dim + 7) / 8, 256, 0, stream>>>(
+                activated.data_ptr<scalar_t>(),
+                fc2_weight_contiguous.data_ptr<scalar_t>(),
+                fc2_bias,
+                input_contiguous.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                hidden_dim,
+                intermediate_dim,
+                has_fc2_bias);
+        }
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    });
 
     return output;
 }
@@ -358,9 +378,14 @@ torch::Tensor one_token_rmsnorm_linear(
     TORCH_CHECK(linear_weight.is_cuda(), "linear_weight must be a CUDA tensor");
     TORCH_CHECK(norm_weight.device() == input.device(), "norm_weight/input device mismatch");
     TORCH_CHECK(linear_weight.device() == input.device(), "linear_weight/input device mismatch");
-    TORCH_CHECK(input.scalar_type() == torch::kFloat32, "input must be fp32");
-    TORCH_CHECK(norm_weight.scalar_type() == torch::kFloat32, "norm_weight must be fp32");
-    TORCH_CHECK(linear_weight.scalar_type() == torch::kFloat32, "linear_weight must be fp32");
+    TORCH_CHECK(
+            input.scalar_type() == torch::kFloat32
+            || input.scalar_type() == torch::kFloat16,
+            "input must be fp32 or fp16");
+    TORCH_CHECK(norm_weight.scalar_type() == input.scalar_type(),
+            "norm_weight dtype must match input");
+    TORCH_CHECK(linear_weight.scalar_type() == input.scalar_type(),
+            "linear_weight dtype must match input");
     TORCH_CHECK(input.dim() == 3 && input.size(0) == 1 && input.size(1) == 1,
             "input must have shape [1, 1, hidden_dim]");
     TORCH_CHECK(norm_weight.dim() == 1, "norm_weight must have shape [hidden_dim]");
@@ -370,6 +395,8 @@ torch::Tensor one_token_rmsnorm_linear(
     const int output_dim = static_cast<int>(linear_weight.size(0));
     TORCH_CHECK(norm_weight.numel() == hidden_dim, "norm_weight/hidden_dim mismatch");
     TORCH_CHECK(linear_weight.size(1) == hidden_dim, "linear_weight hidden_dim mismatch");
+    TORCH_CHECK(outputs_per_block == 2 || outputs_per_block == 4 || outputs_per_block == 8,
+            "unsupported outputs_per_block; expected 2, 4, or 8");
 
     c10::cuda::CUDAGuard device_guard(input.device());
 
@@ -378,56 +405,59 @@ torch::Tensor one_token_rmsnorm_linear(
     auto linear_weight_contiguous = linear_weight.contiguous();
 
     torch::Tensor linear_bias_contiguous;
-    const float* linear_bias_ptr = nullptr;
+    const void* linear_bias_ptr = nullptr;
     int has_linear_bias = 0;
     if (linear_bias.has_value()) {
         linear_bias_contiguous = linear_bias.value().contiguous();
         TORCH_CHECK(linear_bias_contiguous.is_cuda(), "linear_bias must be CUDA");
         TORCH_CHECK(linear_bias_contiguous.device() == input.device(), "linear_bias/input device mismatch");
-        TORCH_CHECK(linear_bias_contiguous.scalar_type() == torch::kFloat32, "linear_bias must be fp32");
+        TORCH_CHECK(linear_bias_contiguous.scalar_type() == input.scalar_type(),
+                "linear_bias dtype must match input");
         TORCH_CHECK(linear_bias_contiguous.numel() == output_dim, "linear_bias/output_dim mismatch");
-        linear_bias_ptr = linear_bias_contiguous.data_ptr<float>();
+        linear_bias_ptr = linear_bias_contiguous.data_ptr();
         has_linear_bias = 1;
     }
 
     auto output = torch::empty({1, 1, output_dim}, input.options());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    if (outputs_per_block == 2) {
-        rmsnorm_linear_warp_group_kernel<2><<<(output_dim + 1) / 2, 64, 0, stream>>>(
-            input_contiguous.data_ptr<float>(),
-            norm_weight_contiguous.data_ptr<float>(),
-            linear_weight_contiguous.data_ptr<float>(),
-            linear_bias_ptr,
-            output.data_ptr<float>(),
-            hidden_dim,
-            output_dim,
-            has_linear_bias,
-            static_cast<float>(eps));
-    } else if (outputs_per_block == 4) {
-        rmsnorm_linear_warp_group_kernel<4><<<(output_dim + 3) / 4, 128, 0, stream>>>(
-            input_contiguous.data_ptr<float>(),
-            norm_weight_contiguous.data_ptr<float>(),
-            linear_weight_contiguous.data_ptr<float>(),
-            linear_bias_ptr,
-            output.data_ptr<float>(),
-            hidden_dim,
-            output_dim,
-            has_linear_bias,
-            static_cast<float>(eps));
-    } else if (outputs_per_block == 8) {
-        rmsnorm_linear_warp_group_kernel<8><<<(output_dim + 7) / 8, 256, 0, stream>>>(
-            input_contiguous.data_ptr<float>(),
-            norm_weight_contiguous.data_ptr<float>(),
-            linear_weight_contiguous.data_ptr<float>(),
-            linear_bias_ptr,
-            output.data_ptr<float>(),
-            hidden_dim,
-            output_dim,
-            has_linear_bias,
-            static_cast<float>(eps));
-    } else {
-        TORCH_CHECK(false, "unsupported outputs_per_block; expected 2, 4, or 8");
-    }
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+            input.scalar_type(), "one_token_rmsnorm_linear", [&] {
+        const auto* bias = static_cast<const scalar_t*>(linear_bias_ptr);
+        if (outputs_per_block == 2) {
+            rmsnorm_linear_warp_group_kernel<scalar_t, 2><<<(output_dim + 1) / 2, 64, 0, stream>>>(
+                input_contiguous.data_ptr<scalar_t>(),
+                norm_weight_contiguous.data_ptr<scalar_t>(),
+                linear_weight_contiguous.data_ptr<scalar_t>(),
+                bias,
+                output.data_ptr<scalar_t>(),
+                hidden_dim,
+                output_dim,
+                has_linear_bias,
+                static_cast<float>(eps));
+        } else if (outputs_per_block == 4) {
+            rmsnorm_linear_warp_group_kernel<scalar_t, 4><<<(output_dim + 3) / 4, 128, 0, stream>>>(
+                input_contiguous.data_ptr<scalar_t>(),
+                norm_weight_contiguous.data_ptr<scalar_t>(),
+                linear_weight_contiguous.data_ptr<scalar_t>(),
+                bias,
+                output.data_ptr<scalar_t>(),
+                hidden_dim,
+                output_dim,
+                has_linear_bias,
+                static_cast<float>(eps));
+        } else {
+            rmsnorm_linear_warp_group_kernel<scalar_t, 8><<<(output_dim + 7) / 8, 256, 0, stream>>>(
+                input_contiguous.data_ptr<scalar_t>(),
+                norm_weight_contiguous.data_ptr<scalar_t>(),
+                linear_weight_contiguous.data_ptr<scalar_t>(),
+                bias,
+                output.data_ptr<scalar_t>(),
+                hidden_dim,
+                output_dim,
+                has_linear_bias,
+                static_cast<float>(eps));
+        }
+    });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
@@ -443,9 +473,14 @@ torch::Tensor one_token_linear_residual(
     TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
     TORCH_CHECK(residual.device() == input.device(), "residual/input device mismatch");
     TORCH_CHECK(weight.device() == input.device(), "weight/input device mismatch");
-    TORCH_CHECK(input.scalar_type() == torch::kFloat32, "input must be fp32");
-    TORCH_CHECK(residual.scalar_type() == torch::kFloat32, "residual must be fp32");
-    TORCH_CHECK(weight.scalar_type() == torch::kFloat32, "weight must be fp32");
+    TORCH_CHECK(
+            input.scalar_type() == torch::kFloat32
+            || input.scalar_type() == torch::kFloat16,
+            "input must be fp32 or fp16");
+    TORCH_CHECK(residual.scalar_type() == input.scalar_type(),
+            "residual dtype must match input");
+    TORCH_CHECK(weight.scalar_type() == input.scalar_type(),
+            "weight dtype must match input");
     TORCH_CHECK(residual.dim() == 3 && residual.size(0) == 1 && residual.size(1) == 1,
             "residual must have shape [1, 1, hidden_dim]");
     TORCH_CHECK(weight.dim() == 2, "weight must have shape [hidden_dim, hidden_dim]");
@@ -453,6 +488,8 @@ torch::Tensor one_token_linear_residual(
     const int hidden_dim = static_cast<int>(residual.size(2));
     TORCH_CHECK(input.numel() == hidden_dim, "input hidden_dim mismatch");
     TORCH_CHECK(weight.size(0) == hidden_dim && weight.size(1) == hidden_dim, "weight hidden_dim mismatch");
+    TORCH_CHECK(outputs_per_block == 2 || outputs_per_block == 4 || outputs_per_block == 8,
+            "unsupported outputs_per_block; expected 2, 4, or 8");
 
     c10::cuda::CUDAGuard device_guard(input.device());
 
@@ -461,50 +498,53 @@ torch::Tensor one_token_linear_residual(
     auto weight_contiguous = weight.contiguous();
 
     torch::Tensor bias_contiguous;
-    const float* bias_ptr = nullptr;
+    const void* bias_ptr = nullptr;
     int has_bias = 0;
     if (bias.has_value()) {
         bias_contiguous = bias.value().contiguous();
         TORCH_CHECK(bias_contiguous.is_cuda(), "bias must be CUDA");
         TORCH_CHECK(bias_contiguous.device() == input.device(), "bias/input device mismatch");
-        TORCH_CHECK(bias_contiguous.scalar_type() == torch::kFloat32, "bias must be fp32");
+        TORCH_CHECK(bias_contiguous.scalar_type() == input.scalar_type(),
+                "bias dtype must match input");
         TORCH_CHECK(bias_contiguous.numel() == hidden_dim, "bias/hidden_dim mismatch");
-        bias_ptr = bias_contiguous.data_ptr<float>();
+        bias_ptr = bias_contiguous.data_ptr();
         has_bias = 1;
     }
 
     auto output = torch::empty({1, 1, hidden_dim}, residual.options());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    if (outputs_per_block == 2) {
-        linear_residual_warp_group_kernel<2><<<(hidden_dim + 1) / 2, 64, 0, stream>>>(
-            input_contiguous.data_ptr<float>(),
-            residual_contiguous.data_ptr<float>(),
-            weight_contiguous.data_ptr<float>(),
-            bias_ptr,
-            output.data_ptr<float>(),
-            hidden_dim,
-            has_bias);
-    } else if (outputs_per_block == 4) {
-        linear_residual_warp_group_kernel<4><<<(hidden_dim + 3) / 4, 128, 0, stream>>>(
-            input_contiguous.data_ptr<float>(),
-            residual_contiguous.data_ptr<float>(),
-            weight_contiguous.data_ptr<float>(),
-            bias_ptr,
-            output.data_ptr<float>(),
-            hidden_dim,
-            has_bias);
-    } else if (outputs_per_block == 8) {
-        linear_residual_warp_group_kernel<8><<<(hidden_dim + 7) / 8, 256, 0, stream>>>(
-            input_contiguous.data_ptr<float>(),
-            residual_contiguous.data_ptr<float>(),
-            weight_contiguous.data_ptr<float>(),
-            bias_ptr,
-            output.data_ptr<float>(),
-            hidden_dim,
-            has_bias);
-    } else {
-        TORCH_CHECK(false, "unsupported outputs_per_block; expected 2, 4, or 8");
-    }
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+            input.scalar_type(), "one_token_linear_residual", [&] {
+        const auto* bias = static_cast<const scalar_t*>(bias_ptr);
+        if (outputs_per_block == 2) {
+            linear_residual_warp_group_kernel<scalar_t, 2><<<(hidden_dim + 1) / 2, 64, 0, stream>>>(
+                input_contiguous.data_ptr<scalar_t>(),
+                residual_contiguous.data_ptr<scalar_t>(),
+                weight_contiguous.data_ptr<scalar_t>(),
+                bias,
+                output.data_ptr<scalar_t>(),
+                hidden_dim,
+                has_bias);
+        } else if (outputs_per_block == 4) {
+            linear_residual_warp_group_kernel<scalar_t, 4><<<(hidden_dim + 3) / 4, 128, 0, stream>>>(
+                input_contiguous.data_ptr<scalar_t>(),
+                residual_contiguous.data_ptr<scalar_t>(),
+                weight_contiguous.data_ptr<scalar_t>(),
+                bias,
+                output.data_ptr<scalar_t>(),
+                hidden_dim,
+                has_bias);
+        } else {
+            linear_residual_warp_group_kernel<scalar_t, 8><<<(hidden_dim + 7) / 8, 256, 0, stream>>>(
+                input_contiguous.data_ptr<scalar_t>(),
+                residual_contiguous.data_ptr<scalar_t>(),
+                weight_contiguous.data_ptr<scalar_t>(),
+                bias,
+                output.data_ptr<scalar_t>(),
+                hidden_dim,
+                has_bias);
+        }
+    });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }

@@ -22,6 +22,8 @@ BASELINE_BRANCH=${BASELINE_BRANCH:?Set BASELINE_BRANCH}
 CANDIDATE_BRANCH=${CANDIDATE_BRANCH:?Set CANDIDATE_BRANCH}
 BASELINE_ENGINE=${BASELINE_ENGINE:-optimized}
 CANDIDATE_ENGINE=${CANDIDATE_ENGINE:-optimized}
+BASELINE_PRECISION=${BASELINE_PRECISION:-fp32}
+CANDIDATE_PRECISION=${CANDIDATE_PRECISION:-fp32}
 PROFILE_CONFIG=${PROFILE_CONFIG:?Set PROFILE_CONFIG explicitly to profile_salvalai_smoke15 or profile_salvalai}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_LABEL=${RUN_LABEL:-native-cross-mlp-smoke}
@@ -29,6 +31,8 @@ MIN_CANDIDATE_TPS=${MIN_CANDIDATE_TPS:-280}
 MIN_MEAN_GAIN_PCT=${MIN_MEAN_GAIN_PCT:-5}
 MIN_ORDER_GAIN_PCT=${MIN_ORDER_GAIN_PCT:-5}
 REQUIRE_WALL_NONREGRESSION=${REQUIRE_WALL_NONREGRESSION:-1}
+ALLOW_OUTPUT_DRIFT=${ALLOW_OUTPUT_DRIFT:-0}
+REGRESSION_TOLERANCE_PCT=${REGRESSION_TOLERANCE_PCT:-1}
 RUN_ROOT="$WORK/runs/inference-${RUN_LABEL}-${SLURM_JOB_ID:-manual}"
 
 validate_repo() {
@@ -98,12 +102,16 @@ echo "baseline_branch=$BASELINE_BRANCH"
 echo "candidate_branch=$CANDIDATE_BRANCH"
 echo "baseline_engine=$BASELINE_ENGINE"
 echo "candidate_engine=$CANDIDATE_ENGINE"
+echo "baseline_precision=$BASELINE_PRECISION"
+echo "candidate_precision=$CANDIDATE_PRECISION"
 echo "profile_config=$PROFILE_CONFIG"
 echo "run_root=$RUN_ROOT"
 echo "min_candidate_tps=$MIN_CANDIDATE_TPS"
 echo "min_mean_gain_pct=$MIN_MEAN_GAIN_PCT"
 echo "min_order_gain_pct=$MIN_ORDER_GAIN_PCT"
 echo "require_wall_nonregression=$REQUIRE_WALL_NONREGRESSION"
+echo "allow_output_drift=$ALLOW_OUTPUT_DRIFT"
+echo "regression_tolerance_pct=$REGRESSION_TOLERANCE_PCT"
 echo "ffmpeg=$(command -v ffmpeg)"
 echo "ffprobe=$(command -v ffprobe)"
 echo "nsys=$(command -v nsys || echo missing)"
@@ -126,7 +134,6 @@ trap 'kill "$SMI_PID" 2>/dev/null || true' EXIT
 COMMON_OVERRIDES=(
   audio_path="$AUDIO"
   device=cuda
-  precision=fp32
   attn_implementation=sdpa
   use_server=false
   parallel=false
@@ -139,7 +146,8 @@ COMMON_OVERRIDES=(
 run_profile() {
   local repo=$1
   local engine=$2
-  local label=$3
+  local precision=$3
+  local label=$4
   local output="$RUN_ROOT/$label"
   local legacy_reset=()
   if [[ "$engine" == optimized ]] && grep -q 'inference_generation_compile:' "$repo/config.py"; then
@@ -152,6 +160,7 @@ run_profile() {
       "$PYTHON" inference.py --config-name "$PROFILE_CONFIG" \
       output_path="$output" \
       inference_engine="$engine" \
+      precision="$precision" \
       "${COMMON_OVERRIDES[@]}" \
       "${legacy_reset[@]}"
   )
@@ -164,28 +173,41 @@ run_profile() {
   printf '%s\n' "$profile" > "$RUN_ROOT/$label.profile-path.txt"
 }
 
-run_profile "$BASELINE_REPO" "$BASELINE_ENGINE" baseline_first
-run_profile "$CANDIDATE_REPO" "$CANDIDATE_ENGINE" candidate_second
-run_profile "$CANDIDATE_REPO" "$CANDIDATE_ENGINE" candidate_first
-run_profile "$BASELINE_REPO" "$BASELINE_ENGINE" baseline_second
+run_profile "$BASELINE_REPO" "$BASELINE_ENGINE" "$BASELINE_PRECISION" baseline_first
+run_profile "$CANDIDATE_REPO" "$CANDIDATE_ENGINE" "$CANDIDATE_PRECISION" candidate_second
+run_profile "$CANDIDATE_REPO" "$CANDIDATE_ENGINE" "$CANDIDATE_PRECISION" candidate_first
+run_profile "$BASELINE_REPO" "$BASELINE_ENGINE" "$BASELINE_PRECISION" baseline_second
 
 BASELINE_FIRST=$(<"$RUN_ROOT/baseline_first.profile-path.txt")
 CANDIDATE_SECOND=$(<"$RUN_ROOT/candidate_second.profile-path.txt")
 CANDIDATE_FIRST=$(<"$RUN_ROOT/candidate_first.profile-path.txt")
 BASELINE_SECOND=$(<"$RUN_ROOT/baseline_second.profile-path.txt")
 
+set +e
 (
   cd "$CANDIDATE_REPO"
   "$PYTHON" utils/summarize_inference_profile.py \
     --reciprocal "$BASELINE_FIRST" "$CANDIDATE_SECOND" "$CANDIDATE_FIRST" "$BASELINE_SECOND" \
     --labels main_generation,timing_context \
-    --regression-tolerance-pct 5 \
+    --regression-tolerance-pct "$REGRESSION_TOLERANCE_PCT" \
     --json-output "$RUN_ROOT/reciprocal-compare.json"
 )
+COMPARE_STATUS=$?
+set -e
+if [[ "$COMPARE_STATUS" -ne 0 && "$ALLOW_OUTPUT_DRIFT" != 1 ]]; then
+  echo "exact reciprocal comparison failed" >&2
+  exit "$COMPARE_STATUS"
+fi
+if [[ ! -s "$RUN_ROOT/reciprocal-compare.json" ]]; then
+  echo "reciprocal comparison did not produce JSON" >&2
+  exit 2
+fi
+echo "reciprocal_compare_status=$COMPARE_STATUS"
 
 "$PYTHON" - "$RUN_ROOT" "$BASELINE_ENGINE" "$CANDIDATE_ENGINE" \
   "$MIN_CANDIDATE_TPS" "$MIN_MEAN_GAIN_PCT" "$MIN_ORDER_GAIN_PCT" \
-  "$REQUIRE_WALL_NONREGRESSION" <<'PY'
+  "$REQUIRE_WALL_NONREGRESSION" "$BASELINE_PRECISION" \
+  "$CANDIDATE_PRECISION" "$ALLOW_OUTPUT_DRIFT" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -231,6 +253,18 @@ for label in ("candidate_second", "candidate_first"):
     ):
         raise SystemExit(f"{label}: cross+MLP tail not enabled for every main record")
     if not all(
+        sum(
+            int(row.get("optimized_dispatch_capture_hits", {}).get(key, 0))
+            for row in main
+        ) > 0
+        for key in (
+            "native_q1_rope_cache_self_attention",
+            "q1_bmm_cross_attention",
+            "native_cross_mlp_tail",
+        )
+    ):
+        raise SystemExit(f"{label}: specialized main dispatch did not execute")
+    if not all(
         row.get("native_cross_mlp_tail_requested") is True
         and row.get("native_cross_mlp_tail_enabled") is False
         and row.get("native_cross_mlp_tail_disabled_reason") == "timing_context"
@@ -246,6 +280,26 @@ min_tps = float(sys.argv[4])
 min_mean_gain = float(sys.argv[5])
 min_order_gain = float(sys.argv[6])
 require_wall = bool(int(sys.argv[7]))
+baseline_precision = sys.argv[8]
+candidate_precision = sys.argv[9]
+allow_output_drift = bool(int(sys.argv[10]))
+for label in ("baseline_first", "baseline_second"):
+    if profiles[label].get("metadata", {}).get("precision") != baseline_precision:
+        raise SystemExit(f"{label}: precision metadata mismatch")
+for label in ("candidate_first", "candidate_second"):
+    if profiles[label].get("metadata", {}).get("precision") != candidate_precision:
+        raise SystemExit(f"{label}: precision metadata mismatch")
+comparison = json.loads((root / "reciprocal-compare.json").read_text())
+if not allow_output_drift and not all(
+    comparison.get(key) is True
+    for key in (
+        "same_calculation_pass",
+        "token_equivalence_pass",
+        "output_artifact_pass",
+        "performance_pass",
+    )
+):
+    raise SystemExit("exact reciprocal comparison did not pass")
 gains = []
 for baseline_label, candidate_label in pairs:
     baseline = aggregate(profiles[baseline_label], "main_generation")

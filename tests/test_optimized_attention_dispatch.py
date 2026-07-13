@@ -79,6 +79,81 @@ def test_q1_bmm_dispatch_uses_fp32_accumulation_for_fp16():
     assert torch.equal(result[0], expected)
 
 
+def test_shared_dispatch_counts_only_paths_that_execute():
+    query = torch.zeros((1, 2, 1, 4))
+    key = torch.zeros((1, 2, 3, 4))
+    value = torch.zeros_like(key)
+    counts = {
+        "native_q1_self_attention": 0,
+        "q1_bmm_cross_attention": 0,
+    }
+    module = SimpleNamespace(is_cross_attention=True, training=False)
+
+    result = sdpa_q1_attention_forward(
+        module=module,
+        query=query,
+        key=key,
+        value=value,
+        bs=1,
+        dim=8,
+        attention_mask=None,
+        q1_bmm_cross_attention=True,
+        native_q1_self_attention=True,
+        native_q1_attention=lambda *args: query,
+        dispatch_counts=counts,
+    )
+
+    assert result is not None
+    assert counts == {
+        "native_q1_self_attention": 0,
+        "q1_bmm_cross_attention": 1,
+    }
+
+    module.training = True
+    assert sdpa_q1_attention_forward(
+        module=module,
+        query=query,
+        key=key,
+        value=value,
+        bs=1,
+        dim=8,
+        attention_mask=None,
+        q1_bmm_cross_attention=True,
+        native_q1_self_attention=True,
+        native_q1_attention=lambda *args: query,
+        dispatch_counts=counts,
+    ) is None
+    assert counts["q1_bmm_cross_attention"] == 1
+
+
+def test_shared_q1_bmm_helper_fails_loudly_on_dtype_and_shape_mismatch():
+    query = torch.zeros((1, 2, 1, 4), dtype=torch.float16)
+    key = torch.zeros((1, 2, 3, 4), dtype=torch.float16)
+    value = torch.zeros_like(key)
+
+    with pytest.raises(TypeError, match="supports only float32 or float16"):
+        dispatch._q1_bmm_cross_attention(
+            query.bfloat16(),
+            key.bfloat16(),
+            value.bfloat16(),
+            expected_dtype=torch.bfloat16,
+        )
+    with pytest.raises(TypeError, match="expected storage dtype"):
+        dispatch._q1_bmm_cross_attention(
+            query,
+            key.float(),
+            value,
+            expected_dtype=torch.float16,
+        )
+    with pytest.raises(ValueError, match="matching 4D shapes"):
+        dispatch._q1_bmm_cross_attention(
+            query,
+            key,
+            value[:, :, :-1],
+            expected_dtype=torch.float16,
+        )
+
+
 def test_active_prefix_dispatch_preserves_exact_slice_order(monkeypatch):
     query = torch.randn((1, 2, 1, 4))
     key = torch.randn((1, 2, 12, 4))

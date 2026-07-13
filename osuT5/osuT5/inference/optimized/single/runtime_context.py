@@ -7,6 +7,8 @@ from dataclasses import replace
 from functools import partial
 from typing import Iterator
 
+import torch
+
 from ...runtime_dispatch import (
     AttentionRuntimeHooks,
     DecoderLayerRuntimeHooks,
@@ -56,7 +58,11 @@ def attention_runtime_context(
     q1_bmm_cross_attention: bool = False,
     native_q1_self_attention: bool = False,
     native_q1_rope_cache_self_attention: bool = False,
+    expected_dtype: torch.dtype = torch.float32,
+    dispatch_counts: dict[str, int] | None = None,
 ) -> Iterator[None]:
+    if expected_dtype not in {torch.float32, torch.float16}:
+        raise TypeError("optimized attention supports only float32 or float16")
     from ..kernels.dispatch import (
         q1_rope_cache_self_attention_forward,
         sdpa_q1_attention_forward,
@@ -79,6 +85,8 @@ def attention_runtime_context(
             q1_bmm_cross_attention=q1_bmm_cross_attention,
             native_q1_self_attention=native_q1_self_attention,
             native_q1_attention=native_q1_attention,
+            expected_dtype=expected_dtype,
+            dispatch_counts=dispatch_counts,
         )
     q1_rope_cache_self_attention = None
     if native_q1_rope_cache_self_attention:
@@ -87,6 +95,8 @@ def attention_runtime_context(
             native_q1_rope_cache_attention=(
                 native_q1_rope_cache_attention
             ),
+            expected_dtype=expected_dtype,
+            dispatch_counts=dispatch_counts,
         )
     hooks = AttentionRuntimeHooks(
         sdpa_attention_inputs=attention_runtime_hooks().sdpa_attention_inputs,
@@ -103,6 +113,7 @@ def attention_runtime_context(
 def decoder_layer_runtime_context(
     *,
     native_cross_mlp_tail: bool = False,
+    dispatch_counts: dict[str, int] | None = None,
 ) -> Iterator[None]:
     cross_mlp_tail_forward = None
     if native_cross_mlp_tail:
@@ -110,7 +121,10 @@ def decoder_layer_runtime_context(
         from ..kernels.cross_mlp import native_cross_mlp_tail_forward
 
         decoder_layer.preload_native_decoder_layer()
-        cross_mlp_tail_forward = native_cross_mlp_tail_forward
+        cross_mlp_tail_forward = partial(
+            native_cross_mlp_tail_forward,
+            dispatch_counts=dispatch_counts,
+        )
     hooks = DecoderLayerRuntimeHooks(
         cross_mlp_tail_forward=cross_mlp_tail_forward,
     )

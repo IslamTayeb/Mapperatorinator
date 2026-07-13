@@ -63,6 +63,7 @@ import sys
 importlib.import_module("osuT5.osuT5.inference.optimized.single.engine")
 
 for name in sys.modules:
+    assert not name.endswith(".optimized.kernels.q1_attention"), name
     assert not name.endswith(".optimized.kernels.cross_mlp"), name
     assert not name.endswith(".optimized.kernels.decoder_layer"), name
     assert not name.startswith("torch.utils.cpp_extension"), name
@@ -93,9 +94,29 @@ def test_q1_kernel_import_does_not_build_and_loader_is_singleton(monkeypatch):
         "q1_rope_cache_attention",
     ]
     assert calls[0]["extra_cuda_cflags"] == ["-O3"]
+    source = calls[0]["cuda_sources"]
+    assert "#include <cuda_fp16.h>" in source
+    assert "#include <c10/cuda/CUDAGuard.h>" in source
+    assert source.count("c10::cuda::CUDAGuard") == 2
+    assert "q1_attention_kernel<block_size>" in source
+    assert "q1_rope_cache_attention_kernel<block_size>" in source
+    assert "q1_attention_half_kernel<block_size>" in source
+    assert "q1_rope_cache_attention_half_kernel<block_size>" in source
+    assert "q.scalar_type() == torch::kFloat32 || q.scalar_type() == torch::kFloat16" in source
+    assert "qkv.scalar_type() == torch::kFloat32 || qkv.scalar_type() == torch::kFloat16" in source
+    assert "float score = 0.0f" in source
+    assert "float denom = 0.0f" in source
+    assert "float numer = 0.0f" in source
+    assert "__half2float" in source
+    assert "__float2half_rn" in source
+    assert source.count('asm("trap;")') == 2
 
 
-def test_q1_wrappers_preserve_mask_conversion_and_argument_order(monkeypatch):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_q1_wrappers_preserve_dtype_mask_conversion_and_argument_order(
+    monkeypatch,
+    dtype,
+):
     from osuT5.osuT5.inference.optimized.kernels import q1_attention
 
     calls = []
@@ -110,9 +131,11 @@ def test_q1_wrappers_preserve_mask_conversion_and_argument_order(monkeypatch):
             return args[0]
 
     monkeypatch.setattr(q1_attention, "_NATIVE_Q1_ATTENTION", _Extension())
-    query = torch.randn(1, 2, 1, 4)
-    key = torch.randn(1, 2, 3, 4)
-    value = torch.randn(1, 2, 3, 4)
+    monkeypatch.setattr(q1_attention, "_validate_q1_inputs", lambda *args: 6)
+    monkeypatch.setattr(q1_attention, "_validate_rope_cache_inputs", lambda *args: None)
+    query = torch.randn(1, 2, 1, 4, dtype=dtype)
+    key = torch.randn(1, 2, 6, 4, dtype=dtype)
+    value = torch.randn(1, 2, 6, 4, dtype=dtype)
     mask = torch.arange(6, dtype=torch.float64).reshape(2, 3).transpose(0, 1)
     q1_attention.native_q1_attention(query, key, value, mask)
 
@@ -125,13 +148,15 @@ def test_q1_wrappers_preserve_mask_conversion_and_argument_order(monkeypatch):
     assert converted_mask.dtype == torch.float32
     assert converted_mask.is_contiguous()
     assert converted_mask.shape == (6,)
+    assert args[0].dtype == args[1].dtype == args[2].dtype == dtype
 
-    qkv = torch.randn(1, 1, 3, 2, 4)
-    cache_keys = torch.randn(1, 2, 8, 4)
-    cache_values = torch.randn(1, 2, 8, 4)
-    cos = torch.randn(1, 4)
-    sin = torch.randn(1, 4)
+    qkv = torch.randn(1, 1, 3, 2, 4, dtype=dtype)
+    cache_keys = torch.randn(1, 2, 8, 4, dtype=dtype)
+    cache_values = torch.randn(1, 2, 8, 4, dtype=dtype)
+    cos = torch.randn(1, 1, 4, dtype=dtype)
+    sin = torch.randn(1, 1, 4, dtype=dtype)
     cache_position = torch.tensor([3])
+    rope_mask = torch.arange(7, dtype=torch.float64)
     q1_attention.native_q1_rope_cache_attention(
         qkv,
         cache_keys,
@@ -139,7 +164,7 @@ def test_q1_wrappers_preserve_mask_conversion_and_argument_order(monkeypatch):
         cos,
         sin,
         cache_position,
-        mask,
+        rope_mask,
         7,
     )
     kind, args = calls.pop(0)
@@ -153,6 +178,85 @@ def test_q1_wrappers_preserve_mask_conversion_and_argument_order(monkeypatch):
     assert args[6].dtype == torch.float32
     assert args[6].is_contiguous()
     assert args[7] == 7
+    assert all(args[index].dtype == dtype for index in range(5))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_q1_supported_cpu_inputs_fail_before_extension_build(monkeypatch, dtype):
+    from osuT5.osuT5.inference.optimized.kernels import q1_attention
+
+    monkeypatch.setattr(
+        q1_attention,
+        "_load_native_q1_attention",
+        lambda: (_ for _ in ()).throw(AssertionError("must not build")),
+    )
+    query = torch.zeros((1, 2, 1, 4), dtype=dtype)
+    key = torch.zeros((1, 2, 3, 4), dtype=dtype)
+    value = torch.zeros_like(key)
+
+    with pytest.raises(RuntimeError, match="CUDA tensors"):
+        q1_attention.native_q1_attention(query, key, value, None)
+
+
+def test_q1_rejects_unsupported_and_mixed_dtypes_before_extension_build(monkeypatch):
+    from osuT5.osuT5.inference.optimized.kernels import q1_attention
+
+    monkeypatch.setattr(
+        q1_attention,
+        "_load_native_q1_attention",
+        lambda: (_ for _ in ()).throw(AssertionError("must not build")),
+    )
+    key = torch.zeros((1, 2, 3, 4), dtype=torch.float16)
+    value = torch.zeros_like(key)
+    with pytest.raises(TypeError, match="float32 or float16"):
+        q1_attention.native_q1_attention(key.double()[..., :1, :], key, value, None)
+
+    query = torch.zeros((1, 2, 1, 4), dtype=torch.float16)
+    with pytest.raises(TypeError, match="key must have dtype"):
+        q1_attention.native_q1_attention(query, key.float(), value, None)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_rope_cache_supported_cpu_inputs_fail_before_extension_build(
+    monkeypatch,
+    dtype,
+):
+    from osuT5.osuT5.inference.optimized.kernels import q1_attention
+
+    monkeypatch.setattr(
+        q1_attention,
+        "_load_native_q1_attention",
+        lambda: (_ for _ in ()).throw(AssertionError("must not build")),
+    )
+    qkv = torch.zeros((1, 1, 3, 2, 4), dtype=dtype)
+    keys = torch.zeros((1, 2, 8, 4), dtype=dtype)
+    values = torch.zeros_like(keys)
+    cos = torch.zeros((1, 1, 4), dtype=dtype)
+    sin = torch.zeros_like(cos)
+
+    with pytest.raises(RuntimeError, match="CUDA tensors"):
+        q1_attention.native_q1_rope_cache_attention(
+            qkv,
+            keys,
+            values,
+            cos,
+            sin,
+            torch.tensor([1]),
+            None,
+            4,
+        )
+
+    with pytest.raises(TypeError, match="cache_keys must have dtype"):
+        q1_attention.native_q1_rope_cache_attention(
+            qkv,
+            keys.float() if dtype == torch.float16 else keys.half(),
+            values,
+            cos,
+            sin,
+            torch.tensor([1]),
+            None,
+            4,
+        )
 
 
 def test_attention_runtime_hooks_restore_for_nested_and_exception_paths():
@@ -187,6 +291,7 @@ def test_native_generation_context_preloads_then_installs_hooks(monkeypatch):
         events.append("entered")
         hooks = attention_runtime_hooks()
         assert hooks.sdpa_attention_forward is not None
+        assert hooks.sdpa_attention_forward.keywords["expected_dtype"] == torch.float32
         assert hooks.q1_rope_cache_self_attention_forward is None
     assert events == ["preload", "entered"]
     assert attention_runtime_hooks() is empty
@@ -235,3 +340,34 @@ def test_fused_generation_context_installs_only_fused_hook(monkeypatch):
         hooks = attention_runtime_hooks()
         assert hooks.sdpa_attention_forward is None
         assert hooks.q1_rope_cache_self_attention_forward is not None
+
+
+def test_fp16_generation_context_uses_the_same_dispatch_policy(monkeypatch):
+    from osuT5.osuT5.inference.optimized.kernels import q1_attention
+    from osuT5.osuT5.inference.optimized.single.runtime_context import (
+        attention_runtime_context,
+    )
+
+    monkeypatch.setattr(q1_attention, "preload_native_q1_attention", lambda: None)
+    with attention_runtime_context(
+        q1_bmm_cross_attention=True,
+        native_q1_self_attention=True,
+        native_q1_rope_cache_self_attention=True,
+        expected_dtype=torch.float16,
+    ):
+        hooks = attention_runtime_hooks()
+        assert hooks.sdpa_attention_forward.keywords["expected_dtype"] == torch.float16
+        assert (
+            hooks.q1_rope_cache_self_attention_forward.keywords["expected_dtype"]
+            == torch.float16
+        )
+
+
+def test_generation_context_rejects_unsupported_dtype() -> None:
+    from osuT5.osuT5.inference.optimized.single.runtime_context import (
+        attention_runtime_context,
+    )
+
+    with pytest.raises(TypeError, match="only float32 or float16"):
+        with attention_runtime_context(expected_dtype=torch.bfloat16):
+            pass
