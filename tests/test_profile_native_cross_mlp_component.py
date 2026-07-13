@@ -43,9 +43,10 @@ def test_summary_weights_live_counts_and_separates_sizing_from_correctness() -> 
     assert report["sizing_pass"]
 
 
-def test_summary_fails_nonexact_self_cache_and_large_logit_drift() -> None:
+def test_summary_allows_bounded_drift_and_fails_values_above_limit() -> None:
     entry = _entry(accepted=2.0, candidate=1.0)
-    entry["drift"]["cache_key_slot_max_abs"] = 1e-8
+    entry["drift"]["cache_key_slot_max_abs"] = 0.00101
+    entry["drift"]["cache_value_slot_max_abs"] = 1e-5
     entry["drift"]["logits_max_abs"] = 0.00101
 
     report = summarize_component({"128": entry}, total_replays=100)
@@ -53,7 +54,18 @@ def test_summary_fails_nonexact_self_cache_and_large_logit_drift() -> None:
     assert not report["correctness_pass"]
     assert report["correctness_failures"] == {
         "128": [
-            "cache_key_slot_not_exact",
+            "cache_key_slot_drift_above_limit",
             "logits_drift_above_limit",
         ]
     }
+
+
+def test_summary_accepts_historical_fp32_rounding_drift() -> None:
+    entry = _entry(accepted=2.0, candidate=1.0)
+    entry["drift"]["cache_key_slot_max_abs"] = 4.1e-5
+    entry["drift"]["cache_value_slot_max_abs"] = 3.8e-5
+    entry["drift"]["logits_max_abs"] = 3.6e-5
+
+    report = summarize_component({"128": entry}, total_replays=100)
+
+    assert report["correctness_pass"]

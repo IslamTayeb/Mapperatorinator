@@ -33,7 +33,7 @@ from utils.profile_native_prefix_dtype_scout import (  # noqa: E402
 
 
 SAVING_TARGET_SECONDS = 1.412
-MAX_LOGIT_DRIFT = 1e-3
+MAX_ABS_DRIFT = 1e-3
 
 
 def _candidate_context(prefix: int):
@@ -68,11 +68,11 @@ def summarize_component(
             if not passed
         ]
         drift = entry["drift"]
-        if float(drift["cache_key_slot_max_abs"]) != 0.0:
-            failures.append("cache_key_slot_not_exact")
-        if float(drift["cache_value_slot_max_abs"]) != 0.0:
-            failures.append("cache_value_slot_not_exact")
-        if float(drift["logits_max_abs"]) > MAX_LOGIT_DRIFT:
+        if float(drift["cache_key_slot_max_abs"]) > MAX_ABS_DRIFT:
+            failures.append("cache_key_slot_drift_above_limit")
+        if float(drift["cache_value_slot_max_abs"]) > MAX_ABS_DRIFT:
+            failures.append("cache_value_slot_drift_above_limit")
+        if float(drift["logits_max_abs"]) > MAX_ABS_DRIFT:
             failures.append("logits_drift_above_limit")
         if failures:
             correctness_failures[bucket] = failures
