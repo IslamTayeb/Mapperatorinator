@@ -176,20 +176,22 @@ def summarize_osu_structure(path: Path) -> dict[str, Any]:
         "unknown": 0,
     }
 
-    def parse_numbers(fields: Sequence[str]) -> tuple[bool, list[float]]:
+    def parse_number(field: str) -> tuple[bool, float | None]:
         nonlocal nonfinite_values
-        values: list[float] = []
-        valid = True
-        for field in fields:
-            try:
-                value = float(field)
-            except ValueError:
-                return False, values
-            if not math.isfinite(value):
-                nonfinite_values += 1
-                valid = False
-            values.append(value)
-        return valid, values
+        try:
+            value = float(field)
+        except ValueError:
+            return False, None
+        if not math.isfinite(value):
+            nonfinite_values += 1
+            return False, value
+        return True, value
+
+    def parse_integer(field: str) -> tuple[bool, int | None]:
+        valid, value = parse_number(field)
+        if not valid or value is None or not value.is_integer():
+            return False, None
+        return True, int(value)
 
     for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
         line = raw_line.strip()
@@ -201,35 +203,88 @@ def summarize_osu_structure(path: Path) -> dict[str, Any]:
         if section == "TimingPoints":
             timing_points += 1
             fields = [field.strip() for field in line.split(",")]
-            parsed, _ = parse_numbers(fields)
-            if len(fields) < 2 or not parsed:
+            if len(fields) != 8:
                 malformed_by_section[section] += 1
                 continue
-            if len(fields) >= 7:
-                try:
-                    uninherited = int(fields[6])
-                except ValueError:
-                    malformed_by_section[section] += 1
-                    continue
-                if uninherited == 1:
-                    uninherited_timing_points += 1
-                elif uninherited == 0:
-                    inherited_timing_points += 1
+            numeric_valid = all(parse_number(field)[0] for field in fields[:2])
+            integer_values = [parse_integer(field) for field in fields[2:]]
+            numeric_valid &= all(valid for valid, _ in integer_values)
+            uninherited = integer_values[4][1]
+            if not numeric_valid or uninherited not in {0, 1}:
+                malformed_by_section[section] += 1
+                continue
+            if uninherited == 1:
+                uninherited_timing_points += 1
+            else:
+                inherited_timing_points += 1
         elif section == "HitObjects":
             hit_objects += 1
             fields = [field.strip() for field in line.split(",")]
-            parsed, _ = parse_numbers(fields[:5]) if len(fields) >= 5 else (False, [])
-            if len(fields) < 5 or not parsed:
+            if len(fields) < 6:
                 malformed_by_section[section] += 1
                 continue
-            object_type = int(float(fields[3]))
-            if object_type & 128:
+            core_values = [parse_integer(field) for field in fields[:5]]
+            if not all(valid for valid, _ in core_values):
+                malformed_by_section[section] += 1
+                continue
+            object_type = core_values[3][1]
+            if object_type is None:
+                malformed_by_section[section] += 1
+                continue
+            base_type = object_type & (1 | 2 | 8 | 128)
+            if base_type not in {1, 2, 8, 128}:
+                malformed_by_section[section] += 1
+                continue
+            type_specific_valid = True
+            if base_type == 2:
+                repeat_valid, repeat_count = (
+                    parse_integer(fields[6]) if len(fields) >= 7 else (False, None)
+                )
+                length_valid, pixel_length = (
+                    parse_number(fields[7]) if len(fields) >= 8 else (False, None)
+                )
+                type_specific_valid = (
+                    len(fields) >= 8
+                    and bool(fields[5])
+                    and repeat_valid
+                    and repeat_count is not None
+                    and repeat_count >= 1
+                    and length_valid
+                    and pixel_length is not None
+                    and pixel_length >= 0
+                )
+            elif base_type == 8:
+                end_valid, end_time = (
+                    parse_number(fields[5]) if len(fields) >= 6 else (False, None)
+                )
+                type_specific_valid = (
+                    len(fields) >= 7
+                    and end_valid
+                    and end_time is not None
+                    and core_values[2][1] is not None
+                    and end_time >= core_values[2][1]
+                )
+            elif base_type == 128:
+                end_time = fields[5].split(":", 1)[0]
+                end_valid, parsed_end_time = (
+                    parse_number(end_time) if end_time else (False, None)
+                )
+                type_specific_valid = (
+                    end_valid
+                    and parsed_end_time is not None
+                    and core_values[2][1] is not None
+                    and parsed_end_time >= core_values[2][1]
+                )
+            if not type_specific_valid:
+                malformed_by_section[section] += 1
+                continue
+            if base_type == 128:
                 hit_object_types["holds"] += 1
-            elif object_type & 8:
+            elif base_type == 8:
                 hit_object_types["spinners"] += 1
-            elif object_type & 2:
+            elif base_type == 2:
                 hit_object_types["sliders"] += 1
-            elif object_type & 1:
+            elif base_type == 1:
                 hit_object_types["circles"] += 1
             else:
                 hit_object_types["unknown"] += 1
@@ -244,6 +299,9 @@ def summarize_osu_structure(path: Path) -> dict[str, Any]:
         "malformed_lines": malformed_lines,
         "malformed_by_section": malformed_by_section,
         "nonfinite_values": nonfinite_values,
+        "numeric_validation_scope": (
+            "timing_all_fields_and_hitobject_core_plus_type_specific_fields"
+        ),
         "finite_and_well_formed": malformed_lines == 0 and nonfinite_values == 0,
     }
 
@@ -520,11 +578,43 @@ def classify_kernel_family(name: str) -> tuple[str, str]:
 
     lowered = name.lower()
     rules = (
-        ("sampling", r"softmax|multinomial|topk|top_k|sort|categorical"),
-        ("attention", r"attention|scaled_dot|sdpa|flash|q1|cross_bmm|self_attn"),
-        ("gemm", r"gemm|gemv|matmul|\bmm\b|cublas|cutlass|linear"),
-        ("elementwise", r"gelu|silu|relu|rmsnorm|layernorm|layer_norm|reduce|elementwise|vectorized"),
-        ("memory", r"memcpy|memset|copy_kernel"),
+        (
+            "native_q1_self_rope_cache",
+            r"q1_rope_cache_attention|rope_cache.*q1|q1_attention_kernel|"
+            r"native_q1_(?:rope_cache_)?attention|q1_self_attention|self.*q1",
+        ),
+        (
+            "fused_fc1_gelu",
+            r"fc1[_:]*gelu|gelu[_:]*fc1|one_token_fc1_gelu",
+        ),
+        (
+            "fused_fc2_residual",
+            r"fc2[_:]*residual|residual[_:]*fc2|one_token_fc2_residual",
+        ),
+        (
+            "fmha_cross_attention",
+            r"fmha|flash[_:]*attention|flash_attn|scaled_dot|sdpa|"
+            r"cross[_:]*(?:attention|attn|bmm)|q1_bmm|bmm_cross",
+        ),
+        (
+            "gemm_gemv_projection",
+            r"gemm|gemv|matmul|(?:^|[^a-z0-9])bmm(?:[^a-z0-9]|$)|"
+            r"cublas|cutlass|linear|projection|out_proj|proj_",
+        ),
+        (
+            "sampling_radix_sort",
+            r"softmax|multinomial|topk|top_k|radix[_:]*sort|radixsort|sort|"
+            r"categorical|distribution|argmax|arg_min|curand|philox",
+        ),
+        (
+            "memory",
+            r"memcpy|memset|copy|catarray|gather|scatter|index_|fillfunctor",
+        ),
+        (
+            "elementwise",
+            r"gelu|silu|relu|rmsnorm|layernorm|layer_norm|reduce|"
+            r"elementwise|vectorized|unrolled|masked_fill|clamp|where_kernel|compare",
+        ),
     )
     for family, pattern in rules:
         if re.search(pattern, lowered):
@@ -2565,10 +2655,16 @@ def _validated_output_structure(run: Mapping[str, Any]) -> dict[str, Any]:
     missing = [field for field in count_fields if field not in raw]
     if missing:
         raise NsightProfileError(f"output_structure is missing required fields: {missing}")
+
+    def count(value: Any, *, field: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise NsightProfileError(f"{field} must be a non-negative integer")
+        return value
+
     result: dict[str, Any] = {
         "status": "available",
         **{
-            field: int(round(_finite_number(raw[field], field=f"output_structure.{field}")))
+            field: count(raw[field], field=f"output_structure.{field}")
             for field in count_fields
         },
     }
@@ -2577,17 +2673,42 @@ def _validated_output_structure(run: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(nested, dict):
             raise NsightProfileError(f"output_structure.{nested_field} must be an object")
         result[nested_field] = {
-            str(key): int(
-                round(
-                    _finite_number(
-                        value,
-                        field=f"output_structure.{nested_field}.{key}",
-                    )
-                )
+            str(key): count(
+                value,
+                field=f"output_structure.{nested_field}.{key}",
             )
             for key, value in sorted(nested.items())
         }
-    result["finite_and_well_formed"] = bool(raw.get("finite_and_well_formed", False))
+    scope = raw.get("numeric_validation_scope")
+    if not isinstance(scope, str) or not scope:
+        raise NsightProfileError(
+            "output_structure.numeric_validation_scope must be a non-empty string"
+        )
+    well_formed = raw.get("finite_and_well_formed")
+    if not isinstance(well_formed, bool):
+        raise NsightProfileError(
+            "output_structure.finite_and_well_formed must be a boolean"
+        )
+    timing_classified = (
+        result["uninherited_timing_points"]
+        + result["inherited_timing_points"]
+        + result["malformed_by_section"].get("TimingPoints", 0)
+    )
+    hit_objects_classified = (
+        sum(result["hit_object_types"].values())
+        + result["malformed_by_section"].get("HitObjects", 0)
+    )
+    if timing_classified != result["timing_points"]:
+        raise NsightProfileError("output_structure timing-point counts are inconsistent")
+    if hit_objects_classified != result["hit_objects"]:
+        raise NsightProfileError("output_structure hit-object counts are inconsistent")
+    expected_well_formed = (
+        result["malformed_lines"] == 0 and result["nonfinite_values"] == 0
+    )
+    if well_formed != expected_well_formed:
+        raise NsightProfileError("output_structure well-formed status is inconsistent")
+    result["numeric_validation_scope"] = scope
+    result["finite_and_well_formed"] = well_formed
     return result
 
 

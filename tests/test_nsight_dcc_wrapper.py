@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import csv
+import json
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -122,6 +125,59 @@ def test_targeted_ncu_collects_only_the_hottest_fresh_fp32_kernel_once() -> None
     assert available.count('--export "$ncu_dir/ncu/hot-kernel"') == 1
     assert available.count('TARGETED_NCU+=("$precision:') == 1
     assert "precision=fp16" not in available
+
+
+def test_hot_kernel_selector_aggregates_exact_names_across_generation_stages(
+    tmp_path: Path,
+) -> None:
+    source = _source()
+    marker = '"$PYTHON" - "$summary_dir" "$hot_kernel_json" <<\'PY\'\n'
+    start = source.index(marker) + len(marker)
+    selector = source[start : source.index("\nPY\n", start)]
+    summary_dir = tmp_path / "stages"
+    summary_dir.mkdir()
+
+    rows_by_stage = {
+        "timing_generation": [
+            (70, "aggregate.kernel[0]"),
+            (5, "aggregate.kernel[0]"),
+            (90, "tie_kernel"),
+            (120, "single_stage_kernel"),
+        ],
+        "main_generation": [
+            (60, "aggregate.kernel[0]"),
+            (45, "tie_kernel"),
+        ],
+    }
+    for stage, rows in rows_by_stage.items():
+        with (summary_dir / f"{stage}.cuda_kernel_summary.csv").open(
+            "w", encoding="utf-8", newline=""
+        ) as handle:
+            writer = csv.writer(handle)
+            writer.writerow(("Total Time (ns)", "Name"))
+            writer.writerows(rows)
+
+    output = tmp_path / "hot-kernel.json"
+    subprocess.run(
+        [sys.executable, "-", str(summary_dir), str(output)],
+        input=selector,
+        text=True,
+        check=True,
+    )
+    result = json.loads(output.read_text(encoding="utf-8"))
+
+    # Both aggregate.kernel[0] and tie_kernel total 135 ns.  Exact-name
+    # aggregation beats the 120 ns single-stage kernel, and the lexical tie
+    # break deterministically selects aggregate.kernel[0].
+    assert result == {
+        "ncu_regex": r"^aggregate\.kernel\[0\]$",
+        "raw_name": "aggregate.kernel[0]",
+        "stage_total_ns": {
+            "main_generation": 60.0,
+            "timing_generation": 75.0,
+        },
+        "total_ns": 135.0,
+    }
 
 
 def test_wrapper_keeps_generated_outputs_under_ignored_run_root() -> None:

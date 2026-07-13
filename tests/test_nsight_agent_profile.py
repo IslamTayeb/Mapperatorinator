@@ -261,6 +261,9 @@ def _run(
             "malformed_lines": 0,
             "malformed_by_section": {"TimingPoints": 0, "HitObjects": 0},
             "nonfinite_values": 0,
+            "numeric_validation_scope": (
+                "timing_all_fields_and_hitobject_core_plus_type_specific_fields"
+            ),
             "finite_and_well_formed": True,
         },
         "pipeline_stage_wall_ns": {
@@ -392,9 +395,47 @@ def test_native_kernel_csv_preserves_exact_identity_and_classifies_family(tmp_pa
         "exact::flash_attention_v2<float>",
         "renamed_gemm_128x64",
     ]
-    assert [kernel["family"] for kernel in parsed["kernels"]] == ["attention", "gemm"]
+    assert [kernel["family"] for kernel in parsed["kernels"]] == [
+        "fmha_cross_attention",
+        "gemm_gemv_projection",
+    ]
     assert parsed["kernels"][0]["kernel_id"] != parsed["kernels"][1]["kernel_id"]
     assert parsed["column_resolution"]["canonical_fields"]["total_ns"]["source_column"] == "Total Time (ns)"
+
+
+@pytest.mark.parametrize(
+    ("name", "expected_family"),
+    [
+        (
+            "void q1_rope_cache_attention_kernel<float, 256>(float const*)",
+            "native_q1_self_rope_cache",
+        ),
+        ("q1_attention_kernel<__half, 128>", "native_q1_self_rope_cache"),
+        ("fc1_gelu_warp_group_kernel<float>", "fused_fc1_gelu"),
+        ("fc2_residual_warp_group_kernel<float>", "fused_fc2_residual"),
+        (
+            "fmha_cutlassF_f32_aligned_64x64_rf_sm75(PyTorchMemEffAttention::AttentionKernel)",
+            "fmha_cross_attention",
+        ),
+        ("q1_bmm_cross_attention", "fmha_cross_attention"),
+        ("volta_sgemm_128x64_tn", "gemm_gemv_projection"),
+        ("one_token_out_projection_kernel", "gemm_gemv_projection"),
+        (
+            "void at::native::radixSortKVInPlace<(int)-2, float, long>()",
+            "sampling_radix_sort",
+        ),
+        ("at::native::multinomial_cuda", "sampling_radix_sort"),
+        ("at::native::vectorized_elementwise_kernel", "elementwise"),
+        ("at::native::CatArrayBatchedCopy_contig", "memory"),
+        ("unknown_vendor_kernel", "other"),
+    ],
+)
+def test_kernel_family_classification_distinguishes_optimization_targets(
+    name, expected_family
+):
+    family, _ = nsight.classify_kernel_family(name)
+
+    assert family == expected_family
 
 
 def test_osu_structure_summary_counts_objects_and_fails_visible_on_bad_values(tmp_path):
@@ -424,6 +465,35 @@ nan,192,1400,1,0,0:0:0:0:
     assert structure["hit_object_types"]["sliders"] == 1
     assert structure["malformed_lines"] == 1
     assert structure["nonfinite_values"] == 1
+    assert not structure["finite_and_well_formed"]
+
+
+def test_osu_structure_summary_rejects_incomplete_flags_fractional_types_and_bad_ends(
+    tmp_path,
+):
+    path = tmp_path / "bad-map.osu"
+    path.write_text(
+        """osu file format v14
+
+[TimingPoints]
+0,500
+100,500,4,2,1,70,2,0
+
+[HitObjects]
+64,192,1000,1.5,0,0:0:0:0:
+64,192,1100,0,0,0:0:0:0:
+256,192,1200,8,0,nan,0:0:0:0:
+""",
+        encoding="utf-8",
+    )
+
+    structure = nsight.summarize_osu_structure(path)
+
+    assert structure["timing_points"] == 2
+    assert structure["hit_objects"] == 3
+    assert structure["malformed_by_section"] == {"TimingPoints": 2, "HitObjects": 3}
+    assert structure["nonfinite_values"] == 1
+    assert all(value == 0 for value in structure["hit_object_types"].values())
     assert not structure["finite_and_well_formed"]
 
 
@@ -486,7 +556,7 @@ def test_analyzer_has_explicit_denominators_and_unattributed_graph_replay(tmp_pa
     assert semantic["regions"]["unattributed"]["kernel_accumulated_ns"] == 30
     assert stage["kernel_families"] == [
         {
-            "family": "attention",
+            "family": "fmha_cross_attention",
             "kernel_count": 1,
             "calls": 1,
             "total_ns": 20,
@@ -499,7 +569,7 @@ def test_analyzer_has_explicit_denominators_and_unattributed_graph_replay(tmp_pa
             },
         },
         {
-            "family": "gemm",
+            "family": "gemm_gemv_projection",
             "kernel_count": 1,
             "calls": 1,
             "total_ns": 10,
@@ -648,6 +718,7 @@ def test_cross_precision_is_divergence_report_not_transparency_gate(tmp_path):
     fp16 = _run("fp16", pass_kind="untraced_control", precision="fp16")
     fp16["stages"]["main_generation"]["token_ids_sha256"] = "drift"
     fp16["output_structure"]["hit_objects"] = 9
+    fp16["output_structure"]["hit_object_types"]["circles"] = 7
     manifest = _manifest(
         tmp_path / "manifest.json",
         [fp32, fp16],
@@ -670,6 +741,14 @@ def test_cross_precision_is_divergence_report_not_transparency_gate(tmp_path):
     assert comparison["output_structure"]["fields"]["timing_points"]["equal"]
     assert result["runs"]["fp32"]["output_structure"]["finite_and_well_formed"]
     assert set(result["run_groups"]) == {"fp32:accepted", "fp16:accepted"}
+
+
+def test_output_structure_manifest_rejects_inconsistent_counts(tmp_path):
+    run = _run("bad-structure", pass_kind="untraced_control")
+    run["output_structure"]["hit_objects"] += 1
+
+    with pytest.raises(nsight.NsightProfileError, match="hit-object counts are inconsistent"):
+        nsight.analyze_manifest(_manifest(tmp_path / "manifest.json", [run]))
 
 
 def test_missing_or_renamed_required_column_fails_loudly(tmp_path):

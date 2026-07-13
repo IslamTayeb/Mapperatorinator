@@ -399,21 +399,32 @@ import sys
 from pathlib import Path
 
 root, output = Path(sys.argv[1]), Path(sys.argv[2])
-candidates = []
-for stage in ("timing_generation", "main_generation"):
+stages = ("timing_generation", "main_generation")
+totals_by_name = {}
+stage_totals_by_name = {}
+for stage in stages:
     path = root / f"{stage}.cuda_kernel_summary.csv"
     with path.open(encoding="utf-8-sig", newline="") as handle:
         for row in csv.DictReader(handle):
-            candidates.append((float(row["Total Time (ns)"]), stage, row["Name"]))
-if not candidates:
+            name = row["Name"]
+            total_ns = float(row["Total Time (ns)"])
+            totals_by_name[name] = totals_by_name.get(name, 0.0) + total_ns
+            stage_totals = stage_totals_by_name.setdefault(
+                name,
+                {stage_name: 0.0 for stage_name in stages},
+            )
+            stage_totals[stage] += total_ns
+if not totals_by_name:
     raise SystemExit("no hot-kernel candidates in fresh node trace")
-total, stage, name = max(candidates, key=lambda item: (item[0], item[2]))
+# Exact demangled kernel names are the aggregation key.  Break combined-time
+# ties by ascending name so repeated runs select the same NCU target.
+name, total = min(totals_by_name.items(), key=lambda item: (-item[1], item[0]))
 output.write_text(
     json.dumps(
         {
             "raw_name": name,
-            "stage": stage,
             "total_ns": total,
+            "stage_total_ns": stage_totals_by_name[name],
             "ncu_regex": "^" + re.escape(name) + "$",
         },
         indent=2,
