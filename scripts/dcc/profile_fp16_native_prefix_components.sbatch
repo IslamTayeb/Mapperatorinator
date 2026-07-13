@@ -60,6 +60,7 @@ export CUDA_CACHE_PATH="$WORK/cache/cuda"
 export TORCH_EXTENSIONS_DIR="$WORK/torch_extensions"
 export TMPDIR="$WORK/tmp"
 export TOKENIZERS_PARALLELISM=false
+export PATH="$(dirname "$PYTHON"):$PATH"
 
 {
   echo "host=$(hostname)"
