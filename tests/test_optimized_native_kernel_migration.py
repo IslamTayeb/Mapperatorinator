@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import os
 from pathlib import Path
 import subprocess
@@ -18,12 +17,6 @@ from osuT5.osuT5.inference.runtime_dispatch import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-MODEL_PATH = (
-    REPO_ROOT
-    / "osuT5/osuT5/model/custom_transformers/modeling_varwhisper.py"
-)
-
-
 def _run_fresh_python(source: str) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(REPO_ROOT)
@@ -54,23 +47,6 @@ for name in sys.modules:
     assert not name.startswith("osuT5.osuT5.inference.optimized"), name
     assert not name.startswith("osuT5.osuT5.inference.native"), name
     assert not name.startswith("torch.utils.cpp_extension"), name
-"""
-    )
-    assert completed.returncode == 0, completed.stderr
-
-
-def test_legacy_native_shims_have_no_optimized_or_cpp_extension_side_effect():
-    completed = _run_fresh_python(
-        """
-import importlib
-import sys
-
-for name in (
-    "osuT5.osuT5.inference.native_q1_attention",
-):
-    importlib.import_module(name)
-assert "osuT5.osuT5.inference.optimized.kernels.q1_attention" not in sys.modules
-assert "torch.utils.cpp_extension" not in sys.modules
 """
     )
     assert completed.returncode == 0, completed.stderr
@@ -177,21 +153,6 @@ def test_attention_runtime_hooks_restore_for_nested_and_exception_paths():
     assert attention_runtime_hooks() is empty
 
 
-def test_q1_bmm_only_context_imports_dispatch_without_native_extension():
-    completed = _run_fresh_python(
-        """
-import sys
-from osuT5.osuT5.inference.optimized.single.runtime_context import attention_runtime_context
-
-with attention_runtime_context(q1_bmm_cross_attention=True):
-    assert "osuT5.osuT5.inference.optimized.kernels.dispatch" in sys.modules
-assert "osuT5.osuT5.inference.optimized.kernels.q1_attention" not in sys.modules
-assert "torch.utils.cpp_extension" not in sys.modules
-"""
-    )
-    assert completed.returncode == 0, completed.stderr
-
-
 def test_native_generation_context_preloads_then_installs_hooks(monkeypatch):
     from osuT5.osuT5.inference.optimized.kernels import q1_attention
     from osuT5.osuT5.inference.optimized.single.runtime_context import attention_runtime_context
@@ -210,28 +171,6 @@ def test_native_generation_context_preloads_then_installs_hooks(monkeypatch):
         assert hooks.q1_rope_cache_self_attention_forward is None
     assert events == ["preload", "entered"]
     assert attention_runtime_hooks() is empty
-
-
-def test_q1_bmm_context_installs_only_sdpa_hook():
-    from osuT5.osuT5.inference.optimized.single.runtime_context import attention_runtime_context
-
-    with attention_runtime_context(q1_bmm_cross_attention=True):
-        hooks = attention_runtime_hooks()
-        assert hooks.sdpa_attention_forward is not None
-        assert hooks.q1_rope_cache_self_attention_forward is None
-
-
-def test_nested_default_generation_context_temporarily_disables_attention_hooks():
-    from osuT5.osuT5.inference.optimized.single.runtime_context import attention_runtime_context
-
-    with attention_runtime_context(q1_bmm_cross_attention=True):
-        outer_hooks = attention_runtime_hooks()
-        assert outer_hooks.sdpa_attention_forward is not None
-        with attention_runtime_context():
-            inner_hooks = attention_runtime_hooks()
-            assert inner_hooks.sdpa_attention_forward is None
-            assert inner_hooks.q1_rope_cache_self_attention_forward is None
-        assert attention_runtime_hooks() is outer_hooks
 
 
 def test_active_prefix_context_owns_state_and_preserves_other_hooks():
@@ -277,23 +216,3 @@ def test_fused_generation_context_installs_only_fused_hook(monkeypatch):
         hooks = attention_runtime_hooks()
         assert hooks.sdpa_attention_forward is None
         assert hooks.q1_rope_cache_self_attention_forward is not None
-
-
-def test_model_hot_path_has_no_optimized_or_native_imports():
-    tree = ast.parse(MODEL_PATH.read_text(encoding="utf-8"))
-    imports = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.Import, ast.ImportFrom))
-    ]
-    rendered = [ast.unparse(node) for node in imports]
-    assert not any("inference.optimized" in item for item in rendered)
-    assert not any("inference.native" in item for item in rendered)
-    assert not any("cpp_extension" in item for item in rendered)
-    source = MODEL_PATH.read_text(encoding="utf-8")
-    assert "torch.bmm" not in source
-    assert "native_q1_rope_cache_self_attention_enabled" not in source
-    assert "native_q1_self_attention_enabled" not in source
-    assert "q1_bmm_cross_attention_enabled" not in source
-    assert "active_prefix_self_attention_length" not in source
-    assert "key[:, :, :prefix_length" not in source

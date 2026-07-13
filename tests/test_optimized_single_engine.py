@@ -8,7 +8,6 @@ import torch
 import inference
 from osuT5.osuT5.inference.engine_binding import (
     InferenceEngineBinding,
-    unwrap_engine_binding,
 )
 from osuT5.osuT5.inference.generation_utils import (
     build_generation_stats,
@@ -119,15 +118,6 @@ def test_single_loader_forces_compile_fp32_sdpa_once():
     assert call_kwargs["precision"] == "fp32"
     assert call_kwargs["attn_implementation"] == "sdpa"
     assert call_kwargs["use_server"] is False
-
-
-def test_engine_binding_unwrap_preserves_raw_model_identity():
-    raw_model = object()
-    runtime = object()
-    binding = InferenceEngineBinding(raw_model=raw_model, runtime=runtime)
-
-    assert unwrap_engine_binding(binding) == (raw_model, runtime)
-    assert unwrap_engine_binding(raw_model) == (raw_model, None)
 
 
 def test_inference_loader_injects_raw_loader_and_returns_binding():

@@ -9,6 +9,7 @@ from typing import Any
 import torch
 
 from ....event import ContextType
+from ....runtime_profiling import generation_profile_context
 from ...engine_binding import InferenceEngineBinding
 from ...generation_utils import (
     build_generation_stats,
@@ -17,7 +18,6 @@ from ...generation_utils import (
 )
 from .decode_loop import active_prefix_decode_generate
 from .logits import build_single_logits_processor_list
-from .runtime_context import attention_runtime_context
 from .state import ProductionDecodeSession
 
 
@@ -172,7 +172,7 @@ def _generate_window(
         device_type=model.device.type,
         dtype=torch.bfloat16,
         enabled=precision == "amp",
-    ), attention_runtime_context(
+    ), generation_profile_context(
         q1_bmm_cross_attention=True,
         native_q1_self_attention=native_q1_self_attention,
         native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,

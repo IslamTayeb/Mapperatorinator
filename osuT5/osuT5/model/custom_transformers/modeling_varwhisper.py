@@ -28,6 +28,10 @@ from transformers.utils import (
     logging,
 )
 
+from ...runtime_profiling import (
+    detail_ranges_enabled,
+    profile_range,
+)
 from ...inference.runtime_dispatch import attention_runtime_hooks
 from .configuration_varwhisper import VarWhisperConfig
 
@@ -278,28 +282,6 @@ def eager_attention_forward(
     if local_attention != (-1, -1):
         attention_mask = sliding_window_mask
 
-    runtime_hooks = attention_runtime_hooks()
-    if runtime_hooks.sdpa_attention_inputs is not None:
-        query, key, value, attention_mask = runtime_hooks.sdpa_attention_inputs(
-            module=module,
-            query=query,
-            key=key,
-            value=value,
-            attention_mask=attention_mask,
-        )
-    if runtime_hooks.sdpa_attention_forward is not None:
-        output = runtime_hooks.sdpa_attention_forward(
-            module=module,
-            query=query,
-            key=key,
-            value=value,
-            bs=bs,
-            dim=dim,
-            attention_mask=attention_mask,
-        )
-        if output is not None:
-            return output
-
     attn_weights = attn_weights + attention_mask
 
     # upcast attention to fp32
@@ -377,6 +359,31 @@ def sdpa_attention_forward(
 ) -> tuple[torch.Tensor]:
     if local_attention != (-1, -1):
         attention_mask = sliding_window_mask
+
+    runtime_hooks = attention_runtime_hooks()
+    optimized_attention_inputs = runtime_hooks.sdpa_attention_inputs
+    if optimized_attention_inputs is not None:
+        query, key, value, attention_mask = optimized_attention_inputs(
+            module=module,
+            query=query,
+            key=key,
+            value=value,
+            attention_mask=attention_mask,
+        )
+
+    optimized_attention_forward = runtime_hooks.sdpa_attention_forward
+    if optimized_attention_forward is not None:
+        optimized_output = optimized_attention_forward(
+            module=module,
+            query=query,
+            key=key,
+            value=value,
+            bs=bs,
+            dim=dim,
+            attention_mask=attention_mask,
+        )
+        if optimized_output is not None:
+            return optimized_output
 
     attn_output = (
         F.scaled_dot_product_attention(
@@ -481,6 +488,9 @@ class VarWhisperAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:
         bs = hidden_states.shape[0]
         is_varlen = cu_seqlens is not None
+        attn_kind = "cross" if self.is_cross_attention else "self"
+        range_prefix = f"attention.layer{self.layer_idx}.{attn_kind}"
+        profile_ranges = detail_ranges_enabled()
 
         attn_func = partial(
             VARWHISPER_ATTENTION_FUNCTION[self.config._attn_implementation],
@@ -554,27 +564,55 @@ class VarWhisperAttention(nn.Module):
                     attn_outputs = attn_func(qkv=qkv)
         else:
             if self.is_cross_attention:
-                query_states = self.Wq(hidden_states).view(bs, -1, self.num_heads, self.head_dim).transpose(1, 2)
+                if profile_ranges:
+                    with profile_range(f"{range_prefix}.q_proj"):
+                        query_states = self.Wq(hidden_states).view(bs, -1, self.num_heads, self.head_dim).transpose(1, 2)
+                else:
+                    query_states = self.Wq(hidden_states).view(bs, -1, self.num_heads, self.head_dim).transpose(1, 2)
 
                 if past_key_value and is_updated:
                     # reuse k,v, cross_attentions
-                    key_states, value_states = past_key_value[self.layer_idx]
+                    if profile_ranges:
+                        with profile_range(f"{range_prefix}.cache_reuse"):
+                            key_states, value_states = past_key_value[self.layer_idx]
+                    else:
+                        key_states, value_states = past_key_value[self.layer_idx]
                 else:
-                    kv = self.Wkv(key_value_states).view(bs, -1, 2, self.num_heads, self.head_dim)
-                    key_states, value_states = kv.transpose(1, 3).unbind(dim=2)
+                    if profile_ranges:
+                        with profile_range(f"{range_prefix}.kv_proj"):
+                            kv = self.Wkv(key_value_states).view(bs, -1, 2, self.num_heads, self.head_dim)
+                            key_states, value_states = kv.transpose(1, 3).unbind(dim=2)
+                    else:
+                        kv = self.Wkv(key_value_states).view(bs, -1, 2, self.num_heads, self.head_dim)
+                        key_states, value_states = kv.transpose(1, 3).unbind(dim=2)
 
                     if past_key_value is not None:
-                        past_key_value.update(key_states, value_states, self.layer_idx)
-                attn_outputs = attn_func(
-                    query=query_states,
-                    key=key_states,
-                    value=value_states,
-                )
+                        if profile_ranges:
+                            with profile_range(f"{range_prefix}.cache_update"):
+                                past_key_value.update(key_states, value_states, self.layer_idx)
+                        else:
+                            past_key_value.update(key_states, value_states, self.layer_idx)
+                if profile_ranges:
+                    with profile_range(f"{range_prefix}.sdpa"):
+                        attn_outputs = attn_func(
+                            query=query_states,
+                            key=key_states,
+                            value=value_states,
+                        )
+                else:
+                    attn_outputs = attn_func(
+                        query=query_states,
+                        key=key_states,
+                        value=value_states,
+                    )
             else:
-                optimized_forward = attention_runtime_hooks().q1_rope_cache_self_attention_forward
-                attn_outputs = None
-                if optimized_forward is not None:
-                    attn_outputs = optimized_forward(
+                runtime_hooks = attention_runtime_hooks()
+                optimized_self_attention_forward = (
+                    runtime_hooks.q1_rope_cache_self_attention_forward
+                )
+                optimized_attn_outputs = None
+                if optimized_self_attention_forward is not None:
+                    optimized_attn_outputs = optimized_self_attention_forward(
                         module=self,
                         hidden_states=hidden_states,
                         bs=bs,
@@ -582,29 +620,59 @@ class VarWhisperAttention(nn.Module):
                         past_key_value=past_key_value,
                         cache_position=cache_position,
                         position_ids=position_ids,
+                        profile_ranges=profile_ranges,
+                        range_prefix=range_prefix,
                         attention_mask=kwargs.get("attention_mask"),
                         sliding_window_mask=kwargs.get("sliding_window_mask"),
                     )
-                if attn_outputs is None:
-                    qkv = self.Wqkv(hidden_states).view(bs, -1, 3, self.num_heads, self.head_dim)
-                    query_states, key_states, value_states = qkv.transpose(1, 3).unbind(dim=2)
+                if optimized_attn_outputs is not None:
+                    attn_outputs = optimized_attn_outputs
+                else:
+                    if profile_ranges:
+                        with profile_range(f"{range_prefix}.qkv_proj"):
+                            qkv = self.Wqkv(hidden_states).view(bs, -1, 3, self.num_heads, self.head_dim)
+                            query_states, key_states, value_states = qkv.transpose(1, 3).unbind(dim=2)
+                    else:
+                        qkv = self.Wqkv(hidden_states).view(bs, -1, 3, self.num_heads, self.head_dim)
+                        query_states, key_states, value_states = qkv.transpose(1, 3).unbind(dim=2)
 
-                    cos, sin = self.rotary_emb(query_states, position_ids=position_ids)
-                    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+                    if profile_ranges:
+                        with profile_range(f"{range_prefix}.rope"):
+                            cos, sin = self.rotary_emb(query_states, position_ids=position_ids)
+                            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+                    else:
+                        cos, sin = self.rotary_emb(query_states, position_ids=position_ids)
+                        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
                     if past_key_value is not None:
                         # sin and cos are specific to RoPE models; cache_position needed for the static cache
                         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-                        key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+                        if profile_ranges:
+                            with profile_range(f"{range_prefix}.cache_update"):
+                                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+                        else:
+                            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-                    attn_outputs = attn_func(
-                        query=query_states,
-                        key=key_states,
-                        value=value_states,
-                    )
+                    if profile_ranges:
+                        with profile_range(f"{range_prefix}.sdpa"):
+                            attn_outputs = attn_func(
+                                query=query_states,
+                                key=key_states,
+                                value=value_states,
+                            )
+                    else:
+                        attn_outputs = attn_func(
+                            query=query_states,
+                            key=key_states,
+                            value=value_states,
+                        )
 
         hidden_states, *rest = attn_outputs
-        hidden_states = self.out_drop(self.Wo(hidden_states))
+        if profile_ranges:
+            with profile_range(f"{range_prefix}.out_proj"):
+                hidden_states = self.out_drop(self.Wo(hidden_states))
+        else:
+            hidden_states = self.out_drop(self.Wo(hidden_states))
 
         return hidden_states, *rest, past_key_value
 
@@ -729,19 +797,38 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
                 returned tensors for more detail.
         """
         residual = hidden_states
-        hidden_states = self.self_attn_layer_norm(hidden_states)
+        layer_name = f"decoder.layer{self.self_attn.layer_idx}"
+        profile_ranges = detail_ranges_enabled()
+        if profile_ranges:
+            with profile_range(f"{layer_name}.self_attn_norm"):
+                hidden_states = self.self_attn_layer_norm(hidden_states)
+        else:
+            hidden_states = self.self_attn_layer_norm(hidden_states)
 
         # Self Attention
-        self_attn_outputs = self.self_attn(
-            hidden_states=hidden_states,
-            past_key_value=past_key_value,
-            attention_mask=attention_mask,
-            cache_position=cache_position,
-            position_ids=position_ids,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            output_attentions=output_attentions
-        )
+        if profile_ranges:
+            with profile_range(f"{layer_name}.self_attn"):
+                self_attn_outputs = self.self_attn(
+                    hidden_states=hidden_states,
+                    past_key_value=past_key_value,
+                    attention_mask=attention_mask,
+                    cache_position=cache_position,
+                    position_ids=position_ids,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    output_attentions=output_attentions
+                )
+        else:
+            self_attn_outputs = self.self_attn(
+                hidden_states=hidden_states,
+                past_key_value=past_key_value,
+                attention_mask=attention_mask,
+                cache_position=cache_position,
+                position_ids=position_ids,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                output_attentions=output_attentions
+            )
         hidden_states = self_attn_outputs[0]
         hidden_states = residual + hidden_states
 
@@ -749,27 +836,62 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
         cross_attn_outputs = ()
         if encoder_hidden_states is not None:
             residual = hidden_states
-            hidden_states = self.cross_attn_layer_norm(hidden_states)
-            cross_attn_outputs = self.cross_attn(
-                hidden_states=hidden_states,
-                key_value_states=encoder_hidden_states,
-                past_key_value=past_key_value,
-                position_ids=position_ids,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                cu_seqlens_k=encoder_cu_seqlens,
-                max_seqlen_k=encoder_max_seqlen,
-                output_attentions=output_attentions
-            )
+            if profile_ranges:
+                with profile_range(f"{layer_name}.cross_attn_norm"):
+                    hidden_states = self.cross_attn_layer_norm(hidden_states)
+            else:
+                hidden_states = self.cross_attn_layer_norm(hidden_states)
+            if profile_ranges:
+                with profile_range(f"{layer_name}.cross_attn"):
+                    cross_attn_outputs = self.cross_attn(
+                        hidden_states=hidden_states,
+                        key_value_states=encoder_hidden_states,
+                        past_key_value=past_key_value,
+                        position_ids=position_ids,
+                        cu_seqlens=cu_seqlens,
+                        max_seqlen=max_seqlen,
+                        cu_seqlens_k=encoder_cu_seqlens,
+                        max_seqlen_k=encoder_max_seqlen,
+                        output_attentions=output_attentions
+                    )
+            else:
+                cross_attn_outputs = self.cross_attn(
+                    hidden_states=hidden_states,
+                    key_value_states=encoder_hidden_states,
+                    past_key_value=past_key_value,
+                    position_ids=position_ids,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    cu_seqlens_k=encoder_cu_seqlens,
+                    max_seqlen_k=encoder_max_seqlen,
+                    output_attentions=output_attentions
+                )
             hidden_states = cross_attn_outputs[0]
             hidden_states = residual + hidden_states
 
         # Fully Connected
         residual = hidden_states
-        hidden_states = self.final_layer_norm(hidden_states)
-        hidden_states = self.activation_fn(self.fc1(hidden_states))
+        if profile_ranges:
+            with profile_range(f"{layer_name}.mlp_norm"):
+                hidden_states = self.final_layer_norm(hidden_states)
+        else:
+            hidden_states = self.final_layer_norm(hidden_states)
+        if profile_ranges:
+            with profile_range(f"{layer_name}.mlp.fc1"):
+                hidden_states = self.fc1(hidden_states)
+        else:
+            hidden_states = self.fc1(hidden_states)
+        if profile_ranges:
+            with profile_range(f"{layer_name}.mlp.activation"):
+                hidden_states = self.activation_fn(hidden_states)
+        else:
+            hidden_states = self.activation_fn(hidden_states)
         hidden_states = nn.functional.dropout(hidden_states, p=self.activation_dropout, training=self.training)
-        hidden_states = self.fc2(hidden_states)
+        if profile_ranges:
+            with profile_range(f"{layer_name}.mlp.fc2"):
+                hidden_states = self.fc2(hidden_states)
+        else:
+            hidden_states = self.fc2(hidden_states)
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states
 
@@ -884,7 +1006,11 @@ class VarWhisperEncoder(VarWhisperPreTrainedModel):
             if output_attentions:
                 all_attentions = all_attentions + (layer_outputs[1],)
 
-        hidden_states = self.layer_norm(hidden_states)
+        if detail_ranges_enabled():
+            with profile_range("encoder.final_norm"):
+                hidden_states = self.layer_norm(hidden_states)
+        else:
+            hidden_states = self.layer_norm(hidden_states)
         if output_hidden_states:
             encoder_states = encoder_states + (hidden_states,)
 
@@ -1143,7 +1269,11 @@ class VarWhisperDecoder(VarWhisperPreTrainedModel):
                 if encoder_hidden_states is not None:
                     all_cross_attentions += (layer_outputs[2],)
 
-        hidden_states = self.layer_norm(hidden_states)
+        if detail_ranges_enabled():
+            with profile_range("decoder.final_norm"):
+                hidden_states = self.layer_norm(hidden_states)
+        else:
+            hidden_states = self.layer_norm(hidden_states)
         # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -1455,7 +1585,11 @@ class VarWhisperForConditionalGeneration(WhisperGenerationMixin, VarWhisperPreTr
             return_dict=return_dict,
             cache_position=cache_position,
         )
-        lm_logits = self.proj_out(outputs[0])
+        if detail_ranges_enabled():
+            with profile_range("decoder.output_projection"):
+                lm_logits = self.proj_out(outputs[0])
+        else:
+            lm_logits = self.proj_out(outputs[0])
 
         loss = None
         if labels is not None:
