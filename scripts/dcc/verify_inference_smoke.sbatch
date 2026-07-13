@@ -19,6 +19,7 @@ BASELINE_COMMIT=${BASELINE_COMMIT:?Set BASELINE_COMMIT}
 CANDIDATE_COMMIT=${CANDIDATE_COMMIT:-$BASELINE_COMMIT}
 BASELINE_ENGINE=${BASELINE_ENGINE:-v32}
 CANDIDATE_ENGINE=${CANDIDATE_ENGINE:-optimized}
+PRECISION=${PRECISION:-fp32}
 PROFILE_CONFIG=${PROFILE_CONFIG:-profile_salvalai_smoke15}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_LABEL=${RUN_LABEL:-smoke}
@@ -55,9 +56,12 @@ if [[ "$CANDIDATE_ENGINE" != v32 && "$CANDIDATE_ENGINE" != optimized ]]; then
   echo "CANDIDATE_ENGINE must be v32 or optimized" >&2
   exit 2
 fi
+if [[ "$PRECISION" != fp32 && "$PRECISION" != fp16 ]]; then
+  echo "PRECISION must be fp32 or fp16" >&2
+  exit 2
+fi
 
 mkdir -p "$WORK/logs" "$WORK/tmp" "$WORK/cache" \
-  "$WORK/cache/torch_inductor" "$WORK/cache/triton" "$WORK/cache/cuda" \
   "$WORK/torch_extensions" "$RUN_ROOT"
 export PATH="$ENV/bin:$PATH"
 export XDG_CACHE_HOME="$WORK/cache"
@@ -65,9 +69,6 @@ export HF_HOME="$WORK/cache/huggingface"
 export TRANSFORMERS_CACHE="$WORK/cache/huggingface"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
-export TORCHINDUCTOR_CACHE_DIR="$WORK/cache/torch_inductor"
-export TRITON_CACHE_DIR="$WORK/cache/triton"
-export CUDA_CACHE_PATH="$WORK/cache/cuda"
 export TORCH_EXTENSIONS_DIR="$WORK/torch_extensions"
 export TMPDIR="$WORK/tmp"
 export TOKENIZERS_PARALLELISM=false
@@ -78,6 +79,7 @@ echo "baseline_commit=$BASELINE_COMMIT"
 echo "candidate_commit=$CANDIDATE_COMMIT"
 echo "baseline_engine=$BASELINE_ENGINE"
 echo "candidate_engine=$CANDIDATE_ENGINE"
+echo "precision=$PRECISION"
 echo "profile_config=$PROFILE_CONFIG"
 echo "run_root=$RUN_ROOT"
 if [[ -n "${SLURM_JOB_ID:-}" ]]; then
@@ -93,7 +95,7 @@ trap 'kill "$SMI_PID" 2>/dev/null || true' EXIT
 COMMON_OVERRIDES=(
   audio_path="$AUDIO"
   device=cuda
-  precision=fp32
+  precision="$PRECISION"
   attn_implementation=sdpa
   use_server=false
   parallel=false
@@ -108,12 +110,21 @@ run_profile() {
   local engine=$2
   local label=$3
   local output="$RUN_ROOT/$label"
+  local compiler_cache="$RUN_ROOT/compiler-cache/$label"
   local legacy_reset=()
   if [[ "$engine" == optimized ]] && grep -q 'inference_generation_compile:' "$repo/config.py"; then
     legacy_reset+=(inference_generation_compile=false)
   fi
-  mkdir -p "$output"
+  if [[ -e "$compiler_cache" ]]; then
+    echo "compiler cache already exists for $label at $compiler_cache" >&2
+    exit 2
+  fi
+  mkdir -p "$output" \
+    "$compiler_cache/torch_inductor" "$compiler_cache/triton" "$compiler_cache/cuda"
   (
+    export TORCHINDUCTOR_CACHE_DIR="$compiler_cache/torch_inductor"
+    export TRITON_CACHE_DIR="$compiler_cache/triton"
+    export CUDA_CACHE_PATH="$compiler_cache/cuda"
     cd "$repo"
     python inference.py --config-name "$PROFILE_CONFIG" \
       output_path="$output" \
@@ -149,7 +160,7 @@ BASELINE_SECOND=$(<"$RUN_ROOT/baseline_second.profile-path.txt")
     --json-output "$RUN_ROOT/reciprocal-compare.json"
 )
 
-python - "$RUN_ROOT" "$BASELINE_ENGINE" "$CANDIDATE_ENGINE" <<'PY'
+python - "$RUN_ROOT" "$BASELINE_ENGINE" "$CANDIDATE_ENGINE" "$PRECISION" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -161,11 +172,14 @@ expected = {
     "candidate_first": sys.argv[3],
     "candidate_second": sys.argv[3],
 }
+precision = sys.argv[4]
 for label, engine in expected.items():
     profile_path = Path((root / f"{label}.profile-path.txt").read_text().strip())
     profile = json.loads(profile_path.read_text(encoding="utf-8"))
     if profile.get("metadata", {}).get("inference_engine") != engine:
         raise SystemExit(f"{label}: inference engine metadata mismatch")
+    if profile.get("metadata", {}).get("precision") != precision:
+        raise SystemExit(f"{label}: precision metadata mismatch")
 print("inference_reciprocal_smoke_gate=PASS")
 PY
 

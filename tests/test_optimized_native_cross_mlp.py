@@ -224,7 +224,7 @@ def test_native_decoder_wrappers_preserve_fp16_storage_and_argument_order(
 def test_native_cross_mlp_is_enabled_in_both_accepted_presets() -> None:
     for precision in ("fp32", "fp16"):
         raw_model = SimpleNamespace(
-            generation_config=SimpleNamespace(disable_compile=False),
+            generation_config=SimpleNamespace(disable_compile=True),
         )
         loader = lambda **kwargs: (raw_model, object())
         kwargs = {

@@ -38,13 +38,13 @@ class OptimizedPreset:
 OPTIMIZED_PRESETS = MappingProxyType(
     {
         "fp32": OptimizedPreset(
-            version="accepted-fp32-native-cross-mlp-289-v2",
+            version="accepted-fp32-native-cross-mlp-289-v3",
             result_class="documented-drift",
             precision="fp32",
             torch_dtype=torch.float32,
         ),
         "fp16": OptimizedPreset(
-            version="accepted-fp16-all-fused-v1",
+            version="accepted-fp16-all-fused-v2",
             result_class="documented-drift",
             precision="fp16",
             torch_dtype=torch.float16,
@@ -349,21 +349,21 @@ def load_optimized_single_engine(
         {
             "precision": preset.precision,
             "attn_implementation": OPTIMIZED_ATTN_IMPLEMENTATION,
-            "generation_compile": True,
+            "generation_compile": False,
             "use_server": False,
         }
     )
     raw_model, tokenizer = model_loader(**effective_loader_kwargs)
-    if bool(
-        getattr(
-            getattr(raw_model, "generation_config", None),
-            "disable_compile",
-            True,
-        )
-    ):
+    disable_compile = getattr(
+        getattr(raw_model, "generation_config", None),
+        "disable_compile",
+        None,
+    )
+    if disable_compile is not True:
         raise RuntimeError(
-            "optimized single loader requested the custom generation path, but "
-            "the raw model reports it disabled."
+            "optimized single loader requires generation_config.disable_compile "
+            "to be boolean True after loading; the model loader ignored or did "
+            "not preserve generation_compile=False."
         )
     return (
         InferenceEngineBinding(

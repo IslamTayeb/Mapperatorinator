@@ -1,4 +1,3 @@
-import os
 import time
 from typing import Any
 
@@ -186,14 +185,6 @@ def active_prefix_decode_generate(
         model_kwargs,
     )
     max_cache_len = _max_cache_shape(model_kwargs, generation_config)
-    model_forward = model.__call__
-    if model._valid_auto_compile_criteria(model_kwargs, generation_config):
-        os.environ["TOKENIZERS_PARALLELISM"] = "0"
-        if model.config._attn_implementation == "flash_attention_2":
-            compile_config = generation_config.compile_config
-            if compile_config is not None and compile_config.fullgraph:
-                compile_config.fullgraph = False
-        model_forward = model.get_compiled_call(generation_config.compile_config)
 
     is_prefill = True
     scores = None
@@ -255,7 +246,7 @@ def active_prefix_decode_generate(
                 outputs = graph_entry["outputs"]
             else:
                 with active_prefix_self_attention_context(prefix_length):
-                    outputs = model_forward(**model_inputs, return_dict=True)
+                    outputs = model(**model_inputs, return_dict=True)
 
         model_kwargs = model._update_model_kwargs_for_generation(
             outputs,
