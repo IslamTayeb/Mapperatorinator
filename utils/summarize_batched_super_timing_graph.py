@@ -9,7 +9,10 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from utils.profile_batched_super_timing_graph import compare_exact
+if __package__:
+    from .profile_batched_super_timing_graph import compare_exact
+else:
+    from profile_batched_super_timing_graph import compare_exact
 
 
 def _reports(root: Path, *, precision: str, phase: str) -> list[dict[str, Any]]:

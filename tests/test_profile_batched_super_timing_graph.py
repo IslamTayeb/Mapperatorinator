@@ -1,12 +1,33 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import torch
 
 from utils.profile_batched_super_timing_graph import _graph_summary, compare_exact
 from utils.summarize_batched_super_timing_graph import summarize
+
+
+def test_summarizer_direct_entrypoint_imports_from_repo_root():
+    repo_root = Path(__file__).resolve().parents[1]
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(repo_root / "utils" / "summarize_batched_super_timing_graph.py"),
+            "--help",
+        ],
+        cwd=repo_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "--report-root" in completed.stdout
 
 
 def _report(*, mode: str, batch: int, repetition: int, seconds: float):
