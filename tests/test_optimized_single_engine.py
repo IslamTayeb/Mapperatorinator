@@ -48,7 +48,8 @@ def test_accepted_runtime_metadata_is_one_fixed_preset():
         "result_class": "exact-output",
         "precision": "fp32",
         "attn_implementation": "sdpa",
-        "generation_compile": True,
+        "decoder_loop_backend": "active_prefix_cuda_graph",
+        "torch_compile_enabled": False,
         "batch_size": 1,
         "cfg_scale": 1.0,
         "num_beams": 1,
@@ -97,7 +98,7 @@ def test_runtime_overlays_structure_without_changing_sampling(monkeypatch):
     assert "active_prefix_decode_bucket_size" not in captured
 
 
-def test_single_loader_forces_compile_fp32_sdpa_once():
+def test_single_loader_enables_custom_generate_fp32_sdpa_once():
     raw_model = SimpleNamespace(
         generation_config=SimpleNamespace(disable_compile=False),
     )

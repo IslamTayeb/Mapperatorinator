@@ -25,10 +25,9 @@ Input JSON schema (schema_version 1)::
             }
           }
         },
-        "fp32_framework": {"buckets": {"...": "same bucket schema"}},
-        "fp32_native_prefix": {"buckets": {"...": "same bucket schema"}},
-        "fp16_framework": {"buckets": {"...": "same bucket schema"}},
-        "fp16_native_prefix": {"buckets": {"...": "same bucket schema"}}
+        "fp32_shared_specialized": {"buckets": {"...": "same bucket schema"}},
+        "fp16_framework_self_bmm_cross": {"buckets": {"...": "same bucket schema"}},
+        "fp16_native_self_bmm_cross": {"buckets": {"...": "same bucket schema"}}
       }
     }
 
@@ -44,12 +43,12 @@ complete one-token model forward; it already includes all decoder layers.
 and capture wall for that prefix, not a per-replay average.  The projection
 charges its baseline-to-candidate delta separately so flat setup is not hidden.
 ``prefix_replay_ms_per_layer`` is the matched self+cross-prefix boundary used
-to compare native against framework operations separately within FP32 and
-FP16.  A native variant is retained only when it is at least five percent
-faster than its same-dtype framework variant.  Its weighted total is multiplied
-by the twelve decoder layers.  ``fp32_native_prefix`` and both FP16 variants may
-promote, while ``fp32_accepted`` remains the current production-dispatch anchor
-for the 28.243-second baseline.
+to compare the two FP16 self-attention policies while both retain accepted-style
+q1 BMM cross-attention.  The native-self variant is retained only when it is at
+least five percent faster than framework self-attention.  The recaptured FP32
+shared-specialized graph is a parity control: it must be exact and no more than
+one percent slower than the cached accepted graph before any FP16 candidate can
+advance.
 
 The full-bucket projection is::
 
@@ -91,15 +90,10 @@ SENTINEL_BUCKETS = frozenset({128, 576, 640})
 ALL_BUCKETS = frozenset(BUCKET_COUNTS)
 VARIANTS = (
     "fp32_accepted",
-    "fp32_framework",
-    "fp32_native_prefix",
-    "fp16_framework",
-    "fp16_native_prefix",
+    "fp32_shared_specialized",
+    "fp16_framework_self_bmm_cross",
+    "fp16_native_self_bmm_cross",
 )
-NATIVE_COMPARISONS = {
-    "fp32": ("fp32_framework", "fp32_native_prefix"),
-    "fp16": ("fp16_framework", "fp16_native_prefix"),
-}
 CHECKS = (
     "finite_outputs",
     "cache_shapes_valid",
@@ -125,6 +119,7 @@ TARGET_MAIN_TPS = BASELINE_MAIN_TOKENS / TARGET_MAIN_SECONDS
 TARGET_TPS_DELTA = TARGET_MAIN_TPS - BASELINE_MAIN_TPS
 DECODER_LAYERS = 12
 NATIVE_PREFIX_MIN_ADVANTAGE_PCT = 5.0
+FP32_PARITY_MAX_REGRESSION_PCT = 1.0
 
 
 def _object(value: Any, *, name: str) -> dict[str, Any]:
@@ -326,52 +321,71 @@ def summarize(payload: Any) -> dict[str, Any]:
             "target_pass": projected_main <= TARGET_MAIN_SECONDS,
         }
 
-    native_comparisons: dict[str, Any] = {}
-    for dtype, (framework_variant, native_variant) in NATIVE_COMPARISONS.items():
-        framework_prefix = weighted[framework_variant]["prefix_replay_seconds_12_layers"]
-        native_prefix = weighted[native_variant]["prefix_replay_seconds_12_layers"]
-        native_advantage_pct = (
-            (framework_prefix - native_prefix) / framework_prefix * 100.0
-        )
-        timing_pass = native_advantage_pct >= NATIVE_PREFIX_MIN_ADVANTAGE_PCT
-        correctness_pair_pass = bool(
-            correctness_pass[framework_variant] and correctness_pass[native_variant]
-        )
-        native_comparisons[dtype] = {
-            "framework_variant": framework_variant,
-            "native_variant": native_variant,
-            "framework_prefix_seconds": framework_prefix,
-            "native_prefix_seconds": native_prefix,
-            "native_advantage_pct": native_advantage_pct,
-            "minimum_advantage_pct": NATIVE_PREFIX_MIN_ADVANTAGE_PCT,
-            "timing_pass": timing_pass,
-            "correctness_pair_pass": correctness_pair_pass,
-            "retained": bool(timing_pass and correctness_pair_pass),
-        }
-
     baseline_valid = correctness_pass["fp32_accepted"]
+    shared = weighted["fp32_shared_specialized"]
+    fp32_replay_regression_pct = (
+        (shared["full_model_replay_seconds"] - baseline["full_model_replay_seconds"])
+        / baseline["full_model_replay_seconds"]
+        * 100.0
+    )
+    fp32_exact = all(
+        value == 0.0
+        for entry in variants["fp32_shared_specialized"].values()
+        for value in entry["drift"].values()
+    )
+    fp32_parity_pass = bool(
+        baseline_valid
+        and correctness_pass["fp32_shared_specialized"]
+        and fp32_exact
+        and fp32_replay_regression_pct <= FP32_PARITY_MAX_REGRESSION_PCT
+    )
+    fp32_parity = {
+        "exact_drift_pass": fp32_exact,
+        "correctness_pass": correctness_pass["fp32_shared_specialized"],
+        "replay_regression_pct": fp32_replay_regression_pct,
+        "maximum_regression_pct": FP32_PARITY_MAX_REGRESSION_PCT,
+        "pass": fp32_parity_pass,
+    }
+
+    framework_variant = "fp16_framework_self_bmm_cross"
+    native_variant = "fp16_native_self_bmm_cross"
+    framework_prefix = weighted[framework_variant]["prefix_replay_seconds_12_layers"]
+    native_prefix = weighted[native_variant]["prefix_replay_seconds_12_layers"]
+    native_advantage_pct = (
+        (framework_prefix - native_prefix) / framework_prefix * 100.0
+    )
+    native_timing_pass = native_advantage_pct >= NATIVE_PREFIX_MIN_ADVANTAGE_PCT
+    native_correctness_pair_pass = bool(
+        correctness_pass[framework_variant] and correctness_pass[native_variant]
+    )
+    native_comparison = {
+        "framework_variant": framework_variant,
+        "native_variant": native_variant,
+        "framework_prefix_seconds": framework_prefix,
+        "native_prefix_seconds": native_prefix,
+        "native_advantage_pct": native_advantage_pct,
+        "minimum_advantage_pct": NATIVE_PREFIX_MIN_ADVANTAGE_PCT,
+        "timing_pass": native_timing_pass,
+        "correctness_pair_pass": native_correctness_pair_pass,
+        "retained": bool(native_timing_pass and native_correctness_pair_pass),
+    }
+
     decisions = {
-        "fp32_native_prefix": {
-            "correctness_pass": correctness_pass["fp32_native_prefix"],
-            "target_pass": projections["fp32_native_prefix"]["target_pass"],
-            "native_retention_required": True,
-            "native_retention_pass": native_comparisons["fp32"]["retained"],
-        },
-        "fp16_framework": {
-            "correctness_pass": correctness_pass["fp16_framework"],
-            "target_pass": projections["fp16_framework"]["target_pass"],
+        framework_variant: {
+            "correctness_pass": correctness_pass[framework_variant],
+            "target_pass": projections[framework_variant]["target_pass"],
             "native_retention_required": False,
         },
-        "fp16_native_prefix": {
-            "correctness_pass": correctness_pass["fp16_native_prefix"],
-            "target_pass": projections["fp16_native_prefix"]["target_pass"],
+        native_variant: {
+            "correctness_pass": correctness_pass[native_variant],
+            "target_pass": projections[native_variant]["target_pass"],
             "native_retention_required": True,
-            "native_retention_pass": native_comparisons["fp16"]["retained"],
+            "native_retention_pass": native_comparison["retained"],
         },
     }
     for variant, decision in decisions.items():
         decision["sizing_pass"] = bool(
-            baseline_valid
+            fp32_parity_pass
             and decision["correctness_pass"]
             and decision["target_pass"]
             and (
@@ -385,7 +399,9 @@ def summarize(payload: Any) -> dict[str, Any]:
 
     sizing_pass = any(decision["sizing_pass"] for decision in decisions.values())
     promotion_pass = any(decision["promotion_pass"] for decision in decisions.values())
-    if promotion_pass:
+    if not fp32_parity_pass:
+        disposition = "STOP_FP32_PARITY"
+    elif promotion_pass:
         disposition = "PROMOTE_TO_FIXED_WORK_LOOP"
     elif evidence_mode == "sentinel_only" and sizing_pass:
         disposition = "COLLECT_ALL_PRODUCTION_BUCKETS"
@@ -405,6 +421,7 @@ def summarize(payload: Any) -> dict[str, Any]:
             "target_main_seconds": TARGET_MAIN_SECONDS,
             "decoder_layers": DECODER_LAYERS,
             "native_prefix_min_advantage_pct": NATIVE_PREFIX_MIN_ADVANTAGE_PCT,
+            "fp32_parity_max_regression_pct": FP32_PARITY_MAX_REGRESSION_PCT,
         },
         "evidence": {
             "mode": evidence_mode,
@@ -427,7 +444,8 @@ def summarize(payload: Any) -> dict[str, Any]:
         },
         "weighted": weighted,
         "projections": projections,
-        "native_prefix_comparisons": native_comparisons,
+        "fp32_parity": fp32_parity,
+        "native_prefix_comparison": native_comparison,
         "candidate_decisions": decisions,
         "sizing_pass": sizing_pass,
         "promotion_pass": promotion_pass,

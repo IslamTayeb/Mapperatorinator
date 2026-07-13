@@ -45,10 +45,9 @@ SENTINEL_BUCKETS = (128, 576, 640)
 ALL_BUCKETS = tuple(BUCKET_COUNTS)
 VARIANTS = (
     "fp32_accepted",
-    "fp32_framework",
-    "fp32_native_prefix",
-    "fp16_framework",
-    "fp16_native_prefix",
+    "fp32_shared_specialized",
+    "fp16_framework_self_bmm_cross",
+    "fp16_native_self_bmm_cross",
 )
 REQUIRED_CHECKS = (
     "finite_outputs",
@@ -99,6 +98,7 @@ class PrefixObservation:
 
 
 DRIFT_LIMIT = 1e-3
+FP32_PARITY_MAX_REGRESSION_PCT = 1.0
 
 
 def _load_args(config_name: str, overrides: list[str]):
@@ -313,12 +313,12 @@ def _full_model_variant_context(
     *,
     model: torch.nn.Module,
     prefix: int,
-    variant: str,
+    dtype: torch.dtype,
+    native_self: bool,
 ) -> Iterator[None]:
     from osuT5.osuT5.inference.optimized.scout.native_prefix import (
         fp32_rms_norm,
-        framework_prefix,
-        native_prefix,
+        specialized_prefix_attention_context,
     )
     from osuT5.osuT5.inference.optimized.single.runtime_context import (
         active_prefix_self_attention_context,
@@ -327,49 +327,16 @@ def _full_model_variant_context(
         VarWhisperDecoderLayer,
     )
 
-    if variant not in {"framework", "native"}:
-        raise ValueError("full-model scout variant must be framework or native")
-    candidate = native_prefix if variant == "native" else framework_prefix
-    originals: list[tuple[torch.nn.Module, Any]] = []
+    if dtype not in {torch.float32, torch.float16}:
+        raise TypeError("shared-specialized scout requires float32 or float16")
+    decoder_layers = [
+        module for module in model.modules() if isinstance(module, VarWhisperDecoderLayer)
+    ]
+    if not decoder_layers:
+        raise RuntimeError("shared-specialized scout found no decoder layers")
+    layer_forward_ids = {id(layer): id(layer.forward.__func__) for layer in decoder_layers}
+    norm_originals: list[tuple[torch.nn.Module, Any]] = []
     final_originals: list[tuple[torch.nn.Module, Any]] = []
-
-    def replacement(layer):
-        def forward(
-            self,
-            hidden_states,
-            attention_mask=None,
-            encoder_hidden_states=None,
-            past_key_value=None,
-            cache_position=None,
-            position_ids=None,
-            **kwargs,
-        ):
-            del kwargs
-            if encoder_hidden_states is None or past_key_value is None:
-                raise RuntimeError("native-prefix scout requires cross attention and cache")
-            if cache_position is None or position_ids is None:
-                raise RuntimeError("native-prefix scout requires cache/position tensors")
-            return (
-                candidate(
-                    self,
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    encoder_hidden_states=encoder_hidden_states,
-                    past_key_value=past_key_value,
-                    cache_position=cache_position,
-                    position_ids=position_ids,
-                    active_prefix_length=prefix,
-                ),
-            )
-
-        return MethodType(forward, layer)
-
-    for module in model.modules():
-        if isinstance(module, VarWhisperDecoderLayer):
-            originals.append((module, module.forward))
-            module.forward = replacement(module)
-    if not originals:
-        raise RuntimeError("native-prefix scout found no decoder layers to patch")
     backbone = getattr(model, "transformer", model)
     decoder = getattr(getattr(backbone, "model", None), "decoder", None)
     decoder_norm = getattr(decoder, "layer_norm", None)
@@ -379,9 +346,18 @@ def _full_model_variant_context(
         torch.nn.Module,
     ):
         raise RuntimeError("native-prefix scout could not locate final norm/projection")
-    final_originals.extend(
-        ((decoder_norm, decoder_norm.forward), (projection, projection.forward))
-    )
+    if dtype == torch.float16:
+        norms = [decoder_norm]
+        for layer in decoder_layers:
+            norms.extend(
+                (
+                    layer.self_attn_layer_norm,
+                    layer.cross_attn_layer_norm,
+                    layer.final_layer_norm,
+                )
+            )
+        norm_originals.extend((norm, norm.forward) for norm in norms)
+        final_originals.append((projection, projection.forward))
 
     def final_norm_forward(self, hidden_states):
         return fp32_rms_norm(hidden_states, self.weight, getattr(self, "eps", None))
@@ -394,16 +370,26 @@ def _full_model_variant_context(
             None if bias is None else bias.float(),
         )
 
-    decoder_norm.forward = MethodType(final_norm_forward, decoder_norm)
-    projection.forward = MethodType(projection_forward, projection)
+    for norm, _ in norm_originals:
+        norm.forward = MethodType(final_norm_forward, norm)
+    if final_originals:
+        projection.forward = MethodType(projection_forward, projection)
     try:
-        with active_prefix_self_attention_context(prefix):
+        with (
+            specialized_prefix_attention_context(
+                dtype=dtype,
+                native_self=native_self,
+            ),
+            active_prefix_self_attention_context(prefix),
+        ):
             yield
     finally:
-        for module, original in originals:
+        for module, original in norm_originals:
             module.forward = original
         for module, original in final_originals:
             module.forward = original
+        if any(id(layer.forward.__func__) != layer_forward_ids[id(layer)] for layer in decoder_layers):
+            raise RuntimeError("shared-specialized scout changed decoder-layer forward ownership")
 
 
 def _capture_cuda_graph(
@@ -827,8 +813,9 @@ def _prefix_callable(capture: LayerCapture, *, variant: str) -> Callable[[], tor
 
     functions = {
         "accepted": accepted_fp32_prefix,
-        "framework": framework_prefix,
-        "native": native_prefix,
+        "shared_specialized": accepted_fp32_prefix,
+        "framework_self_bmm_cross": framework_prefix,
+        "native_self_bmm_cross": native_prefix,
     }
     try:
         fn = functions[variant]
@@ -853,7 +840,7 @@ def _prefix_callable(capture: LayerCapture, *, variant: str) -> Callable[[], tor
 def _prefix_graphs(
     capture: LayerCapture,
     *,
-    include_accepted: bool,
+    names: tuple[str, ...],
     warmup: int,
 ) -> tuple[dict[str, CapturedGraph], dict[str, Any]]:
     from osuT5.osuT5.inference.optimized.scout.verifier import (
@@ -861,10 +848,8 @@ def _prefix_graphs(
     )
 
     cache = capture.past_key_value
-    names = ("accepted", "framework", "native") if include_accepted else (
-        "framework",
-        "native",
-    )
+    if not names or len(set(names)) != len(names):
+        raise ValueError("prefix graph names must be unique and non-empty")
     graphs: dict[str, CapturedGraph] = {}
     verifiers: dict[str, Any] = {}
     for name in names:
@@ -1003,6 +988,61 @@ def _bucket_entry(
     }
 
 
+def _fp32_parity_gate(variants: dict[str, Any]) -> dict[str, Any]:
+    accepted = variants["fp32_accepted"]["buckets"]
+    shared = variants["fp32_shared_specialized"]["buckets"]
+    if set(accepted) != set(shared) or not accepted:
+        raise RuntimeError("FP32 parity variants must cover identical non-empty buckets")
+    accepted_ms = 0.0
+    shared_ms = 0.0
+    failures: list[str] = []
+    for bucket in sorted(accepted, key=int):
+        accepted_entry = accepted[bucket]
+        shared_entry = shared[bucket]
+        count = int(shared_entry["details"]["decode_replays"])
+        accepted_ms += count * float(accepted_entry["full_model_replay_ms_per_call"])
+        shared_ms += count * float(shared_entry["full_model_replay_ms_per_call"])
+        failed_checks = [
+            name for name, passed in shared_entry["checks"].items() if not passed
+        ]
+        if failed_checks:
+            failures.append(f"bucket {bucket} checks={failed_checks}")
+        nonzero_drift = {
+            name: value
+            for name, value in shared_entry["drift"].items()
+            if float(value) != 0.0
+        }
+        if nonzero_drift:
+            failures.append(f"bucket {bucket} drift={nonzero_drift}")
+        dispatch = shared_entry["details"].get("dispatch")
+        required_dispatch = {
+            "original_decoder_layer": True,
+            "q1_bmm_cross_attention": True,
+            "native_q1_self_attention": True,
+            "native_q1_rope_cache_self_attention": True,
+            "kernel_source": "recaptured_production_dispatch",
+        }
+        if dispatch != required_dispatch:
+            failures.append(f"bucket {bucket} dispatch={dispatch!r}")
+    regression_pct = (shared_ms - accepted_ms) / accepted_ms * 100.0
+    if regression_pct > FP32_PARITY_MAX_REGRESSION_PCT:
+        failures.append(
+            f"weighted replay regression {regression_pct:.6f}% exceeds "
+            f"{FP32_PARITY_MAX_REGRESSION_PCT:.6f}%"
+        )
+    report = {
+        "accepted_weighted_ms": accepted_ms,
+        "shared_weighted_ms": shared_ms,
+        "replay_regression_pct": regression_pct,
+        "maximum_regression_pct": FP32_PARITY_MAX_REGRESSION_PCT,
+        "failures": failures,
+        "pass": not failures,
+    }
+    if failures:
+        raise RuntimeError(f"FP32_PARITY_FAILED: {report}")
+    return report
+
+
 @torch.no_grad()
 def profile_native_prefix_dtype_scout(
     args,
@@ -1039,7 +1079,9 @@ def profile_native_prefix_dtype_scout(
     torch.cuda.synchronize()
     extension_preload_seconds = time.perf_counter() - extension_started
 
-    # FP32 accepted/framework/native graphs are timed together before dtype conversion.
+    # FP32 cached-accepted and recaptured shared-specialized graphs are timed
+    # together before dtype conversion. The recapture keeps the original
+    # decoder layer and installs the same specialized dispatch explicitly.
     for prefix, accepted in selected.items():
         inputs = static_inputs[prefix]
         cache = _cache_from_static_inputs(inputs)
@@ -1049,18 +1091,13 @@ def profile_native_prefix_dtype_scout(
         snapshots = _all_cache_snapshots(cache, cache_position)
         capture = _capture_representative_layer(model, inputs, prefix=prefix)
         _restore_all_cache(cache, snapshots)
-        framework = _capture_cuda_graph(
+        shared_specialized = _capture_cuda_graph(
             lambda inputs=inputs: model(**inputs, return_dict=True),
             context=lambda prefix=prefix: _full_model_variant_context(
-                model=model, prefix=prefix, variant="framework"
-            ),
-            warmup=0,
-        )
-        _restore_all_cache(cache, snapshots)
-        native = _capture_cuda_graph(
-            lambda inputs=inputs: model(**inputs, return_dict=True),
-            context=lambda prefix=prefix: _full_model_variant_context(
-                model=model, prefix=prefix, variant="native"
+                model=model,
+                prefix=prefix,
+                dtype=torch.float32,
+                native_self=True,
             ),
             warmup=0,
         )
@@ -1072,8 +1109,7 @@ def profile_native_prefix_dtype_scout(
         )
         full_graphs = {
             "fp32_accepted": accepted_graph,
-            "fp32_framework": framework,
-            "fp32_native_prefix": native,
+            "fp32_shared_specialized": shared_specialized,
         }
         full_checks: dict[str, dict[str, bool]] = {}
         full_details: dict[str, Any] = {}
@@ -1089,7 +1125,7 @@ def profile_native_prefix_dtype_scout(
         )
         prefix_graphs, prefix_verifiers = _prefix_graphs(
             capture,
-            include_accepted=True,
+            names=("accepted", "shared_specialized"),
             warmup=warmup,
         )
         prefix_snapshot = _all_cache_snapshots(cache, cache_position)
@@ -1113,23 +1149,15 @@ def profile_native_prefix_dtype_scout(
         )
         prefix_by_variant = {
             "fp32_accepted": prefix_medians["accepted"],
-            "fp32_framework": prefix_medians["framework"],
-            "fp32_native_prefix": prefix_medians["native"],
+            "fp32_shared_specialized": prefix_medians["shared_specialized"],
         }
         verifier_by_variant = {
             "fp32_accepted": prefix_verifiers["accepted"],
-            "fp32_framework": prefix_verifiers["framework"],
-            "fp32_native_prefix": prefix_verifiers["native"],
+            "fp32_shared_specialized": prefix_verifiers["shared_specialized"],
         }
         for name, graph in full_graphs.items():
             checks = dict(full_checks[name])
-            prefix_name = (
-                "accepted"
-                if name == "fp32_accepted"
-                else "native"
-                if name.endswith("native_prefix")
-                else "framework"
-            )
+            prefix_name = "accepted" if name == "fp32_accepted" else "shared_specialized"
             drift_checks, drift = _observation_drift(
                 full_observations["fp32_accepted"],
                 full_observations[name],
@@ -1149,6 +1177,17 @@ def profile_native_prefix_dtype_scout(
                 drift=drift,
                 details={
                     "dtype": "torch.float32",
+                    "dispatch": {
+                        "original_decoder_layer": True,
+                        "q1_bmm_cross_attention": True,
+                        "native_q1_self_attention": True,
+                        "native_q1_rope_cache_self_attention": True,
+                        "kernel_source": (
+                            "accepted_cached_graph"
+                            if name == "fp32_accepted"
+                            else "recaptured_production_dispatch"
+                        ),
+                    },
                     "decode_replays": int(accepted["decode_replays"]),
                     "cache_position": int(cache_position.item()),
                     "full_graph": full_details[name],
@@ -1166,6 +1205,10 @@ def profile_native_prefix_dtype_scout(
             "static_inputs": _static_input_metadata(inputs),
         }
 
+    # Hard gate: do not convert storage or measure FP16 unless the recaptured
+    # shared policy is exact and restores accepted FP32 performance.
+    fp32_parity = _fp32_parity_gate(variants)
+
     # Accepted graphs have been fully measured; release them before changing dtype.
     # CUDA graphs retain private pools and static tensor references. Release all
     # FP32 graph/snapshot containers before converting model/cache storage.
@@ -1176,8 +1219,7 @@ def profile_native_prefix_dtype_scout(
         accepted,
         accepted_graph,
         full_graphs,
-        framework,
-        native,
+        shared_specialized,
         prefix_graphs,
         prefix_snapshot,
         snapshots,
@@ -1197,24 +1239,30 @@ def profile_native_prefix_dtype_scout(
         snapshots = _all_cache_snapshots(cache, cache_position)
         capture = _capture_representative_layer(model, inputs, prefix=prefix)
         _restore_all_cache(cache, snapshots)
-        framework = _capture_cuda_graph(
+        framework_self = _capture_cuda_graph(
             lambda inputs=inputs: model(**inputs, return_dict=True),
             context=lambda prefix=prefix: _full_model_variant_context(
-                model=model, prefix=prefix, variant="framework"
+                model=model,
+                prefix=prefix,
+                dtype=torch.float16,
+                native_self=False,
             ),
             warmup=0,
         )
         _restore_all_cache(cache, snapshots)
-        native = _capture_cuda_graph(
+        native_self = _capture_cuda_graph(
             lambda inputs=inputs: model(**inputs, return_dict=True),
             context=lambda prefix=prefix: _full_model_variant_context(
-                model=model, prefix=prefix, variant="native"
+                model=model,
+                prefix=prefix,
+                dtype=torch.float16,
+                native_self=True,
             ),
             warmup=0,
         )
         full_graphs = {
-            "fp16_framework": framework,
-            "fp16_native_prefix": native,
+            "fp16_framework_self_bmm_cross": framework_self,
+            "fp16_native_self_bmm_cross": native_self,
         }
         full_checks: dict[str, dict[str, bool]] = {}
         full_details: dict[str, Any] = {}
@@ -1230,7 +1278,7 @@ def profile_native_prefix_dtype_scout(
         )
         prefix_graphs, prefix_verifiers = _prefix_graphs(
             capture,
-            include_accepted=False,
+            names=("framework_self_bmm_cross", "native_self_bmm_cross"),
             warmup=warmup,
         )
         prefix_snapshot = _all_cache_snapshots(cache, cache_position)
@@ -1250,7 +1298,11 @@ def profile_native_prefix_dtype_scout(
         }
         reference_full, reference_prefix = fp32_references[prefix]
         for name, graph in full_graphs.items():
-            prefix_name = "native" if name.endswith("native_prefix") else "framework"
+            prefix_name = (
+                "native_self_bmm_cross"
+                if name == "fp16_native_self_bmm_cross"
+                else "framework_self_bmm_cross"
+            )
             checks = dict(full_checks[name])
             drift_checks, drift = _observation_drift(
                 reference_full,
@@ -1271,6 +1323,19 @@ def profile_native_prefix_dtype_scout(
                 drift=drift,
                 details={
                     "dtype": "torch.float16",
+                    "dispatch": {
+                        "original_decoder_layer": True,
+                        "q1_bmm_cross_attention": True,
+                        "q1_bmm_fp32_accumulation": True,
+                        "native_q1_self_attention": (
+                            name == "fp16_native_self_bmm_cross"
+                        ),
+                        "native_q1_rope_cache_self_attention": (
+                            name == "fp16_native_self_bmm_cross"
+                        ),
+                        "fp32_rmsnorm_reductions": True,
+                        "fp32_logits_projection": True,
+                    },
                     "decode_replays": BUCKET_COUNTS[prefix],
                     "cache_position": int(cache_position.item()),
                     "logits_cast_outside_graph": "torch.float32",
@@ -1290,6 +1355,7 @@ def profile_native_prefix_dtype_scout(
         "variants": variants,
         "metadata": {
             "result_class": "documented-drift-component-scout",
+            "shared_framework": "original-decoder-layer-dtype-aware-specialized-dispatch",
             "source_engine": "optimized",
             "source_precision": "fp32",
             "source_attn_implementation": "sdpa",
@@ -1301,6 +1367,7 @@ def profile_native_prefix_dtype_scout(
             "full_salvalai_runs": 1,
             "full_model_metric": "full one-token model CUDA graph replay",
             "extension_preload_seconds": extension_preload_seconds,
+            "fp32_parity": fp32_parity,
             "result_path": run["result_path"],
             "torch_version": torch.__version__,
             "cuda_device": torch.cuda.get_device_name(),

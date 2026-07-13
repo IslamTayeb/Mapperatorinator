@@ -1501,6 +1501,10 @@ class Processor(object):
             "use_server": isinstance(self.model, InferenceClient),
             "parallel": self.parallel,
         }
+        if stats.get("decoder_loop_backend") is not None:
+            record["decoder_loop_backend"] = stats["decoder_loop_backend"]
+        if stats.get("torch_compile_enabled") is not None:
+            record["torch_compile_enabled"] = stats["torch_compile_enabled"]
         record.update(metadata)
         self.profiler.record_generation(**record)
 

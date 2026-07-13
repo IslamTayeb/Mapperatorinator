@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import inspect
 import unittest
 
 import torch
@@ -8,6 +9,8 @@ from utils.profile_native_prefix_dtype_scout import (
     BUCKET_COUNTS,
     REQUIRED_CHECKS,
     _bucket_entry,
+    _fp32_parity_gate,
+    _full_model_variant_context,
     _load_args,
     convert_static_inputs_dtype,
     select_buckets,
@@ -43,6 +46,12 @@ def _cache(dtype):
 
 
 class ProfileNativePrefixDtypeScoutTest(unittest.TestCase):
+    def test_shared_specialized_context_does_not_replace_decoder_forward(self):
+        source = inspect.getsource(_full_model_variant_context)
+
+        self.assertNotIn("layer.forward =", source)
+        self.assertIn("specialized_prefix_attention_context", source)
+
     def test_load_args_registers_structured_train_and_diffusion_configs(self):
         args = _load_args(
             "profile_salvalai",
@@ -135,6 +144,54 @@ class ProfileNativePrefixDtypeScoutTest(unittest.TestCase):
                 },
                 details={},
             )
+
+    def test_fp32_parity_gate_requires_exact_dispatch_and_one_percent(self):
+        def entry(ms, *, drift=0.0, kernel_source):
+            return {
+                "full_model_replay_ms_per_call": ms,
+                "checks": {name: True for name in REQUIRED_CHECKS},
+                "drift": {
+                    "layer_output_max_abs": drift,
+                    "cache_key_slot_max_abs": 0.0,
+                    "cache_value_slot_max_abs": 0.0,
+                    "logits_max_abs": 0.0,
+                },
+                "details": {
+                    "decode_replays": 100,
+                    "dispatch": {
+                        "original_decoder_layer": True,
+                        "q1_bmm_cross_attention": True,
+                        "native_q1_self_attention": True,
+                        "native_q1_rope_cache_self_attention": True,
+                        "kernel_source": kernel_source,
+                    },
+                },
+            }
+
+        variants = {
+            "fp32_accepted": {
+                "buckets": {
+                    "128": entry(1.0, kernel_source="accepted_cached_graph"),
+                }
+            },
+            "fp32_shared_specialized": {
+                "buckets": {
+                    "128": entry(
+                        1.01,
+                        kernel_source="recaptured_production_dispatch",
+                    ),
+                }
+            },
+        }
+        report = _fp32_parity_gate(variants)
+        self.assertTrue(report["pass"])
+        self.assertAlmostEqual(report["replay_regression_pct"], 1.0)
+
+        variants["fp32_shared_specialized"]["buckets"]["128"]["drift"][
+            "layer_output_max_abs"
+        ] = 1e-7
+        with self.assertRaisesRegex(RuntimeError, "FP32_PARITY_FAILED"):
+            _fp32_parity_gate(variants)
 
 
 if __name__ == "__main__":

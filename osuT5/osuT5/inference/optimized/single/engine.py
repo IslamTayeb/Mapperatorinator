@@ -36,7 +36,8 @@ def _optimized_config_metadata() -> dict[str, Any]:
         "result_class": OPTIMIZED_RESULT_CLASS,
         "precision": OPTIMIZED_PRECISION,
         "attn_implementation": OPTIMIZED_ATTN_IMPLEMENTATION,
-        "generation_compile": True,
+        "decoder_loop_backend": "active_prefix_cuda_graph",
+        "torch_compile_enabled": False,
         "batch_size": 1,
         "cfg_scale": 1.0,
         "num_beams": 1,
@@ -208,7 +209,8 @@ def _generate_window(
     stats.update({
         "precision": precision,
         "context_type": context_type.value if context_type is not None else None,
-        "generation_compile_enabled": True,
+        "decoder_loop_backend": "active_prefix_cuda_graph",
+        "torch_compile_enabled": False,
         "optimized_effective_config_version": OPTIMIZED_CONFIG_VERSION,
     })
     return result, stats
@@ -280,8 +282,8 @@ def load_optimized_single_engine(
         )
     ):
         raise RuntimeError(
-            "optimized single loader requested generation compile, but the raw "
-            "model reports compilation disabled."
+            "optimized single loader requested the custom generation path, but "
+            "the raw model reports it disabled."
         )
     return (
         InferenceEngineBinding(

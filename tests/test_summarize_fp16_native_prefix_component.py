@@ -35,12 +35,10 @@ def _payload(
     framework_ms: float = 0.6,
     native_ms: float = 0.55,
     baseline_capture_s: float = 0.0,
-    fp32_framework_capture_s: float = 0.005,
-    fp32_native_capture_s: float = 0.005,
+    fp32_shared_capture_s: float = 0.0,
     framework_capture_s: float = 0.01,
     native_capture_s: float = 0.01,
-    fp32_framework_prefix_ms: float = 0.11,
-    fp32_native_prefix_ms: float = 0.10,
+    fp32_shared_prefix_ms: float = 0.12,
     framework_prefix_ms: float = 0.09,
     native_prefix_ms: float = 0.08,
 ) -> dict:
@@ -57,27 +55,17 @@ def _payload(
                     for bucket in buckets
                 }
             },
-            "fp32_framework": {
+            "fp32_shared_specialized": {
                 "buckets": {
                     str(bucket): _entry(
-                        replay_ms=0.95,
-                        capture_s=fp32_framework_capture_s,
-                        prefix_ms=fp32_framework_prefix_ms,
+                        replay_ms=baseline_ms,
+                        capture_s=fp32_shared_capture_s,
+                        prefix_ms=fp32_shared_prefix_ms,
                     )
                     for bucket in buckets
                 }
             },
-            "fp32_native_prefix": {
-                "buckets": {
-                    str(bucket): _entry(
-                        replay_ms=0.9,
-                        capture_s=fp32_native_capture_s,
-                        prefix_ms=fp32_native_prefix_ms,
-                    )
-                    for bucket in buckets
-                }
-            },
-            "fp16_framework": {
+            "fp16_framework_self_bmm_cross": {
                 "buckets": {
                     str(bucket): _entry(
                         replay_ms=framework_ms,
@@ -87,7 +75,7 @@ def _payload(
                     for bucket in buckets
                 }
             },
-            "fp16_native_prefix": {
+            "fp16_native_self_bmm_cross": {
                 "buckets": {
                     str(bucket): _entry(
                         replay_ms=native_ms,
@@ -107,18 +95,15 @@ def test_all_bucket_projection_promotes_both_passing_candidates():
     assert report["evidence"]["mode"] == "all_production_buckets"
     assert report["evidence"]["measured_replays"] == 7_597
     assert report["evidence"]["coverage_fraction"] == 1.0
-    assert report["native_prefix_comparisons"]["fp16"]["native_advantage_pct"] == pytest.approx(
+    assert report["fp32_parity"]["pass"]
+    assert report["native_prefix_comparison"]["native_advantage_pct"] == pytest.approx(
         (0.09 - 0.08) / 0.09 * 100
     )
-    assert report["native_prefix_comparisons"]["fp32"]["native_advantage_pct"] == pytest.approx(
-        100 / 11
-    )
-    assert report["native_prefix_comparisons"]["fp32"]["retained"]
-    assert report["projections"]["fp16_framework"]["projected_main_seconds"] == pytest.approx(
+    assert report["projections"]["fp16_framework_self_bmm_cross"]["projected_main_seconds"] == pytest.approx(
         28.243 + 7_597 * (0.6 - 1.0) / 1_000 + 0.12
     )
-    assert report["candidate_decisions"]["fp16_framework"]["promotion_pass"]
-    assert report["candidate_decisions"]["fp16_native_prefix"]["promotion_pass"]
+    assert report["candidate_decisions"]["fp16_framework_self_bmm_cross"]["promotion_pass"]
+    assert report["candidate_decisions"]["fp16_native_self_bmm_cross"]["promotion_pass"]
     assert report["promotion_pass"]
     assert report["disposition"] == "PROMOTE_TO_FIXED_WORK_LOOP"
 
@@ -140,7 +125,7 @@ def test_sentinel_evidence_sizes_but_never_promotes():
     assert not report["evidence"]["promotion_coverage_pass"]
     assert report["sizing_pass"]
     assert not report["promotion_pass"]
-    assert not report["candidate_decisions"]["fp16_framework"]["promotion_pass"]
+    assert not report["candidate_decisions"]["fp16_framework_self_bmm_cross"]["promotion_pass"]
     assert report["disposition"] == "COLLECT_ALL_PRODUCTION_BUCKETS"
 
 
@@ -153,7 +138,7 @@ def test_arbitrary_partial_bucket_coverage_fails_loudly():
 
 def test_variant_bucket_mismatch_fails_loudly():
     payload = _payload(SENTINEL_BUCKETS)
-    del payload["variants"]["fp16_native_prefix"]["buckets"]["640"]
+    del payload["variants"]["fp16_native_self_bmm_cross"]["buckets"]["640"]
 
     with pytest.raises(ValueError, match="identical buckets"):
         summarize(payload)
@@ -170,11 +155,11 @@ def test_capture_setup_regression_is_charged_separately_and_can_stop():
         )
     )
 
-    assert report["projections"]["fp16_framework"]["capture_setup_delta_seconds"] == pytest.approx(
+    assert report["projections"]["fp16_framework_self_bmm_cross"]["capture_setup_delta_seconds"] == pytest.approx(
         1.8
     )
-    assert report["projections"]["fp16_framework"]["target_pass"] is False
-    assert report["projections"]["fp16_native_prefix"]["capture_setup_delta_seconds"] == pytest.approx(
+    assert report["projections"]["fp16_framework_self_bmm_cross"]["target_pass"] is False
+    assert report["projections"]["fp16_native_self_bmm_cross"]["capture_setup_delta_seconds"] == pytest.approx(
         3.6
     )
     assert report["sizing_pass"] is False
@@ -189,49 +174,42 @@ def test_native_below_five_percent_is_rejected_without_blocking_framework():
         )
     )
 
-    assert report["native_prefix_comparisons"]["fp16"]["native_advantage_pct"] == pytest.approx(
+    assert report["native_prefix_comparison"]["native_advantage_pct"] == pytest.approx(
         4.0
     )
-    assert report["native_prefix_comparisons"]["fp16"]["retained"] is False
-    assert report["candidate_decisions"]["fp16_native_prefix"]["promotion_pass"] is False
-    assert report["candidate_decisions"]["fp16_framework"]["promotion_pass"] is True
+    assert report["native_prefix_comparison"]["retained"] is False
+    assert report["candidate_decisions"]["fp16_native_self_bmm_cross"]["promotion_pass"] is False
+    assert report["candidate_decisions"]["fp16_framework_self_bmm_cross"]["promotion_pass"] is True
     assert report["promotion_pass"]
 
 
 def test_framework_correctness_failure_blocks_it_and_native_comparison():
     payload = _payload(ALL_BUCKETS)
-    payload["variants"]["fp16_framework"]["buckets"]["576"]["checks"][
+    payload["variants"]["fp16_framework_self_bmm_cross"]["buckets"]["576"]["checks"][
         "future_slots_untouched"
     ] = False
     report = summarize(payload)
 
-    assert report["correctness"]["variants"]["fp16_framework"]["failures"] == {
+    assert report["correctness"]["variants"]["fp16_framework_self_bmm_cross"]["failures"] == {
         "576": ["future_slots_untouched"]
     }
-    assert report["candidate_decisions"]["fp16_framework"]["promotion_pass"] is False
-    assert report["native_prefix_comparisons"]["fp16"]["correctness_pair_pass"] is False
-    assert report["candidate_decisions"]["fp16_native_prefix"]["promotion_pass"] is False
+    assert report["candidate_decisions"]["fp16_framework_self_bmm_cross"]["promotion_pass"] is False
+    assert report["native_prefix_comparison"]["correctness_pair_pass"] is False
+    assert report["candidate_decisions"]["fp16_native_self_bmm_cross"]["promotion_pass"] is False
 
 
-def test_fp32_native_retention_is_a_promotion_candidate():
-    report = summarize(
-        _payload(
-            ALL_BUCKETS,
-            fp32_native_prefix_ms=0.108,
-        )
-    )
+def test_fp32_shared_regression_above_one_percent_stops_before_fp16():
+    report = summarize(_payload(ALL_BUCKETS, baseline_ms=1.0))
+    assert report["fp32_parity"]["pass"]
 
-    assert report["native_prefix_comparisons"]["fp32"]["native_advantage_pct"] == pytest.approx(
-        (0.11 - 0.108) / 0.11 * 100
-    )
-    assert report["native_prefix_comparisons"]["fp32"]["retained"] is False
-    assert set(report["candidate_decisions"]) == {
-        "fp32_native_prefix",
-        "fp16_framework",
-        "fp16_native_prefix",
-    }
-    assert report["candidate_decisions"]["fp32_native_prefix"]["promotion_pass"] is False
-    assert report["promotion_pass"] is True
+    payload = _payload(ALL_BUCKETS, baseline_ms=1.0)
+    for entry in payload["variants"]["fp32_shared_specialized"]["buckets"].values():
+        entry["full_model_replay_ms_per_call"] = 1.011
+    report = summarize(payload)
+
+    assert report["fp32_parity"]["replay_regression_pct"] == pytest.approx(1.1)
+    assert not report["fp32_parity"]["pass"]
+    assert report["disposition"] == "STOP_FP32_PARITY"
 
 
 def test_baseline_correctness_failure_invalidates_every_candidate():
@@ -246,16 +224,16 @@ def test_baseline_correctness_failure_invalidates_every_candidate():
     assert report["promotion_pass"] is False
 
 
-def test_numeric_drift_is_reported_but_does_not_block_documented_drift():
+def test_fp32_shared_drift_blocks_exact_parity():
     payload = _payload(ALL_BUCKETS)
-    payload["variants"]["fp32_native_prefix"]["buckets"]["640"]["drift"][
+    payload["variants"]["fp32_shared_specialized"]["buckets"]["640"]["drift"][
         "cache_key_slot_max_abs"
     ] = 0.00101
 
     report = summarize(payload)
 
-    assert report["correctness"]["variants"]["fp32_native_prefix"]["failures"] == {}
-    assert report["candidate_decisions"]["fp32_native_prefix"]["correctness_pass"]
+    assert not report["fp32_parity"]["exact_drift_pass"]
+    assert not report["fp32_parity"]["pass"]
 
 
 @pytest.mark.parametrize(
@@ -268,7 +246,7 @@ def test_numeric_drift_is_reported_but_does_not_block_documented_drift():
 )
 def test_invalid_timing_values_fail_loudly(field, value, match):
     payload = _payload(SENTINEL_BUCKETS)
-    payload["variants"]["fp16_framework"]["buckets"]["128"][field] = value
+    payload["variants"]["fp16_framework_self_bmm_cross"]["buckets"]["128"][field] = value
 
     with pytest.raises(ValueError, match=match):
         summarize(payload)
@@ -276,14 +254,14 @@ def test_invalid_timing_values_fail_loudly(field, value, match):
 
 def test_missing_or_non_boolean_hard_checks_fail_loudly():
     missing = _payload(SENTINEL_BUCKETS)
-    del missing["variants"]["fp16_framework"]["buckets"]["128"]["checks"][
+    del missing["variants"]["fp16_framework_self_bmm_cross"]["buckets"]["128"]["checks"][
         "finite_outputs"
     ]
     with pytest.raises(ValueError, match="missing required checks"):
         summarize(missing)
 
     non_boolean = copy.deepcopy(missing)
-    non_boolean["variants"]["fp16_framework"]["buckets"]["128"]["checks"][
+    non_boolean["variants"]["fp16_framework_self_bmm_cross"]["buckets"]["128"]["checks"][
         "finite_outputs"
     ] = 1
     with pytest.raises(ValueError, match="JSON booleans"):
