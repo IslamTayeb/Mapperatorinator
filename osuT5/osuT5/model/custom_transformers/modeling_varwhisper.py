@@ -32,7 +32,10 @@ from ...runtime_profiling import (
     detail_ranges_enabled,
     profile_range,
 )
-from ...inference.runtime_dispatch import attention_runtime_hooks
+from ...inference.runtime_dispatch import (
+    attention_runtime_hooks,
+    decoder_layer_runtime_hooks,
+)
 from .configuration_varwhisper import VarWhisperConfig
 
 if is_flash_attn_2_available():
@@ -831,6 +834,24 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
             )
         hidden_states = self_attn_outputs[0]
         hidden_states = residual + hidden_states
+
+        optimized_tail_forward = (
+            decoder_layer_runtime_hooks().cross_mlp_tail_forward
+        )
+        if optimized_tail_forward is not None:
+            optimized_outputs = optimized_tail_forward(
+                module=self,
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                past_key_value=past_key_value,
+                self_attn_outputs=self_attn_outputs,
+                output_attentions=bool(output_attentions),
+                cu_seqlens=cu_seqlens,
+                encoder_cu_seqlens=encoder_cu_seqlens,
+                layer_name=layer_name,
+            )
+            if optimized_outputs is not None:
+                return optimized_outputs
 
         # Cross-Attention Block
         cross_attn_outputs = ()

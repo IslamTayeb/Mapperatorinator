@@ -1505,6 +1505,13 @@ class Processor(object):
             record["decoder_loop_backend"] = stats["decoder_loop_backend"]
         if stats.get("torch_compile_enabled") is not None:
             record["torch_compile_enabled"] = stats["torch_compile_enabled"]
+        for key in (
+            "native_cross_mlp_tail_requested",
+            "native_cross_mlp_tail_enabled",
+            "native_cross_mlp_tail_disabled_reason",
+        ):
+            if stats.get(key) is not None:
+                record[key] = stats[key]
         record.update(metadata)
         self.profiler.record_generation(**record)
 

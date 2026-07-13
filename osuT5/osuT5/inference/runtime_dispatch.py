@@ -14,12 +14,23 @@ class AttentionRuntimeHooks:
     q1_rope_cache_self_attention_forward: Callable[..., Any] | None = None
 
 
+@dataclass(frozen=True)
+class DecoderLayerRuntimeHooks:
+    cross_mlp_tail_forward: Callable[..., Any] | None = None
+
+
 _EMPTY_ATTENTION_RUNTIME_HOOKS = AttentionRuntimeHooks()
 _ATTENTION_RUNTIME_HOOKS = _EMPTY_ATTENTION_RUNTIME_HOOKS
+_EMPTY_DECODER_LAYER_RUNTIME_HOOKS = DecoderLayerRuntimeHooks()
+_DECODER_LAYER_RUNTIME_HOOKS = _EMPTY_DECODER_LAYER_RUNTIME_HOOKS
 
 
 def attention_runtime_hooks() -> AttentionRuntimeHooks:
     return _ATTENTION_RUNTIME_HOOKS
+
+
+def decoder_layer_runtime_hooks() -> DecoderLayerRuntimeHooks:
+    return _DECODER_LAYER_RUNTIME_HOOKS
 
 
 @contextmanager
@@ -34,3 +45,17 @@ def attention_runtime_hooks_context(
         yield
     finally:
         _ATTENTION_RUNTIME_HOOKS = previous
+
+
+@contextmanager
+def decoder_layer_runtime_hooks_context(
+    hooks: DecoderLayerRuntimeHooks,
+) -> Iterator[None]:
+    global _DECODER_LAYER_RUNTIME_HOOKS
+
+    previous = _DECODER_LAYER_RUNTIME_HOOKS
+    _DECODER_LAYER_RUNTIME_HOOKS = hooks
+    try:
+        yield
+    finally:
+        _DECODER_LAYER_RUNTIME_HOOKS = previous

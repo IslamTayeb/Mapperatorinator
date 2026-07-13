@@ -9,8 +9,10 @@ from typing import Iterator
 
 from ...runtime_dispatch import (
     AttentionRuntimeHooks,
+    DecoderLayerRuntimeHooks,
     attention_runtime_hooks,
     attention_runtime_hooks_context,
+    decoder_layer_runtime_hooks_context,
 )
 
 
@@ -94,4 +96,23 @@ def attention_runtime_context(
         ),
     )
     with attention_runtime_hooks_context(hooks):
+        yield
+
+
+@contextmanager
+def decoder_layer_runtime_context(
+    *,
+    native_cross_mlp_tail: bool = False,
+) -> Iterator[None]:
+    cross_mlp_tail_forward = None
+    if native_cross_mlp_tail:
+        from ..kernels import decoder_layer
+        from ..kernels.cross_mlp import native_cross_mlp_tail_forward
+
+        decoder_layer.preload_native_decoder_layer()
+        cross_mlp_tail_forward = native_cross_mlp_tail_forward
+    hooks = DecoderLayerRuntimeHooks(
+        cross_mlp_tail_forward=cross_mlp_tail_forward,
+    )
+    with decoder_layer_runtime_hooks_context(hooks):
         yield
