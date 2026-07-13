@@ -175,12 +175,12 @@ def validate_accepted_graph_cache(
         if missing:
             raise RuntimeError(f"accepted prefix {prefix} is missing {missing}")
         by_prefix[prefix] = entry
+    counts = {prefix: int(entry["decode_replays"]) for prefix, entry in by_prefix.items()}
     if tuple(sorted(by_prefix)) != ALL_BUCKETS:
         raise RuntimeError(
             f"accepted graph cache must contain eleven buckets {list(ALL_BUCKETS)}, "
-            f"got {sorted(by_prefix)}"
+            f"got counts {dict(sorted(counts.items()))}"
         )
-    counts = {prefix: int(entry["decode_replays"]) for prefix, entry in by_prefix.items()}
     if counts != BUCKET_COUNTS:
         raise RuntimeError(
             f"accepted graph replay counts changed: expected {BUCKET_COUNTS}, got {counts}"
