@@ -9,7 +9,7 @@
 ## Current conclusions
 
 - The opt-in optimized-single path is the only graduated non-V32 inference mode; its established SALVALAI frontier is approximately `270.475 tok/s` on one RTX 2080/2080 Ti in FP32 with SDPA.
-- Minimal-runtime cleanup smoke `49708641` at `c3fe6bc` preserved exact main/timing tokens and final `.osu` bytes. Reciprocal main TPS changed by `+1.31%` and `-0.68%`; timing changed by `+4.25%` and `-3.87%`, preserving the accepted path within the `5%` gate.
+- Minimal-runtime cleanup smoke `49708641` preserved performance within `5%`. After merging OliBomby `f345d7d`, reciprocal V32/optimized smoke `49709859` at `9a8b8fc` preserved exact main/timing tokens and final `.osu` bytes with new SHA `dc690dcc23483f3a4468c55d8e1ea722bd12a67e1ad9ff8e63986f0cbc8568a2`.
 - Current exact batching approaches do not beat optimized serial on real songs. Fast fixed-prefix/model-only islands did not survive complete-step control, setup, dependency, compatibility, and tail costs.
 - A bounded two-song Hybrid-B2 main-loop wall scout produced exact files but only paired `91` steps while `2,625` used a slow private fallback. It ran near `75 tok/s` and took `2.6-3.8x` optimized serial main wall, rejecting the candidate before the complete queue-wall suite. No crossover was measured for this candidate; N=3-5 were intentionally not tested.
 - Current speculative and broad decoder/kernel replacements also fail the end-to-end `5%` bar.
