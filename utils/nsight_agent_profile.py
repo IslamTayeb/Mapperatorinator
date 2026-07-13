@@ -55,6 +55,19 @@ STAGE_NVTX_RANGE_NAMES = {
     "main_generation": "mapperatorinator.stage.main_generation",
 }
 PROFILE_LABELS = ("timing_context", "main_generation")
+TIMING_POSTPROCESS_STAGES = (
+    "timing_context_postprocess",
+    "super_timing_postprocess",
+)
+MAIN_POSTPROCESS_STAGES = (
+    "merge_generated_events",
+    "derive_timing_from_generated_events",
+    "resnap_events",
+    "postprocess_generate_osu",
+    "merge_with_reference_beatmap",
+    "write_osu",
+    "write_osz",
+)
 PROFILE_WORKLOAD_KEYS = (
     "model_path",
     "audio_path",
@@ -143,6 +156,96 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def summarize_osu_structure(path: Path) -> dict[str, Any]:
+    """Return deterministic final-map structure without requiring an osu parser."""
+
+    section = ""
+    timing_points = 0
+    inherited_timing_points = 0
+    uninherited_timing_points = 0
+    hit_objects = 0
+    malformed_by_section = {"TimingPoints": 0, "HitObjects": 0}
+    nonfinite_values = 0
+    hit_object_types = {
+        "circles": 0,
+        "sliders": 0,
+        "spinners": 0,
+        "holds": 0,
+        "unknown": 0,
+    }
+
+    def parse_numbers(fields: Sequence[str]) -> tuple[bool, list[float]]:
+        nonlocal nonfinite_values
+        values: list[float] = []
+        valid = True
+        for field in fields:
+            try:
+                value = float(field)
+            except ValueError:
+                return False, values
+            if not math.isfinite(value):
+                nonfinite_values += 1
+                valid = False
+            values.append(value)
+        return valid, values
+
+    for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("//"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1]
+            continue
+        if section == "TimingPoints":
+            timing_points += 1
+            fields = [field.strip() for field in line.split(",")]
+            parsed, _ = parse_numbers(fields)
+            if len(fields) < 2 or not parsed:
+                malformed_by_section[section] += 1
+                continue
+            if len(fields) >= 7:
+                try:
+                    uninherited = int(fields[6])
+                except ValueError:
+                    malformed_by_section[section] += 1
+                    continue
+                if uninherited == 1:
+                    uninherited_timing_points += 1
+                elif uninherited == 0:
+                    inherited_timing_points += 1
+        elif section == "HitObjects":
+            hit_objects += 1
+            fields = [field.strip() for field in line.split(",")]
+            parsed, _ = parse_numbers(fields[:5]) if len(fields) >= 5 else (False, [])
+            if len(fields) < 5 or not parsed:
+                malformed_by_section[section] += 1
+                continue
+            object_type = int(float(fields[3]))
+            if object_type & 128:
+                hit_object_types["holds"] += 1
+            elif object_type & 8:
+                hit_object_types["spinners"] += 1
+            elif object_type & 2:
+                hit_object_types["sliders"] += 1
+            elif object_type & 1:
+                hit_object_types["circles"] += 1
+            else:
+                hit_object_types["unknown"] += 1
+
+    malformed_lines = sum(malformed_by_section.values())
+    return {
+        "timing_points": timing_points,
+        "uninherited_timing_points": uninherited_timing_points,
+        "inherited_timing_points": inherited_timing_points,
+        "hit_objects": hit_objects,
+        "hit_object_types": hit_object_types,
+        "malformed_lines": malformed_lines,
+        "malformed_by_section": malformed_by_section,
+        "nonfinite_values": nonfinite_values,
+        "finite_and_well_formed": malformed_lines == 0 and nonfinite_values == 0,
+    }
 
 
 def _finite_number(value: Any, *, field: str) -> float:
@@ -1592,6 +1695,54 @@ def _aggregate_trace_kernels(trace: Mapping[str, Any]) -> list[dict[str, Any]]:
     return sorted(grouped.values(), key=lambda item: (-item["total_ns"], item["raw_name"]))
 
 
+def _kernel_family_summary(
+    kernels: Sequence[Mapping[str, Any]],
+    *,
+    denominator_id: str,
+    denominator_ns: int,
+) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for kernel in kernels:
+        family = str(kernel["family"])
+        entry = grouped.setdefault(
+            family,
+            {
+                "family": family,
+                "kernel_count": 0,
+                "calls": 0,
+                "total_ns": 0,
+            },
+        )
+        entry["kernel_count"] += 1
+        entry["calls"] += int(kernel["calls"])
+        entry["total_ns"] += int(kernel["total_ns"])
+    families = sorted(
+        grouped.values(),
+        key=lambda entry: (-entry["total_ns"], entry["family"]),
+    )
+    for entry in families:
+        entry["share_of_accumulated_kernel_time"] = _percentage(
+            entry["total_ns"], denominator_id, denominator_ns
+        )
+    return families
+
+
+def _attach_trace_launch_shapes(
+    kernels: Sequence[Mapping[str, Any]],
+    trace_kernels: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    trace_by_name = {str(kernel["raw_name"]): kernel for kernel in trace_kernels}
+    enriched: list[dict[str, Any]] = []
+    for kernel in kernels:
+        entry = dict(kernel)
+        trace_entry = trace_by_name.get(str(entry["raw_name"]))
+        if trace_entry is not None:
+            entry["launch_shapes"] = list(trace_entry["launch_shapes"])
+            entry["trace_calls"] = int(trace_entry["calls"])
+        enriched.append(entry)
+    return enriched
+
+
 def _semantic_regions(
     kernels: Sequence[Mapping[str, Any]],
     attribution: Mapping[str, Any] | None,
@@ -1694,12 +1845,20 @@ def _analyze_stage(
         stage=stage_name,
         parser=parse_kernel_trace,
     )
+    trace_kernels = (
+        _aggregate_trace_kernels(parsed_trace)
+        if parsed_trace["status"] == "available"
+        else []
+    )
     if parsed_summary["status"] == "available":
-        kernels = parsed_summary["kernels"]
+        kernels = _attach_trace_launch_shapes(
+            parsed_summary["kernels"],
+            trace_kernels,
+        )
         accumulated = parsed_summary["accumulated_kernel_ns"]
         source = "cuda_kernel_summary"
     elif parsed_trace["status"] == "available":
-        kernels = _aggregate_trace_kernels(parsed_trace)
+        kernels = trace_kernels
         accumulated = parsed_trace["accumulated_kernel_ns"]
         source = "cuda_kernel_trace"
     else:
@@ -1722,6 +1881,11 @@ def _analyze_stage(
             int(entry["total_ns"]), kernel_denom_id, accumulated
         )
         top_kernels.append(entry)
+    kernel_families = _kernel_family_summary(
+        kernels,
+        denominator_id=kernel_denom_id,
+        denominator_ns=accumulated,
+    )
 
     trace_window: dict[str, Any] = {"status": "not_available"}
     if parsed_trace["status"] == "available":
@@ -1892,6 +2056,7 @@ def _analyze_stage(
             else None
         ),
         "top_kernels": top_kernels,
+        "kernel_families": kernel_families,
         "decoder_semantic_regions": semantic,
         "cuda_api_report": cuda_api_report,
         "cuda_memory_time_report": memory_time_report,
@@ -2357,6 +2522,75 @@ def _transparency_comparison(control: Mapping[str, Any], traced: Mapping[str, An
     }
 
 
+def _pipeline_stage_summary(run: Mapping[str, Any]) -> dict[str, Any]:
+    raw = run.get("pipeline_stage_wall_ns")
+    if raw is None:
+        return {"status": "not_available", "stage_wall_ns": {}}
+    if not isinstance(raw, dict):
+        raise NsightProfileError("pipeline_stage_wall_ns must be an object")
+    stages = {
+        str(name): int(round(_finite_number(value, field=f"pipeline_stage_wall_ns.{name}")))
+        for name, value in raw.items()
+    }
+
+    def group(names: Sequence[str]) -> dict[str, Any]:
+        included = [name for name in names if name in stages]
+        return {
+            "stage_names": included,
+            "total_ns": sum(stages[name] for name in included),
+        }
+
+    return {
+        "status": "available",
+        "stage_wall_ns": dict(sorted(stages.items())),
+        "timing_postprocessing": group(TIMING_POSTPROCESS_STAGES),
+        "main_postprocessing": group(MAIN_POSTPROCESS_STAGES),
+    }
+
+
+def _validated_output_structure(run: Mapping[str, Any]) -> dict[str, Any]:
+    raw = run.get("output_structure")
+    if raw is None:
+        return {"status": "not_available"}
+    if not isinstance(raw, dict):
+        raise NsightProfileError("output_structure must be an object")
+    count_fields = (
+        "timing_points",
+        "uninherited_timing_points",
+        "inherited_timing_points",
+        "hit_objects",
+        "malformed_lines",
+        "nonfinite_values",
+    )
+    missing = [field for field in count_fields if field not in raw]
+    if missing:
+        raise NsightProfileError(f"output_structure is missing required fields: {missing}")
+    result: dict[str, Any] = {
+        "status": "available",
+        **{
+            field: int(round(_finite_number(raw[field], field=f"output_structure.{field}")))
+            for field in count_fields
+        },
+    }
+    for nested_field in ("hit_object_types", "malformed_by_section"):
+        nested = raw.get(nested_field)
+        if not isinstance(nested, dict):
+            raise NsightProfileError(f"output_structure.{nested_field} must be an object")
+        result[nested_field] = {
+            str(key): int(
+                round(
+                    _finite_number(
+                        value,
+                        field=f"output_structure.{nested_field}.{key}",
+                    )
+                )
+            )
+            for key, value in sorted(nested.items())
+        }
+    result["finite_and_well_formed"] = bool(raw.get("finite_and_well_formed", False))
+    return result
+
+
 def _cross_precision_comparison(left: Mapping[str, Any], right: Mapping[str, Any]) -> dict[str, Any]:
     if left["precision"] == right["precision"]:
         raise NsightProfileError("cross_precision_divergence requires different precisions")
@@ -2374,6 +2608,26 @@ def _cross_precision_comparison(left: Mapping[str, Any], right: Mapping[str, Any
             }
             for key in ("token_ids_sha256", "stopping_sha256", "cache_behavior_sha256")
         }
+    left_structure = _validated_output_structure(left)
+    right_structure = _validated_output_structure(right)
+    structure_fields = sorted(
+        (set(left_structure) | set(right_structure)) - {"status"}
+    )
+    structure = {
+        "left_status": left_structure["status"],
+        "right_status": right_structure["status"],
+        "fields": {
+            field: {
+                "left": left_structure.get(field),
+                "right": right_structure.get(field),
+                "equal": (
+                    left_structure.get(field) is not None
+                    and left_structure.get(field) == right_structure.get(field)
+                ),
+            }
+            for field in structure_fields
+        },
+    }
     return {
         "comparison_type": "cross_precision_divergence",
         "left_run_id": left["run_id"],
@@ -2385,6 +2639,7 @@ def _cross_precision_comparison(left: Mapping[str, Any], right: Mapping[str, Any
             left.get("output_sha256") is not None
             and left.get("output_sha256") == right.get("output_sha256")
         ),
+        "output_structure": structure,
         "is_transparency_gate": False,
     }
 
@@ -2482,6 +2737,8 @@ def analyze_manifest(manifest_path: Path) -> dict[str, Any]:
             "workload_contract_sha256": _hash_or_value(raw_run, "workload_contract_sha256"),
             "output_sha256": raw_run.get("output_sha256"),
             "output_size_bytes": raw_run.get("output_size_bytes"),
+            "output_structure": _validated_output_structure(raw_run),
+            "pipeline": _pipeline_stage_summary(raw_run),
             "identity": raw_run.get("identity", {}),
             "sqlite": sqlite_metadata,
             "stages": stages,
@@ -2562,6 +2819,19 @@ def render_text_summary(summary: Mapping[str, Any]) -> str:
                     f"  kernel {kernel['raw_name']}: total_ns={kernel['total_ns']} "
                     f"calls={kernel['calls']} family={kernel['family']}"
                 )
+            for family in stage["kernel_families"]:
+                lines.append(
+                    f"  family {family['family']}: total_ns={family['total_ns']} "
+                    f"calls={family['calls']} kernels={family['kernel_count']}"
+                )
+        pipeline = run.get("pipeline", {})
+        if pipeline.get("status") == "available":
+            timing_post = pipeline["timing_postprocessing"]
+            main_post = pipeline["main_postprocessing"]
+            lines.append(
+                f"{run_id} postprocessing: timing_ns={timing_post['total_ns']} "
+                f"main_ns={main_post['total_ns']}"
+            )
     lines.append(f"ncu: {summary['ncu']['status']}")
     return "\n".join(lines) + "\n"
 

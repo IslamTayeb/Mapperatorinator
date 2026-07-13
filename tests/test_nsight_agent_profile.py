@@ -246,6 +246,32 @@ def _run(
         "workload_contract": {"song": "same", "seed": 12345},
         "output_sha256": "output",
         "output_size_bytes": 123,
+        "output_structure": {
+            "timing_points": 3,
+            "uninherited_timing_points": 2,
+            "inherited_timing_points": 1,
+            "hit_objects": 10,
+            "hit_object_types": {
+                "circles": 8,
+                "sliders": 2,
+                "spinners": 0,
+                "holds": 0,
+                "unknown": 0,
+            },
+            "malformed_lines": 0,
+            "malformed_by_section": {"TimingPoints": 0, "HitObjects": 0},
+            "nonfinite_values": 0,
+            "finite_and_well_formed": True,
+        },
+        "pipeline_stage_wall_ns": {
+            "timing_context_generation": 100,
+            "timing_context_postprocess": 7,
+            "main_generation": 200,
+            "merge_generated_events": 3,
+            "resnap_events": 5,
+            "postprocess_generate_osu": 11,
+            "write_osu": 2,
+        },
         "stages": {
             "main_generation": _stage(attribution=attribution),
             "timing_generation": _stage(),
@@ -371,6 +397,36 @@ def test_native_kernel_csv_preserves_exact_identity_and_classifies_family(tmp_pa
     assert parsed["column_resolution"]["canonical_fields"]["total_ns"]["source_column"] == "Total Time (ns)"
 
 
+def test_osu_structure_summary_counts_objects_and_fails_visible_on_bad_values(tmp_path):
+    path = tmp_path / "map.osu"
+    path.write_text(
+        """osu file format v14
+
+[TimingPoints]
+0,500,4,2,1,70,1,0
+1000,-100,4,2,1,70,0,0
+
+[HitObjects]
+64,192,1000,1,0,0:0:0:0:
+128,192,1200,2,0,B|256:192,1,120
+nan,192,1400,1,0,0:0:0:0:
+""",
+        encoding="utf-8",
+    )
+
+    structure = nsight.summarize_osu_structure(path)
+
+    assert structure["timing_points"] == 2
+    assert structure["uninherited_timing_points"] == 1
+    assert structure["inherited_timing_points"] == 1
+    assert structure["hit_objects"] == 3
+    assert structure["hit_object_types"]["circles"] == 1
+    assert structure["hit_object_types"]["sliders"] == 1
+    assert structure["malformed_lines"] == 1
+    assert structure["nonfinite_values"] == 1
+    assert not structure["finite_and_well_formed"]
+
+
 def test_trace_uses_interval_union_not_accumulated_time_for_busy_share(tmp_path):
     trace_path = _kernel_trace(tmp_path / "trace.csv")
 
@@ -420,10 +476,45 @@ def test_analyzer_has_explicit_denominators_and_unattributed_graph_replay(tmp_pa
     assert stage["trace_window"]["gpu_busy_union_ns"] == 25
     assert stage["trace_window"]["gpu_idle_gap_union_ns"] == 5
     assert stage["trace_window"]["kernel_accumulated_share_of_window"]["percent"] == 100.0
+    assert stage["top_kernels"][0]["launch_shapes"] == [
+        {"grid": "2 1 1", "block": "64 1 1", "calls": 1}
+    ]
+    assert stage["top_kernels"][0]["trace_calls"] == 1
     semantic = stage["decoder_semantic_regions"]
     assert semantic["attribution"]["confidence"] == "none"
     assert semantic["regions"]["mlp"]["kernel_accumulated_ns"] == 0
     assert semantic["regions"]["unattributed"]["kernel_accumulated_ns"] == 30
+    assert stage["kernel_families"] == [
+        {
+            "family": "attention",
+            "kernel_count": 1,
+            "calls": 1,
+            "total_ns": 20,
+            "share_of_accumulated_kernel_time": {
+                "numerator_ns": 20,
+                "denominator_id": "graph.main_generation.accumulated_kernel_ns",
+                "denominator_ns": 30,
+                "percent": pytest.approx(200 / 3),
+                "status": "available",
+            },
+        },
+        {
+            "family": "gemm",
+            "kernel_count": 1,
+            "calls": 1,
+            "total_ns": 10,
+            "share_of_accumulated_kernel_time": {
+                "numerator_ns": 10,
+                "denominator_id": "graph.main_generation.accumulated_kernel_ns",
+                "denominator_ns": 30,
+                "percent": pytest.approx(100 / 3),
+                "status": "available",
+            },
+        },
+    ]
+    pipeline = result["runs"]["graph"]["pipeline"]
+    assert pipeline["timing_postprocessing"]["total_ns"] == 7
+    assert pipeline["main_postprocessing"]["total_ns"] == 21
     assert result["comparisons"][0]["pass"]
     assert not result["comparisons"][0]["stages"]["main_generation"]["profiler_overhead"]["traced_tps_authoritative"]
 
@@ -556,6 +647,7 @@ def test_cross_precision_is_divergence_report_not_transparency_gate(tmp_path):
     fp32 = _run("fp32", pass_kind="untraced_control")
     fp16 = _run("fp16", pass_kind="untraced_control", precision="fp16")
     fp16["stages"]["main_generation"]["token_ids_sha256"] = "drift"
+    fp16["output_structure"]["hit_objects"] = 9
     manifest = _manifest(
         tmp_path / "manifest.json",
         [fp32, fp16],
@@ -574,6 +666,9 @@ def test_cross_precision_is_divergence_report_not_transparency_gate(tmp_path):
     assert comparison["comparison_type"] == "cross_precision_divergence"
     assert not comparison["is_transparency_gate"]
     assert not comparison["stages"]["main_generation"]["token_ids_sha256"]["equal"]
+    assert not comparison["output_structure"]["fields"]["hit_objects"]["equal"]
+    assert comparison["output_structure"]["fields"]["timing_points"]["equal"]
+    assert result["runs"]["fp32"]["output_structure"]["finite_and_well_formed"]
     assert set(result["run_groups"]) == {"fp32:accepted", "fp16:accepted"}
 
 

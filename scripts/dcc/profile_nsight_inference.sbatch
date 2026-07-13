@@ -386,10 +386,12 @@ elif [[ $NCU_PROBE_EXIT -ne 0 ]]; then
   NCU_FATAL=1
 else
   echo "ncu_status=available" | tee "$NCU_PROBE_DIR/status.txt"
-  for precision in fp32 fp16; do
-    summary_dir="$RUNS/$precision/smoke_node/nsys/stages"
-    hot_kernel_json="$RUN_ROOT/runs/$precision/hot-kernel.json"
-    "$PYTHON" - "$summary_dir" "$hot_kernel_json" <<'PY'
+  # FP32 is the authoritative optimization target.  Select exactly one kernel
+  # from its fresh node-level trace and collect one bounded NCU profile.
+  precision=fp32
+  summary_dir="$RUNS/$precision/smoke_node/nsys/stages"
+  hot_kernel_json="$RUN_ROOT/runs/$precision/hot-kernel.json"
+  "$PYTHON" - "$summary_dir" "$hot_kernel_json" <<'PY'
 import csv
 import json
 import re
@@ -420,40 +422,39 @@ output.write_text(
     encoding="utf-8",
 )
 PY
-    hot_regex=$("$PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["ncu_regex"])' "$hot_kernel_json")
-    ncu_dir="$RUNS/$precision/smoke_ncu"
-    mkdir -p "$ncu_dir/output" "$ncu_dir/ncu"
-    build_inference_command "$precision" profile_salvalai_smoke15 ncu_kernel true false "$ncu_dir/output"
-    printf '%q ' "$NCU" "${INFERENCE_COMMAND[@]}" > "$ncu_dir/command.txt"
-    printf '\n' >> "$ncu_dir/command.txt"
-    "$NCU" \
-      --target-processes application-only \
-      --graph-profiling node \
-      --replay-mode kernel \
-      --kernel-name-base demangled \
-      --kernel-name "regex:$hot_regex" \
-      --launch-count 1 \
-      --nvtx \
-      --nvtx-include 'mapperatorinator.roi.inference_generation/' \
-      --section SpeedOfLight \
-      --section MemoryWorkloadAnalysis \
-      --section LaunchStats \
-      --section Occupancy \
-      --force-overwrite \
-      --export "$ncu_dir/ncu/hot-kernel" \
-      "${INFERENCE_COMMAND[@]}" \
-      > "$ncu_dir/stdout.txt" 2> "$ncu_dir/stderr.txt"
-    capture_run_paths "$ncu_dir"
-    require_nonempty "$ncu_dir/ncu/hot-kernel.ncu-rep"
-    "$NCU" --import "$ncu_dir/ncu/hot-kernel.ncu-rep" --page raw --csv \
-      > "$ncu_dir/ncu/hot-kernel.raw.csv" 2> "$ncu_dir/ncu/import.stderr.txt"
-    require_nonempty "$ncu_dir/ncu/hot-kernel.raw.csv"
-    "$PYTHON" utils/nsight_agent_profile.py transparency \
-      --control "$(<"$RUNS/$precision/smoke_control/profile-path.txt")" \
-      --traced "$(<"$ncu_dir/profile-path.txt")" \
-      --output "$ncu_dir/transparency.json"
-    TARGETED_NCU+=("$precision:$(basename "$ncu_dir/ncu/hot-kernel.ncu-rep")")
-  done
+  hot_regex=$("$PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["ncu_regex"])' "$hot_kernel_json")
+  ncu_dir="$RUNS/$precision/smoke_ncu"
+  mkdir -p "$ncu_dir/output" "$ncu_dir/ncu"
+  build_inference_command "$precision" profile_salvalai_smoke15 ncu_kernel true false "$ncu_dir/output"
+  printf '%q ' "$NCU" "${INFERENCE_COMMAND[@]}" > "$ncu_dir/command.txt"
+  printf '\n' >> "$ncu_dir/command.txt"
+  "$NCU" \
+    --target-processes application-only \
+    --graph-profiling node \
+    --replay-mode kernel \
+    --kernel-name-base demangled \
+    --kernel-name "regex:$hot_regex" \
+    --launch-count 1 \
+    --nvtx \
+    --nvtx-include 'mapperatorinator.roi.inference_generation/' \
+    --section SpeedOfLight \
+    --section MemoryWorkloadAnalysis \
+    --section LaunchStats \
+    --section Occupancy \
+    --force-overwrite \
+    --export "$ncu_dir/ncu/hot-kernel" \
+    "${INFERENCE_COMMAND[@]}" \
+    > "$ncu_dir/stdout.txt" 2> "$ncu_dir/stderr.txt"
+  capture_run_paths "$ncu_dir"
+  require_nonempty "$ncu_dir/ncu/hot-kernel.ncu-rep"
+  "$NCU" --import "$ncu_dir/ncu/hot-kernel.ncu-rep" --page raw --csv \
+    > "$ncu_dir/ncu/hot-kernel.raw.csv" 2> "$ncu_dir/ncu/import.stderr.txt"
+  require_nonempty "$ncu_dir/ncu/hot-kernel.raw.csv"
+  "$PYTHON" utils/nsight_agent_profile.py transparency \
+    --control "$(<"$RUNS/$precision/smoke_control/profile-path.txt")" \
+    --traced "$(<"$ncu_dir/profile-path.txt")" \
+    --output "$ncu_dir/transparency.json"
+  TARGETED_NCU+=("$precision:$(basename "$ncu_dir/ncu/hot-kernel.ncu-rep")")
 fi
 
 TARGETED_NCU_JSON=$(printf '%s\n' "${TARGETED_NCU[@]:-}" | "$PYTHON" -c 'import json,sys; print(json.dumps([line.strip() for line in sys.stdin if line.strip()]))')
@@ -468,6 +469,7 @@ export NSIGHT_TARGETED_NCU_JSON="$TARGETED_NCU_JSON"
 "$PYTHON" - <<'PY'
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 
@@ -516,6 +518,19 @@ def profile_stage(profile, label):
             "kernel_regions": {},
         },
     }
+
+def pipeline_stage_wall_ns(profile):
+    summary = profile.get("summary", {})
+    raw = summary.get("stage_wall_seconds")
+    if not isinstance(raw, dict):
+        raise SystemExit("profile summary is missing stage_wall_seconds")
+    result = {}
+    for name, value in raw.items():
+        seconds = float(value)
+        if not math.isfinite(seconds) or seconds < 0:
+            raise SystemExit(f"invalid pipeline stage duration for {name}: {value}")
+        result[str(name)] = int(round(seconds * 1_000_000_000))
+    return result
 
 def add_run(result, precision, directory_name, scope, pass_kind, paired=None):
     directory = runs_root / precision / directory_name
@@ -589,6 +604,8 @@ def add_run(result, precision, directory_name, scope, pass_kind, paired=None):
             "workload_contract": workload,
             "output_sha256": sha(result_path),
             "output_size_bytes": result_path.stat().st_size,
+            "output_structure": nsight.summarize_osu_structure(result_path),
+            "pipeline_stage_wall_ns": pipeline_stage_wall_ns(profile),
             "identity": {
                 "config_name": config,
                 "source_profile": relative(profile_path),

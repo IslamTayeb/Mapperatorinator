@@ -112,6 +112,18 @@ def test_ncu_permission_is_probed_once_and_permission_denial_stops_targeting() -
     assert "mapperatorinator.roi.inference_generation/" in source
 
 
+def test_targeted_ncu_collects_only_the_hottest_fresh_fp32_kernel_once() -> None:
+    source = _source()
+
+    available = source[source.index('echo "ncu_status=available"') :]
+    assert "for precision in fp32 fp16" not in available
+    assert "precision=fp32" in available
+    assert 'summary_dir="$RUNS/$precision/smoke_node/nsys/stages"' in available
+    assert available.count('--export "$ncu_dir/ncu/hot-kernel"') == 1
+    assert available.count('TARGETED_NCU+=("$precision:') == 1
+    assert "precision=fp16" not in available
+
+
 def test_wrapper_keeps_generated_outputs_under_ignored_run_root() -> None:
     source = _source()
 
@@ -121,3 +133,5 @@ def test_wrapper_keeps_generated_outputs_under_ignored_run_root() -> None:
     assert "analysis.json" in source
     assert "analysis.txt" in source
     assert "sha256sums.txt" in source
+    assert '"output_structure": nsight.summarize_osu_structure(result_path)' in source
+    assert '"pipeline_stage_wall_ns": pipeline_stage_wall_ns(profile)' in source
