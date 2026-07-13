@@ -31,12 +31,12 @@ def test_invalid_inference_engine_fails_loudly():
     )
 
 
-def test_optimized_engine_is_fp32_only():
-    args = InferenceConfig(inference_engine="optimized", precision="bf16")
+def test_optimized_engine_is_fp16_only():
+    args = InferenceConfig(inference_engine="optimized", precision="fp32")
 
     _assert_raises(
         ValueError,
-        "requires precision=fp32",
+        "requires precision=fp16",
         lambda: validate_reserved_runtime_flags(args),
     )
 

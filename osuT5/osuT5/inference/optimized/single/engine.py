@@ -1,4 +1,4 @@
-"""Accepted FP32 optimized single-song inference engine."""
+"""Experimental FP16 optimized single-song inference engine."""
 
 from __future__ import annotations
 
@@ -21,9 +21,9 @@ from .logits import build_single_logits_processor_list
 from .state import ProductionDecodeSession
 
 
-OPTIMIZED_CONFIG_VERSION = "accepted-fp32-native-cross-mlp-289-v2"
-OPTIMIZED_RESULT_CLASS = "documented-drift"
-OPTIMIZED_PRECISION = "fp32"
+OPTIMIZED_CONFIG_VERSION = "experimental-fp16-all-fused-v1"
+OPTIMIZED_RESULT_CLASS = "candidate-unverified"
+OPTIMIZED_PRECISION = "fp16"
 OPTIMIZED_ATTN_IMPLEMENTATION = "sdpa"
 ACTIVE_PREFIX_BUCKET_SIZE = 64
 _OPTIMIZED_TORCH_DTYPES = {
@@ -33,7 +33,7 @@ _OPTIMIZED_TORCH_DTYPES = {
 
 
 def _optimized_config_metadata() -> dict[str, Any]:
-    """Describe the immutable accepted engine preset for profiles."""
+    """Describe the immutable experimental engine preset for profiles."""
 
     return {
         "version": OPTIMIZED_CONFIG_VERSION,
@@ -296,7 +296,9 @@ def load_optimized_single_engine(
     loader_kwargs: dict[str, Any],
 ):
     if loader_kwargs.get("precision") != OPTIMIZED_PRECISION:
-        raise ValueError("optimized single loader requires precision=fp32.")
+        raise ValueError(
+            f"optimized single loader requires precision={OPTIMIZED_PRECISION}."
+        )
     if loader_kwargs.get("attn_implementation") != OPTIMIZED_ATTN_IMPLEMENTATION:
         raise ValueError("optimized single loader requires attn_implementation=sdpa.")
     if loader_kwargs.get("use_server"):

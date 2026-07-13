@@ -30,7 +30,7 @@ def _loader_kwargs(**overrides):
         "device": "cuda",
         "max_batch_size": 8,
         "use_server": False,
-        "precision": "fp32",
+        "precision": "fp16",
         "attn_implementation": "sdpa",
         "eval_mode": True,
         "lora_path": None,
@@ -42,11 +42,11 @@ def _loader_kwargs(**overrides):
     return values
 
 
-def test_accepted_runtime_metadata_is_one_fixed_preset():
+def test_experimental_runtime_metadata_is_one_fixed_preset():
     assert OptimizedSingleRuntime().profile_metadata()["optimized_effective_config"] == {
-        "version": "accepted-fp32-native-cross-mlp-289-v2",
-        "result_class": "documented-drift",
-        "precision": "fp32",
+        "version": "experimental-fp16-all-fused-v1",
+        "result_class": "candidate-unverified",
+        "precision": "fp16",
         "attn_implementation": "sdpa",
         "decoder_loop_backend": "active_prefix_cuda_graph",
         "torch_compile_enabled": False,
@@ -99,7 +99,7 @@ def test_runtime_overlays_structure_without_changing_sampling(monkeypatch):
     assert "active_prefix_decode_bucket_size" not in captured
 
 
-def test_single_loader_enables_custom_generate_fp32_sdpa_once():
+def test_single_loader_enables_custom_generate_fp16_sdpa_once():
     raw_model = SimpleNamespace(
         generation_config=SimpleNamespace(disable_compile=False),
     )
@@ -117,7 +117,7 @@ def test_single_loader_enables_custom_generate_fp32_sdpa_once():
     assert model_loader.call_count == 1
     call_kwargs = model_loader.call_args.kwargs
     assert call_kwargs["generation_compile"] is True
-    assert call_kwargs["precision"] == "fp32"
+    assert call_kwargs["precision"] == "fp16"
     assert call_kwargs["attn_implementation"] == "sdpa"
     assert call_kwargs["use_server"] is False
 
@@ -136,7 +136,8 @@ def test_inference_loader_injects_raw_loader_and_returns_binding():
             ckpt_path=None,
             t5_args=None,
             device="cuda",
-            inference_engine="optimized",
+        inference_engine="optimized",
+        precision="fp16",
         )
 
     assert isinstance(binding, InferenceEngineBinding)
@@ -144,6 +145,7 @@ def test_inference_loader_injects_raw_loader_and_returns_binding():
     assert loaded_tokenizer is tokenizer
     assert raw_loader.call_count == 1
     assert raw_loader.call_args.kwargs["generation_compile"] is True
+    assert raw_loader.call_args.kwargs["precision"] == "fp16"
 
 
 def test_shared_calculation_helpers_preserve_legacy_server_results():

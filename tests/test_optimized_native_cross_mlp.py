@@ -221,32 +221,32 @@ def test_native_decoder_wrappers_preserve_fp16_storage_and_argument_order(
     assert args[6:] == (1e-5, 8)
 
 
-def test_native_cross_mlp_is_the_single_accepted_optimized_preset() -> None:
+def test_native_cross_mlp_is_the_single_experimental_optimized_preset() -> None:
     raw_model = SimpleNamespace(
         generation_config=SimpleNamespace(disable_compile=False),
     )
     loader = lambda **kwargs: (raw_model, object())
     kwargs = {
-        "precision": "fp32",
+        "precision": "fp16",
         "attn_implementation": "sdpa",
         "use_server": False,
     }
 
-    accepted, _ = engine.load_optimized_single_engine(
+    candidate, _ = engine.load_optimized_single_engine(
         model_loader=loader,
         loader_kwargs=kwargs,
     )
-    assert type(accepted.runtime) is engine.OptimizedSingleRuntime
-    assert accepted.runtime.profile_metadata()["optimized_effective_config"][
+    assert type(candidate.runtime) is engine.OptimizedSingleRuntime
+    assert candidate.runtime.profile_metadata()["optimized_effective_config"][
         "native_cross_mlp_tail"
     ] is True
     assert (
-        accepted.runtime.profile_metadata()["optimized_result_class"]
-        == "documented-drift"
+        candidate.runtime.profile_metadata()["optimized_result_class"]
+        == "candidate-unverified"
     )
 
 
-def test_accepted_tail_is_disabled_only_for_timing_context() -> None:
+def test_experimental_tail_is_disabled_only_for_timing_context() -> None:
     assert engine._native_cross_mlp_tail_enabled(
         context_type=ContextType.MAP,
     )
@@ -258,7 +258,7 @@ def test_accepted_tail_is_disabled_only_for_timing_context() -> None:
     )
 
 
-def test_ordinary_generate_window_installs_promoted_dispatch(monkeypatch) -> None:
+def test_ordinary_generate_window_installs_shared_specialized_dispatch(monkeypatch) -> None:
     captured: list[dict[str, object]] = []
 
     @contextmanager
@@ -277,7 +277,7 @@ def test_ordinary_generate_window_installs_promoted_dispatch(monkeypatch) -> Non
 
     model = SimpleNamespace(
         device=torch.device("cpu"),
-        dtype=torch.float32,
+        dtype=torch.float16,
         generate=lambda **kwargs: torch.tensor([[1, 2]]),
     )
     tokenizer = SimpleNamespace(pad_id=0, eos_id=2, context_eos={})
@@ -311,14 +311,14 @@ def test_ordinary_generate_window_installs_promoted_dispatch(monkeypatch) -> Non
         "native_q1_self_attention": True,
         "native_q1_rope_cache_self_attention": True,
         "native_cross_mlp_tail": True,
-        "optimized_expected_dtype": torch.float32,
+        "optimized_expected_dtype": torch.float16,
     }
     assert captured[1] == {
         "q1_bmm_cross_attention": True,
         "native_q1_self_attention": False,
         "native_q1_rope_cache_self_attention": False,
         "native_cross_mlp_tail": False,
-        "optimized_expected_dtype": torch.float32,
+        "optimized_expected_dtype": torch.float16,
     }
     assert main_stats["native_cross_mlp_tail_enabled"] is True
     assert timing_stats["native_cross_mlp_tail_enabled"] is False
@@ -328,7 +328,7 @@ def test_ordinary_generate_window_installs_promoted_dispatch(monkeypatch) -> Non
 
 
 def test_optimized_runtime_rejects_model_dtype_that_disagrees_with_metadata() -> None:
-    model = SimpleNamespace(device=torch.device("cpu"), dtype=torch.float16)
+    model = SimpleNamespace(device=torch.device("cpu"), dtype=torch.float32)
 
     with pytest.raises(TypeError, match="runtime loaded model dtype"):
         engine._generate_window(

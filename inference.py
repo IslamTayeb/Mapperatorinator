@@ -379,8 +379,8 @@ def validate_reserved_runtime_flags(args: InferenceConfig):
             "inference_engine must be one of: " + ", ".join(sorted(supported_engines)) + "."
         )
     if args.inference_engine == "optimized":
-        if args.precision != "fp32":
-            raise ValueError("inference_engine=optimized currently requires precision=fp32.")
+        if args.precision != "fp16":
+            raise ValueError("inference_engine=optimized currently requires precision=fp16.")
         if args.use_server:
             raise ValueError(
                 "inference_engine=optimized requires use_server=false."
