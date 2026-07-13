@@ -118,6 +118,39 @@ def test_framework_attention_rejects_mixed_storage_dtypes() -> None:
         framework_q1_attention(query, key, value, None)
 
 
+def test_native_prefix_maps_native_self_to_framework_bmm_cross(monkeypatch) -> None:
+    import importlib
+
+    native_prefix_module = importlib.import_module(
+        "osuT5.osuT5.inference.optimized.scout.native_prefix"
+    )
+    captured = {}
+
+    def fake_prefix(module, **kwargs):
+        captured.update(kwargs)
+        return module
+
+    monkeypatch.setattr(native_prefix_module, "_prefix", fake_prefix)
+    sentinel = object()
+    result = native_prefix_module.native_prefix(
+        sentinel,
+        hidden_states=object(),
+        attention_mask=None,
+        encoder_hidden_states=object(),
+        past_key_value=object(),
+        cache_position=object(),
+        position_ids=object(),
+        active_prefix_length=64,
+    )
+
+    assert result is sentinel
+    assert (
+        captured["self_attention_fn"]
+        is native_prefix_module.native_q1_rope_cache_attention
+    )
+    assert captured["cross_attention_fn"] is None
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 def test_specialized_policy_selects_dtype_kernels_and_restores_hooks(
     monkeypatch,

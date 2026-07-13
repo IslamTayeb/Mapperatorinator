@@ -398,7 +398,7 @@ def native_prefix(
         position_ids=position_ids,
         active_prefix_length=active_prefix_length,
         self_attention_fn=native_q1_rope_cache_attention,
-        cross_attention_fn=native_q1_attention,
+        cross_attention_fn=None,
     )
 
 
