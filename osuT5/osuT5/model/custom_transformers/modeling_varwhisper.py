@@ -833,7 +833,11 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
                 output_attentions=output_attentions
             )
         hidden_states = self_attn_outputs[0]
-        hidden_states = residual + hidden_states
+        if profile_ranges:
+            with profile_range(f"{layer_name}.self_attn_out_residual"):
+                hidden_states = residual + hidden_states
+        else:
+            hidden_states = residual + hidden_states
 
         optimized_tail_forward = (
             decoder_layer_runtime_hooks().cross_mlp_tail_forward
@@ -888,7 +892,11 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
                     output_attentions=output_attentions
                 )
             hidden_states = cross_attn_outputs[0]
-            hidden_states = residual + hidden_states
+            if profile_ranges:
+                with profile_range(f"{layer_name}.cross_attn_out_residual"):
+                    hidden_states = residual + hidden_states
+            else:
+                hidden_states = residual + hidden_states
 
         # Fully Connected
         residual = hidden_states
@@ -914,7 +922,11 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
         else:
             hidden_states = self.fc2(hidden_states)
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
-        hidden_states = residual + hidden_states
+        if profile_ranges:
+            with profile_range(f"{layer_name}.mlp.out_residual"):
+                hidden_states = residual + hidden_states
+        else:
+            hidden_states = residual + hidden_states
 
         outputs = (hidden_states,) + self_attn_outputs[1:] + cross_attn_outputs[1:]
 

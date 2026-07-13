@@ -8,6 +8,19 @@ from typing import Any, Iterator
 
 import torch
 
+from ..runtime_profiling import detail_ranges_context, profile_range
+
+
+PROFILE_PASS_KINDS = frozenset(
+    {
+        "unspecified",
+        "untraced_control",
+        "nsys_graph",
+        "nsys_node",
+        "ncu_kernel",
+    }
+)
+
 
 class InferenceProfiler:
     """Small synchronized JSON profiler enabled by ``profile_inference``.
@@ -17,16 +30,72 @@ class InferenceProfiler:
     identity through the processor, and writes one stable JSON shape.
     """
 
-    def __init__(self, *, enabled: bool = False):
+    def __init__(
+        self,
+        *,
+        enabled: bool = False,
+        detail_ranges: bool = False,
+        cuda_capture: bool = False,
+        pass_kind: str = "unspecified",
+    ):
+        if pass_kind not in PROFILE_PASS_KINDS:
+            valid = ", ".join(sorted(PROFILE_PASS_KINDS))
+            raise ValueError(f"profile_pass_kind must be one of: {valid}")
+        if detail_ranges and not enabled:
+            raise ValueError("profile_detail_ranges requires profile_inference=true")
+        if cuda_capture and not detail_ranges:
+            raise ValueError(
+                "profile_cuda_capture requires profile_detail_ranges=true"
+            )
         self.enabled = enabled
+        self.detail_ranges = detail_ranges
+        self.cuda_capture = cuda_capture
+        self.pass_kind = pass_kind
+        self._generation_roi_active = False
         self.started_at = time.time()
-        self.metadata: dict[str, Any] = {}
+        self.metadata: dict[str, Any] = {
+            "profile_pass_kind": pass_kind,
+            "authoritative_performance": pass_kind == "untraced_control",
+            "profile_detail_ranges": detail_ranges,
+            "profile_cuda_capture": cuda_capture,
+        } if enabled else {}
         self.stages: list[dict[str, Any]] = []
         self.generation: list[dict[str, Any]] = []
 
     @classmethod
     def from_args(cls, args) -> "InferenceProfiler":
-        return cls(enabled=bool(getattr(args, "profile_inference", False)))
+        return cls(
+            enabled=bool(getattr(args, "profile_inference", False)),
+            detail_ranges=bool(getattr(args, "profile_detail_ranges", False)),
+            cuda_capture=bool(getattr(args, "profile_cuda_capture", False)),
+            pass_kind=str(getattr(args, "profile_pass_kind", "unspecified")),
+        )
+
+    def start_generation_capture(self) -> None:
+        if not self.detail_ranges:
+            return
+        if self._generation_roi_active:
+            raise RuntimeError("generation profiler capture is already active")
+        if self.cuda_capture and not torch.cuda.is_available():
+            raise RuntimeError("profile_cuda_capture requires CUDA")
+        if torch.cuda.is_available():
+            self._sync_cuda()
+            if self.cuda_capture:
+                torch.cuda.cudart().cudaProfilerStart()
+            torch.cuda.nvtx.range_push("mapperatorinator.roi.inference_generation")
+        self._generation_roi_active = True
+
+    def stop_generation_capture(self) -> None:
+        if not self.detail_ranges:
+            return
+        if not self._generation_roi_active:
+            raise RuntimeError("generation profiler capture is not active")
+        if torch.cuda.is_available():
+            self._sync_cuda()
+            torch.cuda.nvtx.range_pop()
+            if self.cuda_capture:
+                torch.cuda.cudart().cudaProfilerStop()
+        self._generation_roi_active = False
 
     def set_metadata(self, **metadata: Any) -> None:
         if self.enabled:
@@ -38,15 +107,24 @@ class InferenceProfiler:
             yield
             return
 
-        self._sync_cuda()
-        started = time.perf_counter()
-        try:
-            yield
-        finally:
+        with detail_ranges_context(self.detail_ranges):
             self._sync_cuda()
-            record = {"name": name, "wall_seconds": time.perf_counter() - started, **metadata}
-            self._add_cuda_memory(record)
-            self.stages.append(self._to_jsonable(record))
+            started = time.perf_counter()
+            try:
+                with profile_range(f"stage.{name}"):
+                    yield
+            finally:
+                self._sync_cuda()
+                finished = time.perf_counter()
+                record = {
+                    "name": name,
+                    "wall_seconds": finished - started,
+                    "started_at_perf_counter_seconds": started,
+                    "finished_at_perf_counter_seconds": finished,
+                    **metadata,
+                }
+                self._add_cuda_memory(record)
+                self.stages.append(self._to_jsonable(record))
 
     def record_generation(self, **record: Any) -> None:
         if self.enabled:
