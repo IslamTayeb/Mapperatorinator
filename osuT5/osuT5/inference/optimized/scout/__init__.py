@@ -10,6 +10,7 @@ from .native_prefix import (
     framework_prefix,
     native_prefix,
     native_prefix_attention_context,
+    specialized_prefix_attention_context,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "framework_prefix",
     "native_prefix",
     "native_prefix_attention_context",
+    "specialized_prefix_attention_context",
 ]

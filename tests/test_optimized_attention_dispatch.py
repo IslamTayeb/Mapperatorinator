@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from osuT5.osuT5.inference.optimized.kernels import dispatch
@@ -40,6 +41,41 @@ def test_q1_bmm_dispatch_preserves_exact_calculation_order():
     expected = expected.transpose(1, 2).contiguous().view(1, -1, 32)
 
     assert result is not None
+    assert torch.equal(result[0], expected)
+
+
+def test_q1_bmm_dispatch_uses_fp32_accumulation_for_fp16():
+    generator = torch.Generator().manual_seed(12346)
+    query = torch.randn((1, 4, 1, 8), generator=generator).half()
+    key = torch.randn((1, 4, 16, 8), generator=generator).half()
+    value = torch.randn((1, 4, 16, 8), generator=generator).half()
+    module = SimpleNamespace(is_cross_attention=True, training=False)
+
+    result = sdpa_q1_attention_forward(
+        module=module,
+        query=query,
+        key=key,
+        value=value,
+        bs=1,
+        dim=32,
+        attention_mask=None,
+        q1_bmm_cross_attention=True,
+        native_q1_self_attention=False,
+        native_q1_attention=None,
+        expected_dtype=torch.float16,
+    )
+
+    q = query.reshape(4, 1, 8).float()
+    k = key.reshape(4, -1, 8).float()
+    v = value.reshape(4, -1, 8).float()
+    scores = torch.bmm(q, k.transpose(1, 2))
+    scores.mul_(8 ** -0.5)
+    expected = torch.bmm(torch.softmax(scores, dim=-1), v).half()
+    expected = expected.view(1, 4, 1, 8).transpose(1, 2).contiguous()
+    expected = expected.view(1, -1, 32)
+
+    assert result is not None
+    assert result[0].dtype == torch.float16
     assert torch.equal(result[0], expected)
 
 
@@ -145,9 +181,60 @@ def test_native_self_dispatch_preserves_wrapper_and_layout():
     assert result[0].shape == (1, 1, 32)
 
 
-def test_fused_rope_cache_dispatch_preserves_sequence_aliases_and_mask(monkeypatch):
+def test_native_self_dispatch_accepts_explicit_fp16_policy_only():
+    query = torch.zeros((1, 4, 1, 8), dtype=torch.float16)
+    key = torch.zeros((1, 4, 16, 8), dtype=torch.float16)
+    value = torch.zeros_like(key)
+    module = SimpleNamespace(is_cross_attention=False, training=False)
+    calls = []
+
+    def native(q, k, v, mask):
+        calls.append((q, k, v, mask))
+        return torch.ones_like(q)
+
+    default_result = sdpa_q1_attention_forward(
+        module=module,
+        query=query,
+        key=key,
+        value=value,
+        bs=1,
+        dim=32,
+        attention_mask=None,
+        q1_bmm_cross_attention=False,
+        native_q1_self_attention=True,
+        native_q1_attention=native,
+    )
+    fp16_result = sdpa_q1_attention_forward(
+        module=module,
+        query=query,
+        key=key,
+        value=value,
+        bs=1,
+        dim=32,
+        attention_mask=None,
+        q1_bmm_cross_attention=False,
+        native_q1_self_attention=True,
+        native_q1_attention=native,
+        expected_dtype=torch.float16,
+    )
+
+    assert default_result is None
+    assert calls == [(query, key, value, None)]
+    assert fp16_result is not None
+    assert fp16_result[0].dtype == torch.float16
+
+
+@pytest.mark.parametrize(
+    ("dtype", "expected_dtype"),
+    ((torch.float32, None), (torch.float16, torch.float16)),
+)
+def test_fused_rope_cache_dispatch_preserves_sequence_aliases_and_mask(
+    monkeypatch,
+    dtype,
+    expected_dtype,
+):
     events = []
-    hidden_states = torch.arange(8, dtype=torch.float32).view(1, 1, 8)
+    hidden_states = torch.arange(8, dtype=dtype).view(1, 1, 8)
     position_ids = torch.tensor([[6]])
     cache_position = torch.tensor([6])
     attention_mask = torch.zeros((1, 1, 1, 12), dtype=torch.float32)
@@ -158,20 +245,23 @@ def test_fused_rope_cache_dispatch_preserves_sequence_aliases_and_mask(monkeypat
             self.layers = [
                 SimpleNamespace(
                     is_initialized=True,
-                    keys=torch.zeros((1, 2, 12, 4)),
-                    values=torch.ones((1, 2, 12, 4)),
+                    keys=torch.zeros((1, 2, 12, 4), dtype=dtype),
+                    values=torch.ones((1, 2, 12, 4), dtype=dtype),
                 )
             ]
 
     class Projection:
         def __call__(self, inputs):
             events.append(("projection", inputs))
-            return torch.arange(24, dtype=torch.float32).view(1, 1, 24)
+            return torch.arange(24, dtype=dtype).view(1, 1, 24)
 
     class Rotary:
         def __call__(self, qkv, *, position_ids):
             events.append(("rotary", qkv, position_ids))
-            return torch.full((1, 4), 2.0), torch.full((1, 4), 3.0)
+            return (
+                torch.full((1, 4), 2.0, dtype=dtype),
+                torch.full((1, 4), 3.0, dtype=dtype),
+            )
 
     module = SimpleNamespace(
         training=False,
@@ -184,7 +274,7 @@ def test_fused_rope_cache_dispatch_preserves_sequence_aliases_and_mask(monkeypat
         all_head_size=8,
     )
     cache = FakeStaticCache()
-    kernel_output = torch.arange(8, dtype=torch.float32).view(1, 2, 1, 4)
+    kernel_output = torch.arange(8, dtype=dtype).view(1, 2, 1, 4)
 
     def native(qkv, keys, values, cos, sin, position, mask, prefix_length):
         events.append(
@@ -209,6 +299,9 @@ def test_fused_rope_cache_dispatch_preserves_sequence_aliases_and_mask(monkeypat
         lambda: 7,
     )
 
+    kwargs = {}
+    if expected_dtype is not None:
+        kwargs["expected_dtype"] = expected_dtype
     result = q1_rope_cache_self_attention_forward(
         module=module,
         hidden_states=hidden_states,
@@ -222,6 +315,7 @@ def test_fused_rope_cache_dispatch_preserves_sequence_aliases_and_mask(monkeypat
         attention_mask=attention_mask,
         sliding_window_mask=sliding_window_mask,
         native_q1_rope_cache_attention=native,
+        **kwargs,
     )
 
     assert [event[0] for event in events] == ["projection", "rotary", "native"]

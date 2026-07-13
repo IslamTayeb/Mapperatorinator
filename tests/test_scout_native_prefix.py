@@ -7,6 +7,7 @@ from osuT5.osuT5.inference.optimized.scout.native_prefix import (
     fp32_rms_norm,
     framework_prefix,
     framework_q1_attention,
+    specialized_prefix_attention_context,
 )
 
 
@@ -115,3 +116,70 @@ def test_framework_attention_rejects_mixed_storage_dtypes() -> None:
 
     with pytest.raises(TypeError, match="dtypes must match"):
         framework_q1_attention(query, key, value, None)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_specialized_policy_selects_dtype_kernels_and_restores_hooks(
+    monkeypatch,
+    dtype,
+) -> None:
+    from osuT5.osuT5.inference import runtime_dispatch
+    from osuT5.osuT5.inference.optimized.kernels import q1_attention as production_q1
+    from osuT5.osuT5.inference.optimized.scout import q1_attention as scout_q1
+
+    selected = production_q1 if dtype == torch.float32 else scout_q1
+    preloads = []
+    monkeypatch.setattr(
+        selected,
+        "preload_native_q1_attention",
+        lambda: preloads.append(dtype),
+    )
+    def marker(**kwargs):
+        return kwargs
+
+    outer = runtime_dispatch.AttentionRuntimeHooks(sdpa_attention_inputs=marker)
+
+    with runtime_dispatch.attention_runtime_hooks_context(outer):
+        before = runtime_dispatch.attention_runtime_hooks()
+        with specialized_prefix_attention_context(dtype=dtype, native_self=True):
+            hooks = runtime_dispatch.attention_runtime_hooks()
+            assert hooks is not before
+            assert hooks.sdpa_attention_inputs is marker
+            assert hooks.sdpa_attention_forward is not None
+            assert hooks.q1_rope_cache_self_attention_forward is not None
+            assert hooks.sdpa_attention_forward.keywords["expected_dtype"] == dtype
+            assert (
+                hooks.sdpa_attention_forward.keywords["native_q1_attention"]
+                is selected.native_q1_attention
+            )
+            assert (
+                hooks.q1_rope_cache_self_attention_forward.keywords[
+                    "native_q1_rope_cache_attention"
+                ]
+                is selected.native_q1_rope_cache_attention
+            )
+            assert (
+                hooks.q1_rope_cache_self_attention_forward.keywords[
+                    "expected_dtype"
+                ]
+                == dtype
+            )
+        assert runtime_dispatch.attention_runtime_hooks() is before
+
+    assert preloads == [dtype]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_specialized_framework_policy_keeps_only_bmm_cross_hook(dtype) -> None:
+    from osuT5.osuT5.inference import runtime_dispatch
+
+    before = runtime_dispatch.attention_runtime_hooks()
+    with specialized_prefix_attention_context(dtype=dtype, native_self=False):
+        hooks = runtime_dispatch.attention_runtime_hooks()
+        assert hooks.sdpa_attention_forward is not None
+        assert hooks.sdpa_attention_forward.keywords["expected_dtype"] == dtype
+        assert hooks.sdpa_attention_forward.keywords["q1_bmm_cross_attention"] is True
+        assert hooks.sdpa_attention_forward.keywords["native_q1_self_attention"] is False
+        assert hooks.sdpa_attention_forward.keywords["native_q1_attention"] is None
+        assert hooks.q1_rope_cache_self_attention_forward is None
+    assert runtime_dispatch.attention_runtime_hooks() is before

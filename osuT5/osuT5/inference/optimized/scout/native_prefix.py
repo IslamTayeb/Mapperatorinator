@@ -497,6 +497,60 @@ def native_prefix_attention_context(*, dtype: torch.dtype) -> Iterator[None]:
         yield
 
 
+@contextmanager
+def specialized_prefix_attention_context(
+    *,
+    dtype: torch.dtype,
+    native_self: bool,
+) -> Iterator[None]:
+    """Install the accepted attention policy without replacing decoder layers.
+
+    FP32 reuses the production q1 kernels. FP16 uses their scout equivalents.
+    Both dtypes retain the framework q1 BMM cross-attention path; the slower
+    native cross-attention control is intentionally not part of this policy.
+    """
+
+    _require_storage_dtype(dtype)
+    from ..kernels.dispatch import (
+        q1_rope_cache_self_attention_forward,
+        sdpa_q1_attention_forward,
+    )
+
+    selected_q1 = None
+    if native_self:
+        if dtype == torch.float32:
+            from ..kernels import q1_attention as selected_q1
+        else:
+            from . import q1_attention as selected_q1
+        selected_q1.preload_native_q1_attention()
+    previous = attention_runtime_hooks()
+    hooks = AttentionRuntimeHooks(
+        sdpa_attention_inputs=previous.sdpa_attention_inputs,
+        sdpa_attention_forward=partial(
+            sdpa_q1_attention_forward,
+            q1_bmm_cross_attention=True,
+            native_q1_self_attention=native_self,
+            native_q1_attention=(
+                selected_q1.native_q1_attention
+                if selected_q1 is not None
+                else None
+            ),
+            expected_dtype=dtype,
+        ),
+        q1_rope_cache_self_attention_forward=partial(
+            q1_rope_cache_self_attention_forward,
+            native_q1_rope_cache_attention=(
+                selected_q1.native_q1_rope_cache_attention
+                if selected_q1 is not None
+                else None
+            ),
+            expected_dtype=dtype,
+        ) if native_self else None,
+    )
+    with attention_runtime_hooks_context(hooks):
+        yield
+
+
 __all__ = [
     "SUPPORTED_DTYPES",
     "accepted_fp32_prefix",
@@ -505,4 +559,5 @@ __all__ = [
     "framework_q1_attention",
     "native_prefix",
     "native_prefix_attention_context",
+    "specialized_prefix_attention_context",
 ]

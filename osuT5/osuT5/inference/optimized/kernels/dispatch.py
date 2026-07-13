@@ -56,14 +56,15 @@ def sdpa_q1_attention_forward(
     q1_bmm_cross_attention: bool,
     native_q1_self_attention: bool,
     native_q1_attention: Callable[..., torch.Tensor] | None,
+    expected_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor] | None:
     use_q1_bmm_cross_attention = (
         q1_bmm_cross_attention
         and module.is_cross_attention
         and not module.training
-        and query.dtype == torch.float32
-        and key.dtype == torch.float32
-        and value.dtype == torch.float32
+        and query.dtype == expected_dtype
+        and key.dtype == expected_dtype
+        and value.dtype == expected_dtype
         and attention_mask is None
         and query.shape[0] == 1
         and query.shape[-2] == 1
@@ -75,9 +76,9 @@ def sdpa_q1_attention_forward(
         and native_q1_attention is not None
         and not module.is_cross_attention
         and not module.training
-        and query.dtype == torch.float32
-        and key.dtype == torch.float32
-        and value.dtype == torch.float32
+        and query.dtype == expected_dtype
+        and key.dtype == expected_dtype
+        and value.dtype == expected_dtype
         and query.shape[0] == 1
         and query.shape[-2] == 1
         and key.shape[0] == 1
@@ -96,11 +97,31 @@ def sdpa_q1_attention_forward(
         q = query.reshape(num_heads, 1, head_dim)
         k = key.reshape(num_heads, -1, head_dim)
         v = value.reshape(num_heads, -1, head_dim)
-        scores = torch.bmm(q, k.transpose(1, 2)) * (head_dim ** -0.5)
-        attn_output = torch.bmm(
-            torch.softmax(scores, dim=-1),
-            v,
-        ).view(1, num_heads, 1, head_dim)
+        if expected_dtype == torch.float32:
+            # Preserve the accepted FP32 calculation order exactly.
+            scores = torch.bmm(q, k.transpose(1, 2)) * (head_dim ** -0.5)
+            attn_output = torch.bmm(
+                torch.softmax(scores, dim=-1),
+                v,
+            ).view(1, num_heads, 1, head_dim)
+        elif expected_dtype == torch.float16:
+            if query.device.type == "cuda":
+                scores = torch.bmm(
+                    q,
+                    k.transpose(1, 2),
+                    out_dtype=torch.float32,
+                )
+            else:
+                scores = torch.bmm(q.float(), k.float().transpose(1, 2))
+            scores.mul_(head_dim ** -0.5)
+            attn_output = torch.bmm(
+                torch.softmax(scores, dim=-1),
+                v.float(),
+            ).to(dtype=torch.float16).view(1, num_heads, 1, head_dim)
+        else:
+            raise TypeError(
+                "q1 attention dispatch supports only float32 or float16"
+            )
         attn_output = attn_output.transpose(1, 2).contiguous()
     else:
         return None
@@ -121,13 +142,14 @@ def q1_rope_cache_self_attention_forward(
     attention_mask: torch.Tensor | None,
     sliding_window_mask: torch.Tensor | None,
     native_q1_rope_cache_attention: Callable[..., torch.Tensor] | None,
+    expected_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor] | None:
     prefix_length = active_prefix_self_attention_length()
     use_native_q1_rope_cache_self_attention = (
         native_q1_rope_cache_attention is not None
         and not is_varlen
         and not module.training
-        and hidden_states.dtype == torch.float32
+        and hidden_states.dtype == expected_dtype
         and hidden_states.shape[0] == 1
         and hidden_states.shape[1] == 1
         and isinstance(past_key_value, StaticCache)
