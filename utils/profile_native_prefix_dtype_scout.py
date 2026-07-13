@@ -28,17 +28,18 @@ import torch  # noqa: E402
 
 
 BUCKET_COUNTS = {
-    128: 22,
+    128: 30,
     192: 64,
-    256: 126,
-    320: 227,
-    384: 136,
-    448: 332,
-    512: 682,
-    576: 1_727,
-    640: 2_907,
-    704: 1_221,
-    768: 108,
+    256: 64,
+    320: 71,
+    384: 161,
+    448: 448,
+    512: 1_166,
+    576: 1_647,
+    640: 2_470,
+    704: 1_142,
+    768: 242,
+    832: 92,
 }
 SENTINEL_BUCKETS = (128, 576, 640)
 ALL_BUCKETS = tuple(BUCKET_COUNTS)
@@ -159,7 +160,7 @@ def _entry_prefix(entry: dict[str, Any]) -> int:
 def validate_accepted_graph_cache(
     graph_cache: dict[Any, dict[str, Any]],
 ) -> dict[int, dict[str, Any]]:
-    """Require the accepted eleven signatures and exact production replay counts."""
+    """Require the current accepted signatures and exact production replay counts."""
 
     if not isinstance(graph_cache, dict):
         raise TypeError("ProductionDecodeSession.graph_cache must be a dict")
@@ -178,7 +179,7 @@ def validate_accepted_graph_cache(
     counts = {prefix: int(entry["decode_replays"]) for prefix, entry in by_prefix.items()}
     if tuple(sorted(by_prefix)) != ALL_BUCKETS:
         raise RuntimeError(
-            f"accepted graph cache must contain eleven buckets {list(ALL_BUCKETS)}, "
+            f"accepted graph cache must contain current buckets {list(ALL_BUCKETS)}, "
             f"got counts {dict(sorted(counts.items()))}"
         )
     if counts != BUCKET_COUNTS:

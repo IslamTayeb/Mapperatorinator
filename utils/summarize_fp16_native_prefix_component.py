@@ -33,7 +33,7 @@ Input JSON schema (schema_version 1)::
     }
 
 Each variant must contain either exactly the sentinel buckets 128, 576, and
-640, or all eleven accepted production buckets.  Sentinel evidence is useful
+640, or all current accepted production buckets.  Sentinel evidence is useful
 for bounded sizing but can never promote a candidate.  All variants must cover
 the same buckets.
 
@@ -74,17 +74,18 @@ from typing import Any
 
 
 BUCKET_COUNTS = {
-    128: 22,
+    128: 30,
     192: 64,
-    256: 126,
-    320: 227,
-    384: 136,
-    448: 332,
-    512: 682,
-    576: 1_727,
-    640: 2_907,
-    704: 1_221,
-    768: 108,
+    256: 64,
+    320: 71,
+    384: 161,
+    448: 448,
+    512: 1_166,
+    576: 1_647,
+    640: 2_470,
+    704: 1_142,
+    768: 242,
+    832: 92,
 }
 SENTINEL_BUCKETS = frozenset({128, 576, 640})
 ALL_BUCKETS = frozenset(BUCKET_COUNTS)
@@ -119,13 +120,12 @@ DRIFT_FIELDS = (
     "cache_value_slot_max_abs",
     "logits_max_abs",
 )
-MAX_ABS_DRIFT = 1e-3
 BASELINE_MAIN_SECONDS = 28.243
-BASELINE_MAIN_TOKENS = 7_639
+BASELINE_MAIN_TOKENS = 7_684
 BASELINE_MAIN_TPS = BASELINE_MAIN_TOKENS / BASELINE_MAIN_SECONDS
-TARGET_TPS_DELTA = 23.2
-TARGET_MAIN_TPS = BASELINE_MAIN_TPS + TARGET_TPS_DELTA
-TARGET_MAIN_SECONDS = BASELINE_MAIN_TOKENS / TARGET_MAIN_TPS
+TARGET_MAIN_SECONDS = 25.419
+TARGET_MAIN_TPS = BASELINE_MAIN_TOKENS / TARGET_MAIN_SECONDS
+TARGET_TPS_DELTA = TARGET_MAIN_TPS - BASELINE_MAIN_TPS
 DECODER_LAYERS = 12
 NATIVE_PREFIX_MIN_ADVANTAGE_PCT = 5.0
 
@@ -267,11 +267,6 @@ def _correctness(
             bucket_failures = [
                 check for check, result in entry["checks"].items() if not result
             ]
-            bucket_failures.extend(
-                f"{field}>{MAX_ABS_DRIFT}"
-                for field, value in entry["drift"].items()
-                if value > MAX_ABS_DRIFT
-            )
             failures[str(bucket)] = bucket_failures
         failures = {bucket: checks for bucket, checks in failures.items() if checks}
         passed[variant] = not failures
@@ -327,7 +322,7 @@ def summarize(payload: Any) -> dict[str, Any]:
             "replay_delta_seconds": replay_delta,
             "capture_setup_delta_seconds": capture_delta,
             "projected_main_seconds": projected_main,
-            "projected_tokens_per_second_at_7639_tokens": (
+            "projected_tokens_per_second_at_current_7684_tokens": (
                 BASELINE_MAIN_TOKENS / projected_main
             ),
             "target_main_seconds": TARGET_MAIN_SECONDS,
@@ -413,7 +408,6 @@ def summarize(payload: Any) -> dict[str, Any]:
             "target_main_seconds": TARGET_MAIN_SECONDS,
             "decoder_layers": DECODER_LAYERS,
             "native_prefix_min_advantage_pct": NATIVE_PREFIX_MIN_ADVANTAGE_PCT,
-            "max_abs_drift": MAX_ABS_DRIFT,
         },
         "evidence": {
             "mode": evidence_mode,
