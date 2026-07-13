@@ -470,6 +470,18 @@ def profile(args, *, mode: str, batch_size: int, seed: int) -> dict[str, Any]:
         float(row["wall_seconds"]) * int(row["batch_size"])
         for row in records
     )
+    warm_records = [
+        row
+        for row in records
+        if float(row.get("decode_graph_capture_seconds_delta", 0.0) or 0.0)
+        == 0.0
+    ]
+    capture_affected_records = [
+        row
+        for row in records
+        if float(row.get("decode_graph_capture_seconds_delta", 0.0) or 0.0)
+        != 0.0
+    ]
     batches_by_iteration: dict[int, list[int]] = {}
     for row in records:
         batches_by_iteration.setdefault(
@@ -530,10 +542,19 @@ def profile(args, *, mode: str, batch_size: int, seed: int) -> dict[str, Any]:
             "model_elapsed_seconds": model_wall,
             "prompt_stack_seconds": prompt_wall,
             "graph_capture_seconds": graph["capture_seconds"],
-            "warm_decode_estimate_seconds": max(
+            "model_wall_excluding_capture_seconds": max(
                 0.0,
                 model_wall - graph["capture_seconds"],
             ),
+            "warm_decode_wall_seconds": sum(
+                float(row["model_elapsed_seconds"]) for row in warm_records
+            ),
+            "warm_decode_record_count": len(warm_records),
+            "capture_affected_decode_wall_seconds": sum(
+                float(row["model_elapsed_seconds"])
+                for row in capture_affected_records
+            ),
+            "capture_affected_decode_record_count": len(capture_affected_records),
             "aggregate_tokens_per_second": (
                 total_generated / complete_seconds if complete_seconds > 0 else 0.0
             ),

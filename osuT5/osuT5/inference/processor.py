@@ -820,6 +820,7 @@ class Processor(object):
             self._record_generation_stats(generation_stats)
             generated_token_ids_per_sample = None
             raw_generated_token_ids_per_sample = None
+            prompt_sha256_per_sample = None
             if self.profiler.enabled:
                 maybe_generated_token_ids = [
                     self._generated_token_ids(row, prompt)
@@ -832,6 +833,12 @@ class Processor(object):
                         [int(token) for token in row[max_len:].detach().cpu().tolist()]
                         for row in result
                     ]
+                prompt_sha256_per_sample = [
+                    hashlib.sha256(
+                        row.detach().contiguous().cpu().numpy().tobytes()
+                    ).hexdigest()
+                    for row in cond_prompt_batch
+                ]
             self._record_generation_profile(
                 profile_label=profile_label,
                 mode="parallel",
@@ -844,12 +851,7 @@ class Processor(object):
                 generation_finished_at_perf_counter_seconds=generation_finished,
                 prompt_tokens_per_sample=cond_prompt_batch.ne(self.tokenizer.pad_id).sum(dim=-1).tolist(),
                 prompt_width=int(cond_prompt_batch.shape[1]),
-                prompt_sha256_per_sample=[
-                    hashlib.sha256(
-                        row.detach().contiguous().cpu().numpy().tobytes()
-                    ).hexdigest()
-                    for row in cond_prompt_batch
-                ],
+                prompt_sha256_per_sample=prompt_sha256_per_sample,
                 output_tokens_per_sample=result.ne(self.tokenizer.pad_id).sum(dim=-1).tolist(),
                 generated_token_ids_per_sample=generated_token_ids_per_sample,
                 raw_generated_token_ids_per_sample=(

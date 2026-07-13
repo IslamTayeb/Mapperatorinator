@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from types import SimpleNamespace
 
-from utils.profile_batched_super_timing_graph import compare_exact
+import torch
+
+from utils.profile_batched_super_timing_graph import _graph_summary, compare_exact
 from utils.summarize_batched_super_timing_graph import summarize
 
 
@@ -98,3 +101,66 @@ def test_ladder_requires_three_exact_deterministic_repetitions_and_five_pct():
     assert result["winning_batch_size"] == 4
     assert result["global_complete_wall_speedup_pct"] == 10.0
     assert result["promotion_pass"]
+
+
+def _cache(batch_size: int):
+    def layers():
+        return [
+            SimpleNamespace(
+                keys=torch.zeros((batch_size, 2, 8, 4)),
+                values=torch.zeros((batch_size, 2, 8, 4)),
+            )
+        ]
+
+    return SimpleNamespace(
+        self_attention_cache=SimpleNamespace(layers=layers()),
+        cross_attention_cache=SimpleNamespace(layers=layers()),
+    )
+
+
+def test_graph_summary_proves_full_and_tail_cache_ownership():
+    from osuT5.osuT5.inference.optimized.single.state import ProductionDecodeSession
+
+    session = ProductionDecodeSession()
+    session.caches = {
+        (1, 4, 1, 1, "torch.float32", "cpu"): _cache(4),
+        (1, 1, 1, 1, "torch.float32", "cpu"): _cache(1),
+    }
+    session.graph_cache[(4,)] = {
+        "static_inputs": {"input_ids": torch.ones((4, 1), dtype=torch.long)},
+        "active_prefix_length": 64,
+        "capture_seconds": 0.1,
+        "decode_replays": 3,
+    }
+    runtime = SimpleNamespace(new_context_state=lambda: session)
+
+    summary = _graph_summary(runtime, expected_batch_sizes={1, 4})
+
+    assert summary["cache_ownership_pass"]
+    assert summary["observed_cache_batches_pass"]
+    assert all(row["families_nonempty"] for row in summary["cache_states"])
+
+
+def test_graph_summary_rejects_cross_state_cache_aliasing():
+    from osuT5.osuT5.inference.optimized.single.state import ProductionDecodeSession
+
+    first = _cache(1)
+    second = _cache(1)
+    second.cross_attention_cache.layers[0].values = (
+        first.cross_attention_cache.layers[0].values
+    )
+    session = ProductionDecodeSession()
+    session.caches = {
+        (1, 1, 1, 1, "torch.float32", "cpu"): first,
+        (2, 1, 1, 1, "torch.float32", "cpu"): second,
+    }
+    runtime = SimpleNamespace(new_context_state=lambda: session)
+
+    summary = _graph_summary(runtime, expected_batch_sizes={1})
+
+    assert not summary["cache_ownership_pass"]
+    assert any(
+        not tensor["unique_storage_across_states"]
+        for row in summary["cache_states"]
+        for tensor in row["tensors"]
+    )
