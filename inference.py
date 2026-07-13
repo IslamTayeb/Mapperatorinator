@@ -31,10 +31,6 @@ from osuT5.osuT5.dataset.data_utils import events_of_type, TIMING_TYPES, merge_e
 from osuT5.osuT5.inference import Preprocessor, Processor, Postprocessor, BeatmapConfig, GenerationConfig, \
     generation_config_from_beatmap, beatmap_config_from_beatmap, background_line
 from osuT5.osuT5.inference.profiler import InferenceProfiler
-from osuT5.osuT5.inference.legacy_single_adapter import (
-    legacy_optimized_single_profile_metadata,
-    validate_legacy_optimized_single,
-)
 from osuT5.osuT5.inference.server import InferenceClient
 from osuT5.osuT5.inference.super_timing_generator import SuperTimingGenerator
 from osuT5.osuT5.model import Mapperatorinator
@@ -378,71 +374,33 @@ def compile_derived_args(args: InferenceConfig):
 
 def validate_reserved_runtime_flags(args: InferenceConfig):
     supported_engines = {"v32", "optimized"}
-    supported_optimized_modes = {"single", "offline_batch", "server"}
     if args.inference_engine not in supported_engines:
         raise ValueError(
             "inference_engine must be one of: " + ", ".join(sorted(supported_engines)) + "."
-        )
-    if args.optimized_inference_mode not in supported_optimized_modes:
-        raise ValueError(
-            "optimized_inference_mode must be one of: "
-            + ", ".join(sorted(supported_optimized_modes))
-            + "."
-        )
-    if args.inference_engine == "v32" and args.optimized_inference_mode != "single":
-        raise ValueError(
-            "optimized_inference_mode is only selectable when inference_engine=optimized; "
-            "leave it at single for the default V32 engine."
         )
     if args.inference_engine == "optimized":
         if args.precision != "fp32":
             raise ValueError("inference_engine=optimized currently requires precision=fp32.")
         if args.use_server:
             raise ValueError(
-                "inference_engine=optimized cannot be combined with the legacy use_server flag; "
-                "select optimized_inference_mode=server when that adapter is implemented."
+                "inference_engine=optimized requires use_server=false."
             )
         if args.parallel:
             raise ValueError(
                 "inference_engine=optimized cannot be combined with the legacy parallel inference path."
             )
-
-        optimized_flag_defaults = {
-            "inference_generation_compile": False,
-            "inference_active_prefix_decode_loop": False,
-            "inference_active_prefix_decode_bucket_size": 128,
-            "inference_active_prefix_decode_cuda_graph": False,
-            "inference_active_prefix_decode_cuda_graph_warmup": 0,
-            "inference_active_prefix_decode_cuda_graph_min_decode_steps": 1,
-            "inference_stateful_monotonic_logits_processor": False,
-            "inference_q1_bmm_cross_attention": False,
-            "inference_decode_session_runtime": False,
-            "inference_decode_session_cuda_graph": False,
-            "inference_decode_session_chunk_size": 1,
-            "inference_native_decode_kernels": False,
-            "inference_native_q1_self_attention": False,
-            "inference_native_q1_rope_cache_self_attention": False,
-        }
-        conflicting_flags = [
-            name for name, default in optimized_flag_defaults.items() if getattr(args, name) != default
-        ]
-        if conflicting_flags:
-            raise ValueError(
-                "inference_engine=optimized owns its runtime configuration and cannot be combined with "
-                "legacy experimental inference flags: " + ", ".join(conflicting_flags)
-            )
         if args.device != "cuda":
-            raise ValueError("inference_engine=optimized single currently requires device=cuda.")
+            raise ValueError("inference_engine=optimized currently requires device=cuda.")
         if args.attn_implementation != "sdpa":
             raise ValueError(
-                "inference_engine=optimized single currently requires attn_implementation=sdpa."
+                "inference_engine=optimized currently requires attn_implementation=sdpa."
             )
         if args.cfg_scale != 1.0:
-            raise ValueError("inference_engine=optimized single currently requires cfg_scale=1.0.")
+            raise ValueError("inference_engine=optimized currently requires cfg_scale=1.0.")
         if args.num_beams != 1:
-            raise ValueError("inference_engine=optimized single currently requires num_beams=1.")
+            raise ValueError("inference_engine=optimized currently requires num_beams=1.")
         if args.super_timing:
-            raise ValueError("inference_engine=optimized single does not support super_timing.")
+            raise ValueError("inference_engine=optimized does not support super_timing.")
 
     def effective_generation_batch_size() -> int:
         batch_multiplier = args.num_beams * (2 if args.cfg_scale > 1.0 else 1)
@@ -450,8 +408,6 @@ def validate_reserved_runtime_flags(args: InferenceConfig):
 
     if args.max_batch_size <= 0:
         raise ValueError("max_batch_size must be positive.")
-    if args.server_batch_timeout <= 0:
-        raise ValueError("server_batch_timeout must be positive.")
     if (args.use_server or args.parallel) and effective_generation_batch_size() <= 0:
         raise ValueError(
             "max_batch_size is too small for the requested batching configuration: "
@@ -463,107 +419,6 @@ def validate_reserved_runtime_flags(args: InferenceConfig):
             "use_server=true and parallel=true are separate batching modes and are not validated together. "
             "Use static IPC server batching or static window batching separately until a mixed-mode harness exists."
         )
-    if args.use_server and args.inference_generation_compile:
-        raise ValueError(
-            "inference_generation_compile=true is not supported with use_server=true. "
-            "The current static IPC server runs generation in a background batch thread, and DCC static-server "
-            "smoke job 49267683 hit a TorchInductor cudagraph TLS AssertionError in that path. "
-            "Use inference_generation_compile=false for server batching until a server-specific compile path "
-            "is validated."
-        )
-
-    validate_legacy_optimized_single(args)
-
-    def require_simple_sequential(flag_name: str) -> None:
-        if args.use_server:
-            raise ValueError(f"{flag_name} requires use_server=false.")
-        if args.parallel:
-            raise ValueError(f"{flag_name} currently supports sequential inference only.")
-        if args.cfg_scale != 1.0:
-            raise ValueError(f"{flag_name} currently requires cfg_scale=1.0.")
-        if args.num_beams != 1:
-            raise ValueError(f"{flag_name} currently requires num_beams=1.")
-
-    if args.inference_active_prefix_decode_loop:
-        require_simple_sequential("inference_active_prefix_decode_loop")
-        if args.inference_active_prefix_decode_bucket_size <= 0:
-            raise ValueError("inference_active_prefix_decode_bucket_size must be positive.")
-        if args.inference_active_prefix_decode_cuda_graph_min_decode_steps <= 0:
-            raise ValueError("inference_active_prefix_decode_cuda_graph_min_decode_steps must be positive.")
-    if args.inference_active_prefix_decode_cuda_graph:
-        if not args.inference_active_prefix_decode_loop:
-            raise ValueError("inference_active_prefix_decode_cuda_graph requires inference_active_prefix_decode_loop=true.")
-        if args.device != "cuda":
-            raise ValueError("inference_active_prefix_decode_cuda_graph requires device=cuda.")
-        require_simple_sequential("inference_active_prefix_decode_cuda_graph")
-    if args.inference_stateful_monotonic_logits_processor:
-        require_simple_sequential("inference_stateful_monotonic_logits_processor")
-        if not args.inference_active_prefix_decode_loop:
-            raise ValueError(
-                "inference_stateful_monotonic_logits_processor is accepted only with "
-                "inference_active_prefix_decode_loop=true."
-            )
-    if args.inference_q1_bmm_cross_attention:
-        require_simple_sequential("inference_q1_bmm_cross_attention")
-        if args.precision != "fp32":
-            raise ValueError("inference_q1_bmm_cross_attention currently requires precision=fp32.")
-        if args.attn_implementation != "sdpa":
-            raise ValueError("inference_q1_bmm_cross_attention currently requires attn_implementation=sdpa.")
-        if not args.inference_active_prefix_decode_loop:
-            raise ValueError("inference_q1_bmm_cross_attention requires inference_active_prefix_decode_loop=true.")
-    if args.inference_decode_session_runtime:
-        require_simple_sequential("inference_decode_session_runtime")
-        if not args.inference_active_prefix_decode_loop:
-            raise ValueError("inference_decode_session_runtime requires inference_active_prefix_decode_loop=true.")
-        if not args.inference_active_prefix_decode_cuda_graph:
-            raise ValueError("inference_decode_session_runtime requires inference_active_prefix_decode_cuda_graph=true.")
-        if not args.inference_decode_session_cuda_graph:
-            raise ValueError("inference_decode_session_runtime requires inference_decode_session_cuda_graph=true.")
-    if args.inference_decode_session_cuda_graph:
-        if not args.inference_decode_session_runtime:
-            raise ValueError("inference_decode_session_cuda_graph requires inference_decode_session_runtime=true.")
-    if args.inference_decode_session_chunk_size != 1:
-        raise NotImplementedError(
-            "inference_decode_session_chunk_size is reserved and must remain 1 until chunked DecodeSession "
-            "generation preserves exact RNG/token behavior."
-        )
-    if args.inference_native_q1_rope_cache_self_attention and not args.inference_native_q1_self_attention:
-        raise ValueError(
-            "inference_native_q1_rope_cache_self_attention requires "
-            "inference_native_q1_self_attention=true."
-        )
-    if args.inference_native_q1_self_attention:
-        if not args.inference_native_decode_kernels:
-            raise ValueError("inference_native_q1_self_attention requires inference_native_decode_kernels=true.")
-        if args.device != "cuda":
-            raise ValueError("inference_native_q1_self_attention requires device=cuda.")
-        if args.precision != "fp32":
-            raise ValueError("inference_native_q1_self_attention currently requires precision=fp32.")
-        if args.attn_implementation != "sdpa":
-            raise ValueError("inference_native_q1_self_attention currently requires attn_implementation=sdpa.")
-        require_simple_sequential("inference_native_q1_self_attention")
-        if not args.inference_active_prefix_decode_loop:
-            raise ValueError("inference_native_q1_self_attention requires inference_active_prefix_decode_loop=true.")
-        if not args.inference_active_prefix_decode_cuda_graph:
-            raise ValueError("inference_native_q1_self_attention requires inference_active_prefix_decode_cuda_graph=true.")
-        if not args.inference_decode_session_runtime:
-            raise ValueError("inference_native_q1_self_attention requires inference_decode_session_runtime=true.")
-        if not args.inference_decode_session_cuda_graph:
-            raise ValueError("inference_native_q1_self_attention requires inference_decode_session_cuda_graph=true.")
-    elif args.inference_native_decode_kernels:
-        raise NotImplementedError(
-            "inference_native_decode_kernels currently only has the explicitly selected "
-            "inference_native_q1_self_attention experiment."
-        )
-    if args.profile_model_generate_cuda_ledger:
-        if not args.profile_inference:
-            raise ValueError("profile_model_generate_cuda_ledger requires profile_inference=true.")
-        if not args.profile_sync_cuda:
-            raise ValueError("profile_model_generate_cuda_ledger requires profile_sync_cuda=true.")
-        if args.device != "cuda":
-            raise ValueError("profile_model_generate_cuda_ledger requires device=cuda.")
-
-
 def compile_args(args: InferenceConfig, verbose=True):
     """Validates and populates missing args."""
     compile_device_and_seed(args, verbose=verbose)
@@ -689,36 +544,11 @@ def generate(
         "precision": args.precision,
         "attn_implementation": args.attn_implementation,
         "inference_engine": args.inference_engine,
-        "optimized_inference_mode": args.optimized_inference_mode,
         "use_server": args.use_server,
-        "server_batch_timeout": args.server_batch_timeout,
         "parallel": args.parallel,
         "max_batch_size": args.max_batch_size,
         "server_rng_policy": "shared_global" if args.use_server else None,
         "token_equivalence_status": "not_checked_shared_server_rng" if args.use_server else None,
-        "inference_generation_compile": args.inference_generation_compile,
-        "inference_active_prefix_decode_loop": args.inference_active_prefix_decode_loop,
-        "inference_active_prefix_decode_bucket_size": args.inference_active_prefix_decode_bucket_size,
-        "inference_active_prefix_decode_cuda_graph": args.inference_active_prefix_decode_cuda_graph,
-        "inference_active_prefix_decode_cuda_graph_warmup": args.inference_active_prefix_decode_cuda_graph_warmup,
-        "inference_active_prefix_decode_cuda_graph_min_decode_steps": (
-            args.inference_active_prefix_decode_cuda_graph_min_decode_steps
-        ),
-        "inference_stateful_monotonic_logits_processor": args.inference_stateful_monotonic_logits_processor,
-        "inference_q1_bmm_cross_attention": args.inference_q1_bmm_cross_attention,
-        "inference_decode_session_runtime": args.inference_decode_session_runtime,
-        "inference_decode_session_cuda_graph": args.inference_decode_session_cuda_graph,
-        "inference_decode_session_chunk_size": args.inference_decode_session_chunk_size,
-        "inference_native_decode_kernels": args.inference_native_decode_kernels,
-        "inference_native_q1_self_attention": args.inference_native_q1_self_attention,
-        "inference_native_q1_rope_cache_self_attention": args.inference_native_q1_rope_cache_self_attention,
-        "profile_record_token_ids": args.profile_record_token_ids,
-        "profile_sync_cuda": args.profile_sync_cuda,
-        "profile_model_generate_cuda_ledger": args.profile_model_generate_cuda_ledger,
-        "profile_torch_generation": args.profile_torch_generation,
-        "profile_nvtx_generation_ranges": args.profile_nvtx_generation_ranges,
-        "profile_generation_detail_ranges": args.profile_generation_detail_ranges,
-        "profile_sdpa_backend": args.profile_sdpa_backend,
         "seed": args.seed,
         "temperature": args.temperature,
         "timing_temperature": args.timing_temperature,
@@ -737,7 +567,6 @@ def generate(
         "in_context": [context.value for context in args.in_context],
         "output_type": [context.value for context in args.output_type],
     }
-    profile_metadata.update(legacy_optimized_single_profile_metadata(args))
     binding_runtime = getattr(model, "runtime", None)
     runtime_profile_metadata = getattr(binding_runtime, "profile_metadata", None)
     if callable(runtime_profile_metadata):
@@ -893,51 +722,20 @@ def generate(
     if profiler.enabled:
         result_metadata.update(file_artifact_metadata(result_path))
     profiler.set_metadata(**result_metadata)
-    profile_path = profiler.write(args.profile_output_path or profiler.default_output_path(result_path))
+    profile_path = profiler.write(profiler.default_output_path(result_path))
     if verbose and profile_path is not None:
         logger.info(f"Inference profile saved to {profile_path}")
 
     return result, result_path
 
 
-def _sanitize_socket_component(value) -> str:
-    return str(value).replace(" ", "_").replace("/", "_").replace("\\", "_").replace(".", "_")
-
-
-def get_server_runtime_key(
-        *,
-        max_batch_size: int,
-        server_batch_timeout: float,
-        device,
-        precision: str,
-        attn_implementation: str,
-        generation_compile: bool,
-) -> str:
-    return "__".join(
-        f"{key}-{_sanitize_socket_component(value)}"
-        for key, value in {
-            "mb": int(max_batch_size),
-            "bt": f"{float(server_batch_timeout):.6g}",
-            "dev": device,
-            "p": precision,
-            "attn": attn_implementation,
-            "compile": int(bool(generation_compile)),
-        }.items()
-    )
-
-
 def load_model_with_server(ckpt_path: str | Path | None, t5_args: TrainConfig, device, max_batch_size: int = 8,
                            use_server: bool = False, precision: str = "fp32", attn_implementation: str = "sdpa",
                            eval_mode: bool = True, lora_path=None, gamemode: int | None = None,
-                           auto_select_gamemode_model: bool = True, generation_compile: bool = False,
-                           server_allow_auto_start: bool = True, server_connect_timeout: float | None = 60.0,
-                           server_request_timeout: float | None = None, server_idle_timeout: float = 20,
-                           server_batch_timeout: float = 0.2):
+                           auto_select_gamemode_model: bool = True, generation_compile: bool = False):
     if use_server and generation_compile:
         raise ValueError(
-            "inference_generation_compile=true is not supported with use_server=true. "
-            "Call compile_args()/validate_reserved_runtime_flags() before loading, or disable generation compile "
-            "for static IPC server batching."
+            "The internal generation-compile path cannot be combined with the V32 server."
         )
     model_loader, tokenizer_loader = load_model_loaders(
         ckpt_path=ckpt_path,
@@ -957,25 +755,12 @@ def load_model_with_server(ckpt_path: str | Path | None, t5_args: TrainConfig, d
         model_loader,
         tokenizer_loader,
         max_batch_size=max_batch_size,
-        batch_timeout=server_batch_timeout,
         socket_path=get_server_address(
             ckpt_path,
             lora_path=lora_path,
             gamemode=gamemode,
             auto_select_gamemode_model=auto_select_gamemode_model,
-            server_runtime_key=get_server_runtime_key(
-                max_batch_size=max_batch_size,
-                server_batch_timeout=server_batch_timeout,
-                device=device,
-                precision=precision,
-                attn_implementation=attn_implementation,
-                generation_compile=generation_compile,
-            ),
         ),
-        allow_auto_start=server_allow_auto_start,
-        connect_timeout=server_connect_timeout,
-        request_timeout=server_request_timeout,
-        idle_timeout=server_idle_timeout,
     ) if use_server else model_loader(), tokenizer_loader()
 
 
@@ -991,14 +776,7 @@ def load_model_with_engine(
         lora_path=None,
         gamemode: int | None = None,
         auto_select_gamemode_model: bool = True,
-        generation_compile: bool = False,
-        server_allow_auto_start: bool = True,
-        server_connect_timeout: float | None = 60.0,
-        server_request_timeout: float | None = None,
-        server_idle_timeout: float = 20,
-        server_batch_timeout: float = 0.2,
         inference_engine: str = "v32",
-        optimized_inference_mode: str = "single",
 ):
     """Select the public runtime without importing optimized code on the V32 path."""
 
@@ -1014,12 +792,7 @@ def load_model_with_engine(
         "lora_path": lora_path,
         "gamemode": gamemode,
         "auto_select_gamemode_model": auto_select_gamemode_model,
-        "generation_compile": generation_compile,
-        "server_allow_auto_start": server_allow_auto_start,
-        "server_connect_timeout": server_connect_timeout,
-        "server_request_timeout": server_request_timeout,
-        "server_idle_timeout": server_idle_timeout,
-        "server_batch_timeout": server_batch_timeout,
+        "generation_compile": False,
     }
     if inference_engine == "v32":
         return load_model_with_server(**loader_kwargs)
@@ -1028,7 +801,6 @@ def load_model_with_engine(
 
     adapter = importlib.import_module("osuT5.osuT5.inference.optimized.adapter")
     return adapter.load_optimized_engine(
-        mode=optimized_inference_mode,
         model_loader=load_model_with_server,
         loader_kwargs=loader_kwargs,
     )
@@ -1039,7 +811,6 @@ def get_server_address(
         lora_path: str | Path | None = None,
         gamemode: int | None = None,
         auto_select_gamemode_model: bool = True,
-        server_runtime_key: str | None = None,
 ):
     """
     Get a valid socket address for the OS and model version.
@@ -1061,8 +832,6 @@ def get_server_address(
     if effective_lora_path:
         effective_lora_str = effective_lora_path.as_posix() if isinstance(effective_lora_path, Path) else str(effective_lora_path)
         ckpt_path_str = f"{ckpt_path_str}__lora__{effective_lora_str}"
-    if server_runtime_key:
-        ckpt_path_str = f"{ckpt_path_str}__server__{server_runtime_key}"
     ckpt_path_str = _sanitize_socket_component(ckpt_path_str)
     # Check if the OS supports Unix sockets
     if os.name == 'posix':
@@ -1118,10 +887,7 @@ def main(args: InferenceConfig):
                                                   precision=args.precision, attn_implementation=args.attn_implementation,
                                                   lora_path=args.lora_path, gamemode=args.gamemode,
                                                   auto_select_gamemode_model=args.auto_select_gamemode_model,
-                                                  generation_compile=args.inference_generation_compile,
-                                                  server_batch_timeout=args.server_batch_timeout,
-                                                  inference_engine=args.inference_engine,
-                                                  optimized_inference_mode=args.optimized_inference_mode)
+                                                  inference_engine=args.inference_engine)
 
     timing_model, timing_tokenizer = None, None
     if should_load_separate_timing_model(args):
@@ -1137,10 +903,7 @@ def main(args: InferenceConfig):
                 attn_implementation=args.attn_implementation,
                 gamemode=args.gamemode,
                 auto_select_gamemode_model=False,
-                generation_compile=args.inference_generation_compile,
-                server_batch_timeout=args.server_batch_timeout,
                 inference_engine=args.inference_engine,
-                optimized_inference_mode=args.optimized_inference_mode,
             )
 
     diff_model, diff_tokenizer, refine_model = None, None, None

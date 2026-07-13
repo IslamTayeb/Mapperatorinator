@@ -181,9 +181,9 @@ def test_q1_bmm_only_context_imports_dispatch_without_native_extension():
     completed = _run_fresh_python(
         """
 import sys
-from osuT5.osuT5.runtime_profiling import generation_profile_context
+from osuT5.osuT5.inference.optimized.single.runtime_context import attention_runtime_context
 
-with generation_profile_context(q1_bmm_cross_attention=True):
+with attention_runtime_context(q1_bmm_cross_attention=True):
     assert "osuT5.osuT5.inference.optimized.kernels.dispatch" in sys.modules
 assert "osuT5.osuT5.inference.optimized.kernels.q1_attention" not in sys.modules
 assert "torch.utils.cpp_extension" not in sys.modules
@@ -194,7 +194,7 @@ assert "torch.utils.cpp_extension" not in sys.modules
 
 def test_native_generation_context_preloads_then_installs_hooks(monkeypatch):
     from osuT5.osuT5.inference.optimized.kernels import q1_attention
-    from osuT5.osuT5.runtime_profiling import generation_profile_context
+    from osuT5.osuT5.inference.optimized.single.runtime_context import attention_runtime_context
 
     events = []
     monkeypatch.setattr(
@@ -203,7 +203,7 @@ def test_native_generation_context_preloads_then_installs_hooks(monkeypatch):
         lambda: events.append("preload"),
     )
     empty = attention_runtime_hooks()
-    with generation_profile_context(native_q1_self_attention=True):
+    with attention_runtime_context(native_q1_self_attention=True):
         events.append("entered")
         hooks = attention_runtime_hooks()
         assert hooks.sdpa_attention_forward is not None
@@ -213,21 +213,21 @@ def test_native_generation_context_preloads_then_installs_hooks(monkeypatch):
 
 
 def test_q1_bmm_context_installs_only_sdpa_hook():
-    from osuT5.osuT5.runtime_profiling import generation_profile_context
+    from osuT5.osuT5.inference.optimized.single.runtime_context import attention_runtime_context
 
-    with generation_profile_context(q1_bmm_cross_attention=True):
+    with attention_runtime_context(q1_bmm_cross_attention=True):
         hooks = attention_runtime_hooks()
         assert hooks.sdpa_attention_forward is not None
         assert hooks.q1_rope_cache_self_attention_forward is None
 
 
 def test_nested_default_generation_context_temporarily_disables_attention_hooks():
-    from osuT5.osuT5.runtime_profiling import generation_profile_context
+    from osuT5.osuT5.inference.optimized.single.runtime_context import attention_runtime_context
 
-    with generation_profile_context(q1_bmm_cross_attention=True):
+    with attention_runtime_context(q1_bmm_cross_attention=True):
         outer_hooks = attention_runtime_hooks()
         assert outer_hooks.sdpa_attention_forward is not None
-        with generation_profile_context():
+        with attention_runtime_context():
             inner_hooks = attention_runtime_hooks()
             assert inner_hooks.sdpa_attention_forward is None
             assert inner_hooks.q1_rope_cache_self_attention_forward is None
@@ -240,10 +240,9 @@ def test_active_prefix_context_owns_state_and_preserves_other_hooks():
         active_prefix_self_attention_length,
         attention_runtime_context,
     )
-    from osuT5.osuT5.runtime_profiling import generation_profile_context
 
     assert active_prefix_self_attention_length() is None
-    with generation_profile_context(q1_bmm_cross_attention=True):
+    with attention_runtime_context(q1_bmm_cross_attention=True):
         q1_hook = attention_runtime_hooks().sdpa_attention_forward
         with active_prefix_self_attention_context(64):
             hooks = attention_runtime_hooks()
@@ -271,10 +270,10 @@ def test_active_prefix_context_owns_state_and_preserves_other_hooks():
 
 def test_fused_generation_context_installs_only_fused_hook(monkeypatch):
     from osuT5.osuT5.inference.optimized.kernels import q1_attention
-    from osuT5.osuT5.runtime_profiling import generation_profile_context
+    from osuT5.osuT5.inference.optimized.single.runtime_context import attention_runtime_context
 
     monkeypatch.setattr(q1_attention, "preload_native_q1_attention", lambda: None)
-    with generation_profile_context(native_q1_rope_cache_self_attention=True):
+    with attention_runtime_context(native_q1_rope_cache_self_attention=True):
         hooks = attention_runtime_hooks()
         assert hooks.sdpa_attention_forward is None
         assert hooks.q1_rope_cache_self_attention_forward is not None

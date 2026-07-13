@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import subprocess
-import sys
-from pathlib import Path
 from types import SimpleNamespace
 
 from osuT5.osuT5.inference.optimized.single import state as state_module
@@ -102,35 +99,12 @@ def test_session_with_existing_cache_resets_on_first_window():
     assert cache.is_updated == {0: False, 2: False}
 
 
-def test_processor_constructs_typed_session_only_on_explicit_request():
-    repo_root = Path(__file__).resolve().parents[1]
-    code = r'''\
-import sys
-from osuT5.osuT5.inference.processor import Processor
-
-assert "osuT5.osuT5.inference.optimized.single.state" not in sys.modules
-processor = object.__new__(Processor)
-processor.inference_runtime = None
-session = processor._new_decode_session_state()
-assert type(session).__name__ == "ProductionDecodeSession"
-assert "osuT5.osuT5.inference.optimized.single.state" in sys.modules
-'''
-    result = subprocess.run(
-        [sys.executable, "-c", code],
-        cwd=repo_root,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert result.returncode == 0, result.stderr
-
-
 def test_sequential_generation_creates_one_session_per_unfinished_context():
     from osuT5.osuT5.inference.processor import Processor
 
     processor = object.__new__(Processor)
-    processor.args = SimpleNamespace(inference_decode_session_runtime=True)
-    processor.inference_runtime = None
+    processor.args = SimpleNamespace()
+    processor.inference_runtime = object()
     processor.decode_session_state = object()
     processor._create_tokens_per_second_meter = lambda: object()
     created = []

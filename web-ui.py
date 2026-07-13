@@ -36,7 +36,7 @@ from config import InferenceConfig
 from osuT5.osuT5.event import ContextType
 from osuT5.osuT5.inference.server import InferenceClient
 from osuT5.osuT5.utils import load_model_loaders
-from inference import compile_args, get_server_address, get_server_runtime_key, main, should_load_separate_timing_model
+from inference import compile_args, get_server_address, main, should_load_separate_timing_model
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 template_folder = os.path.join(script_dir, 'template')
@@ -295,25 +295,11 @@ shutdown_started = False
 
 
 def _ensure_model_server(args, *, auto_select_gamemode_model: bool, lora_path: str | None):
-    if args.inference_generation_compile:
-        raise ValueError(
-            "inference_generation_compile=true is not supported with use_server=true. "
-            "Disable generation compile for the web UI static IPC server path."
-        )
-    server_runtime_key = get_server_runtime_key(
-        max_batch_size=args.max_batch_size,
-        server_batch_timeout=args.server_batch_timeout,
-        device=args.device,
-        precision=args.precision,
-        attn_implementation=args.attn_implementation,
-        generation_compile=args.inference_generation_compile,
-    )
     socket_path = get_server_address(
         args.model_path,
         lora_path=lora_path,
         gamemode=args.gamemode,
         auto_select_gamemode_model=auto_select_gamemode_model,
-        server_runtime_key=server_runtime_key,
     )
 
     with owned_server_clients_lock:
@@ -339,7 +325,6 @@ def _ensure_model_server(args, *, auto_select_gamemode_model: bool, lora_path: s
         model_loader,
         tokenizer_loader,
         max_batch_size=args.max_batch_size,
-        batch_timeout=args.server_batch_timeout,
         idle_timeout=3600,
         server_thread_daemon=True,
         socket_path=socket_path,

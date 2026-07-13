@@ -51,9 +51,9 @@ def active_prefix_self_attention_context(
 @contextmanager
 def attention_runtime_context(
     *,
-    q1_bmm_cross_attention: bool,
-    native_q1_self_attention: bool,
-    native_q1_rope_cache_self_attention: bool,
+    q1_bmm_cross_attention: bool = False,
+    native_q1_self_attention: bool = False,
+    native_q1_rope_cache_self_attention: bool = False,
 ) -> Iterator[None]:
     from ..kernels.dispatch import (
         q1_rope_cache_self_attention_forward,

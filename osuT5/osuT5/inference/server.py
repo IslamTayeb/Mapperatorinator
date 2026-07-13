@@ -4,19 +4,14 @@ import time
 import threading
 import traceback
 import torch
-from dataclasses import dataclass, field
 from multiprocessing.connection import Listener, Client
-from typing import Any
 
-from transformers import LogitsProcessorList, ClassifierFreeGuidanceLogitsProcessor, TemperatureLogitsWarper
+from transformers import LogitsProcessorList, ClassifierFreeGuidanceLogitsProcessor
 
-from ..event import EventType, ContextType
-from .logit_processors import ConditionalTemperatureLogitsWarper, get_beat_type_tokens, \
-    get_mania_type_tokens, get_scroll_speed_tokens, TimeshiftBias, LookbackBiasLogitsWarper, \
-    MonotonicTimeShiftLogitsProcessor
+from ..event import ContextType
 from .cache_utils import get_cache
-from .generation_compatibility import generation_compatibility_key
-from ..runtime_profiling import generation_profile_context
+from .generation_utils import build_generation_stats, eos_token_ids, sync_cuda_for_model
+from .logit_processors import build_logits_processor_list
 from ..model import Mapperatorinator
 from ..tokenizer import Tokenizer
 
@@ -24,170 +19,16 @@ from ..tokenizer import Tokenizer
 SOCKET_PATH = r'\\.\pipe\Mapperatorinator'
 
 MILISECONDS_PER_SECOND = 1000
-MILISECONDS_PER_STEP = 10
-
 RETRY_SIGNAL = "RETRY_SIGNAL"
 
 
-@dataclass
-class StaticServerRequest:
-    model_kwargs: dict[str, Any]
-    total_work: int
-    conn: Any
-    event: threading.Event
-    work_done: int = 0
-    result: Any = None
-    generated_tokens: int = 0
-    prompt_tokens: int = 0
-    output_tokens: int = 0
-    generated_tokens_per_sample: list[int] = field(default_factory=list)
-    prompt_tokens_per_sample: list[int] = field(default_factory=list)
-    output_tokens_per_sample: list[int] = field(default_factory=list)
-    elapsed_seconds: float = 0.0
-    enqueued_at: float = field(default_factory=time.perf_counter)
-    queued_at: float = field(default_factory=time.perf_counter)
-    server_batch_ids: list[int] = field(default_factory=list)
-    server_batch_sizes: list[int] = field(default_factory=list)
-    server_batch_request_counts: list[int] = field(default_factory=list)
-    server_batch_work_items: list[int] = field(default_factory=list)
-    server_batch_elapsed_seconds: list[float] = field(default_factory=list)
-    server_queue_wait_seconds: list[float] = field(default_factory=list)
-    server_first_queue_wait_seconds: float | None = None
-
-    @property
-    def remaining_work(self) -> int:
-        return self.total_work - self.work_done
-
-
-@dataclass
-class StaticServerRequestGroup:
-    generate_kwargs: dict[str, Any]
-    requests: list[StaticServerRequest] = field(default_factory=list)
-
-
-def _prompt_token_counts(model_kwargs, pad_token_id: int | None) -> torch.Tensor | None:
-    decoder_attention_mask = model_kwargs.get("decoder_attention_mask")
-    if isinstance(decoder_attention_mask, torch.Tensor):
-        return decoder_attention_mask.to(torch.long).sum(dim=-1).cpu()
-
-    decoder_input_ids = model_kwargs.get("decoder_input_ids")
-    if not isinstance(decoder_input_ids, torch.Tensor):
-        return None
-
-    if pad_token_id is None:
-        return torch.full((decoder_input_ids.shape[0],), decoder_input_ids.shape[1], dtype=torch.long)
-
-    return decoder_input_ids.ne(pad_token_id).to(torch.long).sum(dim=-1).cpu()
-
-
-def _output_token_counts(result: torch.Tensor, pad_token_id: int | None) -> torch.Tensor:
-    if pad_token_id is None:
-        return torch.full((result.shape[0],), result.shape[1], dtype=torch.long)
-
-    return result.ne(pad_token_id).to(torch.long).sum(dim=-1)
-
-
-def _build_generation_stats(
-        result: torch.Tensor,
-        model_kwargs: dict,
-        pad_token_id: int | None,
-        elapsed_seconds: float,
-) -> dict:
-    prompt_token_counts = _prompt_token_counts(model_kwargs, pad_token_id)
-    output_token_counts = _output_token_counts(result, pad_token_id).cpu()
-    generated_token_counts = output_token_counts.clone()
-    if prompt_token_counts is not None:
-        generated_token_counts = torch.clamp(generated_token_counts - prompt_token_counts, min=0)
-
-    generated_tokens = int(generated_token_counts.sum().item())
-    tokens_per_second = generated_tokens / elapsed_seconds if elapsed_seconds > 0 else 0.0
-    prompt_tokens = int(prompt_token_counts.sum().item()) if prompt_token_counts is not None else None
-
-    return {
-        "batch_size": int(result.shape[0]),
-        "prompt_tokens": prompt_tokens,
-        "prompt_tokens_per_sample": prompt_token_counts.tolist() if prompt_token_counts is not None else None,
-        "output_tokens": int(output_token_counts.sum().item()),
-        "output_tokens_per_sample": output_token_counts.tolist(),
-        "generated_tokens": generated_tokens,
-        "generated_tokens_per_sample": generated_token_counts.tolist(),
-        "elapsed_seconds": float(elapsed_seconds),
-        "tokens_per_second": tokens_per_second,
-    }
-
-
 def get_eos_token_id(tokenizer, lookback_time: float = 0, lookahead_time: float = 0, context_type: ContextType = None):
-    eos_token_id = [tokenizer.eos_id]
-    if context_type is not None and context_type in tokenizer.context_eos:
-        eos_token_id.append(tokenizer.context_eos[context_type])
-    if lookback_time > 0:
-        eos_token_id.extend(range(tokenizer.event_start[EventType.TIME_SHIFT], tokenizer.event_start[EventType.TIME_SHIFT] + int(lookback_time / MILISECONDS_PER_STEP)))
-    if lookahead_time > 0:
-        eos_token_id.extend(range(tokenizer.event_end[EventType.TIME_SHIFT] - int(lookahead_time / MILISECONDS_PER_STEP), tokenizer.event_end[EventType.TIME_SHIFT]))
-    return eos_token_id
-
-
-def build_logits_processor_list(
+    return eos_token_ids(
         tokenizer,
-        *,
-        cfg_scale: float = 1.0,
-        timeshift_bias: float = 0.0,
-        types_first: bool = False,
-        temperature: float = 1.0,
-        timing_temperature: float | None = None,
-        mania_column_temperature: float | None = None,
-        taiko_hit_temperature: float | None = None,
-        lookback_time: float = 0.0,
-        device=None,
-        stateful_monotonic: bool = False,
-) -> LogitsProcessorList:
-    timing_temperature = temperature if timing_temperature is None else timing_temperature
-    mania_column_temperature = temperature if mania_column_temperature is None else mania_column_temperature
-    taiko_hit_temperature = temperature if taiko_hit_temperature is None else taiko_hit_temperature
-    device = device if device is not None else getattr(tokenizer, "device", None)
-
-    logits_processor_list = LogitsProcessorList()
-    if cfg_scale > 1.0:
-        logits_processor_list.append(ClassifierFreeGuidanceLogitsProcessor(cfg_scale))
-
-    if stateful_monotonic:
-        raise ValueError(
-            "stateful monotonic processing is owned by optimized single "
-            "inference; use inference_engine=optimized or the complete accepted "
-            "legacy bundle."
-        )
-    logits_processor_list.append(MonotonicTimeShiftLogitsProcessor(tokenizer))
-
-    if timeshift_bias != 0:
-        logits_processor_list.append(
-            TimeshiftBias(
-                timeshift_bias,
-                tokenizer.event_start[EventType.TIME_SHIFT],
-                tokenizer.event_end[EventType.TIME_SHIFT]
-            )
-        )
-    if types_first:
-        logits_processor_list.append(ConditionalTemperatureLogitsWarper(
-            temperature,
-            timing_temperature,
-            mania_column_temperature,
-            taiko_hit_temperature,
-            types_first,
-            get_beat_type_tokens(tokenizer),
-            get_mania_type_tokens(tokenizer),
-            get_scroll_speed_tokens(tokenizer),
-        ))
-    else:
-        logits_processor_list.append(TemperatureLogitsWarper(temperature))
-    if lookback_time > 0:
-        logits_processor_list.append(LookbackBiasLogitsWarper(lookback_time, tokenizer, types_first, device))
-
-    return logits_processor_list
-
-
-def _sync_cuda_for_model(model) -> None:
-    if torch.cuda.is_available() and getattr(getattr(model, "device", None), "type", None) == "cuda":
-        torch.cuda.synchronize(model.device)
+        lookback_time=lookback_time,
+        lookahead_time=lookahead_time,
+        context_type=context_type,
+    )
 
 
 @torch.no_grad()
@@ -210,35 +51,6 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
     lookahead_time = generate_kwargs.pop('lookahead_time', 0.0)
     context_type = generate_kwargs.pop('context_type', None)
     sync_model_timing = bool(generate_kwargs.pop('sync_model_timing', False))
-    profile_model_generate_cuda_ledger = bool(generate_kwargs.pop('profile_model_generate_cuda_ledger', False))
-    profile_generation_detail_ranges = bool(generate_kwargs.pop('profile_generation_detail_ranges', False))
-    profile_active_prefix_decode_diagnostics = bool(generate_kwargs.pop('profile_active_prefix_decode_diagnostics', False))
-    profile_sdpa_backend = generate_kwargs.pop('profile_sdpa_backend', None)
-    optimized_defaults = {
-        'active_prefix_decode_loop': False,
-        'active_prefix_decode_bucket_size': 128,
-        'active_prefix_decode_cuda_graph': False,
-        'active_prefix_decode_cuda_graph_warmup': 0,
-        'active_prefix_decode_cuda_graph_min_decode_steps': 1,
-        'stateful_monotonic_logits_processor': False,
-        'q1_bmm_cross_attention': False,
-        'native_q1_self_attention': False,
-        'native_q1_rope_cache_self_attention': False,
-        'decode_session_cuda_graph': False,
-    }
-    changed_optimized_options = [
-        name
-        for name, default in optimized_defaults.items()
-        if generate_kwargs.pop(name, default) != default
-    ]
-    decode_session_state = generate_kwargs.pop('decode_session_state', None)
-    if changed_optimized_options or decode_session_state is not None:
-        raise ValueError(
-            "Optimized generation state is no longer implemented in server.py; "
-            "use inference_engine=optimized or the complete accepted legacy "
-            "bundle through Processor. Changed options: "
-            + ", ".join(changed_optimized_options or ["decode_session_state"])
-        )
     if context_type is not None:
         context_type = ContextType(context_type)  # Convert to ContextType enum
 
@@ -254,38 +66,17 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
         taiko_hit_temperature=taiko_hit_temperature,
         lookback_time=lookback_time,
         device=model.device,
-        stateful_monotonic=False,
     )
 
     # Prepare cache
-    cache = get_cache(
-        model,
-        batch_size,
-        generate_kwargs.get('num_beams', 1),
-        cfg_scale,
-    )
+    cache = get_cache(model, batch_size, generate_kwargs.get('num_beams', 1), cfg_scale)
     pad_token_id = generate_kwargs.get('pad_token_id', getattr(tokenizer, 'pad_id', None))
 
     # Perform batched generation
-    generate_start_event = generate_end_event = None
-    generate_cuda_event_seconds = None
-    with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16, enabled=precision == 'amp'), \
-            generation_profile_context(
-                detail_ranges=profile_generation_detail_ranges,
-                sdpa_backend=profile_sdpa_backend,
-            ):
+    with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16, enabled=precision == 'amp'):
         if sync_model_timing:
-            _sync_cuda_for_model(model)
-            if (
-                profile_model_generate_cuda_ledger
-                and torch.cuda.is_available()
-                and getattr(getattr(model, "device", None), "type", None) == "cuda"
-            ):
-                generate_start_event = torch.cuda.Event(enable_timing=True)
-                generate_end_event = torch.cuda.Event(enable_timing=True)
+            sync_cuda_for_model(model)
         start_time = time.perf_counter()
-        if generate_start_event is not None:
-            generate_start_event.record()
         result = model.generate(
             **model_kwargs,
             **generate_kwargs,
@@ -293,54 +84,14 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
             past_key_values=cache,
             logits_processor=logits_processor_list,
             eos_token_id=get_eos_token_id(tokenizer, lookback_time=lookback_time, lookahead_time=lookahead_time, context_type=context_type),
-            custom_generate=None,
         )
-        if generate_end_event is not None:
-            generate_end_event.record()
         if sync_model_timing:
-            _sync_cuda_for_model(model)
+            sync_cuda_for_model(model)
         elapsed_seconds = time.perf_counter() - start_time
-        if generate_start_event is not None and generate_end_event is not None:
-            generate_cuda_event_seconds = float(generate_start_event.elapsed_time(generate_end_event)) / 1000.0
 
     result = result.cpu()
-    stats = _build_generation_stats(result, model_kwargs, pad_token_id, elapsed_seconds)
-    stats.update({
-        "precision": precision,
-        "context_type": context_type.value if context_type is not None else None,
-        "num_beams": int(generate_kwargs.get("num_beams", 1)),
-        "cfg_scale": float(cfg_scale),
-        "do_sample": bool(generate_kwargs.get("do_sample", False)),
-        "sync_model_timing": sync_model_timing,
-        "profile_model_generate_cuda_ledger": profile_model_generate_cuda_ledger,
-        "model_generate_cpu_elapsed_seconds": elapsed_seconds if profile_model_generate_cuda_ledger else None,
-        "model_generate_cuda_event_seconds": generate_cuda_event_seconds,
-        "model_generate_host_gap_seconds": (
-            elapsed_seconds - generate_cuda_event_seconds
-            if generate_cuda_event_seconds is not None
-            else None
-        ),
-        "generation_compile_enabled": not bool(getattr(getattr(model, "generation_config", None), "disable_compile", True)),
-        "profile_generation_detail_ranges": profile_generation_detail_ranges,
-        "profile_active_prefix_decode_diagnostics": profile_active_prefix_decode_diagnostics,
-        "profile_sdpa_backend": profile_sdpa_backend,
-        "stateful_monotonic_logits_processor": False,
-        "q1_bmm_cross_attention_enabled": False,
-        "native_q1_self_attention_requested": False,
-        "native_q1_self_attention_enabled": False,
-        "native_q1_self_attention_disabled_reason": None,
-        "native_q1_rope_cache_self_attention_requested": False,
-        "native_q1_rope_cache_self_attention_enabled": False,
-        "native_q1_rope_cache_self_attention_disabled_reason": None,
-        "decode_session_runtime_enabled": False,
-        "decode_session_cuda_graph_enabled": False,
-        "decode_session_graph_count": None,
-        "active_prefix_decode_loop_enabled": False,
-        "active_prefix_decode_bucket_size": None,
-        "active_prefix_decode_cuda_graph_enabled": False,
-        "active_prefix_decode_cuda_graph_warmup": None,
-        "active_prefix_decode_cuda_graph_min_decode_steps": None,
-    })
+    stats = build_generation_stats(result, model_kwargs, pad_token_id, elapsed_seconds)
+    stats["precision"] = precision
 
     return result, stats
 
@@ -431,7 +182,6 @@ class InferenceServer:
         self.shutdown_flag = threading.Event()
         self.listener = None
         self.connections = 0
-        self.batch_counter = 0
 
     def start(self):
         # Remove stale socket
@@ -487,36 +237,35 @@ class InferenceServer:
                     except (EOFError, OSError):
                         break
 
-                    try:
-                        generate_key = generation_compatibility_key(generate_kwargs)
-                    except TypeError as exc:
-                        conn.send({'error': str(exc)})
-                        continue
+                    generate_kwargs_set = frozenset(generate_kwargs.items())
 
                     # Prepare a response event
                     response_event = threading.Event()
                     batch_size = model_kwargs['inputs'].shape[0]
-                    record = StaticServerRequest(
-                        model_kwargs=model_kwargs,
-                        total_work=batch_size,
-                        conn=conn,
-                        event=response_event,
-                    )
+                    record = {
+                        'model_kwargs': model_kwargs,
+                        'total_work': batch_size,
+                        'work_done': 0,
+                        'conn': conn,
+                        'event': response_event,
+                        'result': None,
+                        'generated_tokens': 0,
+                        'elapsed_seconds': 0.0,
+                    }
 
                     # Enqueue request
                     with self.lock:
-                        group = self.grouped_requests.get(generate_key)
-                        if group is None:
-                            group = StaticServerRequestGroup(generate_kwargs=dict(generate_kwargs))
-                            self.grouped_requests[generate_key] = group
-                        group.requests.append(record)
+                        if generate_kwargs_set in self.grouped_requests:
+                            self.grouped_requests[generate_kwargs_set].append(record)
+                        else:
+                            self.grouped_requests[generate_kwargs_set] = [record]
 
                     # Wait until batch thread processes it
                     response_event.wait()
 
                     # Send back result
                     try:
-                        conn.send(record.result)
+                        conn.send(record['result'])
                     except BrokenPipeError:
                         # Client disconnected
                         break
@@ -530,11 +279,10 @@ class InferenceServer:
             with self.lock:
                 if not self.grouped_requests:
                     continue
-                generate_key = list(self.grouped_requests.keys())[0]
-                group = self.grouped_requests[generate_key]
-                requests = group.requests
+                generate_kwargs_set: frozenset = list(self.grouped_requests.keys())[0]
+                requests: list = self.grouped_requests[generate_kwargs_set]
 
-                generate_kwargs: dict = dict(group.generate_kwargs)
+                generate_kwargs: dict = dict(generate_kwargs_set)
                 cfg_scale = generate_kwargs.get('cfg_scale', 1.0)
                 num_beams = generate_kwargs.get('num_beams', 1)
                 batch_multiplier = 2 * num_beams if cfg_scale > 1 else num_beams
@@ -542,34 +290,21 @@ class InferenceServer:
                 # Grab full or partial requests until BATCH_SIZE is reached or requests is empty
                 batch_requests = []
                 remaining_batch_size = self.max_batch_size // batch_multiplier
-                if remaining_batch_size <= 0:
-                    error_message = (
-                        "max_batch_size is too small for server batching: "
-                        f"max_batch_size={self.max_batch_size}, num_beams={num_beams}, cfg_scale={cfg_scale}."
-                    )
-                    for request in requests:
-                        request.result = {'error': error_message}
-                        request.event.set()
-                    del self.grouped_requests[generate_key]
-                    continue
                 while remaining_batch_size > 0 and len(requests) > 0:
                     request = requests.pop(0)
-                    req_kwargs = request.model_kwargs
-                    req_work_done = request.work_done
-                    req_remaining_work = request.remaining_work
+                    req_kwargs = request['model_kwargs']
+                    req_total_work = request['total_work']
+                    req_work_done = request['work_done']
+                    req_remaining_work = req_total_work - req_work_done
                     work = min(req_remaining_work, remaining_batch_size)
                     batch_requests.append((self._cut_model_kwargs(req_kwargs, req_work_done, work), request, work))
                     remaining_batch_size -= work
                     if req_remaining_work > work:
                         # If there is still work left, re-add the record to the queue
-                        request.queued_at = time.perf_counter()
                         requests.insert(0, request)
 
-                if not group.requests:
-                    del self.grouped_requests[generate_key]
-                self.batch_counter += 1
-                batch_id = self.batch_counter
-                batch_started_at = time.perf_counter()
+                if not self.grouped_requests[generate_kwargs_set]:
+                    del self.grouped_requests[generate_kwargs_set]
 
             try:
                 # Collate inputs
@@ -587,109 +322,39 @@ class InferenceServer:
                     model_kwargs[k] = torch.cat(kwargses, dim=0)
 
                 outputs, stats = model_generate(self.model, self.tokenizer, model_kwargs, generate_kwargs)
-                server_batch_size = int(stats.get('batch_size') or model_kwargs['inputs'].shape[0])
-                server_batch_elapsed_seconds = float(stats.get('elapsed_seconds', 0.0) or 0.0)
                 generated_tokens_per_sample = stats.get('generated_tokens_per_sample', [])
-                prompt_tokens_per_sample = stats.get('prompt_tokens_per_sample') or []
-                output_tokens_per_sample = stats.get('output_tokens_per_sample', [])
 
                 # Split and dispatch results
                 batch_i = 0
                 for i, (_, request, work_done) in enumerate(batch_requests):
                     padding = paddings[i]
                     out = outputs[batch_i:batch_i + work_done, padding:]  # Remove padding from the left
-                    request_generated_counts = generated_tokens_per_sample[batch_i:batch_i + work_done]
-                    request_prompt_counts = prompt_tokens_per_sample[batch_i:batch_i + work_done]
-                    request_output_counts = output_tokens_per_sample[batch_i:batch_i + work_done]
-                    request_generated_tokens = sum(request_generated_counts)
+                    request_generated_tokens = sum(generated_tokens_per_sample[batch_i:batch_i + work_done])
                     batch_i += work_done
-                    request.result = out if request.result is None else torch.cat((request.result, out), dim=0)
-                    request.work_done += work_done
-                    request.generated_tokens += request_generated_tokens
-                    request.prompt_tokens += sum(request_prompt_counts)
-                    request.output_tokens += sum(request_output_counts)
-                    request.generated_tokens_per_sample.extend(request_generated_counts)
-                    request.prompt_tokens_per_sample.extend(request_prompt_counts)
-                    request.output_tokens_per_sample.extend(request_output_counts)
-                    request.elapsed_seconds += stats.get('elapsed_seconds', 0.0)
-                    request.server_batch_ids.append(batch_id)
-                    request.server_batch_sizes.append(server_batch_size)
-                    request.server_batch_request_counts.append(len(batch_requests))
-                    request.server_batch_work_items.append(work_done)
-                    request.server_batch_elapsed_seconds.append(server_batch_elapsed_seconds)
-                    slice_queue_wait = max(0.0, batch_started_at - request.queued_at)
-                    if request.server_first_queue_wait_seconds is None:
-                        request.server_first_queue_wait_seconds = max(0.0, batch_started_at - request.enqueued_at)
-                    request.server_queue_wait_seconds.append(slice_queue_wait)
-                    if request.work_done >= request.total_work:
+                    request['result'] = out if request['result'] is None else torch.cat((request['result'], out), dim=0)
+                    request['work_done'] += work_done
+                    request['generated_tokens'] += request_generated_tokens
+                    request['elapsed_seconds'] += stats.get('elapsed_seconds', 0.0)
+                    if request['work_done'] >= request['total_work']:
                         # All work done for this record, signal completion
-                        elapsed_seconds = request.elapsed_seconds
-                        generated_tokens = request.generated_tokens
-                        server_queue_wait_seconds = request.server_queue_wait_seconds
-                        detail_stats = dict(stats)
-                        for key in (
-                            'batch_size',
-                            'prompt_tokens',
-                            'prompt_tokens_per_sample',
-                            'output_tokens',
-                            'output_tokens_per_sample',
-                            'generated_tokens',
-                            'generated_tokens_per_sample',
-                            'elapsed_seconds',
-                            'tokens_per_second',
-                            'precision',
-                            'context_type',
-                            'num_beams',
-                            'cfg_scale',
-                            'do_sample',
-                        ):
-                            detail_stats.pop(key, None)
-                        request.result = {
-                            'output': request.result,
+                        elapsed_seconds = request['elapsed_seconds']
+                        generated_tokens = request['generated_tokens']
+                        request['result'] = {
+                            'output': request['result'],
                             'stats': {
-                                'batch_size': request.total_work,
-                                'prompt_tokens': request.prompt_tokens,
-                                'prompt_tokens_per_sample': request.prompt_tokens_per_sample,
-                                'output_tokens': request.output_tokens,
-                                'output_tokens_per_sample': request.output_tokens_per_sample,
                                 'generated_tokens': generated_tokens,
-                                'generated_tokens_per_sample': request.generated_tokens_per_sample,
                                 'elapsed_seconds': elapsed_seconds,
                                 'tokens_per_second': generated_tokens / elapsed_seconds if elapsed_seconds > 0 else 0.0,
-                                'precision': stats.get('precision'),
-                                'context_type': stats.get('context_type'),
-                                'num_beams': stats.get('num_beams'),
-                                'cfg_scale': stats.get('cfg_scale'),
-                                'do_sample': stats.get('do_sample'),
-                                **detail_stats,
-                                'server_batching_mode': 'static_ipc',
-                                'server_elapsed_seconds_attribution': 'merged_batch_elapsed_replicated_per_request',
-                                'server_max_batch_size': self.max_batch_size,
-                                'server_batch_timeout_seconds': self.batch_timeout,
-                                'server_batch_count': len(request.server_batch_ids),
-                                'server_batch_ids': request.server_batch_ids,
-                                'server_batch_sizes': request.server_batch_sizes,
-                                'server_batch_request_counts': request.server_batch_request_counts,
-                                'server_batch_work_items': request.server_batch_work_items,
-                                'server_batch_elapsed_seconds': request.server_batch_elapsed_seconds,
-                                'server_queue_wait_seconds': server_queue_wait_seconds,
-                                'server_first_queue_wait_seconds': request.server_first_queue_wait_seconds,
-                                'server_total_queue_wait_seconds': sum(server_queue_wait_seconds),
-                                'server_max_queue_wait_seconds': (
-                                    max(server_queue_wait_seconds) if server_queue_wait_seconds else 0.0
-                                ),
-                                'server_rng_policy': 'shared_global',
-                                'token_equivalence_status': 'not_checked_shared_server_rng',
                             },
                         }
-                        request.event.set()
+                        request['event'].set()
             except Exception as e:
                 print(f"[Batch Thread] Error processing batch: {e}")
                 traceback.print_exc()
                 # Signal all requests in this batch to retry
                 for _, request, _ in batch_requests:
-                    request.result = RETRY_SIGNAL
-                    request.event.set()  # Signal completion
+                    request['result'] = RETRY_SIGNAL
+                    request['event'].set()  # Signal completion
             finally:
                 torch.cuda.empty_cache()  # Clear any cached memory, otherwise will definitely run out of memory if multiple batch sizes are used
 
@@ -724,9 +389,6 @@ class InferenceClient:
             idle_timeout=20,
             server_thread_daemon=False,
             socket_path=SOCKET_PATH,
-            allow_auto_start=True,
-            connect_timeout=60.0,
-            request_timeout=None,
     ):
         """
         Initializes the inference client. Automatically starts the inference server if it is not running.
@@ -745,12 +407,8 @@ class InferenceClient:
         self.idle_timeout = idle_timeout
         self.server_thread_daemon = server_thread_daemon
         self.socket_path = socket_path
-        self.allow_auto_start = allow_auto_start
-        self.connect_timeout = connect_timeout
-        self.request_timeout = request_timeout
         self.conn = None
         self.last_generation_stats = None
-        self._server_start_error = None
         self._server = None
         self._server_thread = None
 
@@ -763,28 +421,10 @@ class InferenceClient:
             try:
                 self.conn = Client(self.socket_path)
             except FileNotFoundError:
-                if not self.allow_auto_start:
-                    raise ConnectionError(
-                        f"Inference server socket does not exist and auto-start is disabled: {self.socket_path}"
-                    )
                 # No server: start one
                 self._start_server_thread()
                 # Wait for server socket to appear
-                started_at = time.perf_counter()
                 while not os.path.exists(self.socket_path):
-                    if self._server_start_error is not None:
-                        raise RuntimeError(
-                            f"Inference server failed to start for socket {self.socket_path}"
-                        ) from self._server_start_error
-                    if self._server_thread is not None and not self._server_thread.is_alive():
-                        raise RuntimeError(
-                            f"Inference server thread exited before creating socket {self.socket_path}"
-                        )
-                    if self.connect_timeout is not None and time.perf_counter() - started_at > self.connect_timeout:
-                        raise TimeoutError(
-                            f"Timed out waiting for inference server socket after "
-                            f"{self.connect_timeout:.1f}s: {self.socket_path}"
-                        )
                     time.sleep(0.1)
                 self.conn = Client(self.socket_path)
 
@@ -804,42 +444,30 @@ class InferenceClient:
             self.conn.close()
 
     def _start_server(self, model_loader, tokenizer_loader):
-        try:
-            # Load model inside server process
-            model = model_loader()
-            tokenizer = tokenizer_loader()
-            server = InferenceServer(
-                model,
-                tokenizer,
-                max_batch_size=self.max_batch_size,
-                batch_timeout=self.batch_timeout,
-                idle_timeout=self.idle_timeout,
-                socket_path=self.socket_path
-            )
-            self._server = server
-            server.start()
-            # Block until shutdown
-            while not server.shutdown_flag.is_set():
-                time.sleep(1)
-        except BaseException as exc:
-            self._server_start_error = exc
-            raise
-        finally:
-            self._server = None
+        # Load model inside server process
+        model = model_loader()
+        tokenizer = tokenizer_loader()
+        server = InferenceServer(
+            model,
+            tokenizer,
+            max_batch_size=self.max_batch_size,
+            batch_timeout=self.batch_timeout,
+            idle_timeout=self.idle_timeout,
+            socket_path=self.socket_path
+        )
+        self._server = server
+        server.start()
+        # Block until shutdown
+        while not server.shutdown_flag.is_set():
+            time.sleep(1)
+        self._server = None
 
     def generate(self, model_kwargs, generate_kwargs, max_retries=3):
         attempts = 0
         while attempts < max_retries:
             # Send request and wait for response
             try:
-                if self.conn is None:
-                    self._reconnect()
                 self.conn.send((model_kwargs, generate_kwargs))
-                if self.request_timeout is not None and not self.conn.poll(self.request_timeout):
-                    raise TimeoutError(
-                        f"Timed out waiting for inference server response after "
-                        f"{self.request_timeout:.1f}s: {self.socket_path}"
-                    )
                 result = self.conn.recv()
             except (EOFError, OSError):
                 print("Connection error, attempting to reconnect...")
@@ -851,8 +479,6 @@ class InferenceClient:
                 print("Retrying request due to Error.")
                 attempts += 1
                 continue
-            if isinstance(result, dict) and 'error' in result:
-                raise RuntimeError(str(result['error']))
             else:
                 if isinstance(result, dict) and 'output' in result:
                     self.last_generation_stats = result.get('stats')
@@ -862,7 +488,7 @@ class InferenceClient:
 
         raise RuntimeError(f"Failed to get a valid response after {max_retries} attempts.")
 
-    def ensure_server(self, timeout=None):
+    def ensure_server(self):
         """Ensure the background inference server is running.
 
         This is useful when an external owner (e.g., a web UI) wants to start the
@@ -874,22 +500,7 @@ class InferenceClient:
                 self._start_server_thread()
 
         # Wait for server socket to appear.
-        started_at = time.perf_counter()
         while not os.path.exists(self.socket_path):
-            if self._server_start_error is not None:
-                raise RuntimeError(
-                    f"Inference server failed to start for socket {self.socket_path}"
-                ) from self._server_start_error
-            if self._server_thread is not None and not self._server_thread.is_alive():
-                raise RuntimeError(
-                    f"Inference server thread exited before creating socket {self.socket_path}"
-                )
-            wait_timeout = self.connect_timeout if timeout is None else timeout
-            if wait_timeout is not None and time.perf_counter() - started_at > wait_timeout:
-                raise TimeoutError(
-                    f"Timed out waiting for inference server socket after "
-                    f"{wait_timeout:.1f}s: {self.socket_path}"
-                )
             time.sleep(0.1)
 
     def shutdown_server(self, join_timeout=5.0):

@@ -4,10 +4,9 @@ from transformers import LogitsProcessor
 
 from osuT5.osuT5.dataset.data_utils import TIMED_EVENTS
 from osuT5.osuT5.event import EventType, Event
-from osuT5.osuT5.tokenizer import Tokenizer
+from osuT5.osuT5.tokenizer import MILISECONDS_PER_STEP, Tokenizer
 
 MILISECONDS_PER_SECOND = 1000
-MILISECONDS_PER_STEP = 10
 
 
 def get_beat_type_tokens(tokenizer: Tokenizer) -> tuple[int, ...]:
@@ -198,3 +197,73 @@ class MonotonicTimeShiftLogitsProcessor(LogitsProcessor):
         if device not in self._sos_ids_by_device:
             self._sos_ids_by_device[device] = self.sos_ids.to(device)
         return self._sos_ids_by_device[device]
+
+
+def build_logits_processor_list(
+    tokenizer,
+    *,
+    cfg_scale: float = 1.0,
+    timeshift_bias: float = 0.0,
+    types_first: bool = False,
+    temperature: float = 1.0,
+    timing_temperature: float | None = None,
+    mania_column_temperature: float | None = None,
+    taiko_hit_temperature: float | None = None,
+    lookback_time: float = 0.0,
+    device=None,
+    monotonic_processor_factory=MonotonicTimeShiftLogitsProcessor,
+):
+    """Build the shared processor chain with a runtime-owned monotonic policy."""
+
+    from transformers import (
+        ClassifierFreeGuidanceLogitsProcessor,
+        LogitsProcessorList,
+        TemperatureLogitsWarper,
+    )
+
+    timing_temperature = temperature if timing_temperature is None else timing_temperature
+    mania_column_temperature = (
+        temperature if mania_column_temperature is None else mania_column_temperature
+    )
+    taiko_hit_temperature = (
+        temperature if taiko_hit_temperature is None else taiko_hit_temperature
+    )
+    device = device if device is not None else getattr(tokenizer, "device", None)
+
+    processors = LogitsProcessorList()
+    if cfg_scale > 1.0:
+        processors.append(ClassifierFreeGuidanceLogitsProcessor(cfg_scale))
+    processors.append(monotonic_processor_factory(tokenizer))
+    if timeshift_bias != 0:
+        processors.append(
+            TimeshiftBias(
+                timeshift_bias,
+                tokenizer.event_start[EventType.TIME_SHIFT],
+                tokenizer.event_end[EventType.TIME_SHIFT],
+            )
+        )
+    if types_first:
+        processors.append(
+            ConditionalTemperatureLogitsWarper(
+                temperature,
+                timing_temperature,
+                mania_column_temperature,
+                taiko_hit_temperature,
+                types_first,
+                get_beat_type_tokens(tokenizer),
+                get_mania_type_tokens(tokenizer),
+                get_scroll_speed_tokens(tokenizer),
+            )
+        )
+    else:
+        processors.append(TemperatureLogitsWarper(temperature))
+    if lookback_time > 0:
+        processors.append(
+            LookbackBiasLogitsWarper(
+                lookback_time,
+                tokenizer,
+                types_first,
+                device,
+            )
+        )
+    return processors

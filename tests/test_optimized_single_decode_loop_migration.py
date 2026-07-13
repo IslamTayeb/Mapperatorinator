@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib
 import os
 from pathlib import Path
 import subprocess
@@ -33,30 +32,6 @@ def _run_fresh_python(source: str) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
     )
-
-
-def test_legacy_decode_loop_is_lazy_until_an_export_is_requested():
-    completed = _run_fresh_python(
-        """
-import importlib
-import sys
-
-legacy = importlib.import_module("osuT5.osuT5.inference.decode_loop")
-assert "osuT5.osuT5.inference.optimized.single.decode_loop" not in sys.modules
-legacy.active_prefix_decode_generate
-assert "osuT5.osuT5.inference.optimized.single.decode_loop" in sys.modules
-"""
-    )
-    assert completed.returncode == 0, completed.stderr
-
-
-def test_legacy_decode_loop_exports_are_identical_to_optimized_source():
-    legacy = importlib.import_module("osuT5.osuT5.inference.decode_loop")
-    optimized = importlib.import_module(
-        "osuT5.osuT5.inference.optimized.single.decode_loop"
-    )
-    for name in legacy.__all__:
-        assert getattr(legacy, name) is getattr(optimized, name)
 
 
 def test_bucket_boundaries_are_unchanged():

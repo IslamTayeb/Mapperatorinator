@@ -7,7 +7,6 @@ from typing import Callable
 import torch
 from transformers.cache_utils import StaticCache
 
-from ....runtime_profiling import profile_range
 from ..single.runtime_context import (
     active_prefix_self_attention_length,
 )
@@ -116,8 +115,6 @@ def q1_rope_cache_self_attention_forward(
     past_key_value,
     cache_position: torch.Tensor | None,
     position_ids: torch.Tensor | None,
-    profile_ranges: bool,
-    range_prefix: str,
     attention_mask: torch.Tensor | None,
     sliding_window_mask: torch.Tensor | None,
     native_q1_rope_cache_attention: Callable[..., torch.Tensor] | None,
@@ -139,29 +136,14 @@ def q1_rope_cache_self_attention_forward(
     if not use_native_q1_rope_cache_self_attention:
         return None
 
-    if profile_ranges:
-        with profile_range(f"{range_prefix}.qkv_proj"):
-            qkv = module.Wqkv(hidden_states).view(
-                bs,
-                -1,
-                3,
-                module.num_heads,
-                module.head_dim,
-            )
-    else:
-        qkv = module.Wqkv(hidden_states).view(
-            bs,
-            -1,
-            3,
-            module.num_heads,
-            module.head_dim,
-        )
-
-    if profile_ranges:
-        with profile_range(f"{range_prefix}.rope"):
-            cos, sin = module.rotary_emb(qkv, position_ids=position_ids)
-    else:
-        cos, sin = module.rotary_emb(qkv, position_ids=position_ids)
+    qkv = module.Wqkv(hidden_states).view(
+        bs,
+        -1,
+        3,
+        module.num_heads,
+        module.head_dim,
+    )
+    cos, sin = module.rotary_emb(qkv, position_ids=position_ids)
 
     cache_layer = past_key_value.layers[module.layer_idx]
     if not getattr(cache_layer, "is_initialized", False):
@@ -179,29 +161,16 @@ def q1_rope_cache_self_attention_forward(
         and attention_mask_for_native.shape[-1] > prefix_length
     ):
         attention_mask_for_native = attention_mask_for_native[..., :prefix_length]
-    if profile_ranges:
-        with profile_range(f"{range_prefix}.rope_cache_native_q1"):
-            output = native_q1_rope_cache_attention(
-                qkv,
-                cache_layer.keys,
-                cache_layer.values,
-                cos,
-                sin,
-                cache_position,
-                attention_mask_for_native,
-                int(prefix_length),
-            )
-    else:
-        output = native_q1_rope_cache_attention(
-            qkv,
-            cache_layer.keys,
-            cache_layer.values,
-            cos,
-            sin,
-            cache_position,
-            attention_mask_for_native,
-            int(prefix_length),
-        )
+    output = native_q1_rope_cache_attention(
+        qkv,
+        cache_layer.keys,
+        cache_layer.values,
+        cos,
+        sin,
+        cache_position,
+        attention_mask_for_native,
+        int(prefix_length),
+    )
     output = output.transpose(1, 2).contiguous()
     output = output.view(bs, -1, module.all_head_size)
     return (output,)

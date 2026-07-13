@@ -10,7 +10,4 @@ end_time: 86000
 seed: 12345
 attn_implementation: sdpa
 use_server: false
-inference_generation_compile: true
-inference_active_prefix_decode_loop: false
-profile_record_token_ids: true
 output_path: "${oc.env:MAPPERATORINATOR_PROFILE_OUTPUT,./logs/profile_salvalai_smoke15}"

@@ -98,7 +98,16 @@ For every retained result, record:
 - artifact paths and hashes;
 - accept/reject decision and the evidence required to revisit it.
 
-Use `utils/summarize_inference_profile.py --compare BASE CANDIDATE --strict-full-song`
-for full-song comparisons. Run tracing separately from
-primary timing. Never use stale server sockets, sample stopped/dummy rows, or
-share mutable request state in an exact batch claim.
+Use the compact exactness gate for a direct pair:
+
+```bash
+python utils/summarize_inference_profile.py \
+  --compare BASE CANDIDATE \
+  --labels main_generation,timing_context \
+  --regression-tolerance-pct 5
+```
+
+Use `scripts/dcc/verify_inference_smoke.sbatch` for reciprocal launch-order
+checks. Run tracing separately from primary timing. Never use stale server
+sockets, sample stopped/dummy rows, or share mutable request state in an exact
+batch claim.

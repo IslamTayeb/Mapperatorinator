@@ -6,10 +6,6 @@ audio_path: "/Users/islamtayeb/Downloads/SALVALAI / SALVALAI [Music Video] (_Vmn
 output_path: "${oc.env:MAPPERATORINATOR_PROFILE_OUTPUT,./logs/profile_salvalai}"
 
 profile_inference: true
-profile_sync_cuda: true
-profile_record_token_ids: true
-inference_generation_compile: true
-inference_active_prefix_decode_loop: false
 seed: 12345
 
 gamemode: 0

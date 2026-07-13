@@ -1,13 +1,8 @@
 from __future__ import annotations
 
-import subprocess
-import sys
-from dataclasses import FrozenInstanceError
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-import pytest
 import torch
 
 import inference
@@ -15,11 +10,11 @@ from osuT5.osuT5.inference.engine_binding import (
     InferenceEngineBinding,
     unwrap_engine_binding,
 )
-from osuT5.osuT5.inference.optimized import adapter
-from osuT5.osuT5.inference.optimized.single import engine as engine_module
-from osuT5.osuT5.inference.optimized.single.config import (
-    ACCEPTED_OPTIMIZED_SINGLE_CONFIG,
+from osuT5.osuT5.inference.generation_utils import (
+    build_generation_stats,
+    eos_token_ids,
 )
+from osuT5.osuT5.inference.optimized.single import engine as engine_module
 from osuT5.osuT5.inference.optimized.single.engine import (
     OptimizedSingleRuntime,
     load_optimized_single_engine,
@@ -43,23 +38,19 @@ def _loader_kwargs(**overrides):
         "gamemode": None,
         "auto_select_gamemode_model": True,
         "generation_compile": False,
-        "server_allow_auto_start": True,
-        "server_connect_timeout": 60.0,
-        "server_request_timeout": None,
-        "server_idle_timeout": 20,
-        "server_batch_timeout": 0.2,
     }
     values.update(overrides)
     return values
 
 
-def test_accepted_config_is_frozen_and_matches_legacy_stack():
-    config = ACCEPTED_OPTIMIZED_SINGLE_CONFIG
-    with pytest.raises(FrozenInstanceError):
-        config.active_prefix_decode_bucket_size = 128
-
-    assert config.generation_overrides() == {
+def test_accepted_runtime_metadata_is_one_fixed_preset():
+    assert OptimizedSingleRuntime().profile_metadata()["optimized_effective_config"] == {
+        "version": "accepted-fp32-270.475-v1",
+        "result_class": "exact-output",
         "precision": "fp32",
+        "attn_implementation": "sdpa",
+        "generation_compile": True,
+        "batch_size": 1,
         "cfg_scale": 1.0,
         "num_beams": 1,
         "active_prefix_decode_loop": True,
@@ -69,9 +60,11 @@ def test_accepted_config_is_frozen_and_matches_legacy_stack():
         "active_prefix_decode_cuda_graph_min_decode_steps": 1,
         "stateful_monotonic_logits_processor": True,
         "q1_bmm_cross_attention": True,
+        "decode_session_runtime": True,
+        "decode_session_cuda_graph": True,
+        "native_decode_kernels": True,
         "native_q1_self_attention": True,
         "native_q1_rope_cache_self_attention": True,
-        "decode_session_cuda_graph": True,
     }
 
 
@@ -102,7 +95,7 @@ def test_runtime_overlays_structure_without_changing_sampling(monkeypatch):
     assert captured["top_p"] == 0.91
     assert captured["top_k"] == 7
     assert captured["temperature"] == 0.83
-    assert captured["active_prefix_decode_bucket_size"] == 64
+    assert "active_prefix_decode_bucket_size" not in captured
 
 
 def test_single_loader_forces_compile_fp32_sdpa_once():
@@ -137,21 +130,6 @@ def test_engine_binding_unwrap_preserves_raw_model_identity():
     assert unwrap_engine_binding(raw_model) == (raw_model, None)
 
 
-@pytest.mark.parametrize("mode", ["offline_batch", "server"])
-def test_unsupported_modes_fail_before_loader_or_single_import(mode):
-    loader = Mock()
-    with patch.object(adapter, "import_module") as single_import:
-        with pytest.raises(NotImplementedError, match="control-plane scaffolding"):
-            adapter.load_optimized_engine(
-                mode=mode,
-                model_loader=loader,
-                loader_kwargs=_loader_kwargs(),
-            )
-
-    loader.assert_not_called()
-    single_import.assert_not_called()
-
-
 def test_inference_loader_injects_raw_loader_and_returns_binding():
     raw_model = SimpleNamespace(
         generation_config=SimpleNamespace(disable_compile=False),
@@ -167,7 +145,6 @@ def test_inference_loader_injects_raw_loader_and_returns_binding():
             t5_args=None,
             device="cuda",
             inference_engine="optimized",
-            optimized_inference_mode="single",
         )
 
     assert isinstance(binding, InferenceEngineBinding)
@@ -177,38 +154,7 @@ def test_inference_loader_injects_raw_loader_and_returns_binding():
     assert raw_loader.call_args.kwargs["generation_compile"] is True
 
 
-def test_adapter_unsupported_mode_is_fresh_process_single_cold():
-    repo_root = Path(__file__).resolve().parents[1]
-    code = r'''\
-import sys
-from osuT5.osuT5.inference.optimized.adapter import load_optimized_engine
-
-try:
-    load_optimized_engine(
-        mode="server",
-        model_loader=lambda **kwargs: (_ for _ in ()).throw(AssertionError(kwargs)),
-        loader_kwargs={},
-    )
-except NotImplementedError:
-    pass
-else:
-    raise AssertionError("optimized server mode unexpectedly loaded")
-
-assert "osuT5.osuT5.inference.optimized.single.engine" not in sys.modules
-assert not any(name.startswith("osuT5.osuT5.inference.optimized.kernels") for name in sys.modules)
-assert "torch.utils.cpp_extension" not in sys.modules
-'''
-    result = subprocess.run(
-        [sys.executable, "-c", code],
-        cwd=repo_root,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert result.returncode == 0, result.stderr
-
-
-def test_engine_shared_calculation_helpers_match_legacy_server():
+def test_shared_calculation_helpers_preserve_legacy_server_results():
     class FakeTokenizer:
         eos_id = 2
         pad_id = 0
@@ -217,7 +163,7 @@ def test_engine_shared_calculation_helpers_match_legacy_server():
         event_end = {EventType.TIME_SHIFT: 20}
 
     tokenizer = FakeTokenizer()
-    assert engine_module._eos_token_ids(
+    assert eos_token_ids(
         tokenizer,
         lookback_time=20,
         lookahead_time=30,
@@ -234,9 +180,19 @@ def test_engine_shared_calculation_helpers_match_legacy_server():
         "decoder_input_ids": torch.tensor([[1, 2, 0, 0]]),
         "decoder_attention_mask": torch.tensor([[1, 1, 0, 0]]),
     }
-    assert engine_module._build_generation_stats(
+    assert build_generation_stats(
         result,
         model_kwargs,
         0,
         0.5,
-    ) == server._build_generation_stats(result, model_kwargs, 0, 0.5)
+    ) == {
+        "batch_size": 1,
+        "prompt_tokens": 2,
+        "prompt_tokens_per_sample": [2],
+        "output_tokens": 3,
+        "output_tokens_per_sample": [3],
+        "generated_tokens": 1,
+        "generated_tokens_per_sample": [1],
+        "elapsed_seconds": 0.5,
+        "tokens_per_second": 2.0,
+    }
