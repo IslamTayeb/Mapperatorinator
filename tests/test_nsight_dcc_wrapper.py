@@ -75,6 +75,14 @@ def test_graph_and_node_collection_use_bounded_low_overhead_options() -> None:
     assert 'item["allow_empty_rows"]' in source
 
 
+def test_parameterized_nsys_report_names_are_detected() -> None:
+    source = _source()
+
+    assert 'grep -Eq "^[[:space:]]*$1(\\\\[|:|[[:space:]]|$)"' in source
+    assert "cuda_gpu_kern_sum" in source
+    assert "cuda_gpu_kern_gb_sum" in source
+
+
 def test_wrapper_gates_transparency_before_next_precision() -> None:
     source = _source()
 

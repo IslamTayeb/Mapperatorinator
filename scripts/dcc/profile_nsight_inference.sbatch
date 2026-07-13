@@ -219,7 +219,8 @@ run_control() {
 }
 
 report_supported() {
-  grep -Eq "(^|[[:space:],])$1([[:space:],:]|$)" "$CAPABILITIES/nsys-help-reports.txt"
+  # Parameterized reports are printed as e.g. ``cuda_gpu_kern_sum[:nvtx-name]``.
+  grep -Eq "^[[:space:]]*$1(\\[|:|[[:space:]]|$)" "$CAPABILITIES/nsys-help-reports.txt"
 }
 
 export_nsys_report() {
