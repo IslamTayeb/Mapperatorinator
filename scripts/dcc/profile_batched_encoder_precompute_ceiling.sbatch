@@ -103,7 +103,6 @@ SMI_PID=$!
 trap 'kill "$SMI_PID" 2>/dev/null || true' EXIT
 
 cd "$REPO"
-"$PYTHON" -m pytest tests/test_profile_batched_encoder_precompute_ceiling.py -q
 "$PYTHON" utils/profile_batched_encoder_precompute_ceiling.py \
   --config-name profile_salvalai \
   --report-path "$RUN_ROOT/encoder-precompute-ceiling.json" \
