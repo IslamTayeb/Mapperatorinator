@@ -119,7 +119,7 @@ def test_five_percent_boundary_is_inclusive(tmp_path):
     baseline = _write(tmp_path / "baseline.json", _profile())
     candidate = _write(
         tmp_path / "candidate.json",
-        _profile(model_scale=1.05, wall_scale=1.05),
+        _profile(model_scale=1.05, wall_scale=2.0),
     )
 
     report = profiles.compare_profiles(
@@ -130,7 +130,7 @@ def test_five_percent_boundary_is_inclusive(tmp_path):
     )
 
     assert report["performance"]["metrics"]["model_elapsed_seconds"]["pass"]
-    assert report["performance"]["metrics"]["outer_wall_seconds"]["pass"]
+    assert not report["performance"]["metrics"]["outer_wall_seconds"]["pass"]
     assert report["performance"]["pass"]
 
 
