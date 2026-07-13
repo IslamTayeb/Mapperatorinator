@@ -24,8 +24,6 @@
 - Promote one gate at a time: component -> real tensors -> short loop -> smoke -> full song -> queue.
 - Stop on the first exactness, ownership, memory, negative-wall, or insufficient-gain failure. Remove candidate runtime wiring, keep reusable verifier infrastructure, and record the lesson and revisit condition.
 - Never present a projection, trace, synthetic prompt, model-free schedule, or isolated kernel result as production throughput.
-- Shared dtype scouts must retain the original decoder-layer forward and the accepted specialized dispatch topology. Treat framework/native self attention and BMM/native cross attention as separate ablations; do not hide a lost accepted kernel inside a broad "shared framework" comparison.
-- Name direct CUDA-graph replay separately from `torch.compile` in configs, metadata, and reports.
 
 ## DCC
 
