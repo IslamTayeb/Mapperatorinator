@@ -11,7 +11,6 @@
 
 - V32 is the default compatibility surface. Preserve its output, APIs, metadata, performance, server behavior, and cold imports.
 - Put optimized runtimes, schedulers, exactness logic, kernels, batching, and speculative work under `osuT5/osuT5/inference/optimized/`.
-- Precision scouts under `inference/optimized/scout/` must share dtype-parameterized component and verifier utilities across FP32 and FP16. Do not maintain parallel precision-specific rewrites; compare framework and native variants through the same boundary.
 - Outside that package, allow only lazy selectors, validation, metadata, shared preparation/assembly, and narrow dispatch hooks.
 - `inference.py` is the selector. `Processor` owns shared window preparation and output assembly. `server.py` remains V32-only until a separately approved optimized-server plan exists.
 - The fork exposes only `inference_engine=v32|optimized` and `profile_inference`. Keep profiling false by default, enable it for inference development and before/after verification, and treat the optimized engine as one immutable preset without combinable tuning flags or legacy shims.

@@ -13,7 +13,6 @@
 - Current exact batching approaches do not beat optimized serial on real songs. Fast fixed-prefix/model-only islands did not survive complete-step control, setup, dependency, compatibility, and tail costs.
 - A bounded two-song Hybrid-B2 main-loop wall scout produced exact files but only paired `91` steps while `2,625` used a slow private fallback. It ran near `75 tok/s` and took `2.6-3.8x` optimized serial main wall, rejecting the candidate before the complete queue-wall suite. No crossover was measured for this candidate; N=3-5 were intentionally not tested.
 - Current speculative and broad decoder/kernel replacements also fail the end-to-end `5%` bar.
-- Relaxing exactness does not rescue the tested FP16/native-prefix shapes on an RTX 2080 Ti. Current-main sentinel job `49715303` passed candidate self-repeat, cache ownership, finiteness, and RNG gates, but projected FP16 framework/native main times were `31.699s`/`32.213s` against the `25.419s` target. An auxiliary fused-linear variant (`49715718`) improved the local FP16 native boundary by `13.73%` yet still projected `29.956s`, slower than accepted. The current accepted SALVALAI work inventory is `7,684` main tokens, `28.243949s`, and 12 active-prefix buckets including `832`.
 
 ## What is worth doing next
 
