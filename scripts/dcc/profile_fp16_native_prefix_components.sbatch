@@ -14,6 +14,7 @@ set -euo pipefail
 PYTHON=${MAPPERATORINATOR_PYTHON:-/hpc/group/romerolab/imt11/envs/mapperatorinator/bin/python}
 REPO=${MAPPERATORINATOR_REPO:?Set MAPPERATORINATOR_REPO to the clean scout worktree}
 COMMIT=${MAPPERATORINATOR_COMMIT:?Set MAPPERATORINATOR_COMMIT to the pushed scout commit}
+BRANCH=${MAPPERATORINATOR_BRANCH:?Set MAPPERATORINATOR_BRANCH to the scout branch}
 WORK=${MAPPERATORINATOR_WORK:-/work/imt11/Mapperatorinator}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_LABEL=${RUN_LABEL:-fp16-prefix-component}
@@ -34,6 +35,10 @@ if [[ -n "$(git -C "$REPO" status --porcelain)" ]]; then
 fi
 if [[ "$(git -C "$REPO" rev-parse HEAD)" != "$COMMIT" ]]; then
   echo "scout worktree does not match MAPPERATORINATOR_COMMIT" >&2
+  exit 2
+fi
+if [[ "$(git -C "$REPO" branch --show-current)" != "$BRANCH" ]]; then
+  echo "scout worktree is not on MAPPERATORINATOR_BRANCH=$BRANCH" >&2
   exit 2
 fi
 if [[ ! -f "$AUDIO" ]]; then
@@ -60,6 +65,7 @@ export TOKENIZERS_PARALLELISM=false
   echo "host=$(hostname)"
   echo "job_id=${SLURM_JOB_ID:-manual}"
   echo "commit=$COMMIT"
+  echo "branch=$BRANCH"
   echo "repo=$REPO"
   echo "python=$PYTHON"
   echo "audio=$AUDIO"
@@ -67,6 +73,8 @@ export TOKENIZERS_PARALLELISM=false
   git -C "$REPO" status --short --branch
   "$PYTHON" -c 'import torch, transformers; print(f"torch={torch.__version__}"); print(f"torch_cuda={torch.version.cuda}"); print(f"transformers={transformers.__version__}")'
   nvidia-smi --query-gpu=name,uuid,driver_version,memory.total --format=csv,noheader
+  command -v nsys || echo "nsys=missing"
+  command -v ncu || echo "ncu=missing"
   if [[ -n "${SLURM_JOB_ID:-}" ]]; then
     scontrol show job -o "$SLURM_JOB_ID"
   fi
