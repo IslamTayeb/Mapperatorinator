@@ -108,13 +108,18 @@ run_profile() {
   local engine=$2
   local label=$3
   local output="$RUN_ROOT/$label"
+  local legacy_reset=()
+  if [[ "$engine" == optimized ]] && grep -q 'inference_generation_compile:' "$repo/config.py"; then
+    legacy_reset+=(inference_generation_compile=false)
+  fi
   mkdir -p "$output"
   (
     cd "$repo"
     python inference.py --config-name "$PROFILE_CONFIG" \
       output_path="$output" \
       inference_engine="$engine" \
-      "${COMMON_OVERRIDES[@]}"
+      "${COMMON_OVERRIDES[@]}" \
+      "${legacy_reset[@]}"
   )
   local profile
   profile=$(find "$output" -name '*.profile.json' -type f | sort | head -n 1)
