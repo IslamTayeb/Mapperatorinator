@@ -107,12 +107,9 @@ def _load_args(config_name: str, overrides: list[str]):
     import hydra
     from omegaconf import DictConfig, OmegaConf
 
-    config_dir = REPO_ROOT / "configs"
-    resolved_name = (
-        config_name
-        if config_name.startswith("inference/")
-        else f"inference/{config_name}"
-    )
+    __import__("config")  # Register structured train/diffusion/inference bases.
+    config_dir = REPO_ROOT / "configs" / "inference"
+    resolved_name = config_name.removeprefix("inference/")
     with hydra.initialize_config_dir(config_dir=str(config_dir), version_base="1.1"):
         cfg = hydra.compose(config_name=resolved_name, overrides=overrides)
     return OmegaConf.to_object(cfg) if isinstance(cfg, DictConfig) else cfg

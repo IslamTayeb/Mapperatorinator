@@ -8,6 +8,7 @@ from utils.profile_native_prefix_dtype_scout import (
     BUCKET_COUNTS,
     REQUIRED_CHECKS,
     _bucket_entry,
+    _load_args,
     convert_static_inputs_dtype,
     select_buckets,
     validate_accepted_graph_cache,
@@ -42,6 +43,16 @@ def _cache(dtype):
 
 
 class ProfileNativePrefixDtypeScoutTest(unittest.TestCase):
+    def test_load_args_registers_structured_train_and_diffusion_configs(self):
+        args = _load_args(
+            "profile_salvalai",
+            ["audio_path=/tmp/salvalai.mp3", "inference_engine=optimized"],
+        )
+
+        self.assertEqual(args.audio_path, "/tmp/salvalai.mp3")
+        self.assertEqual(args.inference_engine, "optimized")
+        self.assertEqual(args.train.model.name, "OliBomby/varwhisper-small")
+
     def test_validate_accepted_graph_cache_requires_exact_counts(self):
         entries = validate_accepted_graph_cache(_graph_cache())
         self.assertEqual(tuple(entries), ALL_BUCKETS)
