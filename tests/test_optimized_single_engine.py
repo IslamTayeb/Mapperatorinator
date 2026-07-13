@@ -264,6 +264,9 @@ def test_generate_window_preserves_custom_generate_dispatch(monkeypatch):
         def active_prefix_decode_kwargs(self):
             return {}
 
+        def graph_profile_summary(self):
+            return {"graphs": []}
+
     monkeypatch.setattr(
         engine_module,
         "_build_logits_processor_list",
@@ -296,6 +299,7 @@ def test_generate_window_preserves_custom_generate_dispatch(monkeypatch):
 
     assert torch.equal(result, torch.tensor([[1, 2]], dtype=torch.long))
     assert stats["torch_compile_enabled"] is False
+    assert stats["optimized_cuda_graphs"] == {"graphs": []}
     custom_generate = captured["custom_generate"]
     assert isinstance(custom_generate, partial)
     assert custom_generate.func is engine_module.active_prefix_decode_generate
