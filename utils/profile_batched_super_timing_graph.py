@@ -263,6 +263,7 @@ def _graph_summary(
         for family, tensors in families.items():
             for tensor in tensors:
                 pointer = int(tensor.untyped_storage().data_ptr())
+                unique_within_state = pointer not in current_storage_pointers
                 unique_across_states = pointer not in tensor_storage_pointers
                 current_storage_pointers.add(pointer)
                 tensor_pass = all((
@@ -270,6 +271,7 @@ def _graph_summary(
                     int(tensor.shape[0]) == expected_batch,
                     str(tensor.dtype) == signature[4],
                     str(tensor.device) == signature[5],
+                    unique_within_state,
                     unique_across_states,
                 ))
                 tensors_pass &= tensor_pass
@@ -278,6 +280,7 @@ def _graph_summary(
                     "shape": list(tensor.shape),
                     "dtype": str(tensor.dtype),
                     "device": str(tensor.device),
+                    "unique_storage_within_state": unique_within_state,
                     "unique_storage_across_states": unique_across_states,
                     "pass": tensor_pass,
                 })

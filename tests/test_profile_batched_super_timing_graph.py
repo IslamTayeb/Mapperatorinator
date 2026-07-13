@@ -164,3 +164,26 @@ def test_graph_summary_rejects_cross_state_cache_aliasing():
         for row in summary["cache_states"]
         for tensor in row["tensors"]
     )
+
+
+def test_graph_summary_rejects_within_state_cache_aliasing():
+    from osuT5.osuT5.inference.optimized.single.state import ProductionDecodeSession
+
+    cache = _cache(1)
+    cache.cross_attention_cache.layers[0].values = (
+        cache.cross_attention_cache.layers[0].keys
+    )
+    session = ProductionDecodeSession()
+    session.caches = {
+        (1, 1, 1, 1, "torch.float32", "cpu"): cache,
+    }
+    runtime = SimpleNamespace(new_context_state=lambda: session)
+
+    summary = _graph_summary(runtime, expected_batch_sizes={1})
+
+    assert not summary["cache_ownership_pass"]
+    assert any(
+        not tensor["unique_storage_within_state"]
+        for row in summary["cache_states"]
+        for tensor in row["tensors"]
+    )
