@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from osuT5.osuT5.inference.profiler import InferenceProfiler
+from osuT5.osuT5.inference.processor import Processor
 
 
 def test_generation_summary_aggregates_model_time_and_tokens(tmp_path):
@@ -48,3 +49,32 @@ def test_disabled_profiler_does_not_write(tmp_path):
 
     assert profiler.write(tmp_path / "profile.json") is None
     assert not (tmp_path / "profile.json").exists()
+
+
+def test_processor_records_specialized_dispatch_capture_hits():
+    processor = Processor.__new__(Processor)
+    processor.profiler = InferenceProfiler(enabled=True)
+    processor.precision = "fp32"
+    processor.model = object()
+    processor.parallel = False
+    hits = {
+        "native_q1_rope_cache_self_attention": 12,
+        "native_q1_self_attention": 0,
+        "q1_bmm_cross_attention": 12,
+        "native_cross_mlp_tail": 12,
+    }
+
+    processor._record_generation_profile(
+        profile_label="main_generation",
+        mode="main",
+        context_type="MAP",
+        wall_seconds=1.0,
+        stats={
+            "generated_tokens": 4,
+            "elapsed_seconds": 0.5,
+            "tokens_per_second": 8.0,
+            "optimized_dispatch_capture_hits": hits,
+        },
+    )
+
+    assert processor.profiler.generation[0]["optimized_dispatch_capture_hits"] == hits

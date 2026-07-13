@@ -1509,6 +1509,7 @@ class Processor(object):
             "native_cross_mlp_tail_requested",
             "native_cross_mlp_tail_enabled",
             "native_cross_mlp_tail_disabled_reason",
+            "optimized_dispatch_capture_hits",
         ):
             if stats.get(key) is not None:
                 record[key] = stats[key]
