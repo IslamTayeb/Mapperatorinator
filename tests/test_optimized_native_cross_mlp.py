@@ -221,32 +221,33 @@ def test_native_decoder_wrappers_preserve_fp16_storage_and_argument_order(
     assert args[6:] == (1e-5, 8)
 
 
-def test_native_cross_mlp_is_the_single_experimental_optimized_preset() -> None:
-    raw_model = SimpleNamespace(
-        generation_config=SimpleNamespace(disable_compile=False),
-    )
-    loader = lambda **kwargs: (raw_model, object())
-    kwargs = {
-        "precision": "fp16",
-        "attn_implementation": "sdpa",
-        "use_server": False,
-    }
+def test_native_cross_mlp_is_enabled_in_both_accepted_presets() -> None:
+    for precision in ("fp32", "fp16"):
+        raw_model = SimpleNamespace(
+            generation_config=SimpleNamespace(disable_compile=False),
+        )
+        loader = lambda **kwargs: (raw_model, object())
+        kwargs = {
+            "precision": precision,
+            "attn_implementation": "sdpa",
+            "use_server": False,
+        }
 
-    candidate, _ = engine.load_optimized_single_engine(
-        model_loader=loader,
-        loader_kwargs=kwargs,
-    )
-    assert type(candidate.runtime) is engine.OptimizedSingleRuntime
-    assert candidate.runtime.profile_metadata()["optimized_effective_config"][
-        "native_cross_mlp_tail"
-    ] is True
-    assert (
-        candidate.runtime.profile_metadata()["optimized_result_class"]
-        == "candidate-unverified"
-    )
+        candidate, _ = engine.load_optimized_single_engine(
+            model_loader=loader,
+            loader_kwargs=kwargs,
+        )
+        assert type(candidate.runtime) is engine.OptimizedSingleRuntime
+        assert candidate.runtime.profile_metadata()["optimized_effective_config"][
+            "native_cross_mlp_tail"
+        ] is True
+        assert (
+            candidate.runtime.profile_metadata()["optimized_result_class"]
+            == "documented-drift"
+        )
 
 
-def test_experimental_tail_is_disabled_only_for_timing_context() -> None:
+def test_accepted_tail_is_disabled_only_for_timing_context() -> None:
     assert engine._native_cross_mlp_tail_enabled(
         context_type=ContextType.MAP,
     )
@@ -295,6 +296,7 @@ def test_ordinary_generate_window_installs_shared_specialized_dispatch(monkeypat
         model_kwargs,
         {"context_type": ContextType.MAP, "pad_token_id": 0},
         context_state=FakeSession(),
+        preset=engine.OPTIMIZED_PRESETS["fp16"],
     )
     _, timing_stats = engine._generate_window(
         model,
@@ -302,6 +304,7 @@ def test_ordinary_generate_window_installs_shared_specialized_dispatch(monkeypat
         model_kwargs,
         {"context_type": ContextType.TIMING, "pad_token_id": 0},
         context_state=FakeSession(),
+        preset=engine.OPTIMIZED_PRESETS["fp16"],
     )
 
     main_dispatch_counts = captured[0].pop("optimized_dispatch_counts")
@@ -327,8 +330,15 @@ def test_ordinary_generate_window_installs_shared_specialized_dispatch(monkeypat
     assert timing_dispatch_counts == timing_stats["optimized_dispatch_capture_hits"]
 
 
-def test_optimized_runtime_rejects_model_dtype_that_disagrees_with_metadata() -> None:
-    model = SimpleNamespace(device=torch.device("cpu"), dtype=torch.float32)
+@pytest.mark.parametrize(
+    ("precision", "wrong_dtype"),
+    (("fp32", torch.float16), ("fp16", torch.float32)),
+)
+def test_optimized_runtime_rejects_model_dtype_that_disagrees_with_metadata(
+    precision,
+    wrong_dtype,
+) -> None:
+    model = SimpleNamespace(device=torch.device("cpu"), dtype=wrong_dtype)
 
     with pytest.raises(TypeError, match="runtime loaded model dtype"):
         engine._generate_window(
@@ -337,6 +347,32 @@ def test_optimized_runtime_rejects_model_dtype_that_disagrees_with_metadata() ->
             {},
             {},
             context_state=SimpleNamespace(),
+            preset=engine.OPTIMIZED_PRESETS[precision],
+        )
+
+
+@pytest.mark.parametrize(
+    ("preset_precision", "model_dtype", "requested_precision"),
+    (
+        ("fp32", torch.float32, "fp16"),
+        ("fp16", torch.float16, "fp32"),
+    ),
+)
+def test_bound_runtime_rejects_generation_time_precision_switches(
+    preset_precision,
+    model_dtype,
+    requested_precision,
+) -> None:
+    model = SimpleNamespace(device=torch.device("cpu"), dtype=model_dtype)
+
+    with pytest.raises(ValueError, match="configuration changed after validation"):
+        engine._generate_window(
+            model,
+            SimpleNamespace(),
+            {"inputs": torch.zeros((1, 1), dtype=model_dtype)},
+            {"precision": requested_precision},
+            context_state=SimpleNamespace(),
+            preset=engine.OPTIMIZED_PRESETS[preset_precision],
         )
 
 

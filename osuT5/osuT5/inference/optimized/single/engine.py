@@ -1,9 +1,11 @@
-"""Experimental FP16 optimized single-song inference engine."""
+"""Accepted immutable FP32 and FP16 optimized single-song presets."""
 
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from functools import partial
+from types import MappingProxyType
 from typing import Any
 
 import torch
@@ -21,24 +23,43 @@ from .logits import build_single_logits_processor_list
 from .state import ProductionDecodeSession
 
 
-OPTIMIZED_CONFIG_VERSION = "experimental-fp16-all-fused-v1"
-OPTIMIZED_RESULT_CLASS = "candidate-unverified"
-OPTIMIZED_PRECISION = "fp16"
 OPTIMIZED_ATTN_IMPLEMENTATION = "sdpa"
 ACTIVE_PREFIX_BUCKET_SIZE = 64
-_OPTIMIZED_TORCH_DTYPES = {
-    "fp32": torch.float32,
-    "fp16": torch.float16,
-}
 
 
-def _optimized_config_metadata() -> dict[str, Any]:
-    """Describe the immutable experimental engine preset for profiles."""
+@dataclass(frozen=True, slots=True)
+class OptimizedPreset:
+    version: str
+    result_class: str
+    precision: str
+    torch_dtype: torch.dtype
+
+
+OPTIMIZED_PRESETS = MappingProxyType(
+    {
+        "fp32": OptimizedPreset(
+            version="accepted-fp32-native-cross-mlp-289-v2",
+            result_class="documented-drift",
+            precision="fp32",
+            torch_dtype=torch.float32,
+        ),
+        "fp16": OptimizedPreset(
+            version="accepted-fp16-all-fused-v1",
+            result_class="documented-drift",
+            precision="fp16",
+            torch_dtype=torch.float16,
+        ),
+    }
+)
+
+
+def _optimized_config_metadata(preset: OptimizedPreset) -> dict[str, Any]:
+    """Describe one immutable accepted engine preset for profiles."""
 
     return {
-        "version": OPTIMIZED_CONFIG_VERSION,
-        "result_class": OPTIMIZED_RESULT_CLASS,
-        "precision": OPTIMIZED_PRECISION,
+        "version": preset.version,
+        "result_class": preset.result_class,
+        "precision": preset.precision,
         "attn_implementation": OPTIMIZED_ATTN_IMPLEMENTATION,
         "decoder_loop_backend": "active_prefix_cuda_graph",
         "torch_compile_enabled": False,
@@ -104,11 +125,12 @@ def _generate_window(
     generate_kwargs: dict[str, Any],
     *,
     context_state: ProductionDecodeSession,
+    preset: OptimizedPreset,
 ):
-    expected_dtype = _OPTIMIZED_TORCH_DTYPES[OPTIMIZED_PRECISION]
+    expected_dtype = preset.torch_dtype
     if model.dtype != expected_dtype:
         raise TypeError(
-            f"optimized {OPTIMIZED_PRECISION} runtime loaded model dtype "
+            f"optimized {preset.precision} runtime loaded model dtype "
             f"{model.dtype}, expected {expected_dtype}"
         )
     model_kwargs = {
@@ -127,7 +149,7 @@ def _generate_window(
     }
     batch_size = model_kwargs["inputs"].shape[0]
 
-    precision = generate_kwargs.pop("precision", OPTIMIZED_PRECISION)
+    precision = generate_kwargs.pop("precision", preset.precision)
     cfg_scale = generate_kwargs.pop("cfg_scale", 1.0)
     timeshift_bias = generate_kwargs.pop("timeshift_bias", 0)
     types_first = generate_kwargs.pop("types_first", False)
@@ -147,7 +169,7 @@ def _generate_window(
     sync_model_timing = bool(generate_kwargs.pop("sync_model_timing", False))
     if context_type is not None:
         context_type = ContextType(context_type)
-    if precision != OPTIMIZED_PRECISION or cfg_scale != 1.0:
+    if precision != preset.precision or cfg_scale != 1.0:
         raise ValueError("optimized single runtime configuration changed after validation.")
     if batch_size != 1:
         raise ValueError("optimized single runtime requires batch_size=1.")
@@ -241,7 +263,7 @@ def _generate_window(
         "context_type": context_type.value if context_type is not None else None,
         "decoder_loop_backend": "active_prefix_cuda_graph",
         "torch_compile_enabled": False,
-        "optimized_effective_config_version": OPTIMIZED_CONFIG_VERSION,
+        "optimized_effective_config_version": preset.version,
         "native_cross_mlp_tail_requested": True,
         "native_cross_mlp_tail_enabled": native_cross_mlp_tail,
         "native_cross_mlp_tail_disabled_reason": (
@@ -254,7 +276,21 @@ def _generate_window(
     return result, stats
 
 
+@dataclass(frozen=True, slots=True)
 class OptimizedSingleRuntime:
+    preset: OptimizedPreset
+
+    def __post_init__(self):
+        if not isinstance(self.preset, OptimizedPreset):
+            raise TypeError(
+                "optimized runtime requires an immutable OptimizedPreset."
+            )
+        if not any(
+            self.preset is candidate
+            for candidate in OPTIMIZED_PRESETS.values()
+        ):
+            raise ValueError("optimized runtime requires a registered precision preset.")
+
     def new_context_state(self) -> ProductionDecodeSession:
         return ProductionDecodeSession()
 
@@ -277,16 +313,17 @@ class OptimizedSingleRuntime:
             model_kwargs,
             dict(generate_kwargs),
             context_state=context_state,
+            preset=self.preset,
         )
 
     def profile_metadata(self) -> dict[str, Any]:
         return {
-            "optimized_effective_config_version": OPTIMIZED_CONFIG_VERSION,
-            "optimized_effective_config": _optimized_config_metadata(),
+            "optimized_effective_config_version": self.preset.version,
+            "optimized_effective_config": _optimized_config_metadata(self.preset),
             "optimized_runtime_owner": (
                 "osuT5.osuT5.inference.optimized.single.engine"
             ),
-            "optimized_result_class": OPTIMIZED_RESULT_CLASS,
+            "optimized_result_class": self.preset.result_class,
         }
 
 
@@ -295,10 +332,13 @@ def load_optimized_single_engine(
     model_loader,
     loader_kwargs: dict[str, Any],
 ):
-    if loader_kwargs.get("precision") != OPTIMIZED_PRECISION:
+    precision = loader_kwargs.get("precision")
+    try:
+        preset = OPTIMIZED_PRESETS[precision]
+    except (KeyError, TypeError) as exc:
         raise ValueError(
-            f"optimized single loader requires precision={OPTIMIZED_PRECISION}."
-        )
+            "optimized single loader requires precision in: fp16, fp32."
+        ) from exc
     if loader_kwargs.get("attn_implementation") != OPTIMIZED_ATTN_IMPLEMENTATION:
         raise ValueError("optimized single loader requires attn_implementation=sdpa.")
     if loader_kwargs.get("use_server"):
@@ -307,7 +347,7 @@ def load_optimized_single_engine(
     effective_loader_kwargs = dict(loader_kwargs)
     effective_loader_kwargs.update(
         {
-            "precision": OPTIMIZED_PRECISION,
+            "precision": preset.precision,
             "attn_implementation": OPTIMIZED_ATTN_IMPLEMENTATION,
             "generation_compile": True,
             "use_server": False,
@@ -328,7 +368,7 @@ def load_optimized_single_engine(
     return (
         InferenceEngineBinding(
             raw_model=raw_model,
-            runtime=OptimizedSingleRuntime(),
+            runtime=OptimizedSingleRuntime(preset),
         ),
         tokenizer,
     )

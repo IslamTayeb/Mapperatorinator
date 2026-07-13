@@ -11,7 +11,7 @@ def load_optimized_engine(
     model_loader=None,
     loader_kwargs: dict[str, Any] | None = None,
 ):
-    """Load the single accepted optimized engine preset."""
+    """Load the immutable optimized preset selected by model precision."""
 
     if not callable(model_loader):
         raise TypeError("optimized inference requires an injected model_loader.")

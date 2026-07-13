@@ -31,12 +31,27 @@ def test_invalid_inference_engine_fails_loudly():
     )
 
 
-def test_optimized_engine_is_fp16_only():
-    args = InferenceConfig(inference_engine="optimized", precision="fp32")
+def test_optimized_engine_accepts_only_the_two_frozen_precision_presets():
+    for precision in ("fp32", "fp16"):
+        validate_reserved_runtime_flags(
+            InferenceConfig(
+                inference_engine="optimized",
+                precision=precision,
+                use_server=False,
+                parallel=False,
+                device="cuda",
+                attn_implementation="sdpa",
+                cfg_scale=1.0,
+                num_beams=1,
+                super_timing=False,
+            )
+        )
+
+    args = InferenceConfig(inference_engine="optimized", precision="bf16")
 
     _assert_raises(
         ValueError,
-        "requires precision=fp16",
+        "requires precision=fp32 or precision=fp16",
         lambda: validate_reserved_runtime_flags(args),
     )
 
