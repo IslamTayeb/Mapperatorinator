@@ -1,0 +1,299 @@
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+from pathlib import Path
+import shutil
+import statistics
+import subprocess
+import sys
+import time
+from typing import Any
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+
+RUN_ORDER = (
+    "cached_first",
+    "direct_first",
+    "direct_second",
+    "cached_second",
+)
+ANALYZER_ROLES = {
+    "baseline_first": "cached_first",
+    "candidate_first": "direct_first",
+    "candidate_second": "direct_second",
+    "baseline_second": "cached_second",
+}
+
+
+def _profile_path(output: Path) -> Path:
+    profiles = sorted(output.rglob("*.profile.json"))
+    if len(profiles) != 1:
+        raise RuntimeError(f"expected one profile under {output}, got {profiles}")
+    return profiles[0]
+
+
+def _load_json(path: Path, *, name: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot read {name} at {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{name} must be a JSON object")
+    return value
+
+
+def _validate_extension_evidence(
+    records: dict[str, Any],
+    manifest_extensions: dict[str, Any],
+    *,
+    mode: str,
+) -> None:
+    expected_mode = "direct" if mode == "direct" else "load_inline"
+    if set(records) != set(manifest_extensions):
+        raise RuntimeError(
+            f"{mode} extension set mismatch: "
+            f"expected {sorted(manifest_extensions)}, got {sorted(records)}"
+        )
+    for name, expected in manifest_extensions.items():
+        record = records.get(name)
+        if not isinstance(record, dict):
+            raise RuntimeError(f"{mode} extension record {name} must be an object")
+        for key in ("source_sha256", "library_sha256", "functions"):
+            if record.get(key) != expected.get(key):
+                raise RuntimeError(f"{mode} extension {name} differs in {key}")
+        if record.get("mode") != expected_mode:
+            raise RuntimeError(
+                f"{mode} extension {name} used {record.get('mode')}, "
+                f"expected {expected_mode}"
+            )
+
+
+def evaluate_gate(
+    analysis: dict[str, Any],
+    process_walls: dict[str, float],
+    *,
+    minimum_cold_saving_seconds: float,
+) -> dict[str, Any]:
+    if set(process_walls) != set(RUN_ORDER):
+        raise ValueError("process wall roles are incomplete")
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or float(value) <= 0.0
+        for value in process_walls.values()
+    ):
+        raise ValueError("process walls must be positive finite numbers")
+    cached = [process_walls["cached_first"], process_walls["cached_second"]]
+    direct = [process_walls["direct_first"], process_walls["direct_second"]]
+    cached_median = statistics.median(cached)
+    direct_median = statistics.median(direct)
+    cold_saving = cached_median - direct_median
+    metrics = analysis.get("metrics")
+    if not isinstance(metrics, dict):
+        raise ValueError("reciprocal analysis metrics are missing")
+    warm = metrics.get("complete_request_wall_seconds")
+    cold_profile = metrics.get("cold_process_outer_wall_seconds")
+    if not isinstance(warm, dict) or not isinstance(cold_profile, dict):
+        raise ValueError("reciprocal warm/cold metrics are missing")
+    warm_delta = float(warm["candidate_minus_baseline"])
+    cold_profile_saving = -float(cold_profile["candidate_minus_baseline"])
+    parity = analysis.get("parity")
+    if not isinstance(parity, dict):
+        raise ValueError("reciprocal parity is missing")
+    exact_pass = bool(
+        parity.get("cross_candidate_exact")
+        and parity.get("required_exact_labels_pass")
+        and parity.get("required_exact_dispatch_labels_pass")
+        and parity.get("output_divergence", {}).get("final_map_equal")
+    )
+    cold_pass = cold_saving >= minimum_cold_saving_seconds
+    warm_pass = warm_delta <= 0.0
+    return {
+        "schema_version": 1,
+        "minimum_cold_saving_seconds": minimum_cold_saving_seconds,
+        "process_wall_seconds": process_walls,
+        "cached_process_median_seconds": cached_median,
+        "direct_process_median_seconds": direct_median,
+        "complete_cold_wall_saving_seconds": cold_saving,
+        "profile_cold_outer_saving_seconds": cold_profile_saving,
+        "warm_complete_request_candidate_minus_cached_seconds": warm_delta,
+        "cold_saving_pass": cold_pass,
+        "warm_no_regression_pass": warm_pass,
+        "exact_parity_pass": exact_pass,
+        "pass": cold_pass and warm_pass and exact_pass,
+    }
+
+
+def run(args: argparse.Namespace) -> dict[str, Any]:
+    from osuT5.osuT5.inference.optimized.kernels.native_extension import (
+        MANIFEST_ENV,
+        validate_packaged_manifest,
+    )
+    from utils.analyze_reciprocal_full_song_candidate import analyze
+    from utils.validate_k4_profile_contract import validate as validate_k4
+    from utils.validate_weight_only_full_song_profile import (
+        validate_profile as validate_weight,
+    )
+
+    run_root = args.run_root.resolve()
+    if run_root.exists():
+        raise RuntimeError(f"run root already exists: {run_root}")
+    run_root.mkdir(parents=True)
+    preflight = validate_packaged_manifest(
+        args.manifest,
+        expected_source_commit=args.commit,
+        expected_manifest_sha256=args.manifest_sha256,
+        extension_cache_root=args.extension_cache_root,
+    )
+    (run_root / "manifest-validation.json").write_text(
+        json.dumps(preflight, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    local_cache = run_root / "cached-extension-cache"
+    shutil.copytree(args.extension_cache_root, local_cache)
+    common_overrides = (
+        f"audio_path={args.audio}",
+        "device=cuda",
+        "precision=fp32",
+        "attn_implementation=sdpa",
+        "inference_engine=optimized",
+        "use_server=false",
+        "parallel=false",
+        "cfg_scale=1.0",
+        "num_beams=1",
+        "seed=12345",
+        "super_timing=false",
+        "generate_positions=false",
+        "profile_inference=true",
+        "profile_detail_ranges=false",
+        "profile_cuda_capture=false",
+        "profile_pass_kind=untraced_control",
+    )
+    if "inference_generation_compile:" in (REPO_ROOT / "config.py").read_text():
+        common_overrides += ("inference_generation_compile=false",)
+
+    process_walls: dict[str, float] = {}
+    profile_paths: dict[str, Path] = {}
+    manifest_extensions = preflight["extensions"]
+    for role in RUN_ORDER:
+        mode = "direct" if role.startswith("direct") else "cached"
+        output = run_root / role
+        init_json = run_root / "initialization" / f"{role}.json"
+        extension_json = run_root / "extension-load" / f"{role}.json"
+        compiler_cache = run_root / "compiler-cache" / role
+        env = os.environ.copy()
+        env["TORCH_EXTENSIONS_DIR"] = str(local_cache)
+        env["TORCHINDUCTOR_CACHE_DIR"] = str(compiler_cache / "torch_inductor")
+        env["TRITON_CACHE_DIR"] = str(compiler_cache / "triton")
+        env["CUDA_CACHE_PATH"] = str(compiler_cache / "cuda")
+        env["TORCH_CUDA_ARCH_LIST"] = "7.5"
+        env["PYTHONHASHSEED"] = "0"
+        env["TOKENIZERS_PARALLELISM"] = "false"
+        if mode == "direct":
+            env[MANIFEST_ENV] = str(args.manifest.resolve())
+        else:
+            env.pop(MANIFEST_ENV, None)
+        for directory in (
+            compiler_cache / "torch_inductor",
+            compiler_cache / "triton",
+            compiler_cache / "cuda",
+            init_json.parent,
+            extension_json.parent,
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+        command = [
+            str(args.python),
+            str(REPO_ROOT / "utils" / "run_k4_approximate_weight_only.py"),
+            "--config-name",
+            "profile_salvalai",
+            "--output-init-json",
+            str(init_json),
+            "--output-extension-json",
+            str(extension_json),
+            f"output_path={output}",
+            *common_overrides,
+        ]
+        stdout_path = run_root / f"{role}.stdout.txt"
+        stderr_path = run_root / f"{role}.stderr.txt"
+        started = time.perf_counter()
+        with stdout_path.open("w") as stdout, stderr_path.open("w") as stderr:
+            completed = subprocess.run(
+                command,
+                cwd=REPO_ROOT,
+                env=env,
+                stdout=stdout,
+                stderr=stderr,
+                check=False,
+            )
+        process_walls[role] = time.perf_counter() - started
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"{role} fresh process failed ({completed.returncode}); "
+                f"see {stdout_path} and {stderr_path}"
+            )
+        profile = _profile_path(output)
+        profile_payload = _load_json(profile, name=f"{role} profile")
+        validate_weight(profile_payload, role="candidate")
+        validate_k4(profile_payload, role="candidate", block_size=4)
+        _validate_extension_evidence(
+            _load_json(extension_json, name=f"{role} extension evidence"),
+            manifest_extensions,
+            mode=mode,
+        )
+        if not init_json.is_file() or not init_json.stat().st_size:
+            raise RuntimeError(f"{role} initialization evidence is missing")
+        profile_paths[role] = profile
+
+    analysis_paths = {
+        analyzer_role: profile_paths[run_role]
+        for analyzer_role, run_role in ANALYZER_ROLES.items()
+    }
+    analysis = analyze(
+        analysis_paths,
+        mode="exact-fp32",
+        required_exact_labels=("timing_context", "main_generation"),
+        required_exact_dispatch_labels=("timing_context", "main_generation"),
+    )
+    (run_root / "reciprocal-analysis.json").write_text(
+        json.dumps(analysis, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    gate = evaluate_gate(
+        analysis,
+        process_walls,
+        minimum_cold_saving_seconds=args.minimum_cold_saving_seconds,
+    )
+    (run_root / "aot-gate.json").write_text(
+        json.dumps(gate, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    if not gate["pass"]:
+        raise SystemExit(3)
+    return gate
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--python", type=Path, required=True)
+    parser.add_argument("--commit", required=True)
+    parser.add_argument("--audio", type=Path, required=True)
+    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--manifest-sha256", required=True)
+    parser.add_argument("--extension-cache-root", type=Path, required=True)
+    parser.add_argument("--run-root", type=Path, required=True)
+    parser.add_argument("--minimum-cold-saving-seconds", type=float, default=0.5)
+    args = parser.parse_args()
+    gate = run(args)
+    print(json.dumps(gate, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

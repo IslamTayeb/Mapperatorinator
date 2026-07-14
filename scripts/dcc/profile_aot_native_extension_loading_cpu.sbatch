@@ -70,7 +70,8 @@ fi
 cd "$REPO"
 "$PYTHON" -m unittest -v \
   tests.test_native_extension_manifest \
-  tests.test_aot_native_extension_cpu_wrapper
+  tests.test_aot_native_extension_cpu_wrapper \
+  tests.test_aot_full_song_reciprocal
 
 "$PYTHON" utils/build_native_extension_manifest.py \
   --manifest "$RUN_ROOT/package/manifest.json" \

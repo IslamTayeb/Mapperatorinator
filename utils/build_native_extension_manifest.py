@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import time
 
@@ -34,6 +35,21 @@ def build(output_path: Path) -> dict[str, object]:
 
     if os.environ.get(MANIFEST_ENV):
         raise RuntimeError(f"unset {MANIFEST_ENV} before building extensions")
+    if subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout:
+        raise RuntimeError("native extension manifest requires a clean worktree")
+    source_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
     started = time.perf_counter()
     modules = (
         q1_attention.preload_native_q1_attention(),
@@ -49,9 +65,11 @@ def build(output_path: Path) -> dict[str, object]:
     manifest = write_loaded_extension_manifest(
         output_path,
         expected_names=EXPECTED_EXTENSIONS,
+        source_commit=source_commit,
     )
     return {
         "manifest": str(output_path.resolve()),
+        "source_commit": source_commit,
         "build_seconds": build_seconds,
         "extensions": loaded_extension_records(),
         "packaged": manifest,
