@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
 #SBATCH --gres=gpu:2080:1
-#SBATCH --time=01:00:00
+#SBATCH --time=00:30:00
 #SBATCH --output=/work/imt11/Mapperatorinator/logs/%x-%j.out
 #SBATCH --error=/work/imt11/Mapperatorinator/logs/%x-%j.err
 
