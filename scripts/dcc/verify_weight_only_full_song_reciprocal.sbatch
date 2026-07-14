@@ -705,8 +705,10 @@ ANALYSIS_DISPATCH_ARGS=(
     'records.main_generation[[]*].optimized_cuda_graphs.*'
 )
 if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
-  ANALYSIS_MODE=exact-fp32
-  ANALYSIS_CLAIM=exact-fp32
+  # Both arms retain the documented-drift mixed-weight runtime. Require an
+  # exact incremental shared-RoPE delta without relabeling the overall runtime.
+  ANALYSIS_MODE=relaxed
+  ANALYSIS_CLAIM=relaxed-nonexact
   ANALYSIS_EXACT_ARGS=(
     --require-exact-label timing_context
     --require-exact-label main_generation
@@ -780,6 +782,10 @@ fi
 
 grep -q "^mode=$ANALYSIS_MODE$" "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q "^parity.claim=$ANALYSIS_CLAIM$" "$RUN_ROOT/reciprocal-analysis.txt"
+if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
+  grep -q '^parity.cross_candidate_exact=true$' \
+    "$RUN_ROOT/reciprocal-analysis.txt"
+fi
 grep -q '^parity.baseline_repeat_stable=true$' "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^parity.candidate_repeat_stable=true$' "$RUN_ROOT/reciprocal-analysis.txt"
 EXPECTED_EXACT_LABELS=none

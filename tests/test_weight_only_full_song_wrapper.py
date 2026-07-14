@@ -115,9 +115,10 @@ def test_shared_rope_wrapper_compares_against_exact_combined_control() -> None:
     assert "verify_weight_only_full_song_reciprocal.sbatch" in source
 
     general = WRAPPER.read_text(encoding="utf-8")
-    assert "ANALYSIS_MODE=exact-fp32" in general
+    assert "Both arms retain the documented-drift mixed-weight runtime" in general
     assert "--require-exact-label main_generation" in general
     assert "--require-exact-dispatch-label main_generation" in general
+    assert "parity.cross_candidate_exact=true" in general
     assert "shared-RoPE did not execute" in general
     assert 'runtime_candidate=$candidate' in general
 
