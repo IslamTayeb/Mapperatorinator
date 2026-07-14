@@ -28,6 +28,32 @@ REGRESSION_TOLERANCE_PCT=${REGRESSION_TOLERANCE_PCT:-5}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_LABEL=${RUN_LABEL:-smoke}
 RUN_ROOT="$WORK/runs/inference-${RUN_LABEL}-${SLURM_JOB_ID:-manual}"
+EXTENSION_JOB_KEY=${SLURM_JOB_ID:-manual}
+
+sanitize_extension_key() {
+  local raw=$1
+  local sanitized
+  sanitized=$(printf '%s' "$raw" | sed 's/[^A-Za-z0-9._-]/_/g')
+  if [[ -z "$sanitized" ]]; then
+    echo "native extension commit key sanitized to empty: $raw" >&2
+    exit 2
+  fi
+  printf '%s\n' "$sanitized"
+}
+
+BASELINE_EXTENSION_KEY=$(sanitize_extension_key "$BASELINE_COMMIT")
+CANDIDATE_EXTENSION_KEY=$(sanitize_extension_key "$CANDIDATE_COMMIT")
+if [[ "$BASELINE_COMMIT" != "$CANDIDATE_COMMIT" ]] \
+  && [[ "$BASELINE_EXTENSION_KEY" == "$CANDIDATE_EXTENSION_KEY" ]]; then
+  echo "distinct commits sanitize to the same native extension key" >&2
+  echo "baseline_commit=$BASELINE_COMMIT" >&2
+  echo "candidate_commit=$CANDIDATE_COMMIT" >&2
+  echo "extension_key=$BASELINE_EXTENSION_KEY" >&2
+  exit 2
+fi
+EXTENSION_JOB_ROOT="$WORK/torch_extensions/reciprocal-$EXTENSION_JOB_KEY"
+BASELINE_TORCH_EXTENSIONS_DIR="$EXTENSION_JOB_ROOT/$BASELINE_EXTENSION_KEY"
+CANDIDATE_TORCH_EXTENSIONS_DIR="$EXTENSION_JOB_ROOT/$CANDIDATE_EXTENSION_KEY"
 
 if [[ ! -x "$ENV/bin/python" ]]; then
   echo "missing environment Python at $ENV/bin/python" >&2
@@ -100,14 +126,14 @@ if value < 0:
 PY
 
 mkdir -p "$WORK/logs" "$WORK/tmp" "$WORK/cache" \
-  "$WORK/torch_extensions" "$RUN_ROOT"
+  "$BASELINE_TORCH_EXTENSIONS_DIR" "$CANDIDATE_TORCH_EXTENSIONS_DIR" \
+  "$RUN_ROOT/native-extension-setup"
 export PATH="$ENV/bin:$PATH"
 export XDG_CACHE_HOME="$WORK/cache"
 export HF_HOME="$WORK/cache/huggingface"
 export TRANSFORMERS_CACHE="$WORK/cache/huggingface"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
-export TORCH_EXTENSIONS_DIR="$WORK/torch_extensions"
 export TMPDIR="$WORK/tmp"
 export TOKENIZERS_PARALLELISM=false
 
@@ -124,6 +150,9 @@ echo "profile_config=$PROFILE_CONFIG"
 echo "precision=$PRECISION"
 echo "regression_tolerance_pct=$REGRESSION_TOLERANCE_PCT"
 echo "run_root=$RUN_ROOT"
+echo "extension_job_root=$EXTENSION_JOB_ROOT"
+echo "baseline_torch_extensions_dir=$BASELINE_TORCH_EXTENSIONS_DIR"
+echo "candidate_torch_extensions_dir=$CANDIDATE_TORCH_EXTENSIONS_DIR"
 if [[ -n "${SLURM_JOB_ID:-}" ]]; then
   scontrol show job -o "$SLURM_JOB_ID"
 fi
@@ -160,10 +189,83 @@ COMMON_OVERRIDES=(
   profile_inference=true
 )
 
+preload_native_extensions() {
+  local repo=$1
+  local engine=$2
+  local label=$3
+  local extension_dir=$4
+  local commit=$5
+  local started_ns
+  local finished_ns
+  local status
+  started_ns=$(date +%s%N)
+  if [[ "$engine" == optimized ]]; then
+    (
+      export TORCH_EXTENSIONS_DIR="$extension_dir"
+      cd "$repo"
+      python - <<'PY'
+from osuT5.osuT5.inference.optimized.kernels.decoder_layer import (
+    preload_native_decoder_layer,
+)
+from osuT5.osuT5.inference.optimized.kernels.q1_attention import (
+    preload_native_q1_attention,
+)
+
+preload_native_q1_attention()
+preload_native_decoder_layer()
+PY
+    )
+    status=preloaded
+  else
+    status=not_applicable
+  fi
+  finished_ns=$(date +%s%N)
+  "$ENV/bin/python" - \
+    "$RUN_ROOT/native-extension-setup/$label.json" \
+    "$label" "$engine" "$repo" "$extension_dir" "$commit" \
+    "$started_ns" "$finished_ns" "$status" <<'PY'
+import json
+import math
+import sys
+from pathlib import Path
+
+(
+    output,
+    label,
+    engine,
+    repo,
+    extension_dir,
+    commit,
+    started_ns,
+    finished_ns,
+    status,
+) = sys.argv[1:]
+started_ns = int(started_ns)
+finished_ns = int(finished_ns)
+wall_seconds = (finished_ns - started_ns) / 1_000_000_000
+if finished_ns < started_ns or not math.isfinite(wall_seconds):
+    raise SystemExit("invalid native extension preload wall")
+payload = {
+    "schema_version": 1,
+    "label": label,
+    "engine": engine,
+    "repo": repo,
+    "commit": commit,
+    "torch_extensions_dir": extension_dir,
+    "status": status,
+    "started_at_unix_ns": started_ns,
+    "finished_at_unix_ns": finished_ns,
+    "wall_seconds": wall_seconds,
+}
+Path(output).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
 run_profile() {
   local repo=$1
   local engine=$2
   local label=$3
+  local extension_dir=$4
   local output="$RUN_ROOT/$label"
   local compiler_cache="$RUN_ROOT/compiler-cache/$label"
   local legacy_reset=()
@@ -177,6 +279,7 @@ run_profile() {
   mkdir -p "$output" \
     "$compiler_cache/torch_inductor" "$compiler_cache/triton" "$compiler_cache/cuda"
   (
+    export TORCH_EXTENSIONS_DIR="$extension_dir"
     export TORCHINDUCTOR_CACHE_DIR="$compiler_cache/torch_inductor"
     export TRITON_CACHE_DIR="$compiler_cache/triton"
     export CUDA_CACHE_PATH="$compiler_cache/cuda"
@@ -196,10 +299,30 @@ run_profile() {
   printf '%s\n' "$profile" > "$RUN_ROOT/$label.profile-path.txt"
 }
 
-run_profile "$BASELINE_REPO" "$BASELINE_ENGINE" baseline_first
-run_profile "$CANDIDATE_REPO" "$CANDIDATE_ENGINE" candidate_second
-run_profile "$CANDIDATE_REPO" "$CANDIDATE_ENGINE" candidate_first
-run_profile "$BASELINE_REPO" "$BASELINE_ENGINE" baseline_second
+preload_native_extensions \
+  "$BASELINE_REPO" "$BASELINE_ENGINE" baseline_first \
+  "$BASELINE_TORCH_EXTENSIONS_DIR" "$BASELINE_COMMIT"
+run_profile \
+  "$BASELINE_REPO" "$BASELINE_ENGINE" baseline_first \
+  "$BASELINE_TORCH_EXTENSIONS_DIR"
+preload_native_extensions \
+  "$CANDIDATE_REPO" "$CANDIDATE_ENGINE" candidate_second \
+  "$CANDIDATE_TORCH_EXTENSIONS_DIR" "$CANDIDATE_COMMIT"
+run_profile \
+  "$CANDIDATE_REPO" "$CANDIDATE_ENGINE" candidate_second \
+  "$CANDIDATE_TORCH_EXTENSIONS_DIR"
+preload_native_extensions \
+  "$CANDIDATE_REPO" "$CANDIDATE_ENGINE" candidate_first \
+  "$CANDIDATE_TORCH_EXTENSIONS_DIR" "$CANDIDATE_COMMIT"
+run_profile \
+  "$CANDIDATE_REPO" "$CANDIDATE_ENGINE" candidate_first \
+  "$CANDIDATE_TORCH_EXTENSIONS_DIR"
+preload_native_extensions \
+  "$BASELINE_REPO" "$BASELINE_ENGINE" baseline_second \
+  "$BASELINE_TORCH_EXTENSIONS_DIR" "$BASELINE_COMMIT"
+run_profile \
+  "$BASELINE_REPO" "$BASELINE_ENGINE" baseline_second \
+  "$BASELINE_TORCH_EXTENSIONS_DIR"
 
 BASELINE_FIRST=$(<"$RUN_ROOT/baseline_first.profile-path.txt")
 CANDIDATE_SECOND=$(<"$RUN_ROOT/candidate_second.profile-path.txt")
