@@ -13,6 +13,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from utils.fixed_seed_inference import fixed_seed_processor_generation
+
 
 def _load_args(config_name: str, overrides: list[str]):
     import config  # noqa: F401
@@ -127,7 +129,8 @@ def run(config_name: str, overrides: list[str], output_init_json: Path) -> None:
 
     inference.load_model_with_engine = candidate_loader
     try:
-        inference.main(args)
+        with fixed_seed_processor_generation(inference, base_seed=args.seed):
+            inference.main(args)
     finally:
         inference.load_model_with_engine = original_loader
     if not initialized or init_metadata is None:
