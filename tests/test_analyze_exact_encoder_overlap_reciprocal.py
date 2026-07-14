@@ -62,6 +62,14 @@ def _overlap():
         "launch_after_timing_window": 1,
         "all_encoder_outputs_finite": True,
         "launch_manifest": {"graph_count": 2, "buckets": {"64": 1, "128": 1}},
+        "final_timing_manifest": {
+            "graph_count": 2,
+            "buckets": {"64": 1, "128": 1},
+        },
+        "pre_capture_barrier_count": 0,
+        "pre_capture_barrier_wait_seconds": 0.0,
+        "guarded_manifest_growth": [],
+        "encoder_synchronized_before_main": True,
         "pinned_input_setup_seconds": 0.01,
         "launch_host_seconds": 0.01,
         "encoder_elapsed_seconds": 2.0,
@@ -152,6 +160,45 @@ def test_candidate_validation_requires_complete_exact_b1_overlap():
     assert _validate_candidate(profile, evidence) is overlap
     overlap["manifest_changed_after_launch"] = True
     with pytest.raises(ValueError, match="contract changed"):
+        _validate_candidate(profile, evidence)
+
+
+def test_candidate_validation_rejects_unguarded_or_broken_manifest_growth():
+    overlap = _overlap()
+    overlap["live_window_count"] = 3
+    overlap["main_model_generate_calls"] = 3
+    overlap["launch_after_timing_window"] = 2
+    overlap["per_row_main_join_wait_seconds"] = [0.03, 0.03, 0.04]
+    overlap["encoder_output_sha256_per_window"] = ["e" * 64, "f" * 64, "0" * 64]
+    aggregate = hashlib.sha256()
+    for digest in overlap["encoder_output_sha256_per_window"]:
+        aggregate.update(digest.encode("ascii"))
+    overlap["encoder_output_aggregate_sha256"] = aggregate.hexdigest()
+    overlap["pre_capture_barrier_count"] = 1
+    overlap["final_timing_manifest"] = {
+        "graph_count": 3,
+        "buckets": {"64": 1, "128": 1, "192": 1},
+    }
+    overlap["guarded_manifest_growth"] = [
+        {
+            "after_timing_window": 2,
+            "capture_barriers": 1,
+            "before": overlap["launch_manifest"],
+            "after": overlap["final_timing_manifest"],
+        }
+    ]
+    profile = {
+        "metadata": {"optimized_exact_main_encoder_overlap": copy.deepcopy(overlap)}
+    }
+    evidence = {"mode": "candidate", "encoder_overlap": overlap}
+    assert _validate_candidate(profile, evidence) is overlap
+
+    overlap["guarded_manifest_growth"][0]["before"] = {
+        "graph_count": 1,
+        "buckets": {"64": 1},
+    }
+    profile["metadata"]["optimized_exact_main_encoder_overlap"] = copy.deepcopy(overlap)
+    with pytest.raises(ValueError, match="chain broke"):
         _validate_candidate(profile, evidence)
 
 

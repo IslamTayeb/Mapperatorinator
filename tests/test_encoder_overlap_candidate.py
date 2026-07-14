@@ -101,6 +101,53 @@ def test_manifest_must_repeat_before_launch_and_must_not_change(monkeypatch):
     assert aborts == [True]
 
 
+def test_guarded_manifest_growth_requires_one_barrier_per_fresh_graph(monkeypatch):
+    manager = ExactMainEncoderOverlap(stable_observations_required=2)
+    processor = object()
+    stream = SimpleNamespace(synchronize=lambda: None)
+    manager._active_label = "timing_context"
+    manager._stream = stream
+    manager._launch_manifest = {"graph_count": 1, "buckets": {"64": 1}}
+    manager._current_manifest = copy = manager._launch_manifest.copy()
+    monkeypatch.setattr(manager, "_publish", lambda _processor: None)
+    monkeypatch.setattr(
+        encoder_overlap,
+        "graph_manifest",
+        lambda _processor: {"graph_count": 2, "buckets": {"64": 1, "128": 1}},
+    )
+
+    manager.before_timing_graph_capture()
+    manager.after_timing_model_generate(processor)
+
+    assert manager._launch_manifest == copy
+    assert manager._current_manifest == {
+        "graph_count": 2,
+        "buckets": {"64": 1, "128": 1},
+    }
+    assert manager._pre_capture_barrier_count == 1
+    assert manager._pending_capture_barriers == 0
+    assert manager._guarded_manifest_growth[0]["capture_barriers"] == 1
+    assert not manager._manifest_changed_after_launch
+
+
+def test_guarded_manifest_growth_fails_if_capture_count_does_not_match(monkeypatch):
+    manager = ExactMainEncoderOverlap()
+    manager._active_label = "timing_context"
+    manager._stream = SimpleNamespace(synchronize=lambda: None)
+    manager._launch_manifest = {"graph_count": 1, "buckets": {"64": 1}}
+    manager._current_manifest = manager._launch_manifest.copy()
+    manager.before_timing_graph_capture()
+    monkeypatch.setattr(
+        encoder_overlap,
+        "graph_manifest",
+        lambda _processor: {"graph_count": 3, "buckets": {"64": 1, "128": 2}},
+    )
+
+    with pytest.raises(EncoderOverlapError, match="fresh capture count"):
+        manager.after_timing_model_generate(object())
+    assert manager._manifest_changed_after_launch
+
+
 def test_registration_requires_exactly_main_then_timing():
     manager = ExactMainEncoderOverlap()
     main, timing = object(), object()

@@ -12,7 +12,7 @@ from typing import Any, Iterator, Sequence
 import torch
 from transformers.modeling_outputs import BaseModelOutput
 
-OVERLAP_VERSION = "exact-b1-main-encoder-overlap-v1"
+OVERLAP_VERSION = "exact-b1-main-encoder-overlap-v2"
 MATERIAL_AUDIT_VERSION = "encoder-cross-kv-material-audit-v1"
 SUPPORTED_LABELS = ("timing_context", "main_generation")
 ENCODER_CONDITIONING_KEYS = (
@@ -174,8 +174,22 @@ class ExactMainEncoderOverlap:
         init=False,
         repr=False,
     )
+    _current_manifest: dict[str, Any] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
     _launch_after_timing_window: int | None = field(default=None, init=False)
     _manifest_changed_after_launch: bool = field(default=False, init=False)
+    _pending_capture_barriers: int = field(default=0, init=False)
+    _pre_capture_barrier_count: int = field(default=0, init=False)
+    _pre_capture_barrier_wait_seconds: float = field(default=0.0, init=False)
+    _guarded_manifest_growth: list[dict[str, Any]] = field(
+        default_factory=list,
+        init=False,
+        repr=False,
+    )
+    _encoder_synchronized_before_main: bool = field(default=False, init=False)
     _pinned_setup_seconds: float = field(default=0.0, init=False)
     _launch_host_seconds: float = field(default=0.0, init=False)
     _baseline_allocated: int = field(default=0, init=False)
@@ -314,6 +328,12 @@ class ExactMainEncoderOverlap:
                 raise EncoderOverlapError(
                     "main encoder conditioning changed after overlap launch"
                 )
+            if self._stream is None or self._encoder_end is None:
+                raise EncoderOverlapError("main overlap lacks an owned encoder stream")
+            started = time.perf_counter()
+            self._stream.synchronize()
+            self._pre_capture_barrier_wait_seconds += time.perf_counter() - started
+            self._encoder_synchronized_before_main = True
         self._active_label = profile_label
 
     @torch.no_grad()
@@ -373,17 +393,90 @@ class ExactMainEncoderOverlap:
         self._encoder_end = end_event
         self._rows = rows
 
+    def before_timing_graph_capture(self) -> None:
+        """Quiesce owned encoder work before a fresh timing CUDA graph capture."""
+
+        if self._launch_manifest is None:
+            return
+        if self._active_label == "main_generation":
+            if not self._encoder_synchronized_before_main:
+                raise EncoderOverlapError(
+                    "main CUDA graph capture began before encoder quiescence"
+                )
+            return
+        if self._active_label != "timing_context" or self._stream is None:
+            raise EncoderOverlapError(
+                "encoder overlap capture guard ran outside an owned generation"
+            )
+        started = time.perf_counter()
+        self._stream.synchronize()
+        self._pre_capture_barrier_wait_seconds += time.perf_counter() - started
+        self._pre_capture_barrier_count += 1
+        self._pending_capture_barriers += 1
+
+    @staticmethod
+    def _validate_guarded_manifest_growth(
+        before: dict[str, Any],
+        after: dict[str, Any],
+        *,
+        captures: int,
+    ) -> None:
+        if captures <= 0:
+            raise EncoderOverlapError("manifest growth lacked a pre-capture barrier")
+        before_count = int(before["graph_count"])
+        after_count = int(after["graph_count"])
+        if after_count - before_count != captures:
+            raise EncoderOverlapError(
+                "guarded manifest growth did not match fresh capture count"
+            )
+        before_buckets = before["buckets"]
+        after_buckets = after["buckets"]
+        if any(
+            int(after_buckets.get(prefix, 0)) < int(count)
+            for prefix, count in before_buckets.items()
+        ):
+            raise EncoderOverlapError("guarded manifest growth removed a graph")
+        if sum(int(value) for value in after_buckets.values()) != after_count:
+            raise EncoderOverlapError("guarded manifest growth has invalid buckets")
+
     def after_timing_model_generate(self, processor: Any) -> None:
         if self._active_label != "timing_context":
             raise EncoderOverlapError("timing hook ran outside timing generation")
         manifest = graph_manifest(processor)
         self._timing_calls += 1
         if self._launch_manifest is not None:
-            if manifest != self._launch_manifest:
+            current = self._current_manifest
+            if current is None:
+                raise EncoderOverlapError("overlap lost its current graph manifest")
+            if manifest != current:
+                try:
+                    self._validate_guarded_manifest_growth(
+                        current,
+                        manifest,
+                        captures=self._pending_capture_barriers,
+                    )
+                except EncoderOverlapError as exc:
+                    self._manifest_changed_after_launch = True
+                    self.abort()
+                    raise EncoderOverlapError(
+                        "timing CUDA graph manifest changed after overlap launch: "
+                        f"{exc}"
+                    ) from exc
+                self._guarded_manifest_growth.append(
+                    {
+                        "after_timing_window": self._timing_calls,
+                        "capture_barriers": self._pending_capture_barriers,
+                        "before": current,
+                        "after": manifest,
+                    }
+                )
+                self._current_manifest = manifest
+                self._pending_capture_barriers = 0
+            elif self._pending_capture_barriers:
                 self._manifest_changed_after_launch = True
                 self.abort()
                 raise EncoderOverlapError(
-                    "timing CUDA graph manifest changed after overlap launch"
+                    "timing capture guard did not produce manifest growth"
                 )
             return
         if manifest == self._previous_manifest:
@@ -393,6 +486,7 @@ class ExactMainEncoderOverlap:
             self._stable_observations = 1
         if self._stable_observations >= self.stable_observations_required:
             self._launch_manifest = manifest
+            self._current_manifest = manifest
             self._launch_after_timing_window = self._timing_calls
             self._launch()
             self._publish(processor)
@@ -457,6 +551,12 @@ class ExactMainEncoderOverlap:
             if self._launch_manifest is None:
                 raise EncoderOverlapError(
                     "timing graph manifest did not stabilize before timing ended"
+                )
+            final_manifest = graph_manifest(processor)
+            if self._pending_capture_barriers or final_manifest != self._current_manifest:
+                self._manifest_changed_after_launch = True
+                raise EncoderOverlapError(
+                    "timing graph manifest lacks a matching pre-capture barrier"
                 )
             event = torch.cuda.Event(enable_timing=True)
             event.record(torch.cuda.current_stream(processor.model.device))
@@ -553,7 +653,12 @@ class ExactMainEncoderOverlap:
                 self._launch_after_timing_window
             ),
             "launch_manifest": self._launch_manifest,
+            "final_timing_manifest": self._current_manifest,
             "manifest_changed_after_launch": self._manifest_changed_after_launch,
+            "pre_capture_barrier_count": self._pre_capture_barrier_count,
+            "pre_capture_barrier_wait_seconds": self._pre_capture_barrier_wait_seconds,
+            "guarded_manifest_growth": list(self._guarded_manifest_growth),
+            "encoder_synchronized_before_main": self._encoder_synchronized_before_main,
             "low_priority_stream_priority": self._least_stream_priority,
             "pinned_input_setup_seconds": self._pinned_setup_seconds,
             "launch_host_seconds": self._launch_host_seconds,
@@ -862,6 +967,7 @@ def install_exact_main_encoder_overlap(
     original_init = processor_class.__init__
     original_generate = processor_class.generate
     original_model_generate = processor_class.model_generate
+    from ..single.k8_runtime import install_k8_pre_capture_guard
 
     def init_with_registration(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
@@ -898,7 +1004,8 @@ def install_exact_main_encoder_overlap(
     processor_class.generate = generate_with_overlap
     processor_class.model_generate = model_generate_with_overlap
     try:
-        yield manager
+        with install_k8_pre_capture_guard(manager.before_timing_graph_capture):
+            yield manager
     finally:
         manager.abort()
         processor_class.__init__ = original_init

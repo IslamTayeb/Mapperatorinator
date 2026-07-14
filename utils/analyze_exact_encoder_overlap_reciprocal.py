@@ -150,6 +150,7 @@ def _validate_candidate(
         "separate_timing_main_models": True,
         "labels_completed": list(LABELS),
         "manifest_changed_after_launch": False,
+        "encoder_synchronized_before_main": True,
     }
     failures = {
         key: {
@@ -162,6 +163,14 @@ def _validate_candidate(
     }
     if failures:
         raise ValueError(f"candidate overlap contract changed: {failures}")
+    for key in (
+        "launch_manifest",
+        "final_timing_manifest",
+        "pre_capture_barrier_count",
+        "guarded_manifest_growth",
+    ):
+        if internal.get(key) != external.get(key):
+            raise ValueError(f"candidate overlap metadata disagrees for {key}")
     windows = external.get("live_window_count")
     if isinstance(windows, bool) or not isinstance(windows, int) or windows <= 0:
         raise ValueError("candidate overlap live window count is invalid")
@@ -180,6 +189,52 @@ def _validate_candidate(
     manifest = external.get("launch_manifest")
     if not isinstance(manifest, dict) or manifest.get("graph_count", 0) <= 0:
         raise ValueError("candidate lacks a stable accepted graph manifest")
+    final_manifest = external.get("final_timing_manifest")
+    if (
+        not isinstance(final_manifest, dict)
+        or final_manifest.get("graph_count", 0) < manifest.get("graph_count", 0)
+    ):
+        raise ValueError("candidate lacks its final guarded timing manifest")
+    barrier_count = external.get("pre_capture_barrier_count")
+    growth = external.get("guarded_manifest_growth")
+    if (
+        isinstance(barrier_count, bool)
+        or not isinstance(barrier_count, int)
+        or barrier_count < 0
+        or not isinstance(growth, list)
+    ):
+        raise ValueError("candidate lacks complete pre-capture barrier evidence")
+    if any(not isinstance(row, dict) for row in growth):
+        raise ValueError("candidate lacks complete pre-capture barrier evidence")
+    capture_counts = [row.get("capture_barriers") for row in growth]
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in capture_counts
+    ) or sum(capture_counts) != barrier_count:
+        raise ValueError("candidate lacks complete pre-capture barrier evidence")
+    current_manifest = manifest
+    for index, row in enumerate(growth):
+        if not isinstance(row, dict) or row.get("before") != current_manifest:
+            raise ValueError(f"candidate guarded manifest chain broke at row {index}")
+        captures = row.get("capture_barriers")
+        after = row.get("after")
+        window = row.get("after_timing_window")
+        if (
+            isinstance(captures, bool)
+            or not isinstance(captures, int)
+            or captures <= 0
+            or isinstance(window, bool)
+            or not isinstance(window, int)
+            or window <= 0
+            or not isinstance(after, dict)
+            or after.get("graph_count", 0)
+            - current_manifest.get("graph_count", 0)
+            != captures
+        ):
+            raise ValueError(f"candidate guarded manifest row {index} is invalid")
+        current_manifest = after
+    if current_manifest != final_manifest:
+        raise ValueError("candidate guarded manifest chain lacks the final manifest")
     for key in (
         "pinned_input_setup_seconds",
         "launch_host_seconds",
@@ -187,6 +242,7 @@ def _validate_candidate(
         "encoder_overlap_with_timing_seconds",
         "encoder_after_timing_seconds",
         "main_join_wait_seconds",
+        "pre_capture_barrier_wait_seconds",
     ):
         _number(external.get(key), name=f"candidate.{key}")
     for key in (

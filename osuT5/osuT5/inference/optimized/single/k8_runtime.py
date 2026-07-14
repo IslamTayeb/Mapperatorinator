@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import time
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import torch
 from torch import nn
@@ -650,6 +650,29 @@ class _K8GraphLifecycle:
 _ACTIVE_K8_LIFECYCLE: _K8GraphLifecycle | None = None
 _ACTIVE_BLOCK_SIZE: int | None = None
 _ACTIVE_GRAPH_REMAINDERS: bool | None = None
+_ACTIVE_PRE_CAPTURE_GUARD: Callable[[], None] | None = None
+
+
+def _run_k8_pre_capture_guard() -> None:
+    guard = _ACTIVE_PRE_CAPTURE_GUARD
+    if guard is not None:
+        guard()
+
+
+@contextmanager
+def install_k8_pre_capture_guard(guard: Callable[[], None]) -> Iterator[None]:
+    """Install one opt-in barrier immediately before every fresh K8 capture."""
+
+    if not callable(guard):
+        raise TypeError("K8 pre-capture guard must be callable")
+    global _ACTIVE_PRE_CAPTURE_GUARD
+    if _ACTIVE_PRE_CAPTURE_GUARD is not None:
+        raise RuntimeError("K8 pre-capture guard is already installed")
+    _ACTIVE_PRE_CAPTURE_GUARD = guard
+    try:
+        yield
+    finally:
+        _ACTIVE_PRE_CAPTURE_GUARD = None
 
 
 @dataclass(slots=True)
@@ -843,6 +866,9 @@ def _capture_k8_entry(
 ) -> _K8GraphEntry:
     if not torch.cuda.is_available():
         raise RuntimeError("K8 graph capture requires CUDA")
+    # CUDA graph capture must never begin while an opt-in auxiliary stream is
+    # still submitting work. The default runtime pays no callback or sync.
+    _run_k8_pre_capture_guard()
     started = time.perf_counter()
     device = state.sequence.device
     with torch.cuda.device(device):

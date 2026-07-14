@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import fields
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -23,6 +24,7 @@ from osuT5.osuT5.inference.optimized.single.k8_runtime import (
     _sync_model_kwargs_after_k8,
     _update_static_model_inputs,
     install_k8_candidate,
+    install_k8_pre_capture_guard,
 )
 from osuT5.osuT5.inference.optimized.single.state import ProductionDecodeSession
 
@@ -43,6 +45,36 @@ class TemperatureLogitsWarper:
 class ConditionalTemperatureLogitsWarper:
     temperature = 2.0
     conditionals = [(0.5, (1,), 3)]
+
+
+def test_pre_capture_guard_is_opt_in_singleton_and_restores() -> None:
+    calls = []
+
+    assert k8_runtime._ACTIVE_PRE_CAPTURE_GUARD is None
+    k8_runtime._run_k8_pre_capture_guard()
+    with install_k8_pre_capture_guard(lambda: calls.append("guard")):
+        k8_runtime._run_k8_pre_capture_guard()
+        with pytest.raises(RuntimeError, match="already installed"):
+            with install_k8_pre_capture_guard(lambda: None):
+                pass
+    assert calls == ["guard"]
+    assert k8_runtime._ACTIVE_PRE_CAPTURE_GUARD is None
+
+
+@pytest.mark.parametrize("guard", [None, 1, "guard"])
+def test_pre_capture_guard_rejects_noncallable(guard) -> None:
+    with pytest.raises(TypeError, match="must be callable"):
+        with install_k8_pre_capture_guard(guard):
+            pass
+
+
+def test_pre_capture_guard_runs_before_fresh_capture_cuda_work() -> None:
+    source = Path(k8_runtime.__file__).read_text(encoding="utf-8")
+    capture = source[source.index("def _capture_k8_entry(") :]
+
+    assert capture.index("_run_k8_pre_capture_guard()") < capture.index(
+        "started = time.perf_counter()"
+    )
 
 
 class LookbackBiasLogitsWarper:
