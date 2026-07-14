@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
 #SBATCH --gres=gpu:2080:1
-#SBATCH --time=00:45:00
+#SBATCH --time=01:00:00
 #SBATCH --output=/work/imt11/Mapperatorinator/logs/%x-%j.out
 #SBATCH --error=/work/imt11/Mapperatorinator/logs/%x-%j.err
 
@@ -15,6 +15,7 @@ PYTHON=${MAPPERATORINATOR_PYTHON:-/hpc/group/romerolab/imt11/envs/mapperatorinat
 REPO=${MAPPERATORINATOR_REPO:?Set MAPPERATORINATOR_REPO to the clean shared-RoPE worktree}
 COMMIT=${MAPPERATORINATOR_COMMIT:?Set MAPPERATORINATOR_COMMIT to the pushed shared-RoPE commit}
 BRANCH=${MAPPERATORINATOR_BRANCH:?Set MAPPERATORINATOR_BRANCH to the shared-RoPE branch}
+REMOTE_REF=${MAPPERATORINATOR_REMOTE_REF:?Set MAPPERATORINATOR_REMOTE_REF to the pushed origin branch}
 WORK=${MAPPERATORINATOR_WORK:-/work/imt11/Mapperatorinator}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_LABEL=${RUN_LABEL:-shared-rope-component}
@@ -39,6 +40,14 @@ if [[ "$(git -C "$REPO" rev-parse HEAD)" != "$COMMIT" ]]; then
 fi
 if [[ "$(git -C "$REPO" branch --show-current)" != "$BRANCH" ]]; then
   echo "shared-RoPE worktree is not on MAPPERATORINATOR_BRANCH=$BRANCH" >&2
+  exit 2
+fi
+if ! git -C "$REPO" rev-parse --verify --quiet "${REMOTE_REF}^{commit}" >/dev/null; then
+  echo "shared-RoPE pushed remote ref does not exist: $REMOTE_REF" >&2
+  exit 2
+fi
+if [[ "$(git -C "$REPO" rev-parse "${REMOTE_REF}^{commit}")" != "$COMMIT" ]]; then
+  echo "shared-RoPE remote ref $REMOTE_REF does not match MAPPERATORINATOR_COMMIT" >&2
   exit 2
 fi
 if [[ ! -f "$AUDIO" ]]; then
@@ -74,6 +83,7 @@ done
   echo "job_id=${SLURM_JOB_ID:-manual}"
   echo "commit=$COMMIT"
   echo "branch=$BRANCH"
+  echo "remote_ref=$REMOTE_REF"
   echo "repo=$REPO"
   echo "python=$PYTHON"
   echo "audio=$AUDIO"
@@ -123,6 +133,22 @@ set +e
   seed=12345
 PROFILE_EXIT=$?
 set -e
+echo "$PROFILE_EXIT" > "$RUN_ROOT/profile-exit-code.txt"
+
+case "$PROFILE_EXIT" in
+  0)
+    echo "promotion_pass" > "$RUN_ROOT/decision-class.txt"
+    ;;
+  3)
+    echo "valid_negative_component_gate" > "$RUN_ROOT/decision-class.txt"
+    ;;
+  1)
+    echo "invariant_or_setup_failure" > "$RUN_ROOT/decision-class.txt"
+    ;;
+  *)
+    echo "unexpected_profiler_failure" > "$RUN_ROOT/decision-class.txt"
+    ;;
+esac
 
 if [[ "$PROFILE_EXIT" -ne 0 && "$PROFILE_EXIT" -ne 3 ]]; then
   echo "shared-RoPE profiler failed before a valid decision (exit=$PROFILE_EXIT)" >&2

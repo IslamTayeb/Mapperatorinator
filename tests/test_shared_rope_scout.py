@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import subprocess
+import sys
+
 import pytest
 import torch
 
@@ -92,6 +95,13 @@ class _Model(torch.nn.Module):
         return value
 
 
+class _MismatchedShapeModel(_Model):
+    def forward(self, x, position_ids):
+        first = self.layers[0].self_attn.rotary_emb(x, position_ids)
+        self.layers[1].self_attn.rotary_emb(x.unsqueeze(0), position_ids)
+        return first[0]
+
+
 def _calls(model):
     return [layer.self_attn.rotary_emb.calls for layer in model.layers]
 
@@ -155,6 +165,25 @@ def test_forward_cache_resets_and_mismatched_position_storage_fails_loudly():
         with pytest.raises(RuntimeError, match="received mismatched inputs"):
             model(torch.ones(1, 1, 4), torch.tensor([[3]]))
 
+    model = _MismatchedShapeModel()
+    with shared_decoder_rope_context(model):
+        with pytest.raises(RuntimeError, match="received mismatched inputs"):
+            model(torch.ones(1, 1, 4), torch.tensor([[3]]))
+
+
+def test_unsupported_dtype_and_device_fail_before_rope_execution():
+    model = _Model()
+    with shared_decoder_rope_context(model):
+        with pytest.raises(TypeError, match="floating tensor"):
+            model(torch.ones(1, 1, 4, dtype=torch.long), torch.tensor([[3]]))
+        with pytest.raises(TypeError, match="int64 tensor"):
+            model(torch.ones(1, 1, 4), torch.tensor([[3]], dtype=torch.int32))
+        with pytest.raises(ValueError, match="must use one device"):
+            model(
+                torch.ones(1, 1, 4, device="meta"),
+                torch.tensor([[3]], device="meta"),
+            )
+
 
 def test_context_restores_instance_state_and_default_forward_ownership():
     model = _Model()
@@ -205,6 +234,23 @@ def test_default_import_does_not_change_runtime_or_model_state():
     assert shared_rope._ACTIVE_MODELS == set()
     assert runtime_dispatch.attention_runtime_hooks() == runtime_dispatch.AttentionRuntimeHooks()
     assert "forward" not in model.__dict__
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "import osuT5.osuT5.inference.optimized.single.engine; "
+                "assert 'osuT5.osuT5.inference.optimized.scout.shared_rope' "
+                "not in sys.modules"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph smoke requires CUDA")
