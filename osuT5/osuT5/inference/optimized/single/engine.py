@@ -47,7 +47,7 @@ OPTIMIZED_PRESETS = MappingProxyType(
             torch_dtype=torch.float32,
         ),
         "fp16": OptimizedPreset(
-            version="accepted-fp16-all-fused-v2",
+            version="candidate-fp16-all-fused-split-kv-v3",
             result_class="documented-drift",
             precision="fp16",
             torch_dtype=torch.float16,
@@ -132,16 +132,10 @@ def _optimized_config_metadata(preset: OptimizedPreset) -> dict[str, Any]:
         "native_decode_kernels": True,
         "native_q1_self_attention": True,
         "native_q1_rope_cache_self_attention": True,
-        "native_q1_rope_cache_split_kv": preset.torch_dtype == torch.float32,
-        "native_q1_rope_cache_split_kv_split_count": (
-            SPLIT_KV_Q1_SPLIT_COUNT
-            if preset.torch_dtype == torch.float32
-            else None
-        ),
+        "native_q1_rope_cache_split_kv": True,
+        "native_q1_rope_cache_split_kv_split_count": SPLIT_KV_Q1_SPLIT_COUNT,
         "native_q1_rope_cache_split_kv_prefix_buckets": (
             SPLIT_KV_Q1_PREFIX_BUCKETS
-            if preset.torch_dtype == torch.float32
-            else ()
         ),
         "native_cross_mlp_tail": True,
     }

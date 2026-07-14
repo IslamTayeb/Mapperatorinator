@@ -6,6 +6,7 @@ from torch.utils.cpp_extension import load_inline
 
 _NATIVE_Q1_ATTENTION = None
 _SUPPORTED_DTYPES = (torch.float32, torch.float16)
+_SPLIT_KV_Q1_DTYPES = frozenset(_SUPPORTED_DTYPES)
 _SPLIT_KV_Q1_PREFIXES = frozenset(range(192, 833, 64))
 _SPLIT_KV_Q1_SPLITS = 8
 _ACCEPTED_ROPE_CACHE_VARIANT = "accepted"
@@ -24,7 +25,7 @@ def _split_kv_q1_eligible(
     capability: tuple[int, int],
 ) -> bool:
     return (
-        dtype == torch.float32
+        dtype in _SPLIT_KV_Q1_DTYPES
         and device_type == "cuda"
         and active_prefix_length in _SPLIT_KV_Q1_PREFIXES
         and capability == (7, 5)
@@ -35,7 +36,7 @@ def native_q1_rope_cache_attention_variant(
     qkv: torch.Tensor,
     active_prefix_length: int,
 ) -> str:
-    """Select the measured SM75 FP32 split-KV path without changing fallbacks."""
+    """Select the dtype-generic SM75 split-KV path without changing fallbacks."""
 
     if not isinstance(qkv, torch.Tensor) or not qkv.is_cuda:
         return _ACCEPTED_ROPE_CACHE_VARIANT
@@ -499,13 +500,13 @@ __global__ void q1_rope_cache_attention_kernel(
     }
 }
 
-template<int BLOCK_SIZE>
+template<typename scalar_t, int BLOCK_SIZE>
 __global__ void split_kv_prepare_rope_cache_kernel(
-        const float* __restrict__ qkv,
-        float* __restrict__ cache_keys,
-        float* __restrict__ cache_values,
-        const float* __restrict__ cos,
-        const float* __restrict__ sin,
+        const scalar_t* __restrict__ qkv,
+        scalar_t* __restrict__ cache_keys,
+        scalar_t* __restrict__ cache_values,
+        const scalar_t* __restrict__ cos,
+        const scalar_t* __restrict__ sin,
         const int64_t* __restrict__ cache_position,
         float* __restrict__ query,
         int heads,
@@ -530,36 +531,38 @@ __global__ void split_kv_prepare_rope_cache_kernel(
     }
     const int half_dim = head_dim / 2;
     const long long q_base = head * qkv_head_stride;
+    using Traits = Q1ScalarTraits<scalar_t>;
     for (int dim = tid; dim < head_dim; dim += BLOCK_SIZE) {
         const int rotated_dim = dim < half_dim ? dim + half_dim : dim - half_dim;
         const float sign = dim < half_dim ? -1.0f : 1.0f;
-        const float cos_v = cos[dim * cos_dim_stride];
-        const float sin_v = sin[dim * sin_dim_stride];
-        const float q_raw = qkv[q_base + dim * qkv_dim_stride];
-        const float q_rot_raw = qkv[q_base + rotated_dim * qkv_dim_stride];
-        const float k_raw = qkv[
-            q_base + qkv_qkv_stride + dim * qkv_dim_stride];
-        const float k_rot_raw = qkv[
-            q_base + qkv_qkv_stride + rotated_dim * qkv_dim_stride];
-        const float v_raw = qkv[
-            q_base + 2 * qkv_qkv_stride + dim * qkv_dim_stride];
+        const float cos_v = Traits::load(cos[dim * cos_dim_stride]);
+        const float sin_v = Traits::load(sin[dim * sin_dim_stride]);
+        const float q_raw = Traits::load(qkv[q_base + dim * qkv_dim_stride]);
+        const float q_rot_raw = Traits::load(
+            qkv[q_base + rotated_dim * qkv_dim_stride]);
+        const float k_raw = Traits::load(qkv[
+            q_base + qkv_qkv_stride + dim * qkv_dim_stride]);
+        const float k_rot_raw = Traits::load(qkv[
+            q_base + qkv_qkv_stride + rotated_dim * qkv_dim_stride]);
+        const float v_raw = Traits::load(qkv[
+            q_base + 2 * qkv_qkv_stride + dim * qkv_dim_stride]);
         query[head * head_dim + dim] = q_raw * cos_v + sign * q_rot_raw * sin_v;
         cache_keys[
             head * cache_head_stride + write_pos * cache_len_stride
             + dim * cache_dim_stride
-        ] = k_raw * cos_v + sign * k_rot_raw * sin_v;
+        ] = Traits::store(k_raw * cos_v + sign * k_rot_raw * sin_v);
         cache_values[
             head * cache_head_stride + write_pos * cache_len_stride
             + dim * cache_dim_stride
-        ] = v_raw;
+        ] = Traits::store(v_raw);
     }
 }
 
-template<int BLOCK_SIZE>
+template<typename scalar_t, int BLOCK_SIZE>
 __global__ void split_kv_partial_kernel(
         const float* __restrict__ query,
-        const float* __restrict__ cache_keys,
-        const float* __restrict__ cache_values,
+        const scalar_t* __restrict__ cache_keys,
+        const scalar_t* __restrict__ cache_values,
         const float* __restrict__ mask,
         float* __restrict__ partial_max,
         float* __restrict__ partial_denom,
@@ -584,16 +587,17 @@ __global__ void split_kv_partial_kernel(
     extern __shared__ float shared[];
     float* scores = shared;
     float* reduction = shared + length;
+    using Traits = Q1ScalarTraits<scalar_t>;
 
     float local_max = -FLT_MAX;
     for (int offset = tid; offset < length; offset += BLOCK_SIZE) {
         const int pos = begin + offset;
         float score = 0.0f;
         for (int dim = 0; dim < head_dim; ++dim) {
-            score += query[head * head_dim + dim] * cache_keys[
+            score += query[head * head_dim + dim] * Traits::load(cache_keys[
                 head * cache_head_stride + pos * cache_len_stride
                 + dim * cache_dim_stride
-            ];
+            ]);
         }
         score *= scale;
         if (has_mask) score += mask[pos];
@@ -629,27 +633,28 @@ __global__ void split_kv_partial_kernel(
         float numerator = 0.0f;
         for (int offset = 0; offset < length; ++offset) {
             const int pos = begin + offset;
-            numerator += scores[offset] * cache_values[
+            numerator += scores[offset] * Traits::load(cache_values[
                 head * cache_head_stride + pos * cache_len_stride
                 + dim * cache_dim_stride
-            ];
+            ]);
         }
         partial_numer[(partial_index * head_dim) + dim] = numerator;
     }
 }
 
-template<int BLOCK_SIZE>
+template<typename scalar_t, int BLOCK_SIZE>
 __global__ void split_kv_merge_kernel(
         const float* __restrict__ partial_max,
         const float* __restrict__ partial_denom,
         const float* __restrict__ partial_numer,
-        float* __restrict__ output,
+        scalar_t* __restrict__ output,
         int heads,
         int head_dim,
         int split_count) {
     const int head = blockIdx.x;
     const int tid = threadIdx.x;
     if (head >= heads) return;
+    using Traits = Q1ScalarTraits<scalar_t>;
     __shared__ float global_max;
     __shared__ float global_denom;
     if (tid == 0) {
@@ -674,7 +679,7 @@ __global__ void split_kv_merge_kernel(
             numerator += expf(partial_max[index] - global_max)
                 * partial_numer[index * head_dim + dim];
         }
-        output[head * head_dim + dim] = numerator / global_denom;
+        output[head * head_dim + dim] = Traits::store(numerator / global_denom);
     }
 }
 
@@ -800,12 +805,14 @@ torch::Tensor split_kv_q1_rope_cache_attention(
         "split-KV qkv/cache tensors must be CUDA");
     TORCH_CHECK(cos.is_cuda() && sin.is_cuda() && cache_position.is_cuda(),
         "split-KV rope/cache_position tensors must be CUDA");
+    TORCH_CHECK(qkv.scalar_type() == cache_keys.scalar_type()
+            && qkv.scalar_type() == cache_values.scalar_type()
+            && qkv.scalar_type() == cos.scalar_type()
+            && qkv.scalar_type() == sin.scalar_type(),
+        "split-KV qkv/cache/cos/sin dtype mismatch");
     TORCH_CHECK(qkv.scalar_type() == torch::kFloat32
-            && cache_keys.scalar_type() == torch::kFloat32
-            && cache_values.scalar_type() == torch::kFloat32
-            && cos.scalar_type() == torch::kFloat32
-            && sin.scalar_type() == torch::kFloat32,
-        "split-KV q1 requires fp32 storage");
+            || qkv.scalar_type() == torch::kFloat16,
+        "split-KV q1 requires fp32 or fp16 storage");
     TORCH_CHECK(cache_position.scalar_type() == torch::kLong,
         "split-KV cache_position must be int64");
     TORCH_CHECK(qkv.dim() == 5 && qkv.size(0) == 1 && qkv.size(1) == 1
@@ -860,12 +867,13 @@ torch::Tensor split_kv_q1_rope_cache_attention(
         has_mask = 1;
     }
 
-    auto options = qkv.options();
-    auto query = torch::empty({heads, head_dim}, options);
-    auto partial_max = torch::empty({heads, split_count}, options);
-    auto partial_denom = torch::empty({heads, split_count}, options);
-    auto partial_numer = torch::empty({heads, split_count, head_dim}, options);
-    auto output = torch::empty({1, heads, 1, head_dim}, options);
+    auto fp32_options = qkv.options().dtype(torch::kFloat32);
+    auto query = torch::empty({heads, head_dim}, fp32_options);
+    auto partial_max = torch::empty({heads, split_count}, fp32_options);
+    auto partial_denom = torch::empty({heads, split_count}, fp32_options);
+    auto partial_numer = torch::empty(
+        {heads, split_count, head_dim}, fp32_options);
+    auto output = torch::empty({1, heads, 1, head_dim}, qkv.options());
     constexpr int block_size = 128;
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     const int largest_split = static_cast<int>(
@@ -873,52 +881,47 @@ torch::Tensor split_kv_q1_rope_cache_attention(
     const size_t partial_shared = static_cast<size_t>(largest_split + block_size)
         * sizeof(float);
 
-    split_kv_prepare_rope_cache_kernel<block_size><<<
-        heads, block_size, 0, stream>>>(
-            qkv.data_ptr<float>(),
-            cache_keys.data_ptr<float>(),
-            cache_values.data_ptr<float>(),
-            cos.data_ptr<float>(),
-            sin.data_ptr<float>(),
-            cache_position.data_ptr<int64_t>(),
-            query.data_ptr<float>(),
-            heads,
-            static_cast<int>(active_prefix_len),
-            max_cache_len,
-            head_dim,
-            static_cast<long long>(qkv.stride(2)),
-            static_cast<long long>(qkv.stride(3)),
-            static_cast<long long>(qkv.stride(4)),
-            static_cast<long long>(cache_keys.stride(1)),
-            static_cast<long long>(cache_keys.stride(2)),
-            static_cast<long long>(cache_keys.stride(3)),
-            static_cast<long long>(cos.stride(2)),
-            static_cast<long long>(sin.stride(2)));
-    split_kv_partial_kernel<block_size><<<
-        dim3(heads, split_count), block_size, partial_shared, stream>>>(
-            query.data_ptr<float>(),
-            cache_keys.data_ptr<float>(),
-            cache_values.data_ptr<float>(),
-            mask_ptr,
-            partial_max.data_ptr<float>(),
-            partial_denom.data_ptr<float>(),
-            partial_numer.data_ptr<float>(),
-            heads,
-            static_cast<int>(active_prefix_len),
-            head_dim,
-            split_count,
-            static_cast<long long>(cache_keys.stride(1)),
-            static_cast<long long>(cache_keys.stride(2)),
-            static_cast<long long>(cache_keys.stride(3)),
-            has_mask);
-    split_kv_merge_kernel<block_size><<<heads, block_size, 0, stream>>>(
-        partial_max.data_ptr<float>(),
-        partial_denom.data_ptr<float>(),
-        partial_numer.data_ptr<float>(),
-        output.data_ptr<float>(),
-        heads,
-        head_dim,
-        split_count);
+#define LAUNCH_SPLIT_KV(scalar_t, PTR) \
+    split_kv_prepare_rope_cache_kernel<scalar_t, block_size><<< \
+        heads, block_size, 0, stream>>>( \
+            PTR(qkv.data_ptr()), PTR(cache_keys.data_ptr()), \
+            PTR(cache_values.data_ptr()), PTR(cos.data_ptr()), \
+            PTR(sin.data_ptr()), cache_position.data_ptr<int64_t>(), \
+            query.data_ptr<float>(), heads, static_cast<int>(active_prefix_len), \
+            max_cache_len, head_dim, static_cast<long long>(qkv.stride(2)), \
+            static_cast<long long>(qkv.stride(3)), \
+            static_cast<long long>(qkv.stride(4)), \
+            static_cast<long long>(cache_keys.stride(1)), \
+            static_cast<long long>(cache_keys.stride(2)), \
+            static_cast<long long>(cache_keys.stride(3)), \
+            static_cast<long long>(cos.stride(2)), \
+            static_cast<long long>(sin.stride(2))); \
+    split_kv_partial_kernel<scalar_t, block_size><<< \
+        dim3(heads, split_count), block_size, partial_shared, stream>>>( \
+            query.data_ptr<float>(), PTR(cache_keys.data_ptr()), \
+            PTR(cache_values.data_ptr()), mask_ptr, \
+            partial_max.data_ptr<float>(), partial_denom.data_ptr<float>(), \
+            partial_numer.data_ptr<float>(), heads, \
+            static_cast<int>(active_prefix_len), head_dim, split_count, \
+            static_cast<long long>(cache_keys.stride(1)), \
+            static_cast<long long>(cache_keys.stride(2)), \
+            static_cast<long long>(cache_keys.stride(3)), has_mask); \
+    split_kv_merge_kernel<scalar_t, block_size><<< \
+        heads, block_size, 0, stream>>>( \
+            partial_max.data_ptr<float>(), partial_denom.data_ptr<float>(), \
+            partial_numer.data_ptr<float>(), PTR(output.data_ptr()), heads, \
+            head_dim, split_count)
+
+    if (qkv.scalar_type() == torch::kFloat32) {
+#define FLOAT_PTR(value) reinterpret_cast<float*>(value)
+        LAUNCH_SPLIT_KV(float, FLOAT_PTR);
+#undef FLOAT_PTR
+    } else {
+#define HALF_PTR(value) reinterpret_cast<__half*>(value)
+        LAUNCH_SPLIT_KV(__half, HALF_PTR);
+#undef HALF_PTR
+    }
+#undef LAUNCH_SPLIT_KV
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
@@ -970,7 +973,7 @@ def native_q1_attention(
     return extension.q1_attention(query, key, value, mask)
 
 
-def native_q1_rope_cache_attention(
+def _native_q1_rope_cache_attention_with_variant(
         qkv: torch.Tensor,
         cache_keys: torch.Tensor,
         cache_values: torch.Tensor,
@@ -979,6 +982,8 @@ def native_q1_rope_cache_attention(
         cache_position: torch.Tensor,
         attention_mask: torch.Tensor | None,
         active_prefix_length: int,
+        *,
+        variant: str,
 ) -> torch.Tensor:
     _validate_rope_cache_inputs(
         qkv,
@@ -994,11 +999,23 @@ def native_q1_rope_cache_attention(
         device=qkv.device,
         expected_numel=int(active_prefix_length),
     )
-    extension = _load_native_q1_attention()
-    if (
-        native_q1_rope_cache_attention_variant(qkv, active_prefix_length)
-        == _SPLIT_KV_ROPE_CACHE_VARIANT
+    if variant not in {
+        _ACCEPTED_ROPE_CACHE_VARIANT,
+        _SPLIT_KV_ROPE_CACHE_VARIANT,
+    }:
+        raise ValueError(f"unsupported q1 RoPE/cache variant: {variant!r}")
+    if variant == _SPLIT_KV_ROPE_CACHE_VARIANT and not _split_kv_q1_eligible(
+        dtype=qkv.dtype,
+        device_type=qkv.device.type,
+        active_prefix_length=active_prefix_length,
+        capability=_device_capability(qkv.device),
     ):
+        raise RuntimeError(
+            "split-KV q1 RoPE/cache requires FP32 or FP16 SM75 storage "
+            "at a measured live prefix"
+        )
+    extension = _load_native_q1_attention()
+    if variant == _SPLIT_KV_ROPE_CACHE_VARIANT:
         return extension.split_kv_q1_rope_cache_attention(
             qkv,
             cache_keys,
@@ -1018,4 +1035,80 @@ def native_q1_rope_cache_attention(
         cache_position,
         mask,
         int(active_prefix_length),
+    )
+
+
+def accepted_q1_rope_cache_attention(
+        qkv: torch.Tensor,
+        cache_keys: torch.Tensor,
+        cache_values: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        cache_position: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        active_prefix_length: int,
+) -> torch.Tensor:
+    """Run the accepted unsplit control for component verification."""
+
+    return _native_q1_rope_cache_attention_with_variant(
+        qkv,
+        cache_keys,
+        cache_values,
+        cos,
+        sin,
+        cache_position,
+        attention_mask,
+        active_prefix_length,
+        variant=_ACCEPTED_ROPE_CACHE_VARIANT,
+    )
+
+
+def split_kv_q1_rope_cache_attention(
+        qkv: torch.Tensor,
+        cache_keys: torch.Tensor,
+        cache_values: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        cache_position: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        active_prefix_length: int,
+) -> torch.Tensor:
+    """Run the measured split-8 candidate for component verification."""
+
+    return _native_q1_rope_cache_attention_with_variant(
+        qkv,
+        cache_keys,
+        cache_values,
+        cos,
+        sin,
+        cache_position,
+        attention_mask,
+        active_prefix_length,
+        variant=_SPLIT_KV_ROPE_CACHE_VARIANT,
+    )
+
+
+def native_q1_rope_cache_attention(
+        qkv: torch.Tensor,
+        cache_keys: torch.Tensor,
+        cache_values: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        cache_position: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        active_prefix_length: int,
+) -> torch.Tensor:
+    return _native_q1_rope_cache_attention_with_variant(
+        qkv,
+        cache_keys,
+        cache_values,
+        cos,
+        sin,
+        cache_position,
+        attention_mask,
+        active_prefix_length,
+        variant=native_q1_rope_cache_attention_variant(
+            qkv,
+            active_prefix_length,
+        ),
     )
