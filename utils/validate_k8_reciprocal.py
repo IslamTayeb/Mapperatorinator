@@ -5,9 +5,14 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from pathlib import Path
 from statistics import mean
 from typing import Any, Mapping
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from utils import nsight_agent_profile as nsight
 from utils import summarize_inference_profile as exact
