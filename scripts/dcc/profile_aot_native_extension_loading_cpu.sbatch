@@ -68,11 +68,9 @@ if [[ -n "${SLURM_JOB_ID:-}" ]]; then
 fi
 
 cd "$REPO"
-"$PYTHON" -m pytest -q \
-  tests/test_native_extension_manifest.py \
-  tests/test_optimized_native_kernel_migration.py \
-  tests/test_optimized_native_cross_mlp.py \
-  tests/test_weight_only_scout.py
+"$PYTHON" -m unittest -v \
+  tests.test_native_extension_manifest \
+  tests.test_aot_native_extension_cpu_wrapper
 
 "$PYTHON" utils/build_native_extension_manifest.py \
   --manifest "$RUN_ROOT/package/manifest.json" \
