@@ -53,6 +53,7 @@ _CUDA_SOURCE = r"""
 #include <c10/cuda/CUDAException.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <math_constants.h>
 
 #include <climits>
 #include <cmath>

@@ -46,6 +46,7 @@ def test_import_is_cold_and_extension_preload_is_singleton(monkeypatch) -> None:
 def test_source_preserves_stable_boundary_and_original_id_sampling() -> None:
     source = top256_sampler._CUDA_SOURCE
 
+    assert "#include <math_constants.h>" in source
     assert "constexpr int kTopK = 256" in source
     assert "constexpr int kCandidatesPerChunk = kTopK + 1" in source
     assert "left_score == right_score && left_id < right_id" in source
