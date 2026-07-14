@@ -33,6 +33,9 @@ def test_base_wrapper_requires_exact_tokens_and_explicit_remainder_evidence() ->
     assert "--require-exact-label main_generation" in source
     assert "EXPECTED_EXACT_DISPATCH_LABELS=none" in source
     assert "parity.cross_candidate_exact=true" in source
+    assert "'records.*[[]*].optimized_dispatch_capture_hits'" in source
+    assert "'records.*[[]*].optimized_dispatch_capture_hits.*'" in source
+    assert "'records.*[[]*].optimized_cuda_graphs.*'" in source
 
 
 def test_candidate_runner_only_enables_opt_in_remainder_graphs() -> None:

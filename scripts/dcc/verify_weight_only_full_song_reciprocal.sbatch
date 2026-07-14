@@ -760,6 +760,15 @@ if [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true ]]; then
     --require-exact-label main_generation
   )
   ANALYSIS_DISPATCH_ARGS=(
+    # The K1 parent is captured before the K4 parent for signatures with a
+    # remainder.  That changes which parent capture owns the profiler's
+    # capture-hit counters, without changing the child model graph or its
+    # executed decoder dispatch.  The dedicated remainder validator below
+    # still requires every remainder to move from eager to the K1 graph.
+    --allow-dispatch-delta
+      'records.*[[]*].optimized_dispatch_capture_hits'
+    --allow-dispatch-delta
+      'records.*[[]*].optimized_dispatch_capture_hits.*'
     --allow-dispatch-delta 'records.*[[]*].optimized_cuda_graphs.*'
   )
 elif [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
