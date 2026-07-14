@@ -68,7 +68,10 @@ def _validate_extension_evidence(
         record = records.get(name)
         if not isinstance(record, dict):
             raise RuntimeError(f"{mode} extension record {name} must be an object")
-        for key in ("source_sha256", "library_sha256", "functions"):
+        identity_keys = ("source_sha256", "functions")
+        if mode == "direct":
+            identity_keys += ("library_sha256",)
+        for key in identity_keys:
             if record.get(key) != expected.get(key):
                 raise RuntimeError(f"{mode} extension {name} differs in {key}")
         if record.get("mode") != expected_mode:

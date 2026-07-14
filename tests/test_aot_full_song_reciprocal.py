@@ -7,6 +7,7 @@ from unittest import mock
 
 from utils import run_k4_shared_rope_k1_remainder_int8_mlp_weight_only as retained
 from utils.run_aot_full_song_reciprocal import (
+    _validate_extension_evidence,
     _validate_retained_initialization,
     evaluate_gate,
 )
@@ -50,6 +51,44 @@ def _analysis(*, warm_delta: float = -0.1) -> dict:
 
 
 class AotFullSongReciprocalTest(unittest.TestCase):
+    def test_jit_control_allows_rebuilt_binary_hash_but_direct_requires_package_hash(
+        self,
+    ) -> None:
+        manifest = {
+            "extension": {
+                "source_sha256": "source",
+                "library_sha256": "packaged-library",
+                "functions": ["forward"],
+            }
+        }
+        jit = {
+            "extension": {
+                **manifest["extension"],
+                "library_sha256": "fresh-jit-library",
+                "mode": "load_inline",
+                "load_seconds": 1.0,
+            }
+        }
+        direct = {
+            "extension": {
+                **manifest["extension"],
+                "mode": "direct",
+                "load_seconds": 0.01,
+            }
+        }
+
+        self.assertEqual(
+            _validate_extension_evidence(jit, manifest, mode="cached"),
+            1.0,
+        )
+        self.assertEqual(
+            _validate_extension_evidence(direct, manifest, mode="direct"),
+            0.01,
+        )
+        direct["extension"]["library_sha256"] = "wrong-library"
+        with self.assertRaisesRegex(RuntimeError, "differs in library_sha256"):
+            _validate_extension_evidence(direct, manifest, mode="direct")
+
     def test_wrapper_has_valid_bash_syntax(self) -> None:
         subprocess.run(["bash", "-n", str(WRAPPER)], check=True)
 
