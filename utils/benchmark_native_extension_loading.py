@@ -20,6 +20,7 @@ EXPECTED_EXTENSIONS = (
     "mapperatorinator_q1_attention",
     "mapperatorinator_native_decoder_layer",
     "mapperatorinator_weight_only_fp16_v1",
+    "mapperatorinator_int8_mlp_scout_v1",
 )
 
 
@@ -53,11 +54,13 @@ def worker(mode: str, manifest: Path) -> dict[str, Any]:
     from osuT5.osuT5.inference.optimized.kernels.native_extension import (
         loaded_extension_records,
     )
+    from osuT5.osuT5.inference.optimized.scout import int8_mlp
 
     modules = (
         q1_attention.preload_native_q1_attention(),
         decoder_layer.preload_native_decoder_layer(),
         weight_only.preload_weight_only_extension(),
+        int8_mlp.preload_int8_mlp_extension(),
     )
     elapsed = time.perf_counter() - started
     records = loaded_extension_records()

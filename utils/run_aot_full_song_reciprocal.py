@@ -30,7 +30,9 @@ ANALYZER_ROLES = {
     "candidate_second": "direct_second",
     "baseline_second": "cached_second",
 }
-EXPECTED_SHARED_COMPOSITION = "k4-split-kv-mixed-weight-shared-rope-v1"
+EXPECTED_RETAINED_COMPOSITION = (
+    "k4-split-kv-mixed-weight-shared-rope-k1-remainder-int8-mlp-v1"
+)
 
 
 def _profile_path(output: Path) -> Path:
@@ -87,13 +89,17 @@ def _validate_extension_evidence(
     return sum(float(record["load_seconds"]) for record in records.values())
 
 
-def _validate_shared_initialization(
+def _validate_retained_initialization(
     payload: dict[str, Any],
     *,
     role: str,
 ) -> dict[str, Any]:
-    if payload.get("combined_runtime") != EXPECTED_SHARED_COMPOSITION:
-        raise RuntimeError(f"{role} did not execute the shared-RoPE composition")
+    if payload.get("result_class") != "documented-drift":
+        raise RuntimeError(f"{role} changed the retained runtime result class")
+    if payload.get("exactness_claim") is not False:
+        raise RuntimeError(f"{role} must not claim exactness against accepted FP32")
+    if payload.get("combined_runtime") != EXPECTED_RETAINED_COMPOSITION:
+        raise RuntimeError(f"{role} did not execute the retained K1+INT8 composition")
     shared = payload.get("shared_rope")
     if not isinstance(shared, dict):
         raise RuntimeError(f"{role} shared-RoPE evidence is missing")
@@ -137,7 +143,47 @@ def _validate_shared_initialization(
             }
     if failures:
         raise RuntimeError(f"{role} shared-RoPE evidence is invalid: {failures}")
-    return shared
+    overlay = payload.get("int8_mlp_overlay")
+    if not isinstance(overlay, dict):
+        raise RuntimeError(f"{role} INT8 MLP initialization evidence is missing")
+    expected_overlay = {
+        "version": "per-row-symmetric-int8-mlp-v1",
+        "result_class": "documented-drift",
+        "exactness_claim": False,
+        "scope": "main-model-decoder-mlp-only",
+        "composition_control": "k4-split-kv-mixed-weight-shared-rope-v1",
+        "replaces_effective_regions": ["mlp_fc1", "mlp_fc2"],
+        "retained_unused_fp16_regions": ["mlp_fc1", "mlp_fc2"],
+        "fp32_activations_norm_bias_reductions_residual_outputs": True,
+        "quantization": "symmetric-per-output-row",
+        "dispatch_counter": "int8_weight_mlp_tail",
+    }
+    overlay_failures = {
+        key: {"expected": value, "actual": overlay.get(key)}
+        for key, value in expected_overlay.items()
+        if overlay.get(key) != value
+    }
+    for key in ("extension_init_seconds", "weight_pack_seconds", "packed_weight_bytes"):
+        value = overlay.get(key)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+        ):
+            overlay_failures[key] = {
+                "expected": "finite non-negative",
+                "actual": value,
+            }
+    if overlay_failures:
+        raise RuntimeError(f"{role} INT8 MLP evidence is invalid: {overlay_failures}")
+    return {
+        "combined_runtime": EXPECTED_RETAINED_COMPOSITION,
+        "result_class": "documented-drift",
+        "exactness_claim": False,
+        "shared_rope": shared,
+        "int8_mlp_overlay": expected_overlay,
+    }
 
 
 def _tree_size_bytes(root: Path) -> int:
@@ -243,6 +289,31 @@ def evaluate_gate(
         raise ValueError("reciprocal warm/cold metrics are missing")
     warm_delta = float(warm["candidate_minus_baseline"])
     cold_profile_saving = -float(cold_profile["candidate_minus_baseline"])
+    profile_cold_walls = cold_profile.get("run_values")
+    if not isinstance(profile_cold_walls, dict) or set(profile_cold_walls) != set(
+        RUN_ORDER
+    ):
+        raise ValueError("profile cold-process walls are incomplete")
+    wall_reconciliation = {
+        role: {
+            "external_process_wall_seconds": float(process_walls[role]),
+            "profile_cold_outer_wall_seconds": float(profile_cold_walls[role]),
+            "python_startup_and_unprofiled_seconds": (
+                float(process_walls[role]) - float(profile_cold_walls[role])
+            ),
+        }
+        for role in RUN_ORDER
+    }
+    invalid_reconciliation = {
+        role: values
+        for role, values in wall_reconciliation.items()
+        if values["python_startup_and_unprofiled_seconds"] < -0.05
+    }
+    if invalid_reconciliation:
+        raise ValueError(
+            "external process wall is shorter than profiled cold outer wall: "
+            f"{invalid_reconciliation}"
+        )
     parity = analysis.get("parity")
     if not isinstance(parity, dict):
         raise ValueError("reciprocal parity is missing")
@@ -262,6 +333,7 @@ def evaluate_gate(
         "direct_process_median_seconds": direct_median,
         "complete_cold_wall_saving_seconds": cold_saving,
         "profile_cold_outer_saving_seconds": cold_profile_saving,
+        "process_wall_reconciliation": wall_reconciliation,
         "warm_complete_request_candidate_minus_cached_seconds": warm_delta,
         "cold_saving_pass": cold_pass,
         "warm_no_regression_pass": warm_pass,
@@ -312,6 +384,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     from utils.analyze_reciprocal_full_song_candidate import analyze
     from utils.validate_k4_profile_contract import validate as validate_k4
+    from utils.validate_k1_remainder_profile import validate as validate_k1
+    from utils.validate_int8_mlp_full_song_profile import (
+        validate_profile as validate_int8_mlp,
+    )
     from utils.validate_weight_only_full_song_profile import (
         validate_profile as validate_weight,
     )
@@ -382,6 +458,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     extension_load_seconds: dict[str, float] = {}
     profile_paths: dict[str, Path] = {}
     initialization_evidence: dict[str, dict[str, Any]] = {}
+    retained_initialization: dict[str, dict[str, Any]] = {}
     manifest_extensions = preflight["extensions"]
     for role in RUN_ORDER:
         mode = "direct" if role.startswith("direct") else "cached"
@@ -414,7 +491,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             str(
                 REPO_ROOT
                 / "utils"
-                / "run_k4_shared_rope_approximate_weight_only.py"
+                / "run_k4_shared_rope_k1_remainder_int8_mlp_weight_only.py"
             ),
             "--config-name",
             "profile_salvalai",
@@ -447,6 +524,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         profile_payload = _load_json(profile, name=f"{role} profile")
         validate_weight(profile_payload, role="candidate")
         validate_k4(profile_payload, role="candidate", block_size=4)
+        validate_k1(profile_payload, role="candidate")
+        validate_int8_mlp(profile_payload, role="candidate")
         extension_load_seconds[role] = _validate_extension_evidence(
             _load_json(extension_json, name=f"{role} extension evidence"),
             manifest_extensions,
@@ -458,19 +537,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             init_json,
             name=f"{role} initialization evidence",
         )
-        _validate_shared_initialization(initialization_evidence[role], role=role)
+        retained_initialization[role] = _validate_retained_initialization(
+            initialization_evidence[role],
+            role=role,
+        )
         profile_paths[role] = profile
 
-    shared_material = {
-        role: {
-            "combined_runtime": evidence["combined_runtime"],
-            "shared_rope": evidence["shared_rope"],
-        }
-        for role, evidence in initialization_evidence.items()
-    }
-    first_shared = shared_material[RUN_ORDER[0]]
-    if any(value != first_shared for value in shared_material.values()):
-        raise RuntimeError("cached/direct shared-RoPE initialization evidence diverged")
+    first_retained = retained_initialization[RUN_ORDER[0]]
+    if any(value != first_retained for value in retained_initialization.values()):
+        raise RuntimeError("cached/direct retained runtime initialization diverged")
 
     analysis_paths = {
         analyzer_role: profile_paths[run_role]
@@ -478,7 +553,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     }
     analysis = analyze(
         analysis_paths,
-        mode="exact-fp32",
+        mode="relaxed",
         required_exact_labels=("timing_context", "main_generation"),
         required_exact_dispatch_labels=("timing_context", "main_generation"),
     )
@@ -494,22 +569,33 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         extension_load_seconds=extension_load_seconds,
         storage_bytes=storage_bytes,
     )
-    gate["shared_rope_initialization"] = first_shared
+    gate["retained_runtime_initialization"] = first_retained
     gate["performance"] = {
         key: analysis["metrics"][key]
         for key in (
             "timing_model_seconds",
             "timing_tokens",
             "timing_tps",
+            "timing_outer_stage_wall_seconds",
+            "timing_postprocess_seconds",
             "main_model_seconds",
             "main_tokens",
             "main_tps",
+            "fixed_8294_main_seconds",
+            "main_outer_stage_wall_seconds",
+            "final_postprocess_write_seconds",
             "complete_request_wall_seconds",
             "cold_process_outer_wall_seconds",
+            "setup_stage_sum_seconds",
+            "graph_capture_seconds",
+            "setup_plus_capture_seconds",
+            "total_postprocess_seconds",
             "peak_cuda_memory_allocated_mb",
         )
     }
     gate["exactness"] = {
+        "comparison": "cached-jit-versus-direct-prebuilt-same-runtime",
+        "accepted_fp32_exactness_claim": False,
         "token_and_stopping_divergence": analysis["parity"][
             "token_and_stopping_divergence"
         ],

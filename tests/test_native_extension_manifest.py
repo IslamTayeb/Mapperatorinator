@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -69,6 +70,39 @@ class NativeExtensionManifestTest(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "non-deterministic build value"):
             native_extension.extension_source_hash(kwargs)
 
+    def test_manual_pybind_symbols_are_stripped_from_jit_and_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            library = Path(directory) / "manual.so"
+            library.write_bytes(b"manual pybind extension")
+            module = SimpleNamespace(__file__=str(library))
+            kwargs = {
+                "name": "manual_extension",
+                "cpp_sources": "manual binding",
+                "cuda_sources": "cuda",
+                "prebuilt_functions": ["manual_call"],
+            }
+            records = {}
+            with mock.patch.dict(
+                os.environ,
+                {native_extension.MANIFEST_ENV: ""},
+                clear=False,
+            ), mock.patch(
+                "torch.utils.cpp_extension.load_inline",
+                return_value=module,
+            ) as load_inline, mock.patch.object(
+                native_extension,
+                "_LOADED_EXTENSIONS",
+                records,
+            ):
+                native_extension.load_inline_or_prebuilt(**kwargs)
+
+            passed = load_inline.call_args.kwargs
+            self.assertNotIn("prebuilt_functions", passed)
+            self.assertEqual(
+                records["manual_extension"]["functions"],
+                ["manual_call"],
+            )
+
     def test_cuda_arch_normalization(self) -> None:
         cases = (
             ("7.5", ["7.5"]),
@@ -130,6 +164,44 @@ class NativeExtensionManifestTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(RuntimeError, "ABI mismatch"):
                     native_extension.load_inline_or_prebuilt(**_kwargs())
+
+    def test_explicit_manifest_missing_manual_extension_never_falls_back_to_jit(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = {
+                "schema_version": 1,
+                "source_commit": SOURCE_COMMIT,
+                "abi": native_extension.runtime_abi(),
+                "cuda_arches": ["7.5"],
+                "extensions": {},
+            }
+            manifest_path = root / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest))
+            kwargs = {
+                "name": "mapperatorinator_int8_mlp_scout_v1",
+                "cpp_sources": "manual binding",
+                "cuda_sources": "cuda",
+                "prebuilt_functions": ["int8_weight_mlp_residual"],
+            }
+            with mock.patch.dict(
+                os.environ,
+                {
+                    native_extension.MANIFEST_ENV: str(manifest_path),
+                    "TORCH_CUDA_ARCH_LIST": "7.5",
+                },
+                clear=False,
+            ), mock.patch.object(
+                native_extension.torch.cuda,
+                "is_available",
+                return_value=False,
+            ), mock.patch(
+                "torch.utils.cpp_extension.load_inline"
+            ) as load_inline:
+                with self.assertRaisesRegex(RuntimeError, "manifest is missing"):
+                    native_extension.load_inline_or_prebuilt(**kwargs)
+            load_inline.assert_not_called()
 
     def test_manifest_writer_copies_exact_libraries_and_hashes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -260,12 +332,14 @@ import os
 import sys
 os.environ.pop("MAPPERATORINATOR_NATIVE_EXTENSION_MANIFEST", None)
 from osuT5.osuT5.inference.optimized.kernels import decoder_layer, q1_attention, weight_only
+from osuT5.osuT5.inference.optimized.scout import int8_mlp
 from osuT5.osuT5.inference.optimized.kernels.native_extension import loaded_extension_records
 assert "torch.utils.cpp_extension" not in sys.modules
 assert loaded_extension_records() == {}
 assert decoder_layer._NATIVE_DECODER_LAYER is None
 assert q1_attention._NATIVE_Q1_ATTENTION is None
 assert weight_only._WEIGHT_ONLY_EXTENSION is None
+assert int8_mlp._INT8_MLP_EXTENSION is None
 """
         env = os.environ.copy()
         env["PYTHONPATH"] = str(REPO_ROOT)

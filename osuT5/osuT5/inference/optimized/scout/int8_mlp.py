@@ -19,9 +19,9 @@ _INT8_MLP_EXTENSION = None
 
 
 def _load_inline(**kwargs):
-    from torch.utils.cpp_extension import load_inline
+    from ..kernels.native_extension import load_inline_or_prebuilt
 
-    return load_inline(**kwargs)
+    return load_inline_or_prebuilt(**kwargs)
 
 
 _CPP_SOURCE = r"""
@@ -286,6 +286,7 @@ def _load_int8_mlp_extension():
             name="mapperatorinator_int8_mlp_scout_v1",
             cpp_sources=_CPP_SOURCE,
             cuda_sources=_CUDA_SOURCE,
+            prebuilt_functions=["int8_weight_mlp_residual"],
             extra_cuda_cflags=["-O3", "--use_fast_math", "-gencode=arch=compute_75,code=sm_75"],
             verbose=False,
         )

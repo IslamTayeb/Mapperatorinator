@@ -24,6 +24,7 @@ def test_extension_is_cold_singleton_with_explicit_manual_binding(monkeypatch) -
     assert len(calls) == 1
     assert calls[0]["name"] == "mapperatorinator_int8_mlp_scout_v1"
     assert "functions" not in calls[0]
+    assert calls[0]["prebuilt_functions"] == ["int8_weight_mlp_residual"]
     assert "torch::Tensor int8_weight_mlp_residual(" in calls[0]["cpp_sources"]
     assert "PYBIND11_MODULE(TORCH_EXTENSION_NAME, module)" in calls[0]["cpp_sources"]
     assert '&int8_weight_mlp_residual' in calls[0]["cpp_sources"]

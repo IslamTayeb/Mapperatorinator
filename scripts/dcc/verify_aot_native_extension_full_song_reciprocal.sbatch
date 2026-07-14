@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=aot-full-recip
+#SBATCH --job-name=aot-k1-int8-recip
 #SBATCH --partition=gpu-common
 #SBATCH --account=romerolab
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
 #SBATCH --gres=gpu:2080:1
-#SBATCH --time=02:00:00
+#SBATCH --time=00:30:00
 #SBATCH --output=/work/imt11/Mapperatorinator/logs/%x-%j.out
 #SBATCH --error=/work/imt11/Mapperatorinator/logs/%x-%j.err
 
@@ -25,8 +25,8 @@ AOT_MANIFEST_SHA256=${AOT_NATIVE_EXTENSION_MANIFEST_SHA256:?Set the exact manife
 AOT_BUILD_RESULT=${AOT_NATIVE_EXTENSION_BUILD_RESULT:?Set the external build result path}
 AOT_BUILD_RESULT_SHA256=${AOT_NATIVE_EXTENSION_BUILD_RESULT_SHA256:?Set the exact build result hash}
 AOT_EXTENSION_CACHE_ROOT=${AOT_NATIVE_EXTENSION_CACHE_ROOT:?Set the exact cached load_inline root}
-RUN_ROOT="$WORK/runs/aot-native-full-song-reciprocal-${SLURM_JOB_ID:-manual}"
-SMI_TEMP="$WORK/logs/.aot-native-full-song-reciprocal-${SLURM_JOB_ID:-manual}.nvidia-smi.csv"
+RUN_ROOT="$WORK/runs/aot-k1-int8-full-song-reciprocal-${SLURM_JOB_ID:-manual}"
+SMI_TEMP="$WORK/logs/.aot-k1-int8-full-song-reciprocal-${SLURM_JOB_ID:-manual}.nvidia-smi.csv"
 
 if [[ ! -d "$REPO/.git" && ! -f "$REPO/.git" ]]; then
   echo "missing worktree at $REPO" >&2
@@ -170,5 +170,30 @@ if payload.get("cold_saving_pass") is not True:
     raise SystemExit("AOT full-song reciprocal cold saving did not pass")
 if payload.get("warm_no_regression_pass") is not True:
     raise SystemExit("AOT full-song reciprocal warm request regressed")
+retained = payload.get("retained_runtime_initialization")
+if not isinstance(retained, dict) or retained.get("combined_runtime") != (
+    "k4-split-kv-mixed-weight-shared-rope-k1-remainder-int8-mlp-v1"
+):
+    raise SystemExit("AOT full-song reciprocal lost the retained K1+INT8 topology")
+if retained.get("result_class") != "documented-drift" or retained.get(
+    "exactness_claim"
+) is not False:
+    raise SystemExit("AOT full-song reciprocal changed the retained drift claim")
+exactness = payload.get("exactness")
+if not isinstance(exactness, dict) or exactness.get(
+    "accepted_fp32_exactness_claim"
+) is not False:
+    raise SystemExit("AOT full-song reciprocal mislabeled accepted-FP32 exactness")
+performance = payload.get("performance")
+for metric in (
+    "fixed_8294_main_seconds",
+    "complete_request_wall_seconds",
+    "cold_process_outer_wall_seconds",
+):
+    if not isinstance(performance, dict) or metric not in performance:
+        raise SystemExit(f"AOT full-song reciprocal is missing {metric}")
+loads = payload.get("native_extension_load_seconds", {}).get("runs", {})
+if set(loads) != {"cached_first", "direct_first", "direct_second", "cached_second"}:
+    raise SystemExit("AOT full-song reciprocal extension load roles are incomplete")
 PY
 echo "AOT_NATIVE_EXTENSION_FULL_SONG_PASS"

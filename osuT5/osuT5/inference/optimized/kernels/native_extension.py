@@ -23,6 +23,15 @@ _NON_CODEGEN_KEYS = frozenset({"build_directory", "keep_intermediates", "verbose
 _LOADED_EXTENSIONS: dict[str, dict[str, Any]] = {}
 
 
+def _exported_functions(kwargs: Mapping[str, Any]) -> list[str]:
+    functions = kwargs.get("prebuilt_functions", kwargs.get("functions")) or []
+    if not isinstance(functions, (list, tuple)) or not functions or not all(
+        isinstance(function, str) and function for function in functions
+    ):
+        raise TypeError("native extension exported functions must be nonempty strings")
+    return list(functions)
+
+
 def _json_value(value: Any, *, name: str) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
@@ -147,7 +156,7 @@ def _load_direct(kwargs: Mapping[str, Any], manifest_path: Path):
             f"native extension source mismatch for {name}: "
             f"expected {expected_source}, got {entry.get('source_sha256')}"
         )
-    functions = list(kwargs.get("functions") or [])
+    functions = _exported_functions(kwargs)
     if entry.get("functions") != functions:
         raise RuntimeError(
             f"native extension exported-symbol mismatch for {name}: "
@@ -204,6 +213,8 @@ def load_inline_or_prebuilt(**kwargs):
     """Use normal lazy JIT resolution unless an explicit manifest is selected."""
 
     started = time.perf_counter()
+    build_kwargs = dict(kwargs)
+    build_kwargs.pop("prebuilt_functions", None)
     manifest_value = os.environ.get(MANIFEST_ENV)
     if manifest_value:
         module = _load_direct(kwargs, Path(manifest_value).expanduser().resolve())
@@ -213,7 +224,7 @@ def load_inline_or_prebuilt(**kwargs):
         return module
     from torch.utils.cpp_extension import load_inline
 
-    module = load_inline(**kwargs)
+    module = load_inline(**build_kwargs)
     name = str(kwargs["name"])
     library = Path(module.__file__).resolve()
     _LOADED_EXTENSIONS[name] = {
@@ -221,7 +232,7 @@ def load_inline_or_prebuilt(**kwargs):
         "source_sha256": extension_source_hash(kwargs),
         "library": str(library),
         "library_sha256": _sha256_file(library),
-        "functions": list(kwargs.get("functions") or []),
+        "functions": _exported_functions(kwargs),
         "load_seconds": time.perf_counter() - started,
     }
     return module

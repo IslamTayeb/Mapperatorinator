@@ -18,6 +18,7 @@ EXPECTED_EXTENSIONS = (
     "mapperatorinator_q1_attention",
     "mapperatorinator_native_decoder_layer",
     "mapperatorinator_weight_only_fp16_v1",
+    "mapperatorinator_int8_mlp_scout_v1",
 )
 
 
@@ -32,6 +33,7 @@ def build(output_path: Path) -> dict[str, object]:
         loaded_extension_records,
         write_loaded_extension_manifest,
     )
+    from osuT5.osuT5.inference.optimized.scout import int8_mlp
 
     if os.environ.get(MANIFEST_ENV):
         raise RuntimeError(f"unset {MANIFEST_ENV} before building extensions")
@@ -55,6 +57,7 @@ def build(output_path: Path) -> dict[str, object]:
         q1_attention.preload_native_q1_attention(),
         decoder_layer.preload_native_decoder_layer(),
         weight_only.preload_weight_only_extension(),
+        int8_mlp.preload_int8_mlp_extension(),
     )
     build_seconds = time.perf_counter() - started
     for expected, module in zip(EXPECTED_EXTENSIONS, modules, strict=True):

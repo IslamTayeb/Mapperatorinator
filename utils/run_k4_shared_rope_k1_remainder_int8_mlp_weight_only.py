@@ -20,11 +20,17 @@ COMPOSITION_VERSION = (
 )
 
 
-def run(config_name: str, overrides: list[str], output_init_json: Path) -> None:
+def run(
+    config_name: str,
+    overrides: list[str],
+    output_init_json: Path,
+    output_extension_json: Path | None = None,
+) -> None:
     run_combined(
         config_name,
         overrides,
         output_init_json,
+        output_extension_json,
         graph_remainders=True,
         weight_runner=run_int8_weight_only,
         composition_version=COMPOSITION_VERSION,
@@ -35,9 +41,15 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config-name", default="profile_salvalai")
     parser.add_argument("--output-init-json", type=Path, required=True)
+    parser.add_argument("--output-extension-json", type=Path)
     parser.add_argument("overrides", nargs="*")
     parsed = parser.parse_args()
-    run(parsed.config_name, parsed.overrides, parsed.output_init_json)
+    run(
+        parsed.config_name,
+        parsed.overrides,
+        parsed.output_init_json,
+        parsed.output_extension_json,
+    )
 
 
 if __name__ == "__main__":
