@@ -748,22 +748,121 @@ def summarize_component(
 
 def _validate_live_graph_cache(
     graph_cache: Any,
-) -> dict[int, dict[str, Any]]:
+) -> dict[int, list[dict[str, Any]]]:
     if not isinstance(graph_cache, dict) or not graph_cache:
         raise TypeError("retained ProductionDecodeSession.graph_cache must be non-empty")
-    entries: dict[int, dict[str, Any]] = {}
-    for raw in graph_cache.values():
-        entry = _object(raw, name="retained graph entry")
+    entries: dict[int, list[dict[str, Any]]] = {}
+    for cache_key, raw in graph_cache.items():
+        entry = _object(raw, name="retained composed graph entry")
+        if not isinstance(cache_key, tuple) or len(cache_key) != 7:
+            raise RuntimeError("retained composed graph has an invalid cache key")
+        if cache_key[0] != "k8_candidate":
+            raise RuntimeError("retained graph cache contains a non-K4 entry")
+        if cache_key[1] != 4:
+            raise RuntimeError("retained composed graph is not the accepted K4 block")
+        if cache_key[2] is not True:
+            raise RuntimeError("retained composed graph did not capture K1 remainders")
+        if not isinstance(cache_key[5], bool):
+            raise TypeError("retained composed graph sampling key must be a bool")
         prefix = entry.get("active_prefix_length")
         if isinstance(prefix, bool) or not isinstance(prefix, int) or prefix <= 0:
             raise ValueError("retained graph entry has an invalid active prefix")
-        if prefix in entries:
-            raise RuntimeError(f"retained graph cache repeats prefix {prefix}")
-        for name in ("graph", "outputs", "static_inputs", "decode_replays"):
-            if name not in entry:
-                raise RuntimeError(f"retained graph prefix {prefix} is missing {name}")
+        if cache_key[4] != prefix:
+            raise RuntimeError(f"retained graph prefix {prefix} disagrees with its key")
+        if entry.get("k8_candidate") is not True:
+            raise RuntimeError(f"retained graph prefix {prefix} is not a K4 candidate")
+        runtime_entry = entry.get("runtime_entry")
+        if runtime_entry is None:
+            raise RuntimeError(f"retained graph prefix {prefix} is missing runtime_entry")
+        state = getattr(runtime_entry, "state", None)
+        if state is None or cache_key[3] != id(state):
+            raise RuntimeError(
+                f"retained graph prefix {prefix} resolved the wrong persistent state"
+            )
+        if getattr(runtime_entry, "processor", None) is None:
+            raise RuntimeError(f"retained graph prefix {prefix} is missing its processor")
+        parent = getattr(runtime_entry, "parent", None)
+        remainder_parent = getattr(runtime_entry, "remainder_parent", None)
+        if parent is None:
+            raise RuntimeError(f"retained graph prefix {prefix} is missing its K4 parent")
+        if remainder_parent is None:
+            raise RuntimeError(
+                f"retained graph prefix {prefix} is missing its captured K1 parent"
+            )
+        model_graph = getattr(parent, "model_graph", None)
+        tail_graph = getattr(parent, "tail_graph", None)
+        remainder_model_graph = getattr(remainder_parent, "model_graph", None)
+        remainder_tail_graph = getattr(remainder_parent, "tail_graph", None)
+        if model_graph is None or tail_graph is None:
+            raise RuntimeError(f"retained graph prefix {prefix} has invalid K4 children")
+        if model_graph is not remainder_model_graph or tail_graph is not remainder_tail_graph:
+            raise RuntimeError(
+                f"retained graph prefix {prefix} K4/K1 parents do not own the same children"
+            )
+        static_inputs = getattr(runtime_entry, "static_inputs", None)
+        if not isinstance(static_inputs, dict) or not static_inputs:
+            raise RuntimeError(f"retained graph prefix {prefix} has invalid static inputs")
+        for required in ("past_key_values", "cache_position"):
+            if required not in static_inputs:
+                raise RuntimeError(
+                    f"retained graph prefix {prefix} static inputs are missing {required}"
+                )
+        expected_signature = tuple(
+            (name, tuple(value.shape), str(value.dtype), str(value.device))
+            if isinstance(value, torch.Tensor)
+            else (name, type(value).__name__, id(value))
+            for name, value in sorted(static_inputs.items())
+        )
+        if cache_key[6] != expected_signature:
+            raise RuntimeError(
+                f"retained graph prefix {prefix} static-input signature changed"
+            )
+        outputs = getattr(runtime_entry, "outputs", None)
+        if outputs is None:
+            raise RuntimeError(f"retained graph prefix {prefix} is missing model outputs")
+        capture_seconds = entry.get("capture_seconds")
+        if (
+            isinstance(capture_seconds, bool)
+            or not isinstance(capture_seconds, (int, float))
+            or capture_seconds <= 0
+            or capture_seconds != getattr(runtime_entry, "capture_seconds", None)
+        ):
+            raise RuntimeError(
+                f"retained graph prefix {prefix} has invalid capture ownership"
+            )
+        stats = _object(entry.get("k8_stats"), name=f"prefix {prefix} k8_stats")
+        expected_stats = {
+            "k8_candidate": True,
+            "block_size": 4,
+            "remainder_backend": "cuda_graph",
+            "eager_remainder_steps": 0,
+        }
+        for name, expected in expected_stats.items():
+            if stats.get(name) != expected:
+                raise RuntimeError(
+                    f"retained graph prefix {prefix} changed K4/K1 {name}"
+                )
+        sampling_mode = stats.get("sampling_mode")
+        if sampling_mode not in {"sample", "greedy"}:
+            raise RuntimeError(
+                f"retained graph prefix {prefix} has invalid sampling metadata"
+            )
+        if cache_key[5] != (sampling_mode == "sample"):
+            raise RuntimeError(
+                f"retained graph prefix {prefix} sampling ownership changed"
+            )
         _positive_int(entry["decode_replays"], name=f"prefix {prefix} decode_replays")
-        entries[prefix] = entry
+        entries.setdefault(prefix, []).append(
+            {
+                "graph": remainder_model_graph,
+                "outputs": outputs,
+                "static_inputs": static_inputs,
+                "decode_replays": entry["decode_replays"],
+                "active_prefix_length": prefix,
+                "capture_seconds": float(capture_seconds),
+                "graph_source": "captured_k1_remainder_parent.model_graph",
+            }
+        )
     missing = sorted(set(SENTINEL_BUCKETS) - set(entries))
     if missing:
         raise RuntimeError(f"retained graph cache is missing sentinel buckets {missing}")
@@ -771,7 +870,7 @@ def _validate_live_graph_cache(
 
 
 def _select_live_buckets(
-    entries: dict[int, dict[str, Any]],
+    entries: dict[int, list[dict[str, Any]]],
     mode: str,
 ) -> dict[int, dict[str, Any]]:
     if mode == "sentinel":
@@ -780,7 +879,17 @@ def _select_live_buckets(
         selected = tuple(entries)
     else:
         raise ValueError("bucket mode must be 'sentinel' or 'all'")
-    return {prefix: entries[prefix] for prefix in selected}
+    ambiguous = {
+        prefix: len(entries[prefix])
+        for prefix in selected
+        if len(entries[prefix]) != 1
+    }
+    if ambiguous:
+        raise RuntimeError(
+            "retained graph selection has ambiguous input signatures: "
+            f"{ambiguous}"
+        )
+    return {prefix: entries[prefix][0] for prefix in selected}
 
 
 def _retained_main_session_run(args, *, output_path: Path) -> dict[str, Any]:
@@ -965,7 +1074,11 @@ def profile_component(
     model.eval()
     entries = _validate_live_graph_cache(run["session"].graph_cache)
     selected = _select_live_buckets(entries, bucket_mode)
-    total_replays = sum(int(entry["decode_replays"]) for entry in entries.values())
+    total_replays = sum(
+        int(entry["decode_replays"])
+        for prefix_entries in entries.values()
+        for entry in prefix_entries
+    )
     layers, final_norm, final_projection = _locate_decoder(model)
 
     from osuT5.osuT5.inference.optimized.kernels.weight_only import (
@@ -1126,8 +1239,18 @@ def profile_component(
             "bucket_mode": bucket_mode,
             "measured_buckets": list(selected),
             "live_bucket_counts": {
-                str(prefix): int(entry["decode_replays"])
-                for prefix, entry in entries.items()
+                str(prefix): sum(
+                    int(entry["decode_replays"]) for entry in prefix_entries
+                )
+                for prefix, prefix_entries in entries.items()
+            },
+            "live_graph_counts": {
+                str(prefix): len(prefix_entries)
+                for prefix, prefix_entries in entries.items()
+            },
+            "selected_graph_sources": {
+                str(prefix): entry["graph_source"]
+                for prefix, entry in selected.items()
             },
             "warmup": warmup,
             "iters": iters,

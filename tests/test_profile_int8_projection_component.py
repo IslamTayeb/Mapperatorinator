@@ -12,6 +12,8 @@ from utils.profile_int8_projection_component import (
     MEASURED_INT8_VS_FP16_MLP_SPEEDUP,
     REQUIRED_DISPATCHES,
     _retained_real_tensor_context,
+    _select_live_buckets,
+    _validate_live_graph_cache,
     _validate_retained_composition_manifest,
     summarize_component,
 )
@@ -32,6 +34,82 @@ EXPECTED_BASELINE = {
     "final_norm_logits": "fp16_weight",
 }
 OUTPUTS_PER_BLOCK = (2, 4, 8)
+
+
+def _composed_graph_entry(
+    prefix: int,
+    *,
+    variant: int = 0,
+    remainder: bool = True,
+) -> tuple[tuple, dict, SimpleNamespace]:
+    state = object()
+    processor = object()
+    cache = object()
+    static_inputs = {
+        "cache_position": torch.tensor([variant], dtype=torch.long),
+        "decoder_input_ids": torch.zeros((1, 1 + variant), dtype=torch.long),
+        "past_key_values": cache,
+    }
+    model_graph = object()
+    tail_graph = object()
+    parent = SimpleNamespace(model_graph=model_graph, tail_graph=tail_graph)
+    remainder_parent = (
+        SimpleNamespace(model_graph=model_graph, tail_graph=tail_graph)
+        if remainder
+        else None
+    )
+    outputs = object()
+    runtime_entry = SimpleNamespace(
+        parent=parent,
+        remainder_parent=remainder_parent,
+        static_inputs=static_inputs,
+        state=state,
+        processor=processor,
+        outputs=outputs,
+        capture_seconds=0.25,
+    )
+    signature = tuple(
+        (name, tuple(value.shape), str(value.dtype), str(value.device))
+        if isinstance(value, torch.Tensor)
+        else (name, type(value).__name__, id(value))
+        for name, value in sorted(static_inputs.items())
+    )
+    key = (
+        "k8_candidate",
+        4,
+        True,
+        id(state),
+        prefix,
+        True,
+        signature,
+    )
+    raw = {
+        "k8_candidate": True,
+        "runtime_entry": runtime_entry,
+        "active_prefix_length": prefix,
+        "capture_seconds": runtime_entry.capture_seconds,
+        "decode_replays": 10 + variant,
+        "k8_stats": {
+            "k8_candidate": True,
+            "block_size": 4,
+            "remainder_backend": "cuda_graph",
+            "eager_remainder_steps": 0,
+            "sampling_mode": "sample",
+        },
+    }
+    return key, raw, runtime_entry
+
+
+def _live_composed_graph_cache(*, duplicate_prefix: int | None = 320) -> dict:
+    result = {}
+    for prefix in (128, 576, 640):
+        key, raw, _ = _composed_graph_entry(prefix)
+        result[key] = raw
+    if duplicate_prefix is not None:
+        for variant in (0, 1):
+            key, raw, _ = _composed_graph_entry(duplicate_prefix, variant=variant)
+            result[key] = raw
+    return result
 
 
 def _buckets(*, baseline_ms: float = 0.3, candidate_ms: float = 0.1):
@@ -95,6 +173,83 @@ def _weight_state() -> dict:
             "dispatch_counter": "int8_weight_mlp_tail",
         },
     }
+
+
+def test_live_composed_cache_selects_captured_k1_model_graph() -> None:
+    cache = _live_composed_graph_cache()
+
+    entries = _validate_live_graph_cache(cache)
+    selected = _select_live_buckets(entries, "sentinel")
+
+    assert len(entries[320]) == 2
+    assert tuple(selected) == (128, 576, 640)
+    for prefix, normalized in selected.items():
+        matching = [
+            raw["runtime_entry"]
+            for raw in cache.values()
+            if raw["active_prefix_length"] == prefix
+        ]
+        assert len(matching) == 1
+        runtime_entry = matching[0]
+        assert normalized["graph"] is runtime_entry.remainder_parent.model_graph
+        assert normalized["graph"] is runtime_entry.parent.model_graph
+        assert normalized["static_inputs"] is runtime_entry.static_inputs
+        assert normalized["outputs"] is runtime_entry.outputs
+        assert normalized["graph_source"] == (
+            "captured_k1_remainder_parent.model_graph"
+        )
+
+    with pytest.raises(RuntimeError, match="ambiguous input signatures"):
+        _select_live_buckets(entries, "all")
+
+
+def test_live_composed_cache_rejects_missing_k1_remainder_parent() -> None:
+    cache = _live_composed_graph_cache(duplicate_prefix=None)
+    raw = next(raw for raw in cache.values() if raw["active_prefix_length"] == 128)
+    raw["runtime_entry"].remainder_parent = None
+
+    with pytest.raises(RuntimeError, match="missing its captured K1 parent"):
+        _validate_live_graph_cache(cache)
+
+
+def test_live_composed_cache_rejects_k4_k1_child_ownership_drift() -> None:
+    cache = _live_composed_graph_cache(duplicate_prefix=None)
+    raw = next(raw for raw in cache.values() if raw["active_prefix_length"] == 128)
+    raw["runtime_entry"].remainder_parent.model_graph = object()
+
+    with pytest.raises(RuntimeError, match="do not own the same children"):
+        _validate_live_graph_cache(cache)
+
+
+def test_live_composed_cache_rejects_state_and_input_signature_drift() -> None:
+    cache = _live_composed_graph_cache(duplicate_prefix=None)
+    key = next(key for key in cache if key[4] == 128)
+    raw = cache.pop(key)
+    bad_state_key = key[:3] + (key[3] + 1,) + key[4:]
+    cache[bad_state_key] = raw
+
+    with pytest.raises(RuntimeError, match="wrong persistent state"):
+        _validate_live_graph_cache(cache)
+
+    cache.pop(bad_state_key)
+    bad_signature_key = key[:-1] + (("stale",),)
+    cache[bad_signature_key] = raw
+    with pytest.raises(RuntimeError, match="static-input signature changed"):
+        _validate_live_graph_cache(cache)
+
+
+def test_live_composed_cache_rejects_eager_or_ambiguous_sentinel_graphs() -> None:
+    cache = _live_composed_graph_cache(duplicate_prefix=None)
+    raw = next(raw for raw in cache.values() if raw["active_prefix_length"] == 128)
+    raw["k8_stats"]["remainder_backend"] = "eager"
+
+    with pytest.raises(RuntimeError, match="changed K4/K1 remainder_backend"):
+        _validate_live_graph_cache(cache)
+
+    duplicate = _live_composed_graph_cache(duplicate_prefix=128)
+    entries = _validate_live_graph_cache(duplicate)
+    with pytest.raises(RuntimeError, match="ambiguous input signatures"):
+        _select_live_buckets(entries, "sentinel")
 
 
 def _manifest() -> dict:
