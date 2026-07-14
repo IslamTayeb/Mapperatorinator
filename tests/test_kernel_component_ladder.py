@@ -181,7 +181,7 @@ class KernelComponentLadderTest(unittest.TestCase):
             "3e6a4dfb934aa03f5fcec639a0b4b8559f8e143c",
             "5fafbaf59b0a0e64bc12da83d5f340dd32aa7b79",
             "5f384760dff8520bc1ad0e11414f994d3024578b",
-            "907652706d402a90723724cd52f2d2ca721b635f",
+            "71c3ecdd80d1f3b33e856e8fad6f7f344aaeed9a",
             "f13e55e1bf1ad32629f2981738acb65aab09a45f",
             "d0de363f6df44195f2b3b73c0797dd57bcab9440",
             "c67211b010183101de048853433e8380b02f180d",
