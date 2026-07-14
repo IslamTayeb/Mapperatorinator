@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import subprocess
 import sys
 
 
@@ -56,6 +57,22 @@ def run(
         mixed_projection_ms_per_step=mixed_projection_ms_per_step,
         promotion_threshold_seconds=promotion_threshold_seconds,
     )
+    report["metadata"] = {
+        "git_commit": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True
+        ).strip(),
+        "git_branch": subprocess.check_output(
+            ["git", "branch", "--show-current"], cwd=REPO_ROOT, text=True
+        ).strip(),
+        "combined_base_commit": "0e6e07bba981b064da62009b5383ba60da514fb6",
+        "mixed_projection_evidence": (
+            "weight-only-component-49799185/component.json; "
+            "selected mixed final projection weighted over 8207 replays"
+        ),
+        "fixed_work_evidence": (
+            "current-main fixed workload: 8294 main and 821 timing steps"
+        ),
+    }
     output_scout_json.parent.mkdir(parents=True, exist_ok=True)
     output_scout_json.write_text(
         json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n",
