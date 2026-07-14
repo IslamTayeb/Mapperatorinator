@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
 #SBATCH --gres=gpu:2080:1
-#SBATCH --time=00:30:00
+#SBATCH --time=01:00:00
 #SBATCH --output=/work/imt11/Mapperatorinator/logs/%x-%j.out
 #SBATCH --error=/work/imt11/Mapperatorinator/logs/%x-%j.err
 
@@ -29,7 +29,7 @@ REMOTE_REF=${MAPPERATORINATOR_REMOTE_REF:?Set MAPPERATORINATOR_REMOTE_REF to the
 WORK=${MAPPERATORINATOR_WORK:-/work/imt11/Mapperatorinator}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 EXPECTED_GPU=${MAPPERATORINATOR_EXPECTED_GPU:-2080 Ti}
-RUNTIME_SPEC_SOURCE=${MAPPERATORINATOR_RUNTIME_SPEC:-$REPO/scripts/dcc/runtime_specs/k1_int8.json}
+RUNTIME_SPEC_SOURCE=${MAPPERATORINATOR_RUNTIME_SPEC:-$REPO/scripts/dcc/runtime_specs/k1_int8_fp16_cross.json}
 RUN_ROOT="$WORK/runs/selected-runtime-nsight-$SLURM_JOB_ID"
 RUNS="$RUN_ROOT/runs"
 CAPABILITIES="$RUN_ROOT/capabilities"
@@ -50,7 +50,7 @@ EXPECTED_MAIN_STEPS=8294
 
 mkdir -p "$WORK/logs" "$WORK/tmp" "$WORK/cache" \
   "$WORK/cache/torch_inductor" "$WORK/cache/triton" "$WORK/cache/cuda" \
-  "$WORK/torch_extensions" "$RUNS" "$CAPABILITIES"
+  "$WORK/torch_extensions/runtime-nsight-$COMMIT" "$RUNS" "$CAPABILITIES"
 export PATH="$(dirname "$PYTHON"):$PATH"
 export XDG_CACHE_HOME="$WORK/cache"
 export HF_HOME="$WORK/cache/huggingface"
@@ -60,9 +60,10 @@ export TRANSFORMERS_OFFLINE=1
 export TORCHINDUCTOR_CACHE_DIR="$WORK/cache/torch_inductor"
 export TRITON_CACHE_DIR="$WORK/cache/triton"
 export CUDA_CACHE_PATH="$WORK/cache/cuda"
-export TORCH_EXTENSIONS_DIR="$WORK/torch_extensions"
+export TORCH_EXTENSIONS_DIR="$WORK/torch_extensions/runtime-nsight-$COMMIT"
 export TMPDIR="$WORK/tmp"
 export TOKENIZERS_PARALLELISM=false
+export PYTHONHASHSEED=0
 
 for tool in ffmpeg ffprobe nvidia-smi nsys; do
   command -v "$tool" >/dev/null 2>&1 || die "missing required executable: $tool"
@@ -79,6 +80,7 @@ mapfile -t GPU_NAMES < <(nvidia-smi --query-gpu=name --format=csv,noheader)
 [[ "${GPU_NAMES[0]}" == *"$EXPECTED_GPU"* ]] || die "expected $EXPECTED_GPU, got ${GPU_NAMES[0]}"
 [[ "${SLURM_JOB_PARTITION:-}" == "gpu-common" ]] || die "expected gpu-common partition"
 
+cd "$REPO"
 cp "$RUNTIME_SPEC_SOURCE" "$RUN_ROOT/runtime-spec.json"
 RUNTIME_SPEC="$RUN_ROOT/runtime-spec.json"
 "$PYTHON" - "$RUNTIME_SPEC" <<'PY'
@@ -123,8 +125,6 @@ nvidia-smi \
 SMI_PID=$!
 cleanup() { kill "$SMI_PID" 2>/dev/null || true; }
 trap cleanup EXIT
-
-cd "$REPO"
 
 COMMON_OVERRIDES=(
   audio_path="$AUDIO"
@@ -254,13 +254,6 @@ run_nsys() {
 run_confirmation accepted_record record-fixed-work untraced_control false false false
 require_nonempty "$RUN_ROOT/fixed-work.json"
 run_confirmation selected_control replay-fixed-work untraced_control false false true
-run_confirmation selected_budget replay-fixed-work untraced_budget false false true
-
-BUDGET_PROFILE=$("$PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["profile_path"])' "$RUNS/selected_budget/evidence.json")
-"$PYTHON" utils/summarize_untraced_budget.py \
-  --profile "$BUDGET_PROFILE" \
-  --output "$RUN_ROOT/untraced-budget.json" \
-  --text-output "$RUN_ROOT/untraced-budget.txt"
 
 run_nsys selected_graph graph nsys_graph
 run_nsys selected_node node nsys_node
@@ -269,7 +262,7 @@ profile_path() {
   "$PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["profile_path"])' "$RUNS/$1/evidence.json"
 }
 CONTROL_PROFILE=$(profile_path selected_control)
-for pair in "selected_budget:budget" "selected_graph:graph" "selected_node:node"; do
+for pair in "selected_graph:graph" "selected_node:node"; do
   run_id=${pair%%:*}
   label=${pair##*:}
   "$PYTHON" utils/nsight_agent_profile.py transparency \
@@ -278,6 +271,13 @@ for pair in "selected_budget:budget" "selected_graph:graph" "selected_node:node"
     --output "$RUN_ROOT/transparency-$label.json"
   require_nonempty "$RUN_ROOT/transparency-$label.json"
 done
+
+"$PYTHON" utils/validate_selected_runtime_nsight.py \
+  --selected-control-evidence "$RUNS/selected_control/evidence.json" \
+  --selected-graph-evidence "$RUNS/selected_graph/evidence.json" \
+  --selected-node-evidence "$RUNS/selected_node/evidence.json" \
+  --output "$RUN_ROOT/topology-contract.json"
+require_nonempty "$RUN_ROOT/topology-contract.json"
 
 "$PYTHON" utils/build_runtime_nsight_manifest.py \
   --run-root "$RUN_ROOT" \
@@ -301,11 +301,9 @@ done
 "$PYTHON" utils/summarize_runtime_reprofile.py \
   --accepted-evidence "$RUNS/accepted_record/evidence.json" \
   --selected-control-evidence "$RUNS/selected_control/evidence.json" \
-  --selected-budget-evidence "$RUNS/selected_budget/evidence.json" \
   --selected-graph-evidence "$RUNS/selected_graph/evidence.json" \
   --selected-node-evidence "$RUNS/selected_node/evidence.json" \
-  --budget "$RUN_ROOT/untraced-budget.json" \
-  --budget-transparency "$RUN_ROOT/transparency-budget.json" \
+  --topology-contract "$RUN_ROOT/topology-contract.json" \
   --graph-transparency "$RUN_ROOT/transparency-graph.json" \
   --node-transparency "$RUN_ROOT/transparency-node.json" \
   --nsight-analysis "$RUN_ROOT/nsight-analysis.json" \
@@ -316,7 +314,9 @@ done
 for required in \
   "$RUN_ROOT/analysis.json" \
   "$RUN_ROOT/analysis.txt" \
+  "$RUN_ROOT/topology-contract.json" \
   "$RUN_ROOT/csv/stage_budget.csv" \
+  "$RUN_ROOT/csv/request_pipeline.csv" \
   "$RUN_ROOT/csv/kernel_families.csv" \
   "$RUN_ROOT/csv/top_kernels.csv" \
   "$RUN_ROOT/csv/copy_sync_launch_gaps.csv"; do

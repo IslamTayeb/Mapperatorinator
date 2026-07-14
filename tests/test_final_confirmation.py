@@ -146,7 +146,8 @@ def test_runtime_spec_is_imported_without_touching_production_selectors(
                 "kwargs": {
                     "block_size": 4,
                     "graph_remainders": True,
-                    "initializer_name": "initialize_approximate_int8_mlp_weight_only",
+                    "initializer_name": "initialize_approximate_int8_mlp_weight_only_cross",
+                    "initializer_kwargs": {"mode": "fp16_packed_projections"},
                 },
             }
         )
@@ -154,6 +155,12 @@ def test_runtime_spec_is_imported_without_touching_production_selectors(
     plugin = load_runtime_plugin(spec)
     assert isinstance(plugin, KBlockSharedRopeWeightPlugin)
     assert plugin.name == "selected-fast-runtime"
+
+    bad_kwargs = json.loads(spec.read_text())
+    bad_kwargs["kwargs"]["initializer_kwargs"] = []
+    spec.write_text(json.dumps(bad_kwargs))
+    with pytest.raises(RuntimeError, match="factory"):
+        load_runtime_plugin(spec)
 
     spec.write_text(json.dumps({"schema_version": "wrong"}))
     with pytest.raises(ValueError, match="schema"):

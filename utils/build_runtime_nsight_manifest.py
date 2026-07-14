@@ -174,6 +174,14 @@ def _run(
         _artifact(run_dir / "stdout.txt", root, "process_stdout", allow_empty=True),
         _artifact(run_dir / "stderr.txt", root, "process_stderr", allow_empty=True),
     ]
+    if candidate:
+        runtime_evidence_path = run_dir / "runtime-evidence.json"
+        runtime_evidence = _load(runtime_evidence_path)
+        if runtime_evidence != evidence.get("runtime"):
+            raise ValueError(f"{run_id} runtime evidence diverged from run evidence")
+        artifacts.append(
+            _artifact(runtime_evidence_path, root, "runtime_initialization_evidence")
+        )
     stages = {
         "timing_generation": _profile_stage(
             profile,
