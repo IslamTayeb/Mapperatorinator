@@ -157,6 +157,7 @@ def test_cross_wrappers_pin_shared_control_and_one_candidate_mode(
 ) -> None:
     source = wrapper.read_text(encoding="utf-8")
 
+    assert "#SBATCH --time=00:30:00" in source
     assert "BASELINE_RUNNER=utils/run_k4_shared_rope_approximate_weight_only.py" in source
     assert f"CANDIDATE_RUNNER={runner}" in source
     assert "REQUIRE_K4_CANDIDATE=true" in source
