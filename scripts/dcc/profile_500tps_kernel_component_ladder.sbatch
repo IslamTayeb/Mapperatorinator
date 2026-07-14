@@ -22,7 +22,7 @@ ENV=${MAPPERATORINATOR_ENV:-/hpc/group/romerolab/imt11/envs/mapperatorinator}
 PYTHON=${MAPPERATORINATOR_PYTHON:-$ENV/bin/python}
 
 CROSS_REPO="$ROOT/500tps-cross-attention-scout"
-CROSS_COMMIT=1c8417d313ce9237f7648aca434f42b6796f2a7d
+CROSS_COMMIT=3e6a4dfb934aa03f5fcec639a0b4b8559f8e143c
 CROSS_BRANCH=codex/500tps-cross-attention-scout
 
 CONDITIONAL_REPO="$ROOT/500tps-conditional-while-scout"

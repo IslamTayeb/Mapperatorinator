@@ -178,7 +178,7 @@ class KernelComponentLadderTest(unittest.TestCase):
         self.assertIn("#SBATCH --mem=64G", source)
         self.assertNotIn("sbatch --parsable", source)
         for commit in (
-            "1c8417d313ce9237f7648aca434f42b6796f2a7d",
+            "3e6a4dfb934aa03f5fcec639a0b4b8559f8e143c",
             "5fafbaf59b0a0e64bc12da83d5f340dd32aa7b79",
             "5f384760dff8520bc1ad0e11414f994d3024578b",
             "907652706d402a90723724cd52f2d2ca721b635f",
