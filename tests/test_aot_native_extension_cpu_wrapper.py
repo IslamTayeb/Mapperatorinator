@@ -25,6 +25,8 @@ class AotNativeExtensionCpuWrapperTest(unittest.TestCase):
         )
         self.assertIn("build_native_extension_manifest.py", source)
         self.assertIn("benchmark_native_extension_loading.py", source)
+        self.assertIn("-m pytest -q", source)
+        self.assertIn("test_run_k4_shared_rope_approximate_weight_only.py", source)
         self.assertIn("--minimum-saving-seconds 0.5", source)
         self.assertIn("--rounds 3", source)
         self.assertIn("AOT_NATIVE_EXTENSION_LOAD_PASS", source)
