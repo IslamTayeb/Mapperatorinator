@@ -2351,6 +2351,7 @@ VOLATILE_GRAPH_CACHE_KEYS = frozenset(
         "prompt_seed_setup_seconds",
         "processor_signature_setup_seconds",
         "peak_vram_bytes",
+        "transition_timing",
     }
 )
 

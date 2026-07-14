@@ -16,6 +16,7 @@ from .decode_loop import (
     _bucketed_prefix_length,
     _capture_decode_cuda_graph,
     _clone_static_graph_inputs,
+    _copy_static_graph_inputs,
     _max_cache_shape,
     _stable_encoder_outputs,
 )
@@ -650,6 +651,72 @@ class _K8GraphLifecycle:
 _ACTIVE_K8_LIFECYCLE: _K8GraphLifecycle | None = None
 _ACTIVE_BLOCK_SIZE: int | None = None
 _ACTIVE_GRAPH_REMAINDERS: bool | None = None
+_ACTIVE_SHARED_STATIC_INPUT_ARENA: bool | None = None
+_ACTIVE_TRANSITION_TIMING: bool | None = None
+
+
+_TRANSITION_STAGES = (
+    "prepare_inputs_for_generation",
+    "graph_key_lookup",
+    "static_input_refresh",
+    "static_input_copies",
+    "graph_replay",
+    "status_d2h",
+    "sync_model_kwargs",
+)
+
+
+def _static_input_signature(model_inputs: dict[str, Any]) -> tuple[Any, ...]:
+    return tuple(
+        (name, tuple(value.shape), str(value.dtype), str(value.device))
+        if isinstance(value, torch.Tensor)
+        else (name, type(value).__name__, id(value))
+        for name, value in sorted(model_inputs.items())
+    )
+
+
+def _tensor_copy_size(model_inputs: dict[str, Any]) -> tuple[int, int]:
+    tensors = [
+        value for value in model_inputs.values() if isinstance(value, torch.Tensor)
+    ]
+    return (
+        len(tensors),
+        sum(value.numel() * value.element_size() for value in tensors),
+    )
+
+
+@dataclass(slots=True)
+class _StaticInputArena:
+    static_inputs: dict[str, Any]
+    signature: tuple[Any, ...]
+    refreshed_window_identity: int
+
+    @classmethod
+    def create(
+        cls,
+        model_inputs: dict[str, Any],
+        *,
+        window_identity: int,
+    ) -> "_StaticInputArena":
+        return cls(
+            static_inputs=_clone_static_graph_inputs(model_inputs),
+            signature=_static_input_signature(model_inputs),
+            refreshed_window_identity=window_identity,
+        )
+
+    def refresh(
+        self,
+        model_inputs: dict[str, Any],
+        *,
+        window_identity: int,
+    ) -> None:
+        if window_identity == self.refreshed_window_identity:
+            raise RuntimeError("shared static-input arena refreshed twice in one window")
+        signature = _static_input_signature(model_inputs)
+        if signature != self.signature:
+            raise RuntimeError("shared static-input arena signature changed")
+        _copy_static_graph_inputs(self.static_inputs, model_inputs)
+        self.refreshed_window_identity = window_identity
 
 
 @dataclass(slots=True)
@@ -670,6 +737,7 @@ class _K8RuntimeSlot:
     state: K8DeviceState
     processor: K8LogitsProcessor
     signature: tuple[Any, ...]
+    static_input_arena: _StaticInputArena | None = None
 
 
 def _freeze_processor_value(
@@ -840,6 +908,7 @@ def _capture_k8_entry(
     do_sample: bool,
     block_size: int = K8_BLOCK_SIZE,
     graph_remainders: bool = False,
+    static_input_arena: dict[str, Any] | None = None,
 ) -> _K8GraphEntry:
     if not torch.cuda.is_available():
         raise RuntimeError("K8 graph capture requires CUDA")
@@ -847,7 +916,13 @@ def _capture_k8_entry(
     device = state.sequence.device
     with torch.cuda.device(device):
         torch.cuda.reset_peak_memory_stats(device)
-        static_inputs = _clone_static_graph_inputs(model_inputs)
+        static_inputs = (
+            _clone_static_graph_inputs(model_inputs)
+            if static_input_arena is None
+            else static_input_arena
+        )
+        if not isinstance(static_inputs, dict):
+            raise TypeError("K8 static-input arena must be a dict")
         model_graph = torch.cuda.CUDAGraph(keep_graph=True)
         with torch.cuda.graph(model_graph):
             with active_prefix_self_attention_context(active_prefix_length):
@@ -1014,7 +1089,15 @@ def k8_active_prefix_decode_generate(
     lifecycle = _ACTIVE_K8_LIFECYCLE
     block_size = _ACTIVE_BLOCK_SIZE
     graph_remainders = _ACTIVE_GRAPH_REMAINDERS
-    if lifecycle is None or block_size is None or graph_remainders is None:
+    shared_static_input_arena = _ACTIVE_SHARED_STATIC_INPUT_ARENA
+    transition_timing = _ACTIVE_TRANSITION_TIMING
+    if (
+        lifecycle is None
+        or block_size is None
+        or graph_remainders is None
+        or shared_static_input_arena is None
+        or transition_timing is None
+    ):
         raise RuntimeError("K8 decode must run inside install_k8_candidate()")
     pad_token_id = int(generation_config._pad_token_tensor.reshape(-1)[0].item())
     _, cur_len = input_ids.shape
@@ -1110,12 +1193,44 @@ def k8_active_prefix_decode_generate(
         "processor_signature_setup_seconds": processor_signature_seconds,
         "parent_backend": "cuda_python_child_graphs",
         "capture_state_restore_synchronized": True,
+        "shared_static_input_arena": shared_static_input_arena,
+        "static_input_arena_refreshes": 0,
+        "static_input_arena_refresh_copy_calls": 0,
+        "static_input_arena_refresh_copy_bytes": 0,
+        "static_input_arena_graph_entries": 0,
     }
+    if transition_timing:
+        stats["transition_timing"] = {
+            "schema_version": 1,
+            "enabled": True,
+            "model_wall_seconds": 0.0,
+            "accounted_wall_seconds": 0.0,
+            "unattributed_wall_seconds": 0.0,
+            "reconciliation_error_fraction": 0.0,
+            "stages": {
+                name: {"calls": 0, "wall_seconds": 0.0}
+                for name in _TRANSITION_STAGES
+            },
+            "device": {
+                "static_input_copies": {"calls": 0, "seconds": 0.0},
+                "graph_replay": {"calls": 0, "seconds": 0.0},
+            },
+        }
     stable_encoder_holder["__k8_latest_stats__"] = stats
 
     is_prefill = True
     finished = False
     scores = None
+    copy_events = (
+        (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+        if transition_timing
+        else None
+    )
+    replay_events = (
+        (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+        if transition_timing
+        else None
+    )
     while not finished:
         if is_prefill:
             active_ids = state.sequence[:, :cur_len]
@@ -1196,13 +1311,66 @@ def k8_active_prefix_decode_generate(
             del outputs
             continue
 
+        model_wall_started = time.perf_counter()
         prefix = _bucketed_prefix_length(
             cur_len, active_prefix_bucket_size, max_length
         )
-        active_ids = state.sequence[:, :cur_len]
-        model_inputs = model.prepare_inputs_for_generation(
-            active_ids, **model_kwargs
+        timing_stats = stats.get("transition_timing")
+        local_stage_wall = {name: 0.0 for name in _TRANSITION_STAGES}
+        local_stage_calls = {name: 0 for name in _TRANSITION_STAGES}
+        copy_events_recorded = False
+
+        def record_stage(name: str, started: float) -> None:
+            if timing_stats is None:
+                return
+            local_stage_calls[name] += 1
+            local_stage_wall[name] += time.perf_counter() - started
+
+        prepare_started = time.perf_counter()
+        arena = slot.static_input_arena
+        first_arena_use_this_window = (
+            shared_static_input_arena
+            and (
+                arena is None
+                or arena.refreshed_window_identity != window_identity
+            )
         )
+        if not shared_static_input_arena or first_arena_use_this_window:
+            active_ids = state.sequence[:, :cur_len]
+            model_inputs = model.prepare_inputs_for_generation(
+                active_ids, **model_kwargs
+            )
+            record_stage("prepare_inputs_for_generation", prepare_started)
+        else:
+            if arena is None:
+                raise RuntimeError("shared static-input arena disappeared")
+            model_inputs = arena.static_inputs
+
+        refresh_started = time.perf_counter()
+        if first_arena_use_this_window:
+            if copy_events is not None:
+                copy_events[0].record()
+            copy_calls, copy_bytes = _tensor_copy_size(model_inputs)
+            if arena is None:
+                arena = _StaticInputArena.create(
+                    model_inputs,
+                    window_identity=window_identity,
+                )
+                slot.static_input_arena = arena
+            else:
+                arena.refresh(model_inputs, window_identity=window_identity)
+            stats["static_input_arena_refreshes"] += 1
+            stats["static_input_arena_refresh_copy_calls"] += copy_calls
+            stats["static_input_arena_refresh_copy_bytes"] += copy_bytes
+            stats["copy_calls"] += copy_calls
+            stats["copy_bytes"] += copy_bytes
+            model_inputs = arena.static_inputs
+            if copy_events is not None:
+                copy_events[1].record()
+                copy_events_recorded = True
+            record_stage("static_input_refresh", refresh_started)
+
+        key_started = time.perf_counter()
         key = (
             "k8_candidate",
             block_size,
@@ -1210,19 +1378,21 @@ def k8_active_prefix_decode_generate(
             id(state),
             prefix,
             do_sample,
-            tuple(
-                (name, tuple(value.shape), str(value.dtype), str(value.device))
-                if isinstance(value, torch.Tensor)
-                else (name, type(value).__name__, id(value))
-                for name, value in sorted(model_inputs.items())
+            (
+                arena.signature
+                if shared_static_input_arena and arena is not None
+                else _static_input_signature(model_inputs)
             ),
         )
         raw_entry = graph_cache.get(key)
+        steady_state_replay = raw_entry is not None
+        record_stage("graph_key_lookup", key_started)
         if raw_entry is None:
-            for value in model_inputs.values():
-                if isinstance(value, torch.Tensor):
-                    stats["copy_calls"] += 1
-                    stats["copy_bytes"] += value.numel() * value.element_size()
+            if not shared_static_input_arena:
+                for value in model_inputs.values():
+                    if isinstance(value, torch.Tensor):
+                        stats["copy_calls"] += 1
+                        stats["copy_bytes"] += value.numel() * value.element_size()
             entry = _capture_k8_entry(
                 model,
                 model_inputs,
@@ -1232,6 +1402,11 @@ def k8_active_prefix_decode_generate(
                 do_sample=do_sample,
                 block_size=block_size,
                 graph_remainders=graph_remainders,
+                static_input_arena=(
+                    arena.static_inputs
+                    if shared_static_input_arena and arena is not None
+                    else None
+                ),
             )
             try:
                 lifecycle.register(entry.parent)
@@ -1251,6 +1426,8 @@ def k8_active_prefix_decode_generate(
                 "k8_stats": stats,
             }
             graph_cache[key] = raw_entry
+            if shared_static_input_arena:
+                stats["static_input_arena_graph_entries"] += 1
             stats["capture_seconds"] += entry.capture_seconds
             stats["peak_vram_bytes"] = max(
                 stats["peak_vram_bytes"], entry.peak_vram_bytes
@@ -1260,21 +1437,32 @@ def k8_active_prefix_decode_generate(
             raw_entry["k8_stats"] = stats
             if entry.state is not state or entry.processor is not processor:
                 raise RuntimeError("K8 graph resolved the wrong persistent state")
-            for name, static_value in entry.static_inputs.items():
-                if not isinstance(static_value, torch.Tensor):
-                    continue
-                current = model_inputs.get(name)
-                if not isinstance(current, torch.Tensor):
-                    raise RuntimeError(f"K8 model input {name} stopped being a tensor")
-                if (
-                    current.shape != static_value.shape
-                    or current.dtype != static_value.dtype
-                    or current.device != static_value.device
-                ):
-                    raise RuntimeError(f"K8 model input {name} changed signature")
-                static_value.copy_(current)
-                stats["copy_calls"] += 1
-                stats["copy_bytes"] += current.numel() * current.element_size()
+            copy_started = time.perf_counter()
+            if shared_static_input_arena:
+                if arena is None or entry.static_inputs is not arena.static_inputs:
+                    raise RuntimeError("K8 graph did not retain the shared input arena")
+            else:
+                if copy_events is not None:
+                    copy_events[0].record()
+                for name, static_value in entry.static_inputs.items():
+                    if not isinstance(static_value, torch.Tensor):
+                        continue
+                    current = model_inputs.get(name)
+                    if not isinstance(current, torch.Tensor):
+                        raise RuntimeError(f"K8 model input {name} stopped being a tensor")
+                    if (
+                        current.shape != static_value.shape
+                        or current.dtype != static_value.dtype
+                        or current.device != static_value.device
+                    ):
+                        raise RuntimeError(f"K8 model input {name} changed signature")
+                    static_value.copy_(current)
+                    stats["copy_calls"] += 1
+                    stats["copy_bytes"] += current.numel() * current.element_size()
+                if copy_events is not None:
+                    copy_events[1].record()
+                    copy_events_recorded = True
+                record_stage("static_input_copies", copy_started)
         replay_steps = block_size if block_eligible else 1
         if block_eligible:
             stats["eligible_steps"] += block_size
@@ -1290,20 +1478,52 @@ def k8_active_prefix_decode_generate(
             stats["remainder_graph_replays"] += 1
             replay_range = "generation.k1_remainder_graph_replay"
         with profile_range(replay_range):
+            replay_started = time.perf_counter()
+            if replay_events is not None:
+                replay_events[0].record()
             parent.replay()
+            if replay_events is not None:
+                replay_events[1].record()
+            record_stage("graph_replay", replay_started)
         raw_entry["decode_replays"] += replay_steps
         stats["status_reads"] += 1
+        status_started = time.perf_counter()
         status = torch.stack((
             state.physical_length[0],
             state.logical_length[0],
             state.unfinished[0].to(dtype=torch.long),
         )).cpu().tolist()
+        record_stage("status_d2h", status_started)
+        if timing_stats is not None and steady_state_replay:
+            if copy_events_recorded and copy_events is not None:
+                device_copy = timing_stats["device"]["static_input_copies"]
+                device_copy["calls"] += 1
+                device_copy["seconds"] += copy_events[0].elapsed_time(
+                    copy_events[1]
+                ) / 1_000.0
+            if replay_events is None:
+                raise RuntimeError("transition replay timing events disappeared")
+            device_replay = timing_stats["device"]["graph_replay"]
+            device_replay["calls"] += 1
+            device_replay["seconds"] += replay_events[0].elapsed_time(
+                replay_events[1]
+            ) / 1_000.0
         physical_length, logical_length = (int(status[0]), int(status[1]))
         unfinished = bool(status[2])
         stats["wasted_steps"] += max(0, physical_length - logical_length)
         cur_len = physical_length if unfinished else logical_length
-        _sync_model_kwargs_after_k8(model_kwargs, entry, cur_len=cur_len)
+        sync_started = time.perf_counter()
+        if not shared_static_input_arena:
+            _sync_model_kwargs_after_k8(model_kwargs, entry, cur_len=cur_len)
+            record_stage("sync_model_kwargs", sync_started)
         finished = not unfinished
+        if timing_stats is not None and steady_state_replay:
+            model_wall = time.perf_counter() - model_wall_started
+            timing_stats["model_wall_seconds"] += model_wall
+            for name in _TRANSITION_STAGES:
+                stage = timing_stats["stages"][name]
+                stage["calls"] += local_stage_calls[name]
+                stage["wall_seconds"] += local_stage_wall[name]
 
     stats["logical_steps"] = cur_len - prompt_length
     stats["physical_steps"] = stats["logical_steps"] + stats["wasted_steps"]
@@ -1316,6 +1536,23 @@ def k8_active_prefix_decode_generate(
     )
     if stats["physical_steps"] != accounted_steps:
         raise RuntimeError("K8 prefill/eligible/remainder work accounting diverged")
+    if shared_static_input_arena and stats["static_input_arena_refreshes"] != 1:
+        raise RuntimeError("shared static-input arena requires one refresh per window")
+    if transition_timing:
+        timing_stats = stats["transition_timing"]
+        accounted = sum(
+            float(stage["wall_seconds"])
+            for stage in timing_stats["stages"].values()
+        )
+        model_wall = float(timing_stats["model_wall_seconds"])
+        unattributed = model_wall - accounted
+        timing_stats["accounted_wall_seconds"] = accounted
+        timing_stats["unattributed_wall_seconds"] = unattributed
+        timing_stats["reconciliation_error_fraction"] = (
+            abs(unattributed) / model_wall
+            if model_wall > 0.0
+            else 0.0
+        )
     return state.sequence[:, :cur_len]
 
 
@@ -1324,19 +1561,30 @@ def install_k8_candidate(
     *,
     block_size: int = K8_BLOCK_SIZE,
     graph_remainders: bool = False,
+    shared_static_input_arena: bool = False,
+    transition_timing: bool = False,
 ) -> Iterator[None]:
     """Temporarily install a bounded block candidate for an explicit runner."""
 
     global _ACTIVE_BLOCK_SIZE, _ACTIVE_GRAPH_REMAINDERS, _ACTIVE_K8_LIFECYCLE
+    global _ACTIVE_SHARED_STATIC_INPUT_ARENA, _ACTIVE_TRANSITION_TIMING
     from . import engine
 
     block_size = _validate_block_size(block_size)
     if not isinstance(graph_remainders, bool):
         raise TypeError("graph_remainders must be a bool")
+    if not isinstance(shared_static_input_arena, bool):
+        raise TypeError("shared_static_input_arena must be a bool")
+    if not isinstance(transition_timing, bool):
+        raise TypeError("transition_timing must be a bool")
+    if shared_static_input_arena and not graph_remainders:
+        raise ValueError("shared static-input arena requires graphed remainders")
     if (
         _ACTIVE_K8_LIFECYCLE is not None
         or _ACTIVE_BLOCK_SIZE is not None
         or _ACTIVE_GRAPH_REMAINDERS is not None
+        or _ACTIVE_SHARED_STATIC_INPUT_ARENA is not None
+        or _ACTIVE_TRANSITION_TIMING is not None
     ):
         raise RuntimeError("K8 candidate context cannot be nested")
     lifecycle = _K8GraphLifecycle()
@@ -1344,6 +1592,8 @@ def install_k8_candidate(
     _ACTIVE_K8_LIFECYCLE = lifecycle
     _ACTIVE_BLOCK_SIZE = block_size
     _ACTIVE_GRAPH_REMAINDERS = graph_remainders
+    _ACTIVE_SHARED_STATIC_INPUT_ARENA = shared_static_input_arena
+    _ACTIVE_TRANSITION_TIMING = transition_timing
     engine.active_prefix_decode_generate = k8_active_prefix_decode_generate
     try:
         yield
@@ -1355,6 +1605,8 @@ def install_k8_candidate(
             _ACTIVE_K8_LIFECYCLE = None
             _ACTIVE_BLOCK_SIZE = None
             _ACTIVE_GRAPH_REMAINDERS = None
+            _ACTIVE_SHARED_STATIC_INPUT_ARENA = None
+            _ACTIVE_TRANSITION_TIMING = None
 
 
 __all__ = [
