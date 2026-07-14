@@ -145,6 +145,65 @@ def test_combined_runner_restores_loader_and_context_on_failure(monkeypatch) -> 
     assert events == ["k4-enter", "k4-exit"]
 
 
+def test_combined_runner_enables_k1_remainder_graphs_only_when_requested(
+    monkeypatch, tmp_path
+) -> None:
+    import inference
+
+    original_loader = inference.load_model_with_engine
+    calls = []
+
+    class _Stats:
+        def as_dict(self):
+            return {
+                "module_count": 12,
+                "group_count": 1,
+                "forwards": 1,
+                "computes": 1,
+                "expected_computes": 1,
+                "reuses": 11,
+                "expected_reuses": 11,
+            }
+
+    @contextmanager
+    def fake_rope(model, *, stats):
+        yield stats
+
+    @contextmanager
+    def fake_k4(**options):
+        calls.append(options)
+        yield
+
+    def fake_loader(*args, **kwargs):
+        return SimpleNamespace(raw_model=object()), object()
+
+    def fake_weight(config_name, overrides, output_init_json):
+        inference.load_model_with_engine("main")
+        inference.load_model_with_engine("timing")
+        output_init_json.write_text(
+            json.dumps(
+                {"result_class": "documented-drift", "exactness_claim": False}
+            ),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(inference, "load_model_with_engine", fake_loader)
+    monkeypatch.setattr(combined, "shared_decoder_rope_context", fake_rope)
+    monkeypatch.setattr(combined, "install_k8_candidate", fake_k4)
+    monkeypatch.setattr(combined, "run_weight_only", fake_weight)
+    monkeypatch.setattr(combined, "SharedRopeStats", _Stats)
+
+    combined.run(
+        "profile_salvalai",
+        ["seed=12345"],
+        tmp_path / "candidate.json",
+        graph_remainders=True,
+    )
+
+    assert calls == [{"block_size": 4, "graph_remainders": True}]
+    monkeypatch.setattr(inference, "load_model_with_engine", original_loader)
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     (

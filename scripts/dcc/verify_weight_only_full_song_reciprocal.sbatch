@@ -27,6 +27,7 @@ CANDIDATE_RUNNER=${CANDIDATE_RUNNER:-utils/run_approximate_weight_only.py}
 REQUIRE_EXACT_TIMING=${REQUIRE_EXACT_TIMING:-true}
 REQUIRE_K4_CANDIDATE=${REQUIRE_K4_CANDIDATE:-false}
 REQUIRE_SHARED_ROPE_INCREMENTAL=${REQUIRE_SHARED_ROPE_INCREMENTAL:-false}
+REQUIRE_K1_REMAINDER_INCREMENTAL=${REQUIRE_K1_REMAINDER_INCREMENTAL:-false}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_LABEL=${RUN_LABEL:-split-weight-full-song-reciprocal}
 RUN_ROOT="$WORK/runs/$RUN_LABEL-${SLURM_JOB_ID:-manual}"
@@ -85,7 +86,32 @@ if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" != true \
   echo "REQUIRE_SHARED_ROPE_INCREMENTAL must be true or false" >&2
   exit 2
 fi
-if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" != true \
+  && "$REQUIRE_K1_REMAINDER_INCREMENTAL" != false ]]; then
+  echo "REQUIRE_K1_REMAINDER_INCREMENTAL must be true or false" >&2
+  exit 2
+fi
+if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
+  && "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true ]]; then
+  echo "shared-RoPE and K1-remainder incremental gates are mutually exclusive" >&2
+  exit 2
+fi
+if [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true ]]; then
+  if [[ "$REQUIRE_K4_CANDIDATE" != true || "$REQUIRE_EXACT_TIMING" != true ]]; then
+    echo "K1-remainder gate requires K4 and exact timing" >&2
+    exit 2
+  fi
+  if [[ "$BASELINE_RUNNER" \
+    != utils/run_k4_shared_rope_approximate_weight_only.py ]]; then
+    echo "K1-remainder gate requires the exact shared-RoPE K4 control" >&2
+    exit 2
+  fi
+  if [[ "$CANDIDATE_RUNNER" \
+    != utils/run_k4_shared_rope_k1_remainder.py ]]; then
+    echo "K1-remainder gate requires the captured-remainder runner" >&2
+    exit 2
+  fi
+elif [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
   if [[ "$REQUIRE_K4_CANDIDATE" != true ]]; then
     echo "shared-RoPE incremental gate requires K4 contract validation" >&2
     exit 2
@@ -276,6 +302,7 @@ echo "candidate_runner=$CANDIDATE_RUNNER"
 echo "require_exact_timing=$REQUIRE_EXACT_TIMING"
 echo "require_k4_candidate=$REQUIRE_K4_CANDIDATE"
 echo "require_shared_rope_incremental=$REQUIRE_SHARED_ROPE_INCREMENTAL"
+echo "require_k1_remainder_incremental=$REQUIRE_K1_REMAINDER_INCREMENTAL"
 echo "audio=$AUDIO"
 echo "run_root=$RUN_ROOT"
 echo "extension_cache_mode=$EXTENSION_CACHE_MODE"
@@ -484,6 +511,19 @@ run_profile() {
       --block-size 4 \
       > "$RUN_ROOT/$role.k4-validation.json"
   )
+  if [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true ]]; then
+    local remainder_role=control
+    if [[ "$candidate" == 1 ]]; then
+      remainder_role=candidate
+    fi
+    (
+      cd "$CANDIDATE_REPO"
+      "$PYTHON" utils/validate_k1_remainder_profile.py \
+        --profile "$profile" \
+        --role "$remainder_role" \
+        > "$RUN_ROOT/$role.k1-remainder-validation.json"
+    )
+  fi
   (
     cd "$CANDIDATE_REPO"
     "$PYTHON" - "$profile" "$role" <<'PY'
@@ -594,11 +634,13 @@ summary = {
 PY
 
 INITIALIZATION_ROLES=candidate_first,candidate_second
-if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
+  || "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true ]]; then
   INITIALIZATION_ROLES=baseline_first,candidate_first,candidate_second,baseline_second
 fi
 "$PYTHON" - "$RUN_ROOT" "$INITIALIZATION_ROLES" \
-  "$REQUIRE_SHARED_ROPE_INCREMENTAL" <<'PY'
+  "$REQUIRE_SHARED_ROPE_INCREMENTAL" \
+  "$REQUIRE_K1_REMAINDER_INCREMENTAL" <<'PY'
 import json
 import math
 import statistics
@@ -608,6 +650,7 @@ from pathlib import Path
 root = Path(sys.argv[1])
 roles = tuple(sys.argv[2].split(","))
 require_shared_rope = sys.argv[3] == "true"
+shared_rope_both_arms = sys.argv[4] == "true"
 runs = {}
 required_numbers = (
     "initialization_wall_seconds",
@@ -652,8 +695,12 @@ for role in roles:
             raise SystemExit(f"{role}: invalid initialization memory field {key}")
     runs[role] = payload
 
-if require_shared_rope:
-    for role in ("candidate_first", "candidate_second"):
+if require_shared_rope or shared_rope_both_arms:
+    shared_roles = roles if shared_rope_both_arms else (
+        "candidate_first",
+        "candidate_second",
+    )
+    for role in shared_roles:
         shared = runs[role].get("shared_rope")
         if not isinstance(shared, dict):
             raise SystemExit(f"{role}: missing shared-RoPE evidence")
@@ -670,9 +717,12 @@ if require_shared_rope:
             raise SystemExit(f"{role}: shared-RoPE compute accounting failed")
         if stats.get("reuses") != stats.get("expected_reuses"):
             raise SystemExit(f"{role}: shared-RoPE reuse accounting failed")
-    for role in ("baseline_first", "baseline_second"):
-        if "shared_rope" in runs[role] or "combined_runtime" in runs[role]:
-            raise SystemExit(f"{role}: combined control unexpectedly enabled shared RoPE")
+    if not shared_rope_both_arms:
+        for role in ("baseline_first", "baseline_second"):
+            if "shared_rope" in runs[role] or "combined_runtime" in runs[role]:
+                raise SystemExit(
+                    f"{role}: combined control unexpectedly enabled shared RoPE"
+                )
 
 summary = {
     "schema_version": 1,
@@ -704,7 +754,15 @@ ANALYSIS_DISPATCH_ARGS=(
   --allow-optional-dispatch-delta
     'records.main_generation[[]*].optimized_cuda_graphs.*'
 )
-if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true ]]; then
+  ANALYSIS_EXACT_ARGS=(
+    --require-exact-label timing_context
+    --require-exact-label main_generation
+  )
+  ANALYSIS_DISPATCH_ARGS=(
+    --allow-dispatch-delta 'records.*[[]*].optimized_cuda_graphs.*'
+  )
+elif [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
   # Both arms retain the documented-drift mixed-weight runtime. Require an
   # exact incremental shared-RoPE delta without relabeling the overall runtime.
   ANALYSIS_MODE=relaxed
@@ -769,6 +827,15 @@ for artifact in \
     exit 2
   fi
 done
+if [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true ]]; then
+  for role in baseline_first candidate_first candidate_second baseline_second; do
+    artifact="$RUN_ROOT/$role.k1-remainder-validation.json"
+    if [[ ! -s "$artifact" ]]; then
+      echo "missing required K1-remainder artifact: $artifact" >&2
+      exit 2
+    fi
+  done
+fi
 if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
   for artifact in \
     "$RUN_ROOT/candidate-initialization/baseline_first.json" \
@@ -782,23 +849,29 @@ fi
 
 grep -q "^mode=$ANALYSIS_MODE$" "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q "^parity.claim=$ANALYSIS_CLAIM$" "$RUN_ROOT/reciprocal-analysis.txt"
-if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
+  || "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true ]]; then
   grep -q '^parity.cross_candidate_exact=true$' \
     "$RUN_ROOT/reciprocal-analysis.txt"
 fi
 grep -q '^parity.baseline_repeat_stable=true$' "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^parity.candidate_repeat_stable=true$' "$RUN_ROOT/reciprocal-analysis.txt"
 EXPECTED_EXACT_LABELS=none
+EXPECTED_EXACT_DISPATCH_LABELS=none
 if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
+  EXPECTED_EXACT_LABELS=timing_context,main_generation
+  EXPECTED_EXACT_DISPATCH_LABELS=$EXPECTED_EXACT_LABELS
+elif [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true ]]; then
   EXPECTED_EXACT_LABELS=timing_context,main_generation
 elif [[ "$REQUIRE_EXACT_TIMING" == true ]]; then
   EXPECTED_EXACT_LABELS=timing_context
+  EXPECTED_EXACT_DISPATCH_LABELS=$EXPECTED_EXACT_LABELS
 fi
 grep -q "^parity.required_exact_labels=$EXPECTED_EXACT_LABELS$" \
   "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^parity.required_exact_labels_pass=true$' \
   "$RUN_ROOT/reciprocal-analysis.txt"
-grep -q "^parity.required_exact_dispatch_labels=$EXPECTED_EXACT_LABELS$" \
+grep -q "^parity.required_exact_dispatch_labels=$EXPECTED_EXACT_DISPATCH_LABELS$" \
   "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^parity.required_exact_dispatch_labels_pass=true$' \
   "$RUN_ROOT/reciprocal-analysis.txt"

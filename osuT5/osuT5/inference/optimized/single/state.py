@@ -156,6 +156,13 @@ class ProductionDecodeSession:
                 "eligible_steps": int(latest.get("eligible_steps", 0)),
                 "block_replays": int(latest.get("block_replays", 0)),
                 "remainder_steps": int(latest.get("remainder_steps", 0)),
+                "remainder_backend": latest.get("remainder_backend", "eager"),
+                "remainder_graph_replays": int(
+                    latest.get("remainder_graph_replays", 0)
+                ),
+                "eager_remainder_steps": int(
+                    latest.get("eager_remainder_steps", 0)
+                ),
                 "status_reads": int(latest.get("status_reads", 0)),
                 "copy_calls": int(latest.get("copy_calls", 0)),
                 "copy_bytes": int(latest.get("copy_bytes", 0)),

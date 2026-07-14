@@ -69,7 +69,13 @@ def _enrich_initialization_evidence(
     )
 
 
-def run(config_name: str, overrides: list[str], output_init_json: Path) -> None:
+def run(
+    config_name: str,
+    overrides: list[str],
+    output_init_json: Path,
+    *,
+    graph_remainders: bool = False,
+) -> None:
     """Install every candidate while sharing RoPE only on the main model.
 
     ``inference.main`` loads the main binding before its separate timing binding.
@@ -97,7 +103,10 @@ def run(config_name: str, overrides: list[str], output_init_json: Path) -> None:
 
     inference.load_model_with_engine = shared_rope_loader
     try:
-        with install_k8_candidate(block_size=4):
+        install_options = {"block_size": 4}
+        if graph_remainders:
+            install_options["graph_remainders"] = True
+        with install_k8_candidate(**install_options):
             run_weight_only(config_name, overrides, output_init_json)
         if loaded_bindings < 2:
             raise RuntimeError(

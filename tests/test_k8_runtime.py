@@ -508,6 +508,62 @@ def test_capture_uses_state_device_guard_and_closes_parent_on_late_failure(
     assert device_guards[0] == torch.device("cuda", 2)
 
 
+def test_capture_builds_distinct_k4_and_k1_remainder_parents(monkeypatch):
+    @contextmanager
+    def device_guard(device):
+        yield
+
+    class Graph:
+        def __init__(self, keep_graph=False):
+            self.keep_graph = keep_graph
+
+    parents = []
+
+    class Parent:
+        def __init__(self, block_size):
+            self.block_size = block_size
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    def build(*args, block_size, **kwargs):
+        parent = Parent(block_size)
+        parents.append(parent)
+        return parent
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device", device_guard)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", Graph)
+    monkeypatch.setattr(torch.cuda, "graph", lambda graph: device_guard("cuda:0"))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda device: 0)
+    monkeypatch.setattr(k8_runtime, "_clone_static_graph_inputs", lambda values: values)
+    monkeypatch.setattr(k8_runtime, "_snapshot_tensors", lambda *args: [])
+    monkeypatch.setattr(k8_runtime, "_one_step_tail", lambda **kwargs: None)
+    monkeypatch.setattr(_ChildGraphSequence, "build", build)
+    state = SimpleNamespace(
+        sequence=SimpleNamespace(device=torch.device("cuda", 0))
+    )
+    model = lambda **kwargs: SimpleNamespace(logits=torch.zeros((1, 1, 4)))
+
+    entry = _capture_k8_entry(
+        model,
+        {},
+        active_prefix_length=128,
+        state=state,
+        processor=object(),
+        do_sample=True,
+        block_size=4,
+        graph_remainders=True,
+    )
+
+    assert [parent.block_size for parent in parents] == [4, 1]
+    assert entry.parent is parents[0]
+    assert entry.remainder_parent is parents[1]
+
+
 def test_k8_lifecycle_closes_graphs_at_session_transition_and_context_exit():
     class Graph:
         def __init__(self):
@@ -527,6 +583,7 @@ def test_k8_lifecycle_closes_graphs_at_session_transition_and_context_exit():
         lifecycle = k8_runtime._ACTIVE_K8_LIFECYCLE
         assert isinstance(lifecycle, _K8GraphLifecycle)
         assert k8_runtime._ACTIVE_BLOCK_SIZE == 4
+        assert k8_runtime._ACTIVE_GRAPH_REMAINDERS is False
         lifecycle.activate(first_cache)
         lifecycle.register(first)
         lifecycle.activate(first_cache)
@@ -539,6 +596,7 @@ def test_k8_lifecycle_closes_graphs_at_session_transition_and_context_exit():
     assert second.close_calls == 1
     assert k8_runtime._ACTIVE_K8_LIFECYCLE is None
     assert k8_runtime._ACTIVE_BLOCK_SIZE is None
+    assert k8_runtime._ACTIVE_GRAPH_REMAINDERS is None
 
 
 def test_opt_in_install_restores_default_even_on_exception(monkeypatch):
@@ -554,6 +612,7 @@ def test_opt_in_install_restores_default_even_on_exception(monkeypatch):
             raise RuntimeError("boom")
     assert engine.active_prefix_decode_generate is default
     assert k8_runtime._ACTIVE_BLOCK_SIZE is None
+    assert k8_runtime._ACTIVE_GRAPH_REMAINDERS is None
 
 
 @pytest.mark.parametrize("block_size", (0, 2, 3, 5, 16))
@@ -580,6 +639,9 @@ def test_session_reports_latest_k8_window_independent_of_graph_entries():
         "eligible_steps": 16,
         "block_replays": 2,
         "remainder_steps": 3,
+        "remainder_backend": "eager",
+        "remainder_graph_replays": 0,
+        "eager_remainder_steps": 3,
         "status_reads": 5,
         "copy_calls": 4,
         "copy_bytes": 64,
@@ -621,6 +683,9 @@ def test_session_reports_latest_k8_window_independent_of_graph_entries():
         "eligible_steps": 16,
         "block_replays": 2,
         "remainder_steps": 3,
+        "remainder_backend": "eager",
+        "remainder_graph_replays": 0,
+        "eager_remainder_steps": 3,
         "status_reads": 5,
         "copy_calls": 4,
         "copy_bytes": 64,
@@ -679,6 +744,18 @@ def test_k1_only_latest_window_does_not_report_stale_k8_graph_stats():
     assert report["block_replays"] == 0
     assert report["remainder_steps"] == 3
     assert report["physical_steps"] == report["logical_steps"] == 4
+
+
+def test_install_exposes_and_restores_graph_remainder_policy():
+    with install_k8_candidate(block_size=4, graph_remainders=True):
+        assert k8_runtime._ACTIVE_GRAPH_REMAINDERS is True
+    assert k8_runtime._ACTIVE_GRAPH_REMAINDERS is None
+
+
+def test_install_rejects_non_boolean_graph_remainder_policy():
+    with pytest.raises(TypeError, match="graph_remainders must be a bool"):
+        with install_k8_candidate(block_size=4, graph_remainders=1):
+            pass
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")

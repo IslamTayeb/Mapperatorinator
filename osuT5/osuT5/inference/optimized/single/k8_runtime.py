@@ -649,11 +649,13 @@ class _K8GraphLifecycle:
 
 _ACTIVE_K8_LIFECYCLE: _K8GraphLifecycle | None = None
 _ACTIVE_BLOCK_SIZE: int | None = None
+_ACTIVE_GRAPH_REMAINDERS: bool | None = None
 
 
 @dataclass(slots=True)
 class _K8GraphEntry:
     parent: _ChildGraphSequence
+    remainder_parent: _ChildGraphSequence | None
     static_inputs: dict[str, Any]
     state: K8DeviceState
     processor: K8LogitsProcessor
@@ -837,6 +839,7 @@ def _capture_k8_entry(
     processor: K8LogitsProcessor,
     do_sample: bool,
     block_size: int = K8_BLOCK_SIZE,
+    graph_remainders: bool = False,
 ) -> _K8GraphEntry:
     if not torch.cuda.is_available():
         raise RuntimeError("K8 graph capture requires CUDA")
@@ -866,10 +869,19 @@ def _capture_k8_entry(
             block_size=block_size,
             device=device,
         )
+        remainder_parent = None
         try:
+            if graph_remainders:
+                remainder_parent = _ChildGraphSequence.build(
+                    model_graph,
+                    tail_graph,
+                    block_size=1,
+                    device=device,
+                )
             torch.cuda.synchronize(device)
             return _K8GraphEntry(
                 parent=parent,
+                remainder_parent=remainder_parent,
                 static_inputs=static_inputs,
                 state=state,
                 processor=processor,
@@ -878,6 +890,8 @@ def _capture_k8_entry(
                 peak_vram_bytes=torch.cuda.max_memory_allocated(device),
             )
         except Exception:
+            if remainder_parent is not None:
+                remainder_parent.close()
             parent.close()
             raise
 
@@ -999,7 +1013,8 @@ def k8_active_prefix_decode_generate(
         raise ValueError("K8 supports tensor outputs only")
     lifecycle = _ACTIVE_K8_LIFECYCLE
     block_size = _ACTIVE_BLOCK_SIZE
-    if lifecycle is None or block_size is None:
+    graph_remainders = _ACTIVE_GRAPH_REMAINDERS
+    if lifecycle is None or block_size is None or graph_remainders is None:
         raise RuntimeError("K8 decode must run inside install_k8_candidate()")
     pad_token_id = int(generation_config._pad_token_tensor.reshape(-1)[0].item())
     _, cur_len = input_ids.shape
@@ -1069,6 +1084,9 @@ def k8_active_prefix_decode_generate(
         "eligible_steps": 0,
         "block_replays": 0,
         "remainder_steps": 0,
+        "remainder_backend": "cuda_graph" if graph_remainders else "eager",
+        "remainder_graph_replays": 0,
+        "eager_remainder_steps": 0,
         "status_reads": 0,
         "copy_calls": 0,
         "copy_bytes": 0,
@@ -1099,28 +1117,59 @@ def k8_active_prefix_decode_generate(
     finished = False
     scores = None
     while not finished:
-        if is_prefill or not _k8_eligible(
-            cur_len,
-            max_length,
-            active_prefix_bucket_size,
-            block_size,
-        ):
+        if is_prefill:
             active_ids = state.sequence[:, :cur_len]
             model_inputs = model.prepare_inputs_for_generation(
                 active_ids, **model_kwargs
             )
-            if is_prefill:
-                with profile_range("generation.encoder_prefill"):
-                    outputs = model(**model_inputs, return_dict=True)
-                is_prefill = False
-                stats["prefill_steps"] += 1
-            else:
-                prefix = _bucketed_prefix_length(
-                    cur_len, active_prefix_bucket_size, max_length
-                )
-                with active_prefix_self_attention_context(prefix):
-                    outputs = model(**model_inputs, return_dict=True)
-                stats["remainder_steps"] += 1
+            with profile_range("generation.encoder_prefill"):
+                outputs = model(**model_inputs, return_dict=True)
+            is_prefill = False
+            stats["prefill_steps"] += 1
+            model_kwargs = model._update_model_kwargs_for_generation(
+                outputs,
+                model_kwargs,
+                is_encoder_decoder=model.config.is_encoder_decoder,
+            )
+            if stable_encoder_holder is not None:
+                encoder_outputs = model_kwargs.get("encoder_outputs")
+                if encoder_outputs is not None:
+                    model_kwargs["encoder_outputs"] = _stable_encoder_outputs(
+                        stable_encoder_holder, encoder_outputs
+                    )
+            scores_step = processor(outputs.logits[:, -1, :])
+            token = (
+                _sample_counter(scores_step, state)
+                if do_sample
+                else torch.argmax(scores_step, dim=-1)
+            )
+            active = state.append(token)
+            processor.observe(active)
+            stats["status_reads"] += 1
+            unfinished = bool(state.unfinished.item())
+            cur_len += 1
+            finished = not unfinished
+            del outputs
+            continue
+
+        block_eligible = _k8_eligible(
+            cur_len,
+            max_length,
+            active_prefix_bucket_size,
+            block_size,
+        )
+        if not block_eligible and not graph_remainders:
+            active_ids = state.sequence[:, :cur_len]
+            model_inputs = model.prepare_inputs_for_generation(
+                active_ids, **model_kwargs
+            )
+            prefix = _bucketed_prefix_length(
+                cur_len, active_prefix_bucket_size, max_length
+            )
+            with active_prefix_self_attention_context(prefix):
+                outputs = model(**model_inputs, return_dict=True)
+            stats["remainder_steps"] += 1
+            stats["eager_remainder_steps"] += 1
             model_kwargs = model._update_model_kwargs_for_generation(
                 outputs,
                 model_kwargs,
@@ -1154,12 +1203,20 @@ def k8_active_prefix_decode_generate(
         model_inputs = model.prepare_inputs_for_generation(
             active_ids, **model_kwargs
         )
-        key = ("k8_candidate", block_size, id(state), prefix, do_sample, tuple(
-            (name, tuple(value.shape), str(value.dtype), str(value.device))
-            if isinstance(value, torch.Tensor)
-            else (name, type(value).__name__, id(value))
-            for name, value in sorted(model_inputs.items())
-        ))
+        key = (
+            "k8_candidate",
+            block_size,
+            graph_remainders,
+            id(state),
+            prefix,
+            do_sample,
+            tuple(
+                (name, tuple(value.shape), str(value.dtype), str(value.device))
+                if isinstance(value, torch.Tensor)
+                else (name, type(value).__name__, id(value))
+                for name, value in sorted(model_inputs.items())
+            ),
+        )
         raw_entry = graph_cache.get(key)
         if raw_entry is None:
             for value in model_inputs.values():
@@ -1174,10 +1231,15 @@ def k8_active_prefix_decode_generate(
                 processor=processor,
                 do_sample=do_sample,
                 block_size=block_size,
+                graph_remainders=graph_remainders,
             )
             try:
                 lifecycle.register(entry.parent)
+                if entry.remainder_parent is not None:
+                    lifecycle.register(entry.remainder_parent)
             except Exception:
+                if entry.remainder_parent is not None:
+                    entry.remainder_parent.close()
                 entry.parent.close()
                 raise
             raw_entry = {
@@ -1213,12 +1275,23 @@ def k8_active_prefix_decode_generate(
                 static_value.copy_(current)
                 stats["copy_calls"] += 1
                 stats["copy_bytes"] += current.numel() * current.element_size()
-        stats["eligible_steps"] += block_size
-        with profile_range("generation.k8_parent_graph_replay"):
-            entry.parent.replay()
-        entry.block_replays += 1
-        raw_entry["decode_replays"] += block_size
-        stats["block_replays"] += 1
+        replay_steps = block_size if block_eligible else 1
+        if block_eligible:
+            stats["eligible_steps"] += block_size
+            parent = entry.parent
+            entry.block_replays += 1
+            stats["block_replays"] += 1
+            replay_range = "generation.k8_parent_graph_replay"
+        else:
+            parent = entry.remainder_parent
+            if parent is None:
+                raise RuntimeError("K1 remainder graph was not captured")
+            stats["remainder_steps"] += 1
+            stats["remainder_graph_replays"] += 1
+            replay_range = "generation.k1_remainder_graph_replay"
+        with profile_range(replay_range):
+            parent.replay()
+        raw_entry["decode_replays"] += replay_steps
         stats["status_reads"] += 1
         status = torch.stack((
             state.physical_length[0],
@@ -1247,19 +1320,30 @@ def k8_active_prefix_decode_generate(
 
 
 @contextmanager
-def install_k8_candidate(*, block_size: int = K8_BLOCK_SIZE) -> Iterator[None]:
+def install_k8_candidate(
+    *,
+    block_size: int = K8_BLOCK_SIZE,
+    graph_remainders: bool = False,
+) -> Iterator[None]:
     """Temporarily install a bounded block candidate for an explicit runner."""
 
-    global _ACTIVE_BLOCK_SIZE, _ACTIVE_K8_LIFECYCLE
+    global _ACTIVE_BLOCK_SIZE, _ACTIVE_GRAPH_REMAINDERS, _ACTIVE_K8_LIFECYCLE
     from . import engine
 
     block_size = _validate_block_size(block_size)
-    if _ACTIVE_K8_LIFECYCLE is not None or _ACTIVE_BLOCK_SIZE is not None:
+    if not isinstance(graph_remainders, bool):
+        raise TypeError("graph_remainders must be a bool")
+    if (
+        _ACTIVE_K8_LIFECYCLE is not None
+        or _ACTIVE_BLOCK_SIZE is not None
+        or _ACTIVE_GRAPH_REMAINDERS is not None
+    ):
         raise RuntimeError("K8 candidate context cannot be nested")
     lifecycle = _K8GraphLifecycle()
     previous = engine.active_prefix_decode_generate
     _ACTIVE_K8_LIFECYCLE = lifecycle
     _ACTIVE_BLOCK_SIZE = block_size
+    _ACTIVE_GRAPH_REMAINDERS = graph_remainders
     engine.active_prefix_decode_generate = k8_active_prefix_decode_generate
     try:
         yield
@@ -1270,6 +1354,7 @@ def install_k8_candidate(*, block_size: int = K8_BLOCK_SIZE) -> Iterator[None]:
         finally:
             _ACTIVE_K8_LIFECYCLE = None
             _ACTIVE_BLOCK_SIZE = None
+            _ACTIVE_GRAPH_REMAINDERS = None
 
 
 __all__ = [
