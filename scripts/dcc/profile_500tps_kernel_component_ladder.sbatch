@@ -48,7 +48,7 @@ SHARED_ROPE_BRANCH=codex/500tps-shared-rope-scout-dcc
 SHARED_ROPE_REMOTE_BRANCH=codex/500tps-shared-rope-scout
 
 PREFILL_REPO="$ROOT/500tps-prefill-graph-scout"
-PREFILL_COMMIT=c67211b010183101de048853433e8380b02f180d
+PREFILL_COMMIT=680d4b05a4731805163463fad04a0a909a7c4d54
 PREFILL_BRANCH=codex/500tps-prefill-graph-scout-dcc
 PREFILL_REMOTE_BRANCH=codex/500tps-prefill-graph-scout
 
