@@ -771,7 +771,23 @@ ANALYSIS_DISPATCH_ARGS=(
   --allow-optional-dispatch-delta
     'records.main_generation[[]*].optimized_cuda_graphs.*'
 )
-if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then
+  # Both arms already own the same K4, split-KV, mixed-weight, and shared-RoPE
+  # topology. The only intentional dispatch delta is the INT8 MLP child counter;
+  # graph replay counts may vary because this relaxed candidate changes tokens.
+  ANALYSIS_DISPATCH_ARGS=(
+    --allow-dispatch-delta
+      'records.main_generation[[]*].optimized_dispatch_capture_hits'
+    --allow-dispatch-delta
+      'records.main_generation[[]*].optimized_dispatch_capture_hits.int8_weight_mlp_tail'
+    --allow-optional-dispatch-delta
+      'records.main_generation[[]*].optimized_cuda_graphs.*'
+  )
+  ANALYSIS_EXACT_ARGS=(
+    --require-exact-label timing_context
+    --require-exact-dispatch-label timing_context
+  )
+elif [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
   # Both arms retain the documented-drift mixed-weight runtime. Require an
   # exact incremental shared-RoPE delta without relabeling the overall runtime.
   ANALYSIS_MODE=relaxed

@@ -147,6 +147,21 @@ def test_int8_mlp_wrapper_uses_exact_combined_control_and_incremental_gate() -> 
     assert "validate_int8_mlp_full_song_profile.py" in general
     assert "INT8 MLP count must equal" not in general
     assert "INT8 MLP gate requires the shared-RoPE combined control" in general
+    int8_analysis = general.split(
+        'if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then\n'
+        "  # Both arms already own",
+        1,
+    )[1].split(
+        'elif [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then',
+        1,
+    )[0]
+    assert (
+        "records.main_generation[[]*].optimized_dispatch_capture_hits.int8_weight_mlp_tail"
+        in int8_analysis
+    )
+    assert "native_cross_mlp_tail_*" not in int8_analysis
+    assert "--require-exact-label timing_context" in int8_analysis
+    assert "--require-exact-dispatch-label timing_context" in int8_analysis
 
 
 def test_general_wrapper_requires_k4_metadata_for_every_profile() -> None:
