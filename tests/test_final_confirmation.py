@@ -1,6 +1,7 @@
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -33,7 +34,7 @@ class _Runtime:
         )
         self.calls.append((dict(generate_kwargs), steps))
         result = torch.zeros((1, prompt.shape[1] + steps), dtype=torch.long)
-        return result, {"generated_tokens": steps}
+        return result, {"generated_tokens": steps, "elapsed_seconds": 1.0}
 
 
 def _manifest() -> dict:
@@ -47,12 +48,15 @@ def test_fixed_work_runtime_replays_exact_per_window_lengths() -> None:
     runtime = _Runtime()
     wrapped = ConfirmationRuntime(runtime, mode="replay-fixed-work", manifest=_manifest())
     prompt = torch.ones((1, 5), dtype=torch.long)
+    tokenizer = SimpleNamespace(eos_id=99, context_eos={}, pad_id=0)
 
     timing, _ = wrapped.generate_window(
+        tokenizer=tokenizer,
         model_kwargs={"decoder_input_ids": prompt},
         generate_kwargs={"context_type": "timing", "max_length": 100},
     )
     main, _ = wrapped.generate_window(
+        tokenizer=tokenizer,
         model_kwargs={"decoder_input_ids": prompt},
         generate_kwargs={"context_type": "map", "max_length": 100},
     )
@@ -67,8 +71,10 @@ def test_fixed_work_runtime_replays_exact_per_window_lengths() -> None:
 
 def test_fixed_work_runtime_fails_on_extra_or_missing_windows() -> None:
     prompt = torch.ones((1, 5), dtype=torch.long)
+    tokenizer = SimpleNamespace(eos_id=99, context_eos={}, pad_id=0)
     wrapped = ConfirmationRuntime(_Runtime(), mode="replay-fixed-work", manifest=_manifest())
     wrapped.generate_window(
+        tokenizer=tokenizer,
         model_kwargs={"decoder_input_ids": prompt},
         generate_kwargs={"context_type": "timing"},
     )
@@ -76,9 +82,37 @@ def test_fixed_work_runtime_fails_on_extra_or_missing_windows() -> None:
         wrapped.validate_complete()
     with pytest.raises(RuntimeError, match="too many timing_context"):
         wrapped.generate_window(
+            tokenizer=tokenizer,
             model_kwargs={"decoder_input_ids": prompt},
             generate_kwargs={"context_type": "timing"},
         )
+
+
+def test_fixed_work_executes_target_but_returns_natural_eos_prefix() -> None:
+    class EosRuntime(_Runtime):
+        def generate_window(self, **kwargs):
+            result, stats = super().generate_window(**kwargs)
+            prompt_width = kwargs["model_kwargs"]["decoder_input_ids"].shape[1]
+            result[0, prompt_width + 1] = 99
+            return result, stats
+
+    wrapped = ConfirmationRuntime(
+        EosRuntime(),
+        mode="replay-fixed-work",
+        manifest=_manifest(),
+    )
+    prompt = torch.ones((1, 5), dtype=torch.long)
+    tokenizer = SimpleNamespace(eos_id=99, context_eos={}, pad_id=0)
+    result, stats = wrapped.generate_window(
+        tokenizer=tokenizer,
+        model_kwargs={"decoder_input_ids": prompt},
+        generate_kwargs={"context_type": "map"},
+    )
+
+    assert wrapped.records[0]["logical_steps"] == 4
+    assert wrapped.records[0]["consumer_steps"] == 2
+    assert result.shape[1] == prompt.shape[1] + 2
+    assert stats["fixed_work_logical_steps"] == 4
 
 
 def test_manifest_and_five_song_inputs_fail_loudly(tmp_path: Path) -> None:
