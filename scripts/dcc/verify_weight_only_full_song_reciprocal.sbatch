@@ -218,6 +218,8 @@ COMMON_OVERRIDES=(
   cfg_scale=1.0
   num_beams=1
   seed=12345
+  super_timing=false
+  generate_positions=false
   profile_inference=true
   profile_detail_ranges=false
   profile_cuda_capture=false
@@ -332,8 +334,9 @@ run_profile() {
         "${COMMON_OVERRIDES[@]}" \
         "${legacy_reset[@]}"
     else
-      "$PYTHON" utils/run_fixed_seed_inference.py \
+      "$PYTHON" "$CANDIDATE_REPO/utils/run_fixed_seed_inference.py" \
         --config-name "$PROFILE_CONFIG" \
+        --target-repo "$BASELINE_REPO" \
         output_path="$output" \
         "${COMMON_OVERRIDES[@]}" \
         "${legacy_reset[@]}"
@@ -354,6 +357,30 @@ run_profile() {
     exit 2
   fi
   printf '%s\n' "$profile" > "$RUN_ROOT/$role.profile-path.txt"
+  (
+    cd "$CANDIDATE_REPO"
+    "$PYTHON" - "$profile" "$role" <<'PY'
+import json
+import sys
+
+from utils.fixed_seed_inference import SEED_POLICY_VERSION, stage_seed
+
+profile_path, role = sys.argv[1:]
+metadata = json.loads(open(profile_path, encoding="utf-8").read()).get("metadata")
+if not isinstance(metadata, dict):
+    raise SystemExit(f"{role}: profile metadata is missing")
+if metadata.get("reciprocal_seed_policy") != SEED_POLICY_VERSION:
+    raise SystemExit(f"{role}: reciprocal seed policy is missing or wrong")
+for label in ("timing_context", "main_generation"):
+    expected_seed = stage_seed(12345, label)
+    if metadata.get(f"reciprocal_seed_{label}") != expected_seed:
+        raise SystemExit(f"{role}: reciprocal seed for {label} is wrong")
+    for device in ("cpu", "cuda"):
+        digest = metadata.get(f"reciprocal_rng_{device}_sha256_{label}")
+        if not isinstance(digest, str) or len(digest) != 64:
+            raise SystemExit(f"{role}: RNG fingerprint for {device}/{label} is missing")
+PY
+  )
 }
 
 preload_baseline_extensions baseline_first
