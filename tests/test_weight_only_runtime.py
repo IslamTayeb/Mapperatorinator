@@ -387,6 +387,8 @@ def test_default_engine_import_does_not_import_weight_only_runtime() -> None:
                 "assert 'osuT5.osuT5.inference.optimized.kernels.weight_only_runtime' "
                 "not in sys.modules; "
                 "assert 'osuT5.osuT5.inference.optimized.scout.int8_mlp' "
+                "not in sys.modules; "
+                "assert 'osuT5.osuT5.inference.optimized.scout.cross_attention' "
                 "not in sys.modules"
             ),
         ],
