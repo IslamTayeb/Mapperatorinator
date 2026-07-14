@@ -188,20 +188,55 @@ def _generate_window(
             f"optimized {preset.precision} runtime loaded model dtype "
             f"{model.dtype}, expected {expected_dtype}"
         )
-    model_kwargs = {
-        key: value.to(model.device) if isinstance(value, torch.Tensor) else value
-        for key, value in model_kwargs.items()
-    }
-    model_kwargs = {
-        key: (
-            value.to(model.dtype)
-            if key != "inputs"
-            and isinstance(value, torch.Tensor)
-            and value.dtype == torch.float32
-            else value
+    profile_pass_kind = str(generate_kwargs.pop("profile_pass_kind", "unspecified"))
+    sync_model_timing = bool(generate_kwargs.pop("sync_model_timing", False))
+    untraced_budget_recorder = (
+        UntracedBudgetRecorder()
+        if profile_pass_kind == "untraced_budget"
+        else None
+    )
+    if untraced_budget_recorder is not None and not sync_model_timing:
+        raise RuntimeError(
+            "untraced budget profiling requires synchronized model timing"
         )
-        for key, value in model_kwargs.items()
-    }
+    device_model_kwargs: dict[str, Any] = {}
+    for key, value in model_kwargs.items():
+        if not isinstance(value, torch.Tensor):
+            device_model_kwargs[key] = value
+            continue
+        started = time.perf_counter()
+        destination = value.to(model.device)
+        transfer_wall = time.perf_counter() - started
+        if untraced_budget_recorder is not None and destination is not value:
+            untraced_budget_recorder.record_external_copy(
+                "model_input_to_device",
+                value,
+                destination,
+                host_wall_seconds=transfer_wall,
+            )
+        device_model_kwargs[key] = destination
+    model_kwargs = device_model_kwargs
+    dtype_model_kwargs: dict[str, Any] = {}
+    for key, value in model_kwargs.items():
+        if (
+            key == "inputs"
+            or not isinstance(value, torch.Tensor)
+            or value.dtype != torch.float32
+        ):
+            dtype_model_kwargs[key] = value
+            continue
+        started = time.perf_counter()
+        destination = value.to(model.dtype)
+        transfer_wall = time.perf_counter() - started
+        if untraced_budget_recorder is not None and destination is not value:
+            untraced_budget_recorder.record_external_copy(
+                "model_input_dtype_conversion",
+                value,
+                destination,
+                host_wall_seconds=transfer_wall,
+            )
+        dtype_model_kwargs[key] = destination
+    model_kwargs = dtype_model_kwargs
     batch_size = model_kwargs["inputs"].shape[0]
 
     precision = generate_kwargs.pop("precision", preset.precision)
@@ -221,17 +256,6 @@ def _generate_window(
     lookback_time = generate_kwargs.pop("lookback_time", 0.0)
     lookahead_time = generate_kwargs.pop("lookahead_time", 0.0)
     context_type = generate_kwargs.pop("context_type", None)
-    sync_model_timing = bool(generate_kwargs.pop("sync_model_timing", False))
-    profile_pass_kind = str(generate_kwargs.pop("profile_pass_kind", "unspecified"))
-    untraced_budget_recorder = (
-        UntracedBudgetRecorder()
-        if profile_pass_kind == "untraced_budget"
-        else None
-    )
-    if untraced_budget_recorder is not None and not sync_model_timing:
-        raise RuntimeError(
-            "untraced budget profiling requires synchronized model timing"
-        )
     if context_type is not None:
         context_type = ContextType(context_type)
     if precision != preset.precision or cfg_scale != 1.0:
@@ -346,7 +370,17 @@ def _generate_window(
         elapsed_seconds = time.perf_counter() - start_time
 
     with profile_range("generation.final_device_to_host"):
+        device_result = result
+        transfer_started = time.perf_counter()
         result = result.cpu()
+        transfer_wall = time.perf_counter() - transfer_started
+        if untraced_budget_recorder is not None and result is not device_result:
+            untraced_budget_recorder.record_external_copy(
+                "final_device_to_host",
+                device_result,
+                result,
+                host_wall_seconds=transfer_wall,
+            )
     stats = build_generation_stats(
         result,
         model_kwargs,
