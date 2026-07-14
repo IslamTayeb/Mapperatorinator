@@ -19,6 +19,7 @@ class KernelComponentLadderTest(unittest.TestCase):
             "e3279d3836d1ff6cc4f5b32f67f45afec8755902",
             "907652706d402a90723724cd52f2d2ca721b635f",
             "f13e55e1bf1ad32629f2981738acb65aab09a45f",
+            "d0de363f6df44195f2b3b73c0797dd57bcab9440",
         ):
             self.assertIn(commit, source)
 
@@ -31,6 +32,7 @@ class KernelComponentLadderTest(unittest.TestCase):
             "fp16-split-kv-q1-component-${SLURM_JOB_ID:-manual}/component.json",
             "int8-mlp-component-${SLURM_JOB_ID:-manual}/component.json",
             "k4-vocab-sampling-${SLURM_JOB_ID:-manual}/scout.json",
+            "shared-rope-component-${SLURM_JOB_ID:-manual}/shared-rope.json",
         ):
             self.assertIn(artifact, source)
         self.assertIn('require_artifacts "$name" "$report" "$@"', source)
@@ -39,6 +41,9 @@ class KernelComponentLadderTest(unittest.TestCase):
         self.assertIn('status == 3 and sizing is False', source)
         self.assertIn('if not isinstance(clears, bool):', source)
         self.assertIn('vocabulary decision is inconsistent', source)
+        self.assertIn('elif name == "shared_rope":', source)
+        self.assertIn('shared RoPE exactness or call accounting failed', source)
+        self.assertIn('MAPPERATORINATOR_REMOTE_REF="$remote_ref"', source)
         self.assertIn('#SBATCH --time=02:00:00', source)
         self.assertIn('LADDER_REMOTE_BRANCH=codex/500tps-kernel-component-ladder', source)
         self.assertIn('MAPPERATORINATOR_LADDER_REPO:?', source)
