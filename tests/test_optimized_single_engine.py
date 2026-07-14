@@ -637,6 +637,68 @@ def test_generate_window_preserves_custom_generate_dispatch(monkeypatch):
     assert custom_generate.func is engine_module.active_prefix_decode_generate
 
 
+def test_untraced_budget_pass_is_opt_in_and_returned_in_stats(monkeypatch):
+    class FakeModel:
+        dtype = torch.float32
+        device = torch.device("cpu")
+
+        def generate(self, **kwargs):
+            assert kwargs["custom_generate"].keywords[
+                "untraced_budget_recorder"
+            ] is not None
+            return torch.tensor([[1, 2]], dtype=torch.long)
+
+    class FakeContextState:
+        graph_count = 0
+        graph_capture_seconds = 0.0
+        graph_decode_replays = 0
+
+        def cache_for_window(self, model, **kwargs):
+            return object()
+
+        def active_prefix_decode_kwargs(self):
+            return {}
+
+        def graph_profile_summary(self):
+            return {"graphs": []}
+
+    monkeypatch.setattr(
+        engine_module,
+        "_build_logits_processor_list",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(engine_module, "eos_token_ids", lambda *args, **kwargs: [2])
+    monkeypatch.setattr(
+        engine_module,
+        "build_generation_stats",
+        lambda *args, **kwargs: {"generated_tokens": 1},
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "generation_profile_context",
+        lambda **kwargs: nullcontext(),
+    )
+
+    _, stats = engine_module._generate_window(
+        FakeModel(),
+        object(),
+        {"inputs": torch.tensor([[1]], dtype=torch.long)},
+        {
+            "precision": "fp32",
+            "profile_pass_kind": "untraced_budget",
+            "sync_model_timing": True,
+        },
+        context_state=FakeContextState(),
+        preset=OPTIMIZED_PRESETS["fp32"],
+    )
+
+    budget = stats["untraced_budget"]
+    assert budget["schema_version"] == 1
+    assert budget["generated_tokens"] == 1
+    assert budget["regions"]["sync"]["calls"] == 1
+    assert budget["reconciliation_pass"] is True
+
+
 def test_shared_calculation_helpers_preserve_legacy_server_results():
     class FakeTokenizer:
         eos_id = 2
