@@ -16,10 +16,22 @@ SHARED_ROPE_WRAPPER = (
     ROOT
     / "scripts/dcc/verify_k4_split_weight_shared_rope_full_song_reciprocal.sbatch"
 )
+FP16_CROSS_WRAPPER = (
+    ROOT / "scripts/dcc/verify_k4_shared_rope_fp16_cross_reciprocal.sbatch"
+)
+SPLIT8_CROSS_WRAPPER = (
+    ROOT / "scripts/dcc/verify_k4_shared_rope_split8_cross_reciprocal.sbatch"
+)
 
 
 def test_weight_only_full_song_wrapper_has_valid_bash_syntax() -> None:
-    for wrapper in (WRAPPER, K4_WRAPPER, SHARED_ROPE_WRAPPER):
+    for wrapper in (
+        WRAPPER,
+        K4_WRAPPER,
+        SHARED_ROPE_WRAPPER,
+        FP16_CROSS_WRAPPER,
+        SPLIT8_CROSS_WRAPPER,
+    ):
         subprocess.run(["bash", "-n", str(wrapper)], check=True)
 
 
@@ -121,6 +133,42 @@ def test_shared_rope_wrapper_compares_against_exact_combined_control() -> None:
     assert "parity.cross_candidate_exact=true" in general
     assert "shared-RoPE did not execute" in general
     assert 'runtime_candidate=$candidate' in general
+
+
+@pytest.mark.parametrize(
+    ("wrapper", "mode", "runner"),
+    (
+        (
+            FP16_CROSS_WRAPPER,
+            "fp16_packed_projections",
+            "utils/run_k4_shared_rope_fp16_cross.py",
+        ),
+        (
+            SPLIT8_CROSS_WRAPPER,
+            "split8_attention",
+            "utils/run_k4_shared_rope_split8_cross.py",
+        ),
+    ),
+)
+def test_cross_wrappers_pin_shared_control_and_one_candidate_mode(
+    wrapper,
+    mode,
+    runner,
+) -> None:
+    source = wrapper.read_text(encoding="utf-8")
+
+    assert "BASELINE_RUNNER=utils/run_k4_shared_rope_approximate_weight_only.py" in source
+    assert f"CANDIDATE_RUNNER={runner}" in source
+    assert "REQUIRE_K4_CANDIDATE=true" in source
+    assert "REQUIRE_SHARED_ROPE_INCREMENTAL=false" in source
+    assert "REQUIRE_CROSS_INCREMENTAL=true" in source
+    assert f"CROSS_CANDIDATE_MODE={mode}" in source
+
+    general = WRAPPER.read_text(encoding="utf-8")
+    assert "cross candidate mode/runner pairing is invalid" in general
+    assert '--cross-mode "$validation_cross_mode"' in general
+    assert "missing cross runtime evidence" in general
+    assert "control unexpectedly contains cross runtime" in general
 
 
 def test_general_wrapper_requires_k4_metadata_for_every_profile() -> None:

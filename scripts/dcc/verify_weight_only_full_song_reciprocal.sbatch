@@ -27,6 +27,8 @@ CANDIDATE_RUNNER=${CANDIDATE_RUNNER:-utils/run_approximate_weight_only.py}
 REQUIRE_EXACT_TIMING=${REQUIRE_EXACT_TIMING:-true}
 REQUIRE_K4_CANDIDATE=${REQUIRE_K4_CANDIDATE:-false}
 REQUIRE_SHARED_ROPE_INCREMENTAL=${REQUIRE_SHARED_ROPE_INCREMENTAL:-false}
+REQUIRE_CROSS_INCREMENTAL=${REQUIRE_CROSS_INCREMENTAL:-false}
+CROSS_CANDIDATE_MODE=${CROSS_CANDIDATE_MODE:-accepted}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_LABEL=${RUN_LABEL:-split-weight-full-song-reciprocal}
 RUN_ROOT="$WORK/runs/$RUN_LABEL-${SLURM_JOB_ID:-manual}"
@@ -85,7 +87,32 @@ if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" != true \
   echo "REQUIRE_SHARED_ROPE_INCREMENTAL must be true or false" >&2
   exit 2
 fi
-if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_CROSS_INCREMENTAL" != true \
+  && "$REQUIRE_CROSS_INCREMENTAL" != false ]]; then
+  echo "REQUIRE_CROSS_INCREMENTAL must be true or false" >&2
+  exit 2
+fi
+if [[ "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
+  if [[ "$REQUIRE_K4_CANDIDATE" != true \
+    || "$REQUIRE_EXACT_TIMING" != true \
+    || "$REQUIRE_SHARED_ROPE_INCREMENTAL" != false ]]; then
+    echo "cross incremental gate requires K4, exact timing, and its own mode" >&2
+    exit 2
+  fi
+  if [[ "$BASELINE_RUNNER" \
+    != utils/run_k4_shared_rope_approximate_weight_only.py ]]; then
+    echo "cross incremental gate requires the shared-RoPE combined control" >&2
+    exit 2
+  fi
+  case "$CROSS_CANDIDATE_MODE:$CANDIDATE_RUNNER" in
+    fp16_packed_projections:utils/run_k4_shared_rope_fp16_cross.py) ;;
+    split8_attention:utils/run_k4_shared_rope_split8_cross.py) ;;
+    *)
+      echo "cross candidate mode/runner pairing is invalid" >&2
+      exit 2
+      ;;
+  esac
+elif [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
   if [[ "$REQUIRE_K4_CANDIDATE" != true ]]; then
     echo "shared-RoPE incremental gate requires K4 contract validation" >&2
     exit 2
@@ -276,6 +303,8 @@ echo "candidate_runner=$CANDIDATE_RUNNER"
 echo "require_exact_timing=$REQUIRE_EXACT_TIMING"
 echo "require_k4_candidate=$REQUIRE_K4_CANDIDATE"
 echo "require_shared_rope_incremental=$REQUIRE_SHARED_ROPE_INCREMENTAL"
+echo "require_cross_incremental=$REQUIRE_CROSS_INCREMENTAL"
+echo "cross_candidate_mode=$CROSS_CANDIDATE_MODE"
 echo "audio=$AUDIO"
 echo "run_root=$RUN_ROOT"
 echo "extension_cache_mode=$EXTENSION_CACHE_MODE"
@@ -465,11 +494,16 @@ run_profile() {
   if [[ "$runtime_candidate" == 1 ]]; then
     validation_role=candidate
   fi
+  local validation_cross_mode=accepted
+  if [[ "$candidate" == 1 && "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
+    validation_cross_mode=$CROSS_CANDIDATE_MODE
+  fi
   (
     cd "$CANDIDATE_REPO"
     "$PYTHON" utils/validate_weight_only_full_song_profile.py \
       --profile "$profile" \
       --role "$validation_role" \
+      --cross-mode "$validation_cross_mode" \
       > "$RUN_ROOT/$role.weight-only-validation.json"
   )
   local k4_validation_role=baseline
@@ -594,11 +628,13 @@ summary = {
 PY
 
 INITIALIZATION_ROLES=candidate_first,candidate_second
-if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
+  || "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
   INITIALIZATION_ROLES=baseline_first,candidate_first,candidate_second,baseline_second
 fi
 "$PYTHON" - "$RUN_ROOT" "$INITIALIZATION_ROLES" \
-  "$REQUIRE_SHARED_ROPE_INCREMENTAL" <<'PY'
+  "$REQUIRE_SHARED_ROPE_INCREMENTAL" "$REQUIRE_CROSS_INCREMENTAL" \
+  "$CROSS_CANDIDATE_MODE" <<'PY'
 import json
 import math
 import statistics
@@ -608,6 +644,8 @@ from pathlib import Path
 root = Path(sys.argv[1])
 roles = tuple(sys.argv[2].split(","))
 require_shared_rope = sys.argv[3] == "true"
+require_cross = sys.argv[4] == "true"
+cross_mode = sys.argv[5]
 runs = {}
 required_numbers = (
     "initialization_wall_seconds",
@@ -673,6 +711,32 @@ if require_shared_rope:
     for role in ("baseline_first", "baseline_second"):
         if "shared_rope" in runs[role] or "combined_runtime" in runs[role]:
             raise SystemExit(f"{role}: combined control unexpectedly enabled shared RoPE")
+elif require_cross:
+    for role in roles:
+        shared = runs[role].get("shared_rope")
+        if not isinstance(shared, dict) or shared.get("scope") != "main-model-only":
+            raise SystemExit(f"{role}: missing shared-RoPE control evidence")
+        stats = shared.get("stats")
+        if not isinstance(stats, dict) or stats.get("forwards", 0) <= 0:
+            raise SystemExit(f"{role}: shared-RoPE did not execute")
+        if stats.get("computes") != stats.get("expected_computes"):
+            raise SystemExit(f"{role}: shared-RoPE compute accounting failed")
+        if stats.get("reuses") != stats.get("expected_reuses"):
+            raise SystemExit(f"{role}: shared-RoPE reuse accounting failed")
+        cross = runs[role].get("cross_candidate")
+        if not isinstance(cross, dict):
+            raise SystemExit(f"{role}: missing cross candidate metadata")
+        expected_mode = cross_mode if role.startswith("candidate") else "accepted"
+        if cross.get("mode") != expected_mode:
+            raise SystemExit(
+                f"{role}: expected cross mode {expected_mode}, got {cross.get('mode')}"
+            )
+        runtime = runs[role].get("cross_runtime")
+        if role.startswith("candidate"):
+            if not isinstance(runtime, dict) or runtime.get("mode") != cross_mode:
+                raise SystemExit(f"{role}: missing cross runtime evidence")
+        elif runtime is not None:
+            raise SystemExit(f"{role}: control unexpectedly contains cross runtime")
 
 summary = {
     "schema_version": 1,
@@ -716,6 +780,14 @@ if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
     --require-exact-dispatch-label main_generation
   )
   ANALYSIS_DISPATCH_ARGS=()
+elif [[ "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
+  ANALYSIS_EXACT_ARGS=(
+    --require-exact-label timing_context
+    --require-exact-dispatch-label timing_context
+  )
+  if [[ "$CROSS_CANDIDATE_MODE" == split8_attention ]]; then
+    ANALYSIS_EXACT_ARGS+=(--require-exact-label main_generation)
+  fi
 elif [[ "$REQUIRE_EXACT_TIMING" == true ]]; then
   ANALYSIS_EXACT_ARGS=(
     --require-exact-label timing_context
@@ -769,7 +841,8 @@ for artifact in \
     exit 2
   fi
 done
-if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
+  || "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
   for artifact in \
     "$RUN_ROOT/candidate-initialization/baseline_first.json" \
     "$RUN_ROOT/candidate-initialization/baseline_second.json"; do
@@ -791,6 +864,9 @@ grep -q '^parity.candidate_repeat_stable=true$' "$RUN_ROOT/reciprocal-analysis.t
 EXPECTED_EXACT_LABELS=none
 if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
   EXPECTED_EXACT_LABELS=timing_context,main_generation
+elif [[ "$REQUIRE_CROSS_INCREMENTAL" == true \
+  && "$CROSS_CANDIDATE_MODE" == split8_attention ]]; then
+  EXPECTED_EXACT_LABELS=timing_context,main_generation
 elif [[ "$REQUIRE_EXACT_TIMING" == true ]]; then
   EXPECTED_EXACT_LABELS=timing_context
 fi
@@ -798,7 +874,12 @@ grep -q "^parity.required_exact_labels=$EXPECTED_EXACT_LABELS$" \
   "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^parity.required_exact_labels_pass=true$' \
   "$RUN_ROOT/reciprocal-analysis.txt"
-grep -q "^parity.required_exact_dispatch_labels=$EXPECTED_EXACT_LABELS$" \
+EXPECTED_EXACT_DISPATCH_LABELS=$EXPECTED_EXACT_LABELS
+if [[ "$REQUIRE_CROSS_INCREMENTAL" == true \
+  && "$CROSS_CANDIDATE_MODE" == split8_attention ]]; then
+  EXPECTED_EXACT_DISPATCH_LABELS=timing_context
+fi
+grep -q "^parity.required_exact_dispatch_labels=$EXPECTED_EXACT_DISPATCH_LABELS$" \
   "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^parity.required_exact_dispatch_labels_pass=true$' \
   "$RUN_ROOT/reciprocal-analysis.txt"
