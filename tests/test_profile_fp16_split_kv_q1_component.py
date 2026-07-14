@@ -104,12 +104,15 @@ def test_summary_weights_live_counts_and_keeps_128_accepted_fallback() -> None:
         "640": "split_kv_8_fp16",
     }
     assert report["coverage_fraction"] == pytest.approx(0.6)
+    assert report["weighted_local_speedup"] == pytest.approx(0.168 / 0.09)
     assert report["projected_main_saving_seconds"] == pytest.approx(0.078)
     assert report["invariants_pass"]
     assert report["correctness_pass"]
-    assert report["sizing_pass"]
-    assert report["promotion_pass"]
-    assert profile.report_exit_code(report) == 0
+    assert not report["weighted_local_speedup_pass"]
+    assert not report["main_saving_pass"]
+    assert not report["sizing_pass"]
+    assert not report["promotion_pass"]
+    assert profile.report_exit_code(report) == 3
 
 
 def test_summary_rejects_drift_even_when_candidate_is_faster() -> None:
@@ -139,9 +142,7 @@ def test_summary_rejects_drift_even_when_candidate_is_faster() -> None:
     assert report["performance_fallbacks"] == {}
     assert not report["invariants_pass"]
     assert not report["correctness_pass"]
-    # Sizing is an independent performance signal from the still-valid 640
-    # bucket; the invariant gate remains authoritative and forces exit 1.
-    assert report["sizing_pass"]
+    assert not report["sizing_pass"]
     assert not report["promotion_pass"]
     assert profile.report_exit_code(report) == 1
 
@@ -186,7 +187,7 @@ def test_summary_treats_not_faster_as_valid_performance_only_fallback() -> None:
     assert profile.report_exit_code(report) == 3
 
 
-def test_summary_can_promote_a_valid_per_bucket_speed_selector() -> None:
+def test_summary_stops_a_valid_selector_below_both_sizing_thresholds() -> None:
     buckets = {
         "128": {
             "selector": "accepted_fallback",
@@ -213,6 +214,91 @@ def test_summary_can_promote_a_valid_per_bucket_speed_selector() -> None:
     assert report["selected"]["576"] == "accepted_fallback"
     assert report["selected"]["640"] == "split_kv_8_fp16"
     assert report["invariants_pass"]
+    assert not report["weighted_local_speedup_pass"]
+    assert not report["main_saving_pass"]
+    assert not report["sizing_pass"]
+    assert not report["promotion_pass"]
+    assert profile.report_exit_code(report) == 3
+
+
+def test_summary_requires_both_weighted_speed_and_main_saving() -> None:
+    fast_but_small = {
+        "128": {
+            "selector": "accepted_fallback",
+            "accepted_fp16": _accepted(0.01),
+        },
+        "576": {
+            "selector": "split_kv_8",
+            "accepted_fp16": _accepted(0.4),
+            "split_kv_8_fp16": _split(0.1),
+        },
+        "640": {
+            "selector": "split_kv_8",
+            "accepted_fp16": _accepted(0.5),
+            "split_kv_8_fp16": _split(0.1),
+        },
+    }
+    fast_report = profile.summarize(
+        fast_but_small,
+        live_counts={128: 1, 576: 1, 640: 1},
+    )
+    assert fast_report["weighted_local_speedup_pass"]
+    assert not fast_report["main_saving_pass"]
+    assert not fast_report["sizing_pass"]
+    assert profile.report_exit_code(fast_report) == 3
+
+    large_but_slow = {
+        "128": {
+            "selector": "accepted_fallback",
+            "accepted_fp16": _accepted(0.1),
+        },
+        "576": {
+            "selector": "split_kv_8",
+            "accepted_fp16": _accepted(0.4),
+            "split_kv_8_fp16": _split(0.25),
+        },
+        "640": {
+            "selector": "split_kv_8",
+            "accepted_fp16": _accepted(0.5),
+            "split_kv_8_fp16": _split(0.3),
+        },
+    }
+    slow_report = profile.summarize(
+        large_but_slow,
+        live_counts={128: 1_000, 576: 1_000, 640: 1_000},
+    )
+    assert not slow_report["weighted_local_speedup_pass"]
+    assert slow_report["main_saving_pass"]
+    assert not slow_report["sizing_pass"]
+    assert profile.report_exit_code(slow_report) == 3
+
+
+def test_summary_promotes_only_after_both_sizing_thresholds_pass() -> None:
+    buckets = {
+        "128": {
+            "selector": "accepted_fallback",
+            "accepted_fp16": _accepted(0.1),
+        },
+        "576": {
+            "selector": "split_kv_8",
+            "accepted_fp16": _accepted(0.4),
+            "split_kv_8_fp16": _split(0.1),
+        },
+        "640": {
+            "selector": "split_kv_8",
+            "accepted_fp16": _accepted(0.5),
+            "split_kv_8_fp16": _split(0.1),
+        },
+    }
+    report = profile.summarize(
+        buckets,
+        live_counts={128: 1_000, 576: 1_000, 640: 1_000},
+    )
+
+    assert report["weighted_local_speedup"] == pytest.approx(10.0 / 3.0)
+    assert report["weighted_local_speedup_pass"]
+    assert report["projected_main_saving_seconds"] == pytest.approx(8.4)
+    assert report["main_saving_pass"]
     assert report["sizing_pass"]
     assert report["promotion_pass"]
     assert profile.report_exit_code(report) == 0

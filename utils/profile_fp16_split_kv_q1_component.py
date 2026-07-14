@@ -37,6 +37,8 @@ SENTINEL_BUCKETS = (128, 576, 640)
 DECODER_LAYERS = 12
 MAX_ABS_DRIFT = 1e-3
 DEFAULT_TIMING_CYCLES = 5
+MIN_WEIGHTED_LOCAL_SPEEDUP = 2.0
+REQUIRED_MAIN_SAVING_SECONDS = 1.503
 
 
 def _git_head() -> str:
@@ -243,15 +245,25 @@ def summarize(
     accepted_seconds = DECODER_LAYERS * accepted_ms / 1000.0
     selected_seconds = DECODER_LAYERS * selected_ms / 1000.0
     saving_seconds = accepted_seconds - selected_seconds
+    weighted_local_speedup = accepted_seconds / selected_seconds
+    weighted_local_speedup_pass = (
+        weighted_local_speedup >= MIN_WEIGHTED_LOCAL_SPEEDUP
+    )
+    main_saving_pass = saving_seconds >= REQUIRED_MAIN_SAVING_SECONDS
     invariants_pass = not invariant_failures
-    sizing_pass = saving_seconds > 0
+    sizing_pass = weighted_local_speedup_pass and main_saving_pass
     return {
         "total_live_replays": total_replays,
         "measured_replays": measured_replays,
         "coverage_fraction": measured_replays / total_replays,
         "weighted_accepted_fp16_seconds_12_layers": accepted_seconds,
         "weighted_selected_fp16_seconds_12_layers": selected_seconds,
+        "weighted_local_speedup": weighted_local_speedup,
+        "minimum_weighted_local_speedup": MIN_WEIGHTED_LOCAL_SPEEDUP,
+        "weighted_local_speedup_pass": weighted_local_speedup_pass,
         "projected_main_saving_seconds": saving_seconds,
+        "required_main_saving_seconds": REQUIRED_MAIN_SAVING_SECONDS,
+        "main_saving_pass": main_saving_pass,
         "selected": selected,
         "candidate_invariant_failures": invariant_failures,
         "performance_fallbacks": performance_fallbacks,
@@ -448,7 +460,7 @@ def profile_fp16_split_kv_component(
         _restore_all_cache(capture.past_key_value, snapshots)
 
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "metadata": {
             "candidate": "sm75_split_kv_8_fp16_storage_fp32_accumulation",
             "control": "accepted_unsplit_fp16_storage_fp32_accumulation",
