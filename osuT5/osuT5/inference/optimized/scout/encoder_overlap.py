@@ -275,6 +275,9 @@ class ExactMainEncoderOverlap:
         least_priority, _greatest_priority = torch.cuda.get_stream_priority_range()
         self._least_stream_priority = int(least_priority)
         stream = torch.cuda.Stream(device=device, priority=least_priority)
+        # Own the stream before enqueueing anything so the context's failure
+        # path can always synchronize work submitted by a partially built row.
+        self._stream = stream
         current = torch.cuda.current_stream(device)
         stream.wait_stream(current)
         encoder = self._main_processor.model.get_encoder()
@@ -283,33 +286,36 @@ class ExactMainEncoderOverlap:
         end_event = torch.cuda.Event(enable_timing=True)
         rows: list[_OverlapRow] = []
         started = time.perf_counter()
-        with torch.cuda.stream(stream):
-            start_event.record(stream)
-            for index in range(len(self._pinned_frames)):
-                frame = self._pinned_frames[index : index + 1].to(
-                    device,
-                    non_blocking=True,
-                )
-                kwargs = {
-                    key: value.to(device, non_blocking=True)
-                    for key, value in self._pinned_conditioning[index].items()
-                }
-                outputs = encoder(frames=frame, **kwargs, return_dict=True)
-                hidden = getattr(outputs, "last_hidden_state", None)
-                if not isinstance(hidden, torch.Tensor):
-                    raise EncoderOverlapError(
-                        f"main encoder row {index} lacks last_hidden_state"
+        try:
+            with torch.cuda.stream(stream):
+                start_event.record(stream)
+                for index in range(len(self._pinned_frames)):
+                    frame = self._pinned_frames[index : index + 1].to(
+                        device,
+                        non_blocking=True,
                     )
-                if hidden.dtype != torch.float32 or hidden.device != device:
-                    raise EncoderOverlapError(
-                        f"main encoder row {index} changed storage dtype/device"
-                    )
-                ready = torch.cuda.Event(enable_timing=True)
-                ready.record(stream)
-                rows.append(_OverlapRow(hidden=hidden, ready=ready))
-            end_event.record(stream)
+                    kwargs = {
+                        key: value.to(device, non_blocking=True)
+                        for key, value in self._pinned_conditioning[index].items()
+                    }
+                    outputs = encoder(frames=frame, **kwargs, return_dict=True)
+                    hidden = getattr(outputs, "last_hidden_state", None)
+                    if not isinstance(hidden, torch.Tensor):
+                        raise EncoderOverlapError(
+                            f"main encoder row {index} lacks last_hidden_state"
+                        )
+                    if hidden.dtype != torch.float32 or hidden.device != device:
+                        raise EncoderOverlapError(
+                            f"main encoder row {index} changed storage dtype/device"
+                        )
+                    ready = torch.cuda.Event(enable_timing=True)
+                    ready.record(stream)
+                    rows.append(_OverlapRow(hidden=hidden, ready=ready))
+                end_event.record(stream)
+        except BaseException:
+            stream.synchronize()
+            raise
         self._launch_host_seconds = time.perf_counter() - started
-        self._stream = stream
         self._encoder_start = start_event
         self._encoder_end = end_event
         self._rows = rows
