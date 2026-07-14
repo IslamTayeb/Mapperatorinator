@@ -31,6 +31,7 @@ REQUIRE_K1_REMAINDER_INCREMENTAL=${REQUIRE_K1_REMAINDER_INCREMENTAL:-false}
 REQUIRE_INT8_MLP_INCREMENTAL=${REQUIRE_INT8_MLP_INCREMENTAL:-false}
 REQUIRE_CROSS_INCREMENTAL=${REQUIRE_CROSS_INCREMENTAL:-false}
 CROSS_CANDIDATE_MODE=${CROSS_CANDIDATE_MODE:-accepted}
+REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL=${REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL:-false}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_LABEL=${RUN_LABEL:-split-weight-full-song-reciprocal}
 RUN_ROOT="$WORK/runs/$RUN_LABEL-${SLURM_JOB_ID:-manual}"
@@ -40,6 +41,7 @@ BASELINE_EXTENSION_KEY_OVERRIDE=${BASELINE_EXTENSION_KEY_OVERRIDE:-}
 CANDIDATE_EXTENSION_KEY_OVERRIDE=${CANDIDATE_EXTENSION_KEY_OVERRIDE:-}
 INT8_K1_COMPOSITION=false
 CROSS_K1_INT8_COMPOSITION=false
+COALESCED_K1_INT8_COMPOSITION=false
 
 if [[ "$BASELINE_COMMIT" != "$CANDIDATE_COMMIT" ]]; then
   echo "split+weight reciprocal requires one shared baseline/candidate commit" >&2
@@ -106,21 +108,43 @@ if [[ "$REQUIRE_CROSS_INCREMENTAL" != true \
   echo "REQUIRE_CROSS_INCREMENTAL must be true or false" >&2
   exit 2
 fi
+if [[ "$REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL" != true \
+  && "$REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL" != false ]]; then
+  echo "REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL must be true or false" >&2
+  exit 2
+fi
 enabled_incremental_modes=0
 for enabled in \
   "$REQUIRE_SHARED_ROPE_INCREMENTAL" \
   "$REQUIRE_K1_REMAINDER_INCREMENTAL" \
   "$REQUIRE_INT8_MLP_INCREMENTAL" \
-  "$REQUIRE_CROSS_INCREMENTAL"; do
+  "$REQUIRE_CROSS_INCREMENTAL" \
+  "$REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL"; do
   if [[ "$enabled" == true ]]; then
     enabled_incremental_modes=$((enabled_incremental_modes + 1))
   fi
 done
 if (( enabled_incremental_modes > 1 )); then
-  echo "shared-RoPE, K1-remainder, INT8 MLP, and cross gates are mutually exclusive" >&2
+  echo "shared-RoPE, K1-remainder, INT8 MLP, cross, and coalesced gates are mutually exclusive" >&2
   exit 2
 fi
-if [[ "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL" == true ]]; then
+  if [[ "$REQUIRE_K4_CANDIDATE" != true || "$REQUIRE_EXACT_TIMING" != true ]]; then
+    echo "coalesced split-KV gate requires K4 and exact timing" >&2
+    exit 2
+  fi
+  if [[ "$BASELINE_RUNNER" \
+      != utils/run_k4_shared_rope_k1_remainder_int8_mlp_weight_only.py ]]; then
+    echo "coalesced split-KV gate requires the K1+INT8 composition control" >&2
+    exit 2
+  fi
+  if [[ "$CANDIDATE_RUNNER" \
+      != utils/run_k4_shared_rope_coalesced_split_kv.py ]]; then
+    echo "coalesced split-KV gate requires the independent candidate runner" >&2
+    exit 2
+  fi
+  COALESCED_K1_INT8_COMPOSITION=true
+elif [[ "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
   if [[ "$REQUIRE_K4_CANDIDATE" != true || "$REQUIRE_EXACT_TIMING" != true ]]; then
     echo "cross incremental gate requires K4 and exact timing" >&2
     exit 2
@@ -367,6 +391,8 @@ echo "int8_k1_composition=$INT8_K1_COMPOSITION"
 echo "require_cross_incremental=$REQUIRE_CROSS_INCREMENTAL"
 echo "cross_candidate_mode=$CROSS_CANDIDATE_MODE"
 echo "cross_k1_int8_composition=$CROSS_K1_INT8_COMPOSITION"
+echo "require_coalesced_split_kv_incremental=$REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL"
+echo "coalesced_k1_int8_composition=$COALESCED_K1_INT8_COMPOSITION"
 echo "audio=$AUDIO"
 echo "run_root=$RUN_ROOT"
 echo "extension_cache_mode=$EXTENSION_CACHE_MODE"
@@ -569,9 +595,12 @@ run_profile() {
       > "$RUN_ROOT/$role.weight-only-validation.json"
   )
   if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true \
-    || "$CROSS_K1_INT8_COMPOSITION" == true ]]; then
+    || "$CROSS_K1_INT8_COMPOSITION" == true \
+    || "$COALESCED_K1_INT8_COMPOSITION" == true ]]; then
     local int8_validation_role=baseline
-    if [[ "$candidate" == 1 || "$CROSS_K1_INT8_COMPOSITION" == true ]]; then
+    if [[ "$candidate" == 1 \
+      || "$CROSS_K1_INT8_COMPOSITION" == true \
+      || "$COALESCED_K1_INT8_COMPOSITION" == true ]]; then
       int8_validation_role=candidate
     fi
     (
@@ -580,6 +609,19 @@ run_profile() {
         --profile "$profile" \
         --role "$int8_validation_role" \
         > "$RUN_ROOT/$role.int8-mlp-validation.json"
+    )
+  fi
+  if [[ "$REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL" == true ]]; then
+    local coalesced_role=baseline
+    if [[ "$candidate" == 1 ]]; then
+      coalesced_role=candidate
+    fi
+    (
+      cd "$CANDIDATE_REPO"
+      "$PYTHON" utils/validate_coalesced_split_kv_profile.py \
+        --profile "$profile" \
+        --role "$coalesced_role" \
+        > "$RUN_ROOT/$role.coalesced-split-kv-validation.json"
     )
   fi
   local k4_validation_role=baseline
@@ -596,11 +638,13 @@ run_profile() {
   )
   if [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true \
     || "$INT8_K1_COMPOSITION" == true \
-    || "$CROSS_K1_INT8_COMPOSITION" == true ]]; then
+    || "$CROSS_K1_INT8_COMPOSITION" == true \
+    || "$COALESCED_K1_INT8_COMPOSITION" == true ]]; then
     local remainder_role=control
     if [[ "$candidate" == 1 \
       || "$INT8_K1_COMPOSITION" == true \
-      || "$CROSS_K1_INT8_COMPOSITION" == true ]]; then
+      || "$CROSS_K1_INT8_COMPOSITION" == true \
+      || "$COALESCED_K1_INT8_COMPOSITION" == true ]]; then
       remainder_role=candidate
     fi
     (
@@ -724,7 +768,8 @@ INITIALIZATION_ROLES=candidate_first,candidate_second
 if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
   || "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true \
   || "$REQUIRE_INT8_MLP_INCREMENTAL" == true \
-  || "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
+  || "$REQUIRE_CROSS_INCREMENTAL" == true \
+  || "$REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL" == true ]]; then
   INITIALIZATION_ROLES=baseline_first,candidate_first,candidate_second,baseline_second
 fi
 "$PYTHON" - "$RUN_ROOT" "$INITIALIZATION_ROLES" \
@@ -734,7 +779,9 @@ fi
   "$INT8_K1_COMPOSITION" \
   "$REQUIRE_CROSS_INCREMENTAL" \
   "$CROSS_CANDIDATE_MODE" \
-  "$CROSS_K1_INT8_COMPOSITION" <<'PY'
+  "$CROSS_K1_INT8_COMPOSITION" \
+  "$REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL" \
+  "$COALESCED_K1_INT8_COMPOSITION" <<'PY'
 import json
 import math
 import statistics
@@ -750,6 +797,8 @@ int8_k1_composition = sys.argv[6] == "true"
 require_cross = sys.argv[7] == "true"
 cross_mode = sys.argv[8]
 cross_k1_int8_composition = sys.argv[9] == "true"
+require_coalesced = sys.argv[10] == "true"
+coalesced_k1_int8_composition = sys.argv[11] == "true"
 runs = {}
 required_numbers = (
     "initialization_wall_seconds",
@@ -794,7 +843,7 @@ for role in roles:
             raise SystemExit(f"{role}: invalid initialization memory field {key}")
     runs[role] = payload
 
-if require_shared_rope or shared_rope_both_arms or require_cross:
+if require_shared_rope or shared_rope_both_arms or require_cross or require_coalesced:
     shared_roles = roles if shared_rope_both_arms else (
         "candidate_first",
         "candidate_second",
@@ -875,6 +924,38 @@ if require_cross:
         elif runtime is not None:
             raise SystemExit(f"{role}: control unexpectedly contains cross runtime")
 
+if require_coalesced:
+    if not coalesced_k1_int8_composition:
+        raise SystemExit("coalesced gate did not declare K1+INT8 composition ownership")
+    for role in roles:
+        overlay = runs[role].get("int8_mlp_overlay")
+        if not isinstance(overlay, dict):
+            raise SystemExit(f"{role}: missing INT8 MLP composition evidence")
+        if overlay.get("dispatch_counter") != "int8_weight_mlp_tail":
+            raise SystemExit(f"{role}: INT8 MLP dispatch ownership is wrong")
+        cross = runs[role].get("cross_candidate")
+        if not isinstance(cross, dict) or cross.get("mode") != "accepted":
+            raise SystemExit(f"{role}: independent coalesced gate changed cross mode")
+        expected_runtime = (
+            "k4-split-kv-mixed-weight-shared-rope-k1-remainder-int8-mlp-v1"
+            if role.startswith("baseline")
+            else "k4-split-kv-mixed-weight-shared-rope-k1-remainder-int8-mlp-coalesced-split-kv-v1"
+        )
+        if runs[role].get("combined_runtime") != expected_runtime:
+            raise SystemExit(f"{role}: coalesced composition identity is wrong")
+        evidence = runs[role].get("coalesced_split_kv")
+        if role.startswith("candidate"):
+            if not isinstance(evidence, dict):
+                raise SystemExit(f"{role}: coalesced split-KV evidence is missing")
+            if evidence.get("scope") != (
+                "main-model-mixed-weight-self-attention-only"
+            ):
+                raise SystemExit(f"{role}: coalesced split-KV scope is wrong")
+            if evidence.get("exactness_claim") is not False:
+                raise SystemExit(f"{role}: coalesced split-KV must not claim exactness")
+        elif evidence is not None:
+            raise SystemExit(f"{role}: control unexpectedly enabled coalesced split-KV")
+
 summary = {
     "schema_version": 1,
     "result_class": "documented-drift",
@@ -905,7 +986,24 @@ ANALYSIS_DISPATCH_ARGS=(
   --allow-optional-dispatch-delta
     'records.main_generation[[]*].optimized_cuda_graphs.*'
 )
-if [[ "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL" == true ]]; then
+  ANALYSIS_EXACT_ARGS=(
+    --require-exact-label timing_context
+    --require-exact-dispatch-label timing_context
+  )
+  ANALYSIS_DISPATCH_ARGS=(
+    --allow-dispatch-delta
+      'records.main_generation[[]*].optimized_dispatch_capture_hits'
+    --allow-optional-dispatch-delta
+      'records.main_generation[[]*].optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8_coalesced'
+    --allow-optional-dispatch-delta
+      'records.main_generation[[]*].optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8_coalesced_prefix_*'
+    --allow-optional-dispatch-delta
+      'records.main_generation[[]*].optimized_dispatch_capture_hits.*'
+    --allow-optional-dispatch-delta
+      'records.main_generation[[]*].optimized_cuda_graphs.*'
+  )
+elif [[ "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
   ANALYSIS_EXACT_ARGS=(
     --require-exact-label timing_context
     --require-exact-dispatch-label timing_context
@@ -1020,7 +1118,8 @@ for artifact in \
 done
 if [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true \
   || "$INT8_K1_COMPOSITION" == true \
-  || "$CROSS_K1_INT8_COMPOSITION" == true ]]; then
+  || "$CROSS_K1_INT8_COMPOSITION" == true \
+  || "$COALESCED_K1_INT8_COMPOSITION" == true ]]; then
   for role in baseline_first candidate_first candidate_second baseline_second; do
     artifact="$RUN_ROOT/$role.k1-remainder-validation.json"
     if [[ ! -s "$artifact" ]]; then
@@ -1030,7 +1129,8 @@ if [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true \
   done
 fi
 if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true \
-  || "$CROSS_K1_INT8_COMPOSITION" == true ]]; then
+  || "$CROSS_K1_INT8_COMPOSITION" == true \
+  || "$COALESCED_K1_INT8_COMPOSITION" == true ]]; then
   for role in baseline_first candidate_first candidate_second baseline_second; do
     artifact="$RUN_ROOT/$role.int8-mlp-validation.json"
     if [[ ! -s "$artifact" ]]; then
@@ -1041,7 +1141,8 @@ if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true \
 fi
 if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
   || "$REQUIRE_INT8_MLP_INCREMENTAL" == true \
-  || "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
+  || "$REQUIRE_CROSS_INCREMENTAL" == true \
+  || "$REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL" == true ]]; then
   for artifact in \
     "$RUN_ROOT/candidate-initialization/baseline_first.json" \
     "$RUN_ROOT/candidate-initialization/baseline_second.json"; do
@@ -1076,6 +1177,9 @@ elif [[ "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
   if [[ "$CROSS_CANDIDATE_MODE" == split8_attention ]]; then
     EXPECTED_EXACT_LABELS=timing_context,main_generation
   fi
+elif [[ "$REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL" == true ]]; then
+  EXPECTED_EXACT_LABELS=timing_context
+  EXPECTED_EXACT_DISPATCH_LABELS=timing_context
 elif [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then
   EXPECTED_EXACT_LABELS=timing_context
   EXPECTED_EXACT_DISPATCH_LABELS=$EXPECTED_EXACT_LABELS
@@ -1092,6 +1196,16 @@ grep -q "^parity.required_exact_dispatch_labels=$EXPECTED_EXACT_DISPATCH_LABELS$
 grep -q '^parity.required_exact_dispatch_labels_pass=true$' \
   "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^dispatch.declaration_pass=true$' "$RUN_ROOT/reciprocal-analysis.txt"
+if [[ "$REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL" == true ]]; then
+  for role in baseline_first candidate_first candidate_second baseline_second; do
+    artifact="$RUN_ROOT/$role.coalesced-split-kv-validation.json"
+    if [[ ! -s "$artifact" ]]; then
+      echo "missing coalesced split-KV validation: $artifact" >&2
+      exit 2
+    fi
+    grep -q '"pass": true' "$artifact"
+  done
+fi
 grep -q '^metric.timing_model_seconds=' "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^metric.main_model_seconds=' "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^metric.fixed_8294_main_seconds=' "$RUN_ROOT/reciprocal-analysis.txt"

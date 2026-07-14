@@ -10,6 +10,7 @@ _SPLIT_KV_Q1_PREFIXES = frozenset(range(192, 833, 64))
 _SPLIT_KV_Q1_SPLITS = 8
 _ACCEPTED_ROPE_CACHE_VARIANT = "accepted"
 _SPLIT_KV_ROPE_CACHE_VARIANT = "split_kv_8"
+_COALESCED_SPLIT_KV_ROPE_CACHE_VARIANT = "split_kv_8_coalesced"
 
 
 def _device_capability(device: torch.device) -> tuple[int, int]:
@@ -47,6 +48,20 @@ def native_q1_rope_cache_attention_variant(
     ):
         return _ACCEPTED_ROPE_CACHE_VARIANT
     return _SPLIT_KV_ROPE_CACHE_VARIANT
+
+
+def native_q1_rope_cache_attention_coalesced_variant(
+    qkv: torch.Tensor,
+    active_prefix_length: int,
+) -> str:
+    """Select the opt-in coalesced implementation only where split-KV is accepted."""
+
+    if (
+        native_q1_rope_cache_attention_variant(qkv, active_prefix_length)
+        == _SPLIT_KV_ROPE_CACHE_VARIANT
+    ):
+        return _COALESCED_SPLIT_KV_ROPE_CACHE_VARIANT
+    return _ACCEPTED_ROPE_CACHE_VARIANT
 
 
 def _require_supported_tensor(
@@ -639,6 +654,103 @@ __global__ void split_kv_partial_kernel(
 }
 
 template<int BLOCK_SIZE>
+__global__ void split_kv_partial_coalesced_kernel(
+        const float* __restrict__ query,
+        const float* __restrict__ cache_keys,
+        const float* __restrict__ cache_values,
+        const float* __restrict__ mask,
+        float* __restrict__ partial_max,
+        float* __restrict__ partial_denom,
+        float* __restrict__ partial_numer,
+        int heads,
+        int active_prefix_len,
+        int head_dim,
+        int split_count,
+        long long cache_head_stride,
+        long long cache_len_stride,
+        long long cache_dim_stride,
+        int has_mask) {
+    static_assert(BLOCK_SIZE == 128, "coalesced split-KV requires four warps");
+    const int head = blockIdx.x;
+    const int split = blockIdx.y;
+    const int tid = threadIdx.x;
+    if (head >= heads || split >= split_count) return;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    constexpr int warp_count = BLOCK_SIZE / 32;
+    const int begin = active_prefix_len * split / split_count;
+    const int end = active_prefix_len * (split + 1) / split_count;
+    const int length = end - begin;
+    const int partial_index = head * split_count + split;
+    const float scale = rsqrtf(static_cast<float>(head_dim));
+    extern __shared__ float shared[];
+    float* scores = shared;
+    float* reduction = shared + length;
+
+    // One warp owns one cache row at a time. Lanes therefore read adjacent
+    // head dimensions instead of making adjacent threads jump by a cache row.
+    for (int offset = warp; offset < length; offset += warp_count) {
+        const int pos = begin + offset;
+        float score = 0.0f;
+        for (int dim = lane; dim < head_dim; dim += 32) {
+            score += query[head * head_dim + dim] * cache_keys[
+                head * cache_head_stride + pos * cache_len_stride
+                + dim * cache_dim_stride
+            ];
+        }
+        for (int delta = 16; delta > 0; delta >>= 1) {
+            score += __shfl_down_sync(0xffffffffu, score, delta);
+        }
+        if (lane == 0) {
+            score *= scale;
+            if (has_mask) score += mask[pos];
+            scores[offset] = score;
+        }
+    }
+    __syncthreads();
+
+    reduction[tid] = tid < length ? scores[tid] : -FLT_MAX;
+    __syncthreads();
+    for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) reduction[tid] = fmaxf(
+            reduction[tid], reduction[tid + stride]);
+        __syncthreads();
+    }
+    const float split_max = reduction[0];
+
+    float local_denom = 0.0f;
+    if (tid < length) {
+        const float weight = expf(scores[tid] - split_max);
+        scores[tid] = weight;
+        local_denom = weight;
+    }
+    reduction[tid] = local_denom;
+    __syncthreads();
+    for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) reduction[tid] += reduction[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        partial_max[partial_index] = split_max;
+        partial_denom[partial_index] = reduction[0];
+    }
+
+    // Threads own adjacent value dimensions, which keeps every cache-value
+    // transaction coalesced while accumulating all positions in the split.
+    for (int dim = tid; dim < head_dim; dim += BLOCK_SIZE) {
+        float numerator = 0.0f;
+        for (int offset = 0; offset < length; ++offset) {
+            const int pos = begin + offset;
+            numerator += scores[offset] * cache_values[
+                head * cache_head_stride + pos * cache_len_stride
+                + dim * cache_dim_stride
+            ];
+        }
+        partial_numer[(partial_index * head_dim) + dim] = numerator;
+    }
+}
+
+template<int BLOCK_SIZE>
 __global__ void split_kv_merge_kernel(
         const float* __restrict__ partial_max,
         const float* __restrict__ partial_denom,
@@ -787,7 +899,7 @@ torch::Tensor q1_rope_cache_attention(
     return output;
 }
 
-torch::Tensor split_kv_q1_rope_cache_attention(
+torch::Tensor split_kv_q1_rope_cache_attention_impl(
         torch::Tensor qkv,
         torch::Tensor cache_keys,
         torch::Tensor cache_values,
@@ -795,7 +907,8 @@ torch::Tensor split_kv_q1_rope_cache_attention(
         torch::Tensor sin,
         torch::Tensor cache_position,
         c10::optional<torch::Tensor> mask,
-        int64_t active_prefix_len) {
+        int64_t active_prefix_len,
+        bool coalesced) {
     TORCH_CHECK(qkv.is_cuda() && cache_keys.is_cuda() && cache_values.is_cuda(),
         "split-KV qkv/cache tensors must be CUDA");
     TORCH_CHECK(cos.is_cuda() && sin.is_cuda() && cache_position.is_cuda(),
@@ -870,6 +983,12 @@ torch::Tensor split_kv_q1_rope_cache_attention(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     const int largest_split = static_cast<int>(
         (active_prefix_len + split_count - 1) / split_count);
+    if (coalesced) {
+        TORCH_CHECK(head_dim == 64,
+            "coalesced split-KV q1 requires head_dim=64");
+        TORCH_CHECK(largest_split <= block_size,
+            "coalesced split-KV q1 split must fit in one 128-thread block");
+    }
     const size_t partial_shared = static_cast<size_t>(largest_split + block_size)
         * sizeof(float);
 
@@ -894,8 +1013,27 @@ torch::Tensor split_kv_q1_rope_cache_attention(
             static_cast<long long>(cache_keys.stride(3)),
             static_cast<long long>(cos.stride(2)),
             static_cast<long long>(sin.stride(2)));
-    split_kv_partial_kernel<block_size><<<
-        dim3(heads, split_count), block_size, partial_shared, stream>>>(
+    if (coalesced) {
+        split_kv_partial_coalesced_kernel<block_size><<<
+            dim3(heads, split_count), block_size, partial_shared, stream>>>(
+                query.data_ptr<float>(),
+                cache_keys.data_ptr<float>(),
+                cache_values.data_ptr<float>(),
+                mask_ptr,
+                partial_max.data_ptr<float>(),
+                partial_denom.data_ptr<float>(),
+                partial_numer.data_ptr<float>(),
+                heads,
+                static_cast<int>(active_prefix_len),
+                head_dim,
+                split_count,
+                static_cast<long long>(cache_keys.stride(1)),
+                static_cast<long long>(cache_keys.stride(2)),
+                static_cast<long long>(cache_keys.stride(3)),
+                has_mask);
+    } else {
+        split_kv_partial_kernel<block_size><<<
+            dim3(heads, split_count), block_size, partial_shared, stream>>>(
             query.data_ptr<float>(),
             cache_keys.data_ptr<float>(),
             cache_values.data_ptr<float>(),
@@ -911,6 +1049,7 @@ torch::Tensor split_kv_q1_rope_cache_attention(
             static_cast<long long>(cache_keys.stride(2)),
             static_cast<long long>(cache_keys.stride(3)),
             has_mask);
+    }
     split_kv_merge_kernel<block_size><<<heads, block_size, 0, stream>>>(
         partial_max.data_ptr<float>(),
         partial_denom.data_ptr<float>(),
@@ -921,6 +1060,34 @@ torch::Tensor split_kv_q1_rope_cache_attention(
         split_count);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
+}
+
+torch::Tensor split_kv_q1_rope_cache_attention(
+        torch::Tensor qkv,
+        torch::Tensor cache_keys,
+        torch::Tensor cache_values,
+        torch::Tensor cos,
+        torch::Tensor sin,
+        torch::Tensor cache_position,
+        c10::optional<torch::Tensor> mask,
+        int64_t active_prefix_len) {
+    return split_kv_q1_rope_cache_attention_impl(
+        qkv, cache_keys, cache_values, cos, sin, cache_position, mask,
+        active_prefix_len, false);
+}
+
+torch::Tensor split_kv_q1_rope_cache_attention_coalesced(
+        torch::Tensor qkv,
+        torch::Tensor cache_keys,
+        torch::Tensor cache_values,
+        torch::Tensor cos,
+        torch::Tensor sin,
+        torch::Tensor cache_position,
+        c10::optional<torch::Tensor> mask,
+        int64_t active_prefix_len) {
+    return split_kv_q1_rope_cache_attention_impl(
+        qkv, cache_keys, cache_values, cos, sin, cache_position, mask,
+        active_prefix_len, true);
 }
 """
 
@@ -937,12 +1104,17 @@ torch::Tensor split_kv_q1_rope_cache_attention(
             "torch::Tensor cache_keys, torch::Tensor cache_values, torch::Tensor cos, "
             "torch::Tensor sin, torch::Tensor cache_position, "
             "c10::optional<torch::Tensor> mask, int64_t active_prefix_len);\n"
+            "torch::Tensor split_kv_q1_rope_cache_attention_coalesced(torch::Tensor qkv, "
+            "torch::Tensor cache_keys, torch::Tensor cache_values, torch::Tensor cos, "
+            "torch::Tensor sin, torch::Tensor cache_position, "
+            "c10::optional<torch::Tensor> mask, int64_t active_prefix_len);\n"
         ),
         cuda_sources=cuda_source,
         functions=[
             "q1_attention",
             "q1_rope_cache_attention",
             "split_kv_q1_rope_cache_attention",
+            "split_kv_q1_rope_cache_attention_coalesced",
         ],
         extra_cuda_cflags=["-O3"],
         verbose=False,
@@ -1000,6 +1172,61 @@ def native_q1_rope_cache_attention(
         == _SPLIT_KV_ROPE_CACHE_VARIANT
     ):
         return extension.split_kv_q1_rope_cache_attention(
+            qkv,
+            cache_keys,
+            cache_values,
+            cos,
+            sin,
+            cache_position,
+            mask,
+            int(active_prefix_length),
+        )
+    return extension.q1_rope_cache_attention(
+        qkv,
+        cache_keys,
+        cache_values,
+        cos,
+        sin,
+        cache_position,
+        mask,
+        int(active_prefix_length),
+    )
+
+
+def native_q1_rope_cache_attention_coalesced(
+        qkv: torch.Tensor,
+        cache_keys: torch.Tensor,
+        cache_values: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        cache_position: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        active_prefix_length: int,
+) -> torch.Tensor:
+    """Opt-in coalesced split-KV kernel with the accepted short-prefix fallback."""
+
+    _validate_rope_cache_inputs(
+        qkv,
+        cache_keys,
+        cache_values,
+        cos,
+        sin,
+        cache_position,
+        active_prefix_length,
+    )
+    mask = _native_mask(
+        attention_mask,
+        device=qkv.device,
+        expected_numel=int(active_prefix_length),
+    )
+    extension = _load_native_q1_attention()
+    if (
+        native_q1_rope_cache_attention_coalesced_variant(
+            qkv, active_prefix_length
+        )
+        == _COALESCED_SPLIT_KV_ROPE_CACHE_VARIANT
+    ):
+        return extension.split_kv_q1_rope_cache_attention_coalesced(
             qkv,
             cache_keys,
             cache_values,

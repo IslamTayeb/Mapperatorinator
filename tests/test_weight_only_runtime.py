@@ -172,6 +172,28 @@ def test_weight_owned_self_attention_records_effective_split_variant() -> None:
     assert counts == before
 
 
+def test_weight_owned_self_attention_records_coalesced_split_separately() -> None:
+    counts = {
+        "weight_only_self_attention_block": 0,
+        "native_q1_rope_cache_self_attention": 0,
+    }
+
+    weight_only_runtime._record_weight_only_self_attention_dispatch(
+        counts,
+        variant="split_kv_8_coalesced",
+        prefix_length=640,
+    )
+
+    assert counts == {
+        "weight_only_self_attention_block": 1,
+        "native_q1_rope_cache_self_attention": 1,
+        "native_q1_rope_cache_self_attention_split_kv_8": 1,
+        "native_q1_rope_cache_self_attention_split_kv_8_prefix_640": 1,
+        "native_q1_rope_cache_self_attention_split_kv_8_coalesced": 1,
+        "native_q1_rope_cache_self_attention_split_kv_8_coalesced_prefix_640": 1,
+    }
+
+
 def test_runtime_initialization_is_idempotent_and_model_owned(monkeypatch) -> None:
     owner = torch.nn.Module()
     state = _state(owner)
