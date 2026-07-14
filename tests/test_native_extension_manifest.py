@@ -14,6 +14,7 @@ from utils.benchmark_native_extension_loading import summarize
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+SOURCE_COMMIT = "1" * 40
 
 
 def _kwargs(source: str = "source") -> dict[str, object]:
@@ -83,6 +84,7 @@ class NativeExtensionManifestTest(unittest.TestCase):
             root = Path(directory)
             manifest = {
                 "schema_version": 1,
+                "source_commit": SOURCE_COMMIT,
                 "abi": native_extension.runtime_abi(),
                 "cuda_arches": ["7.5"],
                 "extensions": {
@@ -111,6 +113,7 @@ class NativeExtensionManifestTest(unittest.TestCase):
             root = Path(directory)
             manifest = {
                 "schema_version": 1,
+                "source_commit": SOURCE_COMMIT,
                 "abi": {
                     **native_extension.runtime_abi(),
                     "torch_version": "wrong",
@@ -155,6 +158,7 @@ class NativeExtensionManifestTest(unittest.TestCase):
                 manifest = native_extension.write_loaded_extension_manifest(
                     output,
                     expected_names=("example_extension",),
+                    source_commit=SOURCE_COMMIT,
                 )
 
             entry = manifest["extensions"]["example_extension"]
@@ -164,6 +168,75 @@ class NativeExtensionManifestTest(unittest.TestCase):
                 entry["library_sha256"], native_extension._sha256_file(copied)
             )
             self.assertEqual(json.loads(output.read_text()), manifest)
+
+    def test_packaged_manifest_validates_exact_commit_manifest_and_cache_hashes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "package"
+            libraries = package / "libraries"
+            cache = root / "cache" / "example_extension"
+            libraries.mkdir(parents=True)
+            cache.mkdir(parents=True)
+            library = libraries / "example_extension.so"
+            cached = cache / "example_extension.so"
+            library.write_bytes(b"same extension")
+            cached.write_bytes(library.read_bytes())
+            library_hash = native_extension._sha256_file(library)
+            manifest = {
+                "schema_version": 1,
+                "source_commit": SOURCE_COMMIT,
+                "abi": native_extension.runtime_abi(),
+                "cuda_arches": ["7.5"],
+                "extensions": {
+                    "example_extension": {
+                        "source_sha256": "a" * 64,
+                        "library": "libraries/example_extension.so",
+                        "library_sha256": library_hash,
+                        "functions": ["call"],
+                    }
+                },
+            }
+            manifest_path = package / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest))
+            manifest_hash = native_extension._sha256_file(manifest_path)
+            with mock.patch.dict(
+                os.environ,
+                {"TORCH_CUDA_ARCH_LIST": "7.5"},
+                clear=False,
+            ), mock.patch.object(
+                native_extension.torch.cuda, "is_available", return_value=False
+            ):
+                report = native_extension.validate_packaged_manifest(
+                    manifest_path,
+                    expected_source_commit=SOURCE_COMMIT,
+                    expected_manifest_sha256=manifest_hash,
+                    extension_cache_root=root / "cache",
+                )
+                self.assertTrue(report["pass"])
+                with self.assertRaisesRegex(RuntimeError, "manifest hash mismatch"):
+                    native_extension.validate_packaged_manifest(
+                        manifest_path,
+                        expected_source_commit=SOURCE_COMMIT,
+                        expected_manifest_sha256="0" * 64,
+                        extension_cache_root=root / "cache",
+                    )
+                with self.assertRaisesRegex(RuntimeError, "commit mismatch"):
+                    native_extension.validate_packaged_manifest(
+                        manifest_path,
+                        expected_source_commit="2" * 40,
+                        expected_manifest_sha256=manifest_hash,
+                        extension_cache_root=root / "cache",
+                    )
+                cached.write_bytes(b"corrupted")
+                with self.assertRaisesRegex(RuntimeError, "artifact hash mismatch"):
+                    native_extension.validate_packaged_manifest(
+                        manifest_path,
+                        expected_source_commit=SOURCE_COMMIT,
+                        expected_manifest_sha256=manifest_hash,
+                        extension_cache_root=root / "cache",
+                    )
 
     def test_loading_summary_requires_parity_and_half_second_saving(self) -> None:
         passed = summarize(
