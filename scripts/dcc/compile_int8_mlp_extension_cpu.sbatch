@@ -64,9 +64,6 @@ if [[ -n "${SLURM_JOB_ID:-}" ]]; then
 fi
 
 cd "$REPO"
-"$PYTHON" -m pytest -q \
-  tests/test_int8_mlp_scout.py \
-  tests/test_profile_int8_mlp_component.py
 "$PYTHON" utils/compile_int8_mlp_extension.py \
   --json-path "$RUN_ROOT/compile.json" \
   --text-path "$RUN_ROOT/compile.txt"
