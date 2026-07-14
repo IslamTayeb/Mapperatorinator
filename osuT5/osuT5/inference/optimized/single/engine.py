@@ -182,6 +182,28 @@ def _native_cross_mlp_tail_enabled(
     return context_type != ContextType.TIMING
 
 
+TIMING_NATIVE_SELF_VERSION = "fp32-timing-native-self-v1"
+
+
+def _timing_native_self_metadata() -> dict[str, Any]:
+    return {
+        "version": TIMING_NATIVE_SELF_VERSION,
+        "scope": "timing-context-only",
+        "precision": "fp32",
+        "torch_dtype": "torch.float32",
+        "result_class": "exact",
+        "exactness_claim": True,
+        "native_q1_self_attention": True,
+        "native_q1_rope_cache_self_attention": True,
+        "split_kv_selector": True,
+        "q1_bmm_cross_attention_retained": True,
+        "native_cross_mlp_tail_retained_disabled": True,
+        "approximate_weight_only_retained_disabled": True,
+        "original_decoder_forward_retained": True,
+        "production_selector_unchanged": True,
+    }
+
+
 @torch.no_grad()
 def _generate_window(
     model,
@@ -194,6 +216,7 @@ def _generate_window(
     allow_batched_decode: bool = False,
     specialized_dispatch_batch_size: int | None = None,
     approximate_weight_only_state: Any | None = None,
+    timing_native_self_owner: torch.nn.Module | None = None,
 ):
     expected_dtype = preset.torch_dtype
     if model.dtype != expected_dtype:
@@ -258,6 +281,22 @@ def _generate_window(
                 "approximate FP16-weight candidate requires the FP32 optimized preset"
             )
         approximate_weight_only_state.validate_owner(model)
+    if timing_native_self_owner is not None:
+        if timing_native_self_owner is not model:
+            raise RuntimeError(
+                "FP32 timing-native-self runtime is bound to a different model"
+            )
+        if preset.precision != "fp32" or model.dtype != torch.float32:
+            raise TypeError("timing-native-self runtime requires FP32 model storage")
+        if approximate_weight_only_state is not None:
+            raise RuntimeError(
+                "timing-native-self runtime cannot share a model runtime with "
+                "mixed weights"
+            )
+        if context_type != ContextType.TIMING:
+            raise RuntimeError(
+                "timing-native-self runtime may execute only timing context"
+            )
     approximate_weight_only_enabled = (
         approximate_weight_only_state is not None
         and specialized_batch
@@ -271,9 +310,17 @@ def _generate_window(
         else None
     )
     q1_bmm_cross_attention = specialized_batch
+    timing_native_self_enabled = (
+        timing_native_self_owner is not None
+        and specialized_batch
+        and context_type == ContextType.TIMING
+    )
     native_q1_self_attention = (
         specialized_batch
-        and context_type != ContextType.TIMING
+        and (
+            context_type != ContextType.TIMING
+            or timing_native_self_enabled
+        )
         and not approximate_weight_only_enabled
     )
     native_q1_rope_cache_self_attention = native_q1_self_attention
@@ -406,6 +453,8 @@ def _generate_window(
         "optimized_dispatch_mode": (
             "approximate_weight_only_batch1"
             if approximate_weight_only_enabled
+            else "fp32_timing_native_self_batch1"
+            if timing_native_self_enabled
             else "accepted_batch1"
             if specialized_batch
             else "framework_batch"
@@ -447,7 +496,11 @@ def _generate_window(
                 ),
             },
             "effective_native_q1_rope_cache_self_attention": {
-                "requested": specialized_batch and context_type != ContextType.TIMING,
+                "requested": specialized_batch
+                and (
+                    context_type != ContextType.TIMING
+                    or timing_native_self_enabled
+                ),
                 "enabled": effective_native_q1_rope_cache_self_attention,
                 "owner": effective_native_q1_owner,
                 "kernel": (
@@ -512,6 +565,19 @@ def _generate_window(
         ),
         "optimized_cuda_graphs": context_state.graph_profile_summary(),
     })
+    if timing_native_self_owner is not None:
+        stats["optimized_dispatch_policy"]["timing_native_self"] = {
+            "requested": True,
+            "enabled": timing_native_self_enabled,
+            "disabled_reason": (
+                None
+                if timing_native_self_enabled
+                else batched_policy_disabled_reason
+            ),
+            "result_class": "exact",
+            "exactness_claim": True,
+        }
+        stats["optimized_timing_native_self"] = _timing_native_self_metadata()
     if approximate_weight_only_state is not None:
         stats["optimized_dispatch_policy"]["approximate_weight_only"] = {
             "requested": True,
@@ -536,6 +602,12 @@ def _generate_window(
 class OptimizedSingleRuntime:
     preset: OptimizedPreset
     _approximate_weight_only_state: Any | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _timing_native_self_owner: torch.nn.Module | None = field(
         default=None,
         init=False,
         repr=False,
@@ -574,6 +646,30 @@ class OptimizedSingleRuntime:
         state = ApproximateWeightOnlyState.initialize(model)
         object.__setattr__(self, "_approximate_weight_only_state", state)
         return state.metadata()
+
+    def initialize_fp32_timing_native_self(
+        self,
+        model: torch.nn.Module,
+    ) -> dict[str, Any]:
+        """Opt one standalone FP32 timing model into accepted native self kernels."""
+        if self.preset.precision != "fp32":
+            raise TypeError("timing-native-self runtime requires the FP32 preset")
+        if not isinstance(model, torch.nn.Module):
+            raise TypeError("timing-native-self runtime requires a torch module")
+        if model.dtype != torch.float32:
+            raise TypeError("timing-native-self runtime requires FP32 model storage")
+        if self._approximate_weight_only_state is not None:
+            raise RuntimeError(
+                "timing-native-self runtime requires a standalone timing model "
+                "without mixed weights"
+            )
+        existing = self._timing_native_self_owner
+        if existing is not None and existing is not model:
+            raise RuntimeError(
+                "timing-native-self runtime is already bound to a different model"
+            )
+        object.__setattr__(self, "_timing_native_self_owner", model)
+        return _timing_native_self_metadata()
 
     def initialize_approximate_weight_only_cross(
         self,
@@ -714,6 +810,7 @@ class OptimizedSingleRuntime:
             context_state=context_state,
             preset=self.preset,
             approximate_weight_only_state=self._approximate_weight_only_state,
+            timing_native_self_owner=self._timing_native_self_owner,
         )
 
     def profile_metadata(self) -> dict[str, Any]:
@@ -730,6 +827,10 @@ class OptimizedSingleRuntime:
                 self._approximate_weight_only_state.metadata()
             )
             metadata["optimized_result_class"] = "documented-drift"
+        if self._timing_native_self_owner is not None:
+            metadata["optimized_timing_native_self"] = (
+                _timing_native_self_metadata()
+            )
         return metadata
 
 

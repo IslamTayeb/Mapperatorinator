@@ -1576,6 +1576,7 @@ class Processor(object):
             "optimized_batched_super_timing",
             "optimized_dispatch_mode",
             "optimized_dispatch_policy",
+            "optimized_timing_native_self",
             "native_cross_mlp_tail_requested",
             "native_cross_mlp_tail_enabled",
             "native_cross_mlp_tail_disabled_reason",
