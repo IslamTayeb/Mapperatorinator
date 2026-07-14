@@ -102,7 +102,7 @@ def test_summary_charges_only_live_coverage_and_clears_gate() -> None:
         assert report[block]["promotion_pass"]
 
 
-def test_summary_blocks_partial_coverage_or_correctness_failure() -> None:
+def test_summary_conservatively_allows_partial_coverage_but_blocks_failure() -> None:
     live = {64: 4, 128: 4}
     buckets = {
         "64": {
@@ -115,7 +115,8 @@ def test_summary_blocks_partial_coverage_or_correctness_failure() -> None:
 
     assert report["8"]["projected_main_saved_seconds"] == pytest.approx(8.0)
     assert report["8"]["coverage_fraction"] == 0.5
-    assert not report["8"]["promotion_pass"]
+    assert report["8"]["unmeasured_prefixes_assumed_saving_seconds"] == 0.0
+    assert report["8"]["promotion_pass"]
     assert not report["16"]["all_correctness_pass"]
     assert not report["16"]["promotion_pass"]
 

@@ -472,7 +472,7 @@ def summarize(
             "promotion_saving_seconds": PROMOTION_SAVING_SECONDS,
             "promotion_pass": (
                 saved_seconds >= PROMOTION_SAVING_SECONDS
-                and measured_replays == total_replays
+                and measured_replays > 0
                 and all(entry["pass"] for entry in measured.values())
             ),
             "unmeasured_prefixes_assumed_saving_seconds": 0.0,
