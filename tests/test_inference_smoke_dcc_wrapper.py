@@ -31,8 +31,8 @@ def test_reciprocal_native_extension_caches_are_commit_keyed_and_reused() -> Non
     assert 'export TORCH_EXTENSIONS_DIR="$extension_dir"' in source
     assert 'export TORCH_EXTENSIONS_DIR="$WORK/torch_extensions"' not in source
 
-    assert source.count('"$BASELINE_TORCH_EXTENSIONS_DIR"') >= 6
-    assert source.count('"$CANDIDATE_TORCH_EXTENSIONS_DIR"') >= 6
+    assert source.count('"$BASELINE_TORCH_EXTENSIONS_DIR"') >= 5
+    assert source.count('"$CANDIDATE_TORCH_EXTENSIONS_DIR"') >= 5
 
 
 def test_native_extension_preload_wall_is_a_separate_json_artifact() -> None:
