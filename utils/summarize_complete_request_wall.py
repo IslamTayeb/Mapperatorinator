@@ -314,10 +314,17 @@ def summarize(control_payload: Any, budget_payload: Any) -> dict[str, Any]:
         "measurement_scope": {
             "request_to_output": "validate_inputs start through final output write finish",
             "cold_in_process": "compile_args start through final output write finish",
+            "authoritative_performance_role": "control",
+            "budget_role": "instrumentation diagnostic",
+            "stage_boundary_cuda_synchronization": True,
             "excludes": [
                 "Python process launch and imports before compile_args",
                 "profile JSON serialization after final output write",
             ],
+            "cold_cache_caveat": (
+                "cold_in_process is process-local; shared filesystem, model, and native "
+                "build caches may already be warm"
+            ),
         },
         "group_order": list(GROUP_STAGE_NAMES),
         "request_group_order": list(REQUEST_GROUPS),
