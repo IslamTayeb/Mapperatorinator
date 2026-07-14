@@ -278,6 +278,32 @@ def test_exact_fp32_reports_reciprocal_order_aware_metrics(tmp_path: Path) -> No
     assert "metric.complete_request_wall_seconds=" in text_report(report)
 
 
+def test_fixed_work_normalization_uses_each_arms_measured_tps(tmp_path: Path) -> None:
+    report = analyze(
+        _four_runs(tmp_path),
+        fixed_timing_tokens=821,
+        fixed_main_tokens=8294,
+    )
+
+    fixed_main = report["metrics"][
+        "fixed_main_generation_model_seconds_at_8294_tokens"
+    ]
+    assert fixed_main["baseline_median"] == pytest.approx(8294 / (4 / 10.2))
+    assert fixed_main["candidate_median"] == pytest.approx(8294 / (4 / 8.2))
+    assert report["measurement_scope"]["fixed_work_tokens"] == {
+        "timing_context": 821,
+        "main_generation": 8294,
+    }
+    text = text_report(report)
+    assert "metric.fixed_timing_context_model_seconds_at_821_tokens=" in text
+    assert "metric.fixed_main_generation_model_seconds_at_8294_tokens=" in text
+
+
+def test_fixed_work_requires_positive_integer_counts(tmp_path: Path) -> None:
+    with pytest.raises(CandidateAnalysisError, match="positive integer"):
+        analyze(_four_runs(tmp_path), fixed_main_tokens=0)
+
+
 def test_exact_dispatch_delta_requires_a_used_explicit_pattern(tmp_path: Path) -> None:
     profiles = _four_runs(tmp_path, split_kv=True)
     with pytest.raises(CandidateAnalysisError, match="undeclared"):

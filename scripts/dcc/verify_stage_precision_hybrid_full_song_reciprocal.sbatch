@@ -21,6 +21,11 @@ REMOTE=${MAPPERATORINATOR_REMOTE:-origin}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 PROFILE_CONFIG=${PROFILE_CONFIG:-profile_salvalai}
 RUN_LABEL=${RUN_LABEL:-fp16-timing-hybrid-full-song-reciprocal}
+CONTROL_RUNNER=${CONTROL_RUNNER:-utils/run_stage_aware_k4_mixed_control.py}
+CANDIDATE_RUNNER=${CANDIDATE_RUNNER:-utils/run_k4_stage_precision_hybrid.py}
+REQUIRE_SHARED_ROPE=${REQUIRE_SHARED_ROPE:-false}
+FIXED_TIMING_TOKENS=${FIXED_TIMING_TOKENS:-821}
+FIXED_MAIN_TOKENS=${FIXED_MAIN_TOKENS:-8294}
 RUN_ROOT="$WORK/runs/$RUN_LABEL-${SLURM_JOB_ID:-manual}"
 TORCH_EXTENSIONS_DIR="$WORK/torch_extensions/stage-precision-hybrid-$COMMIT"
 
@@ -166,10 +171,10 @@ run_profile() {
   local kind=$2
   local output="$RUN_ROOT/$role"
   local init_json="$RUN_ROOT/$role.initialization.json"
-  local runner=utils/run_stage_aware_k4_mixed_control.py
+  local runner=$CONTROL_RUNNER
   local validation_role=control
   if [[ "$kind" == candidate ]]; then
-    runner=utils/run_k4_stage_precision_hybrid.py
+    runner=$CANDIDATE_RUNNER
     validation_role=candidate
   elif [[ "$kind" != control ]]; then
     echo "unknown run kind $kind" >&2
@@ -214,6 +219,12 @@ run_profile() {
       --block-size 4 \
       --timing-block-size 1 \
       > "$RUN_ROOT/$role.k4-validation.json"
+    if [[ "$REQUIRE_SHARED_ROPE" == true ]]; then
+      "$PYTHON" utils/validate_shared_rope_stage_initialization.py \
+        --initialization "$init_json" \
+        --role "$validation_role" \
+        > "$RUN_ROOT/$role.shared-rope-validation.json"
+    fi
   )
 }
 
@@ -236,6 +247,8 @@ BASELINE_SECOND=$(<"$RUN_ROOT/baseline_second.profile-path.txt")
     --baseline-second-profile "$BASELINE_SECOND" \
     --mode relaxed \
     --allow-mixed-stage-precision \
+    --fixed-timing-tokens "$FIXED_TIMING_TOKENS" \
+    --fixed-main-tokens "$FIXED_MAIN_TOKENS" \
     --require-dispatch-declaration \
     --allow-dispatch-delta \
       'records.timing_context[[]*].optimized_effective_config_version' \
@@ -264,6 +277,10 @@ for role in baseline_first candidate_first candidate_second baseline_second; do
       exit 2
     fi
   done
+  if [[ "$REQUIRE_SHARED_ROPE" == true && ! -s "$RUN_ROOT/$role.shared-rope-validation.json" ]]; then
+    echo "missing required artifact $role.shared-rope-validation.json" >&2
+    exit 2
+  fi
 done
 for artifact in extension-preload.json reciprocal-analysis.json reciprocal-analysis.txt; do
   if [[ ! -s "$RUN_ROOT/$artifact" ]]; then
@@ -279,9 +296,21 @@ grep -q '^dispatch.declaration_pass=true$' "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^metric.timing_model_seconds=' "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^metric.main_model_seconds=' "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^metric.complete_request_wall_seconds=' "$RUN_ROOT/reciprocal-analysis.txt"
+grep -q '^metric.timing_outer_stage_wall_seconds=' "$RUN_ROOT/reciprocal-analysis.txt"
+grep -q '^metric.main_outer_stage_wall_seconds=' "$RUN_ROOT/reciprocal-analysis.txt"
+grep -q '^metric.timing_tokens=' "$RUN_ROOT/reciprocal-analysis.txt"
+grep -q '^metric.main_tokens=' "$RUN_ROOT/reciprocal-analysis.txt"
+grep -q "^metric.fixed_timing_context_model_seconds_at_${FIXED_TIMING_TOKENS}_tokens=" \
+  "$RUN_ROOT/reciprocal-analysis.txt"
+grep -q "^metric.fixed_main_generation_model_seconds_at_${FIXED_MAIN_TOKENS}_tokens=" \
+  "$RUN_ROOT/reciprocal-analysis.txt"
+grep -q '^metric.peak_cuda_memory_allocated_mb=' "$RUN_ROOT/reciprocal-analysis.txt"
+grep -q '^metric.setup_plus_capture_seconds=' "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^divergence.timing_context=' "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^divergence.main_generation=' "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^divergence.final_map_equal=' "$RUN_ROOT/reciprocal-analysis.txt"
+grep -q '^divergence.osu.timing_points_delta=' "$RUN_ROOT/reciprocal-analysis.txt"
+grep -q '^divergence.osu.hit_objects_delta=' "$RUN_ROOT/reciprocal-analysis.txt"
 find "$RUN_ROOT" -type f \
   \( -name '*.profile.json' -o -name '*analysis.json' -o -name '*validation.json' \) \
   -print0 | sort -z | xargs -0 sha256sum

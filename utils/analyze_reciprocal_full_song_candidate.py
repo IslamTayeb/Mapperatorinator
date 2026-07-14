@@ -990,6 +990,8 @@ def analyze(
     required_exact_dispatch_labels: Sequence[str] = (),
     require_dispatch_declaration: bool = False,
     allow_mixed_stage_precision: bool = False,
+    fixed_timing_tokens: int | None = None,
+    fixed_main_tokens: int | None = None,
 ) -> dict[str, Any]:
     if mode not in MODES:
         raise CandidateAnalysisError(f"mode must be one of {MODES}")
@@ -1005,6 +1007,21 @@ def analyze(
         )
         for role in RUN_ORDER
     }
+    fixed_work_tokens = {
+        "timing_context": fixed_timing_tokens,
+        "main_generation": fixed_main_tokens,
+    }
+    for label, tokens in fixed_work_tokens.items():
+        if tokens is None:
+            continue
+        if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens <= 0:
+            raise CandidateAnalysisError(
+                f"fixed {label} token count must be a positive integer"
+            )
+        tps_key = "timing_tps" if label == "timing_context" else "main_tps"
+        metric_key = f"fixed_{label}_model_seconds_at_{tokens}_tokens"
+        for run in runs.values():
+            run.metrics[metric_key] = tokens / run.metrics[tps_key]
     sequences = {role: runs[role].stage_sequence for role in RUN_ORDER}
     _require_equal(sequences, name="stage sequence")
     workload = _validate_workloads(runs, mode=mode)
@@ -1034,6 +1051,11 @@ def analyze(
             "cold_process_stage_sum": "sum of measured stage walls from compile_args through final write",
             "cold_process_outer_wall": "compile_args start through final write finish",
             "reciprocal_order": "baseline,candidate,candidate,baseline",
+            "fixed_work_tokens": {
+                label: tokens
+                for label, tokens in fixed_work_tokens.items()
+                if tokens is not None
+            },
         },
         "workload": workload,
         "parity": parity,
@@ -1159,6 +1181,8 @@ def _arguments() -> argparse.Namespace:
         action="store_true",
         help="fail relaxed mode on undeclared or unused dispatch/cache deltas",
     )
+    parser.add_argument("--fixed-timing-tokens", type=int)
+    parser.add_argument("--fixed-main-tokens", type=int)
     parser.add_argument("--json-output", type=Path, required=True)
     parser.add_argument("--text-output", type=Path, required=True)
     return parser.parse_args()
@@ -1178,6 +1202,8 @@ def main() -> None:
         required_exact_dispatch_labels=args.require_exact_dispatch_label,
         require_dispatch_declaration=args.require_dispatch_declaration,
         allow_mixed_stage_precision=args.allow_mixed_stage_precision,
+        fixed_timing_tokens=args.fixed_timing_tokens,
+        fixed_main_tokens=args.fixed_main_tokens,
     )
     args.json_output.parent.mkdir(parents=True, exist_ok=True)
     args.text_output.parent.mkdir(parents=True, exist_ok=True)
