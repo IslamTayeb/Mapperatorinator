@@ -613,6 +613,12 @@ class OptimizedSingleRuntime:
         repr=False,
         compare=False,
     )
+    _persistent_graph_workspace_pool: Any | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self):
         if not isinstance(self.preset, OptimizedPreset):
@@ -626,7 +632,47 @@ class OptimizedSingleRuntime:
             raise ValueError("optimized runtime requires a registered precision preset.")
 
     def new_context_state(self) -> ProductionDecodeSession:
+        if self._persistent_graph_workspace_pool is not None:
+            return self._persistent_graph_workspace_pool.new_request()
         return ProductionDecodeSession()
+
+    def initialize_persistent_graph_workspace_scout(
+        self,
+        model: torch.nn.Module,
+        *,
+        topology_signature: tuple[Any, ...],
+        max_slots: int = 2,
+    ) -> dict[str, Any]:
+        """Initialize the opt-in same-process persistent graph workspace scout."""
+
+        if self._persistent_graph_workspace_pool is not None:
+            raise RuntimeError("persistent graph workspace scout is already initialized")
+        if not isinstance(model, torch.nn.Module):
+            raise TypeError("persistent graph workspace scout requires a torch module")
+        if self._approximate_weight_only_state is not None:
+            self._approximate_weight_only_state.validate_owner(model)
+        if (
+            self._timing_native_self_owner is not None
+            and self._timing_native_self_owner is not model
+        ):
+            raise RuntimeError("persistent graph workspace owner changed")
+        from ..scout.persistent_graph_workspace import PersistentGraphWorkspacePool
+
+        pool = PersistentGraphWorkspacePool(
+            model,
+            topology_signature=topology_signature,
+            packed_state=self._approximate_weight_only_state,
+            max_slots=max_slots,
+        )
+        object.__setattr__(self, "_persistent_graph_workspace_pool", pool)
+        return pool.summary()
+
+    def close_persistent_graph_workspace_scout(self) -> None:
+        pool = self._persistent_graph_workspace_pool
+        if pool is None:
+            return
+        pool.close()
+        object.__setattr__(self, "_persistent_graph_workspace_pool", None)
 
     def initialize_approximate_weight_only(
         self,
@@ -802,16 +848,25 @@ class OptimizedSingleRuntime:
             raise TypeError(
                 "optimized single runtime requires ProductionDecodeSession."
             )
-        return _generate_window(
+        inputs = model_kwargs.get("inputs")
+        if not isinstance(inputs, torch.Tensor) or inputs.ndim < 1:
+            raise TypeError("optimized runtime requires tensor model inputs")
+        with context_state.window_lease(
             model,
-            tokenizer,
-            model_kwargs,
-            dict(generate_kwargs),
-            context_state=context_state,
-            preset=self.preset,
-            approximate_weight_only_state=self._approximate_weight_only_state,
-            timing_native_self_owner=self._timing_native_self_owner,
-        )
+            batch_size=int(inputs.shape[0]),
+            num_beams=int(generate_kwargs.get("num_beams", 1)),
+            cfg_scale=float(generate_kwargs.get("cfg_scale", 1.0)),
+        ):
+            return _generate_window(
+                model,
+                tokenizer,
+                model_kwargs,
+                dict(generate_kwargs),
+                context_state=context_state,
+                preset=self.preset,
+                approximate_weight_only_state=self._approximate_weight_only_state,
+                timing_native_self_owner=self._timing_native_self_owner,
+            )
 
     def profile_metadata(self) -> dict[str, Any]:
         metadata = {
@@ -830,6 +885,10 @@ class OptimizedSingleRuntime:
         if self._timing_native_self_owner is not None:
             metadata["optimized_timing_native_self"] = (
                 _timing_native_self_metadata()
+            )
+        if self._persistent_graph_workspace_pool is not None:
+            metadata["optimized_persistent_graph_workspace_scout"] = (
+                self._persistent_graph_workspace_pool.summary()
             )
         return metadata
 

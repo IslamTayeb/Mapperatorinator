@@ -993,6 +993,8 @@ def k8_active_prefix_decode_generate(
     cuda_graph_min_decode_steps: int = 1,
     shared_graph_cache: dict[Any, dict[str, Any]] | None = None,
     stable_encoder_holder: dict[str, BaseModelOutput] | None = None,
+    k8_request_state: dict[str, Any] | None = None,
+    k8_graph_lifecycle: _K8GraphLifecycle | None = None,
     **model_kwargs,
 ) -> torch.LongTensor:
     """Opt-in full-model+tail K8 loop; defaults never select this callable."""
@@ -1011,7 +1013,11 @@ def k8_active_prefix_decode_generate(
         generation_config.output_logits,
     )):
         raise ValueError("K8 supports tensor outputs only")
-    lifecycle = _ACTIVE_K8_LIFECYCLE
+    lifecycle = (
+        k8_graph_lifecycle
+        if k8_graph_lifecycle is not None
+        else _ACTIVE_K8_LIFECYCLE
+    )
     block_size = _ACTIVE_BLOCK_SIZE
     graph_remainders = _ACTIVE_GRAPH_REMAINDERS
     if lifecycle is None or block_size is None or graph_remainders is None:
@@ -1030,14 +1036,21 @@ def k8_active_prefix_decode_generate(
     )
     if stable_encoder_holder is None:
         raise RuntimeError("K8 requires persistent request-local runtime state")
+    request_state = (
+        stable_encoder_holder
+        if k8_request_state is None
+        else k8_request_state
+    )
+    if not isinstance(request_state, dict):
+        raise TypeError("K8 request state must be a dictionary")
     graph_cache = shared_graph_cache if shared_graph_cache is not None else {}
     lifecycle.activate(graph_cache)
     window_identity = int(
-        stable_encoder_holder.get("__k8_window_serial__", 0)
+        request_state.get("__k8_window_serial__", 0)
     ) + 1
-    stable_encoder_holder["__k8_window_serial__"] = window_identity
+    request_state["__k8_window_serial__"] = window_identity
     current_request_seed = _request_seed(generator, input_ids.device)
-    stored_request_seed = stable_encoder_holder.setdefault(
+    stored_request_seed = request_state.setdefault(
         "__k8_request_seed__",
         current_request_seed,
     )
@@ -1249,6 +1262,10 @@ def k8_active_prefix_decode_generate(
                 "capture_seconds": entry.capture_seconds,
                 "decode_replays": 0,
                 "k8_stats": stats,
+                "last_request_serial": request_state.get(
+                    "__persistent_request_serial__"
+                ),
+                "cross_request_reuse_hits": 0,
             }
             graph_cache[key] = raw_entry
             stats["capture_seconds"] += entry.capture_seconds
@@ -1258,6 +1275,15 @@ def k8_active_prefix_decode_generate(
         else:
             entry = raw_entry["runtime_entry"]
             raw_entry["k8_stats"] = stats
+            request_serial = request_state.get("__persistent_request_serial__")
+            if (
+                request_serial is not None
+                and raw_entry.get("last_request_serial") != request_serial
+            ):
+                raw_entry["cross_request_reuse_hits"] = int(
+                    raw_entry.get("cross_request_reuse_hits", 0)
+                ) + 1
+                raw_entry["last_request_serial"] = request_serial
             if entry.state is not state or entry.processor is not processor:
                 raise RuntimeError("K8 graph resolved the wrong persistent state")
             for name, static_value in entry.static_inputs.items():

@@ -77,21 +77,41 @@ def _stable_encoder_outputs(
     source = encoder_outputs.last_hidden_state
     if not isinstance(source, torch.Tensor):
         raise RuntimeError("encoder_outputs.last_hidden_state must be a tensor")
-    current = holder.get("encoder_outputs")
+    slots = holder.get("__persistent_encoder_slots__")
+    if slots is not None:
+        if not isinstance(slots, dict):
+            raise TypeError("persistent encoder slots must be a dictionary")
+        if encoder_outputs.hidden_states is not None or encoder_outputs.attentions is not None:
+            raise RuntimeError(
+                "persistent encoder slots require generation without auxiliary outputs"
+            )
+        signature = (
+            tuple(source.shape),
+            tuple(source.stride()),
+            str(source.dtype),
+            str(source.device),
+        )
+        current = slots.get(signature)
+    else:
+        current = holder.get("encoder_outputs")
     if (
         current is None
         or current.last_hidden_state.shape != source.shape
         or current.last_hidden_state.dtype != source.dtype
         or current.last_hidden_state.device != source.device
     ):
-        holder["encoder_outputs"] = BaseModelOutput(
+        current = BaseModelOutput(
             last_hidden_state=source.clone(memory_format=torch.contiguous_format),
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
         )
+        if slots is not None:
+            slots[signature] = current
+        holder["encoder_outputs"] = current
     else:
         current.last_hidden_state.copy_(source)
-    return holder["encoder_outputs"]
+        holder["encoder_outputs"] = current
+    return current
 
 
 def _capture_decode_cuda_graph(

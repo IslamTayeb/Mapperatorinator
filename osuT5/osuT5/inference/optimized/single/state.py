@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -27,6 +28,19 @@ class ProductionDecodeSession:
         dict[str, BaseModelOutput],
     ] = field(default_factory=dict)
     active_state_signature: tuple[Any, ...] | None = None
+
+    def window_lease(
+        self,
+        model,
+        *,
+        batch_size: int,
+        num_beams: int,
+        cfg_scale: float,
+    ):
+        """Return the default request-local no-op workspace lease."""
+
+        del model, batch_size, num_beams, cfg_scale
+        return nullcontext()
 
     @staticmethod
     def _state_signature(
