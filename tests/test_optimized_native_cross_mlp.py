@@ -73,7 +73,7 @@ def test_decoder_layer_keeps_original_forward_and_uses_narrow_hook() -> None:
     ):
         assert VarWhisperDecoderLayer.forward is forward
 
-    assert "decoder_layer_runtime_hooks().cross_mlp_tail_forward" in source
+    assert "runtime_hooks.cross_mlp_tail_forward" in source
     assert "module.forward =" not in source
 
 

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from osuT5.osuT5.inference.optimized.scout import weight_only
+from osuT5.osuT5.inference.optimized.kernels import weight_only
 
 
 def test_extension_is_cold_singleton_and_exposes_all_mixed_weight_kernels(
@@ -24,7 +24,7 @@ def test_extension_is_cold_singleton_and_exposes_all_mixed_weight_kernels(
     assert weight_only.preload_weight_only_extension() is extension
     assert weight_only.preload_weight_only_extension() is extension
     assert len(calls) == 1
-    assert calls[0]["name"] == "mapperatorinator_weight_only_fp16_scout"
+    assert calls[0]["name"] == "mapperatorinator_weight_only_fp16_v1"
     assert calls[0]["functions"] == [
         "weight_only_linear",
         "weight_only_rmsnorm_linear",
@@ -162,6 +162,8 @@ def test_wrappers_preserve_argument_order_and_fp32_output(monkeypatch) -> None:
         first,
         second,
         eps=1e-5,
+        fc1_outputs_per_block=2,
+        fc2_outputs_per_block=4,
     ).dtype == torch.float32
     assert calls.pop(0) == (
         "mlp",
@@ -173,7 +175,8 @@ def test_wrappers_preserve_argument_order_and_fp32_output(monkeypatch) -> None:
             second.weight,
             second.bias,
             1e-5,
-            8,
+            2,
+            4,
         ),
     )
 
@@ -190,16 +193,14 @@ def test_decoder_pack_reports_replacement_and_scout_memory_separately() -> None:
     pack = weight_only.DecoderWeightPack(
         self_qkv=packed(12, 4),
         self_out=packed(4, 4),
-        cross_q=packed(4, 4),
-        cross_out=packed(4, 4),
         fc1=packed(16, 4),
         fc2=packed(4, 16),
     )
 
     report = pack.memory_report()
-    assert report["packed_weight_bytes"] * 2 == report["source_weight_bytes"]
-    assert report["projected_replacement_saving_bytes"] == report["packed_weight_bytes"]
-    assert report["scout_resident_increment_bytes"] == report["packed_weight_bytes"]
+    assert report["packed_weight_bytes"] * 2 == report["retained_fp32_source_weight_bytes"]
+    assert report["hypothetical_saving_if_fp32_sources_freed_bytes"] == report["packed_weight_bytes"]
+    assert report["resident_increment_bytes"] == report["packed_weight_bytes"]
 
 
 def test_pack_requires_fp32_cuda_source_without_silently_converting_bias(
