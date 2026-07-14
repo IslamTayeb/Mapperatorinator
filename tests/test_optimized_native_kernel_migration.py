@@ -262,7 +262,7 @@ def test_fp32_sm75_live_prefix_routes_split8_and_other_cases_fall_back(
     assert calls[1][1][-1] == 128
 
 
-def test_split_kv_policy_is_fp32_sm75_and_live_prefix_only(monkeypatch):
+def test_split_kv_policy_is_fp32_sm75_and_live_prefix_only():
     from osuT5.osuT5.inference.optimized.kernels import q1_attention
 
     assert q1_attention.native_q1_rope_cache_attention_variant(
@@ -275,6 +275,27 @@ def test_split_kv_policy_is_fp32_sm75_and_live_prefix_only(monkeypatch):
         range(192, 833, 64)
     )
     assert q1_attention._SPLIT_KV_Q1_SPLITS == 8
+    assert q1_attention._split_kv_q1_eligible(
+        dtype=torch.float32,
+        device_type="cuda",
+        active_prefix_length=640,
+        capability=(7, 5),
+    )
+    for overrides in (
+        {"dtype": torch.float16},
+        {"device_type": "cpu"},
+        {"active_prefix_length": 128},
+        {"active_prefix_length": 896},
+        {"capability": (8, 0)},
+    ):
+        arguments = {
+            "dtype": torch.float32,
+            "device_type": "cuda",
+            "active_prefix_length": 640,
+            "capability": (7, 5),
+        }
+        arguments.update(overrides)
+        assert not q1_attention._split_kv_q1_eligible(**arguments)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
