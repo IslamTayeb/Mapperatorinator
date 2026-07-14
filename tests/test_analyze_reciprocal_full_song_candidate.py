@@ -318,6 +318,50 @@ def test_exact_dispatch_delta_requires_a_used_explicit_pattern(tmp_path: Path) -
         )
 
 
+def test_declared_dispatch_mapping_and_scout_metadata_paths_are_used(
+    tmp_path: Path,
+) -> None:
+    profiles = _four_runs(tmp_path)
+    for role in ("candidate_first", "candidate_second"):
+        path = profiles[role]
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        record = next(
+            value
+            for value in payload["generation"]
+            if value["profile_label"] == "timing_context"
+        )
+        record["optimized_dispatch_mode"] = "fp32_timing_native_self_batch1"
+        record["optimized_dispatch_policy"] = {
+            "timing_native_self_scout": {"requested": True, "enabled": True}
+        }
+        record["optimized_timing_native_self_scout"] = {
+            "version": "fp32-timing-native-self-v1",
+            "enabled": True,
+        }
+        record["optimized_dispatch_capture_hits"][
+            "native_q1_rope_cache_self_attention"
+        ] += 1
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    patterns = [
+        "records.timing_context[[]*].optimized_dispatch_mode",
+        "records.timing_context[[]*].optimized_dispatch_policy.*",
+        "records.timing_context[[]*].optimized_timing_native_self_scout.*",
+        "records.timing_context[[]*].optimized_dispatch_capture_hits",
+        "records.timing_context[[]*].optimized_dispatch_capture_hits.*",
+    ]
+    report = analyze(profiles, allowed_dispatch_deltas=patterns)
+    topology = report["parity"]["dispatch_cache_topology"]
+
+    assert topology["pass"] is True
+    assert topology["unused_patterns"] == []
+    assert topology["undeclared_paths"] == []
+    assert topology["matched_paths_by_pattern"][patterns[3]] == [
+        "records.timing_context[0].optimized_dispatch_capture_hits."
+        "native_q1_rope_cache_self_attention"
+    ]
+
+
 def test_exact_mode_rejects_token_or_final_map_divergence(tmp_path: Path) -> None:
     profiles = _four_runs(tmp_path, main_tokens=[10, 99, 12, 13])
     with pytest.raises(CandidateAnalysisError, match="tokens, stopping, or final OSU"):

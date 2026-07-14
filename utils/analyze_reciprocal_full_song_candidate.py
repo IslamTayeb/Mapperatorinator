@@ -113,6 +113,11 @@ INVARIANT_EFFECTIVE_CONFIG = {
     "native_q1_rope_cache_self_attention": True,
 }
 FIXED_MAIN_STEPS = 8_294
+DECLARABLE_DISPATCH_RECORD_KEYS = (
+    "optimized_dispatch_mode",
+    "optimized_dispatch_policy",
+    "optimized_timing_native_self_scout",
+)
 
 
 class CandidateAnalysisError(ValueError):
@@ -577,8 +582,23 @@ def _validate_allowed_differences(
     undeclared: list[str] = []
     for difference in differences:
         path = str(difference["path"])
+        # ``_flatten`` emits only leaf paths for non-empty mappings.  Treat a
+        # declared mapping path as matching its changed descendants as well;
+        # otherwise a required declaration such as
+        # ``...optimized_dispatch_capture_hits`` can never be used when the
+        # mapping is non-empty.
+        path_and_parents = [path]
+        parent = path
+        while "." in parent:
+            parent = parent.rsplit(".", 1)[0]
+            path_and_parents.append(parent)
         matches = [
-            pattern for pattern in all_patterns if fnmatch.fnmatchcase(path, pattern)
+            pattern
+            for pattern in all_patterns
+            if any(
+                fnmatch.fnmatchcase(candidate_path, pattern)
+                for candidate_path in path_and_parents
+            )
         ]
         if not matches:
             undeclared.append(path)
@@ -773,9 +793,21 @@ def _exact_dispatch_label_material(run: ParsedRun, label: str) -> list[dict[str,
     """Compare executed dispatch while ignoring explicit zero-only counter keys."""
 
     records = run.graph_signature["material"]["records"].get(label, [])
+    source_records = [
+        record
+        for record in run.profile.get("generation", [])
+        if isinstance(record, dict) and record.get("profile_label") == label
+    ]
+    if len(source_records) != len(records):
+        raise CandidateAnalysisError(
+            f"{run.role} {label} dispatch material/source record counts differ"
+        )
     normalized: list[dict[str, Any]] = []
-    for record in records:
+    for record, source in zip(records, source_records, strict=True):
         values = dict(record)
+        for key in DECLARABLE_DISPATCH_RECORD_KEYS:
+            if key in source:
+                values[key] = source[key]
         hits = values.get("optimized_dispatch_capture_hits")
         if isinstance(hits, dict):
             values["optimized_dispatch_capture_hits"] = {
