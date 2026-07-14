@@ -795,6 +795,7 @@ if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
 elif [[ "$REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL" == true ]]; then
   ANALYSIS_EXACT_ARGS=(
     --require-exact-label timing_context
+    --require-exact-label main_generation
     --require-exact-dispatch-label timing_context
   )
   ANALYSIS_DISPATCH_ARGS=(
@@ -877,18 +878,22 @@ fi
 grep -q '^parity.baseline_repeat_stable=true$' "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^parity.candidate_repeat_stable=true$' "$RUN_ROOT/reciprocal-analysis.txt"
 EXPECTED_EXACT_LABELS=none
+EXPECTED_EXACT_DISPATCH_LABELS=none
 if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
   EXPECTED_EXACT_LABELS=timing_context,main_generation
+  EXPECTED_EXACT_DISPATCH_LABELS=timing_context,main_generation
 elif [[ "$REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL" == true ]]; then
-  EXPECTED_EXACT_LABELS=timing_context
+  EXPECTED_EXACT_LABELS=timing_context,main_generation
+  EXPECTED_EXACT_DISPATCH_LABELS=timing_context
 elif [[ "$REQUIRE_EXACT_TIMING" == true ]]; then
   EXPECTED_EXACT_LABELS=timing_context
+  EXPECTED_EXACT_DISPATCH_LABELS=timing_context
 fi
 grep -q "^parity.required_exact_labels=$EXPECTED_EXACT_LABELS$" \
   "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^parity.required_exact_labels_pass=true$' \
   "$RUN_ROOT/reciprocal-analysis.txt"
-grep -q "^parity.required_exact_dispatch_labels=$EXPECTED_EXACT_LABELS$" \
+grep -q "^parity.required_exact_dispatch_labels=$EXPECTED_EXACT_DISPATCH_LABELS$" \
   "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^parity.required_exact_dispatch_labels_pass=true$' \
   "$RUN_ROOT/reciprocal-analysis.txt"
