@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 import json
 from pathlib import Path
 import sys
@@ -15,10 +15,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import torch  # noqa: E402
-import torch.nn.functional as F  # noqa: E402
 
 from utils.profile_native_prefix_dtype_scout import (  # noqa: E402
     LayerCapture,
+    SENTINEL_BUCKETS,
     _accepted_main_session_run,
     _all_cache_snapshots,
     _assert_scout_args,
@@ -29,8 +29,6 @@ from utils.profile_native_prefix_dtype_scout import (  # noqa: E402
     _max_abs,
     _reciprocal_graph_rounds,
     _restore_all_cache,
-    select_buckets,
-    validate_accepted_graph_cache,
 )
 
 
@@ -49,19 +47,288 @@ CURRENT_BASELINE = {
     "cross_out_residual": "fp32_weight",
     "final_norm_logits": "fp16_weight",
 }
+EXCLUDED_ALREADY_INT8_REGIONS = ("mlp_fc1", "mlp_fc2")
+RETAINED_COMPOSITION_VERSION = (
+    "k4-split-kv-mixed-weight-shared-rope-k1-remainder-int8-mlp-v1"
+)
+REQUIRED_DISPATCHES = (
+    "weight_only_self_attention_block",
+    "native_q1_rope_cache_self_attention",
+    "q1_bmm_cross_attention",
+    "weight_only_mlp_tail",
+    "int8_weight_mlp_tail",
+    "weight_only_final_projection",
+)
 OUTPUTS_PER_BLOCK = (2, 4, 8)
 FIXED_MAIN_SAVING_GATE_SECONDS = 0.5
-AUDITED_CURRENT_REGION_SECONDS = {
-    "self_norm_qkv": 0.6724584794483185,
-    "self_out_residual": 0.4069147370853424,
-    "cross_norm_q": 0.4132181438140869,
-    "cross_out_residual": 0.40312816597938533,
-    "final_norm_logits": 0.08943501430416106,
-}
 MEASURED_INT8_VS_FP16_MLP_SPEEDUP = 1.3666607805044033
-AUDITED_REALISTIC_CEILING_SECONDS = sum(AUDITED_CURRENT_REGION_SECONDS.values()) * (
-    1.0 - 1.0 / MEASURED_INT8_VS_FP16_MLP_SPEEDUP
-)
+
+
+def _object(value: Any, *, name: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise TypeError(f"{name} must be an object")
+    return value
+
+
+def _positive_int(value: Any, *, name: str, allow_zero: bool = False) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer")
+    minimum = 0 if allow_zero else 1
+    if value < minimum:
+        qualifier = "non-negative" if allow_zero else "positive"
+        raise ValueError(f"{name} must be {qualifier}")
+    return value
+
+
+def _validate_current_projection_scope(
+    *,
+    regions: Any,
+    baseline_by_region: Any,
+    excluded_regions: Any,
+) -> None:
+    if tuple(regions) != REGIONS:
+        raise RuntimeError(
+            f"projection scout region map changed: expected {REGIONS}, got {regions}"
+        )
+    if dict(baseline_by_region) != CURRENT_BASELINE:
+        raise RuntimeError("projection scout current-baseline dispatch map changed")
+    if tuple(excluded_regions) != EXCLUDED_ALREADY_INT8_REGIONS:
+        raise RuntimeError("projection scout must exclude the retained INT8 MLP regions")
+    overlap = set(regions) & set(excluded_regions)
+    if overlap:
+        raise RuntimeError(f"projection scout double-counts INT8 MLP regions: {overlap}")
+
+
+def _validate_weight_state_metadata(metadata: Any) -> dict[str, Any]:
+    value = _object(metadata, name="weight_state")
+    exact = {
+        "version": "approximate-fp16-weights-fp32-state-v2",
+        "result_class": "documented-drift",
+        "exactness_claim": False,
+        "fp32_activations_caches_reductions_logits": True,
+        "fp16_weight_regions": [
+            "self_qkv",
+            "self_output",
+            "mlp_fc1",
+            "mlp_fc2",
+            "final_logits",
+        ],
+        "fp32_selected_decode_matrix_regions": ["cross_query", "cross_output"],
+        "outputs_per_block": {
+            "self_qkv": 4,
+            "self_output": 4,
+            "mlp_fc1": 2,
+            "mlp_fc2": 4,
+            "final_logits": 2,
+        },
+    }
+    for key, expected in exact.items():
+        if value.get(key) != expected:
+            raise RuntimeError(f"retained weight state changed {key}")
+    overlay = _object(value.get("int8_mlp_overlay"), name="int8_mlp_overlay")
+    overlay_exact = {
+        "version": "per-row-symmetric-int8-mlp-v1",
+        "result_class": "documented-drift",
+        "exactness_claim": False,
+        "scope": "main-model-decoder-mlp-only",
+        "composition_control": "k4-split-kv-mixed-weight-shared-rope-v1",
+        "replaces_effective_regions": list(EXCLUDED_ALREADY_INT8_REGIONS),
+        "retained_unused_fp16_regions": list(EXCLUDED_ALREADY_INT8_REGIONS),
+        "fp32_activations_norm_bias_reductions_residual_outputs": True,
+        "quantization": "symmetric-per-output-row",
+        "dispatch_counter": "int8_weight_mlp_tail",
+    }
+    for key, expected in overlay_exact.items():
+        if overlay.get(key) != expected:
+            raise RuntimeError(f"retained INT8 MLP overlay changed {key}")
+    return value
+
+
+def _validate_dispatch_policy(record: dict[str, Any], *, index: int) -> None:
+    if record.get("optimized_dispatch_mode") != "approximate_weight_only_batch1":
+        raise RuntimeError(f"main generation record {index} changed dispatch mode")
+    policy = _object(
+        record.get("optimized_dispatch_policy"),
+        name=f"main_generation[{index}].optimized_dispatch_policy",
+    )
+    expected_policy = {
+        "q1_bmm_cross_attention": {"enabled": True, "disabled_reason": None},
+        "native_q1_self_attention": {
+            "enabled": False,
+            "disabled_reason": "approximate_weight_only",
+        },
+        "native_q1_rope_cache_self_attention": {
+            "enabled": False,
+            "disabled_reason": "approximate_weight_only",
+        },
+        "effective_native_q1_rope_cache_self_attention": {
+            "enabled": True,
+            "owner": "approximate_weight_only",
+            "kernel": "native_q1_rope_cache_attention",
+            "standard_attention_hook_enabled": False,
+            "split_kv_selector_enabled": True,
+        },
+        "native_cross_mlp_tail": {
+            "enabled": False,
+            "disabled_reason": "approximate_weight_only",
+        },
+    }
+    for name, fields in expected_policy.items():
+        entry = _object(policy.get(name), name=f"dispatch_policy.{name}")
+        for field, expected in fields.items():
+            if entry.get(field) != expected:
+                raise RuntimeError(
+                    f"main generation record {index} changed {name}.{field}"
+                )
+
+    hits = _object(
+        record.get("optimized_dispatch_capture_hits"),
+        name=f"main_generation[{index}].optimized_dispatch_capture_hits",
+    )
+    values = {
+        name: _positive_int(hits.get(name), name=f"dispatch_hits.{name}")
+        for name in REQUIRED_DISPATCHES
+    }
+    if values["weight_only_self_attention_block"] != values[
+        "native_q1_rope_cache_self_attention"
+    ]:
+        raise RuntimeError("weight-only self-attention dispatch ownership diverged")
+    tail = values["q1_bmm_cross_attention"]
+    if not (
+        tail
+        == values["weight_only_mlp_tail"]
+        == values["int8_weight_mlp_tail"]
+    ):
+        raise RuntimeError("cross/INT8-MLP dispatch ownership diverged")
+    for forbidden in ("native_q1_self_attention", "native_cross_mlp_tail"):
+        if int(hits.get(forbidden, 0) or 0) != 0:
+            raise RuntimeError(f"unexpected retained dispatch {forbidden}")
+    split_prefixes = {
+        name: int(count)
+        for name, count in hits.items()
+        if name.startswith(
+            "native_q1_rope_cache_self_attention_split_kv_8_prefix_"
+        )
+    }
+    split_total = int(
+        hits.get("native_q1_rope_cache_self_attention_split_kv_8", 0) or 0
+    )
+    if split_total != sum(split_prefixes.values()):
+        raise RuntimeError("split-KV aggregate dispatch count diverged")
+    if split_total > values["weight_only_self_attention_block"]:
+        raise RuntimeError("split-KV dispatch count exceeds self-attention ownership")
+
+
+def _validate_k1_zero_waste(record: dict[str, Any], *, index: int) -> dict[str, int]:
+    graphs = _object(
+        record.get("optimized_cuda_graphs"),
+        name=f"main_generation[{index}].optimized_cuda_graphs",
+    )
+    runtime = _object(
+        graphs.get("k8_candidate"),
+        name=f"main_generation[{index}].optimized_cuda_graphs.k8_candidate",
+    )
+    if runtime.get("block_size") != 4:
+        raise RuntimeError(f"main generation record {index} did not retain K4")
+    if runtime.get("remainder_backend") != "cuda_graph":
+        raise RuntimeError(f"main generation record {index} did not retain captured K1")
+    counts = {
+        name: _positive_int(
+            runtime.get(name),
+            name=f"k1.{name}",
+            allow_zero=True,
+        )
+        for name in (
+            "prefill_steps",
+            "eligible_steps",
+            "block_replays",
+            "remainder_steps",
+            "remainder_graph_replays",
+            "eager_remainder_steps",
+            "physical_steps",
+            "logical_steps",
+            "wasted_steps",
+        )
+    }
+    if counts["eager_remainder_steps"] != 0:
+        raise RuntimeError("captured K1 fell back to eager remainder steps")
+    if counts["remainder_graph_replays"] != counts["remainder_steps"]:
+        raise RuntimeError("captured K1 did not own every remainder step")
+    if counts["wasted_steps"] != 0 or counts["physical_steps"] != counts["logical_steps"]:
+        raise RuntimeError("K4/K1 retained runtime executed wasted physical steps")
+    if counts["eligible_steps"] != 4 * counts["block_replays"]:
+        raise RuntimeError("K4 block replay accounting diverged")
+    if counts["physical_steps"] != (
+        counts["prefill_steps"]
+        + counts["eligible_steps"]
+        + counts["remainder_steps"]
+    ):
+        raise RuntimeError("K4/K1 physical-step accounting diverged")
+    expected_rng = {
+        "rng_policy": "counter_request_seed_window_prompt_v2",
+        "rng_exact": False,
+        "rng_early_eos_isolation": True,
+        "capture_state_restore_synchronized": True,
+    }
+    for name, expected in expected_rng.items():
+        if runtime.get(name) != expected:
+            raise RuntimeError(f"captured K1 changed {name}")
+    return counts
+
+
+def _validate_retained_composition_manifest(manifest: Any) -> dict[str, Any]:
+    value = _object(manifest, name="retained_composition")
+    if value.get("composition_version") != RETAINED_COMPOSITION_VERSION:
+        raise RuntimeError("retained K1+INT8/shared-RoPE composition version changed")
+    _validate_current_projection_scope(
+        regions=value.get("scouted_regions"),
+        baseline_by_region=value.get("baseline_by_region"),
+        excluded_regions=value.get("excluded_already_int8_regions"),
+    )
+    weight_state = _validate_weight_state_metadata(value.get("weight_state"))
+    shared_rope = _object(value.get("shared_rope"), name="shared_rope")
+    shared_exact = {
+        "version": "shared-decoder-rope-v1",
+        "scope": "main-model-only",
+        "incremental_exactness_claim": True,
+        "original_decoder_forward_required": True,
+    }
+    for name, expected in shared_exact.items():
+        if shared_rope.get(name) != expected:
+            raise RuntimeError(f"retained shared RoPE changed {name}")
+    rope_stats = _object(shared_rope.get("stats"), name="shared_rope.stats")
+    if rope_stats.get("module_count") != DECODER_LAYERS or rope_stats.get("group_count") != 1:
+        raise RuntimeError("shared RoPE no longer covers the complete decoder")
+    forwards = _positive_int(rope_stats.get("forwards"), name="shared_rope.forwards")
+    if rope_stats.get("computes") != forwards or rope_stats.get("expected_computes") != forwards:
+        raise RuntimeError("shared RoPE compute accounting diverged")
+    expected_reuses = (DECODER_LAYERS - 1) * forwards
+    if rope_stats.get("reuses") != expected_reuses or rope_stats.get(
+        "expected_reuses"
+    ) != expected_reuses:
+        raise RuntimeError("shared RoPE reuse accounting diverged")
+
+    records = value.get("main_generation_records")
+    if not isinstance(records, list) or not records:
+        raise RuntimeError("retained composition has no main generation records")
+    totals = {"records": len(records), "remainder_steps": 0, "physical_steps": 0}
+    for index, raw in enumerate(records):
+        record = _object(raw, name=f"main_generation[{index}]")
+        _validate_dispatch_policy(record, index=index)
+        counts = _validate_k1_zero_waste(record, index=index)
+        totals["remainder_steps"] += counts["remainder_steps"]
+        totals["physical_steps"] += counts["physical_steps"]
+    if totals["remainder_steps"] <= 0 or totals["physical_steps"] <= 0:
+        raise RuntimeError("retained K1 evidence contains no real decode work")
+    return {
+        "composition_version": RETAINED_COMPOSITION_VERSION,
+        "baseline_by_region": dict(CURRENT_BASELINE),
+        "excluded_already_int8_regions": list(EXCLUDED_ALREADY_INT8_REGIONS),
+        "weight_state": weight_state,
+        "shared_rope": shared_rope,
+        "k1": totals,
+        "pass": True,
+    }
 
 
 def _eps(module: torch.nn.Module) -> float:
@@ -102,20 +369,21 @@ def _locate_decoder(
 
 def _capture_final_input(
     model: torch.nn.Module,
-    final_norm: torch.nn.Module,
+    final_decoder_layer: torch.nn.Module,
     static_inputs: dict[str, Any],
 ) -> torch.Tensor:
     captured: list[torch.Tensor] = []
 
-    def hook(module, args):
-        del module
+    def hook(module, args, output):
+        del module, args
         if captured:
-            raise RuntimeError("decoder final norm ran more than once")
-        if not args or not isinstance(args[0], torch.Tensor):
-            raise TypeError("decoder final norm did not receive a tensor")
-        captured.append(args[0].detach().clone())
+            raise RuntimeError("final decoder layer ran more than once")
+        hidden = output[0] if isinstance(output, tuple) and output else None
+        if not isinstance(hidden, torch.Tensor):
+            raise TypeError("final decoder layer did not return hidden states")
+        captured.append(hidden.detach().clone())
 
-    handle = final_norm.register_forward_pre_hook(hook)
+    handle = final_decoder_layer.register_forward_hook(hook)
     try:
         model(**static_inputs, return_dict=True)
         torch.cuda.synchronize()
@@ -126,7 +394,10 @@ def _capture_final_input(
     return captured[0]
 
 
-def _prepare_region_inputs(capture: LayerCapture) -> dict[str, torch.Tensor]:
+def _prepare_region_inputs(
+    capture: LayerCapture,
+    fp16_packs: dict[str, Any],
+) -> dict[str, torch.Tensor]:
     from osuT5.osuT5.inference.optimized.kernels.decoder_layer import (
         native_one_token_linear_residual,
         native_one_token_rmsnorm_linear,
@@ -134,24 +405,27 @@ def _prepare_region_inputs(capture: LayerCapture) -> dict[str, torch.Tensor]:
     from osuT5.osuT5.inference.optimized.kernels.q1_attention import (
         native_q1_rope_cache_attention,
     )
+    from osuT5.osuT5.inference.optimized.kernels.dispatch import (
+        _q1_bmm_cross_attention,
+    )
+    from osuT5.osuT5.inference.optimized.kernels.weight_only import (
+        weight_only_linear_residual,
+        weight_only_rmsnorm_linear,
+    )
     from osuT5.osuT5.inference.optimized.scout.native_prefix import (
         _cache_tensors,
         _trim_mask,
-        fp32_rms_norm,
-        framework_q1_attention,
     )
 
     module = capture.module
     self_attn = module.self_attn
     hidden = capture.hidden_states
-    qkv = F.linear(
-        fp32_rms_norm(
-            hidden,
-            module.self_attn_layer_norm.weight,
-            getattr(module.self_attn_layer_norm, "eps", None),
-        ),
-        self_attn.Wqkv.weight,
-        self_attn.Wqkv.bias,
+    qkv = weight_only_rmsnorm_linear(
+        hidden,
+        module.self_attn_layer_norm.weight,
+        fp16_packs["self_norm_qkv"],
+        eps=_eps(module.self_attn_layer_norm),
+        outputs_per_block=4,
     ).view(1, 1, 3, self_attn.num_heads, self_attn.head_dim)
     self_keys, self_values = _cache_tensors(
         capture.past_key_value, "self", capture.layer_idx
@@ -167,10 +441,11 @@ def _prepare_region_inputs(capture: LayerCapture) -> dict[str, torch.Tensor]:
         _trim_mask(capture.attention_mask, capture.active_prefix_length),
         capture.active_prefix_length,
     ).transpose(1, 2).contiguous().view(1, 1, self_attn.all_head_size)
-    after_self = hidden + F.linear(
+    after_self = weight_only_linear_residual(
         self_output,
-        self_attn.Wo.weight,
-        self_attn.Wo.bias,
+        hidden,
+        fp16_packs["self_out_residual"],
+        outputs_per_block=4,
     )
 
     cross_attn = module.cross_attn
@@ -185,8 +460,11 @@ def _prepare_region_inputs(capture: LayerCapture) -> dict[str, torch.Tensor]:
     cross_keys, cross_values = _cache_tensors(
         capture.past_key_value, "cross", capture.layer_idx
     )
-    cross_output = framework_q1_attention(
-        query, cross_keys, cross_values, None
+    cross_output = _q1_bmm_cross_attention(
+        query,
+        cross_keys,
+        cross_values,
+        expected_dtype=torch.float32,
     ).transpose(1, 2).contiguous().view(1, 1, cross_attn.all_head_size)
     after_cross = native_one_token_linear_residual(
         cross_output,
@@ -335,6 +613,7 @@ def summarize_component(
         raise ValueError("invalid measured/total replay counts")
     region_summary: dict[str, Any] = {}
     selected_fixed_saving = 0.0
+    current_projection_family_seconds = 0.0
     failures: dict[str, list[str]] = {}
     for region in REGIONS:
         multiplier = 1 if region == "final_norm_logits" else DECODER_LAYERS
@@ -379,6 +658,8 @@ def summarize_component(
             raise RuntimeError(f"no valid INT8 configuration for {region}")
         selected_key = min(valid_keys, key=lambda key: candidate_seconds[key])
         baseline_seconds = baseline_ms / 1000.0
+        fixed_baseline_seconds = baseline_seconds * total_replays / measured_replays
+        current_projection_family_seconds += fixed_baseline_seconds
         measured_saving = baseline_seconds - candidate_seconds[selected_key]
         fixed_saving = measured_saving * total_replays / measured_replays
         retained = fixed_saving > 0
@@ -388,17 +669,26 @@ def summarize_component(
             "current_baseline": CURRENT_BASELINE[region],
             "selected_outputs_per_block": int(selected_key),
             "measured_baseline_seconds": baseline_seconds,
+            "fixed_work_current_baseline_seconds": fixed_baseline_seconds,
             "measured_candidate_seconds": candidate_seconds[selected_key],
             "measured_saving_seconds": measured_saving,
             "fixed_work_saving_seconds": fixed_saving,
             "retained_by_selective_policy": retained,
             "candidate_seconds_by_outputs_per_block": candidate_seconds,
         }
+    modeled_fraction = 1.0 - 1.0 / MEASURED_INT8_VS_FP16_MLP_SPEEDUP
+    modeled_live_ceiling = current_projection_family_seconds * modeled_fraction
     return {
         "measured_replays": measured_replays,
         "total_replays": int(total_replays),
         "coverage_fraction": measured_replays / total_replays,
         "regions": region_summary,
+        "current_projection_family_seconds": current_projection_family_seconds,
+        "modeled_int8_vs_fp16_speedup": MEASURED_INT8_VS_FP16_MLP_SPEEDUP,
+        "live_modeled_realistic_ceiling_seconds": modeled_live_ceiling,
+        "live_modeled_ceiling_clears_gate": (
+            modeled_live_ceiling >= FIXED_MAIN_SAVING_GATE_SECONDS
+        ),
         "selective_fixed_work_main_saving_seconds": selected_fixed_saving,
         "saving_gate_seconds": FIXED_MAIN_SAVING_GATE_SECONDS,
         "invariant_failures": failures,
@@ -410,11 +700,158 @@ def summarize_component(
     }
 
 
+def _validate_live_graph_cache(
+    graph_cache: Any,
+) -> dict[int, dict[str, Any]]:
+    if not isinstance(graph_cache, dict) or not graph_cache:
+        raise TypeError("retained ProductionDecodeSession.graph_cache must be non-empty")
+    entries: dict[int, dict[str, Any]] = {}
+    for raw in graph_cache.values():
+        entry = _object(raw, name="retained graph entry")
+        prefix = entry.get("active_prefix_length")
+        if isinstance(prefix, bool) or not isinstance(prefix, int) or prefix <= 0:
+            raise ValueError("retained graph entry has an invalid active prefix")
+        if prefix in entries:
+            raise RuntimeError(f"retained graph cache repeats prefix {prefix}")
+        for name in ("graph", "outputs", "static_inputs", "decode_replays"):
+            if name not in entry:
+                raise RuntimeError(f"retained graph prefix {prefix} is missing {name}")
+        _positive_int(entry["decode_replays"], name=f"prefix {prefix} decode_replays")
+        entries[prefix] = entry
+    missing = sorted(set(SENTINEL_BUCKETS) - set(entries))
+    if missing:
+        raise RuntimeError(f"retained graph cache is missing sentinel buckets {missing}")
+    return dict(sorted(entries.items()))
+
+
+def _select_live_buckets(
+    entries: dict[int, dict[str, Any]],
+    mode: str,
+) -> dict[int, dict[str, Any]]:
+    if mode == "sentinel":
+        selected = SENTINEL_BUCKETS
+    elif mode == "all":
+        selected = tuple(entries)
+    else:
+        raise ValueError("bucket mode must be 'sentinel' or 'all'")
+    return {prefix: entries[prefix] for prefix in selected}
+
+
+def _retained_main_session_run(args, *, output_path: Path) -> dict[str, Any]:
+    """Run and validate the exact retained main composition before component work."""
+
+    import inference
+
+    from osuT5.osuT5.inference.optimized.scout.shared_rope import (
+        SharedRopeStats,
+        shared_decoder_rope_context,
+    )
+    from osuT5.osuT5.inference.optimized.single.k8_runtime import (
+        install_k8_candidate,
+    )
+    from utils.run_k4_shared_rope_approximate_weight_only import (
+        _validated_shared_rope_evidence,
+    )
+    from utils.run_k4_shared_rope_k1_remainder_int8_mlp_weight_only import (
+        COMPOSITION_VERSION,
+    )
+
+    if COMPOSITION_VERSION != RETAINED_COMPOSITION_VERSION:
+        raise RuntimeError("component scout composition constant is stale")
+    original_loader = inference.load_model_with_engine
+    stack = ExitStack()
+    shared_stats = SharedRopeStats()
+    captured: dict[str, Any] = {}
+    loaded_bindings = 0
+
+    def retained_loader(*loader_args, **loader_kwargs):
+        nonlocal loaded_bindings
+        binding, tokenizer = original_loader(*loader_args, **loader_kwargs)
+        loaded_bindings += 1
+        if loaded_bindings == 1:
+            model = binding.raw_model
+            metadata = binding.runtime.initialize_approximate_int8_mlp_weight_only(model)
+            state = getattr(binding.runtime, "_approximate_weight_only_state", None)
+            if state is None:
+                raise RuntimeError("retained runtime did not expose initialized weight state")
+            state.validate_owner(model)
+            captured.update(model=model, state=state, weight_state=metadata)
+            stack.enter_context(shared_decoder_rope_context(model, stats=shared_stats))
+        return binding, tokenizer
+
+    inference.load_model_with_engine = retained_loader
+    try:
+        with install_k8_candidate(block_size=4, graph_remainders=True):
+            run = _accepted_main_session_run(args, output_path=output_path)
+    finally:
+        inference.load_model_with_engine = original_loader
+        stack.close()
+    if loaded_bindings < 2:
+        raise RuntimeError("retained full-song capture expected separate main/timing bindings")
+    if run["model"] is not captured.get("model"):
+        raise RuntimeError("retained full-song capture returned the wrong main model")
+    records = [
+        record
+        for record in run["processor"].profiler.generation
+        if record.get("profile_label") == "main_generation"
+    ]
+    raw_manifest = {
+        "composition_version": RETAINED_COMPOSITION_VERSION,
+        "scouted_regions": list(REGIONS),
+        "baseline_by_region": dict(CURRENT_BASELINE),
+        "excluded_already_int8_regions": list(EXCLUDED_ALREADY_INT8_REGIONS),
+        "weight_state": captured["weight_state"],
+        "shared_rope": _validated_shared_rope_evidence(shared_stats),
+        "main_generation_records": records,
+    }
+    run.update(
+        state=captured["state"],
+        retained_composition=_validate_retained_composition_manifest(raw_manifest),
+    )
+    return run
+
+
+@contextmanager
+def _retained_real_tensor_context(
+    model: torch.nn.Module,
+    state: Any,
+    *,
+    prefix: int,
+) -> Any:
+    from osuT5.osuT5.inference.optimized.scout.shared_rope import (
+        SharedRopeStats,
+        shared_decoder_rope_context,
+    )
+    from osuT5.osuT5.runtime_profiling import generation_profile_context
+
+    state.validate_owner(model)
+    dispatch_counts = {name: 0 for name in REQUIRED_DISPATCHES}
+    rope_stats = SharedRopeStats()
+    with (
+        shared_decoder_rope_context(model, stats=rope_stats),
+        generation_profile_context(
+            active_prefix_self_attention_length=prefix,
+            q1_bmm_cross_attention=True,
+            native_q1_self_attention=True,
+            native_q1_rope_cache_self_attention=True,
+            approximate_weight_only_state=state,
+            optimized_expected_dtype=torch.float32,
+            optimized_dispatch_counts=dispatch_counts,
+        ),
+    ):
+        yield {"dispatch_counts": dispatch_counts, "shared_rope_stats": rope_stats}
+    if rope_stats.forwards <= 0:
+        raise RuntimeError("retained real-tensor capture did not execute a model forward")
+    for name in REQUIRED_DISPATCHES:
+        if dispatch_counts.get(name, 0) <= 0:
+            raise RuntimeError(f"retained real-tensor capture missed dispatch {name}")
+
+
 def _pack_projection_family(
     layers: list[torch.nn.Module],
     final_projection: torch.nn.Module,
+    state: Any,
 ) -> tuple[dict[int, dict[str, Any]], dict[str, Any], dict[str, int]]:
-    from osuT5.osuT5.inference.optimized.kernels.weight_only import PackedLinear
     from osuT5.osuT5.inference.optimized.scout.int8_mlp import Int8PackedLinear
 
     torch.cuda.synchronize()
@@ -429,7 +866,11 @@ def _pack_projection_family(
             "cross_norm_q": layer.cross_attn.Wq,
             "cross_out_residual": layer.cross_attn.Wo,
         }
-        fp16 = {name: PackedLinear.from_module(module) for name, module in modules.items()}
+        retained_pack = state.pack_for_layer(layer)
+        fp16 = {
+            "self_norm_qkv": retained_pack.self_qkv,
+            "self_out_residual": retained_pack.self_out,
+        }
         int8 = {name: Int8PackedLinear.from_module(module) for name, module in modules.items()}
         by_layer[id(layer)] = {"fp16": fp16, "int8": int8}
         source_bytes += sum(value.source_weight_bytes for value in int8.values())
@@ -440,7 +881,7 @@ def _pack_projection_family(
             + int8["cross_out_residual"].source_weight_bytes
         )
         int8_bytes += sum(value.packed_weight_bytes for value in int8.values())
-    final_fp16 = PackedLinear.from_module(final_projection)
+    final_fp16 = state.final_projection_pack
     final_int8 = Int8PackedLinear.from_module(final_projection)
     source_bytes += final_int8.source_weight_bytes
     current_mixed_bytes += final_fp16.packed_weight_bytes
@@ -472,11 +913,12 @@ def profile_component(
         raise ValueError("warmup and iters must be positive")
     _assert_scout_args(args)
     output_path.mkdir(parents=True, exist_ok=True)
-    run = _accepted_main_session_run(args, output_path=output_path)
+    run = _retained_main_session_run(args, output_path=output_path)
     model = run["model"]
+    state = run["state"]
     model.eval()
-    entries = validate_accepted_graph_cache(run["session"].graph_cache)
-    selected = select_buckets(entries, bucket_mode)
+    entries = _validate_live_graph_cache(run["session"].graph_cache)
+    selected = _select_live_buckets(entries, bucket_mode)
     total_replays = sum(int(entry["decode_replays"]) for entry in entries.values())
     layers, final_norm, final_projection = _locate_decoder(model)
 
@@ -498,7 +940,7 @@ def profile_component(
         torch.cuda.synchronize()
         preload_times[name] = time.perf_counter() - started
     layer_packs, final_packs, pack_report = _pack_projection_family(
-        layers, final_projection
+        layers, final_projection, state
     )
 
     buckets: dict[str, dict[str, Any]] = {}
@@ -510,11 +952,18 @@ def profile_component(
             raise RuntimeError(f"prefix {prefix} has invalid cache position")
         snapshots = _all_cache_snapshots(cache, position)
         _restore_all_cache(cache, snapshots)
-        capture = _capture_representative_layer(model, static_inputs, prefix=prefix)
-        _restore_all_cache(cache, snapshots)
-        inputs = _prepare_region_inputs(capture)
-        _restore_all_cache(cache, snapshots)
-        final_input = _capture_final_input(model, final_norm, static_inputs)
+        with _retained_real_tensor_context(
+            model,
+            state,
+            prefix=prefix,
+        ) as capture_evidence:
+            capture = _capture_representative_layer(
+                model,
+                static_inputs,
+                prefix=prefix,
+            )
+            _restore_all_cache(cache, snapshots)
+            final_input = _capture_final_input(model, layers[-1], static_inputs)
         _restore_all_cache(cache, snapshots)
 
         packs = layer_packs.get(id(capture.module))
@@ -522,6 +971,8 @@ def profile_component(
             raise RuntimeError("captured decoder layer has no owned weight pack")
         fp16_packs = dict(packs["fp16"])
         fp16_packs["final_norm_logits"] = final_packs["fp16"]
+        inputs = _prepare_region_inputs(capture, fp16_packs)
+        _restore_all_cache(cache, snapshots)
         int8_packs = dict(packs["int8"])
         int8_packs["final_norm_logits"] = final_packs["int8"]
         baselines = _baseline_functions(
@@ -591,6 +1042,10 @@ def profile_component(
             torch.cuda.empty_cache()
         buckets[str(prefix)] = {
             "decode_replays": int(accepted["decode_replays"]),
+            "retained_capture_dispatches": dict(capture_evidence["dispatch_counts"]),
+            "retained_capture_shared_rope": capture_evidence[
+                "shared_rope_stats"
+            ].as_dict(),
             "regions": region_results,
         }
     summary = summarize_component(buckets, total_replays=total_replays)
@@ -600,15 +1055,20 @@ def profile_component(
             "candidate": "per_row_symmetric_int8_remaining_projection_family",
             "result_class": "component_scout_documented_drift",
             "production_wiring": False,
-            "comparison": "mixed_weight_plus_int8_mlp_current_projection_policy",
-            "excluded_already_int8_regions": ["mlp_fc1", "mlp_fc2"],
+            "comparison": "retained_k1_int8_mlp_shared_rope_projection_policy",
+            "retained_composition": run["retained_composition"],
+            "excluded_already_int8_regions": list(EXCLUDED_ALREADY_INT8_REGIONS),
             "current_baseline_by_region": CURRENT_BASELINE,
-            "preimplementation_audit": {
-                "current_region_seconds": AUDITED_CURRENT_REGION_SECONDS,
+            "live_component_model": {
                 "measured_int8_vs_fp16_mlp_speedup": (
                     MEASURED_INT8_VS_FP16_MLP_SPEEDUP
                 ),
-                "realistic_ceiling_seconds": AUDITED_REALISTIC_CEILING_SECONDS,
+                "current_projection_family_seconds": summary[
+                    "current_projection_family_seconds"
+                ],
+                "realistic_ceiling_seconds": summary[
+                    "live_modeled_realistic_ceiling_seconds"
+                ],
                 "required_ceiling_seconds": FIXED_MAIN_SAVING_GATE_SECONDS,
             },
             "precision_contract": {
@@ -649,6 +1109,10 @@ def _text(report: dict[str, Any]) -> str:
         )
     lines.extend(
         [
+            "current_projection_family_seconds="
+            f"{summary['current_projection_family_seconds']:.6f}",
+            "live_modeled_realistic_ceiling_seconds="
+            f"{summary['live_modeled_realistic_ceiling_seconds']:.6f}",
             "selective_fixed_work_main_saving_seconds="
             f"{summary['selective_fixed_work_main_saving_seconds']:.6f}",
             f"saving_gate_seconds={summary['saving_gate_seconds']:.6f}",
