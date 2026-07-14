@@ -23,6 +23,7 @@ CANDIDATE_BRANCH=${CANDIDATE_BRANCH:?Set CANDIDATE_BRANCH explicitly}
 CANDIDATE_REMOTE=${CANDIDATE_REMOTE:-origin}
 PROFILE_CONFIG=${PROFILE_CONFIG:-profile_salvalai}
 CANDIDATE_RUNNER=${CANDIDATE_RUNNER:-utils/run_approximate_weight_only.py}
+REQUIRE_EXACT_TIMING=${REQUIRE_EXACT_TIMING:-true}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_LABEL=${RUN_LABEL:-split-weight-full-song-reciprocal}
 RUN_ROOT="$WORK/runs/$RUN_LABEL-${SLURM_JOB_ID:-manual}"
@@ -56,6 +57,10 @@ if [[ "$CANDIDATE_RUNNER" = /* || "$CANDIDATE_RUNNER" == *".."* ]]; then
 fi
 if [[ ! -f "$CANDIDATE_REPO/$CANDIDATE_RUNNER" ]]; then
   echo "missing candidate runner at $CANDIDATE_REPO/$CANDIDATE_RUNNER" >&2
+  exit 2
+fi
+if [[ "$REQUIRE_EXACT_TIMING" != true && "$REQUIRE_EXACT_TIMING" != false ]]; then
+  echo "REQUIRE_EXACT_TIMING must be true or false" >&2
   exit 2
 fi
 
@@ -205,6 +210,7 @@ echo "candidate_remote_ref=$CANDIDATE_REMOTE_REF"
 echo "same_commit_gate=true"
 echo "profile_config=$PROFILE_CONFIG"
 echo "candidate_runner=$CANDIDATE_RUNNER"
+echo "require_exact_timing=$REQUIRE_EXACT_TIMING"
 echo "audio=$AUDIO"
 echo "run_root=$RUN_ROOT"
 echo "extension_cache_mode=$EXTENSION_CACHE_MODE"
@@ -572,6 +578,24 @@ summary = {
 )
 PY
 
+ANALYSIS_EXACT_ARGS=()
+ANALYSIS_TIMING_DISPATCH_ARGS=()
+if [[ "$REQUIRE_EXACT_TIMING" == true ]]; then
+  ANALYSIS_EXACT_ARGS=(
+    --require-exact-label timing_context
+    --require-exact-dispatch-label timing_context
+  )
+else
+  ANALYSIS_TIMING_DISPATCH_ARGS=(
+    --allow-dispatch-delta
+      'records.timing_context[[]*].optimized_dispatch_capture_hits'
+    --allow-dispatch-delta
+      'records.timing_context[[]*].optimized_dispatch_capture_hits.*'
+    --allow-optional-dispatch-delta
+      'records.timing_context[[]*].optimized_cuda_graphs.*'
+  )
+fi
+
 (
   cd "$CANDIDATE_REPO"
   "$PYTHON" utils/analyze_reciprocal_full_song_candidate.py \
@@ -580,9 +604,9 @@ PY
     --candidate-second-profile "$CANDIDATE_SECOND" \
     --baseline-second-profile "$BASELINE_SECOND" \
     --mode relaxed \
-    --require-exact-label timing_context \
-    --require-exact-dispatch-label timing_context \
+    "${ANALYSIS_EXACT_ARGS[@]}" \
     --require-dispatch-declaration \
+    "${ANALYSIS_TIMING_DISPATCH_ARGS[@]}" \
     --allow-optional-dispatch-delta 'optimized_result_class' \
     --allow-dispatch-delta \
       'records.main_generation[[]*].optimized_dispatch_capture_hits' \
@@ -619,11 +643,15 @@ grep -q '^mode=relaxed$' "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^parity.claim=relaxed-nonexact$' "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^parity.baseline_repeat_stable=true$' "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^parity.candidate_repeat_stable=true$' "$RUN_ROOT/reciprocal-analysis.txt"
-grep -q '^parity.required_exact_labels=timing_context$' \
+EXPECTED_EXACT_LABELS=none
+if [[ "$REQUIRE_EXACT_TIMING" == true ]]; then
+  EXPECTED_EXACT_LABELS=timing_context
+fi
+grep -q "^parity.required_exact_labels=$EXPECTED_EXACT_LABELS$" \
   "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^parity.required_exact_labels_pass=true$' \
   "$RUN_ROOT/reciprocal-analysis.txt"
-grep -q '^parity.required_exact_dispatch_labels=timing_context$' \
+grep -q "^parity.required_exact_dispatch_labels=$EXPECTED_EXACT_LABELS$" \
   "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^parity.required_exact_dispatch_labels_pass=true$' \
   "$RUN_ROOT/reciprocal-analysis.txt"

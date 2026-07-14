@@ -66,6 +66,22 @@ def test_wrapper_validates_opt_in_candidate_runner_inside_candidate_repo() -> No
     assert 'echo "candidate_runner=$CANDIDATE_RUNNER"' in source
 
 
+def test_wrapper_allows_declared_timing_drift_for_k4_composition() -> None:
+    source = WRAPPER.read_text(encoding="utf-8")
+
+    assert "REQUIRE_EXACT_TIMING=${REQUIRE_EXACT_TIMING:-true}" in source
+    assert '[[ "$REQUIRE_EXACT_TIMING" != true' in source
+    assert 'if [[ "$REQUIRE_EXACT_TIMING" == true ]]' in source
+    assert "EXPECTED_EXACT_LABELS=none" in source
+    assert "EXPECTED_EXACT_LABELS=timing_context" in source
+    for pattern in (
+        "'records.timing_context[[]*].optimized_dispatch_capture_hits'",
+        "'records.timing_context[[]*].optimized_dispatch_capture_hits.*'",
+        "'records.timing_context[[]*].optimized_cuda_graphs.*'",
+    ):
+        assert pattern in source
+
+
 def test_wrapper_isolates_native_extensions_and_keeps_compiler_caches_per_run() -> None:
     source = WRAPPER.read_text(encoding="utf-8")
 
