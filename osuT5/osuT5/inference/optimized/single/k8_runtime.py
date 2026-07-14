@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import time
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import torch
 from torch import nn
@@ -650,6 +650,7 @@ class _K8GraphLifecycle:
 _ACTIVE_K8_LIFECYCLE: _K8GraphLifecycle | None = None
 _ACTIVE_BLOCK_SIZE: int | None = None
 _ACTIVE_GRAPH_REMAINDERS: bool | None = None
+_ACTIVE_ENTRY_SNAPSHOTTER: Callable[["_K8GraphEntry", int], Any] | None = None
 
 
 @dataclass(slots=True)
@@ -670,6 +671,22 @@ class _K8RuntimeSlot:
     state: K8DeviceState
     processor: K8LogitsProcessor
     signature: tuple[Any, ...]
+
+
+def _attach_entry_profile_snapshot(
+    raw_entry: dict[str, Any],
+    entry: _K8GraphEntry,
+    *,
+    active_prefix_length: int,
+) -> None:
+    """Attach opt-in pre-replay evidence without changing default K4 ownership."""
+
+    snapshotter = _ACTIVE_ENTRY_SNAPSHOTTER
+    if snapshotter is None:
+        return
+    snapshot = snapshotter(entry, active_prefix_length)
+    if snapshot is not None:
+        raw_entry["profile_pre_replay_snapshot"] = snapshot
 
 
 def _freeze_processor_value(
@@ -1250,6 +1267,11 @@ def k8_active_prefix_decode_generate(
                 "decode_replays": 0,
                 "k8_stats": stats,
             }
+            _attach_entry_profile_snapshot(
+                raw_entry,
+                entry,
+                active_prefix_length=prefix,
+            )
             graph_cache[key] = raw_entry
             stats["capture_seconds"] += entry.capture_seconds
             stats["peak_vram_bytes"] = max(
@@ -1324,19 +1346,24 @@ def install_k8_candidate(
     *,
     block_size: int = K8_BLOCK_SIZE,
     graph_remainders: bool = False,
+    entry_snapshotter: Callable[[_K8GraphEntry, int], Any] | None = None,
 ) -> Iterator[None]:
     """Temporarily install a bounded block candidate for an explicit runner."""
 
-    global _ACTIVE_BLOCK_SIZE, _ACTIVE_GRAPH_REMAINDERS, _ACTIVE_K8_LIFECYCLE
+    global _ACTIVE_BLOCK_SIZE, _ACTIVE_ENTRY_SNAPSHOTTER
+    global _ACTIVE_GRAPH_REMAINDERS, _ACTIVE_K8_LIFECYCLE
     from . import engine
 
     block_size = _validate_block_size(block_size)
     if not isinstance(graph_remainders, bool):
         raise TypeError("graph_remainders must be a bool")
+    if entry_snapshotter is not None and not callable(entry_snapshotter):
+        raise TypeError("entry_snapshotter must be callable or None")
     if (
         _ACTIVE_K8_LIFECYCLE is not None
         or _ACTIVE_BLOCK_SIZE is not None
         or _ACTIVE_GRAPH_REMAINDERS is not None
+        or _ACTIVE_ENTRY_SNAPSHOTTER is not None
     ):
         raise RuntimeError("K8 candidate context cannot be nested")
     lifecycle = _K8GraphLifecycle()
@@ -1344,6 +1371,7 @@ def install_k8_candidate(
     _ACTIVE_K8_LIFECYCLE = lifecycle
     _ACTIVE_BLOCK_SIZE = block_size
     _ACTIVE_GRAPH_REMAINDERS = graph_remainders
+    _ACTIVE_ENTRY_SNAPSHOTTER = entry_snapshotter
     engine.active_prefix_decode_generate = k8_active_prefix_decode_generate
     try:
         yield
@@ -1355,6 +1383,7 @@ def install_k8_candidate(
             _ACTIVE_K8_LIFECYCLE = None
             _ACTIVE_BLOCK_SIZE = None
             _ACTIVE_GRAPH_REMAINDERS = None
+            _ACTIVE_ENTRY_SNAPSHOTTER = None
 
 
 __all__ = [

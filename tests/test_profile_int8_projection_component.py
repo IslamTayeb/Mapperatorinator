@@ -11,8 +11,11 @@ from utils.profile_int8_projection_component import (
     FIXED_MAIN_SAVING_GATE_SECONDS,
     MEASURED_INT8_VS_FP16_MLP_SPEEDUP,
     REQUIRED_DISPATCHES,
+    _DiagnosticRecorder,
     _retained_real_tensor_context,
+    _restore_pre_replay_entry,
     _select_live_buckets,
+    _snapshot_pre_replay_entry,
     _validate_live_graph_cache,
     _validate_retained_composition_manifest,
     summarize_component,
@@ -89,6 +92,7 @@ def _composed_graph_entry(
         "active_prefix_length": prefix,
         "capture_seconds": runtime_entry.capture_seconds,
         "decode_replays": 10 + variant,
+        "profile_pre_replay_snapshot": {"prefix": prefix},
         "k8_stats": {
             "k8_candidate": True,
             "block_size": 4,
@@ -110,6 +114,24 @@ def _live_composed_graph_cache(*, duplicate_prefix: int | None = 320) -> dict:
             key, raw, _ = _composed_graph_entry(duplicate_prefix, variant=variant)
             result[key] = raw
     return result
+
+
+def _profile_cache() -> SimpleNamespace:
+    def layers(offset: float):
+        return [
+            SimpleNamespace(
+                is_initialized=True,
+                keys=torch.full((1, 2, 128, 2), offset + index),
+                values=torch.full((1, 2, 128, 2), offset + index + 0.5),
+            )
+            for index in range(12)
+        ]
+
+    return SimpleNamespace(
+        self_attention_cache=SimpleNamespace(layers=layers(0.0)),
+        cross_attention_cache=SimpleNamespace(layers=layers(20.0)),
+        is_updated={index: True for index in range(12)},
+    )
 
 
 def _buckets(*, baseline_ms: float = 0.3, candidate_ms: float = 0.1):
@@ -203,12 +225,68 @@ def test_live_composed_cache_selects_captured_k1_model_graph() -> None:
         _select_live_buckets(entries, "all")
 
 
+def test_pre_replay_snapshot_restores_temporally_mutated_graph_state(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    cache = _profile_cache()
+    static_inputs = {
+        "cache_position": torch.tensor([107], dtype=torch.long),
+        "decoder_attention_mask": torch.zeros((1, 1, 1, 128)),
+        "decoder_input_ids": torch.tensor([[9]], dtype=torch.long),
+        "decoder_position_ids": torch.tensor([[107]], dtype=torch.long),
+        "past_key_values": cache,
+    }
+    runtime_entry = SimpleNamespace(static_inputs=static_inputs)
+    diagnostics = _DiagnosticRecorder(tmp_path / "diagnostics.jsonl")
+
+    snapshot = _snapshot_pre_replay_entry(runtime_entry, 128, diagnostics)
+
+    assert snapshot is not None
+    static_inputs["cache_position"].fill_(128)
+    static_inputs["decoder_position_ids"].fill_(128)
+    static_inputs["decoder_input_ids"].fill_(11)
+    for owner_name in ("self_attention_cache", "cross_attention_cache"):
+        for layer in getattr(cache, owner_name).layers:
+            layer.keys.add_(1000)
+            layer.values.add_(1000)
+    entry = {
+        "active_prefix_length": 128,
+        "static_inputs": static_inputs,
+        "profile_pre_replay_snapshot": snapshot,
+    }
+
+    restored = _restore_pre_replay_entry(entry, diagnostics)
+
+    assert restored is snapshot
+    assert static_inputs["cache_position"].item() == 107
+    assert static_inputs["decoder_position_ids"].item() == 107
+    assert static_inputs["decoder_input_ids"].item() == 9
+    assert torch.equal(
+        cache.self_attention_cache.layers[0].keys,
+        torch.zeros((1, 2, 128, 2)),
+    )
+    rows = (tmp_path / "diagnostics.jsonl").read_text().splitlines()
+    assert any('"event": "pre_replay_snapshot"' in row for row in rows)
+    assert any('"event": "pre_replay_restore"' in row for row in rows)
+
+
 def test_live_composed_cache_rejects_missing_k1_remainder_parent() -> None:
     cache = _live_composed_graph_cache(duplicate_prefix=None)
     raw = next(raw for raw in cache.values() if raw["active_prefix_length"] == 128)
     raw["runtime_entry"].remainder_parent = None
 
     with pytest.raises(RuntimeError, match="missing its captured K1 parent"):
+        _validate_live_graph_cache(cache)
+
+
+def test_live_composed_cache_requires_owned_pre_replay_sentinel_snapshot() -> None:
+    cache = _live_composed_graph_cache(duplicate_prefix=None)
+    raw = next(raw for raw in cache.values() if raw["active_prefix_length"] == 128)
+    del raw["profile_pre_replay_snapshot"]
+
+    with pytest.raises(RuntimeError, match="missing its pre-replay snapshot"):
         _validate_live_graph_cache(cache)
 
 

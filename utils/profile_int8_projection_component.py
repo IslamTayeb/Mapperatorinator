@@ -64,6 +64,90 @@ FIXED_MAIN_SAVING_GATE_SECONDS = 0.5
 MEASURED_INT8_VS_FP16_MLP_SPEEDUP = 1.3666607805044033
 
 
+class _DiagnosticRecorder:
+    def __init__(self, path: Path):
+        self.path = path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("")
+
+    def record(self, event: str, **payload: Any) -> None:
+        row = {"event": event, "time_unix": time.time(), **payload}
+        with self.path.open("a") as handle:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+            handle.flush()
+
+
+def _cuda_sync_checkpoint(
+    diagnostics: _DiagnosticRecorder,
+    checkpoint: str,
+) -> None:
+    started = time.perf_counter()
+    try:
+        torch.cuda.synchronize()
+    except Exception as exc:
+        diagnostics.record(
+            "cuda_sync",
+            checkpoint=checkpoint,
+            passed=False,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise RuntimeError(
+            f"CUDA synchronization failed at checkpoint {checkpoint}"
+        ) from exc
+    diagnostics.record(
+        "cuda_sync",
+        checkpoint=checkpoint,
+        passed=True,
+        elapsed_seconds=time.perf_counter() - started,
+    )
+
+
+def _tensor_layout(value: torch.Tensor) -> dict[str, Any]:
+    if not isinstance(value, torch.Tensor):
+        raise TypeError("tensor layout requires a tensor")
+    return {
+        "shape": list(value.shape),
+        "stride": list(value.stride()),
+        "dtype": str(value.dtype),
+        "device": str(value.device),
+        "data_ptr": int(value.data_ptr()),
+        "storage_data_ptr": int(value.untyped_storage().data_ptr()),
+        "storage_offset": int(value.storage_offset()),
+        "numel": int(value.numel()),
+        "element_size": int(value.element_size()),
+        "contiguous": bool(value.is_contiguous()),
+    }
+
+
+def _validate_tensor_layout(
+    value: Any,
+    *,
+    name: str,
+    device: torch.device,
+    dtype: torch.dtype | None = None,
+    shape: tuple[int, ...] | None = None,
+    contiguous: bool = False,
+) -> dict[str, Any]:
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(f"{name} must be a tensor")
+    if value.device != device:
+        raise RuntimeError(f"{name} must use device {device}, got {value.device}")
+    if dtype is not None and value.dtype != dtype:
+        raise TypeError(f"{name} must use {dtype}, got {value.dtype}")
+    if shape is not None and tuple(value.shape) != shape:
+        raise ValueError(f"{name} must have shape {shape}, got {tuple(value.shape)}")
+    if contiguous and not value.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+    layout = _tensor_layout(value)
+    if value.numel() > 0 and (
+        layout["data_ptr"] <= 0 or layout["storage_data_ptr"] <= 0
+    ):
+        raise RuntimeError(f"{name} has invalid CUDA storage pointers")
+    if layout["storage_offset"] < 0 or any(stride < 0 for stride in value.stride()):
+        raise RuntimeError(f"{name} has invalid storage offset or strides")
+    return layout
+
+
 def _object(value: Any, *, name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise TypeError(f"{name} must be an object")
@@ -413,6 +497,119 @@ def _locate_decoder(
     return layers, final_norm, next(iter(projections.values()))
 
 
+def _validate_restored_capture_inputs(
+    model: torch.nn.Module,
+    static_inputs: dict[str, Any],
+    *,
+    prefix: int,
+    diagnostics: _DiagnosticRecorder,
+) -> dict[str, Any]:
+    from osuT5.osuT5.inference.optimized.scout.native_prefix import (
+        _cache_tensors,
+    )
+
+    try:
+        device = next(model.parameters()).device
+    except StopIteration as exc:
+        raise RuntimeError("capture model has no parameters") from exc
+    if device.type != "cuda":
+        raise RuntimeError("capture model must remain on CUDA")
+    layouts = {
+        "decoder_input_ids": _validate_tensor_layout(
+            static_inputs.get("decoder_input_ids"),
+            name="decoder_input_ids",
+            device=device,
+            dtype=torch.long,
+            shape=(1, 1),
+            contiguous=True,
+        ),
+        "cache_position": _validate_tensor_layout(
+            static_inputs.get("cache_position"),
+            name="cache_position",
+            device=device,
+            dtype=torch.long,
+            shape=(1,),
+            contiguous=True,
+        ),
+        "decoder_position_ids": _validate_tensor_layout(
+            static_inputs.get("decoder_position_ids"),
+            name="decoder_position_ids",
+            device=device,
+            dtype=torch.long,
+            shape=(1, 1),
+            contiguous=True,
+        ),
+    }
+    mask = static_inputs.get("decoder_attention_mask")
+    mask_layout = _validate_tensor_layout(
+        mask,
+        name="decoder_attention_mask",
+        device=device,
+        dtype=torch.float32,
+    )
+    if mask.ndim != 4 or tuple(mask.shape[:3]) != (1, 1, 1):
+        raise ValueError("decoder_attention_mask must have shape [1, 1, 1, length]")
+    if mask.shape[-1] < prefix:
+        raise ValueError("decoder_attention_mask is shorter than the active prefix")
+    layouts["decoder_attention_mask"] = mask_layout
+    position = int(static_inputs["cache_position"].detach().item())
+    position_id = int(static_inputs["decoder_position_ids"].detach().item())
+    if position != position_id:
+        raise RuntimeError("cache and decoder positions disagree")
+    if not 0 <= position < prefix:
+        raise RuntimeError(
+            f"cache position {position} is outside active prefix {prefix}"
+        )
+    cache = _cache_from_static_inputs(static_inputs)
+    cache_layouts: dict[str, Any] = {}
+    for layer_idx in range(DECODER_LAYERS):
+        for kind in ("self", "cross"):
+            keys, values = _cache_tensors(cache, kind, layer_idx)
+            key_name = f"{kind}.{layer_idx}.keys"
+            value_name = f"{kind}.{layer_idx}.values"
+            key_layout = _validate_tensor_layout(
+                keys,
+                name=key_name,
+                device=device,
+                dtype=torch.float32,
+                contiguous=True,
+            )
+            value_layout = _validate_tensor_layout(
+                values,
+                name=value_name,
+                device=device,
+                dtype=torch.float32,
+                contiguous=True,
+            )
+            if keys.ndim != 4 or values.shape != keys.shape:
+                raise ValueError(f"{kind} layer {layer_idx} cache shapes are invalid")
+            if kind == "self" and keys.shape[-2] < prefix:
+                raise ValueError(
+                    f"self layer {layer_idx} cache is shorter than prefix {prefix}"
+                )
+            if keys.data_ptr() == values.data_ptr():
+                raise RuntimeError(f"{kind} layer {layer_idx} key/value storage aliases")
+            cache_layouts[key_name] = key_layout
+            cache_layouts[value_name] = value_layout
+    encoder_outputs = static_inputs.get("encoder_outputs")
+    encoder_hidden = getattr(encoder_outputs, "last_hidden_state", None)
+    if isinstance(encoder_hidden, torch.Tensor):
+        layouts["encoder_outputs.last_hidden_state"] = _validate_tensor_layout(
+            encoder_hidden,
+            name="encoder_outputs.last_hidden_state",
+            device=device,
+            dtype=torch.float32,
+        )
+    report = {
+        "prefix": prefix,
+        "cache_position": position,
+        "static_tensors": layouts,
+        "cache_tensors": cache_layouts,
+    }
+    diagnostics.record("restored_capture_inputs", **report)
+    return report
+
+
 def _capture_final_input(
     model: torch.nn.Module,
     final_decoder_layer: torch.nn.Module,
@@ -526,6 +723,76 @@ def _prepare_region_inputs(
         "cross_attention_output": cross_output,
         "after_cross": after_cross,
     }
+
+
+def _validate_projection_call_inputs(
+    inputs: dict[str, torch.Tensor],
+    final_input: torch.Tensor,
+    fp16_packs: dict[str, Any],
+    int8_packs: dict[str, Any],
+    *,
+    prefix: int,
+    diagnostics: _DiagnosticRecorder,
+) -> None:
+    device = final_input.device
+    tensor_layouts = {
+        name: _validate_tensor_layout(
+            value,
+            name=f"prefix {prefix} {name}",
+            device=device,
+            dtype=torch.float32,
+            contiguous=True,
+        )
+        for name, value in {**inputs, "final_input": final_input}.items()
+    }
+    pack_layouts: dict[str, Any] = {}
+    for name, pack in fp16_packs.items():
+        pack_layouts[f"fp16.{name}.weight"] = _validate_tensor_layout(
+            getattr(pack, "weight", None),
+            name=f"fp16 {name} weight",
+            device=device,
+            dtype=torch.float16,
+            contiguous=True,
+        )
+        bias = getattr(pack, "bias", None)
+        if bias is not None:
+            pack_layouts[f"fp16.{name}.bias"] = _validate_tensor_layout(
+                bias,
+                name=f"fp16 {name} bias",
+                device=device,
+                dtype=torch.float32,
+                contiguous=True,
+            )
+    for name, pack in int8_packs.items():
+        pack_layouts[f"int8.{name}.weight"] = _validate_tensor_layout(
+            getattr(pack, "weight", None),
+            name=f"int8 {name} weight",
+            device=device,
+            dtype=torch.int8,
+            contiguous=True,
+        )
+        pack_layouts[f"int8.{name}.scale"] = _validate_tensor_layout(
+            getattr(pack, "scale", None),
+            name=f"int8 {name} scale",
+            device=device,
+            dtype=torch.float32,
+            contiguous=True,
+        )
+        bias = getattr(pack, "bias", None)
+        if bias is not None:
+            pack_layouts[f"int8.{name}.bias"] = _validate_tensor_layout(
+                bias,
+                name=f"int8 {name} bias",
+                device=device,
+                dtype=torch.float32,
+                contiguous=True,
+            )
+    diagnostics.record(
+        "projection_call_inputs",
+        prefix=prefix,
+        tensors=tensor_layouts,
+        packs=pack_layouts,
+    )
 
 
 def _baseline_functions(
@@ -746,6 +1013,134 @@ def summarize_component(
     }
 
 
+def _snapshot_pre_replay_entry(
+    runtime_entry: Any,
+    prefix: int,
+    diagnostics: _DiagnosticRecorder,
+) -> dict[str, Any] | None:
+    if prefix not in SENTINEL_BUCKETS:
+        return None
+    static_inputs = getattr(runtime_entry, "static_inputs", None)
+    if not isinstance(static_inputs, dict) or not static_inputs:
+        raise RuntimeError(f"prefix {prefix} pre-replay static inputs are missing")
+    position = static_inputs.get("cache_position")
+    if not isinstance(position, torch.Tensor) or position.numel() != 1:
+        raise RuntimeError(f"prefix {prefix} pre-replay cache position is invalid")
+    _cuda_sync_checkpoint(diagnostics, f"prefix_{prefix}.pre_replay.before_snapshot")
+    position_value = int(position.detach().item())
+    if not 0 <= position_value < prefix:
+        raise RuntimeError(
+            f"prefix {prefix} pre-replay cache position {position_value} is invalid"
+        )
+    cache = _cache_from_static_inputs(static_inputs)
+    cache_snapshots = _all_cache_snapshots(cache, position)
+    static_tensors = {
+        name: value.detach().clone()
+        for name, value in static_inputs.items()
+        if isinstance(value, torch.Tensor)
+    }
+    static_ownership = {
+        name: _tensor_layout(value)
+        for name, value in static_inputs.items()
+        if isinstance(value, torch.Tensor)
+    }
+    _cuda_sync_checkpoint(diagnostics, f"prefix_{prefix}.pre_replay.after_snapshot")
+    diagnostics.record(
+        "pre_replay_snapshot",
+        prefix=prefix,
+        cache_position=position_value,
+        static_tensors=static_ownership,
+        cache_layers=len(cache_snapshots),
+    )
+    return {
+        "prefix": prefix,
+        "cache_position": position_value,
+        "static_tensors": static_tensors,
+        "static_ownership": static_ownership,
+        "cache_snapshots": cache_snapshots,
+    }
+
+
+def _restore_pre_replay_entry(
+    entry: dict[str, Any],
+    diagnostics: _DiagnosticRecorder,
+) -> dict[str, Any]:
+    prefix = int(entry["active_prefix_length"])
+    snapshot = _object(
+        entry.get("profile_pre_replay_snapshot"),
+        name=f"prefix {prefix} profile_pre_replay_snapshot",
+    )
+    if snapshot.get("prefix") != prefix:
+        raise RuntimeError(f"prefix {prefix} pre-replay snapshot ownership changed")
+    static_inputs = entry["static_inputs"]
+    static_tensors = _object(
+        snapshot.get("static_tensors"),
+        name=f"prefix {prefix} pre-replay static tensors",
+    )
+    ownership = _object(
+        snapshot.get("static_ownership"),
+        name=f"prefix {prefix} pre-replay static ownership",
+    )
+    if set(static_tensors) != set(ownership):
+        raise RuntimeError(f"prefix {prefix} pre-replay tensor evidence diverged")
+    with torch.no_grad():
+        for name, saved in static_tensors.items():
+            current = static_inputs.get(name)
+            if not isinstance(saved, torch.Tensor) or not isinstance(
+                current, torch.Tensor
+            ):
+                raise RuntimeError(
+                    f"prefix {prefix} pre-replay tensor {name} is missing"
+                )
+            if _tensor_layout(current) != ownership[name]:
+                raise RuntimeError(
+                    f"prefix {prefix} pre-replay tensor {name} changed ownership"
+                )
+            if (
+                current.shape != saved.shape
+                or current.dtype != saved.dtype
+                or current.device != saved.device
+            ):
+                raise RuntimeError(
+                    f"prefix {prefix} pre-replay tensor {name} changed signature"
+                )
+            current.copy_(saved)
+    cache_snapshots = snapshot.get("cache_snapshots")
+    if not isinstance(cache_snapshots, list) or len(cache_snapshots) != DECODER_LAYERS:
+        raise RuntimeError(f"prefix {prefix} pre-replay cache snapshot is incomplete")
+    _restore_all_cache(_cache_from_static_inputs(static_inputs), cache_snapshots)
+    _cuda_sync_checkpoint(diagnostics, f"prefix_{prefix}.pre_replay.restore")
+    position = static_inputs.get("cache_position")
+    if not isinstance(position, torch.Tensor) or position.numel() != 1:
+        raise RuntimeError(f"prefix {prefix} restored cache position is invalid")
+    position_value = int(position.detach().item())
+    if position_value != snapshot.get("cache_position"):
+        raise RuntimeError(f"prefix {prefix} restored the wrong cache position")
+    if not 0 <= position_value < prefix:
+        raise RuntimeError(
+            f"prefix {prefix} restored cache position {position_value} is outside prefix"
+        )
+    position_ids = static_inputs.get("decoder_position_ids")
+    if (
+        not isinstance(position_ids, torch.Tensor)
+        or position_ids.shape != (1, 1)
+        or position_ids.dtype != torch.long
+        or int(position_ids.detach().item()) != position_value
+    ):
+        raise RuntimeError(f"prefix {prefix} restored decoder position is inconsistent")
+    diagnostics.record(
+        "pre_replay_restore",
+        prefix=prefix,
+        cache_position=position_value,
+        static_tensors={
+            name: _tensor_layout(value)
+            for name, value in static_inputs.items()
+            if isinstance(value, torch.Tensor)
+        },
+    )
+    return snapshot
+
+
 def _validate_live_graph_cache(
     graph_cache: Any,
 ) -> dict[int, list[dict[str, Any]]]:
@@ -851,6 +1246,18 @@ def _validate_live_graph_cache(
             raise RuntimeError(
                 f"retained graph prefix {prefix} sampling ownership changed"
             )
+        profile_snapshot = entry.get("profile_pre_replay_snapshot")
+        if prefix in SENTINEL_BUCKETS and not isinstance(profile_snapshot, dict):
+            raise RuntimeError(
+                f"retained graph prefix {prefix} is missing its pre-replay snapshot"
+            )
+        if profile_snapshot is not None and (
+            not isinstance(profile_snapshot, dict)
+            or profile_snapshot.get("prefix") != prefix
+        ):
+            raise RuntimeError(
+                f"retained graph prefix {prefix} has invalid pre-replay ownership"
+            )
         _positive_int(entry["decode_replays"], name=f"prefix {prefix} decode_replays")
         entries.setdefault(prefix, []).append(
             {
@@ -861,6 +1268,7 @@ def _validate_live_graph_cache(
                 "active_prefix_length": prefix,
                 "capture_seconds": float(capture_seconds),
                 "graph_source": "captured_k1_remainder_parent.model_graph",
+                "profile_pre_replay_snapshot": profile_snapshot,
             }
         )
     missing = sorted(set(SENTINEL_BUCKETS) - set(entries))
@@ -892,7 +1300,12 @@ def _select_live_buckets(
     return {prefix: entries[prefix][0] for prefix in selected}
 
 
-def _retained_main_session_run(args, *, output_path: Path) -> dict[str, Any]:
+def _retained_main_session_run(
+    args,
+    *,
+    output_path: Path,
+    diagnostics: _DiagnosticRecorder,
+) -> dict[str, Any]:
     """Run and validate the exact retained main composition before component work."""
 
     import inference
@@ -936,7 +1349,15 @@ def _retained_main_session_run(args, *, output_path: Path) -> dict[str, Any]:
 
     inference.load_model_with_engine = retained_loader
     try:
-        with install_k8_candidate(block_size=4, graph_remainders=True):
+        with install_k8_candidate(
+            block_size=4,
+            graph_remainders=True,
+            entry_snapshotter=lambda entry, prefix: _snapshot_pre_replay_entry(
+                entry,
+                prefix,
+                diagnostics,
+            ),
+        ):
             run = _accepted_main_session_run(args, output_path=output_path)
     finally:
         inference.load_model_with_engine = original_loader
@@ -1058,6 +1479,7 @@ def profile_component(
     args,
     *,
     output_path: Path,
+    diagnostic_path: Path,
     bucket_mode: str,
     warmup: int,
     iters: int,
@@ -1068,7 +1490,14 @@ def profile_component(
         raise ValueError("warmup and iters must be positive")
     _assert_scout_args(args)
     output_path.mkdir(parents=True, exist_ok=True)
-    run = _retained_main_session_run(args, output_path=output_path)
+    diagnostics = _DiagnosticRecorder(diagnostic_path)
+    diagnostics.record("component_scout_start")
+    run = _retained_main_session_run(
+        args,
+        output_path=output_path,
+        diagnostics=diagnostics,
+    )
+    _cuda_sync_checkpoint(diagnostics, "retained_full_song.complete")
     model = run["model"]
     state = run["state"]
     model.eval()
@@ -1093,37 +1522,87 @@ def profile_component(
         ("current_fp16_projection", preload_weight_only_extension),
         ("candidate_int8_projection", preload_int8_mlp_extension),
     ):
-        torch.cuda.synchronize()
+        _cuda_sync_checkpoint(diagnostics, f"extension.{name}.before_preload")
         started = time.perf_counter()
         preload()
-        torch.cuda.synchronize()
+        _cuda_sync_checkpoint(diagnostics, f"extension.{name}.after_preload")
         preload_times[name] = time.perf_counter() - started
     layer_packs, final_packs, pack_report = _pack_projection_family(
         layers, final_projection, state
     )
+    _cuda_sync_checkpoint(diagnostics, "projection_family.pack.complete")
 
     buckets: dict[str, dict[str, Any]] = {}
     for prefix, accepted in selected.items():
         static_inputs = accepted["static_inputs"]
+        _restore_pre_replay_entry(accepted, diagnostics)
+        _validate_restored_capture_inputs(
+            model,
+            static_inputs,
+            prefix=prefix,
+            diagnostics=diagnostics,
+        )
         cache = _cache_from_static_inputs(static_inputs)
         position = static_inputs.get("cache_position")
         if not isinstance(position, torch.Tensor) or position.numel() != 1:
             raise RuntimeError(f"prefix {prefix} has invalid cache position")
         snapshots = _all_cache_snapshots(cache, position)
         _restore_all_cache(cache, snapshots)
+        _cuda_sync_checkpoint(diagnostics, f"prefix_{prefix}.before_model_capture")
         with _retained_real_tensor_context(
             model,
             state,
             prefix=prefix,
         ) as capture_evidence:
-            capture = _capture_representative_layer(
-                model,
-                static_inputs,
-                prefix=prefix,
+            try:
+                capture = _capture_representative_layer(
+                    model,
+                    static_inputs,
+                    prefix=prefix,
+                )
+            except Exception as exc:
+                diagnostics.record(
+                    "retained_model_capture",
+                    prefix=prefix,
+                    stage="representative_layer",
+                    passed=False,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                raise RuntimeError(
+                    f"retained representative-layer capture failed at prefix {prefix}"
+                ) from exc
+            _cuda_sync_checkpoint(
+                diagnostics,
+                f"prefix_{prefix}.representative_layer_capture",
             )
             _restore_all_cache(cache, snapshots)
-            final_input = _capture_final_input(model, layers[-1], static_inputs)
+            _cuda_sync_checkpoint(
+                diagnostics,
+                f"prefix_{prefix}.before_final_input_capture",
+            )
+            try:
+                final_input = _capture_final_input(
+                    model,
+                    layers[-1],
+                    static_inputs,
+                )
+            except Exception as exc:
+                diagnostics.record(
+                    "retained_model_capture",
+                    prefix=prefix,
+                    stage="final_input",
+                    passed=False,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                raise RuntimeError(
+                    f"retained final-input capture failed at prefix {prefix}"
+                ) from exc
+            _cuda_sync_checkpoint(
+                diagnostics,
+                f"prefix_{prefix}.final_input_capture",
+            )
         _restore_all_cache(cache, snapshots)
+        _cuda_sync_checkpoint(diagnostics, f"prefix_{prefix}.capture_restore")
 
         packs = layer_packs.get(id(capture.module))
         if packs is None:
@@ -1131,9 +1610,18 @@ def profile_component(
         fp16_packs = dict(packs["fp16"])
         fp16_packs["final_norm_logits"] = final_packs["fp16"]
         inputs = _prepare_region_inputs(capture, fp16_packs)
+        _cuda_sync_checkpoint(diagnostics, f"prefix_{prefix}.region_inputs")
         _restore_all_cache(cache, snapshots)
         int8_packs = dict(packs["int8"])
         int8_packs["final_norm_logits"] = final_packs["int8"]
+        _validate_projection_call_inputs(
+            inputs,
+            final_input,
+            fp16_packs,
+            int8_packs,
+            prefix=prefix,
+            diagnostics=diagnostics,
+        )
         baselines = _baseline_functions(
             capture,
             inputs,
@@ -1159,10 +1647,32 @@ def profile_component(
             callables.update(
                 {f"int8_{opb}": candidates[str(opb)][region] for opb in OUTPUTS_PER_BLOCK}
             )
-            graphs = {
-                name: _capture_cuda_graph(fn, context=nullcontext, warmup=0)
-                for name, fn in callables.items()
-            }
+            graphs = {}
+            for name, fn in callables.items():
+                checkpoint = f"prefix_{prefix}.{region}.{name}"
+                _cuda_sync_checkpoint(diagnostics, f"{checkpoint}.before_capture")
+                try:
+                    graphs[name] = _capture_cuda_graph(
+                        fn,
+                        context=nullcontext,
+                        warmup=0,
+                    )
+                except Exception as exc:
+                    diagnostics.record(
+                        "component_graph_capture",
+                        checkpoint=checkpoint,
+                        passed=False,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                    raise RuntimeError(
+                        f"component graph capture failed at {checkpoint}"
+                    ) from exc
+                _cuda_sync_checkpoint(diagnostics, f"{checkpoint}.after_capture")
+                diagnostics.record(
+                    "component_graph_capture",
+                    checkpoint=checkpoint,
+                    passed=True,
+                )
             timings, rounds, memory = _reciprocal_graph_rounds(
                 {name: graph.graph for name, graph in graphs.items()},
                 restore=lambda: None,
@@ -1257,6 +1767,7 @@ def profile_component(
             "extension_preload_seconds": preload_times,
         },
         "pack_report": pack_report,
+        "diagnostic_path": str(diagnostic_path),
         "buckets": buckets,
         "summary": summary,
     }
@@ -1298,6 +1809,7 @@ def main() -> None:
     parser.add_argument("--config-name", default="profile_salvalai")
     parser.add_argument("--report-path", type=Path, required=True)
     parser.add_argument("--text-path", type=Path, required=True)
+    parser.add_argument("--diagnostic-path", type=Path, required=True)
     parser.add_argument("--output-path", type=Path, required=True)
     parser.add_argument("--bucket-mode", choices=("sentinel", "all"), default="sentinel")
     parser.add_argument("--warmup", type=int, default=100)
@@ -1307,6 +1819,7 @@ def main() -> None:
     report = profile_component(
         args,
         output_path=parsed.output_path,
+        diagnostic_path=parsed.diagnostic_path,
         bucket_mode=parsed.bucket_mode,
         warmup=parsed.warmup,
         iters=parsed.iters,
