@@ -20,9 +20,7 @@ from typing import Any, Mapping, Sequence
 
 try:
     from utils.nsight_agent_profile import (
-        PROFILE_GRAPH_CACHE_RECORD_KEYS,
         PROFILE_LABELS,
-        PROFILE_PRESET_KEYS,
         PROFILE_WORKLOAD_KEYS,
         _profile_graph_cache_signature,
         _profile_label_signature,
@@ -31,9 +29,7 @@ try:
     )
 except ModuleNotFoundError:  # Direct ``python utils/...py`` execution.
     from nsight_agent_profile import (  # type: ignore[no-redef]
-        PROFILE_GRAPH_CACHE_RECORD_KEYS,
         PROFILE_LABELS,
-        PROFILE_PRESET_KEYS,
         PROFILE_WORKLOAD_KEYS,
         _profile_graph_cache_signature,
         _profile_label_signature,
@@ -100,8 +96,7 @@ TIMING_POSTPROCESS_STAGES = frozenset(
 )
 FINAL_POSTPROCESS_STAGES = GROUP_STAGE_NAMES["merge_resnap_postprocess_write"]
 SETUP_STAGES = (
-    GROUP_STAGE_NAMES["pre_request_setup_load"]
-    | GROUP_STAGE_NAMES["request_setup"]
+    GROUP_STAGE_NAMES["pre_request_setup_load"] | GROUP_STAGE_NAMES["request_setup"]
 )
 INVARIANT_METADATA = {
     "inference_engine": "optimized",
@@ -206,7 +201,9 @@ def _load_profile(path: Path, *, role: str) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise CandidateAnalysisError(f"cannot read {role} profile {path}: {exc}") from exc
+        raise CandidateAnalysisError(
+            f"cannot read {role} profile {path}: {exc}"
+        ) from exc
     root = _object(payload, name=f"{role}.profile")
     if root.get("schema_version") != PROFILE_SCHEMA_VERSION:
         raise CandidateAnalysisError(
@@ -234,7 +231,9 @@ def _resolve_osu_path(
         path = profile_path.parent / path
     path = path.resolve()
     if path.suffix.lower() != ".osu" or not path.is_file():
-        raise CandidateAnalysisError(f"{role} OSU output is missing or not .osu: {path}")
+        raise CandidateAnalysisError(
+            f"{role} OSU output is missing or not .osu: {path}"
+        )
     return path
 
 
@@ -247,7 +246,9 @@ def _parse_stages(profile: Mapping[str, Any], *, role: str) -> tuple[Stage, ...]
         raw = _object(value, name=f"{role}.profile.stages[{index}]")
         name = raw.get("name")
         if not isinstance(name, str) or not name:
-            raise CandidateAnalysisError(f"{role}.profile.stages[{index}].name is invalid")
+            raise CandidateAnalysisError(
+                f"{role}.profile.stages[{index}].name is invalid"
+            )
         if name not in ALL_SUPPORTED_STAGE_NAMES:
             raise CandidateAnalysisError(f"{role} contains unsupported stage {name!r}")
         started = _number(
@@ -260,9 +261,13 @@ def _parse_stages(profile: Mapping[str, Any], *, role: str) -> tuple[Stage, ...]
         )
         wall = _number(raw.get("wall_seconds"), name=f"{role}.{name}.wall_seconds")
         if finished < started:
-            raise CandidateAnalysisError(f"{role} stage {name!r} finishes before it starts")
+            raise CandidateAnalysisError(
+                f"{role} stage {name!r} finishes before it starts"
+            )
         if not math.isclose(wall, finished - started, rel_tol=1e-8, abs_tol=1e-8):
-            raise CandidateAnalysisError(f"{role} stage {name!r} wall disagrees with timestamps")
+            raise CandidateAnalysisError(
+                f"{role} stage {name!r} wall disagrees with timestamps"
+            )
         stages.append(Stage(name, wall, started, finished, dict(raw)))
     for previous, current in zip(stages, stages[1:], strict=False):
         if current.started < previous.started:
@@ -289,7 +294,9 @@ def _parse_stages(profile: Mapping[str, Any], *, role: str) -> tuple[Stage, ...]
         )
     final_count = sum(stage.name in FINAL_WRITE_STAGES for stage in stages)
     if final_count != 1:
-        raise CandidateAnalysisError(f"{role} profile must contain exactly one final write")
+        raise CandidateAnalysisError(
+            f"{role} profile must contain exactly one final write"
+        )
     if stages[0].name != "compile_args" or stages[-1].name not in FINAL_WRITE_STAGES:
         raise CandidateAnalysisError(
             f"{role} stages must start at compile_args and finish at write_osu/write_osz"
@@ -300,7 +307,9 @@ def _parse_stages(profile: Mapping[str, Any], *, role: str) -> tuple[Stage, ...]
 def _unique_stage(stages: Sequence[Stage], names: set[str] | frozenset[str]) -> Stage:
     matches = [stage for stage in stages if stage.name in names]
     if len(matches) != 1:
-        raise CandidateAnalysisError(f"expected one stage from {sorted(names)}, got {len(matches)}")
+        raise CandidateAnalysisError(
+            f"expected one stage from {sorted(names)}, got {len(matches)}"
+        )
     return matches[0]
 
 
@@ -388,9 +397,7 @@ def _parse_run(
     except Exception as exc:
         raise CandidateAnalysisError(str(exc)) from exc
     stages = _parse_stages(profile, role=role)
-    osu_path = _resolve_osu_path(
-        profile_path, metadata, osu_override, role=role
-    )
+    osu_path = _resolve_osu_path(profile_path, metadata, osu_override, role=role)
     structure = summarize_osu_structure(osu_path)
     if not structure.get("finite_and_well_formed"):
         raise CandidateAnalysisError(f"{role} OSU output is malformed or non-finite")
@@ -399,7 +406,9 @@ def _parse_run(
     label_values: dict[str, tuple[float, int, float, float]] = {}
     for label in PROFILE_LABELS:
         signature = _profile_label_signature(profile, label)
-        if signature.get("status") != "available" or not signature.get("self_consistent"):
+        if signature.get("status") != "available" or not signature.get(
+            "self_consistent"
+        ):
             raise CandidateAnalysisError(
                 f"{role} {label} token/stopping signature is unavailable or inconsistent"
             )
@@ -480,11 +489,7 @@ def _parse_run(
     if any(not math.isfinite(value) or value < 0.0 for value in metrics.values()):
         raise CandidateAnalysisError(f"{role} contains invalid computed metrics")
 
-    workload = {
-        key: metadata[key]
-        for key in PROFILE_WORKLOAD_KEYS
-        if key in metadata
-    }
+    workload = {key: metadata[key] for key in PROFILE_WORKLOAD_KEYS if key in metadata}
     missing_workload = [
         key
         for key in ("model_path", "audio_path", "seed", "precision", "inference_engine")
@@ -548,27 +553,45 @@ def _material_differences(reference: Any, candidate: Any) -> list[dict[str, Any]
 
 
 def _validate_allowed_differences(
-    differences: Sequence[dict[str, Any]], patterns: Sequence[str]
+    differences: Sequence[dict[str, Any]],
+    patterns: Sequence[str],
+    optional_patterns: Sequence[str] = (),
 ) -> dict[str, Any]:
-    clean_patterns = tuple(dict.fromkeys(pattern.strip() for pattern in patterns if pattern.strip()))
-    matched: dict[str, list[str]] = {pattern: [] for pattern in clean_patterns}
+    clean_patterns = tuple(
+        dict.fromkeys(pattern.strip() for pattern in patterns if pattern.strip())
+    )
+    clean_optional = tuple(
+        dict.fromkeys(
+            pattern.strip() for pattern in optional_patterns if pattern.strip()
+        )
+    )
+    duplicate_patterns = sorted(set(clean_patterns) & set(clean_optional))
+    if duplicate_patterns:
+        raise CandidateAnalysisError(
+            f"dispatch delta patterns cannot be both required and optional: {duplicate_patterns}"
+        )
+    all_patterns = (*clean_patterns, *clean_optional)
+    matched: dict[str, list[str]] = {pattern: [] for pattern in all_patterns}
     undeclared: list[str] = []
     for difference in differences:
         path = str(difference["path"])
         matches = [
-            pattern for pattern in clean_patterns if fnmatch.fnmatchcase(path, pattern)
+            pattern for pattern in all_patterns if fnmatch.fnmatchcase(path, pattern)
         ]
         if not matches:
             undeclared.append(path)
         for pattern in matches:
             matched[pattern].append(path)
-    unused = [pattern for pattern, paths in matched.items() if not paths]
+    unused = [pattern for pattern in clean_patterns if not matched[pattern]]
+    unused_optional = [pattern for pattern in clean_optional if not matched[pattern]]
     return {
         "declared_patterns": list(clean_patterns),
+        "optional_declared_patterns": list(clean_optional),
         "differences": list(differences),
         "matched_paths_by_pattern": matched,
         "undeclared_paths": undeclared,
         "unused_patterns": unused,
+        "unused_optional_patterns": unused_optional,
         "pass": not undeclared and not unused,
     }
 
@@ -603,7 +626,9 @@ def _validate_workloads(runs: Mapping[str, ParsedRun], *, mode: str) -> dict[str
             f"baseline/candidate workload differs outside precision: {undeclared}"
         )
     if mode == "exact-fp32" and any(run.precision != "fp32" for run in runs.values()):
-        raise CandidateAnalysisError("exact-fp32 mode requires all four profiles to be fp32")
+        raise CandidateAnalysisError(
+            "exact-fp32 mode requires all four profiles to be fp32"
+        )
     return {
         "baseline_sha256": _sha256_json(runs["baseline_first"].workload),
         "candidate_sha256": _sha256_json(runs["candidate_first"].workload),
@@ -632,7 +657,9 @@ def _metric_summary(metric: str, runs: Mapping[str, ParsedRun]) -> dict[str, Any
     pairs = []
     for order, baseline_role, candidate_role in pair_roles:
         pair_delta = values[candidate_role] - values[baseline_role]
-        pair_improvement = pair_delta if direction == "higher_is_better" else -pair_delta
+        pair_improvement = (
+            pair_delta if direction == "higher_is_better" else -pair_delta
+        )
         pairs.append(
             {
                 "order": order,
@@ -680,7 +707,9 @@ def _token_groups(profile: Mapping[str, Any], label: str) -> list[list[int]]:
     return groups
 
 
-def _token_divergence(reference: ParsedRun, candidate: ParsedRun, label: str) -> dict[str, Any]:
+def _token_divergence(
+    reference: ParsedRun, candidate: ParsedRun, label: str
+) -> dict[str, Any]:
     reference_groups = _token_groups(reference.profile, label)
     candidate_groups = _token_groups(candidate.profile, label)
     reference_flat = [token for group in reference_groups for token in group]
@@ -688,7 +717,9 @@ def _token_divergence(reference: ParsedRun, candidate: ParsedRun, label: str) ->
     aligned = min(len(reference_flat), len(candidate_flat))
     mismatches = sum(
         left != right
-        for left, right in zip(reference_flat[:aligned], candidate_flat[:aligned], strict=True)
+        for left, right in zip(
+            reference_flat[:aligned], candidate_flat[:aligned], strict=True
+        )
     )
     return {
         "baseline_tokens": len(reference_flat),
@@ -736,11 +767,41 @@ def _structure_divergence(reference: ParsedRun, candidate: ParsedRun) -> dict[st
     }
 
 
+def _exact_dispatch_label_material(run: ParsedRun, label: str) -> list[dict[str, Any]]:
+    """Compare executed dispatch while ignoring explicit zero-only counter keys."""
+
+    records = run.graph_signature["material"]["records"].get(label, [])
+    normalized: list[dict[str, Any]] = []
+    for record in records:
+        values = dict(record)
+        hits = values.get("optimized_dispatch_capture_hits")
+        if isinstance(hits, dict):
+            values["optimized_dispatch_capture_hits"] = {
+                key: value for key, value in hits.items() if value != 0
+            }
+        normalized.append(values)
+    return normalized
+
+
+def _normalized_dispatch_material(run: ParsedRun) -> dict[str, Any]:
+    material = dict(run.graph_signature["material"])
+    material["records"] = {
+        label: _exact_dispatch_label_material(run, label)
+        for label in PROFILE_LABELS
+        if _exact_dispatch_label_material(run, label)
+    }
+    return material
+
+
 def _parity_and_divergence(
     runs: Mapping[str, ParsedRun],
     *,
     mode: str,
     allowed_dispatch_deltas: Sequence[str],
+    optional_allowed_dispatch_deltas: Sequence[str],
+    required_exact_labels: Sequence[str],
+    required_exact_dispatch_labels: Sequence[str],
+    require_dispatch_declaration: bool,
 ) -> dict[str, Any]:
     for label in PROFILE_LABELS:
         _require_equal(
@@ -789,13 +850,17 @@ def _parity_and_divergence(
     )
 
     graph_differences = _material_differences(
-        runs["baseline_first"].graph_signature["material"],
-        runs["candidate_first"].graph_signature["material"],
+        _normalized_dispatch_material(runs["baseline_first"]),
+        _normalized_dispatch_material(runs["candidate_first"]),
     )
     dispatch_declaration = _validate_allowed_differences(
-        graph_differences, allowed_dispatch_deltas
+        graph_differences,
+        allowed_dispatch_deltas,
+        optional_allowed_dispatch_deltas,
     )
-    if mode == "exact-fp32" and not dispatch_declaration["pass"]:
+    if (mode == "exact-fp32" or require_dispatch_declaration) and not (
+        dispatch_declaration["pass"]
+    ):
         raise CandidateAnalysisError(
             "dispatch/cache metadata contains undeclared or unused expected deltas: "
             f"undeclared={dispatch_declaration['undeclared_paths']}, "
@@ -803,18 +868,50 @@ def _parity_and_divergence(
         )
 
     token_divergence = {
-        label: _token_divergence(
-            runs["baseline_first"], runs["candidate_first"], label
-        )
+        label: _token_divergence(runs["baseline_first"], runs["candidate_first"], label)
         for label in PROFILE_LABELS
     }
     output_divergence = _structure_divergence(
         runs["baseline_first"], runs["candidate_first"]
     )
-    exact_cross_candidate = all(
-        divergence["token_stream_equal"] and divergence["stopping_equal"]
-        for divergence in token_divergence.values()
-    ) and output_divergence["final_map_equal"]
+    exact_labels = tuple(dict.fromkeys(required_exact_labels))
+    exact_dispatch_labels = tuple(dict.fromkeys(required_exact_dispatch_labels))
+    invalid_labels = sorted(
+        (set(exact_labels) | set(exact_dispatch_labels)) - set(PROFILE_LABELS)
+    )
+    if invalid_labels:
+        raise CandidateAnalysisError(
+            f"required exact labels are unsupported: {invalid_labels}"
+        )
+    inexact_labels = [
+        label
+        for label in exact_labels
+        if not (
+            token_divergence[label]["token_stream_equal"]
+            and token_divergence[label]["stopping_equal"]
+        )
+    ]
+    if inexact_labels:
+        raise CandidateAnalysisError(
+            f"required exact token/stopping labels diverged: {inexact_labels}"
+        )
+    inexact_dispatch_labels = [
+        label
+        for label in exact_dispatch_labels
+        if _exact_dispatch_label_material(runs["baseline_first"], label)
+        != _exact_dispatch_label_material(runs["candidate_first"], label)
+    ]
+    if inexact_dispatch_labels:
+        raise CandidateAnalysisError(
+            f"required exact dispatch/cache labels diverged: {inexact_dispatch_labels}"
+        )
+    exact_cross_candidate = (
+        all(
+            divergence["token_stream_equal"] and divergence["stopping_equal"]
+            for divergence in token_divergence.values()
+        )
+        and output_divergence["final_map_equal"]
+    )
     if mode == "exact-fp32" and not exact_cross_candidate:
         raise CandidateAnalysisError(
             "exact-fp32 candidate differs in tokens, stopping, or final OSU bytes"
@@ -824,6 +921,10 @@ def _parity_and_divergence(
         "baseline_repeat_stable": True,
         "candidate_repeat_stable": True,
         "cross_candidate_exact": exact_cross_candidate,
+        "required_exact_labels": list(exact_labels),
+        "required_exact_labels_pass": not inexact_labels,
+        "required_exact_dispatch_labels": list(exact_dispatch_labels),
+        "required_exact_dispatch_labels_pass": not inexact_dispatch_labels,
         "dispatch_cache_topology": dispatch_declaration,
         "token_and_stopping_divergence": token_divergence,
         "output_divergence": output_divergence,
@@ -836,6 +937,10 @@ def analyze(
     mode: str = "exact-fp32",
     osu_overrides: Mapping[str, Path | None] | None = None,
     allowed_dispatch_deltas: Sequence[str] = (),
+    optional_allowed_dispatch_deltas: Sequence[str] = (),
+    required_exact_labels: Sequence[str] = (),
+    required_exact_dispatch_labels: Sequence[str] = (),
+    require_dispatch_declaration: bool = False,
 ) -> dict[str, Any]:
     if mode not in MODES:
         raise CandidateAnalysisError(f"mode must be one of {MODES}")
@@ -853,6 +958,10 @@ def analyze(
         runs,
         mode=mode,
         allowed_dispatch_deltas=allowed_dispatch_deltas,
+        optional_allowed_dispatch_deltas=optional_allowed_dispatch_deltas,
+        required_exact_labels=required_exact_labels,
+        required_exact_dispatch_labels=required_exact_dispatch_labels,
+        require_dispatch_declaration=require_dispatch_declaration,
     )
     metric_names = tuple(runs[RUN_ORDER[0]].metrics)
     for role in RUN_ORDER[1:]:
@@ -903,11 +1012,23 @@ def text_report(report: Mapping[str, Any]) -> str:
         f"parity.cross_candidate_exact={str(parity['cross_candidate_exact']).lower()}",
         "parity.baseline_repeat_stable=true",
         "parity.candidate_repeat_stable=true",
+        "parity.required_exact_labels="
+        + (",".join(parity["required_exact_labels"]) or "none"),
+        "parity.required_exact_labels_pass="
+        + str(parity["required_exact_labels_pass"]).lower(),
+        "parity.required_exact_dispatch_labels="
+        + (",".join(parity["required_exact_dispatch_labels"]) or "none"),
+        "parity.required_exact_dispatch_labels_pass="
+        + str(parity["required_exact_dispatch_labels_pass"]).lower(),
     ]
     topology = parity["dispatch_cache_topology"]
     lines.append(
         "dispatch.declared_patterns="
         + (",".join(topology["declared_patterns"]) or "none")
+    )
+    lines.append(
+        "dispatch.optional_declared_patterns="
+        + (",".join(topology["optional_declared_patterns"]) or "none")
     )
     lines.append(f"dispatch.changed_paths={len(topology['differences'])}")
     lines.append(f"dispatch.declaration_pass={str(topology['pass']).lower()}")
@@ -949,6 +1070,32 @@ def _arguments() -> argparse.Namespace:
         metavar="GLOB",
         help="repeatable fnmatch path for an intentional dispatch/cache topology delta",
     )
+    parser.add_argument(
+        "--require-exact-label",
+        action="append",
+        default=[],
+        choices=PROFILE_LABELS,
+        help="require baseline/candidate token and stopping equality for this label",
+    )
+    parser.add_argument(
+        "--allow-optional-dispatch-delta",
+        action="append",
+        default=[],
+        metavar="GLOB",
+        help="fnmatch path allowed when present but not required to differ",
+    )
+    parser.add_argument(
+        "--require-exact-dispatch-label",
+        action="append",
+        default=[],
+        choices=PROFILE_LABELS,
+        help="require baseline/candidate dispatch/cache equality for this label",
+    )
+    parser.add_argument(
+        "--require-dispatch-declaration",
+        action="store_true",
+        help="fail relaxed mode on undeclared or unused dispatch/cache deltas",
+    )
     parser.add_argument("--json-output", type=Path, required=True)
     parser.add_argument("--text-output", type=Path, required=True)
     return parser.parse_args()
@@ -956,15 +1103,17 @@ def _arguments() -> argparse.Namespace:
 
 def main() -> None:
     args = _arguments()
-    profile_paths = {
-        role: getattr(args, f"{role}_profile") for role in RUN_ORDER
-    }
+    profile_paths = {role: getattr(args, f"{role}_profile") for role in RUN_ORDER}
     osu_overrides = {role: getattr(args, f"{role}_osu") for role in RUN_ORDER}
     report = analyze(
         profile_paths,
         mode=args.mode,
         osu_overrides=osu_overrides,
         allowed_dispatch_deltas=args.allow_dispatch_delta,
+        optional_allowed_dispatch_deltas=args.allow_optional_dispatch_delta,
+        required_exact_labels=args.require_exact_label,
+        required_exact_dispatch_labels=args.require_exact_dispatch_label,
+        require_dispatch_declaration=args.require_dispatch_declaration,
     )
     args.json_output.parent.mkdir(parents=True, exist_ok=True)
     args.text_output.parent.mkdir(parents=True, exist_ok=True)

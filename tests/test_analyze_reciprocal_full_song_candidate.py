@@ -100,9 +100,7 @@ def _generation_record(
     }
     if split_kv:
         dispatch["native_q1_rope_cache_self_attention_split_kv_8"] = 12
-        dispatch[
-            "native_q1_rope_cache_self_attention_split_kv_8_prefix_640"
-        ] = 12
+        dispatch["native_q1_rope_cache_self_attention_split_kv_8_prefix_640"] = 12
     return {
         "profile_label": label,
         "context_type": "timing" if label == "timing_context" else "map",
@@ -124,7 +122,13 @@ def _generation_record(
             "graph_count": 1,
             "decode_replays": len(tokens) - 1,
             "capture_seconds": 0.05,
-            "buckets": {"128": {"graph_count": 1, "decode_replays": len(tokens) - 1, "capture_seconds": 0.05}},
+            "buckets": {
+                "128": {
+                    "graph_count": 1,
+                    "decode_replays": len(tokens) - 1,
+                    "capture_seconds": 0.05,
+                }
+            },
         },
         "native_cross_mlp_tail_requested": True,
         "native_cross_mlp_tail_enabled": True,
@@ -239,9 +243,7 @@ def _write_run(
 
 def _four_runs(tmp_path: Path, **candidate_kwargs) -> dict[str, Path]:
     return {
-        "baseline_first": _write_run(
-            tmp_path, "baseline_first", main_seconds=10.0
-        ),
+        "baseline_first": _write_run(tmp_path, "baseline_first", main_seconds=10.0),
         "candidate_first": _write_run(
             tmp_path,
             "candidate_first",
@@ -254,9 +256,7 @@ def _four_runs(tmp_path: Path, **candidate_kwargs) -> dict[str, Path]:
             main_seconds=8.4,
             **candidate_kwargs,
         ),
-        "baseline_second": _write_run(
-            tmp_path, "baseline_second", main_seconds=10.4
-        ),
+        "baseline_second": _write_run(tmp_path, "baseline_second", main_seconds=10.4),
     }
 
 
@@ -324,15 +324,96 @@ def test_relaxed_mode_reports_token_stopping_structure_and_map_divergence(
     parity = report["parity"]
     assert parity["claim"] == "relaxed-nonexact"
     assert parity["cross_candidate_exact"] is False
-    assert parity["token_and_stopping_divergence"]["main_generation"][
-        "aligned_mismatches"
-    ] == 1
+    assert (
+        parity["token_and_stopping_divergence"]["main_generation"]["aligned_mismatches"]
+        == 1
+    )
     assert not parity["token_and_stopping_divergence"]["main_generation"][
         "stopping_equal"
     ]
     assert parity["output_divergence"]["scalar_deltas"]["timing_points"] == 1
     assert parity["output_divergence"]["scalar_deltas"]["hit_objects"] == 1
     assert parity["output_divergence"]["final_map_equal"] is False
+
+
+def test_relaxed_gate_requires_timing_tokens_stopping_and_dispatch_exact(
+    tmp_path: Path,
+) -> None:
+    profiles = _four_runs(
+        tmp_path,
+        main_tokens=[10, 99, 12],
+        osu=_osu(hit_objects=2),
+    )
+    for role in ("candidate_first", "candidate_second"):
+        path = profiles[role]
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["generation"][0]["optimized_dispatch_capture_hits"][
+            "weight_only_self_attention_block"
+        ] = 0
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    report = analyze(
+        profiles,
+        mode="relaxed",
+        required_exact_labels=["timing_context"],
+        required_exact_dispatch_labels=["timing_context"],
+    )
+    parity = report["parity"]
+    assert parity["required_exact_labels_pass"] is True
+    assert parity["required_exact_dispatch_labels_pass"] is True
+    assert "parity.required_exact_labels=timing_context" in text_report(report)
+
+    timing_root = tmp_path / "timing-drift"
+    timing_root.mkdir()
+    timing_drift = _four_runs(timing_root, timing_tokens=[1, 9])
+    with pytest.raises(CandidateAnalysisError, match="exact token/stopping"):
+        analyze(
+            timing_drift,
+            mode="relaxed",
+            required_exact_labels=["timing_context"],
+        )
+
+    dispatch_root = tmp_path / "dispatch-drift"
+    dispatch_root.mkdir()
+    dispatch_drift = _four_runs(dispatch_root)
+    for role in ("candidate_first", "candidate_second"):
+        path = dispatch_drift[role]
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["generation"][0]["optimized_dispatch_capture_hits"][
+            "q1_bmm_cross_attention"
+        ] += 1
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(CandidateAnalysisError, match="exact dispatch/cache"):
+        analyze(
+            dispatch_drift,
+            mode="relaxed",
+            required_exact_dispatch_labels=["timing_context"],
+        )
+
+
+def test_relaxed_gate_can_require_declared_dispatch_deltas(tmp_path: Path) -> None:
+    profiles = _four_runs(tmp_path, split_kv=True)
+    pattern = (
+        "records.*[[]0].optimized_dispatch_capture_hits."
+        "native_q1_rope_cache_self_attention*"
+    )
+    report = analyze(
+        profiles,
+        mode="relaxed",
+        allowed_dispatch_deltas=[pattern],
+        optional_allowed_dispatch_deltas=["records.*.optional_difference"],
+        require_dispatch_declaration=True,
+    )
+    assert report["parity"]["dispatch_cache_topology"]["pass"] is True
+    assert report["parity"]["dispatch_cache_topology"]["unused_optional_patterns"] == [
+        "records.*.optional_difference"
+    ]
+
+    with pytest.raises(CandidateAnalysisError, match="undeclared"):
+        analyze(
+            profiles,
+            mode="relaxed",
+            require_dispatch_declaration=True,
+        )
 
 
 @pytest.mark.parametrize(
@@ -344,9 +425,7 @@ def test_relaxed_mode_reports_token_stopping_structure_and_map_divergence(
             "finite",
         ),
         (
-            lambda profile: profile["metadata"].update(
-                authoritative_performance=False
-            ),
+            lambda profile: profile["metadata"].update(authoritative_performance=False),
             "authoritative_performance",
         ),
     ],

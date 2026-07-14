@@ -30,8 +30,9 @@ def _metadata() -> dict:
 def _record(label: str, *, candidate: bool) -> dict:
     timing = label == "timing_context"
     hits = {
-        "native_q1_rope_cache_self_attention": 10,
+        "native_q1_rope_cache_self_attention": 0 if timing else 12,
         "q1_bmm_cross_attention": 10,
+        "native_cross_mlp_tail": 0 if timing else 12,
     }
     policy = {
         "q1_bmm_cross_attention": {"requested": True, "enabled": True},
@@ -42,34 +43,66 @@ def _record(label: str, *, candidate: bool) -> dict:
         "optimized_dispatch_policy": policy,
         "optimized_dispatch_capture_hits": hits,
     }
-    if candidate and not timing:
-        policy["approximate_weight_only"] = {
-            "requested": True,
-            "enabled": True,
-            "disabled_reason": None,
-            "result_class": "documented-drift",
-            "exactness_claim": False,
-        }
-        policy["effective_native_q1_rope_cache_self_attention"] = {
-            "requested": True,
-            "enabled": True,
-            "owner": "approximate_weight_only",
-            "kernel": "native_q1_rope_cache_attention",
+    policy["effective_native_q1_rope_cache_self_attention"] = (
+        {
+            "requested": False,
+            "enabled": False,
+            "owner": None,
+            "kernel": None,
             "standard_attention_hook_enabled": False,
+            "split_kv_selector_enabled": False,
+            "disabled_reason": "timing_context",
+        }
+        if timing
+        else {
+            "requested": True,
+            "enabled": True,
+            "owner": (
+                "approximate_weight_only" if candidate else "accepted_attention_hook"
+            ),
+            "kernel": "native_q1_rope_cache_attention",
+            "standard_attention_hook_enabled": not candidate,
             "split_kv_selector_enabled": True,
             "disabled_reason": None,
         }
+    )
+    if not timing:
+        hits.update(
+            {
+                "native_q1_rope_cache_self_attention_split_kv_8": 10,
+                "native_q1_rope_cache_self_attention_split_kv_8_prefix_192": 3,
+                "native_q1_rope_cache_self_attention_split_kv_8_prefix_640": 7,
+            }
+        )
+    if candidate:
+        policy["approximate_weight_only"] = {
+            "requested": True,
+            "enabled": not timing,
+            "disabled_reason": "timing_context" if timing else None,
+            "result_class": "documented-drift",
+            "exactness_claim": False,
+        }
+        record["approximate_weight_only"] = _metadata()
+        hits.update(
+            {
+                key: 0
+                for key in (
+                    "weight_only_self_attention_block",
+                    "weight_only_mlp_tail",
+                    "weight_only_final_projection",
+                )
+            }
+        )
+    if candidate and not timing:
         record["optimized_dispatch_mode"] = "approximate_weight_only_batch1"
         hits.update(
             {
                 "native_q1_rope_cache_self_attention": 12,
                 "q1_bmm_cross_attention": 12,
+                "native_cross_mlp_tail": 0,
                 "weight_only_self_attention_block": 12,
                 "weight_only_mlp_tail": 12,
                 "weight_only_final_projection": 1,
-                "native_q1_rope_cache_self_attention_split_kv_8": 10,
-                "native_q1_rope_cache_self_attention_split_kv_8_prefix_192": 3,
-                "native_q1_rope_cache_self_attention_split_kv_8_prefix_640": 7,
             }
         )
     return record
@@ -94,6 +127,11 @@ def test_candidate_requires_enabled_main_and_disabled_timing_dispatch() -> None:
 
     assert report["candidate_enabled_for_main"] is True
     assert report["candidate_disabled_for_timing"] is True
+    assert report["timing_effective_self_attention_counts"] == {
+        "native_q1_rope_cache_self_attention": 0,
+        "native_q1_rope_cache_self_attention_split_kv_8": 0,
+        "split_kv_prefix_counts": {},
+    }
     assert report["main_weight_only_dispatch_counts"] == {
         "weight_only_self_attention_block": 12,
         "weight_only_mlp_tail": 12,
@@ -125,8 +163,8 @@ def test_candidate_rejects_zero_main_or_nonzero_timing_dispatch() -> None:
     timing_policy = _profile(candidate=True)
     timing_policy["generation"][0]["optimized_dispatch_policy"][
         "approximate_weight_only"
-    ] = {"enabled": False}
-    with pytest.raises(WeightOnlyProfileError, match="must not request"):
+    ]["disabled_reason"] = None
+    with pytest.raises(WeightOnlyProfileError, match="invalid mixed-weight dispatch"):
         validate_profile(timing_policy, role="candidate")
 
 
@@ -135,7 +173,9 @@ def test_candidate_rejects_wrong_enabled_policy_or_legacy_metadata_name() -> Non
     wrong_policy["generation"][1]["optimized_dispatch_policy"][
         "approximate_weight_only"
     ]["enabled"] = False
-    with pytest.raises(WeightOnlyProfileError, match="invalid mixed-weight dispatch policy"):
+    with pytest.raises(
+        WeightOnlyProfileError, match="invalid mixed-weight dispatch policy"
+    ):
         validate_profile(wrong_policy, role="candidate")
 
     legacy = _profile(candidate=True)
@@ -226,9 +266,10 @@ def test_baseline_requires_candidate_metadata_policy_and_counters_absent() -> No
         "weight_only_final_projection": 0,
     }
     assert report["main_effective_self_attention_counts"] == {
-        "native_q1_rope_cache_self_attention": 0,
-        "native_q1_rope_cache_self_attention_split_kv_8": 0,
-        "split_kv_prefix_counts": {},
+        "native_q1_rope_cache_self_attention": 12,
+        "native_q1_rope_cache_self_attention_split_kv_8": 10,
+        "split_kv_prefix_counts": {192: 3, 640: 7},
+        "accepted_fallback": 2,
     }
 
     for mutation, message in (
@@ -255,3 +296,20 @@ def test_baseline_requires_candidate_metadata_policy_and_counters_absent() -> No
         mutation(profile)
         with pytest.raises(WeightOnlyProfileError, match=message):
             validate_profile(profile, role="baseline")
+
+
+def test_baseline_requires_exact_split_kv_and_accepted_fallback() -> None:
+    no_split = _profile(candidate=False)
+    hits = no_split["generation"][1]["optimized_dispatch_capture_hits"]
+    hits["native_q1_rope_cache_self_attention_split_kv_8"] = 0
+    hits["native_q1_rope_cache_self_attention_split_kv_8_prefix_192"] = 0
+    hits["native_q1_rope_cache_self_attention_split_kv_8_prefix_640"] = 0
+    with pytest.raises(WeightOnlyProfileError, match="exact split-KV"):
+        validate_profile(no_split, role="baseline")
+
+    no_fallback = _profile(candidate=False)
+    hits = no_fallback["generation"][1]["optimized_dispatch_capture_hits"]
+    hits["native_q1_rope_cache_self_attention_split_kv_8"] = 12
+    hits["native_q1_rope_cache_self_attention_split_kv_8_prefix_640"] = 9
+    with pytest.raises(WeightOnlyProfileError, match="accepted native q1 fallback"):
+        validate_profile(no_fallback, role="baseline")

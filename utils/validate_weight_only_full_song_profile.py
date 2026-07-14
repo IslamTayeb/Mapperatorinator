@@ -90,9 +90,14 @@ def _effective_self_attention_counts(
     raw = _object(record.get("optimized_dispatch_capture_hits"), name=f"{name}.hits")
     generic = raw.get("native_q1_rope_cache_self_attention")
     split = raw.get(SPLIT_KV_DISPATCH, 0)
-    for key, value in (("native_q1_rope_cache_self_attention", generic), (SPLIT_KV_DISPATCH, split)):
+    for key, value in (
+        ("native_q1_rope_cache_self_attention", generic),
+        (SPLIT_KV_DISPATCH, split),
+    ):
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise WeightOnlyProfileError(f"{name}.hits.{key} must be a non-negative integer")
+            raise WeightOnlyProfileError(
+                f"{name}.hits.{key} must be a non-negative integer"
+            )
     prefixes: dict[int, int] = {}
     for key, value in raw.items():
         if not key.startswith(SPLIT_KV_PREFIX):
@@ -163,9 +168,12 @@ def validate_profile(payload: Any, *, role: str) -> dict[str, Any]:
 
     totals = {key: 0 for key in WEIGHT_ONLY_DISPATCHES}
     effective_self_attention_totals = {
-        "native_q1_rope_cache_self_attention": 0,
-        "native_q1_rope_cache_self_attention_split_kv_8": 0,
-        "split_kv_prefix_counts": {},
+        label: {
+            "native_q1_rope_cache_self_attention": 0,
+            "native_q1_rope_cache_self_attention_split_kv_8": 0,
+            "split_kv_prefix_counts": {},
+        }
+        for label in PROFILE_LABELS
     }
     for label, records in by_label.items():
         for index, record in enumerate(records):
@@ -176,7 +184,24 @@ def validate_profile(payload: Any, *, role: str) -> dict[str, Any]:
             )
             candidate_policy = policy.get("approximate_weight_only")
             candidate_main = candidate and label == "main_generation"
-            if not candidate_main:
+            if candidate:
+                expected_candidate_policy = {
+                    "requested": True,
+                    "enabled": candidate_main,
+                    "disabled_reason": None if candidate_main else "timing_context",
+                    "result_class": "documented-drift",
+                    "exactness_claim": False,
+                }
+                if candidate_policy != expected_candidate_policy:
+                    raise WeightOnlyProfileError(
+                        f"{name} has invalid mixed-weight dispatch policy: "
+                        f"expected {expected_candidate_policy}, got {candidate_policy}"
+                    )
+                _metadata(
+                    record.get("approximate_weight_only"),
+                    name=f"{name}.approximate_weight_only",
+                )
+            else:
                 if candidate_policy is not None:
                     raise WeightOnlyProfileError(
                         f"{name} must not request mixed-weight dispatch"
@@ -185,89 +210,141 @@ def validate_profile(payload: Any, *, role: str) -> dict[str, Any]:
                     raise WeightOnlyProfileError(
                         f"{name} must not contain record-level mixed-weight metadata"
                     )
-                raw_hits = _object(
-                    record.get("optimized_dispatch_capture_hits"),
-                    name=f"{name}.hits",
+
+            raw_hits = _object(
+                record.get("optimized_dispatch_capture_hits"),
+                name=f"{name}.hits",
+            )
+            if not candidate:
+                unexpected_keys = [
+                    key for key in WEIGHT_ONLY_DISPATCHES if key in raw_hits
+                ]
+                if unexpected_keys:
+                    raise WeightOnlyProfileError(
+                        f"{name} contains mixed-weight dispatch counters: "
+                        f"{unexpected_keys}"
+                    )
+            weight_counts = {
+                key: raw_hits.get(key, 0) for key in WEIGHT_ONLY_DISPATCHES
+            }
+            invalid_weight_counts = {
+                key: value
+                for key, value in weight_counts.items()
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0
+            }
+            if invalid_weight_counts:
+                raise WeightOnlyProfileError(
+                    f"{name} contains invalid mixed-weight dispatch counters: "
+                    f"{invalid_weight_counts}"
                 )
+            if not candidate_main:
                 unexpected = {
-                    key: raw_hits[key]
-                    for key in WEIGHT_ONLY_DISPATCHES
-                    if key in raw_hits
+                    key: value for key, value in weight_counts.items() if value != 0
                 }
                 if unexpected:
                     raise WeightOnlyProfileError(
-                        f"{name} contains mixed-weight dispatch counters: "
-                        f"{unexpected}"
+                        f"{name} contains mixed-weight dispatch counters: {unexpected}"
                     )
-                if candidate and record.get("optimized_dispatch_mode") != "accepted_batch1":
-                    raise WeightOnlyProfileError(
-                        f"{name}.optimized_dispatch_mode must be accepted_batch1"
-                    )
-                continue
-
-            expected_policy = {
-                "requested": True,
-                "enabled": True,
-                "disabled_reason": None,
-                "result_class": "documented-drift",
-                "exactness_claim": False,
-            }
-            if candidate_policy != expected_policy:
-                raise WeightOnlyProfileError(
-                    f"{name} has invalid mixed-weight dispatch policy: "
-                    f"expected {expected_policy}, got {candidate_policy}"
-                )
-            expected_effective_self_attention = {
-                "requested": True,
-                "enabled": True,
-                "owner": "approximate_weight_only",
-                "kernel": "native_q1_rope_cache_attention",
-                "standard_attention_hook_enabled": False,
-                "split_kv_selector_enabled": True,
-                "disabled_reason": None,
-            }
+            expected_effective_self_attention = (
+                {
+                    "requested": False,
+                    "enabled": False,
+                    "owner": None,
+                    "kernel": None,
+                    "standard_attention_hook_enabled": False,
+                    "split_kv_selector_enabled": False,
+                    "disabled_reason": "timing_context",
+                }
+                if label == "timing_context"
+                else {
+                    "requested": True,
+                    "enabled": True,
+                    "owner": (
+                        "approximate_weight_only"
+                        if candidate_main
+                        else "accepted_attention_hook"
+                    ),
+                    "kernel": "native_q1_rope_cache_attention",
+                    "standard_attention_hook_enabled": not candidate_main,
+                    "split_kv_selector_enabled": True,
+                    "disabled_reason": None,
+                }
+            )
             if policy.get("effective_native_q1_rope_cache_self_attention") != (
                 expected_effective_self_attention
             ):
                 raise WeightOnlyProfileError(
                     f"{name} has invalid effective native q1 policy"
                 )
-            expected_mode = "approximate_weight_only_batch1"
+            expected_mode = (
+                "approximate_weight_only_batch1"
+                if candidate_main
+                else "accepted_batch1"
+            )
             if record.get("optimized_dispatch_mode") != expected_mode:
                 raise WeightOnlyProfileError(
                     f"{name}.optimized_dispatch_mode must be {expected_mode}"
                 )
-            counts = _dispatch_counts(record, name=name)
-            for key, value in counts.items():
-                totals[key] += value
             effective = _effective_self_attention_counts(record, name=name)
-            if (
-                effective["native_q1_rope_cache_self_attention"]
-                != counts["weight_only_self_attention_block"]
-            ):
-                raise WeightOnlyProfileError(
-                    f"{name} native q1 count does not match weight-owned self-attention"
-                )
-            raw_hits = _object(
-                record.get("optimized_dispatch_capture_hits"),
-                name=f"{name}.hits",
-            )
-            if raw_hits.get("q1_bmm_cross_attention") != counts["weight_only_mlp_tail"]:
-                raise WeightOnlyProfileError(
-                    f"{name} q1 BMM count does not match weight-owned MLP tail"
-                )
-            effective_self_attention_totals[
+            label_totals = effective_self_attention_totals[label]
+            label_totals["native_q1_rope_cache_self_attention"] += effective[
                 "native_q1_rope_cache_self_attention"
-            ] += effective["native_q1_rope_cache_self_attention"]
-            effective_self_attention_totals[
-                "native_q1_rope_cache_self_attention_split_kv_8"
-            ] += effective["native_q1_rope_cache_self_attention_split_kv_8"]
-            prefix_totals = effective_self_attention_totals[
-                "split_kv_prefix_counts"
             ]
+            label_totals["native_q1_rope_cache_self_attention_split_kv_8"] += effective[
+                "native_q1_rope_cache_self_attention_split_kv_8"
+            ]
+            prefix_totals = label_totals["split_kv_prefix_counts"]
             for prefix, value in effective["split_kv_prefix_counts"].items():
                 prefix_totals[prefix] = prefix_totals.get(prefix, 0) + value
 
+            if label == "timing_context":
+                if any(
+                    effective[key] != 0
+                    for key in (
+                        "native_q1_rope_cache_self_attention",
+                        "native_q1_rope_cache_self_attention_split_kv_8",
+                    )
+                ):
+                    raise WeightOnlyProfileError(
+                        f"{name} timing context must not execute native self-attention"
+                    )
+                continue
+
+            if candidate_main:
+                counts = _dispatch_counts(record, name=name)
+                for key, value in counts.items():
+                    totals[key] += value
+                if (
+                    effective["native_q1_rope_cache_self_attention"]
+                    != counts["weight_only_self_attention_block"]
+                ):
+                    raise WeightOnlyProfileError(
+                        f"{name} native q1 count does not match weight-owned self-attention"
+                    )
+                if (
+                    raw_hits.get("q1_bmm_cross_attention")
+                    != counts["weight_only_mlp_tail"]
+                ):
+                    raise WeightOnlyProfileError(
+                        f"{name} q1 BMM count does not match weight-owned MLP tail"
+                    )
+            else:
+                for key in (
+                    "native_q1_rope_cache_self_attention",
+                    "q1_bmm_cross_attention",
+                    "native_cross_mlp_tail",
+                ):
+                    value = raw_hits.get(key)
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, int)
+                        or value <= 0
+                    ):
+                        raise WeightOnlyProfileError(
+                            f"{name}.hits.{key} must be a positive integer"
+                        )
+
+    main_effective = effective_self_attention_totals["main_generation"]
     if candidate:
         missing_dispatch = {key: value for key, value in totals.items() if value <= 0}
         if missing_dispatch:
@@ -275,34 +352,46 @@ def validate_profile(payload: Any, *, role: str) -> dict[str, Any]:
                 "candidate main generation did not execute every mixed-weight region: "
                 f"{missing_dispatch}"
             )
-        if (
-            effective_self_attention_totals[
-                "native_q1_rope_cache_self_attention_split_kv_8"
-            ]
-            <= 0
-        ):
+        if main_effective["native_q1_rope_cache_self_attention_split_kv_8"] <= 0:
             raise WeightOnlyProfileError(
                 "candidate main generation did not execute split-KV native q1"
             )
         accepted_fallback = (
-            effective_self_attention_totals[
-                "native_q1_rope_cache_self_attention"
-            ]
-            - effective_self_attention_totals[
-                "native_q1_rope_cache_self_attention_split_kv_8"
-            ]
+            main_effective["native_q1_rope_cache_self_attention"]
+            - main_effective["native_q1_rope_cache_self_attention_split_kv_8"]
         )
         if accepted_fallback <= 0:
             raise WeightOnlyProfileError(
                 "candidate main generation did not execute accepted native q1 fallback"
             )
-        effective_self_attention_totals["accepted_fallback"] = accepted_fallback
+        main_effective["accepted_fallback"] = accepted_fallback
+    else:
+        if main_effective["native_q1_rope_cache_self_attention"] <= 0:
+            raise WeightOnlyProfileError(
+                "baseline main generation did not execute accepted native q1"
+            )
+        if main_effective["native_q1_rope_cache_self_attention_split_kv_8"] <= 0:
+            raise WeightOnlyProfileError(
+                "baseline main generation did not execute exact split-KV native q1"
+            )
+        accepted_fallback = (
+            main_effective["native_q1_rope_cache_self_attention"]
+            - main_effective["native_q1_rope_cache_self_attention_split_kv_8"]
+        )
+        if accepted_fallback <= 0:
+            raise WeightOnlyProfileError(
+                "baseline main generation did not execute accepted native q1 fallback"
+            )
+        main_effective["accepted_fallback"] = accepted_fallback
     return {
         "role": role,
         "candidate_enabled_for_main": candidate,
         "candidate_disabled_for_timing": candidate,
         "main_weight_only_dispatch_counts": totals,
-        "main_effective_self_attention_counts": effective_self_attention_totals,
+        "timing_effective_self_attention_counts": effective_self_attention_totals[
+            "timing_context"
+        ],
+        "main_effective_self_attention_counts": main_effective,
     }
 
 

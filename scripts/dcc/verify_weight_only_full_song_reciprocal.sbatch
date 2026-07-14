@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=weight-only-full-recip
+#SBATCH --job-name=split-weight-full-recip
 #SBATCH --partition=gpu-common
 #SBATCH --account=romerolab
 #SBATCH --cpus-per-task=8
@@ -18,17 +18,32 @@ BASELINE_REPO=${BASELINE_REPO:?Set BASELINE_REPO to a clean pushed worktree}
 CANDIDATE_REPO=${CANDIDATE_REPO:?Set CANDIDATE_REPO to a clean pushed worktree}
 BASELINE_COMMIT=${BASELINE_COMMIT:?Set BASELINE_COMMIT}
 CANDIDATE_COMMIT=${CANDIDATE_COMMIT:?Set CANDIDATE_COMMIT}
-BASELINE_BRANCH=${BASELINE_BRANCH:-DETACHED}
+BASELINE_BRANCH=${BASELINE_BRANCH:?Set BASELINE_BRANCH explicitly}
 CANDIDATE_BRANCH=${CANDIDATE_BRANCH:?Set CANDIDATE_BRANCH explicitly}
 CANDIDATE_REMOTE=${CANDIDATE_REMOTE:-origin}
 PROFILE_CONFIG=${PROFILE_CONFIG:-profile_salvalai}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
-RUN_LABEL=${RUN_LABEL:-weight-only-full-song-reciprocal}
+RUN_LABEL=${RUN_LABEL:-split-weight-full-song-reciprocal}
 RUN_ROOT="$WORK/runs/$RUN_LABEL-${SLURM_JOB_ID:-manual}"
 EXTENSION_JOB_KEY=${SLURM_JOB_ID:-manual}
 EXTENSION_CACHE_ROOT_OVERRIDE=${EXTENSION_CACHE_ROOT_OVERRIDE:-}
 BASELINE_EXTENSION_KEY_OVERRIDE=${BASELINE_EXTENSION_KEY_OVERRIDE:-}
 CANDIDATE_EXTENSION_KEY_OVERRIDE=${CANDIDATE_EXTENSION_KEY_OVERRIDE:-}
+
+if [[ "$BASELINE_COMMIT" != "$CANDIDATE_COMMIT" ]]; then
+  echo "split+weight reciprocal requires one shared baseline/candidate commit" >&2
+  exit 2
+fi
+if [[ "$BASELINE_BRANCH" != "$CANDIDATE_BRANCH" ]]; then
+  echo "split+weight reciprocal requires one shared baseline/candidate branch" >&2
+  exit 2
+fi
+BASELINE_REPO_RESOLVED=$(realpath -e "$BASELINE_REPO")
+CANDIDATE_REPO_RESOLVED=$(realpath -e "$CANDIDATE_REPO")
+if [[ "$BASELINE_REPO_RESOLVED" != "$CANDIDATE_REPO_RESOLVED" ]]; then
+  echo "split+weight reciprocal requires one shared baseline/candidate worktree" >&2
+  exit 2
+fi
 
 if [[ "$PROFILE_CONFIG" != profile_salvalai ]]; then
   echo "full-song reciprocal requires PROFILE_CONFIG=profile_salvalai" >&2
@@ -178,6 +193,7 @@ echo "candidate_commit=$CANDIDATE_COMMIT"
 echo "baseline_branch=$BASELINE_BRANCH"
 echo "candidate_branch=$CANDIDATE_BRANCH"
 echo "candidate_remote_ref=$CANDIDATE_REMOTE_REF"
+echo "same_commit_gate=true"
 echo "profile_config=$PROFILE_CONFIG"
 echo "audio=$AUDIO"
 echo "run_root=$RUN_ROOT"
@@ -554,6 +570,16 @@ PY
     --candidate-second-profile "$CANDIDATE_SECOND" \
     --baseline-second-profile "$BASELINE_SECOND" \
     --mode relaxed \
+    --require-exact-label timing_context \
+    --require-exact-dispatch-label timing_context \
+    --require-dispatch-declaration \
+    --allow-dispatch-delta 'optimized_result_class' \
+    --allow-dispatch-delta \
+      'records.main_generation[[]*].optimized_dispatch_capture_hits.*' \
+    --allow-dispatch-delta \
+      'records.main_generation[[]*].native_cross_mlp_tail_*' \
+    --allow-optional-dispatch-delta \
+      'records.main_generation[[]*].optimized_cuda_graphs.*' \
     --json-output "$RUN_ROOT/reciprocal-analysis.json" \
     --text-output "$RUN_ROOT/reciprocal-analysis.txt"
 )
@@ -579,6 +605,25 @@ done
 
 grep -q '^mode=relaxed$' "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^parity.claim=relaxed-nonexact$' "$RUN_ROOT/reciprocal-analysis.txt"
+grep -q '^parity.baseline_repeat_stable=true$' "$RUN_ROOT/reciprocal-analysis.txt"
+grep -q '^parity.candidate_repeat_stable=true$' "$RUN_ROOT/reciprocal-analysis.txt"
+grep -q '^parity.required_exact_labels=timing_context$' \
+  "$RUN_ROOT/reciprocal-analysis.txt"
+grep -q '^parity.required_exact_labels_pass=true$' \
+  "$RUN_ROOT/reciprocal-analysis.txt"
+grep -q '^parity.required_exact_dispatch_labels=timing_context$' \
+  "$RUN_ROOT/reciprocal-analysis.txt"
+grep -q '^parity.required_exact_dispatch_labels_pass=true$' \
+  "$RUN_ROOT/reciprocal-analysis.txt"
+grep -q '^dispatch.declaration_pass=true$' "$RUN_ROOT/reciprocal-analysis.txt"
+grep -q '^metric.timing_model_seconds=' "$RUN_ROOT/reciprocal-analysis.txt"
+grep -q '^metric.main_model_seconds=' "$RUN_ROOT/reciprocal-analysis.txt"
+grep -q '^metric.complete_request_wall_seconds=' \
+  "$RUN_ROOT/reciprocal-analysis.txt"
+grep -q '^metric.peak_cuda_memory_allocated_mb=' \
+  "$RUN_ROOT/reciprocal-analysis.txt"
+grep -q '^metric.setup_plus_capture_seconds=' \
+  "$RUN_ROOT/reciprocal-analysis.txt"
 find "$RUN_ROOT" -type f \
   \( -name '*.profile.json' -o -name '*analysis.json' -o -name '*summary.json' \) \
   -print0 | sort -z | xargs -0 sha256sum

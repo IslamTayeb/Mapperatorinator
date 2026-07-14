@@ -25,9 +25,7 @@ def test_wrapper_uses_full_fp32_optimized_reciprocal_order_and_launchers() -> No
     assert "profile_detail_ranges=false" in source
     assert "profile_cuda_capture=false" in source
     assert "profile_pass_kind=untraced_control" in source
-    assert (
-        '"$PYTHON" "$CANDIDATE_REPO/utils/run_fixed_seed_inference.py"' in source
-    )
+    assert '"$PYTHON" "$CANDIDATE_REPO/utils/run_fixed_seed_inference.py"' in source
     assert '--target-repo "$BASELINE_REPO"' in source
     assert '"$PYTHON" utils/run_approximate_weight_only.py' in source
     assert source.count("run_profile baseline_first") == 1
@@ -43,6 +41,17 @@ def test_wrapper_uses_full_fp32_optimized_reciprocal_order_and_launchers() -> No
     assert source.index("run_profile candidate_second") < source.index(
         "run_profile baseline_second"
     )
+
+
+def test_wrapper_requires_one_pushed_combined_commit_and_worktree() -> None:
+    source = WRAPPER.read_text(encoding="utf-8")
+
+    assert '[[ "$BASELINE_COMMIT" != "$CANDIDATE_COMMIT" ]]' in source
+    assert '[[ "$BASELINE_BRANCH" != "$CANDIDATE_BRANCH" ]]' in source
+    assert 'BASELINE_REPO_RESOLVED=$(realpath -e "$BASELINE_REPO")' in source
+    assert 'CANDIDATE_REPO_RESOLVED=$(realpath -e "$CANDIDATE_REPO")' in source
+    assert '[[ "$BASELINE_REPO_RESOLVED" != "$CANDIDATE_REPO_RESOLVED" ]]' in source
+    assert 'echo "same_commit_gate=true"' in source
 
 
 def test_wrapper_isolates_native_extensions_and_keeps_compiler_caches_per_run() -> None:
@@ -72,10 +81,17 @@ def test_wrapper_can_reuse_only_exact_commit_keyed_extension_caches() -> None:
     source = WRAPPER.read_text(encoding="utf-8")
 
     assert "EXTENSION_CACHE_ROOT_OVERRIDE=${EXTENSION_CACHE_ROOT_OVERRIDE:-}" in source
-    assert "BASELINE_EXTENSION_KEY_OVERRIDE=${BASELINE_EXTENSION_KEY_OVERRIDE:-}" in source
-    assert "CANDIDATE_EXTENSION_KEY_OVERRIDE=${CANDIDATE_EXTENSION_KEY_OVERRIDE:-}" in source
-    assert 'EXTENSION_CACHE_MODE=existing_override' in source
-    assert 'EXTENSION_JOB_ROOT=$(realpath -e "$EXTENSION_CACHE_ROOT_OVERRIDE")' in source
+    assert (
+        "BASELINE_EXTENSION_KEY_OVERRIDE=${BASELINE_EXTENSION_KEY_OVERRIDE:-}" in source
+    )
+    assert (
+        "CANDIDATE_EXTENSION_KEY_OVERRIDE=${CANDIDATE_EXTENSION_KEY_OVERRIDE:-}"
+        in source
+    )
+    assert "EXTENSION_CACHE_MODE=existing_override" in source
+    assert (
+        'EXTENSION_JOB_ROOT=$(realpath -e "$EXTENSION_CACHE_ROOT_OVERRIDE")' in source
+    )
     assert (
         '[[ "$BASELINE_EXTENSION_KEY_OVERRIDE" != "$BASELINE_EXTENSION_KEY" ]]'
         in source
@@ -111,7 +127,9 @@ def test_baseline_extensions_preload_before_each_measured_baseline() -> None:
     assert '"wall_seconds": statistics.median(' in source
 
 
-def test_wrapper_requires_initialization_evidence_and_relaxed_analyzer_outputs() -> None:
+def test_wrapper_requires_initialization_evidence_and_relaxed_analyzer_outputs() -> (
+    None
+):
     source = WRAPPER.read_text(encoding="utf-8")
 
     for field in (
@@ -130,14 +148,28 @@ def test_wrapper_requires_initialization_evidence_and_relaxed_analyzer_outputs()
     assert '"$RUN_ROOT/reciprocal-analysis.json"' in source
     assert '"$RUN_ROOT/reciprocal-analysis.txt"' in source
     assert "parity.claim=relaxed-nonexact" in source
+    assert "--require-exact-label timing_context" in source
+    assert "--require-exact-dispatch-label timing_context" in source
+    assert "--require-dispatch-declaration" in source
+    assert "parity.required_exact_labels_pass=true" in source
+    assert "parity.required_exact_dispatch_labels_pass=true" in source
+    assert "dispatch.declaration_pass=true" in source
+    for metric in (
+        "timing_model_seconds",
+        "main_model_seconds",
+        "complete_request_wall_seconds",
+        "peak_cuda_memory_allocated_mb",
+        "setup_plus_capture_seconds",
+    ):
+        assert f"metric.{metric}=" in source
 
 
 def test_wrapper_fails_loudly_on_weight_only_profile_dispatch_contract() -> None:
     source = WRAPPER.read_text(encoding="utf-8")
 
-    assert 'local validation_role=baseline' in source
-    assert 'validation_role=candidate' in source
-    assert 'utils/validate_weight_only_full_song_profile.py \\' in source
+    assert "local validation_role=baseline" in source
+    assert "validation_role=candidate" in source
+    assert "utils/validate_weight_only_full_song_profile.py \\" in source
     assert '--profile "$profile"' in source
     assert '--role "$validation_role"' in source
     for role in (
@@ -156,7 +188,9 @@ def test_initialization_evidence_reconciles_walls_and_memory(monkeypatch) -> Non
     clocks = iter((10.0, 12.0))
     synchronizations = []
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda: synchronizations.append(True))
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", lambda: synchronizations.append(True)
+    )
     monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: next(allocated))
     monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: next(reserved))
     monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: next(peak))
