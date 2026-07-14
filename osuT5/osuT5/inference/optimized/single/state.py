@@ -133,7 +133,7 @@ class ProductionDecodeSession:
             bucket["capture_seconds"] = float(bucket["capture_seconds"]) + float(
                 entry.get("capture_seconds", 0.0)
             )
-        return {
+        result = {
             "graph_count": self.graph_count,
             "decode_replays": sum(
                 int(bucket["decode_replays"]) for bucket in buckets.values()
@@ -143,3 +143,56 @@ class ProductionDecodeSession:
             ),
             "buckets": dict(sorted(buckets.items(), key=lambda item: int(item[0]))),
         }
+        k8_entries = [
+            entry for entry in self.graph_cache.values()
+            if entry.get("k8_candidate") is True
+        ]
+        if k8_entries:
+            snapshots = []
+            seen_stats: set[int] = set()
+            for entry in k8_entries:
+                stats = entry.get("k8_stats", {})
+                if id(stats) not in seen_stats:
+                    snapshots.append(stats)
+                    seen_stats.add(id(stats))
+            latest_serial = max(
+                int(row.get("window_serial", 0)) for row in snapshots
+            )
+            snapshots = [
+                row for row in snapshots
+                if int(row.get("window_serial", 0)) == latest_serial
+            ]
+            latest = snapshots[-1]
+            result["k8_candidate"] = {
+                "block_size": int(latest.get("block_size", 8)),
+                "eligible_steps": sum(
+                    int(row.get("eligible_steps", 0)) for row in snapshots
+                ),
+                "block_replays": sum(
+                    int(row.get("block_replays", 0)) for row in snapshots
+                ),
+                "remainder_steps": sum(
+                    int(row.get("remainder_steps", 0)) for row in snapshots
+                ),
+                "status_reads": sum(
+                    int(row.get("status_reads", 0)) for row in snapshots
+                ),
+                "copy_calls": sum(
+                    int(row.get("copy_calls", 0)) for row in snapshots
+                ),
+                "copy_bytes": sum(
+                    int(row.get("copy_bytes", 0)) for row in snapshots
+                ),
+                "capture_seconds": sum(
+                    float(row.get("capture_seconds", 0.0)) for row in snapshots
+                ),
+                "peak_vram_bytes": max(
+                    int(row.get("peak_vram_bytes", 0)) for row in snapshots
+                ),
+                "wasted_steps": sum(
+                    int(row.get("wasted_steps", 0)) for row in snapshots
+                ),
+                "rng_policy": latest.get("rng_policy"),
+                "parent_backend": latest.get("parent_backend"),
+            }
+        return result
