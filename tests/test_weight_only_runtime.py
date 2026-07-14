@@ -18,7 +18,7 @@ from osuT5.osuT5.model.custom_transformers.modeling_varwhisper import (
 )
 
 
-def _state(owner) -> weight_only_runtime.ApproximateWeightOnlyState:
+def _state(owner, *, int8_mlp=False) -> weight_only_runtime.ApproximateWeightOnlyState:
     projection = torch.nn.Linear(4, 8, bias=False)
     norm = torch.nn.RMSNorm(4)
     packed = SimpleNamespace(
@@ -41,6 +41,10 @@ def _state(owner) -> weight_only_runtime.ApproximateWeightOnlyState:
         reserved_bytes_delta=128,
         retained_fp32_source_weight_bytes=256,
         packed_weight_bytes=128,
+        int8_mlp_packs={} if int8_mlp else None,
+        int8_mlp_extension_init_seconds=1.5 if int8_mlp else 0.0,
+        int8_mlp_pack_seconds=0.25 if int8_mlp else 0.0,
+        int8_mlp_packed_weight_bytes=48 if int8_mlp else 0,
     )
 
 
@@ -173,6 +177,51 @@ def test_runtime_initialization_is_idempotent_and_model_owned(monkeypatch) -> No
         runtime.initialize_approximate_weight_only(torch.nn.Module())
 
 
+def test_int8_mlp_initialization_is_explicit_idempotent_and_declared(monkeypatch) -> None:
+    owner = torch.nn.Module()
+    state = _state(owner, int8_mlp=True)
+    calls = []
+
+    def initialize(cls, model, *, int8_mlp=False):
+        calls.append((model, int8_mlp))
+        return state
+
+    monkeypatch.setattr(
+        weight_only_runtime.ApproximateWeightOnlyState,
+        "initialize",
+        classmethod(initialize),
+    )
+    runtime = engine.OptimizedSingleRuntime(engine.OPTIMIZED_PRESETS["fp32"])
+
+    first = runtime.initialize_approximate_int8_mlp_weight_only(owner)
+    second = runtime.initialize_approximate_int8_mlp_weight_only(owner)
+
+    assert first == second == state.metadata()
+    assert calls == [(owner, True)]
+    overlay = first["int8_mlp_overlay"]
+    assert overlay["scope"] == "main-model-decoder-mlp-only"
+    assert overlay["replaces_effective_regions"] == ["mlp_fc1", "mlp_fc2"]
+    assert overlay["retained_unused_fp16_regions"] == ["mlp_fc1", "mlp_fc2"]
+    assert overlay["packed_weight_bytes"] == 48
+
+
+def test_int8_mlp_initialization_rejects_preexisting_plain_mixed_state(
+    monkeypatch,
+) -> None:
+    owner = torch.nn.Module()
+    state = _state(owner)
+    monkeypatch.setattr(
+        weight_only_runtime.ApproximateWeightOnlyState,
+        "initialize",
+        classmethod(lambda cls, model: state),
+    )
+    runtime = engine.OptimizedSingleRuntime(engine.OPTIMIZED_PRESETS["fp32"])
+    runtime.initialize_approximate_weight_only(owner)
+
+    with pytest.raises(RuntimeError, match="without the INT8 MLP overlay"):
+        runtime.initialize_approximate_int8_mlp_weight_only(owner)
+
+
 def test_repeated_initialize_and_context_teardown_reuse_one_owned_state(
     monkeypatch,
 ) -> None:
@@ -206,6 +255,8 @@ def test_fp16_runtime_rejects_weight_only_initialization() -> None:
     runtime = engine.OptimizedSingleRuntime(engine.OPTIMIZED_PRESETS["fp16"])
     with pytest.raises(TypeError, match="requires the FP32 preset"):
         runtime.initialize_approximate_weight_only(torch.nn.Module())
+    with pytest.raises(TypeError, match="requires the FP32 preset"):
+        runtime.initialize_approximate_int8_mlp_weight_only(torch.nn.Module())
 
 
 def test_profile_metadata_is_unchanged_until_explicit_initialization(monkeypatch) -> None:
@@ -236,6 +287,8 @@ def test_default_engine_import_does_not_import_weight_only_runtime() -> None:
                 "assert 'osuT5.osuT5.inference.optimized.kernels.weight_only' "
                 "not in sys.modules; "
                 "assert 'osuT5.osuT5.inference.optimized.kernels.weight_only_runtime' "
+                "not in sys.modules; "
+                "assert 'osuT5.osuT5.inference.optimized.scout.int8_mlp' "
                 "not in sys.modules"
             ),
         ],

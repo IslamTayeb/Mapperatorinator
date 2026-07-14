@@ -139,9 +139,18 @@ class ApproximateWeightOnlyState:
     reserved_bytes_delta: int
     retained_fp32_source_weight_bytes: int
     packed_weight_bytes: int
+    int8_mlp_packs: dict[int, Any] | None = None
+    int8_mlp_extension_init_seconds: float = 0.0
+    int8_mlp_pack_seconds: float = 0.0
+    int8_mlp_packed_weight_bytes: int = 0
 
     @classmethod
-    def initialize(cls, model: torch.nn.Module) -> "ApproximateWeightOnlyState":
+    def initialize(
+        cls,
+        model: torch.nn.Module,
+        *,
+        int8_mlp: bool = False,
+    ) -> "ApproximateWeightOnlyState":
         if not isinstance(model, torch.nn.Module):
             raise TypeError("weight-only candidate owner must be a torch module")
         if model.training:
@@ -190,6 +199,14 @@ class ApproximateWeightOnlyState:
         preload_native_q1_attention()
         preload_native_decoder_layer()
         preload_weight_only_extension()
+        int8_extension_seconds = 0.0
+        if int8_mlp:
+            from ..scout.int8_mlp import preload_int8_mlp_extension
+
+            int8_extension_start = time.perf_counter()
+            preload_int8_mlp_extension()
+            torch.cuda.synchronize()
+            int8_extension_seconds = time.perf_counter() - int8_extension_start
         torch.cuda.synchronize()
         extension_seconds = time.perf_counter() - extension_start
         extension_allocated_after = torch.cuda.memory_allocated(device)
@@ -200,6 +217,20 @@ class ApproximateWeightOnlyState:
         pack_start = time.perf_counter()
         packs = {id(layer): DecoderWeightPack.from_layer(layer) for layer in layers}
         projection_pack = PackedLinear.from_module(final_projection)
+        int8_packs = None
+        int8_pack_seconds = 0.0
+        int8_packed_bytes = 0
+        if int8_mlp:
+            from ..scout.int8_mlp import Int8MlpPack
+
+            int8_pack_start = time.perf_counter()
+            int8_packs = {id(layer): Int8MlpPack.from_layer(layer) for layer in layers}
+            torch.cuda.synchronize(device)
+            int8_pack_seconds = time.perf_counter() - int8_pack_start
+            int8_packed_bytes = sum(
+                pack.memory_report()["packed_weight_bytes"]
+                for pack in int8_packs.values()
+            )
         torch.cuda.synchronize(device)
         pack_seconds = time.perf_counter() - pack_start
         allocated_after = torch.cuda.memory_allocated(device)
@@ -228,7 +259,11 @@ class ApproximateWeightOnlyState:
             allocated_bytes_delta=allocated_after - allocated_before,
             reserved_bytes_delta=reserved_after - reserved_before,
             retained_fp32_source_weight_bytes=source_bytes,
-            packed_weight_bytes=packed_bytes,
+            packed_weight_bytes=packed_bytes + int8_packed_bytes,
+            int8_mlp_packs=int8_packs,
+            int8_mlp_extension_init_seconds=int8_extension_seconds,
+            int8_mlp_pack_seconds=int8_pack_seconds,
+            int8_mlp_packed_weight_bytes=int8_packed_bytes,
         )
 
     def validate_owner(self, model: torch.nn.Module) -> None:
@@ -241,8 +276,20 @@ class ApproximateWeightOnlyState:
         except KeyError as exc:
             raise RuntimeError("weight-only candidate received an unowned decoder layer") from exc
 
+    @property
+    def int8_mlp_enabled(self) -> bool:
+        return self.int8_mlp_packs is not None
+
+    def int8_mlp_pack_for_layer(self, layer: torch.nn.Module) -> Any:
+        if self.int8_mlp_packs is None:
+            raise RuntimeError("INT8 MLP overlay was not initialized")
+        try:
+            return self.int8_mlp_packs[id(layer)]
+        except KeyError as exc:
+            raise RuntimeError("INT8 MLP overlay received an unowned decoder layer") from exc
+
     def metadata(self) -> dict[str, Any]:
-        return {
+        metadata = {
             "version": "approximate-fp16-weights-fp32-state-v2",
             "result_class": "documented-drift",
             "exactness_claim": False,
@@ -276,6 +323,23 @@ class ApproximateWeightOnlyState:
             "retained_fp32_source_weight_bytes": self.retained_fp32_source_weight_bytes,
             "packed_weight_bytes": self.packed_weight_bytes,
         }
+        if self.int8_mlp_enabled:
+            metadata["int8_mlp_overlay"] = {
+                "version": "per-row-symmetric-int8-mlp-v1",
+                "result_class": "documented-drift",
+                "exactness_claim": False,
+                "scope": "main-model-decoder-mlp-only",
+                "composition_control": "k4-split-kv-mixed-weight-shared-rope-v1",
+                "replaces_effective_regions": ["mlp_fc1", "mlp_fc2"],
+                "retained_unused_fp16_regions": ["mlp_fc1", "mlp_fc2"],
+                "fp32_activations_norm_bias_reductions_residual_outputs": True,
+                "quantization": "symmetric-per-output-row",
+                "dispatch_counter": "int8_weight_mlp_tail",
+                "extension_init_seconds": self.int8_mlp_extension_init_seconds,
+                "weight_pack_seconds": self.int8_mlp_pack_seconds,
+                "packed_weight_bytes": self.int8_mlp_packed_weight_bytes,
+            }
+        return metadata
 
 
 def _self_attention_block_forward(
@@ -431,18 +495,33 @@ def _cross_mlp_tail_forward(
             module.cross_attn.Wo.bias,
             outputs_per_block=8,
         )
-    with profile_range(f"{layer_name}.weight_only.mlp"):
-        hidden_states = weight_only_mlp_residual(
-            hidden_states,
-            module.final_layer_norm.weight,
-            pack.fc1,
-            pack.fc2,
-            eps=_norm_eps(module.final_layer_norm),
-            fc1_outputs_per_block=MLP_FC1_OUTPUTS_PER_BLOCK,
-            fc2_outputs_per_block=MLP_FC2_OUTPUTS_PER_BLOCK,
-        )
+    if state.int8_mlp_enabled:
+        from ..scout.int8_mlp import int8_weight_mlp_residual
+
+        with profile_range(f"{layer_name}.weight_only.int8_mlp"):
+            hidden_states = int8_weight_mlp_residual(
+                hidden_states,
+                module.final_layer_norm.weight,
+                state.int8_mlp_pack_for_layer(module),
+                eps=_norm_eps(module.final_layer_norm),
+                fc1_outputs_per_block=MLP_FC1_OUTPUTS_PER_BLOCK,
+                fc2_outputs_per_block=MLP_FC2_OUTPUTS_PER_BLOCK,
+            )
+    else:
+        with profile_range(f"{layer_name}.weight_only.mlp"):
+            hidden_states = weight_only_mlp_residual(
+                hidden_states,
+                module.final_layer_norm.weight,
+                pack.fc1,
+                pack.fc2,
+                eps=_norm_eps(module.final_layer_norm),
+                fc1_outputs_per_block=MLP_FC1_OUTPUTS_PER_BLOCK,
+                fc2_outputs_per_block=MLP_FC2_OUTPUTS_PER_BLOCK,
+            )
     if dispatch_counts is not None:
         dispatch_counts["weight_only_mlp_tail"] += 1
+        if state.int8_mlp_enabled:
+            dispatch_counts["int8_weight_mlp_tail"] += 1
         dispatch_counts["q1_bmm_cross_attention"] += 1
     return (hidden_states,) + self_attn_outputs[1:] + (past_key_value,)
 

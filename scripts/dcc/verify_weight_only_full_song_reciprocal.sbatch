@@ -27,6 +27,7 @@ CANDIDATE_RUNNER=${CANDIDATE_RUNNER:-utils/run_approximate_weight_only.py}
 REQUIRE_EXACT_TIMING=${REQUIRE_EXACT_TIMING:-true}
 REQUIRE_K4_CANDIDATE=${REQUIRE_K4_CANDIDATE:-false}
 REQUIRE_SHARED_ROPE_INCREMENTAL=${REQUIRE_SHARED_ROPE_INCREMENTAL:-false}
+REQUIRE_INT8_MLP_INCREMENTAL=${REQUIRE_INT8_MLP_INCREMENTAL:-false}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_LABEL=${RUN_LABEL:-split-weight-full-song-reciprocal}
 RUN_ROOT="$WORK/runs/$RUN_LABEL-${SLURM_JOB_ID:-manual}"
@@ -85,7 +86,36 @@ if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" != true \
   echo "REQUIRE_SHARED_ROPE_INCREMENTAL must be true or false" >&2
   exit 2
 fi
-if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" != true \
+  && "$REQUIRE_INT8_MLP_INCREMENTAL" != false ]]; then
+  echo "REQUIRE_INT8_MLP_INCREMENTAL must be true or false" >&2
+  exit 2
+fi
+if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
+  && "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then
+  echo "shared-RoPE and INT8 MLP incremental modes are mutually exclusive" >&2
+  exit 2
+fi
+if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then
+  if [[ "$REQUIRE_K4_CANDIDATE" != true ]]; then
+    echo "INT8 MLP incremental gate requires K4 contract validation" >&2
+    exit 2
+  fi
+  if [[ "$REQUIRE_EXACT_TIMING" != true ]]; then
+    echo "INT8 MLP incremental gate requires exact timing parity" >&2
+    exit 2
+  fi
+  if [[ "$BASELINE_RUNNER" \
+    != utils/run_k4_shared_rope_approximate_weight_only.py ]]; then
+    echo "INT8 MLP gate requires the shared-RoPE combined control" >&2
+    exit 2
+  fi
+  if [[ "$CANDIDATE_RUNNER" \
+    != utils/run_k4_shared_rope_int8_mlp_weight_only.py ]]; then
+    echo "INT8 MLP gate requires the exact INT8 combined runner" >&2
+    exit 2
+  fi
+elif [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
   if [[ "$REQUIRE_K4_CANDIDATE" != true ]]; then
     echo "shared-RoPE incremental gate requires K4 contract validation" >&2
     exit 2
@@ -276,6 +306,7 @@ echo "candidate_runner=$CANDIDATE_RUNNER"
 echo "require_exact_timing=$REQUIRE_EXACT_TIMING"
 echo "require_k4_candidate=$REQUIRE_K4_CANDIDATE"
 echo "require_shared_rope_incremental=$REQUIRE_SHARED_ROPE_INCREMENTAL"
+echo "require_int8_mlp_incremental=$REQUIRE_INT8_MLP_INCREMENTAL"
 echo "audio=$AUDIO"
 echo "run_root=$RUN_ROOT"
 echo "extension_cache_mode=$EXTENSION_CACHE_MODE"
@@ -472,6 +503,19 @@ run_profile() {
       --role "$validation_role" \
       > "$RUN_ROOT/$role.weight-only-validation.json"
   )
+  if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then
+    local int8_validation_role=baseline
+    if [[ "$candidate" == 1 ]]; then
+      int8_validation_role=candidate
+    fi
+    (
+      cd "$CANDIDATE_REPO"
+      "$PYTHON" utils/validate_int8_mlp_full_song_profile.py \
+        --profile "$profile" \
+        --role "$int8_validation_role" \
+        > "$RUN_ROOT/$role.int8-mlp-validation.json"
+    )
+  fi
   local k4_validation_role=baseline
   if [[ "$runtime_candidate" == 1 && "$REQUIRE_K4_CANDIDATE" == true ]]; then
     k4_validation_role=candidate
@@ -594,11 +638,12 @@ summary = {
 PY
 
 INITIALIZATION_ROLES=candidate_first,candidate_second
-if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
+  || "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then
   INITIALIZATION_ROLES=baseline_first,candidate_first,candidate_second,baseline_second
 fi
 "$PYTHON" - "$RUN_ROOT" "$INITIALIZATION_ROLES" \
-  "$REQUIRE_SHARED_ROPE_INCREMENTAL" <<'PY'
+  "$REQUIRE_SHARED_ROPE_INCREMENTAL" "$REQUIRE_INT8_MLP_INCREMENTAL" <<'PY'
 import json
 import math
 import statistics
@@ -608,6 +653,7 @@ from pathlib import Path
 root = Path(sys.argv[1])
 roles = tuple(sys.argv[2].split(","))
 require_shared_rope = sys.argv[3] == "true"
+require_int8_mlp = sys.argv[4] == "true"
 runs = {}
 required_numbers = (
     "initialization_wall_seconds",
@@ -673,6 +719,27 @@ if require_shared_rope:
     for role in ("baseline_first", "baseline_second"):
         if "shared_rope" in runs[role] or "combined_runtime" in runs[role]:
             raise SystemExit(f"{role}: combined control unexpectedly enabled shared RoPE")
+elif require_int8_mlp:
+    for role in roles:
+        shared = runs[role].get("shared_rope")
+        if not isinstance(shared, dict):
+            raise SystemExit(f"{role}: missing shared-RoPE composition evidence")
+        stats = shared.get("stats")
+        if not isinstance(stats, dict) or stats.get("reuses", 0) <= 0:
+            raise SystemExit(f"{role}: shared-RoPE did not execute")
+    for role in ("baseline_first", "baseline_second"):
+        if "int8_mlp_overlay" in runs[role]:
+            raise SystemExit(f"{role}: incremental control initialized INT8 MLP")
+        if runs[role].get("combined_runtime") \
+            != "k4-split-kv-mixed-weight-shared-rope-v1":
+            raise SystemExit(f"{role}: incremental control composition is wrong")
+    for role in ("candidate_first", "candidate_second"):
+        overlay = runs[role].get("int8_mlp_overlay")
+        if not isinstance(overlay, dict):
+            raise SystemExit(f"{role}: missing INT8 MLP initialization evidence")
+        if runs[role].get("combined_runtime") \
+            != "k4-split-kv-mixed-weight-shared-rope-int8-mlp-v1":
+            raise SystemExit(f"{role}: INT8 MLP composition identity is wrong")
 
 summary = {
     "schema_version": 1,
@@ -769,7 +836,20 @@ for artifact in \
     exit 2
   fi
 done
-if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then
+  for artifact in \
+    "$RUN_ROOT/baseline_first.int8-mlp-validation.json" \
+    "$RUN_ROOT/candidate_first.int8-mlp-validation.json" \
+    "$RUN_ROOT/candidate_second.int8-mlp-validation.json" \
+    "$RUN_ROOT/baseline_second.int8-mlp-validation.json"; do
+    if [[ ! -s "$artifact" ]]; then
+      echo "missing required INT8 MLP artifact: $artifact" >&2
+      exit 2
+    fi
+  done
+fi
+if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
+  || "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then
   for artifact in \
     "$RUN_ROOT/candidate-initialization/baseline_first.json" \
     "$RUN_ROOT/candidate-initialization/baseline_second.json"; do

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from utils import run_k4_shared_rope_approximate_weight_only as combined
+from utils import run_k4_shared_rope_int8_mlp_weight_only as int8_combined
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -143,6 +144,33 @@ def test_combined_runner_restores_loader_and_context_on_failure(monkeypatch) -> 
 
     assert inference.load_model_with_engine is original_loader
     assert events == ["k4-enter", "k4-exit"]
+
+
+def test_int8_combined_runner_selects_overlay_without_replacing_other_layers(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    calls = []
+
+    def fake_combined(config_name, overrides, output, **kwargs):
+        calls.append((config_name, list(overrides), output, kwargs))
+
+    monkeypatch.setattr(int8_combined, "run_combined", fake_combined)
+    output = tmp_path / "init.json"
+
+    int8_combined.run("profile_salvalai", ["seed=12345"], output)
+
+    assert calls == [
+        (
+            "profile_salvalai",
+            ["seed=12345"],
+            output,
+            {
+                "weight_runner": int8_combined.run_int8_weight_only,
+                "composition_version": int8_combined.COMPOSITION_VERSION,
+            },
+        )
+    ]
 
 
 @pytest.mark.parametrize(

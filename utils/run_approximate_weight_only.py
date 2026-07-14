@@ -90,7 +90,13 @@ def _initialize_with_evidence(initializer, model) -> dict:
     }
 
 
-def run(config_name: str, overrides: list[str], output_init_json: Path) -> None:
+def run(
+    config_name: str,
+    overrides: list[str],
+    output_init_json: Path,
+    *,
+    initializer_name: str = "initialize_approximate_weight_only",
+) -> None:
     import inference
 
     args = _load_args(config_name, overrides)
@@ -118,12 +124,13 @@ def run(config_name: str, overrides: list[str], output_init_json: Path) -> None:
         if not initialized:
             initializer = getattr(
                 binding.runtime,
-                "initialize_approximate_weight_only",
+                initializer_name,
                 None,
             )
             if initializer is None:
                 raise RuntimeError(
-                    "loaded runtime does not expose weight-only initialization"
+                    "loaded runtime does not expose requested weight-only "
+                    f"initialization {initializer_name!r}"
                 )
             init_metadata = _initialize_with_evidence(
                 initializer,

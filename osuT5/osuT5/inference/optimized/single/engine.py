@@ -344,6 +344,8 @@ def _generate_window(
                 "weight_only_final_projection": 0,
             }
         )
+        if approximate_weight_only_state.int8_mlp_enabled:
+            dispatch_counts["int8_weight_mlp_tail"] = 0
 
     profile_context_kwargs = {
         "q1_bmm_cross_attention": q1_bmm_cross_attention,
@@ -570,6 +572,29 @@ class OptimizedSingleRuntime:
         from ..kernels.weight_only_runtime import ApproximateWeightOnlyState
 
         state = ApproximateWeightOnlyState.initialize(model)
+        object.__setattr__(self, "_approximate_weight_only_state", state)
+        return state.metadata()
+
+    def initialize_approximate_int8_mlp_weight_only(
+        self,
+        model: torch.nn.Module,
+    ) -> dict[str, Any]:
+        """Explicitly replace the mixed FP16 MLP call with the INT8 scout."""
+        if self.preset.precision != "fp32":
+            raise TypeError(
+                "approximate INT8 MLP candidate requires the FP32 preset"
+            )
+        existing = self._approximate_weight_only_state
+        if existing is not None:
+            existing.validate_owner(model)
+            if not existing.int8_mlp_enabled:
+                raise RuntimeError(
+                    "mixed-weight state was initialized without the INT8 MLP overlay"
+                )
+            return existing.metadata()
+        from ..kernels.weight_only_runtime import ApproximateWeightOnlyState
+
+        state = ApproximateWeightOnlyState.initialize(model, int8_mlp=True)
         object.__setattr__(self, "_approximate_weight_only_state", state)
         return state.metadata()
 
