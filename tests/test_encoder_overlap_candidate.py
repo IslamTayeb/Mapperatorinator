@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,13 @@ from osuT5.osuT5.inference.optimized.scout.encoder_overlap import (
     install_encoder_material_audit,
     install_exact_main_encoder_overlap,
 )
+
+
+def test_overlap_stream_creation_avoids_optional_priority_range_api() -> None:
+    source = Path(encoder_overlap.__file__).read_text(encoding="utf-8")
+
+    assert "get_stream_priority_range" not in source
+    assert "torch.cuda.Stream(device=device, priority=0)" in source
 
 
 class _GraphState:

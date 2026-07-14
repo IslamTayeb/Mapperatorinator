@@ -323,9 +323,11 @@ class ExactMainEncoderOverlap:
         if self._rows or self._stream is not None:
             raise EncoderOverlapError("overlap encoder launched more than once")
         device = self._main_processor.model.device
-        least_priority, _greatest_priority = torch.cuda.get_stream_priority_range()
-        self._least_stream_priority = int(least_priority)
-        stream = torch.cuda.Stream(device=device, priority=least_priority)
+        # PyTorch does not expose cudaDeviceGetStreamPriorityRange on every
+        # supported build. Priority zero is the portable CUDA default and is
+        # the least-priority value on the pinned SM75 runtime.
+        self._least_stream_priority = 0
+        stream = torch.cuda.Stream(device=device, priority=0)
         # Own the stream before enqueueing anything so the context's failure
         # path can always synchronize work submitted by a partially built row.
         self._stream = stream
