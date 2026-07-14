@@ -38,8 +38,12 @@ def validate_profile(payload: Any, *, role: str) -> dict[str, Any]:
     if not isinstance(generation, list) or not generation:
         raise CoalescedProfileError("profile.generation must be non-empty")
     totals = {label: {GENERIC: 0, SPLIT: 0, COALESCED: 0} for label in PROFILE_LABELS}
-    standard_prefix_totals: dict[int, int] = {}
-    prefix_totals: dict[int, int] = {}
+    standard_prefix_totals: dict[str, dict[int, int]] = {
+        label: {} for label in PROFILE_LABELS
+    }
+    prefix_totals: dict[str, dict[int, int]] = {
+        label: {} for label in PROFILE_LABELS
+    }
     seen = {label: False for label in PROFILE_LABELS}
     for index, raw in enumerate(generation):
         record = _object(raw, name=f"profile.generation[{index}]")
@@ -71,9 +75,8 @@ def validate_profile(payload: Any, *, role: str) -> dict[str, Any]:
                     )
                 if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                     raise CoalescedProfileError(f"{key} must be non-negative int")
-                standard_prefix_totals[prefix] = (
-                    standard_prefix_totals.get(prefix, 0) + value
-                )
+                label_prefix_totals = standard_prefix_totals[label]
+                label_prefix_totals[prefix] = label_prefix_totals.get(prefix, 0) + value
                 continue
             if not key.startswith(PREFIX):
                 continue
@@ -86,28 +89,41 @@ def validate_profile(payload: Any, *, role: str) -> dict[str, Any]:
                 raise CoalescedProfileError(f"unsupported coalesced prefix {suffix}")
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise CoalescedProfileError(f"{key} must be non-negative int")
-            prefix_totals[prefix] = prefix_totals.get(prefix, 0) + value
+            label_prefix_totals = prefix_totals[label]
+            label_prefix_totals[prefix] = label_prefix_totals.get(prefix, 0) + value
     missing = [label for label, present in seen.items() if not present]
     if missing:
         raise CoalescedProfileError(f"profile is missing labels {missing}")
-    if totals["timing_context"][COALESCED] != 0:
+    timing = totals["timing_context"]
+    timing_standard_prefixes = standard_prefix_totals["timing_context"]
+    timing_coalesced_prefixes = prefix_totals["timing_context"]
+    if timing[COALESCED] != 0 or any(timing_coalesced_prefixes.values()):
         raise CoalescedProfileError("timing generation must not execute coalesced split-KV")
+    if timing[SPLIT] != sum(timing_standard_prefixes.values()):
+        raise CoalescedProfileError(
+            "timing accepted split-KV aggregate does not equal per-prefix counts"
+        )
     main = totals["main_generation"]
-    if main[SPLIT] != sum(standard_prefix_totals.values()):
+    main_standard_prefixes = standard_prefix_totals["main_generation"]
+    main_coalesced_prefixes = prefix_totals["main_generation"]
+    if main[SPLIT] != sum(main_standard_prefixes.values()):
         raise CoalescedProfileError(
             "accepted split-KV aggregate does not equal per-prefix counts"
         )
     if role == "baseline":
-        if main[COALESCED] != 0 or prefix_totals:
+        if main[COALESCED] != 0 or any(main_coalesced_prefixes.values()):
             raise CoalescedProfileError("baseline unexpectedly executed coalesced split-KV")
     else:
         if main[COALESCED] <= 0:
             raise CoalescedProfileError("candidate did not execute coalesced split-KV")
-        if main[COALESCED] != sum(prefix_totals.values()):
+        if main[COALESCED] != sum(main_coalesced_prefixes.values()):
             raise CoalescedProfileError(
                 "coalesced split-KV aggregate does not equal per-prefix counts"
             )
-        if not standard_prefix_totals or prefix_totals != standard_prefix_totals:
+        if (
+            not main_standard_prefixes
+            or main_coalesced_prefixes != main_standard_prefixes
+        ):
             raise CoalescedProfileError(
                 "candidate did not execute every live eligible split-KV prefix"
             )
@@ -119,10 +135,13 @@ def validate_profile(payload: Any, *, role: str) -> dict[str, Any]:
             raise CoalescedProfileError("candidate did not retain accepted short fallback")
     return {
         "role": role,
-        "timing_counts": totals["timing_context"],
+        "timing_counts": timing,
         "main_counts": main,
-        "accepted_split_prefix_counts": dict(sorted(standard_prefix_totals.items())),
-        "coalesced_prefix_counts": dict(sorted(prefix_totals.items())),
+        "timing_accepted_split_prefix_counts": dict(
+            sorted(timing_standard_prefixes.items())
+        ),
+        "accepted_split_prefix_counts": dict(sorted(main_standard_prefixes.items())),
+        "coalesced_prefix_counts": dict(sorted(main_coalesced_prefixes.items())),
         "pass": True,
     }
 
