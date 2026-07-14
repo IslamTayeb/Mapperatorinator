@@ -183,6 +183,7 @@ def test_k1_int8_wrapper_layers_only_int8_over_exact_remainder_control() -> None
     source = K1_INT8_MLP_WRAPPER.read_text(encoding="utf-8")
 
     assert "#SBATCH --gres=gpu:2080:1" in source
+    assert "#SBATCH --time=00:30:00" in source
     assert "export BASELINE_RUNNER=utils/run_k4_shared_rope_k1_remainder.py" in source
     assert (
         "export CANDIDATE_RUNNER="
