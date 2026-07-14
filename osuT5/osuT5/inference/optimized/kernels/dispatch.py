@@ -187,6 +187,8 @@ def q1_rope_cache_self_attention_forward(
     attention_mask: torch.Tensor | None,
     sliding_window_mask: torch.Tensor | None,
     native_q1_rope_cache_attention: Callable[..., torch.Tensor] | None,
+    native_q1_rope_cache_attention_variant: Callable[[torch.Tensor, int], str]
+    | None = None,
     expected_dtype: torch.dtype = torch.float32,
     dispatch_counts: dict[str, int] | None = None,
 ) -> tuple[torch.Tensor] | None:
@@ -270,8 +272,22 @@ def q1_rope_cache_self_attention_forward(
             attention_mask_for_native,
             int(prefix_length),
         )
+    selected_variant = (
+        native_q1_rope_cache_attention_variant(qkv, int(prefix_length))
+        if native_q1_rope_cache_attention_variant is not None
+        else "accepted"
+    )
     output = output.transpose(1, 2).contiguous()
     output = output.view(bs, -1, module.all_head_size)
     if dispatch_counts is not None:
         dispatch_counts["native_q1_rope_cache_self_attention"] += 1
+        if selected_variant != "accepted":
+            aggregate_key = (
+                "native_q1_rope_cache_self_attention_split_kv_8"
+            )
+            prefix_key = f"{aggregate_key}_prefix_{int(prefix_length)}"
+            dispatch_counts[aggregate_key] = (
+                dispatch_counts.get(aggregate_key, 0) + 1
+            )
+            dispatch_counts[prefix_key] = dispatch_counts.get(prefix_key, 0) + 1
     return (output,)

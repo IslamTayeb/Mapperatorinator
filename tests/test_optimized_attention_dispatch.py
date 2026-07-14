@@ -409,6 +409,68 @@ def test_fused_rope_cache_dispatch_preserves_sequence_aliases_and_mask(
     assert torch.equal(result[0], expected)
 
 
+def test_fused_rope_cache_dispatch_records_split8_prefix_selection(monkeypatch):
+    dtype = torch.float32
+    hidden_states = torch.zeros((1, 1, 8), dtype=dtype)
+
+    class FakeStaticCache:
+        def __init__(self):
+            self.layers = [
+                SimpleNamespace(
+                    is_initialized=True,
+                    keys=torch.zeros((1, 2, 640, 4), dtype=dtype),
+                    values=torch.zeros((1, 2, 640, 4), dtype=dtype),
+                )
+            ]
+
+    module = SimpleNamespace(
+        training=False,
+        Wqkv=lambda inputs: torch.zeros((1, 1, 24), dtype=dtype),
+        rotary_emb=lambda qkv, position_ids: (
+            torch.zeros((1, 1, 4), dtype=dtype),
+            torch.zeros((1, 1, 4), dtype=dtype),
+        ),
+        num_heads=2,
+        head_dim=4,
+        layer_idx=0,
+        local_attention=(-1, -1),
+        all_head_size=8,
+    )
+    counts = {"native_q1_rope_cache_self_attention": 0}
+    monkeypatch.setattr(dispatch, "StaticCache", FakeStaticCache)
+    monkeypatch.setattr(
+        dispatch,
+        "active_prefix_self_attention_length",
+        lambda: 640,
+    )
+
+    result = q1_rope_cache_self_attention_forward(
+        module=module,
+        hidden_states=hidden_states,
+        bs=1,
+        is_varlen=False,
+        past_key_value=FakeStaticCache(),
+        cache_position=torch.tensor([10]),
+        position_ids=torch.tensor([[10]]),
+        profile_ranges=False,
+        range_prefix="decoder.layer0.self",
+        attention_mask=None,
+        sliding_window_mask=None,
+        native_q1_rope_cache_attention=lambda *args: torch.zeros(
+            (1, 2, 1, 4), dtype=dtype
+        ),
+        native_q1_rope_cache_attention_variant=lambda qkv, prefix: "split_kv_8",
+        dispatch_counts=counts,
+    )
+
+    assert result is not None
+    assert counts == {
+        "native_q1_rope_cache_self_attention": 1,
+        "native_q1_rope_cache_self_attention_split_kv_8": 1,
+        "native_q1_rope_cache_self_attention_split_kv_8_prefix_640": 1,
+    }
+
+
 def test_fused_rope_cache_dispatch_rejects_without_side_effects(monkeypatch):
     calls = []
     monkeypatch.setattr(

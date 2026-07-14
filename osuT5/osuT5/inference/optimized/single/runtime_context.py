@@ -70,6 +70,7 @@ def attention_runtime_context(
 
     native_q1_attention = None
     native_q1_rope_cache_attention = None
+    native_q1_rope_cache_attention_variant = None
     if native_q1_self_attention or native_q1_rope_cache_self_attention:
         from ..kernels import q1_attention
 
@@ -77,6 +78,9 @@ def attention_runtime_context(
         native_q1_attention = q1_attention.native_q1_attention
         native_q1_rope_cache_attention = (
             q1_attention.native_q1_rope_cache_attention
+        )
+        native_q1_rope_cache_attention_variant = (
+            q1_attention.native_q1_rope_cache_attention_variant
         )
     sdpa_attention_forward = None
     if q1_bmm_cross_attention or native_q1_self_attention:
@@ -94,6 +98,9 @@ def attention_runtime_context(
             q1_rope_cache_self_attention_forward,
             native_q1_rope_cache_attention=(
                 native_q1_rope_cache_attention
+            ),
+            native_q1_rope_cache_attention_variant=(
+                native_q1_rope_cache_attention_variant
             ),
             expected_dtype=expected_dtype,
             dispatch_counts=dispatch_counts,
