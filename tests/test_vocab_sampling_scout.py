@@ -13,6 +13,7 @@ from utils.vocab_sampling_scout import (
     _capture_graph,
     _processor_descriptor,
     _require_recaptured_tensor,
+    _representatives_by_vocab_size,
     _top_p_kwargs,
     benchmark_existing_tail,
     install_vocab_sampling_observer,
@@ -33,8 +34,18 @@ def _descriptor(top_p: float = 0.9):
     )
 
 
-def _sample(*, nucleus_size: int = 2) -> VocabSample:
-    pre = torch.tensor([[4.0, 3.0, 2.0, 1.0]])
+def _sample(
+    *,
+    nucleus_size: int = 2,
+    vocab_size: int = 4,
+    top_p: float = 0.9,
+) -> VocabSample:
+    pre = torch.arange(
+        vocab_size,
+        0,
+        -1,
+        dtype=torch.float32,
+    ).reshape(1, vocab_size)
     post = pre.clone()
     post[:, nucleus_size:] = -torch.inf
     return VocabSample(
@@ -43,9 +54,44 @@ def _sample(*, nucleus_size: int = 2) -> VocabSample:
         post_top_p=post,
         threshold=0.25,
         selected_token=0,
-        processor_descriptor=_descriptor(),
+        processor_descriptor=_descriptor(top_p),
         source="k4_graph_final_step",
     )
+
+
+def _component(worst_by_vocab_size: dict[int, float]) -> dict:
+    return {
+        "observed_vocab_sizes": sorted(worst_by_vocab_size),
+        "observed_score_shapes": [
+            [1, vocab_size] for vocab_size in sorted(worst_by_vocab_size)
+        ],
+        "representatives": [
+            {
+                "representative": label,
+                "vocab_size": vocab_size,
+                "score_shape": [1, vocab_size],
+                "combined_ms_per_step_worst": worst_by_vocab_size[vocab_size],
+            }
+            for vocab_size in sorted(worst_by_vocab_size)
+            for label in ("min", "p50", "p95", "max")
+        ],
+        "worst_combined_ms_per_step_by_vocab_size": {
+            str(vocab_size): value
+            for vocab_size, value in sorted(worst_by_vocab_size.items())
+        },
+        "worst_combined_ms_per_step": max(worst_by_vocab_size.values()),
+    }
+
+
+def _buffers(sample: VocabSample) -> dict:
+    return {
+        "raw_logits": sample.raw_logits,
+        "pre_top_p": sample.pre_top_p,
+        "post_top_p": sample.post_top_p,
+        "threshold": torch.tensor(sample.threshold),
+        "token": torch.tensor([sample.selected_token]),
+        "processor_descriptor": sample.processor_descriptor,
+    }
 
 
 def test_sample_requires_top_p_to_only_mask_scores() -> None:
@@ -79,6 +125,62 @@ def test_observer_records_bounded_graph_and_eager_samples() -> None:
     assert observer.total_graph_observations == 2
     assert observer.dropped_observations == 1
     assert observer.samples[0].nucleus_size == 2
+
+
+def test_observer_reserves_coverage_for_a_late_vocab_at_the_sample_cap() -> None:
+    observer = VocabSamplingObserver(max_samples=2)
+    observer._record(_buffers(_sample(nucleus_size=1)), source="eager_remainder")
+    observer._record(_buffers(_sample(nucleus_size=2)), source="eager_remainder")
+    observer._record(
+        _buffers(_sample(nucleus_size=3, vocab_size=6)),
+        source="eager_remainder",
+    )
+
+    assert {sample.vocab_size for sample in observer.samples} == {4, 6}
+    assert observer.observed_vocab_counts == {4: 2, 6: 1}
+    assert observer.dropped_observations == 1
+
+
+def test_observer_fails_loudly_when_cap_cannot_represent_every_vocab() -> None:
+    observer = VocabSamplingObserver(max_samples=1)
+    observer._record(_buffers(_sample()), source="eager_remainder")
+
+    with pytest.raises(RuntimeError, match="cannot retain every observed shape"):
+        observer._record(
+            _buffers(_sample(vocab_size=6)),
+            source="eager_remainder",
+        )
+
+
+def test_observer_rebalances_bounded_samples_across_vocab_sizes() -> None:
+    observer = VocabSamplingObserver(max_samples=4)
+    for nucleus_size in (1, 2, 3, 4):
+        observer._record(
+            _buffers(_sample(nucleus_size=nucleus_size)),
+            source="eager_remainder",
+        )
+    for nucleus_size in (2, 5):
+        observer._record(
+            _buffers(_sample(nucleus_size=nucleus_size, vocab_size=6)),
+            source="eager_remainder",
+        )
+
+    stored_counts = {
+        vocab_size: sum(sample.vocab_size == vocab_size for sample in observer.samples)
+        for vocab_size in (4, 6)
+    }
+    assert stored_counts == {4: 2, 6: 2}
+
+
+def test_observer_rejects_changed_top_p_descriptor_even_at_sample_cap() -> None:
+    observer = VocabSamplingObserver(max_samples=1)
+    observer._record(_buffers(_sample(top_p=0.9)), source="eager_remainder")
+
+    with pytest.raises(RuntimeError, match="multiple TopP configurations"):
+        observer._record(
+            _buffers(_sample(top_p=0.95)),
+            source="eager_remainder",
+        )
 
 
 def test_observer_excludes_final_graph_score_after_logical_eos() -> None:
@@ -232,8 +334,9 @@ def test_recapture_mismatch_reports_quantitative_diagnostics() -> None:
 def test_summary_computes_fixed_main_and_request_zero_cost_ceilings() -> None:
     observer = VocabSamplingObserver(max_samples=8)
     observer.samples = [_sample(nucleus_size=value) for value in (1, 2, 3, 4)]
+    observer.observed_vocab_counts = {4: 4}
     observer.total_graph_observations = 4
-    component = {"worst_combined_ms_per_step": 0.15}
+    component = _component({4: 0.15})
 
     report = summarize(
         observer,
@@ -245,13 +348,130 @@ def test_summary_computes_fixed_main_and_request_zero_cost_ceilings() -> None:
     )
 
     ceiling = report["fixed_work_ceiling"]
+    assert report["schema_version"] == 2
     assert ceiling["ideal_main_top_p_sampling_seconds"] == pytest.approx(1.2441)
     assert ceiling["ideal_main_projection_seconds"] == pytest.approx(0.08294)
     assert ceiling["ideal_main_total_seconds"] == pytest.approx(1.32704)
     assert ceiling["ideal_complete_request_total_seconds"] == pytest.approx(1.4584)
     assert not ceiling["main_ceiling_clears_threshold"]
     assert report["decision"] == "stop_below_main_component_gate"
+    assert report["distribution"]["vocab_sizes"] == [4]
     assert report["distribution"]["nucleus_size_p95"] == 4
+
+
+def test_representatives_are_selected_independently_for_every_vocab_size() -> None:
+    samples = [
+        _sample(nucleus_size=nucleus, vocab_size=vocab_size)
+        for vocab_size, nuclei in ((4, (1, 2, 3, 4)), (6, (2, 3, 5, 6)))
+        for nucleus in nuclei
+    ]
+
+    representatives = _representatives_by_vocab_size(samples)
+
+    assert list(representatives) == [4, 6]
+    assert set(representatives[4]) == {"min", "p50", "p95", "max"}
+    assert set(representatives[6]) == {"min", "p50", "p95", "max"}
+    assert {
+        sample.vocab_size
+        for shape_representatives in representatives.values()
+        for sample in shape_representatives.values()
+    } == {4, 6}
+
+
+def test_summary_supports_two_vocab_sizes_and_uses_slowest_shape() -> None:
+    observer = VocabSamplingObserver(max_samples=8)
+    observer.samples = [
+        _sample(nucleus_size=1, vocab_size=4),
+        _sample(nucleus_size=3, vocab_size=4),
+        _sample(nucleus_size=2, vocab_size=6),
+        _sample(nucleus_size=5, vocab_size=6),
+    ]
+    observer.observed_vocab_counts = {4: 2, 6: 2}
+    component = _component({4: 0.12, 6: 0.20})
+
+    report = summarize(
+        observer,
+        component,
+        fixed_main_steps=8294,
+        fixed_timing_steps=821,
+        mixed_projection_ms_per_step=0.01,
+        promotion_threshold_seconds=1.5,
+    )
+
+    distribution = report["distribution"]
+    ceiling = report["fixed_work_ceiling"]
+    assert distribution["vocab_sizes"] == [4, 6]
+    assert distribution["score_shapes"] == [[1, 4], [1, 6]]
+    assert distribution["samples_by_vocab_size"] == {"4": 2, "6": 2}
+    assert distribution["nucleus_size_by_vocab_size"] == {
+        "4": {"min": 1, "p50": 3, "p95": 3, "max": 3},
+        "6": {"min": 2, "p50": 5, "p95": 5, "max": 5},
+    }
+    assert ceiling["existing_top_p_sampling_ms_per_step"] == 0.20
+    assert ceiling["existing_top_p_sampling_worst_across_shapes_ms_per_step"] == 0.20
+    assert ceiling["existing_top_p_sampling_ms_per_step_by_vocab_size"] == {
+        "4": 0.12,
+        "6": 0.20,
+    }
+    assert ceiling["worst_case_vocab_sizes"] == [6]
+    assert ceiling["ceiling_cost_policy"] == (
+        "charge the worst observed score-shape tail to every fixed step"
+    )
+    assert ceiling["ideal_main_top_p_sampling_seconds"] == pytest.approx(1.6588)
+
+
+def test_summary_makes_no_claim_when_one_observed_vocab_size_is_untimed() -> None:
+    observer = VocabSamplingObserver(max_samples=2)
+    observer.samples = [
+        _sample(vocab_size=4),
+        _sample(vocab_size=6),
+    ]
+    observer.observed_vocab_counts = {4: 1, 6: 1}
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"does not cover every observed vocabulary size.*\[4, 6\]",
+    ):
+        summarize(
+            observer,
+            _component({4: 0.12}),
+            fixed_main_steps=8294,
+            fixed_timing_steps=821,
+            mixed_projection_ms_per_step=0.01,
+            promotion_threshold_seconds=1.5,
+        )
+
+
+@pytest.mark.parametrize(
+    "failure", ["duplicate", "shape", "per_vocab_worst", "global_worst"]
+)
+def test_summary_rejects_inconsistent_multi_vocab_component_rows(failure) -> None:
+    observer = VocabSamplingObserver(max_samples=2)
+    observer.samples = [_sample(vocab_size=4), _sample(vocab_size=6)]
+    observer.observed_vocab_counts = {4: 1, 6: 1}
+    component = _component({4: 0.12, 6: 0.20})
+    if failure == "duplicate":
+        component["representatives"].append(dict(component["representatives"][0]))
+        expected = "repeats a vocabulary representative"
+    elif failure == "shape":
+        component["representatives"][0]["score_shape"] = [1, 6]
+        expected = "score shape is inconsistent"
+    elif failure == "per_vocab_worst":
+        component["worst_combined_ms_per_step_by_vocab_size"]["4"] = 0.13
+        expected = "inconsistent with representative rows"
+    else:
+        component["worst_combined_ms_per_step"] = 0.21
+        expected = "worst timing is inconsistent"
+
+    with pytest.raises(RuntimeError, match=expected):
+        summarize(
+            observer,
+            component,
+            fixed_main_steps=8294,
+            fixed_timing_steps=821,
+            mixed_projection_ms_per_step=0.01,
+            promotion_threshold_seconds=1.5,
+        )
 
 
 def test_component_benchmark_requires_cuda() -> None:
@@ -268,6 +488,7 @@ def test_runner_scopes_observer_k4_and_weight_candidate(monkeypatch, tmp_path) -
     def observer_context(observer):
         events.append("observer-enter")
         observer.samples = [_sample()]
+        observer.observed_vocab_counts = {4: 1}
         try:
             yield
         finally:
@@ -292,7 +513,7 @@ def test_runner_scopes_observer_k4_and_weight_candidate(monkeypatch, tmp_path) -
     monkeypatch.setattr(
         run_k4_vocab_sampling_scout,
         "benchmark_existing_tail",
-        lambda *args, **kwargs: {"worst_combined_ms_per_step": 0.1},
+        lambda *args, **kwargs: _component({4: 0.1}),
     )
     output = tmp_path / "scout.json"
     report = run_k4_vocab_sampling_scout.run(
