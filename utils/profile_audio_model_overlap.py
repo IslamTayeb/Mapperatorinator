@@ -296,7 +296,7 @@ def run_single(
         )
 
         if mode == "overlap":
-            from osuT5.osuT5.inference.optimized.scout.audio_model_overlap import (
+            from osuT5.osuT5.inference.optimized.audio_model_overlap_scout import (
                 AudioPreparationTask,
             )
 
@@ -349,7 +349,7 @@ def run_single(
             )
 
         if mode == "overlap":
-            from osuT5.osuT5.inference.optimized.scout.audio_model_overlap import (
+            from osuT5.osuT5.inference.optimized.audio_model_overlap_scout import (
                 preload_accepted_native_extensions,
             )
 
