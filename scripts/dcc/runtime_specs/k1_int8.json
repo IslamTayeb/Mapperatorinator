@@ -1,0 +1,13 @@
+{
+  "schema_version": "mapperatorinator.final-runtime-spec.v1",
+  "name": "k1-int8-shared-rope",
+  "factory": "utils.final_confirmation_runtime:kblock_shared_rope_weight_plugin",
+  "kwargs": {
+    "block_size": 1,
+    "graph_remainders": true,
+    "initializer_name": "initialize_approximate_int8_mlp_weight_only",
+    "shared_rope_binding_index": 0,
+    "initializer_binding_index": 0,
+    "minimum_bindings": 1
+  }
+}
