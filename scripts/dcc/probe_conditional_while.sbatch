@@ -145,5 +145,9 @@ cd "$REPO"
   profile_cuda_capture=false \
   profile_pass_kind=untraced_control
 
+find "$RUN_ROOT" -type f -name '*.osu' -delete
+INVALID_ARTIFACT=$(find "$RUN_ROOT" -type f ! -name '*.json' ! -name '*.txt' -print -quit)
+[[ -z "$INVALID_ARTIFACT" ]] \
+  || fail "unexpected non-JSON/text artifact: $INVALID_ARTIFACT"
 echo "conditional_while_staged_gate=PASS" | tee "$RUN_ROOT/decision.txt"
 echo "artifacts=$RUN_ROOT"

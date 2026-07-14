@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -187,6 +189,10 @@ def test_default_engine_import_does_not_import_conditional_scout(tmp_path):
         check=True,
         capture_output=True,
         text=True,
+        env={
+            **os.environ,
+            "PATH": f"{Path(sys.executable).parent}:{os.environ.get('PATH', '')}",
+        },
     )
     assert completed.stdout.strip() == "False"
     assert completed.stderr == ""
