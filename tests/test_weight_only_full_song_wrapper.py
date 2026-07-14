@@ -9,10 +9,14 @@ from utils import run_approximate_weight_only
 
 ROOT = Path(__file__).resolve().parents[1]
 WRAPPER = ROOT / "scripts/dcc/verify_weight_only_full_song_reciprocal.sbatch"
+K4_WRAPPER = (
+    ROOT / "scripts/dcc/verify_k4_split_weight_full_song_reciprocal.sbatch"
+)
 
 
 def test_weight_only_full_song_wrapper_has_valid_bash_syntax() -> None:
-    subprocess.run(["bash", "-n", str(WRAPPER)], check=True)
+    for wrapper in (WRAPPER, K4_WRAPPER):
+        subprocess.run(["bash", "-n", str(wrapper)], check=True)
 
 
 def test_wrapper_uses_full_fp32_optimized_reciprocal_order_and_launchers() -> None:
@@ -70,6 +74,7 @@ def test_wrapper_allows_declared_timing_drift_for_k4_composition() -> None:
     source = WRAPPER.read_text(encoding="utf-8")
 
     assert "REQUIRE_EXACT_TIMING=${REQUIRE_EXACT_TIMING:-true}" in source
+    assert "REQUIRE_K4_CANDIDATE=${REQUIRE_K4_CANDIDATE:-false}" in source
     assert '[[ "$REQUIRE_EXACT_TIMING" != true' in source
     assert 'if [[ "$REQUIRE_EXACT_TIMING" == true ]]' in source
     assert "EXPECTED_EXACT_LABELS=none" in source
@@ -80,6 +85,30 @@ def test_wrapper_allows_declared_timing_drift_for_k4_composition() -> None:
         "'records.timing_context[[]*].optimized_cuda_graphs.*'",
     ):
         assert pattern in source
+    assert "timing drift may be enabled only for the K4 candidate" in source
+
+
+def test_dedicated_k4_wrapper_pins_combined_runner_and_contract() -> None:
+    source = K4_WRAPPER.read_text(encoding="utf-8")
+
+    assert "export CANDIDATE_RUNNER=utils/run_k4_approximate_weight_only.py" in source
+    assert "export REQUIRE_EXACT_TIMING=false" in source
+    assert "export REQUIRE_K4_CANDIDATE=true" in source
+    assert "verify_weight_only_full_song_reciprocal.sbatch" in source
+
+
+def test_general_wrapper_requires_k4_metadata_for_every_profile() -> None:
+    source = WRAPPER.read_text(encoding="utf-8")
+
+    assert "utils/validate_k4_profile_contract.py" in source
+    assert "k4_validation_role=candidate" in source
+    for role in (
+        "baseline_first",
+        "candidate_first",
+        "candidate_second",
+        "baseline_second",
+    ):
+        assert f'"$RUN_ROOT/{role}.k4-validation.json"' in source
 
 
 def test_wrapper_isolates_native_extensions_and_keeps_compiler_caches_per_run() -> None:

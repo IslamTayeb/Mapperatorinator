@@ -24,6 +24,7 @@ CANDIDATE_REMOTE=${CANDIDATE_REMOTE:-origin}
 PROFILE_CONFIG=${PROFILE_CONFIG:-profile_salvalai}
 CANDIDATE_RUNNER=${CANDIDATE_RUNNER:-utils/run_approximate_weight_only.py}
 REQUIRE_EXACT_TIMING=${REQUIRE_EXACT_TIMING:-true}
+REQUIRE_K4_CANDIDATE=${REQUIRE_K4_CANDIDATE:-false}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_LABEL=${RUN_LABEL:-split-weight-full-song-reciprocal}
 RUN_ROOT="$WORK/runs/$RUN_LABEL-${SLURM_JOB_ID:-manual}"
@@ -61,6 +62,27 @@ if [[ ! -f "$CANDIDATE_REPO/$CANDIDATE_RUNNER" ]]; then
 fi
 if [[ "$REQUIRE_EXACT_TIMING" != true && "$REQUIRE_EXACT_TIMING" != false ]]; then
   echo "REQUIRE_EXACT_TIMING must be true or false" >&2
+  exit 2
+fi
+if [[ "$REQUIRE_K4_CANDIDATE" != true && "$REQUIRE_K4_CANDIDATE" != false ]]; then
+  echo "REQUIRE_K4_CANDIDATE must be true or false" >&2
+  exit 2
+fi
+if [[ "$REQUIRE_K4_CANDIDATE" == true ]]; then
+  if [[ "$CANDIDATE_RUNNER" != utils/run_k4_approximate_weight_only.py ]]; then
+    echo "K4 candidate gate requires the exact combined runner" >&2
+    exit 2
+  fi
+  if [[ "$REQUIRE_EXACT_TIMING" != false ]]; then
+    echo "K4 candidate gate requires documented timing drift" >&2
+    exit 2
+  fi
+elif [[ "$CANDIDATE_RUNNER" != utils/run_approximate_weight_only.py ]]; then
+  echo "non-K4 gate requires the default mixed-weight runner" >&2
+  exit 2
+fi
+if [[ "$REQUIRE_EXACT_TIMING" == false && "$REQUIRE_K4_CANDIDATE" != true ]]; then
+  echo "timing drift may be enabled only for the K4 candidate" >&2
   exit 2
 fi
 
@@ -211,6 +233,7 @@ echo "same_commit_gate=true"
 echo "profile_config=$PROFILE_CONFIG"
 echo "candidate_runner=$CANDIDATE_RUNNER"
 echo "require_exact_timing=$REQUIRE_EXACT_TIMING"
+echo "require_k4_candidate=$REQUIRE_K4_CANDIDATE"
 echo "audio=$AUDIO"
 echo "run_root=$RUN_ROOT"
 echo "extension_cache_mode=$EXTENSION_CACHE_MODE"
@@ -400,6 +423,18 @@ run_profile() {
       --profile "$profile" \
       --role "$validation_role" \
       > "$RUN_ROOT/$role.weight-only-validation.json"
+  )
+  local k4_validation_role=baseline
+  if [[ "$candidate" == 1 && "$REQUIRE_K4_CANDIDATE" == true ]]; then
+    k4_validation_role=candidate
+  fi
+  (
+    cd "$CANDIDATE_REPO"
+    "$PYTHON" utils/validate_k4_profile_contract.py \
+      --profile "$profile" \
+      --role "$k4_validation_role" \
+      --block-size 4 \
+      > "$RUN_ROOT/$role.k4-validation.json"
   )
   (
     cd "$CANDIDATE_REPO"
@@ -631,6 +666,10 @@ for artifact in \
   "$RUN_ROOT/candidate_first.weight-only-validation.json" \
   "$RUN_ROOT/candidate_second.weight-only-validation.json" \
   "$RUN_ROOT/baseline_second.weight-only-validation.json" \
+  "$RUN_ROOT/baseline_first.k4-validation.json" \
+  "$RUN_ROOT/candidate_first.k4-validation.json" \
+  "$RUN_ROOT/candidate_second.k4-validation.json" \
+  "$RUN_ROOT/baseline_second.k4-validation.json" \
   "$RUN_ROOT/reciprocal-analysis.json" \
   "$RUN_ROOT/reciprocal-analysis.txt"; do
   if [[ ! -s "$artifact" ]]; then
