@@ -164,6 +164,18 @@ def test_wrapper_requires_initialization_evidence_and_relaxed_analyzer_outputs()
         assert f"metric.{metric}=" in source
 
 
+def test_wrapper_declares_optional_result_class_and_full_main_dispatch_delta() -> None:
+    source = WRAPPER.read_text(encoding="utf-8")
+
+    assert "--allow-optional-dispatch-delta 'optimized_result_class'" in source
+    assert "--allow-dispatch-delta 'optimized_result_class'" not in source
+    aggregate = "'records.main_generation[[]*].optimized_dispatch_capture_hits'"
+    children = "'records.main_generation[[]*].optimized_dispatch_capture_hits.*'"
+    assert aggregate in source
+    assert children in source
+    assert source.index(aggregate) < source.index(children)
+
+
 def test_wrapper_fails_loudly_on_weight_only_profile_dispatch_contract() -> None:
     source = WRAPPER.read_text(encoding="utf-8")
 

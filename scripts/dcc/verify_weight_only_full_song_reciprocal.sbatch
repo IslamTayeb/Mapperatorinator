@@ -573,7 +573,9 @@ PY
     --require-exact-label timing_context \
     --require-exact-dispatch-label timing_context \
     --require-dispatch-declaration \
-    --allow-dispatch-delta 'optimized_result_class' \
+    --allow-optional-dispatch-delta 'optimized_result_class' \
+    --allow-dispatch-delta \
+      'records.main_generation[[]*].optimized_dispatch_capture_hits' \
     --allow-dispatch-delta \
       'records.main_generation[[]*].optimized_dispatch_capture_hits.*' \
     --allow-dispatch-delta \
