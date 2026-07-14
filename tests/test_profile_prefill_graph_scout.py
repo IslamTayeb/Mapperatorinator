@@ -13,6 +13,8 @@ from utils.profile_prefill_graph_scout import (
     copy_graph_inputs,
     prefill_signature,
     Observation,
+    restore_rng_state,
+    snapshot_rng_state,
 )
 
 
@@ -120,3 +122,43 @@ def test_observation_comparison_separates_exactness_and_drift():
     }
     assert drifted["exact"] is False
     assert drifted["max_abs_drift"] == pytest.approx(0.25)
+
+
+def test_rng_snapshot_restores_same_seed_cpu_reciprocal_behavior():
+    torch.manual_seed(12345)
+    snapshot = snapshot_rng_state()
+    first = torch.rand(16)
+    torch.rand(7)
+
+    restore_rng_state(snapshot)
+    reciprocal = torch.rand(16)
+
+    assert torch.equal(reciprocal, first)
+
+
+def test_rng_snapshot_clones_and_restores_all_cuda_states(monkeypatch):
+    source = [torch.tensor([1, 2], dtype=torch.uint8), torch.tensor([3, 4], dtype=torch.uint8)]
+    restored = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(torch.cuda, "get_rng_state_all", lambda: source)
+    monkeypatch.setattr(torch.cuda, "set_rng_state_all", lambda states: restored.extend(states))
+
+    snapshot = snapshot_rng_state()
+    source[0].zero_()
+    source[1].zero_()
+    restore_rng_state(snapshot)
+
+    assert len(restored) == 2
+    assert torch.equal(restored[0], torch.tensor([1, 2], dtype=torch.uint8))
+    assert torch.equal(restored[1], torch.tensor([3, 4], dtype=torch.uint8))
+
+
+def test_rng_restore_fails_if_cuda_device_inventory_changes(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_rng_state_all", lambda: [torch.tensor([1], dtype=torch.uint8)])
+    snapshot = snapshot_rng_state()
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+
+    with pytest.raises(RuntimeError, match="state count changed"):
+        restore_rng_state(snapshot)

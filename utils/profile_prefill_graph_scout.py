@@ -81,6 +81,43 @@ class CapturedPrefillGraph:
     reserved_delta_bytes: int
 
 
+@dataclass(slots=True)
+class RngSnapshot:
+    cpu: torch.Tensor
+    cuda: tuple[torch.Tensor, ...]
+
+
+def snapshot_rng_state() -> RngSnapshot:
+    """Capture every generator consumed by the accepted sampling path."""
+
+    return RngSnapshot(
+        cpu=torch.random.get_rng_state().clone(),
+        cuda=(
+            tuple(state.clone() for state in torch.cuda.get_rng_state_all())
+            if torch.cuda.is_available()
+            else ()
+        ),
+    )
+
+
+def restore_rng_state(snapshot: RngSnapshot) -> None:
+    """Restore a reciprocal song run to the exact CPU and CUDA RNG state."""
+
+    if not isinstance(snapshot, RngSnapshot):
+        raise TypeError("prefill reciprocal RNG state must be an RngSnapshot")
+    torch.random.set_rng_state(snapshot.cpu.clone())
+    if snapshot.cuda:
+        if not torch.cuda.is_available():
+            raise RuntimeError("captured CUDA RNG state cannot be restored without CUDA")
+        device_count = torch.cuda.device_count()
+        if len(snapshot.cuda) != device_count:
+            raise RuntimeError(
+                "captured CUDA RNG state count changed: "
+                f"captured={len(snapshot.cuda)} current={device_count}"
+            )
+        torch.cuda.set_rng_state_all([state.clone() for state in snapshot.cuda])
+
+
 def bucket_prompt_length(length: int, *, bucket_size: int = BUCKET_SIZE) -> int:
     if isinstance(length, bool) or not isinstance(length, int) or length <= 0:
         raise ValueError("prompt length must be a positive integer")
@@ -683,6 +720,7 @@ def run(args: Any, *, output_path: Path, warmup: int, iterations: int) -> dict[s
         inference_engine=args.inference_engine,
     )
     generation_config, beatmap_config = get_config(args)
+    reciprocal_rng = snapshot_rng_state()
     baseline = _run_song(
         args,
         binding=binding,
@@ -692,6 +730,7 @@ def run(args: Any, *, output_path: Path, warmup: int, iterations: int) -> dict[s
         output_path=output_path / "baseline",
         capture_records=None,
     )
+    restore_rng_state(reciprocal_rng)
     records: list[PrefillRecord] = []
     captured = _run_song(
         args,
