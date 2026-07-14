@@ -167,6 +167,10 @@ def validate_profile(payload: Any, *, role: str) -> dict[str, Any]:
         raise WeightOnlyProfileError(f"profile is missing generation labels: {missing}")
 
     totals = {key: 0 for key in WEIGHT_ONLY_DISPATCHES}
+    baseline_main_dispatch_totals = {
+        "q1_bmm_cross_attention": 0,
+        "native_cross_mlp_tail": 0,
+    }
     effective_self_attention_totals = {
         label: {
             "native_q1_rope_cache_self_attention": 0,
@@ -338,11 +342,13 @@ def validate_profile(payload: Any, *, role: str) -> dict[str, Any]:
                     if (
                         isinstance(value, bool)
                         or not isinstance(value, int)
-                        or value <= 0
+                        or value < 0
                     ):
                         raise WeightOnlyProfileError(
-                            f"{name}.hits.{key} must be a positive integer"
+                            f"{name}.hits.{key} must be a non-negative integer"
                         )
+                    if key in baseline_main_dispatch_totals:
+                        baseline_main_dispatch_totals[key] += value
 
     main_effective = effective_self_attention_totals["main_generation"]
     if candidate:
@@ -366,6 +372,16 @@ def validate_profile(payload: Any, *, role: str) -> dict[str, Any]:
             )
         main_effective["accepted_fallback"] = accepted_fallback
     else:
+        missing_dispatch = {
+            key: value
+            for key, value in baseline_main_dispatch_totals.items()
+            if value <= 0
+        }
+        if missing_dispatch:
+            raise WeightOnlyProfileError(
+                "baseline main generation did not execute every accepted region: "
+                f"{missing_dispatch}"
+            )
         if main_effective["native_q1_rope_cache_self_attention"] <= 0:
             raise WeightOnlyProfileError(
                 "baseline main generation did not execute accepted native q1"
@@ -388,6 +404,7 @@ def validate_profile(payload: Any, *, role: str) -> dict[str, Any]:
         "candidate_enabled_for_main": candidate,
         "candidate_disabled_for_timing": candidate,
         "main_weight_only_dispatch_counts": totals,
+        "baseline_main_dispatch_counts": baseline_main_dispatch_totals,
         "timing_effective_self_attention_counts": effective_self_attention_totals[
             "timing_context"
         ],

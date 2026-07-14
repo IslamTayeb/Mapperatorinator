@@ -313,3 +313,35 @@ def test_baseline_requires_exact_split_kv_and_accepted_fallback() -> None:
     hits["native_q1_rope_cache_self_attention_split_kv_8_prefix_640"] = 9
     with pytest.raises(WeightOnlyProfileError, match="accepted native q1 fallback"):
         validate_profile(no_fallback, role="baseline")
+
+
+def test_baseline_allows_zero_dispatch_windows_when_stage_aggregate_is_valid() -> None:
+    profile = _profile(candidate=False)
+    zero_decode_window = copy.deepcopy(profile["generation"][1])
+    hits = zero_decode_window["optimized_dispatch_capture_hits"]
+    for key in tuple(hits):
+        if key.startswith("native_q1_rope_cache_self_attention") or key in {
+            "q1_bmm_cross_attention",
+            "native_cross_mlp_tail",
+        }:
+            hits[key] = 0
+    profile["generation"].insert(1, zero_decode_window)
+
+    report = validate_profile(profile, role="baseline")
+
+    assert report["baseline_main_dispatch_counts"] == {
+        "q1_bmm_cross_attention": 10,
+        "native_cross_mlp_tail": 12,
+    }
+
+
+@pytest.mark.parametrize(
+    "dispatch",
+    ["q1_bmm_cross_attention", "native_cross_mlp_tail"],
+)
+def test_baseline_requires_accepted_dispatch_across_main_stage(dispatch: str) -> None:
+    profile = _profile(candidate=False)
+    profile["generation"][1]["optimized_dispatch_capture_hits"][dispatch] = 0
+
+    with pytest.raises(WeightOnlyProfileError, match="every accepted region"):
+        validate_profile(profile, role="baseline")
