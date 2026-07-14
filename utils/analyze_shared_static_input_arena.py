@@ -188,7 +188,20 @@ def _transition_summary(
             )
             if current_wall > 0.0:
                 measured_records += 1
-                if error > 0.02:
+                computed_error = abs(float(current_unattributed)) / current_wall
+                if abs(
+                    current_wall
+                    - current_accounted
+                    - float(current_unattributed)
+                ) > max(1e-9, current_wall * 1e-6):
+                    raise ValueError(
+                        f"{role}.{label}[{index}] transition decomposition does not sum"
+                    )
+                if abs(error - computed_error) > 1e-9:
+                    raise ValueError(
+                        f"{role}.{label}[{index}] reconciliation error is inconsistent"
+                    )
+                if computed_error > 0.02:
                     raise ValueError(
                         f"{role}.{label}[{index}] transition wall misses 2% reconciliation"
                     )
@@ -211,15 +224,23 @@ def _transition_summary(
             }
             if set(stages) != expected_stages:
                 raise ValueError(f"{role}.{label}[{index}] stage schema changed")
+            record_stage_sum = 0.0
             for name, raw_stage in stages.items():
                 stage = _object(raw_stage, name=f"{role}.{label}.{name}")
                 calls = stage.get("calls")
                 if isinstance(calls, bool) or not isinstance(calls, int) or calls < 0:
                     raise ValueError(f"{role}.{label}.{name}.calls is invalid")
                 wall = _number(stage.get("wall_seconds"), name=f"{role}.{label}.{name}")
+                record_stage_sum += wall
                 total = stage_totals.setdefault(name, {"calls": 0, "wall_seconds": 0.0})
                 total["calls"] = int(total["calls"]) + calls
                 total["wall_seconds"] = float(total["wall_seconds"]) + wall
+            if abs(record_stage_sum - current_accounted) > max(
+                1e-9, current_wall * 1e-6
+            ):
+                raise ValueError(
+                    f"{role}.{label}[{index}] accounted wall differs from stage sum"
+                )
 
             device = _object(
                 timing.get("device"),

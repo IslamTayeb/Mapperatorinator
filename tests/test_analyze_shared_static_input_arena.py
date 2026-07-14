@@ -145,6 +145,18 @@ def test_shared_arena_gate_rejects_extra_refresh_or_reconciliation_gap():
     timing = profiles["candidate_first"]["generation"][0]["optimized_cuda_graphs"][
         "k8_candidate"
     ]["transition_timing"]
+    timing["unattributed_wall_seconds"] = 0.021 * timing["model_wall_seconds"]
+    timing["accounted_wall_seconds"] = (
+        timing["model_wall_seconds"] - timing["unattributed_wall_seconds"]
+    )
+    other_stage_seconds = sum(
+        stage["wall_seconds"]
+        for name, stage in timing["stages"].items()
+        if name != "status_d2h"
+    )
+    timing["stages"]["status_d2h"]["wall_seconds"] = (
+        timing["accounted_wall_seconds"] - other_stage_seconds
+    )
     timing["reconciliation_error_fraction"] = 0.021
     with pytest.raises(ValueError, match="2% reconciliation"):
         analyze(_reciprocal(), profiles)
