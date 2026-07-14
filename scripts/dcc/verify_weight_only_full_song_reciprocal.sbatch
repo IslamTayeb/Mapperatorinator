@@ -798,7 +798,9 @@ elif [[ "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
     split8_attention)
       ANALYSIS_DISPATCH_ARGS+=(
         --allow-dispatch-delta
-          'records.main_generation[[]*].optimized_dispatch_capture_hits.split8_cross_attention_candidate'
+          'records.main_generation[[]*].optimized_dispatch_capture_hits.q1_bmm_cross_attention'
+        --allow-dispatch-delta
+          'records.main_generation[[]*].optimized_dispatch_capture_hits.split8_q1_cross_attention_candidate'
       )
       ;;
     *)

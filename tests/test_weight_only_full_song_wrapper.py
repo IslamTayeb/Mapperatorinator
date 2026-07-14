@@ -186,7 +186,8 @@ def test_cross_analysis_declares_only_the_selected_cross_dispatch_counter() -> N
 
     assert "ANALYSIS_DISPATCH_ARGS=(" in cross_block
     assert "fp16_packed_cross_projection_candidate" in cross_block
-    assert "split8_cross_attention_candidate" in cross_block
+    assert "split8_q1_cross_attention_candidate" in cross_block
+    assert "q1_bmm_cross_attention" in cross_block
     assert "native_cross_mlp_tail_*" not in cross_block
     assert (
         "'records.main_generation[[]*].optimized_dispatch_capture_hits'"
