@@ -16,7 +16,10 @@ class AttentionRuntimeHooks:
 
 @dataclass(frozen=True)
 class DecoderLayerRuntimeHooks:
+    self_attention_block_forward: Callable[..., Any] | None = None
     cross_mlp_tail_forward: Callable[..., Any] | None = None
+    decoder_final_norm_forward: Callable[..., Any] | None = None
+    output_projection_forward: Callable[..., Any] | None = None
 
 
 _EMPTY_ATTENTION_RUNTIME_HOOKS = AttentionRuntimeHooks()

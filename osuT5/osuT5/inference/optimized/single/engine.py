@@ -193,6 +193,7 @@ def _generate_window(
     preset: OptimizedPreset,
     allow_batched_decode: bool = False,
     specialized_dispatch_batch_size: int | None = None,
+    approximate_weight_only_state: Any | None = None,
 ):
     expected_dtype = preset.torch_dtype
     if model.dtype != expected_dtype:
@@ -251,6 +252,17 @@ def _generate_window(
         batch_size == 1
         and specialized_dispatch_batch_size in {None, 1}
     )
+    if approximate_weight_only_state is not None:
+        if preset.precision != "fp32":
+            raise TypeError(
+                "approximate FP16-weight candidate requires the FP32 optimized preset"
+            )
+        approximate_weight_only_state.validate_owner(model)
+    approximate_weight_only_enabled = (
+        approximate_weight_only_state is not None
+        and specialized_batch
+        and context_type != ContextType.TIMING
+    )
     batched_policy_disabled_reason = (
         "batch_gt_1"
         if batch_size > 1
@@ -260,12 +272,15 @@ def _generate_window(
     )
     q1_bmm_cross_attention = specialized_batch
     native_q1_self_attention = (
-        specialized_batch and context_type != ContextType.TIMING
+        specialized_batch
+        and context_type != ContextType.TIMING
+        and not approximate_weight_only_enabled
     )
     native_q1_rope_cache_self_attention = native_q1_self_attention
     native_cross_mlp_tail = (
         specialized_batch
         and _native_cross_mlp_tail_enabled(context_type=context_type)
+        and not approximate_weight_only_enabled
     )
     processors = _build_logits_processor_list(
         tokenizer,
@@ -311,19 +326,35 @@ def _generate_window(
         "q1_bmm_cross_attention": 0,
         "native_cross_mlp_tail": 0,
     }
+    if approximate_weight_only_state is not None:
+        dispatch_counts.update(
+            {
+                "weight_only_self_attention_block": 0,
+                "weight_only_mlp_tail": 0,
+                "weight_only_final_projection": 0,
+            }
+        )
+
+    profile_context_kwargs = {
+        "q1_bmm_cross_attention": q1_bmm_cross_attention,
+        "native_q1_self_attention": native_q1_self_attention,
+        "native_q1_rope_cache_self_attention": (
+            native_q1_rope_cache_self_attention
+        ),
+        "native_cross_mlp_tail": native_cross_mlp_tail,
+        "optimized_expected_dtype": expected_dtype,
+        "optimized_dispatch_counts": dispatch_counts,
+    }
+    if approximate_weight_only_enabled:
+        profile_context_kwargs["approximate_weight_only_state"] = (
+            approximate_weight_only_state
+        )
 
     with torch.autocast(
         device_type=model.device.type,
         dtype=torch.bfloat16,
         enabled=precision == "amp",
-    ), generation_profile_context(
-        q1_bmm_cross_attention=q1_bmm_cross_attention,
-        native_q1_self_attention=native_q1_self_attention,
-        native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
-        native_cross_mlp_tail=native_cross_mlp_tail,
-        optimized_expected_dtype=expected_dtype,
-        optimized_dispatch_counts=dispatch_counts,
-    ):
+    ), generation_profile_context(**profile_context_kwargs):
         if sync_model_timing:
             sync_cuda_for_model(model)
         start_time = time.perf_counter()
@@ -361,7 +392,11 @@ def _generate_window(
         "optimized_effective_config_version": preset.version,
         "optimized_batched_super_timing": allow_batched_decode,
         "optimized_dispatch_mode": (
-            "accepted_batch1" if specialized_batch else "framework_batch"
+            "approximate_weight_only_batch1"
+            if approximate_weight_only_enabled
+            else "accepted_batch1"
+            if specialized_batch
+            else "framework_batch"
         ),
         "optimized_dispatch_policy": {
             "q1_bmm_cross_attention": {
@@ -381,6 +416,8 @@ def _generate_window(
                     if native_q1_self_attention
                     else batched_policy_disabled_reason
                     if not specialized_batch
+                    else "approximate_weight_only"
+                    if approximate_weight_only_enabled
                     else "timing_context"
                 ),
             },
@@ -392,6 +429,8 @@ def _generate_window(
                     if native_q1_rope_cache_self_attention
                     else batched_policy_disabled_reason
                     if not specialized_batch
+                    else "approximate_weight_only"
+                    if approximate_weight_only_enabled
                     else "timing_context"
                 ),
             },
@@ -403,6 +442,8 @@ def _generate_window(
                     if native_cross_mlp_tail
                     else batched_policy_disabled_reason
                     if not specialized_batch
+                    else "approximate_weight_only"
+                    if approximate_weight_only_enabled
                     else "timing_context"
                 ),
             },
@@ -412,6 +453,8 @@ def _generate_window(
         "native_cross_mlp_tail_disabled_reason": (
             batched_policy_disabled_reason
             if not specialized_batch
+            else "approximate_weight_only"
+            if approximate_weight_only_enabled
             else "timing_context"
             if not native_cross_mlp_tail
             else None
@@ -433,12 +476,35 @@ def _generate_window(
         ),
         "optimized_cuda_graphs": context_state.graph_profile_summary(),
     })
+    if approximate_weight_only_state is not None:
+        stats["optimized_dispatch_policy"]["approximate_weight_only"] = {
+            "requested": True,
+            "enabled": approximate_weight_only_enabled,
+            "disabled_reason": (
+                None
+                if approximate_weight_only_enabled
+                else batched_policy_disabled_reason
+                if not specialized_batch
+                else "timing_context"
+            ),
+            "result_class": "documented-drift",
+            "exactness_claim": False,
+        }
+        stats["approximate_weight_only"] = (
+            approximate_weight_only_state.metadata()
+        )
     return result, stats
 
 
 @dataclass(frozen=True, slots=True)
 class OptimizedSingleRuntime:
     preset: OptimizedPreset
+    _approximate_weight_only_state: Any | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self):
         if not isinstance(self.preset, OptimizedPreset):
@@ -453,6 +519,25 @@ class OptimizedSingleRuntime:
 
     def new_context_state(self) -> ProductionDecodeSession:
         return ProductionDecodeSession()
+
+    def initialize_approximate_weight_only(
+        self,
+        model: torch.nn.Module,
+    ) -> dict[str, Any]:
+        """Explicitly build extensions and pack model-owned candidate weights."""
+        if self.preset.precision != "fp32":
+            raise TypeError(
+                "approximate FP16-weight candidate requires the FP32 preset"
+            )
+        existing = self._approximate_weight_only_state
+        if existing is not None:
+            existing.validate_owner(model)
+            return existing.metadata()
+        from ..kernels.weight_only_runtime import ApproximateWeightOnlyState
+
+        state = ApproximateWeightOnlyState.initialize(model)
+        object.__setattr__(self, "_approximate_weight_only_state", state)
+        return state.metadata()
 
     def for_super_timing(
         self,
@@ -495,10 +580,11 @@ class OptimizedSingleRuntime:
             dict(generate_kwargs),
             context_state=context_state,
             preset=self.preset,
+            approximate_weight_only_state=self._approximate_weight_only_state,
         )
 
     def profile_metadata(self) -> dict[str, Any]:
-        return {
+        metadata = {
             "optimized_effective_config_version": self.preset.version,
             "optimized_effective_config": _optimized_config_metadata(self.preset),
             "optimized_runtime_owner": (
@@ -506,6 +592,12 @@ class OptimizedSingleRuntime:
             ),
             "optimized_result_class": self.preset.result_class,
         }
+        if self._approximate_weight_only_state is not None:
+            metadata["optimized_approximate_weight_only"] = (
+                self._approximate_weight_only_state.metadata()
+            )
+            metadata["optimized_result_class"] = "documented-drift"
+        return metadata
 
 
 @dataclass(frozen=True, slots=True)
