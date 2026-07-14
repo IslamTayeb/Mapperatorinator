@@ -43,14 +43,21 @@ def _module() -> SimpleNamespace:
     )
 
 
-def _exercise(monkeypatch, mode: str) -> tuple[dict[str, int], list[str]]:
+def _exercise(
+    monkeypatch,
+    mode: str,
+    *,
+    int8_mlp: bool = False,
+) -> tuple[dict[str, int], list[str]]:
     calls: list[str] = []
     module = _module()
     cross_packs = (object(), object())
     state = SimpleNamespace(
         cross_mode=mode,
+        int8_mlp_enabled=int8_mlp,
         pack_for_layer=lambda layer: SimpleNamespace(fc1=object(), fc2=object()),
         cross_pack_for_layer=lambda layer: cross_packs,
+        int8_mlp_pack_for_layer=lambda layer: object(),
     )
     monkeypatch.setattr(weight_only_runtime, "EncoderDecoderCache", _FakeEncoderDecoderCache)
     monkeypatch.setattr(weight_only_runtime, "_require_fp32_cuda", lambda value, **kwargs: value)
@@ -92,6 +99,13 @@ def _exercise(monkeypatch, mode: str) -> tuple[dict[str, int], list[str]]:
         "weight_only_mlp_residual",
         lambda hidden, *args, **kwargs: calls.append("mlp") or hidden,
     )
+    from osuT5.osuT5.inference.optimized.scout import int8_mlp as int8_mlp_module
+
+    monkeypatch.setattr(
+        int8_mlp_module,
+        "int8_weight_mlp_residual",
+        lambda hidden, *args, **kwargs: calls.append("int8_mlp") or hidden,
+    )
     from osuT5.osuT5.inference.optimized.scout import cross_attention
 
     monkeypatch.setattr(cross_attention, "cross_attention_split", split8)
@@ -99,6 +113,8 @@ def _exercise(monkeypatch, mode: str) -> tuple[dict[str, int], list[str]]:
         "weight_only_mlp_tail": 0,
         "q1_bmm_cross_attention": 0,
     }
+    if int8_mlp:
+        counts["int8_weight_mlp_tail"] = 0
     output = weight_only_runtime._cross_mlp_tail_forward(
         state=state,
         module=module,
@@ -138,6 +154,31 @@ def test_split8_cross_retains_fp32_projections_and_replaces_only_attention(
         "q1_bmm_cross_attention": 0,
         "split8_q1_cross_attention_candidate": 1,
     }
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_cross_calls"),
+    (
+        (
+            weight_only_runtime.CROSS_FP16_PACKED,
+            ["packed_q", "accepted_bmm", "packed_out"],
+        ),
+        (
+            weight_only_runtime.CROSS_SPLIT8,
+            ["native_q", "split8", "native_out"],
+        ),
+    ),
+)
+def test_each_cross_mode_preserves_the_int8_mlp_overlay(
+    monkeypatch,
+    mode,
+    expected_cross_calls,
+) -> None:
+    counts, calls = _exercise(monkeypatch, mode, int8_mlp=True)
+
+    assert calls == expected_cross_calls + ["int8_mlp"]
+    assert counts["weight_only_mlp_tail"] == 1
+    assert counts["int8_weight_mlp_tail"] == 1
 
 
 @pytest.mark.parametrize("mode", ["bad", "", None])
