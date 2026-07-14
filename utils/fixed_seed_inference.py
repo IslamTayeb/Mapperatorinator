@@ -47,7 +47,6 @@ def rng_state_fingerprints() -> dict[str, str]:
 @contextmanager
 def fixed_seed_processor_generation(inference_module, *, base_seed: int) -> Iterator[None]:
     """Reset RNG at each named generation stage and restore the class method."""
-
     processor = inference_module.Processor
     original_generate = processor.generate
 
@@ -78,3 +77,12 @@ def fixed_seed_processor_generation(inference_module, *, base_seed: int) -> Iter
         yield
     finally:
         processor.generate = original_generate
+
+
+__all__ = [
+    "SEED_POLICY_VERSION",
+    "fixed_seed_processor_generation",
+    "reset_rng",
+    "rng_state_fingerprints",
+    "stage_seed",
+]
