@@ -14,7 +14,7 @@ from osuT5.osuT5.inference.audio_preparation import (
     resolve_audio_samples,
     validate_preloaded_audio,
 )
-from osuT5.osuT5.inference.optimized.scout.audio_model_overlap import (
+from osuT5.osuT5.inference.optimized.audio_model_overlap_scout import (
     AudioPreparationTask,
 )
 from utils.profile_audio_model_overlap import (
@@ -130,7 +130,7 @@ def test_scout_import_keeps_native_extensions_cold_and_quiet() -> None:
                 "stdout=io.StringIO()",
                 "stderr=io.StringIO()",
                 "with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):",
-                "    import osuT5.osuT5.inference.optimized.scout.audio_model_overlap",
+                "    import osuT5.osuT5.inference.optimized.audio_model_overlap_scout",
                 "assert stdout.getvalue()==''",
                 "assert stderr.getvalue()==''",
                 "assert 'osuT5.osuT5.inference.optimized.kernels.q1_attention' not in sys.modules",
