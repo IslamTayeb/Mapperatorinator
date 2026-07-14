@@ -29,6 +29,8 @@ REQUIRE_K4_CANDIDATE=${REQUIRE_K4_CANDIDATE:-false}
 REQUIRE_SHARED_ROPE_INCREMENTAL=${REQUIRE_SHARED_ROPE_INCREMENTAL:-false}
 REQUIRE_K1_REMAINDER_INCREMENTAL=${REQUIRE_K1_REMAINDER_INCREMENTAL:-false}
 REQUIRE_INT8_MLP_INCREMENTAL=${REQUIRE_INT8_MLP_INCREMENTAL:-false}
+REQUIRE_CROSS_INCREMENTAL=${REQUIRE_CROSS_INCREMENTAL:-false}
+CROSS_CANDIDATE_MODE=${CROSS_CANDIDATE_MODE:-accepted}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_LABEL=${RUN_LABEL:-split-weight-full-song-reciprocal}
 RUN_ROOT="$WORK/runs/$RUN_LABEL-${SLURM_JOB_ID:-manual}"
@@ -37,6 +39,7 @@ EXTENSION_CACHE_ROOT_OVERRIDE=${EXTENSION_CACHE_ROOT_OVERRIDE:-}
 BASELINE_EXTENSION_KEY_OVERRIDE=${BASELINE_EXTENSION_KEY_OVERRIDE:-}
 CANDIDATE_EXTENSION_KEY_OVERRIDE=${CANDIDATE_EXTENSION_KEY_OVERRIDE:-}
 INT8_K1_COMPOSITION=false
+CROSS_K1_INT8_COMPOSITION=false
 
 if [[ "$BASELINE_COMMIT" != "$CANDIDATE_COMMIT" ]]; then
   echo "split+weight reciprocal requires one shared baseline/candidate commit" >&2
@@ -98,20 +101,45 @@ if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" != true \
   echo "REQUIRE_INT8_MLP_INCREMENTAL must be true or false" >&2
   exit 2
 fi
+if [[ "$REQUIRE_CROSS_INCREMENTAL" != true \
+  && "$REQUIRE_CROSS_INCREMENTAL" != false ]]; then
+  echo "REQUIRE_CROSS_INCREMENTAL must be true or false" >&2
+  exit 2
+fi
 enabled_incremental_modes=0
 for enabled in \
   "$REQUIRE_SHARED_ROPE_INCREMENTAL" \
   "$REQUIRE_K1_REMAINDER_INCREMENTAL" \
-  "$REQUIRE_INT8_MLP_INCREMENTAL"; do
+  "$REQUIRE_INT8_MLP_INCREMENTAL" \
+  "$REQUIRE_CROSS_INCREMENTAL"; do
   if [[ "$enabled" == true ]]; then
     enabled_incremental_modes=$((enabled_incremental_modes + 1))
   fi
 done
 if (( enabled_incremental_modes > 1 )); then
-  echo "shared-RoPE, K1-remainder, and INT8 MLP gates are mutually exclusive" >&2
+  echo "shared-RoPE, K1-remainder, INT8 MLP, and cross gates are mutually exclusive" >&2
   exit 2
 fi
-if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
+  if [[ "$REQUIRE_K4_CANDIDATE" != true || "$REQUIRE_EXACT_TIMING" != true ]]; then
+    echo "cross incremental gate requires K4 and exact timing" >&2
+    exit 2
+  fi
+  if [[ "$BASELINE_RUNNER" \
+      != utils/run_k4_shared_rope_k1_remainder_int8_mlp_weight_only.py ]]; then
+    echo "cross incremental gate requires the K1+INT8 composition control" >&2
+    exit 2
+  fi
+  case "$CROSS_CANDIDATE_MODE:$CANDIDATE_RUNNER" in
+    fp16_packed_projections:utils/run_k4_shared_rope_fp16_cross.py) ;;
+    split8_attention:utils/run_k4_shared_rope_split8_cross.py) ;;
+    *)
+      echo "cross candidate mode/runner pairing is invalid" >&2
+      exit 2
+      ;;
+  esac
+  CROSS_K1_INT8_COMPOSITION=true
+elif [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then
   if [[ "$REQUIRE_K4_CANDIDATE" != true || "$REQUIRE_EXACT_TIMING" != true ]]; then
     echo "INT8 MLP gate requires K4 and exact timing" >&2
     exit 2
@@ -336,6 +364,9 @@ echo "require_shared_rope_incremental=$REQUIRE_SHARED_ROPE_INCREMENTAL"
 echo "require_k1_remainder_incremental=$REQUIRE_K1_REMAINDER_INCREMENTAL"
 echo "require_int8_mlp_incremental=$REQUIRE_INT8_MLP_INCREMENTAL"
 echo "int8_k1_composition=$INT8_K1_COMPOSITION"
+echo "require_cross_incremental=$REQUIRE_CROSS_INCREMENTAL"
+echo "cross_candidate_mode=$CROSS_CANDIDATE_MODE"
+echo "cross_k1_int8_composition=$CROSS_K1_INT8_COMPOSITION"
 echo "audio=$AUDIO"
 echo "run_root=$RUN_ROOT"
 echo "extension_cache_mode=$EXTENSION_CACHE_MODE"
@@ -525,16 +556,22 @@ run_profile() {
   if [[ "$runtime_candidate" == 1 ]]; then
     validation_role=candidate
   fi
+  local validation_cross_mode=accepted
+  if [[ "$REQUIRE_CROSS_INCREMENTAL" == true && "$candidate" == 1 ]]; then
+    validation_cross_mode=$CROSS_CANDIDATE_MODE
+  fi
   (
     cd "$CANDIDATE_REPO"
     "$PYTHON" utils/validate_weight_only_full_song_profile.py \
       --profile "$profile" \
       --role "$validation_role" \
+      --cross-mode "$validation_cross_mode" \
       > "$RUN_ROOT/$role.weight-only-validation.json"
   )
-  if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then
+  if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true \
+    || "$CROSS_K1_INT8_COMPOSITION" == true ]]; then
     local int8_validation_role=baseline
-    if [[ "$candidate" == 1 ]]; then
+    if [[ "$candidate" == 1 || "$CROSS_K1_INT8_COMPOSITION" == true ]]; then
       int8_validation_role=candidate
     fi
     (
@@ -558,9 +595,12 @@ run_profile() {
       > "$RUN_ROOT/$role.k4-validation.json"
   )
   if [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true \
-    || "$INT8_K1_COMPOSITION" == true ]]; then
+    || "$INT8_K1_COMPOSITION" == true \
+    || "$CROSS_K1_INT8_COMPOSITION" == true ]]; then
     local remainder_role=control
-    if [[ "$candidate" == 1 || "$INT8_K1_COMPOSITION" == true ]]; then
+    if [[ "$candidate" == 1 \
+      || "$INT8_K1_COMPOSITION" == true \
+      || "$CROSS_K1_INT8_COMPOSITION" == true ]]; then
       remainder_role=candidate
     fi
     (
@@ -683,14 +723,18 @@ PY
 INITIALIZATION_ROLES=candidate_first,candidate_second
 if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
   || "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true \
-  || "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then
+  || "$REQUIRE_INT8_MLP_INCREMENTAL" == true \
+  || "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
   INITIALIZATION_ROLES=baseline_first,candidate_first,candidate_second,baseline_second
 fi
 "$PYTHON" - "$RUN_ROOT" "$INITIALIZATION_ROLES" \
   "$REQUIRE_SHARED_ROPE_INCREMENTAL" \
   "$REQUIRE_K1_REMAINDER_INCREMENTAL" \
   "$REQUIRE_INT8_MLP_INCREMENTAL" \
-  "$INT8_K1_COMPOSITION" <<'PY'
+  "$INT8_K1_COMPOSITION" \
+  "$REQUIRE_CROSS_INCREMENTAL" \
+  "$CROSS_CANDIDATE_MODE" \
+  "$CROSS_K1_INT8_COMPOSITION" <<'PY'
 import json
 import math
 import statistics
@@ -703,6 +747,9 @@ require_shared_rope = sys.argv[3] == "true"
 shared_rope_both_arms = sys.argv[4] == "true" or sys.argv[5] == "true"
 require_int8_mlp = sys.argv[5] == "true"
 int8_k1_composition = sys.argv[6] == "true"
+require_cross = sys.argv[7] == "true"
+cross_mode = sys.argv[8]
+cross_k1_int8_composition = sys.argv[9] == "true"
 runs = {}
 required_numbers = (
     "initialization_wall_seconds",
@@ -747,7 +794,7 @@ for role in roles:
             raise SystemExit(f"{role}: invalid initialization memory field {key}")
     runs[role] = payload
 
-if require_shared_rope or shared_rope_both_arms:
+if require_shared_rope or shared_rope_both_arms or require_cross:
     shared_roles = roles if shared_rope_both_arms else (
         "candidate_first",
         "candidate_second",
@@ -797,6 +844,37 @@ if require_int8_mlp:
         if runs[role].get("combined_runtime") != expected_runtime:
             raise SystemExit(f"{role}: INT8 K1 composition identity is wrong")
 
+if require_cross:
+    if not cross_k1_int8_composition:
+        raise SystemExit("cross gate did not declare K1+INT8 composition ownership")
+    for role in roles:
+        overlay = runs[role].get("int8_mlp_overlay")
+        if not isinstance(overlay, dict):
+            raise SystemExit(f"{role}: missing INT8 MLP composition evidence")
+        if overlay.get("dispatch_counter") != "int8_weight_mlp_tail":
+            raise SystemExit(f"{role}: INT8 MLP dispatch ownership is wrong")
+        cross = runs[role].get("cross_candidate")
+        if not isinstance(cross, dict):
+            raise SystemExit(f"{role}: missing cross candidate metadata")
+        expected_mode = cross_mode if role.startswith("candidate") else "accepted"
+        if cross.get("mode") != expected_mode:
+            raise SystemExit(
+                f"{role}: expected cross mode {expected_mode}, got {cross.get('mode')}"
+            )
+        expected_runtime = (
+            "k4-split-kv-mixed-weight-shared-rope-k1-remainder-int8-mlp-v1"
+            if role.startswith("baseline")
+            else f"k4-split-kv-mixed-weight-shared-rope-k1-remainder-int8-mlp-{cross_mode}-v1"
+        )
+        if runs[role].get("combined_runtime") != expected_runtime:
+            raise SystemExit(f"{role}: cross composition identity is wrong")
+        runtime = runs[role].get("cross_runtime")
+        if role.startswith("candidate"):
+            if not isinstance(runtime, dict) or runtime.get("mode") != cross_mode:
+                raise SystemExit(f"{role}: missing cross runtime evidence")
+        elif runtime is not None:
+            raise SystemExit(f"{role}: control unexpectedly contains cross runtime")
+
 summary = {
     "schema_version": 1,
     "result_class": "documented-drift",
@@ -827,7 +905,29 @@ ANALYSIS_DISPATCH_ARGS=(
   --allow-optional-dispatch-delta
     'records.main_generation[[]*].optimized_cuda_graphs.*'
 )
-if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
+  ANALYSIS_EXACT_ARGS=(
+    --require-exact-label timing_context
+    --require-exact-dispatch-label timing_context
+  )
+  if [[ "$CROSS_CANDIDATE_MODE" == split8_attention ]]; then
+    ANALYSIS_EXACT_ARGS+=(--require-exact-label main_generation)
+  fi
+  ANALYSIS_DISPATCH_ARGS=(
+    --allow-dispatch-delta
+      'records.main_generation[[]*].optimized_dispatch_capture_hits'
+    --allow-dispatch-delta
+      'records.main_generation[[]*].optimized_dispatch_capture_hits.q1_bmm_cross_attention'
+    --allow-optional-dispatch-delta
+      'records.main_generation[[]*].optimized_dispatch_capture_hits.fp16_packed_cross_projection_candidate'
+    --allow-optional-dispatch-delta
+      'records.main_generation[[]*].optimized_dispatch_capture_hits.split8_q1_cross_attention_candidate'
+    --allow-optional-dispatch-delta
+      'records.main_generation[[]*].optimized_dispatch_capture_hits.*'
+    --allow-optional-dispatch-delta
+      'records.main_generation[[]*].optimized_cuda_graphs.*'
+  )
+elif [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then
   # Both arms already own K4, split-KV, mixed weights, shared RoPE, and captured K1
   # remainders. The candidate replaces the single mixed MLP hook with INT8;
   # token-dependent graph counts may therefore differ in main generation.
@@ -919,7 +1019,8 @@ for artifact in \
   fi
 done
 if [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true \
-  || "$INT8_K1_COMPOSITION" == true ]]; then
+  || "$INT8_K1_COMPOSITION" == true \
+  || "$CROSS_K1_INT8_COMPOSITION" == true ]]; then
   for role in baseline_first candidate_first candidate_second baseline_second; do
     artifact="$RUN_ROOT/$role.k1-remainder-validation.json"
     if [[ ! -s "$artifact" ]]; then
@@ -928,7 +1029,8 @@ if [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true \
     fi
   done
 fi
-if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true \
+  || "$CROSS_K1_INT8_COMPOSITION" == true ]]; then
   for role in baseline_first candidate_first candidate_second baseline_second; do
     artifact="$RUN_ROOT/$role.int8-mlp-validation.json"
     if [[ ! -s "$artifact" ]]; then
@@ -938,7 +1040,8 @@ if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then
   done
 fi
 if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
-  || "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then
+  || "$REQUIRE_INT8_MLP_INCREMENTAL" == true \
+  || "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
   for artifact in \
     "$RUN_ROOT/candidate-initialization/baseline_first.json" \
     "$RUN_ROOT/candidate-initialization/baseline_second.json"; do
@@ -952,7 +1055,9 @@ fi
 grep -q "^mode=$ANALYSIS_MODE$" "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q "^parity.claim=$ANALYSIS_CLAIM$" "$RUN_ROOT/reciprocal-analysis.txt"
 if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
-  || "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true ]]; then
+  || "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true \
+  || ( "$REQUIRE_CROSS_INCREMENTAL" == true \
+    && "$CROSS_CANDIDATE_MODE" == split8_attention ) ]]; then
   grep -q '^parity.cross_candidate_exact=true$' \
     "$RUN_ROOT/reciprocal-analysis.txt"
 fi
@@ -965,6 +1070,12 @@ if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
   EXPECTED_EXACT_DISPATCH_LABELS=$EXPECTED_EXACT_LABELS
 elif [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true ]]; then
   EXPECTED_EXACT_LABELS=timing_context,main_generation
+elif [[ "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
+  EXPECTED_EXACT_LABELS=timing_context
+  EXPECTED_EXACT_DISPATCH_LABELS=timing_context
+  if [[ "$CROSS_CANDIDATE_MODE" == split8_attention ]]; then
+    EXPECTED_EXACT_LABELS=timing_context,main_generation
+  fi
 elif [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then
   EXPECTED_EXACT_LABELS=timing_context
   EXPECTED_EXACT_DISPATCH_LABELS=$EXPECTED_EXACT_LABELS

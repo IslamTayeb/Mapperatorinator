@@ -23,6 +23,15 @@ FP16_WEIGHT_REGIONS = (
     "final_logits",
 )
 FP32_SELECTED_DECODE_MATRIX_REGIONS = ("cross_query", "cross_output")
+CROSS_MODES = (
+    "accepted",
+    "fp16_packed_projections",
+    "split8_attention",
+)
+CROSS_DISPATCHES = (
+    "fp16_packed_cross_projection_candidate",
+    "split8_q1_cross_attention_candidate",
+)
 SPLIT_KV_DISPATCH = "native_q1_rope_cache_self_attention_split_kv_8"
 SPLIT_KV_PREFIX = f"{SPLIT_KV_DISPATCH}_prefix_"
 SPLIT_KV_PREFIXES = frozenset(range(192, 833, 64))
@@ -40,17 +49,27 @@ def _object(value: Any, *, name: str) -> dict[str, Any]:
     return value
 
 
-def _metadata(value: Any, *, name: str) -> dict[str, Any]:
+def _metadata(
+    value: Any,
+    *,
+    name: str,
+    cross_mode: str = "accepted",
+) -> dict[str, Any]:
     metadata = _object(value, name=name)
+    if cross_mode not in CROSS_MODES:
+        raise WeightOnlyProfileError(f"cross_mode must be one of {CROSS_MODES}")
+    fp16_regions = list(FP16_WEIGHT_REGIONS)
+    fp32_regions = list(FP32_SELECTED_DECODE_MATRIX_REGIONS)
+    if cross_mode == "fp16_packed_projections":
+        fp16_regions.extend(FP32_SELECTED_DECODE_MATRIX_REGIONS)
+        fp32_regions = []
     required = {
         "version": WEIGHT_ONLY_METADATA_VERSION,
         "result_class": "documented-drift",
         "exactness_claim": False,
         "fp32_activations_caches_reductions_logits": True,
-        "fp16_weight_regions": list(FP16_WEIGHT_REGIONS),
-        "fp32_selected_decode_matrix_regions": list(
-            FP32_SELECTED_DECODE_MATRIX_REGIONS
-        ),
+        "fp16_weight_regions": fp16_regions,
+        "fp32_selected_decode_matrix_regions": fp32_regions,
     }
     failures = {
         key: {"expected": expected, "actual": metadata.get(key)}
@@ -65,6 +84,48 @@ def _metadata(value: Any, *, name: str) -> dict[str, Any]:
     if failures:
         raise WeightOnlyProfileError(
             f"{name} has invalid mixed-weight metadata: {failures}"
+        )
+    cross = _object(metadata.get("cross_candidate"), name=f"{name}.cross_candidate")
+    common_cross = {
+        "mode": cross_mode,
+        "scope": "main-model-only",
+        "attention_accumulation": "fp32",
+        "production_selector_unchanged": True,
+    }
+    cross_failures = {
+        key: {"expected": expected, "actual": cross.get(key)}
+        for key, expected in common_cross.items()
+        if cross.get(key) != expected
+    }
+    if cross_mode == "accepted":
+        expected_specific = {
+            "result_class": "control",
+            "exactness_claim": False,
+            "accepted_q1_bmm": True,
+        }
+    elif cross_mode == "fp16_packed_projections":
+        expected_specific = {
+            "result_class": "documented-drift",
+            "exactness_claim": False,
+            "packed_projection_weights": True,
+        }
+    else:
+        expected_specific = {
+            "result_class": "exactness-required",
+            "exactness_claim": True,
+            "split_count": 8,
+            "fp32_query_kv_output": True,
+        }
+    cross_failures.update(
+        {
+            key: {"expected": expected, "actual": cross.get(key)}
+            for key, expected in expected_specific.items()
+            if cross.get(key) != expected
+        }
+    )
+    if cross_failures:
+        raise WeightOnlyProfileError(
+            f"{name} has invalid cross candidate metadata: {cross_failures}"
         )
     return metadata
 
@@ -133,7 +194,12 @@ def _effective_self_attention_counts(
     }
 
 
-def validate_profile(payload: Any, *, role: str) -> dict[str, Any]:
+def validate_profile(
+    payload: Any,
+    *,
+    role: str,
+    cross_mode: str = "accepted",
+) -> dict[str, Any]:
     if role not in PROFILE_ROLES:
         raise WeightOnlyProfileError(f"role must be one of {PROFILE_ROLES}")
     root = _object(payload, name="profile")
@@ -147,6 +213,7 @@ def validate_profile(payload: Any, *, role: str) -> dict[str, Any]:
         _metadata(
             top_metadata.get("optimized_approximate_weight_only"),
             name="profile.metadata.optimized_approximate_weight_only",
+            cross_mode=cross_mode,
         )
     elif "optimized_approximate_weight_only" in top_metadata:
         raise WeightOnlyProfileError(
@@ -167,6 +234,7 @@ def validate_profile(payload: Any, *, role: str) -> dict[str, Any]:
         raise WeightOnlyProfileError(f"profile is missing generation labels: {missing}")
 
     totals = {key: 0 for key in WEIGHT_ONLY_DISPATCHES}
+    cross_totals = {key: 0 for key in CROSS_DISPATCHES}
     baseline_main_dispatch_totals = {
         "q1_bmm_cross_attention": 0,
         "native_cross_mlp_tail": 0,
@@ -329,12 +397,47 @@ def validate_profile(payload: Any, *, role: str) -> dict[str, Any]:
                     raise WeightOnlyProfileError(
                         f"{name} native q1 count does not match weight-owned self-attention"
                     )
-                if (
-                    raw_hits.get("q1_bmm_cross_attention")
-                    != counts["weight_only_mlp_tail"]
+                expected_tail_count = counts["weight_only_mlp_tail"]
+                cross_counts = {
+                    key: raw_hits.get(key, 0) for key in CROSS_DISPATCHES
+                }
+                if any(
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < 0
+                    for value in cross_counts.values()
                 ):
                     raise WeightOnlyProfileError(
-                        f"{name} q1 BMM count does not match weight-owned MLP tail"
+                        f"{name} contains invalid cross candidate counters"
+                    )
+                for key, value in cross_counts.items():
+                    cross_totals[key] += value
+                q1_bmm = raw_hits.get("q1_bmm_cross_attention", 0)
+                if isinstance(q1_bmm, bool) or not isinstance(q1_bmm, int):
+                    raise WeightOnlyProfileError(
+                        f"{name}.hits.q1_bmm_cross_attention must be an integer"
+                    )
+                expected = {
+                    "accepted": (expected_tail_count, 0, 0),
+                    "fp16_packed_projections": (
+                        expected_tail_count,
+                        expected_tail_count,
+                        0,
+                    ),
+                    "split8_attention": (0, 0, expected_tail_count),
+                }[cross_mode]
+                actual = (
+                    q1_bmm,
+                    cross_counts["fp16_packed_cross_projection_candidate"],
+                    cross_counts["split8_q1_cross_attention_candidate"],
+                )
+                if actual != expected:
+                    if cross_mode == "accepted":
+                        raise WeightOnlyProfileError(
+                            f"{name} q1 BMM count does not match weight-owned MLP tail"
+                        )
+                    raise WeightOnlyProfileError(
+                        f"{name} cross dispatch tuple must be {expected}, got {actual}"
                     )
             else:
                 for key in (
@@ -405,9 +508,11 @@ def validate_profile(payload: Any, *, role: str) -> dict[str, Any]:
         main_effective["accepted_fallback"] = accepted_fallback
     return {
         "role": role,
+        "cross_mode": cross_mode,
         "candidate_enabled_for_main": candidate,
         "candidate_disabled_for_timing": candidate,
         "main_weight_only_dispatch_counts": totals,
+        "main_cross_candidate_dispatch_counts": cross_totals,
         "baseline_main_dispatch_counts": baseline_main_dispatch_totals,
         "timing_effective_self_attention_counts": effective_self_attention_totals[
             "timing_context"
@@ -416,20 +521,30 @@ def validate_profile(payload: Any, *, role: str) -> dict[str, Any]:
     }
 
 
-def validate_profile_path(path: Path, *, role: str) -> dict[str, Any]:
+def validate_profile_path(
+    path: Path,
+    *,
+    role: str,
+    cross_mode: str = "accepted",
+) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise WeightOnlyProfileError(f"cannot read profile {path}: {exc}") from exc
-    return validate_profile(payload, role=role)
+    return validate_profile(payload, role=role, cross_mode=cross_mode)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", type=Path, required=True)
     parser.add_argument("--role", choices=PROFILE_ROLES, required=True)
+    parser.add_argument("--cross-mode", choices=CROSS_MODES, default="accepted")
     args = parser.parse_args()
-    result = validate_profile_path(args.profile, role=args.role)
+    result = validate_profile_path(
+        args.profile,
+        role=args.role,
+        cross_mode=args.cross_mode,
+    )
     print(json.dumps(result, sort_keys=True))
 
 

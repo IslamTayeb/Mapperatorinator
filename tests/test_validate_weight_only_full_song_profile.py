@@ -24,6 +24,15 @@ def _metadata() -> dict:
             "final_logits",
         ],
         "fp32_selected_decode_matrix_regions": ["cross_query", "cross_output"],
+        "cross_candidate": {
+            "mode": "accepted",
+            "scope": "main-model-only",
+            "attention_accumulation": "fp32",
+            "production_selector_unchanged": True,
+            "result_class": "control",
+            "exactness_claim": False,
+            "accepted_q1_bmm": True,
+        },
     }
 
 
@@ -122,6 +131,48 @@ def _profile(*, candidate: bool) -> dict:
     }
 
 
+def _cross_profile(mode: str) -> dict:
+    profile = _profile(candidate=True)
+    metadata = profile["metadata"]["optimized_approximate_weight_only"]
+    cross = metadata["cross_candidate"]
+    hits = profile["generation"][1]["optimized_dispatch_capture_hits"]
+    if mode == "fp16_packed_projections":
+        metadata["fp16_weight_regions"].extend(("cross_query", "cross_output"))
+        metadata["fp32_selected_decode_matrix_regions"] = []
+        cross.clear()
+        cross.update(
+            {
+                "mode": mode,
+                "scope": "main-model-only",
+                "attention_accumulation": "fp32",
+                "production_selector_unchanged": True,
+                "result_class": "documented-drift",
+                "exactness_claim": False,
+                "packed_projection_weights": True,
+            }
+        )
+        hits["fp16_packed_cross_projection_candidate"] = 12
+    elif mode == "split8_attention":
+        cross.clear()
+        cross.update(
+            {
+                "mode": mode,
+                "scope": "main-model-only",
+                "attention_accumulation": "fp32",
+                "production_selector_unchanged": True,
+                "result_class": "exactness-required",
+                "exactness_claim": True,
+                "split_count": 8,
+                "fp32_query_kv_output": True,
+            }
+        )
+        hits["q1_bmm_cross_attention"] = 0
+        hits["split8_q1_cross_attention_candidate"] = 12
+    else:
+        raise AssertionError(mode)
+    return profile
+
+
 def test_candidate_requires_enabled_main_and_disabled_timing_dispatch() -> None:
     report = validate_profile(_profile(candidate=True), role="candidate")
 
@@ -143,6 +194,48 @@ def test_candidate_requires_enabled_main_and_disabled_timing_dispatch() -> None:
         "split_kv_prefix_counts": {192: 3, 640: 7},
         "accepted_fallback": 2,
     }
+
+
+@pytest.mark.parametrize(
+    ("mode", "dispatch"),
+    (
+        (
+            "fp16_packed_projections",
+            {
+                "fp16_packed_cross_projection_candidate": 12,
+                "split8_q1_cross_attention_candidate": 0,
+            },
+        ),
+        (
+            "split8_attention",
+            {
+                "fp16_packed_cross_projection_candidate": 0,
+                "split8_q1_cross_attention_candidate": 12,
+            },
+        ),
+    ),
+)
+def test_cross_candidate_modes_require_truthful_metadata_and_dispatch(
+    mode,
+    dispatch,
+) -> None:
+    report = validate_profile(
+        _cross_profile(mode),
+        role="candidate",
+        cross_mode=mode,
+    )
+
+    assert report["cross_mode"] == mode
+    assert report["main_cross_candidate_dispatch_counts"] == dispatch
+
+
+def test_cross_candidate_mode_mismatch_fails_loudly() -> None:
+    with pytest.raises(WeightOnlyProfileError, match="invalid mixed-weight metadata"):
+        validate_profile(
+            _cross_profile("fp16_packed_projections"),
+            role="candidate",
+            cross_mode="split8_attention",
+        )
 
 
 def test_candidate_rejects_zero_main_or_nonzero_timing_dispatch() -> None:
