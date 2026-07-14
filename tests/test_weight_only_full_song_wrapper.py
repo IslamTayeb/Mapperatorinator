@@ -65,6 +65,49 @@ def test_wrapper_isolates_native_extensions_and_keeps_compiler_caches_per_run() 
     assert 'export TRITON_CACHE_DIR="$compiler_cache/triton"' in source
 
 
+def test_wrapper_can_reuse_only_exact_commit_keyed_extension_caches() -> None:
+    source = WRAPPER.read_text(encoding="utf-8")
+
+    assert "EXTENSION_CACHE_ROOT_OVERRIDE=${EXTENSION_CACHE_ROOT_OVERRIDE:-}" in source
+    assert "BASELINE_EXTENSION_KEY_OVERRIDE=${BASELINE_EXTENSION_KEY_OVERRIDE:-}" in source
+    assert "CANDIDATE_EXTENSION_KEY_OVERRIDE=${CANDIDATE_EXTENSION_KEY_OVERRIDE:-}" in source
+    assert 'EXTENSION_CACHE_MODE=existing_override' in source
+    assert 'EXTENSION_JOB_ROOT=$(realpath -e "$EXTENSION_CACHE_ROOT_OVERRIDE")' in source
+    assert (
+        '[[ "$BASELINE_EXTENSION_KEY_OVERRIDE" != "$BASELINE_EXTENSION_KEY" ]]'
+        in source
+    )
+    assert (
+        '[[ "$CANDIDATE_EXTENSION_KEY_OVERRIDE" != "$CANDIDATE_EXTENSION_KEY" ]]'
+        in source
+    )
+    assert "native extension cache path/commit pairing is not exact" in source
+
+
+def test_baseline_extensions_preload_before_each_measured_baseline() -> None:
+    source = WRAPPER.read_text(encoding="utf-8")
+
+    first_preload = source.index("preload_baseline_extensions baseline_first")
+    first_run = source.index("run_profile baseline_first")
+    second_preload = source.index("preload_baseline_extensions baseline_second")
+    second_run = source.index("run_profile baseline_second")
+    assert first_preload < first_run
+    assert second_preload < second_run
+    assert source.count("preload_native_q1_attention()") == 1
+    assert source.count("preload_native_decoder_layer()") == 1
+    assert 'export TORCH_EXTENSIONS_DIR="$BASELINE_TORCH_EXTENSIONS_DIR"' in source
+
+    for artifact in (
+        "baseline-extension-setup/baseline_first.json",
+        "baseline-extension-setup/baseline_second.json",
+        "baseline-extension-setup-summary.json",
+    ):
+        assert artifact in source
+    assert '"wall_seconds": wall_seconds' in source
+    assert '"cuda_memory": {' in source
+    assert '"wall_seconds": statistics.median(' in source
+
+
 def test_wrapper_requires_initialization_evidence_and_relaxed_analyzer_outputs() -> None:
     source = WRAPPER.read_text(encoding="utf-8")
 

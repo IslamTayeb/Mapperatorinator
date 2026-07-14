@@ -26,6 +26,9 @@ AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_LABEL=${RUN_LABEL:-weight-only-full-song-reciprocal}
 RUN_ROOT="$WORK/runs/$RUN_LABEL-${SLURM_JOB_ID:-manual}"
 EXTENSION_JOB_KEY=${SLURM_JOB_ID:-manual}
+EXTENSION_CACHE_ROOT_OVERRIDE=${EXTENSION_CACHE_ROOT_OVERRIDE:-}
+BASELINE_EXTENSION_KEY_OVERRIDE=${BASELINE_EXTENSION_KEY_OVERRIDE:-}
+CANDIDATE_EXTENSION_KEY_OVERRIDE=${CANDIDATE_EXTENSION_KEY_OVERRIDE:-}
 
 if [[ "$PROFILE_CONFIG" != profile_salvalai ]]; then
   echo "full-song reciprocal requires PROFILE_CONFIG=profile_salvalai" >&2
@@ -50,9 +53,56 @@ if [[ "$BASELINE_COMMIT" != "$CANDIDATE_COMMIT" ]] \
   echo "distinct commits sanitize to the same native extension key" >&2
   exit 2
 fi
-EXTENSION_JOB_ROOT="$WORK/torch_extensions/reciprocal-$EXTENSION_JOB_KEY"
+if [[ -z "$EXTENSION_CACHE_ROOT_OVERRIDE" ]]; then
+  if [[ -n "$BASELINE_EXTENSION_KEY_OVERRIDE" || -n "$CANDIDATE_EXTENSION_KEY_OVERRIDE" ]]; then
+    echo "extension key overrides require EXTENSION_CACHE_ROOT_OVERRIDE" >&2
+    exit 2
+  fi
+  EXTENSION_CACHE_MODE=job_local
+  EXTENSION_JOB_ROOT="$WORK/torch_extensions/reciprocal-$EXTENSION_JOB_KEY"
+else
+  if [[ "$EXTENSION_CACHE_ROOT_OVERRIDE" != /* ]]; then
+    echo "EXTENSION_CACHE_ROOT_OVERRIDE must be absolute" >&2
+    exit 2
+  fi
+  if [[ -z "$BASELINE_EXTENSION_KEY_OVERRIDE" || -z "$CANDIDATE_EXTENSION_KEY_OVERRIDE" ]]; then
+    echo "existing extension cache reuse requires both commit key overrides" >&2
+    exit 2
+  fi
+  if [[ "$BASELINE_EXTENSION_KEY_OVERRIDE" != "$BASELINE_EXTENSION_KEY" ]]; then
+    echo "baseline extension key override does not match BASELINE_COMMIT" >&2
+    exit 2
+  fi
+  if [[ "$CANDIDATE_EXTENSION_KEY_OVERRIDE" != "$CANDIDATE_EXTENSION_KEY" ]]; then
+    echo "candidate extension key override does not match CANDIDATE_COMMIT" >&2
+    exit 2
+  fi
+  if [[ ! -d "$EXTENSION_CACHE_ROOT_OVERRIDE" ]]; then
+    echo "existing extension cache root does not exist" >&2
+    exit 2
+  fi
+  EXTENSION_CACHE_MODE=existing_override
+  EXTENSION_JOB_ROOT=$(realpath -e "$EXTENSION_CACHE_ROOT_OVERRIDE")
+fi
 BASELINE_TORCH_EXTENSIONS_DIR="$EXTENSION_JOB_ROOT/$BASELINE_EXTENSION_KEY"
 CANDIDATE_TORCH_EXTENSIONS_DIR="$EXTENSION_JOB_ROOT/$CANDIDATE_EXTENSION_KEY"
+if [[ "$EXTENSION_CACHE_MODE" == existing_override ]]; then
+  for pair in \
+    "$BASELINE_TORCH_EXTENSIONS_DIR:$BASELINE_EXTENSION_KEY" \
+    "$CANDIDATE_TORCH_EXTENSIONS_DIR:$CANDIDATE_EXTENSION_KEY"; do
+    extension_dir=${pair%%:*}
+    expected_key=${pair##*:}
+    if [[ ! -d "$extension_dir" ]]; then
+      echo "missing existing native extension cache for commit key $expected_key" >&2
+      exit 2
+    fi
+    resolved_extension_dir=$(realpath -e "$extension_dir")
+    if [[ "$resolved_extension_dir" != "$EXTENSION_JOB_ROOT/$expected_key" ]]; then
+      echo "native extension cache path/commit pairing is not exact" >&2
+      exit 2
+    fi
+  done
+fi
 
 validate_repo() {
   local repo=$1
@@ -111,7 +161,7 @@ done
 
 mkdir -p "$WORK/logs" "$WORK/tmp" "$WORK/cache" \
   "$BASELINE_TORCH_EXTENSIONS_DIR" "$CANDIDATE_TORCH_EXTENSIONS_DIR" \
-  "$RUN_ROOT/candidate-initialization"
+  "$RUN_ROOT/candidate-initialization" "$RUN_ROOT/baseline-extension-setup"
 export XDG_CACHE_HOME="$WORK/cache"
 export HF_HOME="$WORK/cache/huggingface"
 export TRANSFORMERS_CACHE="$WORK/cache/huggingface"
@@ -130,6 +180,7 @@ echo "candidate_remote_ref=$CANDIDATE_REMOTE_REF"
 echo "profile_config=$PROFILE_CONFIG"
 echo "audio=$AUDIO"
 echo "run_root=$RUN_ROOT"
+echo "extension_cache_mode=$EXTENSION_CACHE_MODE"
 echo "baseline_torch_extensions_dir=$BASELINE_TORCH_EXTENSIONS_DIR"
 echo "candidate_torch_extensions_dir=$CANDIDATE_TORCH_EXTENSIONS_DIR"
 echo "ffmpeg=$(command -v ffmpeg)"
@@ -172,6 +223,82 @@ COMMON_OVERRIDES=(
   profile_cuda_capture=false
   profile_pass_kind=untraced_control
 )
+
+preload_baseline_extensions() {
+  local role=$1
+  local output="$RUN_ROOT/baseline-extension-setup/$role.json"
+  if [[ -e "$output" ]]; then
+    echo "baseline extension setup evidence already exists for $role" >&2
+    exit 2
+  fi
+  (
+    export TORCH_EXTENSIONS_DIR="$BASELINE_TORCH_EXTENSIONS_DIR"
+    cd "$BASELINE_REPO"
+    "$PYTHON" - "$output" "$role" "$BASELINE_COMMIT" \
+      "$BASELINE_TORCH_EXTENSIONS_DIR" <<'PY'
+import json
+import math
+import sys
+import time
+from pathlib import Path
+
+import torch
+
+output, role, commit, extension_dir = sys.argv[1:]
+if not torch.cuda.is_available():
+    raise SystemExit("baseline native extension setup requires CUDA")
+torch.cuda.synchronize()
+allocated_before = int(torch.cuda.memory_allocated())
+reserved_before = int(torch.cuda.memory_reserved())
+peak_before = int(torch.cuda.max_memory_allocated())
+started = time.perf_counter()
+from osuT5.osuT5.inference.optimized.kernels.decoder_layer import (
+    preload_native_decoder_layer,
+)
+from osuT5.osuT5.inference.optimized.kernels.q1_attention import (
+    preload_native_q1_attention,
+)
+
+preload_native_q1_attention()
+preload_native_decoder_layer()
+torch.cuda.synchronize()
+finished = time.perf_counter()
+allocated_after = int(torch.cuda.memory_allocated())
+reserved_after = int(torch.cuda.memory_reserved())
+peak_after = int(torch.cuda.max_memory_allocated())
+wall_seconds = finished - started
+if not math.isfinite(wall_seconds) or wall_seconds < 0.0:
+    raise SystemExit("invalid baseline native extension setup wall")
+payload = {
+    "schema_version": 1,
+    "role": role,
+    "commit": commit,
+    "torch_extensions_dir": extension_dir,
+    "status": "preloaded",
+    "wall_seconds": wall_seconds,
+    "cuda_memory": {
+        "allocated_bytes_before": allocated_before,
+        "allocated_bytes_after": allocated_after,
+        "allocated_bytes_delta": allocated_after - allocated_before,
+        "reserved_bytes_before": reserved_before,
+        "reserved_bytes_after": reserved_after,
+        "reserved_bytes_delta": reserved_after - reserved_before,
+        "max_allocated_bytes_before": peak_before,
+        "max_allocated_bytes_after": peak_after,
+        "max_allocated_bytes_delta": peak_after - peak_before,
+    },
+}
+Path(output).write_text(
+    json.dumps(payload, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+PY
+  )
+  if [[ ! -s "$output" ]]; then
+    echo "missing baseline extension setup evidence for $role" >&2
+    exit 2
+  fi
+}
 
 run_profile() {
   local role=$1
@@ -228,15 +355,88 @@ run_profile() {
   printf '%s\n' "$profile" > "$RUN_ROOT/$role.profile-path.txt"
 }
 
+preload_baseline_extensions baseline_first
 run_profile baseline_first "$BASELINE_REPO" "$BASELINE_TORCH_EXTENSIONS_DIR" 0
 run_profile candidate_first "$CANDIDATE_REPO" "$CANDIDATE_TORCH_EXTENSIONS_DIR" 1
 run_profile candidate_second "$CANDIDATE_REPO" "$CANDIDATE_TORCH_EXTENSIONS_DIR" 1
+preload_baseline_extensions baseline_second
 run_profile baseline_second "$BASELINE_REPO" "$BASELINE_TORCH_EXTENSIONS_DIR" 0
 
 BASELINE_FIRST=$(<"$RUN_ROOT/baseline_first.profile-path.txt")
 CANDIDATE_FIRST=$(<"$RUN_ROOT/candidate_first.profile-path.txt")
 CANDIDATE_SECOND=$(<"$RUN_ROOT/candidate_second.profile-path.txt")
 BASELINE_SECOND=$(<"$RUN_ROOT/baseline_second.profile-path.txt")
+
+"$PYTHON" - "$RUN_ROOT" "$BASELINE_COMMIT" \
+  "$BASELINE_TORCH_EXTENSIONS_DIR" <<'PY'
+import json
+import math
+import statistics
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+expected_commit = sys.argv[2]
+expected_extension_dir = sys.argv[3]
+runs = {}
+memory_fields = (
+    "allocated_bytes_before",
+    "allocated_bytes_after",
+    "allocated_bytes_delta",
+    "reserved_bytes_before",
+    "reserved_bytes_after",
+    "reserved_bytes_delta",
+    "max_allocated_bytes_before",
+    "max_allocated_bytes_after",
+    "max_allocated_bytes_delta",
+)
+for role in ("baseline_first", "baseline_second"):
+    path = root / "baseline-extension-setup" / f"{role}.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("role") != role or payload.get("status") != "preloaded":
+        raise SystemExit(f"{role}: invalid baseline extension setup identity")
+    if payload.get("commit") != expected_commit:
+        raise SystemExit(f"{role}: baseline extension setup commit mismatch")
+    if payload.get("torch_extensions_dir") != expected_extension_dir:
+        raise SystemExit(f"{role}: baseline extension setup cache mismatch")
+    wall = payload.get("wall_seconds")
+    if (
+        isinstance(wall, bool)
+        or not isinstance(wall, (int, float))
+        or not math.isfinite(float(wall))
+        or float(wall) < 0.0
+    ):
+        raise SystemExit(f"{role}: invalid baseline extension setup wall")
+    memory = payload.get("cuda_memory")
+    if not isinstance(memory, dict):
+        raise SystemExit(f"{role}: missing baseline extension setup memory")
+    for key in memory_fields:
+        if isinstance(memory.get(key), bool) or not isinstance(memory.get(key), int):
+            raise SystemExit(f"{role}: invalid baseline setup memory field {key}")
+    runs[role] = payload
+
+summary = {
+    "schema_version": 1,
+    "commit": expected_commit,
+    "torch_extensions_dir": expected_extension_dir,
+    "runs": runs,
+    "medians": {
+        "wall_seconds": statistics.median(
+            float(payload["wall_seconds"]) for payload in runs.values()
+        ),
+        "cuda_memory": {
+            key: statistics.median(
+                int(payload["cuda_memory"][key]) for payload in runs.values()
+            )
+            for key in memory_fields
+        },
+    },
+}
+(root / "baseline-extension-setup-summary.json").write_text(
+    json.dumps(summary, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+PY
 
 "$PYTHON" - "$RUN_ROOT" <<'PY'
 import json
@@ -319,6 +519,9 @@ PY
 )
 
 for artifact in \
+  "$RUN_ROOT/baseline-extension-setup/baseline_first.json" \
+  "$RUN_ROOT/baseline-extension-setup/baseline_second.json" \
+  "$RUN_ROOT/baseline-extension-setup-summary.json" \
   "$RUN_ROOT/candidate-initialization/candidate_first.json" \
   "$RUN_ROOT/candidate-initialization/candidate_second.json" \
   "$RUN_ROOT/candidate-initialization-summary.json" \
