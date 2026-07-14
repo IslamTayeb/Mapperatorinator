@@ -179,7 +179,8 @@ def summarize(
     measured_replays = sum(live_counts[prefix] for prefix in SENTINEL_BUCKETS)
     accepted_ms = 0.0
     selected_ms = 0.0
-    failures: dict[str, list[str]] = {}
+    invariant_failures: dict[str, list[str]] = {}
+    performance_fallbacks: dict[str, list[str]] = {}
     selected: dict[str, str] = {}
     for raw_prefix, entry in buckets.items():
         prefix = int(raw_prefix)
@@ -201,15 +202,15 @@ def summarize(
             continue
         candidate = float(split["ms_per_call"])
         drift = split.get("drift")
-        candidate_failures: list[str] = []
+        candidate_invariant_failures: list[str] = []
         if not math.isfinite(candidate) or candidate <= 0:
             raise ValueError(f"prefix {prefix} has invalid split timing")
         if not split.get("cache_verifier", {}).get("pass"):
-            candidate_failures.append("cache_verifier")
+            candidate_invariant_failures.append("cache_verifier")
         if not split.get("memory_stable"):
-            candidate_failures.append("memory_stable")
+            candidate_invariant_failures.append("memory_stable")
         if not isinstance(drift, dict):
-            candidate_failures.append("drift_schema")
+            candidate_invariant_failures.append("drift_schema")
         else:
             for name in (
                 "output_max_abs",
@@ -223,13 +224,17 @@ def summarize(
                     or not math.isfinite(float(value))
                     or float(value) < 0
                 ):
-                    candidate_failures.append(f"{name}_invalid")
+                    candidate_invariant_failures.append(f"{name}_invalid")
                 elif float(value) > MAX_ABS_DRIFT:
-                    candidate_failures.append(f"{name}>{MAX_ABS_DRIFT}")
-        if candidate >= accepted:
-            candidate_failures.append("not_faster")
-        if candidate_failures:
-            failures[raw_prefix] = candidate_failures
+                    candidate_invariant_failures.append(
+                        f"{name}>{MAX_ABS_DRIFT}"
+                    )
+        if candidate_invariant_failures:
+            invariant_failures[raw_prefix] = candidate_invariant_failures
+            selected_ms += count * accepted
+            selected[raw_prefix] = "accepted_fallback"
+        elif candidate >= accepted:
+            performance_fallbacks[raw_prefix] = ["not_faster"]
             selected_ms += count * accepted
             selected[raw_prefix] = "accepted_fallback"
         else:
@@ -238,6 +243,8 @@ def summarize(
     accepted_seconds = DECODER_LAYERS * accepted_ms / 1000.0
     selected_seconds = DECODER_LAYERS * selected_ms / 1000.0
     saving_seconds = accepted_seconds - selected_seconds
+    invariants_pass = not invariant_failures
+    sizing_pass = saving_seconds > 0
     return {
         "total_live_replays": total_replays,
         "measured_replays": measured_replays,
@@ -246,11 +253,26 @@ def summarize(
         "weighted_selected_fp16_seconds_12_layers": selected_seconds,
         "projected_main_saving_seconds": saving_seconds,
         "selected": selected,
-        "candidate_failures": failures,
+        "candidate_invariant_failures": invariant_failures,
+        "performance_fallbacks": performance_fallbacks,
         "unmeasured_buckets_assigned_zero_delta": True,
-        "correctness_pass": not failures,
-        "promotion_pass": not failures and saving_seconds > 0,
+        "invariants_pass": invariants_pass,
+        "correctness_pass": invariants_pass,
+        "sizing_pass": sizing_pass,
+        "promotion_pass": invariants_pass and sizing_pass,
     }
+
+
+def report_exit_code(summary: dict[str, Any]) -> int:
+    """Return 1 for invalid evidence, 3 for a valid negative sizing, else 0."""
+
+    if not summary.get("invariants_pass"):
+        return 1
+    if not summary.get("sizing_pass"):
+        return 3
+    if not summary.get("promotion_pass"):
+        raise ValueError("promotion decision disagrees with invariant/sizing gates")
+    return 0
 
 
 @torch.no_grad()
@@ -426,7 +448,7 @@ def profile_fp16_split_kv_component(
         _restore_all_cache(capture.past_key_value, snapshots)
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "metadata": {
             "candidate": "sm75_split_kv_8_fp16_storage_fp32_accumulation",
             "control": "accepted_unsplit_fp16_storage_fp32_accumulation",
@@ -476,8 +498,7 @@ def main() -> None:
         encoding="utf-8",
     )
     print(json.dumps(report["summary"], indent=2, sort_keys=True))
-    if not report["summary"]["promotion_pass"]:
-        raise SystemExit("STOP_FP16_SPLIT_KV_COMPONENT")
+    raise SystemExit(report_exit_code(report["summary"]))
 
 
 if __name__ == "__main__":

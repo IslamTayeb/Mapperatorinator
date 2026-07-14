@@ -105,7 +105,11 @@ def test_summary_weights_live_counts_and_keeps_128_accepted_fallback() -> None:
     }
     assert report["coverage_fraction"] == pytest.approx(0.6)
     assert report["projected_main_saving_seconds"] == pytest.approx(0.078)
+    assert report["invariants_pass"]
+    assert report["correctness_pass"]
+    assert report["sizing_pass"]
     assert report["promotion_pass"]
+    assert profile.report_exit_code(report) == 0
 
 
 def test_summary_rejects_drift_even_when_candidate_is_faster() -> None:
@@ -129,10 +133,100 @@ def test_summary_rejects_drift_even_when_candidate_is_faster() -> None:
         buckets,
         live_counts={128: 1, 576: 1, 640: 1},
     )
-    assert report["candidate_failures"]["576"] == [
+    assert report["candidate_invariant_failures"]["576"] == [
         f"output_max_abs>{profile.MAX_ABS_DRIFT}"
     ]
+    assert report["performance_fallbacks"] == {}
+    assert not report["invariants_pass"]
+    assert not report["correctness_pass"]
+    # Sizing is an independent performance signal from the still-valid 640
+    # bucket; the invariant gate remains authoritative and forces exit 1.
+    assert report["sizing_pass"]
     assert not report["promotion_pass"]
+    assert profile.report_exit_code(report) == 1
+
+
+def test_summary_treats_not_faster_as_valid_performance_only_fallback() -> None:
+    buckets = {
+        "128": {
+            "selector": "accepted_fallback",
+            "accepted_fp16": _accepted(0.1),
+        },
+        "576": {
+            "selector": "split_kv_8",
+            "accepted_fp16": _accepted(0.2),
+            "split_kv_8_fp16": _split(0.21),
+        },
+        "640": {
+            "selector": "split_kv_8",
+            "accepted_fp16": _accepted(0.3),
+            "split_kv_8_fp16": _split(0.3),
+        },
+    }
+
+    report = profile.summarize(
+        buckets,
+        live_counts={128: 10, 576: 20, 640: 30},
+    )
+
+    assert report["candidate_invariant_failures"] == {}
+    assert report["performance_fallbacks"] == {
+        "576": ["not_faster"],
+        "640": ["not_faster"],
+    }
+    assert report["selected"] == {
+        "128": "accepted_fallback",
+        "576": "accepted_fallback",
+        "640": "accepted_fallback",
+    }
+    assert report["invariants_pass"]
+    assert report["correctness_pass"]
+    assert not report["sizing_pass"]
+    assert not report["promotion_pass"]
+    assert profile.report_exit_code(report) == 3
+
+
+def test_summary_can_promote_a_valid_per_bucket_speed_selector() -> None:
+    buckets = {
+        "128": {
+            "selector": "accepted_fallback",
+            "accepted_fp16": _accepted(0.1),
+        },
+        "576": {
+            "selector": "split_kv_8",
+            "accepted_fp16": _accepted(0.2),
+            "split_kv_8_fp16": _split(0.21),
+        },
+        "640": {
+            "selector": "split_kv_8",
+            "accepted_fp16": _accepted(0.3),
+            "split_kv_8_fp16": _split(0.15),
+        },
+    }
+
+    report = profile.summarize(
+        buckets,
+        live_counts={128: 10, 576: 20, 640: 30},
+    )
+
+    assert report["performance_fallbacks"] == {"576": ["not_faster"]}
+    assert report["selected"]["576"] == "accepted_fallback"
+    assert report["selected"]["640"] == "split_kv_8_fp16"
+    assert report["invariants_pass"]
+    assert report["sizing_pass"]
+    assert report["promotion_pass"]
+    assert profile.report_exit_code(report) == 0
+
+
+def test_report_exit_code_rejects_inconsistent_promotion_decision() -> None:
+    with pytest.raises(ValueError, match="decision disagrees"):
+        profile.report_exit_code(
+            {
+                "invariants_pass": True,
+                "sizing_pass": True,
+                "promotion_pass": False,
+            }
+        )
 
 
 def test_summary_fails_loudly_when_accepted_control_is_invalid() -> None:
