@@ -24,7 +24,10 @@ from .decoder_layer import (
     native_one_token_rmsnorm_linear,
 )
 from .dispatch import _q1_bmm_cross_attention
-from .q1_attention import native_q1_rope_cache_attention
+from .q1_attention import (
+    native_q1_rope_cache_attention,
+    native_q1_rope_cache_attention_variant,
+)
 from .weight_only import (
     DecoderWeightPack,
     PackedLinear,
@@ -40,6 +43,8 @@ SELF_OUT_OUTPUTS_PER_BLOCK = 4
 MLP_FC1_OUTPUTS_PER_BLOCK = 2
 MLP_FC2_OUTPUTS_PER_BLOCK = 4
 FINAL_LOGITS_OUTPUTS_PER_BLOCK = 2
+ACCEPTED_Q1_VARIANT = "accepted"
+SPLIT_KV_Q1_VARIANT = "split_kv_8"
 
 
 def _norm_eps(module: torch.nn.Module) -> float:
@@ -57,6 +62,27 @@ def _require_fp32_cuda(value: Any, *, name: str) -> torch.Tensor:
     if not value.is_contiguous():
         raise ValueError(f"{name} must be contiguous")
     return value
+
+
+def _record_weight_only_self_attention_dispatch(
+    dispatch_counts: dict[str, int] | None,
+    *,
+    variant: str,
+    prefix_length: int,
+) -> None:
+    """Record the effective native kernel selected inside the weight-owned hook."""
+
+    if variant not in {ACCEPTED_Q1_VARIANT, SPLIT_KV_Q1_VARIANT}:
+        raise RuntimeError(f"weight-only self-attention selected unknown q1 variant {variant!r}")
+    if dispatch_counts is None:
+        return
+    dispatch_counts["weight_only_self_attention_block"] += 1
+    dispatch_counts["native_q1_rope_cache_self_attention"] += 1
+    if variant == SPLIT_KV_Q1_VARIANT:
+        aggregate = "native_q1_rope_cache_self_attention_split_kv_8"
+        prefix = f"{aggregate}_prefix_{prefix_length}"
+        dispatch_counts[aggregate] = dispatch_counts.get(aggregate, 0) + 1
+        dispatch_counts[prefix] = dispatch_counts.get(prefix, 0) + 1
 
 
 def _locate_candidate_modules(
@@ -308,6 +334,10 @@ def _self_attention_block_forward(
         _require_fp32_cuda(native_mask, name="self attention mask")
         if native_mask.shape[-1] > prefix_length:
             native_mask = native_mask[..., :prefix_length]
+    native_q1_variant = native_q1_rope_cache_attention_variant(
+        qkv,
+        int(prefix_length),
+    )
     with profile_range(f"{layer_name}.weight_only.self_attention"):
         self_output = native_q1_rope_cache_attention(
             qkv,
@@ -326,9 +356,11 @@ def _self_attention_block_forward(
             pack.self_out,
             outputs_per_block=SELF_OUT_OUTPUTS_PER_BLOCK,
         )
-    if dispatch_counts is not None:
-        dispatch_counts["weight_only_self_attention_block"] += 1
-        dispatch_counts["native_q1_rope_cache_self_attention"] += 1
+    _record_weight_only_self_attention_dispatch(
+        dispatch_counts,
+        variant=native_q1_variant,
+        prefix_length=int(prefix_length),
+    )
     return output, (self_output, self_cache)
 
 

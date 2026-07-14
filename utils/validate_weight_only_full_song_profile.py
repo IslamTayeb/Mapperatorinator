@@ -23,6 +23,9 @@ FP16_WEIGHT_REGIONS = (
     "final_logits",
 )
 FP32_SELECTED_DECODE_MATRIX_REGIONS = ("cross_query", "cross_output")
+SPLIT_KV_DISPATCH = "native_q1_rope_cache_self_attention_split_kv_8"
+SPLIT_KV_PREFIX = f"{SPLIT_KV_DISPATCH}_prefix_"
+SPLIT_KV_PREFIXES = frozenset(range(192, 833, 64))
 PROFILE_ROLES = ("baseline", "candidate")
 PROFILE_LABELS = ("timing_context", "main_generation")
 
@@ -79,6 +82,52 @@ def _dispatch_counts(record: dict[str, Any], *, name: str) -> dict[str, int]:
     return counts
 
 
+def _effective_self_attention_counts(
+    record: dict[str, Any],
+    *,
+    name: str,
+) -> dict[str, Any]:
+    raw = _object(record.get("optimized_dispatch_capture_hits"), name=f"{name}.hits")
+    generic = raw.get("native_q1_rope_cache_self_attention")
+    split = raw.get(SPLIT_KV_DISPATCH, 0)
+    for key, value in (("native_q1_rope_cache_self_attention", generic), (SPLIT_KV_DISPATCH, split)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise WeightOnlyProfileError(f"{name}.hits.{key} must be a non-negative integer")
+    prefixes: dict[int, int] = {}
+    for key, value in raw.items():
+        if not key.startswith(SPLIT_KV_PREFIX):
+            continue
+        suffix = key.removeprefix(SPLIT_KV_PREFIX)
+        try:
+            prefix = int(suffix)
+        except ValueError as exc:
+            raise WeightOnlyProfileError(
+                f"{name}.hits contains malformed split-KV prefix key {key!r}"
+            ) from exc
+        if str(prefix) != suffix or prefix not in SPLIT_KV_PREFIXES:
+            raise WeightOnlyProfileError(
+                f"{name}.hits contains unsupported split-KV prefix {suffix!r}"
+            )
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise WeightOnlyProfileError(
+                f"{name}.hits.{key} must be a non-negative integer"
+            )
+        prefixes[prefix] = value
+    if split != sum(prefixes.values()):
+        raise WeightOnlyProfileError(
+            f"{name}.hits split-KV aggregate does not equal per-prefix counts"
+        )
+    if split > generic:
+        raise WeightOnlyProfileError(
+            f"{name}.hits split-KV count exceeds effective native q1 count"
+        )
+    return {
+        "native_q1_rope_cache_self_attention": generic,
+        "native_q1_rope_cache_self_attention_split_kv_8": split,
+        "split_kv_prefix_counts": dict(sorted(prefixes.items())),
+    }
+
+
 def validate_profile(payload: Any, *, role: str) -> dict[str, Any]:
     if role not in PROFILE_ROLES:
         raise WeightOnlyProfileError(f"role must be one of {PROFILE_ROLES}")
@@ -113,6 +162,11 @@ def validate_profile(payload: Any, *, role: str) -> dict[str, Any]:
         raise WeightOnlyProfileError(f"profile is missing generation labels: {missing}")
 
     totals = {key: 0 for key in WEIGHT_ONLY_DISPATCHES}
+    effective_self_attention_totals = {
+        "native_q1_rope_cache_self_attention": 0,
+        "native_q1_rope_cache_self_attention_split_kv_8": 0,
+        "split_kv_prefix_counts": {},
+    }
     for label, records in by_label.items():
         for index, record in enumerate(records):
             name = f"profile.{label}[{index}]"
@@ -163,6 +217,21 @@ def validate_profile(payload: Any, *, role: str) -> dict[str, Any]:
                     f"{name} has invalid mixed-weight dispatch policy: "
                     f"expected {expected_policy}, got {candidate_policy}"
                 )
+            expected_effective_self_attention = {
+                "requested": True,
+                "enabled": True,
+                "owner": "approximate_weight_only",
+                "kernel": "native_q1_rope_cache_attention",
+                "standard_attention_hook_enabled": False,
+                "split_kv_selector_enabled": True,
+                "disabled_reason": None,
+            }
+            if policy.get("effective_native_q1_rope_cache_self_attention") != (
+                expected_effective_self_attention
+            ):
+                raise WeightOnlyProfileError(
+                    f"{name} has invalid effective native q1 policy"
+                )
             expected_mode = "approximate_weight_only_batch1"
             if record.get("optimized_dispatch_mode") != expected_mode:
                 raise WeightOnlyProfileError(
@@ -171,6 +240,33 @@ def validate_profile(payload: Any, *, role: str) -> dict[str, Any]:
             counts = _dispatch_counts(record, name=name)
             for key, value in counts.items():
                 totals[key] += value
+            effective = _effective_self_attention_counts(record, name=name)
+            if (
+                effective["native_q1_rope_cache_self_attention"]
+                != counts["weight_only_self_attention_block"]
+            ):
+                raise WeightOnlyProfileError(
+                    f"{name} native q1 count does not match weight-owned self-attention"
+                )
+            raw_hits = _object(
+                record.get("optimized_dispatch_capture_hits"),
+                name=f"{name}.hits",
+            )
+            if raw_hits.get("q1_bmm_cross_attention") != counts["weight_only_mlp_tail"]:
+                raise WeightOnlyProfileError(
+                    f"{name} q1 BMM count does not match weight-owned MLP tail"
+                )
+            effective_self_attention_totals[
+                "native_q1_rope_cache_self_attention"
+            ] += effective["native_q1_rope_cache_self_attention"]
+            effective_self_attention_totals[
+                "native_q1_rope_cache_self_attention_split_kv_8"
+            ] += effective["native_q1_rope_cache_self_attention_split_kv_8"]
+            prefix_totals = effective_self_attention_totals[
+                "split_kv_prefix_counts"
+            ]
+            for prefix, value in effective["split_kv_prefix_counts"].items():
+                prefix_totals[prefix] = prefix_totals.get(prefix, 0) + value
 
     if candidate:
         missing_dispatch = {key: value for key, value in totals.items() if value <= 0}
@@ -179,11 +275,34 @@ def validate_profile(payload: Any, *, role: str) -> dict[str, Any]:
                 "candidate main generation did not execute every mixed-weight region: "
                 f"{missing_dispatch}"
             )
+        if (
+            effective_self_attention_totals[
+                "native_q1_rope_cache_self_attention_split_kv_8"
+            ]
+            <= 0
+        ):
+            raise WeightOnlyProfileError(
+                "candidate main generation did not execute split-KV native q1"
+            )
+        accepted_fallback = (
+            effective_self_attention_totals[
+                "native_q1_rope_cache_self_attention"
+            ]
+            - effective_self_attention_totals[
+                "native_q1_rope_cache_self_attention_split_kv_8"
+            ]
+        )
+        if accepted_fallback <= 0:
+            raise WeightOnlyProfileError(
+                "candidate main generation did not execute accepted native q1 fallback"
+            )
+        effective_self_attention_totals["accepted_fallback"] = accepted_fallback
     return {
         "role": role,
         "candidate_enabled_for_main": candidate,
         "candidate_disabled_for_timing": candidate,
         "main_weight_only_dispatch_counts": totals,
+        "main_effective_self_attention_counts": effective_self_attention_totals,
     }
 
 

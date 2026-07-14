@@ -282,6 +282,16 @@ def _generate_window(
         and _native_cross_mlp_tail_enabled(context_type=context_type)
         and not approximate_weight_only_enabled
     )
+    effective_native_q1_rope_cache_self_attention = (
+        native_q1_rope_cache_self_attention or approximate_weight_only_enabled
+    )
+    effective_native_q1_owner = (
+        "approximate_weight_only"
+        if approximate_weight_only_enabled
+        else "accepted_attention_hook"
+        if native_q1_rope_cache_self_attention
+        else None
+    )
     processors = _build_logits_processor_list(
         tokenizer,
         cfg_scale=cfg_scale,
@@ -431,6 +441,30 @@ def _generate_window(
                     if not specialized_batch
                     else "approximate_weight_only"
                     if approximate_weight_only_enabled
+                    else "timing_context"
+                ),
+            },
+            "effective_native_q1_rope_cache_self_attention": {
+                "requested": specialized_batch and context_type != ContextType.TIMING,
+                "enabled": effective_native_q1_rope_cache_self_attention,
+                "owner": effective_native_q1_owner,
+                "kernel": (
+                    "native_q1_rope_cache_attention"
+                    if effective_native_q1_rope_cache_self_attention
+                    else None
+                ),
+                "standard_attention_hook_enabled": (
+                    native_q1_rope_cache_self_attention
+                ),
+                "split_kv_selector_enabled": (
+                    effective_native_q1_rope_cache_self_attention
+                    and expected_dtype == torch.float32
+                ),
+                "disabled_reason": (
+                    None
+                    if effective_native_q1_rope_cache_self_attention
+                    else batched_policy_disabled_reason
+                    if not specialized_batch
                     else "timing_context"
                 ),
             },

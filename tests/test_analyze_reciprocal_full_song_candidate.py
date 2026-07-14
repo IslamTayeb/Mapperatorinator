@@ -99,8 +99,10 @@ def _generation_record(
         "native_cross_mlp_tail": 12,
     }
     if split_kv:
-        dispatch["split_kv_q1_rope_cache_self_attention"] = 12
-        dispatch["native_q1_rope_cache_self_attention"] = 0
+        dispatch["native_q1_rope_cache_self_attention_split_kv_8"] = 12
+        dispatch[
+            "native_q1_rope_cache_self_attention_split_kv_8_prefix_640"
+        ] = 12
     return {
         "profile_label": label,
         "context_type": "timing" if label == "timing_context" else "map",
@@ -282,7 +284,8 @@ def test_exact_dispatch_delta_requires_a_used_explicit_pattern(tmp_path: Path) -
         analyze(profiles)
 
     patterns = [
-        "records.*[[]0].optimized_dispatch_capture_hits.*q1_rope_cache_self_attention"
+        "records.*[[]0].optimized_dispatch_capture_hits."
+        "native_q1_rope_cache_self_attention*"
     ]
     report = analyze(profiles, allowed_dispatch_deltas=patterns)
     topology = report["parity"]["dispatch_cache_topology"]

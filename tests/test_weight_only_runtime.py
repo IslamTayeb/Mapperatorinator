@@ -117,6 +117,41 @@ def test_state_owner_and_metadata_fail_loudly() -> None:
     assert metadata["weight_pack_reserved_bytes_delta"] == 128
 
 
+def test_weight_owned_self_attention_records_effective_split_variant() -> None:
+    counts = {
+        "weight_only_self_attention_block": 0,
+        "native_q1_rope_cache_self_attention": 0,
+    }
+
+    for variant, prefix in (
+        ("accepted", 128),
+        ("split_kv_8", 192),
+        ("split_kv_8", 640),
+        ("split_kv_8", 640),
+    ):
+        weight_only_runtime._record_weight_only_self_attention_dispatch(
+            counts,
+            variant=variant,
+            prefix_length=prefix,
+        )
+
+    assert counts == {
+        "weight_only_self_attention_block": 4,
+        "native_q1_rope_cache_self_attention": 4,
+        "native_q1_rope_cache_self_attention_split_kv_8": 3,
+        "native_q1_rope_cache_self_attention_split_kv_8_prefix_192": 1,
+        "native_q1_rope_cache_self_attention_split_kv_8_prefix_640": 2,
+    }
+    before = dict(counts)
+    with pytest.raises(RuntimeError, match="unknown q1 variant"):
+        weight_only_runtime._record_weight_only_self_attention_dispatch(
+            counts,
+            variant="unknown",
+            prefix_length=640,
+        )
+    assert counts == before
+
+
 def test_runtime_initialization_is_idempotent_and_model_owned(monkeypatch) -> None:
     owner = torch.nn.Module()
     state = _state(owner)
@@ -378,7 +413,36 @@ def test_explicit_candidate_replaces_only_main_specialized_hooks(monkeypatch) ->
     assert "approximate_weight_only_state" not in captured[1]
     assert main_stats["optimized_dispatch_mode"] == "approximate_weight_only_batch1"
     assert main_stats["approximate_weight_only"]["exactness_claim"] is False
+    assert main_stats["optimized_dispatch_policy"][
+        "native_q1_rope_cache_self_attention"
+    ] == {
+        "requested": True,
+        "enabled": False,
+        "disabled_reason": "approximate_weight_only",
+    }
+    assert main_stats["optimized_dispatch_policy"][
+        "effective_native_q1_rope_cache_self_attention"
+    ] == {
+        "requested": True,
+        "enabled": True,
+        "owner": "approximate_weight_only",
+        "kernel": "native_q1_rope_cache_attention",
+        "standard_attention_hook_enabled": False,
+        "split_kv_selector_enabled": True,
+        "disabled_reason": None,
+    }
     assert timing_stats["optimized_dispatch_mode"] == "accepted_batch1"
+    assert timing_stats["optimized_dispatch_policy"][
+        "effective_native_q1_rope_cache_self_attention"
+    ] == {
+        "requested": False,
+        "enabled": False,
+        "owner": None,
+        "kernel": None,
+        "standard_attention_hook_enabled": False,
+        "split_kv_selector_enabled": False,
+        "disabled_reason": "timing_context",
+    }
     assert timing_stats["optimized_dispatch_policy"]["approximate_weight_only"] == {
         "requested": True,
         "enabled": False,
