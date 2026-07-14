@@ -1,3 +1,4 @@
+import os
 import subprocess
 from pathlib import Path
 import sys
@@ -187,6 +188,7 @@ def test_cross_candidate_runner_bootstraps_repo_from_unrelated_cwd(
     completed = subprocess.run(
         [sys.executable, str(ROOT / "utils" / runner), "--help"],
         cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": ""},
         check=False,
         capture_output=True,
         text=True,
