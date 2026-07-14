@@ -223,6 +223,10 @@ def test_shared_static_input_arena_rejects_signature_or_owner_changes():
             window_identity=2,
         )
 
+    arena.static_inputs["decoder_input_ids"] = torch.tensor([[3]])
+    with pytest.raises(RuntimeError, match="tensor address changed"):
+        arena.validate_tensor_addresses()
+
 
 def test_graph_processor_owns_monotonic_temperature_and_lookback_state():
     state = _state()
@@ -654,7 +658,7 @@ def test_capture_reuses_explicit_static_input_arena_without_cloning(monkeypatch)
     arena = {"decoder_input_ids": torch.tensor([[1]])}
     model = lambda **kwargs: SimpleNamespace(logits=torch.zeros((1, 1, 4)))
 
-    entry = _capture_k8_entry(
+    entry_128 = _capture_k8_entry(
         model,
         arena,
         active_prefix_length=128,
@@ -663,8 +667,21 @@ def test_capture_reuses_explicit_static_input_arena_without_cloning(monkeypatch)
         do_sample=True,
         static_input_arena=arena,
     )
+    entry_640 = _capture_k8_entry(
+        model,
+        arena,
+        active_prefix_length=640,
+        state=state,
+        processor=object(),
+        do_sample=True,
+        static_input_arena=arena,
+    )
 
-    assert entry.static_inputs is arena
+    assert entry_128.static_inputs is arena
+    assert entry_640.static_inputs is arena
+    assert entry_128.static_inputs["decoder_input_ids"].data_ptr() == (
+        entry_640.static_inputs["decoder_input_ids"].data_ptr()
+    )
 
 
 def test_k8_lifecycle_closes_graphs_at_session_transition_and_context_exit():

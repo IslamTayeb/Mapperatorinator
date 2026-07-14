@@ -689,7 +689,20 @@ def _tensor_copy_size(model_inputs: dict[str, Any]) -> tuple[int, int]:
 class _StaticInputArena:
     static_inputs: dict[str, Any]
     signature: tuple[Any, ...]
+    tensor_addresses: tuple[tuple[str, int], ...]
     refreshed_window_identity: int
+
+    @staticmethod
+    def _tensor_addresses(values: dict[str, Any]) -> tuple[tuple[str, int], ...]:
+        return tuple(
+            (name, value.data_ptr())
+            for name, value in sorted(values.items())
+            if isinstance(value, torch.Tensor)
+        )
+
+    def validate_tensor_addresses(self) -> None:
+        if self._tensor_addresses(self.static_inputs) != self.tensor_addresses:
+            raise RuntimeError("shared static-input arena tensor address changed")
 
     @classmethod
     def create(
@@ -698,9 +711,11 @@ class _StaticInputArena:
         *,
         window_identity: int,
     ) -> "_StaticInputArena":
+        static_inputs = _clone_static_graph_inputs(model_inputs)
         return cls(
-            static_inputs=_clone_static_graph_inputs(model_inputs),
+            static_inputs=static_inputs,
             signature=_static_input_signature(model_inputs),
+            tensor_addresses=cls._tensor_addresses(static_inputs),
             refreshed_window_identity=window_identity,
         )
 
@@ -710,12 +725,14 @@ class _StaticInputArena:
         *,
         window_identity: int,
     ) -> None:
+        self.validate_tensor_addresses()
         if window_identity == self.refreshed_window_identity:
             raise RuntimeError("shared static-input arena refreshed twice in one window")
         signature = _static_input_signature(model_inputs)
         if signature != self.signature:
             raise RuntimeError("shared static-input arena signature changed")
         _copy_static_graph_inputs(self.static_inputs, model_inputs)
+        self.validate_tensor_addresses()
         self.refreshed_window_identity = window_identity
 
 
@@ -1421,6 +1438,16 @@ def k8_active_prefix_decode_generate(
                     else None
                 ),
             )
+            if shared_static_input_arena:
+                if arena is None:
+                    raise RuntimeError(
+                        "shared static-input arena disappeared during capture"
+                    )
+                arena.validate_tensor_addresses()
+                if entry.static_inputs is not arena.static_inputs:
+                    raise RuntimeError(
+                        "K8 graph capture did not retain the shared input arena"
+                    )
             try:
                 lifecycle.register(entry.parent)
                 if entry.remainder_parent is not None:
@@ -1465,7 +1492,10 @@ def k8_active_prefix_decode_generate(
                 raise RuntimeError("K8 graph resolved the wrong persistent state")
             copy_started = time.perf_counter()
             if shared_static_input_arena:
-                if arena is None or entry.static_inputs is not arena.static_inputs:
+                if arena is None:
+                    raise RuntimeError("shared static-input arena disappeared")
+                arena.validate_tensor_addresses()
+                if entry.static_inputs is not arena.static_inputs:
                     raise RuntimeError("K8 graph did not retain the shared input arena")
             else:
                 if copy_events is not None:
