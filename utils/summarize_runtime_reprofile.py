@@ -205,6 +205,45 @@ def _export_csvs(
         stage_rows,
     )
 
+    request_rows = []
+    for run_id, run in report["runs"].items():
+        timing = run["generation"]["timing_generation"]
+        main = run["generation"]["main_generation"]
+        pipeline = run["pipeline"]
+        request_rows.append(
+            [
+                run_id,
+                pipeline["request_profiled_stage_wall_seconds"],
+                timing["outer_wall_seconds"],
+                timing["synchronized_model_seconds"],
+                timing["post_model_seconds"],
+                pipeline["timing_postprocessing_seconds"],
+                main["outer_wall_seconds"],
+                main["synchronized_model_seconds"],
+                main["post_model_seconds"],
+                pipeline["main_postprocessing_seconds"],
+                pipeline["other_profiled_stage_wall_seconds"],
+            ]
+        )
+    request_path = output_dir / "request_pipeline.csv"
+    _write_csv(
+        request_path,
+        [
+            "run_id",
+            "complete_profiled_request_wall_seconds",
+            "timing_generation_outer_wall_seconds",
+            "timing_generation_synchronized_model_seconds",
+            "timing_generation_post_model_seconds",
+            "timing_postprocessing_seconds",
+            "main_generation_outer_wall_seconds",
+            "main_generation_synchronized_model_seconds",
+            "main_generation_post_model_seconds",
+            "main_postprocessing_seconds",
+            "other_profiled_stage_wall_seconds",
+        ],
+        request_rows,
+    )
+
     node = nsight_analysis.get("runs", {}).get("selected_node", {})
     family_rows = []
     kernel_rows = []
@@ -286,6 +325,7 @@ def _export_csvs(
     )
     return {
         "stage_budget_csv": str(stage_path.resolve()),
+        "request_pipeline_csv": str(request_path.resolve()),
         "kernel_families_csv": str(family_path.resolve()),
         "top_kernels_csv": str(kernel_path.resolve()),
         "copy_sync_launch_gaps_csv": str(transition_path.resolve()),
@@ -295,7 +335,7 @@ def _export_csvs(
 def summarize(
     *,
     evidence_paths: dict[str, Path],
-    budget_path: Path,
+    topology_contract_path: Path,
     transparency_paths: dict[str, Path],
     nsight_analysis_path: Path,
     csv_dir: Path,
@@ -311,7 +351,6 @@ def summarize(
         evidence[name].get("runtime_spec_sha256")
         for name in (
             "selected_control",
-            "selected_budget",
             "selected_graph",
             "selected_node",
         )
@@ -324,9 +363,13 @@ def summarize(
     if len(fixed_manifest_hashes) != 1:
         raise ValueError("fixed-work manifest differs across runs")
 
-    budget = _load(budget_path)
-    if budget.get("profile_pass_kind") != "untraced_budget":
-        raise ValueError("budget artifact has the wrong pass kind")
+    topology_contract = _load(topology_contract_path)
+    if topology_contract.get("schema_version") != (
+        "mapperatorinator.selected-runtime-nsight-topology.v1"
+    ):
+        raise ValueError("selected runtime topology contract has the wrong schema")
+    if topology_contract.get("pass") is not True:
+        raise ValueError("selected runtime topology contract did not pass")
     transparencies = {name: _load(path) for name, path in transparency_paths.items()}
     transparency_pass = all(bool(item.get("pass")) for item in transparencies.values())
     nsight_analysis = _load(nsight_analysis_path)
@@ -359,11 +402,11 @@ def summarize(
         "runtime_spec_sha256": next(iter(selected_spec_hashes)),
         "fixed_manifest_sha256": next(iter(fixed_manifest_hashes)),
         "runs": runs,
-        "untraced_budget": budget,
+        "selected_runtime_topology": topology_contract,
         "profiler_transparency": transparencies,
         "accepted_vs_selected_divergence": divergence,
         "nsight_analysis_path": str(nsight_analysis_path.resolve()),
-        "pass": bool(budget.get("pass")) and transparency_pass and nsight_comparisons_pass,
+        "pass": transparency_pass and nsight_comparisons_pass,
     }
     report["csv_artifacts"] = _export_csvs(report, nsight_analysis, csv_dir)
     return report
@@ -375,8 +418,16 @@ def _text(report: dict[str, Any]) -> str:
         f"expected_main_steps={report['expected_main_steps']}",
         f"runtime_spec_sha256={report['runtime_spec_sha256']}",
     ]
-    for run_id in ("accepted_record", "selected_control", "selected_budget", "selected_graph", "selected_node"):
+    for run_id in ("accepted_record", "selected_control", "selected_graph", "selected_node"):
         run = report["runs"][run_id]
+        pipeline = run["pipeline"]
+        lines.append(
+            f"{run_id}.request="
+            f"profiled_wall_s:{pipeline['request_profiled_stage_wall_seconds']:.9f},"
+            f"timing_post_s:{pipeline['timing_postprocessing_seconds']:.9f},"
+            f"main_post_s:{pipeline['main_postprocessing_seconds']:.9f},"
+            f"other_s:{pipeline['other_profiled_stage_wall_seconds']:.9f}"
+        )
         for stage in ("timing_generation", "main_generation"):
             values = run["generation"][stage]
             lines.append(
@@ -398,11 +449,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--accepted-evidence", type=Path, required=True)
     parser.add_argument("--selected-control-evidence", type=Path, required=True)
-    parser.add_argument("--selected-budget-evidence", type=Path, required=True)
     parser.add_argument("--selected-graph-evidence", type=Path, required=True)
     parser.add_argument("--selected-node-evidence", type=Path, required=True)
-    parser.add_argument("--budget", type=Path, required=True)
-    parser.add_argument("--budget-transparency", type=Path, required=True)
+    parser.add_argument("--topology-contract", type=Path, required=True)
     parser.add_argument("--graph-transparency", type=Path, required=True)
     parser.add_argument("--node-transparency", type=Path, required=True)
     parser.add_argument("--nsight-analysis", type=Path, required=True)
@@ -414,13 +463,11 @@ def main() -> None:
         evidence_paths={
             "accepted_record": args.accepted_evidence,
             "selected_control": args.selected_control_evidence,
-            "selected_budget": args.selected_budget_evidence,
             "selected_graph": args.selected_graph_evidence,
             "selected_node": args.selected_node_evidence,
         },
-        budget_path=args.budget,
+        topology_contract_path=args.topology_contract,
         transparency_paths={
-            "budget": args.budget_transparency,
             "graph": args.graph_transparency,
             "node": args.node_transparency,
         },

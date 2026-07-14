@@ -12,6 +12,7 @@ from utils.summarize_runtime_reprofile import (
     _pipeline,
     _stage,
 )
+from utils.validate_selected_runtime_nsight import _runtime_contract
 
 
 def _profile(main_tokens: list[int]) -> dict:
@@ -119,19 +120,35 @@ def test_relaxed_divergence_reports_tokens_stopping_structure_and_bytes(tmp_path
 
 
 def test_csv_export_keeps_kernel_family_launch_and_gap_evidence(tmp_path):
+    timing = {
+        "logical_steps": 200,
+        "consumer_tokens": 190,
+        "outer_wall_seconds": 2.0,
+        "synchronized_model_seconds": 1.5,
+        "post_model_seconds": 0.5,
+        "fixed_work_tokens_per_second": 200 / 1.5,
+    }
+    main = {
+        "logical_steps": 8294,
+        "consumer_tokens": 8000,
+        "outer_wall_seconds": 30.0,
+        "synchronized_model_seconds": 25.0,
+        "post_model_seconds": 5.0,
+        "fixed_work_tokens_per_second": 331.76,
+    }
     report = {
         "runs": {
             "selected_control": {
                 "generation": {
-                    "main_generation": {
-                        "logical_steps": 8294,
-                        "consumer_tokens": 8000,
-                        "outer_wall_seconds": 30.0,
-                        "synchronized_model_seconds": 25.0,
-                        "post_model_seconds": 5.0,
-                        "fixed_work_tokens_per_second": 331.76,
-                    }
-                }
+                    "timing_generation": timing,
+                    "main_generation": main,
+                },
+                "pipeline": {
+                    "request_profiled_stage_wall_seconds": 34.0,
+                    "timing_postprocessing_seconds": 0.5,
+                    "main_postprocessing_seconds": 1.0,
+                    "other_profiled_stage_wall_seconds": 0.5,
+                },
             }
         }
     }
@@ -183,6 +200,7 @@ def test_csv_export_keeps_kernel_family_launch_and_gap_evidence(tmp_path):
 
     assert set(outputs) == {
         "stage_budget_csv",
+        "request_pipeline_csv",
         "kernel_families_csv",
         "top_kernels_csv",
         "copy_sync_launch_gaps_csv",
@@ -191,20 +209,23 @@ def test_csv_export_keeps_kernel_family_launch_and_gap_evidence(tmp_path):
     assert "gpu_idle_gap_union_ns" in (
         tmp_path / "copy_sync_launch_gaps.csv"
     ).read_text()
+    assert "complete_profiled_request_wall_seconds" in (
+        tmp_path / "request_pipeline.csv"
+    ).read_text()
 
 
 def test_dcc_wrapper_is_fixed_work_runtime_spec_driven_and_report_only():
     root = Path(__file__).resolve().parents[1]
     wrapper = (root / "scripts/dcc/profile_selected_runtime_nsight.sbatch").read_text()
     spec = json.loads(
-        (root / "scripts/dcc/runtime_specs/k1_int8.json").read_text()
+        (root / "scripts/dcc/runtime_specs/k1_int8_fp16_cross.json").read_text()
     )
 
-    assert "#SBATCH --time=00:30:00" in wrapper
+    assert "#SBATCH --time=01:00:00" in wrapper
     assert "EXPECTED_MAIN_STEPS=8294" in wrapper
     assert "MAPPERATORINATOR_RUNTIME_SPEC" in wrapper
     assert "selected_control" in wrapper
-    assert "selected_budget" in wrapper
+    assert "selected_budget" not in wrapper
     assert "selected_graph" in wrapper
     assert "selected_node" in wrapper
     assert "profile_pass_kind" in wrapper
@@ -212,9 +233,88 @@ def test_dcc_wrapper_is_fixed_work_runtime_spec_driven_and_report_only():
     assert ".html" not in wrapper
     assert ".png" not in wrapper
     assert ".md" not in wrapper
-    assert spec["kwargs"]["block_size"] == 1
+    assert "PYTHONHASHSEED=0" in wrapper
+    assert "runtime-nsight-$COMMIT" in wrapper
+    assert "validate_selected_runtime_nsight.py" in wrapper
+    assert "topology-contract.json" in wrapper
+    assert "request_pipeline.csv" in wrapper
+    assert spec["kwargs"]["block_size"] == 4
     assert spec["kwargs"]["graph_remainders"] is True
+    assert spec["kwargs"]["initializer_name"] == (
+        "initialize_approximate_int8_mlp_weight_only_cross"
+    )
+    assert spec["kwargs"]["initializer_kwargs"] == {
+        "mode": "fp16_packed_projections"
+    }
+    assert spec["kwargs"]["minimum_bindings"] == 2
     assert spec["factory"].count(":") == 1
+
+
+def test_selected_runtime_contract_requires_exact_composed_topology():
+    stats = {
+        "module_count": 12,
+        "group_count": 1,
+        "forwards": 10,
+        "computes": 10,
+        "expected_computes": 10,
+        "reuses": 110,
+        "expected_reuses": 110,
+    }
+    initialization = {
+        "cross_candidate": {
+            "mode": "fp16_packed_projections",
+            "scope": "main-model-only",
+            "attention_accumulation": "fp32",
+            "production_selector_unchanged": True,
+            "projection_delta_only": True,
+            "accepted_q1_bmm": True,
+            "incremental_exactness_required": True,
+        },
+        "int8_mlp_overlay": {
+            "version": "per-row-symmetric-int8-mlp-v1",
+            "scope": "main-model-decoder-mlp-only",
+            "dispatch_counter": "int8_weight_mlp_tail",
+        },
+    }
+    kwargs = {
+        "block_size": 4,
+        "graph_remainders": True,
+        "initializer_name": "initialize_approximate_int8_mlp_weight_only_cross",
+        "initializer_kwargs": {"mode": "fp16_packed_projections"},
+        "shared_rope_binding_index": 0,
+        "initializer_binding_index": 0,
+        "minimum_bindings": 2,
+    }
+    evidence = {
+        "candidate": True,
+        "expected_main_steps": 8294,
+        "labels": {"main_generation": {"logical_steps": 8294}},
+        "runtime": {
+            "name": "k4-k1-int8-fp16-packed-cross",
+            "factory": "utils.final_confirmation_runtime:kblock_shared_rope_weight_plugin",
+            "binding_count": 2,
+            "spec": {"kwargs": kwargs},
+            "initialization": initialization,
+            "temporary_hooks": [
+                {"kind": "block_decode", "block_size": 4, "graph_remainders": True},
+                {"kind": "shared_decoder_rope", "binding_index": 0, "stats": stats},
+                {
+                    "kind": "runtime_initializer",
+                    "binding_index": 0,
+                    "name": "initialize_approximate_int8_mlp_weight_only_cross",
+                    "kwargs": {"mode": "fp16_packed_projections"},
+                },
+            ],
+        },
+    }
+
+    result = _runtime_contract(evidence, run_id="selected_control")
+    assert result["binding_count"] == 2
+    assert result["shared_rope"]["reuses"] == 110
+
+    evidence["runtime"]["spec"]["kwargs"]["block_size"] = 1
+    with pytest.raises(ValueError, match="spec.kwargs"):
+        _runtime_contract(evidence, run_id="selected_control")
 
 
 def test_manifest_builder_uses_paired_controls_without_explicit_fake_comparisons(

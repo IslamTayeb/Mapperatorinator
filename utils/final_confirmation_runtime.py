@@ -118,6 +118,7 @@ class KBlockSharedRopeWeightPlugin:
         block_size: int,
         graph_remainders: bool,
         initializer_name: str,
+        initializer_kwargs: dict[str, Any] | None = None,
         shared_rope_binding_index: int = 0,
         initializer_binding_index: int = 0,
         minimum_bindings: int = 1,
@@ -128,6 +129,12 @@ class KBlockSharedRopeWeightPlugin:
             raise TypeError("graph_remainders must be boolean")
         if not isinstance(initializer_name, str) or not initializer_name:
             raise ValueError("initializer_name must be non-empty")
+        if initializer_kwargs is None:
+            initializer_kwargs = {}
+        elif not isinstance(initializer_kwargs, dict):
+            raise TypeError("initializer_kwargs must be an object")
+        if not all(isinstance(key, str) and key for key in initializer_kwargs):
+            raise ValueError("initializer_kwargs keys must be non-empty strings")
         for label, value in (
             ("shared_rope_binding_index", shared_rope_binding_index),
             ("initializer_binding_index", initializer_binding_index),
@@ -141,6 +148,7 @@ class KBlockSharedRopeWeightPlugin:
         self._block_size = block_size
         self._graph_remainders = graph_remainders
         self._initializer_name = initializer_name
+        self._initializer_kwargs = dict(initializer_kwargs)
         self._shared_rope_binding_index = shared_rope_binding_index
         self._initializer_binding_index = initializer_binding_index
         self._minimum_bindings = minimum_bindings
@@ -208,7 +216,7 @@ class KBlockSharedRopeWeightPlugin:
                     f"{self._initializer_name!r}"
                 )
             self._initialization = _initialize_with_evidence(
-                initializer,
+                lambda model: initializer(model, **self._initializer_kwargs),
                 binding.raw_model,
             )
         self._bindings += 1
@@ -252,6 +260,7 @@ class KBlockSharedRopeWeightPlugin:
                     "kind": "runtime_initializer",
                     "binding_index": self._initializer_binding_index,
                     "name": self._initializer_name,
+                    "kwargs": self._initializer_kwargs,
                 },
             ],
         }
