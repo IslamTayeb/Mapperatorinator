@@ -66,6 +66,8 @@ def run(
     output_init_json: Path,
     *,
     mode: str,
+    shared_static_input_arena: bool = False,
+    transition_timing: bool = False,
 ) -> None:
     if mode not in CROSS_CANDIDATE_MODES:
         raise ValueError(
@@ -96,6 +98,8 @@ def run(
         graph_remainders=True,
         weight_runner=weight_runner,
         composition_version=composition_version,
+        shared_static_input_arena=shared_static_input_arena,
+        transition_timing=transition_timing,
     )
     _enrich_evidence(
         output_init_json,

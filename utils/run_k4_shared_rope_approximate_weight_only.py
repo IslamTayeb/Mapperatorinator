@@ -79,6 +79,8 @@ def run(
     graph_remainders: bool = False,
     weight_runner=None,
     composition_version: str = COMPOSITION_VERSION,
+    shared_static_input_arena: bool = False,
+    transition_timing: bool = False,
 ) -> None:
     """Install every candidate while sharing RoPE only on the main model.
 
@@ -113,6 +115,10 @@ def run(
         install_options = {"block_size": 4}
         if graph_remainders:
             install_options["graph_remainders"] = True
+        if shared_static_input_arena:
+            install_options["shared_static_input_arena"] = True
+        if transition_timing:
+            install_options["transition_timing"] = True
         with install_k8_candidate(**install_options):
             weight_runner(config_name, overrides, output_init_json)
         if loaded_bindings < 2:

@@ -31,6 +31,7 @@ REQUIRE_K1_REMAINDER_INCREMENTAL=${REQUIRE_K1_REMAINDER_INCREMENTAL:-false}
 REQUIRE_INT8_MLP_INCREMENTAL=${REQUIRE_INT8_MLP_INCREMENTAL:-false}
 REQUIRE_CROSS_INCREMENTAL=${REQUIRE_CROSS_INCREMENTAL:-false}
 REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL=${REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL:-false}
+REQUIRE_SHARED_ARENA_INCREMENTAL=${REQUIRE_SHARED_ARENA_INCREMENTAL:-false}
 CROSS_CANDIDATE_MODE=${CROSS_CANDIDATE_MODE:-accepted}
 FIXED_TIMING_TOKENS=${FIXED_TIMING_TOKENS:-821}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
@@ -117,19 +118,25 @@ if ! [[ "$FIXED_TIMING_TOKENS" =~ ^[1-9][0-9]*$ ]]; then
   echo "FIXED_TIMING_TOKENS must be a positive integer" >&2
   exit 2
 fi
+if [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" != true \
+  && "$REQUIRE_SHARED_ARENA_INCREMENTAL" != false ]]; then
+  echo "REQUIRE_SHARED_ARENA_INCREMENTAL must be true or false" >&2
+  exit 2
+fi
 enabled_incremental_modes=0
 for enabled in \
   "$REQUIRE_SHARED_ROPE_INCREMENTAL" \
   "$REQUIRE_K1_REMAINDER_INCREMENTAL" \
   "$REQUIRE_INT8_MLP_INCREMENTAL" \
   "$REQUIRE_CROSS_INCREMENTAL" \
-  "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL"; do
+  "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" \
+  "$REQUIRE_SHARED_ARENA_INCREMENTAL"; do
   if [[ "$enabled" == true ]]; then
     enabled_incremental_modes=$((enabled_incremental_modes + 1))
   fi
 done
 if (( enabled_incremental_modes > 1 )); then
-  echo "shared-RoPE, K1-remainder, INT8 MLP, and cross gates are mutually exclusive" >&2
+  echo "shared-RoPE, K1-remainder, INT8 MLP, cross, timing-native-self, and shared-arena gates are mutually exclusive" >&2
   exit 2
 fi
 if [[ "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" == true ]]; then
@@ -144,6 +151,23 @@ if [[ "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" == true ]]; then
   fi
   if [[ "$CROSS_CANDIDATE_MODE" != fp16_packed_projections ]]; then
     echo "timing-native-self gate requires selected FP16-packed cross mode" >&2
+    exit 2
+  fi
+  CROSS_K1_INT8_COMPOSITION=true
+elif [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+  if [[ "$REQUIRE_K4_CANDIDATE" != true || "$REQUIRE_EXACT_TIMING" != true ]]; then
+    echo "shared-arena gate requires K4 and exact timing" >&2
+    exit 2
+  fi
+  if [[ "$BASELINE_RUNNER" \
+      != utils/run_k4_shared_rope_fp16_cross_transition_timing.py \
+    || "$CANDIDATE_RUNNER" \
+      != utils/run_k4_shared_rope_fp16_cross_shared_arena_transition_timing.py ]]; then
+    echo "shared-arena gate requires the paired transition-timing runners" >&2
+    exit 2
+  fi
+  if [[ "$CROSS_CANDIDATE_MODE" != fp16_packed_projections ]]; then
+    echo "shared-arena gate requires selected FP16 packed cross projections" >&2
     exit 2
   fi
   CROSS_K1_INT8_COMPOSITION=true
@@ -393,6 +417,7 @@ echo "int8_k1_composition=$INT8_K1_COMPOSITION"
 echo "require_cross_incremental=$REQUIRE_CROSS_INCREMENTAL"
 echo "require_timing_native_self_incremental=$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL"
 echo "fixed_timing_tokens=$FIXED_TIMING_TOKENS"
+echo "require_shared_arena_incremental=$REQUIRE_SHARED_ARENA_INCREMENTAL"
 echo "cross_candidate_mode=$CROSS_CANDIDATE_MODE"
 echo "cross_k1_int8_composition=$CROSS_K1_INT8_COMPOSITION"
 echo "audio=$AUDIO"
@@ -589,6 +614,8 @@ run_profile() {
     validation_cross_mode=$CROSS_CANDIDATE_MODE
   elif [[ "$REQUIRE_CROSS_INCREMENTAL" == true && "$candidate" == 1 ]]; then
     validation_cross_mode=$CROSS_CANDIDATE_MODE
+  elif [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+    validation_cross_mode=$CROSS_CANDIDATE_MODE
   fi
   local timing_native_self_validation_args=()
   if [[ "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" == true \
@@ -619,9 +646,12 @@ run_profile() {
     )
   fi
   if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true \
-    || "$CROSS_K1_INT8_COMPOSITION" == true ]]; then
+    || "$CROSS_K1_INT8_COMPOSITION" == true \
+    || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
     local int8_validation_role=baseline
-    if [[ "$candidate" == 1 || "$CROSS_K1_INT8_COMPOSITION" == true ]]; then
+    if [[ "$candidate" == 1 \
+      || "$CROSS_K1_INT8_COMPOSITION" == true \
+      || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
       int8_validation_role=candidate
     fi
     (
@@ -646,11 +676,13 @@ run_profile() {
   )
   if [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true \
     || "$INT8_K1_COMPOSITION" == true \
-    || "$CROSS_K1_INT8_COMPOSITION" == true ]]; then
+    || "$CROSS_K1_INT8_COMPOSITION" == true \
+    || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
     local remainder_role=control
     if [[ "$candidate" == 1 \
       || "$INT8_K1_COMPOSITION" == true \
-      || "$CROSS_K1_INT8_COMPOSITION" == true ]]; then
+      || "$CROSS_K1_INT8_COMPOSITION" == true \
+      || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
       remainder_role=candidate
     fi
     (
@@ -775,7 +807,8 @@ if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
   || "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true \
   || "$REQUIRE_INT8_MLP_INCREMENTAL" == true \
   || "$REQUIRE_CROSS_INCREMENTAL" == true \
-  || "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" == true ]]; then
+  || "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" == true \
+  || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
   INITIALIZATION_ROLES=baseline_first,candidate_first,candidate_second,baseline_second
 fi
 "$PYTHON" - "$RUN_ROOT" "$INITIALIZATION_ROLES" \
@@ -999,6 +1032,14 @@ if [[ "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" == true ]]; then
     --allow-optional-dispatch-delta
       'records.timing_context[[]*].optimized_cuda_graphs.*'
   )
+elif [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+  ANALYSIS_EXACT_ARGS=(
+    --require-exact-label timing_context
+    --require-exact-label main_generation
+  )
+  ANALYSIS_DISPATCH_ARGS=(
+    --allow-dispatch-delta 'records.*[[]*].optimized_cuda_graphs.*'
+  )
 elif [[ "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
   ANALYSIS_EXACT_ARGS=(
     --require-exact-label timing_context
@@ -1080,6 +1121,36 @@ fi
     --text-output "$RUN_ROOT/reciprocal-analysis.txt"
 )
 
+SHARED_ARENA_STATUS=0
+if [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+  set +e
+  (
+    cd "$CANDIDATE_REPO"
+    "$PYTHON" utils/analyze_shared_static_input_arena.py \
+      --reciprocal-analysis "$RUN_ROOT/reciprocal-analysis.json" \
+      --baseline-first-profile "$BASELINE_FIRST" \
+      --candidate-first-profile "$CANDIDATE_FIRST" \
+      --candidate-second-profile "$CANDIDATE_SECOND" \
+      --baseline-second-profile "$BASELINE_SECOND" \
+      --json-output "$RUN_ROOT/shared-static-input-arena-analysis.json" \
+      --text-output "$RUN_ROOT/shared-static-input-arena-analysis.txt"
+  )
+  SHARED_ARENA_STATUS=$?
+  set -e
+  if [[ "$SHARED_ARENA_STATUS" -ne 0 && "$SHARED_ARENA_STATUS" -ne 3 ]]; then
+    echo "shared static-input arena analyzer failed before its declared gate" >&2
+    exit "$SHARED_ARENA_STATUS"
+  fi
+  for artifact in \
+    "$RUN_ROOT/shared-static-input-arena-analysis.json" \
+    "$RUN_ROOT/shared-static-input-arena-analysis.txt"; do
+    if [[ ! -s "$artifact" ]]; then
+      echo "missing shared static-input arena artifact: $artifact" >&2
+      exit 2
+    fi
+  done
+fi
+
 for artifact in \
   "$RUN_ROOT/baseline-extension-setup/baseline_first.json" \
   "$RUN_ROOT/baseline-extension-setup/baseline_second.json" \
@@ -1104,7 +1175,8 @@ for artifact in \
 done
 if [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true \
   || "$INT8_K1_COMPOSITION" == true \
-  || "$CROSS_K1_INT8_COMPOSITION" == true ]]; then
+  || "$CROSS_K1_INT8_COMPOSITION" == true \
+  || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
   for role in baseline_first candidate_first candidate_second baseline_second; do
     artifact="$RUN_ROOT/$role.k1-remainder-validation.json"
     if [[ ! -s "$artifact" ]]; then
@@ -1114,7 +1186,8 @@ if [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true \
   done
 fi
 if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true \
-  || "$CROSS_K1_INT8_COMPOSITION" == true ]]; then
+  || "$CROSS_K1_INT8_COMPOSITION" == true \
+  || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
   for role in baseline_first candidate_first candidate_second baseline_second; do
     artifact="$RUN_ROOT/$role.int8-mlp-validation.json"
     if [[ ! -s "$artifact" ]]; then
@@ -1135,7 +1208,8 @@ fi
 if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
   || "$REQUIRE_INT8_MLP_INCREMENTAL" == true \
   || "$REQUIRE_CROSS_INCREMENTAL" == true \
-  || "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" == true ]]; then
+  || "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" == true \
+  || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
   for artifact in \
     "$RUN_ROOT/candidate-initialization/baseline_first.json" \
     "$RUN_ROOT/candidate-initialization/baseline_second.json"; do
@@ -1156,7 +1230,8 @@ grep -q "^parity.claim=$ANALYSIS_CLAIM$" "$RUN_ROOT/reciprocal-analysis.txt"
 if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
   || "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true \
   || "$REQUIRE_CROSS_INCREMENTAL" == true \
-  || "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" == true ]]; then
+  || "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" == true \
+  || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
   grep -q '^parity.cross_candidate_exact=true$' \
     "$RUN_ROOT/reciprocal-analysis.txt"
 fi
@@ -1164,7 +1239,9 @@ grep -q '^parity.baseline_repeat_stable=true$' "$RUN_ROOT/reciprocal-analysis.tx
 grep -q '^parity.candidate_repeat_stable=true$' "$RUN_ROOT/reciprocal-analysis.txt"
 EXPECTED_EXACT_LABELS=none
 EXPECTED_EXACT_DISPATCH_LABELS=none
-if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+  EXPECTED_EXACT_LABELS=timing_context,main_generation
+elif [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
   EXPECTED_EXACT_LABELS=timing_context,main_generation
   EXPECTED_EXACT_DISPATCH_LABELS=$EXPECTED_EXACT_LABELS
 elif [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true ]]; then
@@ -1206,3 +1283,6 @@ find "$RUN_ROOT" -type f \
   \( -name '*.profile.json' -o -name '*analysis.json' -o -name '*summary.json' \
     -o -name '*manifest.json' \) \
   -print0 | sort -z | xargs -0 sha256sum
+if [[ "$SHARED_ARENA_STATUS" -eq 3 ]]; then
+  exit 3
+fi

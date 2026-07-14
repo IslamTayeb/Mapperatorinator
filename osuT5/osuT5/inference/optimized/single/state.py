@@ -217,4 +217,14 @@ class ProductionDecodeSession:
                     latest.get("capture_state_restore_synchronized", False)
                 ),
             }
+            for key in (
+                "shared_static_input_arena",
+                "static_input_arena_refreshes",
+                "static_input_arena_refresh_copy_calls",
+                "static_input_arena_refresh_copy_bytes",
+                "static_input_arena_graph_entries",
+                "transition_timing",
+            ):
+                if key in latest:
+                    result["k8_candidate"][key] = latest[key]
         return result

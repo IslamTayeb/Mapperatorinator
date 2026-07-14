@@ -13,6 +13,7 @@ from osuT5.osuT5.inference.optimized.single.k8_runtime import (
     K8LogitsProcessor,
     _ChildGraphSequence,
     _K8GraphLifecycle,
+    _StaticInputArena,
     _capture_k8_entry,
     _k8_eligible,
     _processor_signature,
@@ -166,6 +167,61 @@ def test_runtime_slot_separates_sampling_modes():
     assert sampled is not greedy
     assert sampled.signature[-1] is True
     assert greedy.signature[-1] is False
+
+
+def test_shared_static_input_arena_preserves_addresses_and_refreshes_once_per_window():
+    marker = object()
+    first = {
+        "decoder_input_ids": torch.tensor([[3]]),
+        "cache_position": torch.tensor([4]),
+        "decoder_position_ids": torch.tensor([[4]]),
+        "decoder_attention_mask": torch.zeros((1, 1, 1, 8)),
+        "past_key_values": marker,
+    }
+    arena = _StaticInputArena.create(first, window_identity=1)
+    pointers = {
+        name: value.data_ptr()
+        for name, value in arena.static_inputs.items()
+        if isinstance(value, torch.Tensor)
+    }
+    second = {
+        "decoder_input_ids": torch.tensor([[9]]),
+        "cache_position": torch.tensor([7]),
+        "decoder_position_ids": torch.tensor([[7]]),
+        "decoder_attention_mask": torch.ones((1, 1, 1, 8)),
+        "past_key_values": marker,
+    }
+
+    arena.refresh(second, window_identity=2)
+
+    assert arena.refreshed_window_identity == 2
+    assert arena.static_inputs["decoder_input_ids"].tolist() == [[9]]
+    assert arena.static_inputs["cache_position"].tolist() == [7]
+    assert {
+        name: value.data_ptr()
+        for name, value in arena.static_inputs.items()
+        if isinstance(value, torch.Tensor)
+    } == pointers
+    with pytest.raises(RuntimeError, match="refreshed twice"):
+        arena.refresh(second, window_identity=2)
+
+
+def test_shared_static_input_arena_rejects_signature_or_owner_changes():
+    marker = object()
+    arena = _StaticInputArena.create(
+        {"decoder_input_ids": torch.tensor([[3]]), "cache": marker},
+        window_identity=1,
+    )
+    with pytest.raises(RuntimeError, match="signature changed"):
+        arena.refresh(
+            {"decoder_input_ids": torch.tensor([[3, 4]]), "cache": marker},
+            window_identity=2,
+        )
+    with pytest.raises(RuntimeError, match="signature changed"):
+        arena.refresh(
+            {"decoder_input_ids": torch.tensor([[3]]), "cache": object()},
+            window_identity=2,
+        )
 
 
 def test_graph_processor_owns_monotonic_temperature_and_lookback_state():
@@ -564,6 +620,53 @@ def test_capture_builds_distinct_k4_and_k1_remainder_parents(monkeypatch):
     assert entry.remainder_parent is parents[1]
 
 
+def test_capture_reuses_explicit_static_input_arena_without_cloning(monkeypatch):
+    @contextmanager
+    def device_guard(device):
+        yield
+
+    class Graph:
+        def __init__(self, keep_graph=False):
+            self.keep_graph = keep_graph
+
+    class Parent:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device", device_guard)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", Graph)
+    monkeypatch.setattr(torch.cuda, "graph", lambda graph: device_guard("cuda:0"))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda device: 0)
+    monkeypatch.setattr(
+        k8_runtime,
+        "_clone_static_graph_inputs",
+        lambda values: (_ for _ in ()).throw(AssertionError("must not clone")),
+    )
+    monkeypatch.setattr(k8_runtime, "_snapshot_tensors", lambda *args: [])
+    monkeypatch.setattr(k8_runtime, "_one_step_tail", lambda **kwargs: None)
+    monkeypatch.setattr(_ChildGraphSequence, "build", lambda *args, **kwargs: Parent())
+    state = SimpleNamespace(sequence=SimpleNamespace(device=torch.device("cuda", 0)))
+    arena = {"decoder_input_ids": torch.tensor([[1]])}
+    model = lambda **kwargs: SimpleNamespace(logits=torch.zeros((1, 1, 4)))
+
+    entry = _capture_k8_entry(
+        model,
+        arena,
+        active_prefix_length=128,
+        state=state,
+        processor=object(),
+        do_sample=True,
+        static_input_arena=arena,
+    )
+
+    assert entry.static_inputs is arena
+
+
 def test_k8_lifecycle_closes_graphs_at_session_transition_and_context_exit():
     class Graph:
         def __init__(self):
@@ -750,6 +853,35 @@ def test_install_exposes_and_restores_graph_remainder_policy():
     with install_k8_candidate(block_size=4, graph_remainders=True):
         assert k8_runtime._ACTIVE_GRAPH_REMAINDERS is True
     assert k8_runtime._ACTIVE_GRAPH_REMAINDERS is None
+
+
+def test_install_exposes_and_restores_shared_arena_and_transition_timing():
+    with install_k8_candidate(
+        block_size=4,
+        graph_remainders=True,
+        shared_static_input_arena=True,
+        transition_timing=True,
+    ):
+        assert k8_runtime._ACTIVE_SHARED_STATIC_INPUT_ARENA is True
+        assert k8_runtime._ACTIVE_TRANSITION_TIMING is True
+    assert k8_runtime._ACTIVE_SHARED_STATIC_INPUT_ARENA is None
+    assert k8_runtime._ACTIVE_TRANSITION_TIMING is None
+
+
+def test_shared_arena_requires_graphed_remainders_and_boolean_options():
+    with pytest.raises(ValueError, match="requires graphed remainders"):
+        with install_k8_candidate(block_size=4, shared_static_input_arena=True):
+            pass
+    with pytest.raises(TypeError, match="shared_static_input_arena"):
+        with install_k8_candidate(
+            block_size=4,
+            graph_remainders=True,
+            shared_static_input_arena=1,
+        ):
+            pass
+    with pytest.raises(TypeError, match="transition_timing"):
+        with install_k8_candidate(block_size=4, transition_timing=1):
+            pass
 
 
 def test_install_rejects_non_boolean_graph_remainder_policy():
