@@ -247,12 +247,13 @@ def _self_attention_block_forward(
     output_attentions: bool,
     layer_name: str,
     dispatch_counts: dict[str, int] | None,
-) -> tuple[torch.Tensor, tuple[Any, ...]]:
+) -> tuple[torch.Tensor, tuple[Any, ...]] | None:
     del max_seqlen
+    if hidden_states.shape[:2] != (1, 1):
+        return None
     _require_fp32_cuda(hidden_states, name="hidden states")
     if (
         module.training
-        or hidden_states.shape[:2] != (1, 1)
         or not isinstance(past_key_value, EncoderDecoderCache)
         or not isinstance(cache_position, torch.Tensor)
         or not isinstance(position_ids, torch.Tensor)
@@ -325,14 +326,15 @@ def _cross_mlp_tail_forward(
     encoder_cu_seqlens: torch.Tensor | None,
     layer_name: str,
     dispatch_counts: dict[str, int] | None,
-) -> tuple[Any, ...]:
+) -> tuple[Any, ...] | None:
+    if hidden_states.shape[:2] != (1, 1):
+        return None
     _require_fp32_cuda(hidden_states, name="hidden states")
     if (
         encoder_hidden_states is None
         or module.training
         or module.activation_dropout != 0
         or module.dropout != 0
-        or hidden_states.shape[:2] != (1, 1)
         or not isinstance(getattr(module, "activation_fn", None), GELUActivation)
         or not isinstance(past_key_value, EncoderDecoderCache)
         or output_attentions
@@ -400,9 +402,11 @@ def _defer_final_norm(
     module: torch.nn.Module,
     hidden_states: torch.Tensor,
     output_hidden_states: bool,
-) -> torch.Tensor:
+) -> torch.Tensor | None:
     if module is not state.final_norm:
         raise RuntimeError("weight-only candidate received an unowned final norm")
+    if hidden_states.shape[:2] != (1, 1):
+        return None
     if output_hidden_states:
         raise RuntimeError(
             "weight-only fused final projection does not support hidden-state output"
@@ -417,9 +421,11 @@ def _final_projection_forward(
     module: torch.nn.Module,
     hidden_states: torch.Tensor,
     dispatch_counts: dict[str, int] | None,
-) -> torch.Tensor:
+) -> torch.Tensor | None:
     if module is not state.final_projection:
         raise RuntimeError("weight-only candidate received an unowned output projection")
+    if hidden_states.shape[:2] != (1, 1):
+        return None
     logits = weight_only_rmsnorm_linear(
         hidden_states,
         state.final_norm.weight,

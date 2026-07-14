@@ -186,6 +186,24 @@ def test_final_norm_fusion_rejects_cpu_storage() -> None:
         )
 
 
+def test_final_norm_and_projection_fall_back_for_prefill_shapes() -> None:
+    state = _state(torch.nn.Module())
+    prefill = torch.zeros((1, 4, 4))
+
+    assert weight_only_runtime._defer_final_norm(
+        state=state,
+        module=state.final_norm,
+        hidden_states=prefill,
+        output_hidden_states=False,
+    ) is None
+    assert weight_only_runtime._final_projection_forward(
+        state=state,
+        module=state.final_projection,
+        hidden_states=prefill,
+        dispatch_counts=None,
+    ) is None
+
+
 def test_default_generation_profile_kwargs_do_not_expose_candidate(monkeypatch) -> None:
     captured = {}
 
@@ -232,3 +250,77 @@ def test_default_generation_profile_kwargs_do_not_expose_candidate(monkeypatch) 
     )
 
     assert "approximate_weight_only_state" not in captured
+
+
+def test_explicit_candidate_replaces_only_main_specialized_hooks(monkeypatch) -> None:
+    captured = []
+
+    def fake_profile_context(**kwargs):
+        captured.append(kwargs)
+        return nullcontext()
+
+    class FakeSession:
+        graph_count = 0
+        graph_capture_seconds = 0.0
+        graph_decode_replays = 0
+
+        @staticmethod
+        def cache_for_window(*args, **kwargs):
+            return object()
+
+        @staticmethod
+        def active_prefix_decode_kwargs():
+            return {}
+
+        @staticmethod
+        def graph_profile_summary():
+            return {}
+
+    model = SimpleNamespace(
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        generate=lambda **kwargs: torch.tensor([[1, 2]]),
+    )
+    state = _state(model)
+    monkeypatch.setattr(engine, "generation_profile_context", fake_profile_context)
+    monkeypatch.setattr(engine, "_build_logits_processor_list", lambda *args, **kwargs: [])
+    common_model_kwargs = {
+        "inputs": torch.zeros((1, 1)),
+        "decoder_input_ids": torch.tensor([[1]]),
+        "decoder_attention_mask": torch.tensor([[1]]),
+    }
+
+    _, main_stats = engine._generate_window(
+        model,
+        SimpleNamespace(pad_id=0, eos_id=2, context_eos={}),
+        common_model_kwargs,
+        {"pad_token_id": 0},
+        context_state=FakeSession(),
+        preset=engine.OPTIMIZED_PRESETS["fp32"],
+        approximate_weight_only_state=state,
+    )
+    _, timing_stats = engine._generate_window(
+        model,
+        SimpleNamespace(pad_id=0, eos_id=2, context_eos={}),
+        common_model_kwargs,
+        {"pad_token_id": 0, "context_type": "timing"},
+        context_state=FakeSession(),
+        preset=engine.OPTIMIZED_PRESETS["fp32"],
+        approximate_weight_only_state=state,
+    )
+
+    assert captured[0]["approximate_weight_only_state"] is state
+    assert captured[0]["native_q1_self_attention"] is False
+    assert captured[0]["native_q1_rope_cache_self_attention"] is False
+    assert captured[0]["native_cross_mlp_tail"] is False
+    assert "approximate_weight_only_state" not in captured[1]
+    assert main_stats["optimized_dispatch_mode"] == "approximate_weight_only_batch1"
+    assert main_stats["approximate_weight_only"]["exactness_claim"] is False
+    assert timing_stats["optimized_dispatch_mode"] == "accepted_batch1"
+    assert timing_stats["optimized_dispatch_policy"]["approximate_weight_only"] == {
+        "requested": True,
+        "enabled": False,
+        "disabled_reason": "timing_context",
+        "result_class": "documented-drift",
+        "exactness_claim": False,
+    }
