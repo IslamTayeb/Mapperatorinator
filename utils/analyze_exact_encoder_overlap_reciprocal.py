@@ -341,6 +341,31 @@ def _material_exactness(audits: dict[str, dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _overlap_material_exactness(
+    candidate_evidence: dict[str, dict[str, Any]],
+    material_audits: dict[str, dict[str, Any]],
+) -> dict[str, bool]:
+    report = {
+        "candidate_runs_equal": (
+            candidate_evidence["candidate_first"][
+                "encoder_output_sha256_per_window"
+            ]
+            == candidate_evidence["candidate_second"][
+                "encoder_output_sha256_per_window"
+            ]
+        ),
+        "last_overlap_matches_consumed_encoder": all(
+            candidate_evidence[role]["encoder_output_sha256_per_window"][-1]
+            == material_audits[role]["stages"]["main_generation"]["encoder"][
+                "sha256"
+            ]
+            for role in ("candidate_first", "candidate_second")
+        ),
+    }
+    report["pass"] = all(report.values())
+    return report
+
+
 def _validate_baseline(profile: dict[str, Any], evidence: dict[str, Any]) -> None:
     if evidence.get("mode") != "baseline" or evidence.get("encoder_overlap") is not None:
         raise ValueError("baseline evidence unexpectedly contains overlap")
@@ -431,25 +456,9 @@ def analyze(
         for role in profiles
     }
     material_exactness = _material_exactness(material_audits)
-    overlap_material_exactness = {
-        "candidate_runs_equal": (
-            candidate_evidence["candidate_first"][
-                "encoder_output_sha256_per_window"
-            ]
-            == candidate_evidence["candidate_second"][
-                "encoder_output_sha256_per_window"
-            ]
-        ),
-        "last_overlap_matches_consumed_encoder": all(
-            candidate_evidence[role]["encoder_output_sha256_per_window"][-1]
-            == material_audits[role]["stages"]["main_generation"]["encoder"][
-                "sha256"
-            ]
-            for role in ("candidate_first", "candidate_second")
-        ),
-    }
-    overlap_material_exactness["pass"] = all(
-        overlap_material_exactness.values()
+    overlap_material_exactness = _overlap_material_exactness(
+        candidate_evidence,
+        material_audits,
     )
     reciprocal = compare_reciprocal_profiles(
         profile_paths["baseline_first"],

@@ -8,6 +8,7 @@ WRAPPER = ROOT / "scripts" / "dcc" / "verify_exact_encoder_overlap_full_song_rec
 def test_wrapper_is_pinned_reciprocal_and_never_enables_batched_encoder():
     source = WRAPPER.read_text(encoding="utf-8")
     assert "#SBATCH --gres=gpu:2080:1" in source
+    assert "#SBATCH --time=00:30:00" in source
     assert "precision=fp32" in source
     assert "inference_engine=optimized" in source
     assert "auto_select_gamemode_model=true" in source
@@ -18,6 +19,7 @@ def test_wrapper_is_pinned_reciprocal_and_never_enables_batched_encoder():
     assert source.count("--initialization-path") == 1
     assert source.count("validate_weight_only_full_song_profile.py") == 1
     assert source.count("validate_k4_profile_contract.py") == 1
+    assert source.count("validate_k1_remainder_profile.py") == 1
     assert "profile_batched_encoder_precompute_ceiling" not in source
     assert "ENCODER_BATCH_SIZE" not in source
 
@@ -52,5 +54,6 @@ def test_overlap_keeps_current_combined_runtime_and_original_decoder_forward():
     ).read_text(encoding="utf-8")
     assert "run_k4_shared_rope_approximate_weight_only" in runner
     assert "run_current_topology" in runner
+    assert "graph_remainders=True" in runner
     assert "VarWhisperDecoderLayer" not in overlap
     assert ".forward =" not in overlap

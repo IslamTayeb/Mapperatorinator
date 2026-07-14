@@ -10,6 +10,7 @@ from osuT5.osuT5.inference.optimized.scout.encoder_overlap import (
 from utils.analyze_exact_encoder_overlap_reciprocal import (
     _exact_signatures,
     _material_exactness,
+    _overlap_material_exactness,
     _text,
     _validate_candidate,
     _validate_material_audit,
@@ -176,6 +177,28 @@ def test_material_audit_requires_profile_identity_and_raw_kv_rng_exactness():
         "aggregate_sha256"
     ] = "d" * 64
     assert not _material_exactness(audits)["pass"]
+
+
+def test_overlap_digest_matches_the_encoder_output_consumed_by_main():
+    overlap = _overlap()
+    consumed_digest = overlap["encoder_output_sha256_per_window"][-1]
+    candidate_evidence = {
+        role: copy.deepcopy(overlap)
+        for role in ("candidate_first", "candidate_second")
+    }
+    material_audits = {
+        role: _material_audit(consumed_digest)
+        for role in ("candidate_first", "candidate_second")
+    }
+
+    assert _overlap_material_exactness(candidate_evidence, material_audits)["pass"]
+
+    material_audits["candidate_second"]["stages"]["main_generation"][
+        "encoder"
+    ]["sha256"] = "0" * 64
+    report = _overlap_material_exactness(candidate_evidence, material_audits)
+    assert not report["last_overlap_matches_consumed_encoder"]
+    assert not report["pass"]
 
 
 def test_text_report_contains_overlap_and_timing_costs():

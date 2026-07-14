@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=rope-encoder-overlap
+#SBATCH --job-name=k1-encoder-overlap
 #SBATCH --partition=gpu-common
 #SBATCH --account=romerolab
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
 #SBATCH --gres=gpu:2080:1
-#SBATCH --time=02:00:00
+#SBATCH --time=00:30:00
 #SBATCH --output=/work/imt11/Mapperatorinator/logs/%x-%j.out
 #SBATCH --error=/work/imt11/Mapperatorinator/logs/%x-%j.err
 
@@ -20,7 +20,7 @@ BRANCH=${MAPPERATORINATOR_BRANCH:?Set MAPPERATORINATOR_BRANCH}
 REMOTE=${MAPPERATORINATOR_REMOTE:-origin}
 PROFILE_CONFIG=${PROFILE_CONFIG:-profile_salvalai}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
-RUN_LABEL=${RUN_LABEL:-shared-rope-exact-encoder-overlap-reciprocal}
+RUN_LABEL=${RUN_LABEL:-k1-exact-encoder-overlap-reciprocal}
 RUN_ROOT="$WORK/runs/$RUN_LABEL-${SLURM_JOB_ID:-manual}"
 TORCH_EXTENSIONS_DIR="$WORK/torch_extensions/shared-overlap-$COMMIT"
 
@@ -196,6 +196,9 @@ run_profile() {
   "$PYTHON" utils/validate_k4_profile_contract.py \
     --profile "$profile" --role candidate --block-size 4 \
     > "$RUN_ROOT/$role.k4-validation.json"
+  "$PYTHON" utils/validate_k1_remainder_profile.py \
+    --profile "$profile" --role candidate \
+    > "$RUN_ROOT/$role.k1-validation.json"
 }
 
 run_profile baseline_first baseline

@@ -89,7 +89,12 @@ def run(
             if mode == "candidate"
             else nullcontext(None)
         )
-        run_current_topology(config_name, overrides, initialization_path)
+        run_current_topology(
+            config_name,
+            overrides,
+            initialization_path,
+            graph_remainders=True,
+        )
     run_wall_seconds = time.perf_counter() - started
     if not math.isfinite(run_wall_seconds) or run_wall_seconds <= 0:
         raise RuntimeError("encoder-overlap runner produced invalid wall time")
