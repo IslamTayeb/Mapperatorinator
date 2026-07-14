@@ -1,11 +1,17 @@
 import hashlib
 import json
+from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from utils.final_confirmation_runtime import (
+    RUNTIME_SPEC_SCHEMA_VERSION,
+    KBlockSharedRopeWeightPlugin,
+    load_runtime_plugin,
+)
 from utils.analyze_final_confirmation import _memory_stability
 from utils.run_final_confirmation import (
     MANIFEST_SCHEMA_VERSION,
@@ -88,6 +94,72 @@ def test_fixed_work_runtime_fails_on_extra_or_missing_windows() -> None:
         )
 
 
+def test_separate_timing_main_bindings_share_fixed_work_indices() -> None:
+    indices = defaultdict(int)
+    records = []
+    timing = ConfirmationRuntime(
+        _Runtime(),
+        mode="replay-fixed-work",
+        manifest=_manifest(),
+        indices=indices,
+        records=records,
+    )
+    main = ConfirmationRuntime(
+        _Runtime(),
+        mode="replay-fixed-work",
+        manifest=_manifest(),
+        indices=indices,
+        records=records,
+    )
+    prompt = torch.ones((1, 5), dtype=torch.long)
+    tokenizer = SimpleNamespace(eos_id=99, context_eos={}, pad_id=0)
+    timing.generate_window(
+        tokenizer=tokenizer,
+        model_kwargs={"decoder_input_ids": prompt},
+        generate_kwargs={"context_type": "timing"},
+    )
+    main.generate_window(
+        tokenizer=tokenizer,
+        model_kwargs={"decoder_input_ids": prompt},
+        generate_kwargs={"context_type": "map"},
+    )
+    timing.validate_complete()
+    assert [record["profile_label"] for record in records] == [
+        "timing_context",
+        "main_generation",
+    ]
+
+
+def test_runtime_spec_is_imported_without_touching_production_selectors(
+    tmp_path: Path,
+) -> None:
+    spec = tmp_path / "runtime.json"
+    spec.write_text(
+        json.dumps(
+            {
+                "schema_version": RUNTIME_SPEC_SCHEMA_VERSION,
+                "name": "selected-fast-runtime",
+                "factory": (
+                    "utils.final_confirmation_runtime:"
+                    "kblock_shared_rope_weight_plugin"
+                ),
+                "kwargs": {
+                    "block_size": 4,
+                    "graph_remainders": True,
+                    "initializer_name": "initialize_approximate_int8_mlp_weight_only",
+                },
+            }
+        )
+    )
+    plugin = load_runtime_plugin(spec)
+    assert isinstance(plugin, KBlockSharedRopeWeightPlugin)
+    assert plugin.name == "selected-fast-runtime"
+
+    spec.write_text(json.dumps({"schema_version": "wrong"}))
+    with pytest.raises(ValueError, match="schema"):
+        load_runtime_plugin(spec)
+
+
 def test_fixed_work_executes_target_but_returns_natural_eos_prefix() -> None:
     class EosRuntime(_Runtime):
         def generate_window(self, **kwargs):
@@ -166,6 +238,11 @@ def test_dcc_wrapper_is_one_serial_authoritative_json_text_gate() -> None:
     assert "#SBATCH --gres=gpu:2080:1" in source
     assert "EXPECTED_MAIN_STEPS=${EXPECTED_MAIN_STEPS:-8294}" in source
     assert "FIXED_REPETITIONS=${FIXED_REPETITIONS:-5}" in source
+    assert "NATURAL_REPETITIONS=${NATURAL_REPETITIONS:-5}" in source
+    assert "CANDIDATE_RUNTIME_SPEC" in source
+    assert "--runtime-spec" in source
+    assert "MAPPERATORINATOR_REMOTE_BRANCH" in source
+    assert '[[ "$BRANCH" == DETACHED ]]' in source
     assert "utils/run_final_confirmation.py" in source
     assert "utils/run_serial_final_confirmation.py" in source
     assert "utils/analyze_final_confirmation.py" in source

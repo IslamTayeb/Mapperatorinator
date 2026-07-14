@@ -8,6 +8,7 @@ import json
 import sys
 import time
 import uuid
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +18,12 @@ if str(REPO_ROOT) not in sys.path:
 
 from osuT5.osuT5.inference.engine_binding import InferenceEngineBinding
 from osuT5.osuT5.inference.profiler import InferenceProfiler
-from utils.run_approximate_weight_only import _initialize_with_evidence, _load_args
+from utils.final_confirmation_runtime import load_runtime_plugin
+from utils.fixed_seed_inference import (
+    fixed_seed_processor_generation,
+    rng_state_fingerprints,
+)
+from utils.run_approximate_weight_only import _load_args
 from utils.run_final_confirmation import ConfirmationRuntime, _sha256_file
 
 
@@ -58,10 +64,13 @@ def run(
     output_root: Path,
     evidence_path: Path,
     candidate: bool,
+    runtime_spec_path: Path | None,
     initialization_path: Path | None,
 ) -> None:
+    if candidate != (runtime_spec_path is not None):
+        raise ValueError("candidate suite requires exactly one runtime spec")
     if candidate != (initialization_path is not None):
-        raise ValueError("candidate suite requires exactly one initialization path")
+        raise ValueError("candidate suite requires exactly one runtime evidence path")
     import torch
     import inference
 
@@ -74,116 +83,137 @@ def run(
     )
     inference.compile_args(first_args, verbose=False)
     inference.setup_inference_environment(first_args.seed)
-    model_load_started = time.perf_counter()
-    binding, tokenizer = inference.load_model_with_engine(
-        first_args.model_path,
-        first_args.train,
-        first_args.device,
-        max_batch_size=first_args.max_batch_size,
-        use_server=first_args.use_server,
-        precision=first_args.precision,
-        attn_implementation=first_args.attn_implementation,
-        lora_path=first_args.lora_path,
-        gamemode=first_args.gamemode,
-        auto_select_gamemode_model=first_args.auto_select_gamemode_model,
-        inference_engine=first_args.inference_engine,
+    plugin = load_runtime_plugin(runtime_spec_path)
+    stack = ExitStack()
+    stack.enter_context(plugin)
+    stack.enter_context(
+        fixed_seed_processor_generation(inference, base_seed=first_args.seed)
     )
-    torch.cuda.synchronize()
-    model_load_seconds = time.perf_counter() - model_load_started
-    if not isinstance(binding, InferenceEngineBinding):
-        raise TypeError("serial confirmation requires an optimized engine binding")
-    initialization = None
-    if candidate:
-        initializer = getattr(binding.runtime, "initialize_approximate_weight_only", None)
-        if initializer is None:
-            raise RuntimeError("candidate runtime lacks approximate-weight initialization")
-        initialization = _initialize_with_evidence(initializer, binding.raw_model)
-        assert initialization_path is not None
+    rng_before = rng_state_fingerprints()
+    model_load_started = time.perf_counter()
+    try:
+        binding, tokenizer = inference.load_model_with_engine(
+            first_args.model_path,
+            first_args.train,
+            first_args.device,
+            max_batch_size=first_args.max_batch_size,
+            use_server=first_args.use_server,
+            precision=first_args.precision,
+            attn_implementation=first_args.attn_implementation,
+            lora_path=first_args.lora_path,
+            gamemode=first_args.gamemode,
+            auto_select_gamemode_model=first_args.auto_select_gamemode_model,
+            inference_engine=first_args.inference_engine,
+        )
+        torch.cuda.synchronize()
+        model_load_seconds = time.perf_counter() - model_load_started
+        if not isinstance(binding, InferenceEngineBinding):
+            raise TypeError("serial confirmation requires an optimized engine binding")
+        binding = plugin.transform_binding(binding, binding_index=0)
+        runtime = ConfirmationRuntime(binding.runtime, mode="natural", manifest=None)
+        binding = InferenceEngineBinding(binding.raw_model, runtime)
+
+        runs: list[dict[str, Any]] = []
+        for index, song in enumerate(songs):
+            song_output = output_root / song["name"]
+            song_output.mkdir(parents=True, exist_ok=False)
+            args = _load_args(
+                config_name,
+                [
+                    *overrides,
+                    f"audio_path={song['audio_path']}",
+                    f"output_path={song_output}",
+                ],
+            )
+            profiler = InferenceProfiler.from_args(args)
+            with profiler.stage("compile_args"):
+                inference.compile_args(args, verbose=False)
+            with profiler.stage("setup_inference_environment"):
+                inference.setup_inference_environment(args.seed)
+            if (
+                args.model_path != first_args.model_path
+                or args.precision != first_args.precision
+                or args.inference_engine != first_args.inference_engine
+                or inference.should_load_separate_timing_model(args)
+            ):
+                raise RuntimeError(
+                    "serial confirmation songs must share one timing/main model"
+                )
+            with profiler.stage("build_generation_config"):
+                generation_config, beatmap_config = inference.get_config(args)
+            gc.collect()
+            torch.cuda.synchronize()
+            allocated_before = int(torch.cuda.memory_allocated())
+            reserved_before = int(torch.cuda.memory_reserved())
+            torch.cuda.reset_peak_memory_stats()
+            rng_song_before = rng_state_fingerprints()
+            record_start = len(runtime.records)
+            _, result_path = inference.generate(
+                args,
+                generation_config=generation_config,
+                beatmap_config=beatmap_config,
+                model=binding,
+                tokenizer=tokenizer,
+                profiler=profiler,
+                verbose=False,
+            )
+            torch.cuda.synchronize()
+            rng_song_after = rng_state_fingerprints()
+            record_end = len(runtime.records)
+            gc.collect()
+            torch.cuda.synchronize()
+            result_path = Path(result_path).resolve()
+            profile_path = result_path.with_name(result_path.name + ".profile.json")
+            if not profile_path.is_file():
+                raise RuntimeError(f"serial song profile is missing: {profile_path}")
+            song_records = runtime.records[record_start:record_end]
+            logical = {
+                label: sum(
+                    int(record["logical_steps"])
+                    for record in song_records
+                    if record["profile_label"] == label
+                )
+                for label in ("timing_context", "main_generation")
+            }
+            if min(logical.values()) <= 0:
+                raise RuntimeError(f"serial song {song['name']} lacks timing/main work")
+            runs.append(
+                {
+                    "index": index,
+                    "name": song["name"],
+                    "audio_path": song["audio_path"],
+                    "audio_sha256": song["sha256"],
+                    "profile_path": str(profile_path),
+                    "profile_sha256": _sha256_file(profile_path),
+                    "result_path": str(result_path),
+                    "result_sha256": _sha256_file(result_path),
+                    "logical_steps": logical,
+                    "rng": {
+                        "before": rng_song_before,
+                        "after": rng_song_after,
+                    },
+                    "cuda_memory": {
+                        "allocated_bytes_before": allocated_before,
+                        "allocated_bytes_after": int(torch.cuda.memory_allocated()),
+                        "allocated_bytes_delta": (
+                            int(torch.cuda.memory_allocated()) - allocated_before
+                        ),
+                        "reserved_bytes_before": reserved_before,
+                        "reserved_bytes_after": int(torch.cuda.memory_reserved()),
+                        "max_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+                        "max_reserved_bytes": int(torch.cuda.max_memory_reserved()),
+                    },
+                }
+            )
+    finally:
+        stack.close()
+    rng_after = rng_state_fingerprints()
+    runtime_evidence = plugin.evidence()
+    if initialization_path is not None:
         initialization_path.parent.mkdir(parents=True, exist_ok=True)
         initialization_path.write_text(
-            json.dumps(initialization, indent=2, sort_keys=True) + "\n",
+            json.dumps(runtime_evidence, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
-        )
-    runtime = ConfirmationRuntime(binding.runtime, mode="natural", manifest=None)
-    binding = InferenceEngineBinding(binding.raw_model, runtime)
-
-    runs: list[dict[str, Any]] = []
-    for index, song in enumerate(songs):
-        song_output = output_root / song["name"]
-        song_output.mkdir(parents=True, exist_ok=False)
-        args = _load_args(
-            config_name,
-            [*overrides, f"audio_path={song['audio_path']}", f"output_path={song_output}"],
-        )
-        profiler = InferenceProfiler.from_args(args)
-        with profiler.stage("compile_args"):
-            inference.compile_args(args, verbose=False)
-        with profiler.stage("setup_inference_environment"):
-            inference.setup_inference_environment(args.seed)
-        if (
-            args.model_path != first_args.model_path
-            or args.precision != first_args.precision
-            or args.inference_engine != first_args.inference_engine
-            or inference.should_load_separate_timing_model(args)
-        ):
-            raise RuntimeError("serial confirmation songs must share one timing/main model")
-        with profiler.stage("build_generation_config"):
-            generation_config, beatmap_config = inference.get_config(args)
-        gc.collect()
-        torch.cuda.synchronize()
-        allocated_before = int(torch.cuda.memory_allocated())
-        reserved_before = int(torch.cuda.memory_reserved())
-        torch.cuda.reset_peak_memory_stats()
-        record_start = len(runtime.records)
-        _, result_path = inference.generate(
-            args,
-            generation_config=generation_config,
-            beatmap_config=beatmap_config,
-            model=binding,
-            tokenizer=tokenizer,
-            profiler=profiler,
-            verbose=False,
-        )
-        torch.cuda.synchronize()
-        record_end = len(runtime.records)
-        gc.collect()
-        torch.cuda.synchronize()
-        result_path = Path(result_path).resolve()
-        profile_path = result_path.with_name(result_path.name + ".profile.json")
-        if not profile_path.is_file():
-            raise RuntimeError(f"serial song profile is missing: {profile_path}")
-        song_records = runtime.records[record_start:record_end]
-        logical = {
-            label: sum(
-                int(record["logical_steps"])
-                for record in song_records
-                if record["profile_label"] == label
-            )
-            for label in ("timing_context", "main_generation")
-        }
-        if min(logical.values()) <= 0:
-            raise RuntimeError(f"serial song {song['name']} lacks timing/main work")
-        runs.append(
-            {
-                "index": index,
-                "name": song["name"],
-                "audio_path": song["audio_path"],
-                "audio_sha256": song["sha256"],
-                "profile_path": str(profile_path),
-                "profile_sha256": _sha256_file(profile_path),
-                "result_path": str(result_path),
-                "result_sha256": _sha256_file(result_path),
-                "logical_steps": logical,
-                "cuda_memory": {
-                    "allocated_bytes_before": allocated_before,
-                    "allocated_bytes_after": int(torch.cuda.memory_allocated()),
-                    "allocated_bytes_delta": int(torch.cuda.memory_allocated()) - allocated_before,
-                    "reserved_bytes_before": reserved_before,
-                    "reserved_bytes_after": int(torch.cuda.memory_reserved()),
-                    "max_allocated_bytes": int(torch.cuda.max_memory_allocated()),
-                    "max_reserved_bytes": int(torch.cuda.max_memory_reserved()),
-                },
-            }
         )
     evidence = {
         "schema_version": SCHEMA_VERSION,
@@ -195,14 +225,22 @@ def run(
         "startup": {
             "model_load_seconds": model_load_seconds,
             "candidate_initialization_seconds": (
-                float(initialization["initialization_wall_seconds"])
-                if initialization is not None
+                float(runtime_evidence["initialization"]["initialization_wall_seconds"])
+                if runtime_evidence["initialization"] is not None
                 else 0.0
             ),
         },
         "song_manifest_path": str(song_manifest.resolve()),
         "song_manifest_sha256": _sha256_file(song_manifest),
-        "initialization": initialization,
+        "runtime": runtime_evidence,
+        "runtime_spec_path": (
+            str(runtime_spec_path.resolve()) if runtime_spec_path is not None else None
+        ),
+        "runtime_spec_sha256": (
+            _sha256_file(runtime_spec_path) if runtime_spec_path is not None else None
+        ),
+        "rng": {"before": rng_before, "after": rng_after},
+        "initialization": runtime_evidence["initialization"],
         "runs": runs,
     }
     evidence_path.parent.mkdir(parents=True, exist_ok=True)
@@ -219,6 +257,7 @@ def main() -> None:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--evidence-path", type=Path, required=True)
     parser.add_argument("--candidate", action="store_true")
+    parser.add_argument("--runtime-spec", type=Path)
     parser.add_argument("--initialization-path", type=Path)
     parser.add_argument("overrides", nargs="*")
     parsed = parser.parse_args()
@@ -229,6 +268,7 @@ def main() -> None:
         output_root=parsed.output_root,
         evidence_path=parsed.evidence_path,
         candidate=parsed.candidate,
+        runtime_spec_path=parsed.runtime_spec,
         initialization_path=parsed.initialization_path,
     )
 

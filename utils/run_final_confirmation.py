@@ -24,7 +24,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from osuT5.osuT5.inference.engine_binding import InferenceEngineBinding
-from utils.run_approximate_weight_only import _initialize_with_evidence, _load_args
+from utils.final_confirmation_runtime import load_runtime_plugin
+from utils.fixed_seed_inference import (
+    fixed_seed_processor_generation,
+    rng_state_fingerprints,
+)
+from utils.run_approximate_weight_only import _load_args
 
 
 SCHEMA_VERSION = "mapperatorinator.final-confirmation-run.v1"
@@ -65,12 +70,14 @@ class ConfirmationRuntime:
         *,
         mode: str,
         manifest: dict[str, Any] | None,
+        indices: defaultdict[str, int] | None = None,
+        records: list[dict[str, Any]] | None = None,
     ) -> None:
         self._runtime = runtime
         self._mode = mode
         self._manifest = manifest
-        self._indices: defaultdict[str, int] = defaultdict(int)
-        self.records: list[dict[str, Any]] = []
+        self._indices = indices if indices is not None else defaultdict(int)
+        self.records = records if records is not None else []
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._runtime, name)
@@ -207,6 +214,7 @@ def run(
     *,
     mode: str,
     candidate: bool,
+    runtime_spec_path: Path | None,
     manifest_path: Path | None,
     evidence_path: Path,
     initialization_path: Path | None,
@@ -220,8 +228,10 @@ def run(
         raise ValueError("natural confirmation must not receive a fixed-work manifest")
     if mode != "natural" and manifest_path is None:
         raise ValueError("fixed-work confirmation requires --manifest-path")
+    if candidate != (runtime_spec_path is not None):
+        raise ValueError("candidate mode requires exactly one runtime spec")
     if candidate != (initialization_path is not None):
-        raise ValueError("candidate mode requires exactly one initialization evidence path")
+        raise ValueError("candidate mode requires exactly one runtime evidence path")
 
     import torch
     import inference
@@ -240,41 +250,47 @@ def run(
             )
 
     original_loader = inference.load_model_with_engine
-    wrapped_runtime: ConfirmationRuntime | None = None
-    initialization = None
+    wrapped_runtimes: list[ConfirmationRuntime] = []
+    shared_indices: defaultdict[str, int] = defaultdict(int)
+    shared_records: list[dict[str, Any]] = []
+    plugin = load_runtime_plugin(runtime_spec_path)
 
     def loader(*loader_args: Any, **loader_kwargs: Any):
-        nonlocal wrapped_runtime, initialization
-        if wrapped_runtime is not None:
-            raise RuntimeError("final confirmation supports one shared timing/main model only")
         binding, tokenizer = original_loader(*loader_args, **loader_kwargs)
         if not isinstance(binding, InferenceEngineBinding):
             raise TypeError("final confirmation requires an optimized engine binding")
-        if candidate:
-            initializer = getattr(binding.runtime, "initialize_approximate_weight_only", None)
-            if initializer is None:
-                raise RuntimeError("candidate runtime lacks approximate-weight initialization")
-            initialization = _initialize_with_evidence(initializer, binding.raw_model)
-            assert initialization_path is not None
-            initialization_path.parent.mkdir(parents=True, exist_ok=True)
-            initialization_path.write_text(
-                json.dumps(initialization, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
-        wrapped_runtime = ConfirmationRuntime(binding.runtime, mode=mode, manifest=manifest)
+        binding = plugin.transform_binding(binding, binding_index=len(wrapped_runtimes))
+        wrapped_runtime = ConfirmationRuntime(
+            binding.runtime,
+            mode=mode,
+            manifest=manifest,
+            indices=shared_indices,
+            records=shared_records,
+        )
+        wrapped_runtimes.append(wrapped_runtime)
         return InferenceEngineBinding(binding.raw_model, wrapped_runtime), tokenizer
 
     inference.load_model_with_engine = loader
     process_started = time.time_ns()
     torch.cuda.reset_peak_memory_stats()
+    rng_before = rng_state_fingerprints()
     try:
-        _, result_path = inference.main(args)
+        with plugin, fixed_seed_processor_generation(inference, base_seed=args.seed):
+            _, result_path = inference.main(args)
     finally:
         inference.load_model_with_engine = original_loader
-    if wrapped_runtime is None:
+    rng_after = rng_state_fingerprints()
+    if not wrapped_runtimes:
         raise RuntimeError("confirmation model was never loaded")
-    wrapped_runtime.validate_complete()
-    labels = _recorded_labels(wrapped_runtime.records)
+    wrapped_runtimes[0].validate_complete()
+    labels = _recorded_labels(shared_records)
+    runtime_evidence = plugin.evidence()
+    if initialization_path is not None:
+        initialization_path.parent.mkdir(parents=True, exist_ok=True)
+        initialization_path.write_text(
+            json.dumps(runtime_evidence, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     if mode == "record-fixed-work":
         assert manifest_path is not None
         if sum(labels["main_generation"]) != expected_main_steps:
@@ -323,14 +339,25 @@ def run(
             }
             for label, counts in labels.items()
         },
-        "records": wrapped_runtime.records,
+        "records": shared_records,
+        "runtime": runtime_evidence,
+        "runtime_spec_path": (
+            str(runtime_spec_path.resolve()) if runtime_spec_path is not None else None
+        ),
+        "runtime_spec_sha256": (
+            _sha256_file(runtime_spec_path) if runtime_spec_path is not None else None
+        ),
+        "rng": {
+            "before": rng_before,
+            "after": rng_after,
+        },
         "cuda_memory": {
             "allocated_bytes": int(torch.cuda.memory_allocated()),
             "reserved_bytes": int(torch.cuda.memory_reserved()),
             "max_allocated_bytes": int(torch.cuda.max_memory_allocated()),
             "max_reserved_bytes": int(torch.cuda.max_memory_reserved()),
         },
-        "initialization": initialization,
+        "initialization": runtime_evidence["initialization"],
     }
     evidence_path.parent.mkdir(parents=True, exist_ok=True)
     evidence_path.write_text(
@@ -344,6 +371,7 @@ def main() -> None:
     parser.add_argument("--config-name", default="profile_salvalai")
     parser.add_argument("--mode", choices=MODES, required=True)
     parser.add_argument("--candidate", action="store_true")
+    parser.add_argument("--runtime-spec", type=Path)
     parser.add_argument("--manifest-path", type=Path)
     parser.add_argument("--evidence-path", type=Path, required=True)
     parser.add_argument("--initialization-path", type=Path)
@@ -355,6 +383,7 @@ def main() -> None:
         parsed.overrides,
         mode=parsed.mode,
         candidate=parsed.candidate,
+        runtime_spec_path=parsed.runtime_spec,
         manifest_path=parsed.manifest_path,
         evidence_path=parsed.evidence_path,
         initialization_path=parsed.initialization_path,
