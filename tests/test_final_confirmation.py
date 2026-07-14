@@ -166,6 +166,8 @@ def test_dcc_wrapper_is_one_serial_authoritative_json_text_gate() -> None:
     assert "#SBATCH --gres=gpu:2080:1" in source
     assert "EXPECTED_MAIN_STEPS=${EXPECTED_MAIN_STEPS:-8294}" in source
     assert "FIXED_REPETITIONS=${FIXED_REPETITIONS:-5}" in source
+    assert "MAPPERATORINATOR_REMOTE_BRANCH" in source
+    assert '[[ "$BRANCH" == DETACHED ]]' in source
     assert "utils/run_final_confirmation.py" in source
     assert "utils/run_serial_final_confirmation.py" in source
     assert "utils/analyze_final_confirmation.py" in source
