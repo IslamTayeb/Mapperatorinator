@@ -63,6 +63,8 @@ def _overlap():
         "encoder_after_timing_seconds": 0.1,
         "main_join_wait_seconds": 0.1,
         "per_row_main_join_wait_seconds": [0.05, 0.05],
+        "pinned_input_bytes": 80,
+        "device_input_copy_bytes": 80,
         "output_store_bytes": 100,
         "peak_allocated_vram_bytes": 1000,
         "peak_reserved_vram_bytes": 1200,
