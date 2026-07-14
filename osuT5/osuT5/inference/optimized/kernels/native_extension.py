@@ -11,6 +11,7 @@ from pathlib import Path
 import shutil
 import sys
 import sysconfig
+import time
 from typing import Any
 
 import torch
@@ -202,9 +203,14 @@ def _load_direct(kwargs: Mapping[str, Any], manifest_path: Path):
 def load_inline_or_prebuilt(**kwargs):
     """Use normal lazy JIT resolution unless an explicit manifest is selected."""
 
+    started = time.perf_counter()
     manifest_value = os.environ.get(MANIFEST_ENV)
     if manifest_value:
-        return _load_direct(kwargs, Path(manifest_value).expanduser().resolve())
+        module = _load_direct(kwargs, Path(manifest_value).expanduser().resolve())
+        _LOADED_EXTENSIONS[str(kwargs["name"])]["load_seconds"] = (
+            time.perf_counter() - started
+        )
+        return module
     from torch.utils.cpp_extension import load_inline
 
     module = load_inline(**kwargs)
@@ -216,6 +222,7 @@ def load_inline_or_prebuilt(**kwargs):
         "library": str(library),
         "library_sha256": _sha256_file(library),
         "functions": list(kwargs.get("functions") or []),
+        "load_seconds": time.perf_counter() - started,
     }
     return module
 

@@ -44,6 +44,7 @@ def test_combined_runner_scopes_shared_rope_to_main_and_restores_everything(
     tmp_path,
 ) -> None:
     import inference
+    from osuT5.osuT5.inference.optimized.kernels import native_extension
 
     events: list[object] = []
     original_loader = inference.load_model_with_engine
@@ -94,9 +95,20 @@ def test_combined_runner_scopes_shared_rope_to_main_and_restores_everything(
     monkeypatch.setattr(combined, "install_k8_candidate", fake_k4)
     monkeypatch.setattr(combined, "run_weight_only", fake_weight_run)
     monkeypatch.setattr(combined, "SharedRopeStats", _Stats)
+    monkeypatch.setattr(
+        native_extension,
+        "loaded_extension_records",
+        lambda: {"example": {"mode": "direct", "load_seconds": 0.1}},
+    )
     output = tmp_path / "init.json"
+    extension_output = tmp_path / "extensions.json"
 
-    combined.run("profile_salvalai", ["seed=12345"], output)
+    combined.run(
+        "profile_salvalai",
+        ["seed=12345"],
+        output,
+        extension_output,
+    )
 
     assert events == [
         ("k4-enter", 4),
@@ -113,6 +125,9 @@ def test_combined_runner_scopes_shared_rope_to_main_and_restores_everything(
     assert payload["shared_rope"]["scope"] == "main-model-only"
     assert payload["shared_rope"]["incremental_exactness_claim"] is True
     assert payload["shared_rope"]["stats"]["reuses"] == 33
+    assert json.loads(extension_output.read_text(encoding="utf-8")) == {
+        "example": {"load_seconds": 0.1, "mode": "direct"}
+    }
     monkeypatch.setattr(inference, "load_model_with_engine", original_loader)
 
 

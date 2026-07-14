@@ -256,9 +256,16 @@ class NativeExtensionManifestTest(unittest.TestCase):
 
     def test_importing_policy_does_not_import_cpp_extension(self) -> None:
         source = """
+import os
 import sys
-import osuT5.osuT5.inference.optimized.kernels.native_extension
+os.environ.pop("MAPPERATORINATOR_NATIVE_EXTENSION_MANIFEST", None)
+from osuT5.osuT5.inference.optimized.kernels import decoder_layer, q1_attention, weight_only
+from osuT5.osuT5.inference.optimized.kernels.native_extension import loaded_extension_records
 assert "torch.utils.cpp_extension" not in sys.modules
+assert loaded_extension_records() == {}
+assert decoder_layer._NATIVE_DECODER_LAYER is None
+assert q1_attention._NATIVE_Q1_ATTENTION is None
+assert weight_only._WEIGHT_ONLY_EXTENSION is None
 """
         env = os.environ.copy()
         env["PYTHONPATH"] = str(REPO_ROOT)
@@ -271,6 +278,8 @@ assert "torch.utils.cpp_extension" not in sys.modules
             text=True,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, "")
+        self.assertEqual(completed.stderr, "")
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ class AotNativeExtensionCpuWrapperTest(unittest.TestCase):
         self.assertIn(
             '"$(git -C "$REPO" branch --show-current)" != "$BRANCH"', source
         )
+        self.assertIn('rev-parse "$REMOTE_REF"', source)
         self.assertIn("status --porcelain", source)
         self.assertIn("CPU native-extension job received CUDA_VISIBLE_DEVICES", source)
         self.assertIn("export TORCH_CUDA_ARCH_LIST=7.5", source)

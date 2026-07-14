@@ -10,7 +10,7 @@ from utils.run_aot_full_song_reciprocal import evaluate_gate
 ROOT = Path(__file__).resolve().parents[1]
 WRAPPER = ROOT / "scripts" / "dcc" / "verify_aot_native_extension_full_song_reciprocal.sbatch"
 DRIVER = ROOT / "utils" / "run_aot_full_song_reciprocal.py"
-RUNNER = ROOT / "utils" / "run_k4_approximate_weight_only.py"
+RUNNER = ROOT / "utils" / "run_k4_shared_rope_approximate_weight_only.py"
 
 
 def _analysis(*, warm_delta: float = -0.1) -> dict:
@@ -45,6 +45,8 @@ class AotFullSongReciprocalTest(unittest.TestCase):
         self.assertIn("AOT_NATIVE_EXTENSION_MANIFEST", source)
         self.assertIn("AOT_NATIVE_EXTENSION_MANIFEST_SHA256", source)
         self.assertIn("AOT_NATIVE_EXTENSION_CACHE_ROOT", source)
+        self.assertIn("AOT_NATIVE_EXTENSION_BUILD_RESULT", source)
+        self.assertIn("AOT_NATIVE_EXTENSION_BUILD_RESULT_SHA256", source)
         self.assertIn('"$(git -C "$REPO" rev-parse HEAD)" != "$COMMIT"', source)
         self.assertIn('rev-parse "$REMOTE_REF"', source)
         self.assertIn("run_aot_full_song_reciprocal.py", source)
@@ -74,12 +76,15 @@ class AotFullSongReciprocalTest(unittest.TestCase):
         self.assertIn("validate_packaged_manifest", source)
         self.assertIn("validate_weight", source)
         self.assertIn("validate_k4", source)
+        self.assertIn("_validate_shared_initialization", source)
+        self.assertIn("native_extension_storage_bytes", source)
+        self.assertIn("peak_cuda_memory_allocated_mb", source)
 
     def test_combined_runner_emits_extension_loader_evidence(self) -> None:
         source = RUNNER.read_text(encoding="utf-8")
         self.assertIn("--output-extension-json", source)
         self.assertIn("loaded_extension_records", source)
-        self.assertIn("K4 mixed-weight run loaded no native extensions", source)
+        self.assertIn("shared-RoPE runtime loaded no native extensions", source)
 
     def test_gate_requires_half_second_cold_saving_exactness_and_no_warm_regression(
         self,
@@ -105,6 +110,37 @@ class AotFullSongReciprocalTest(unittest.TestCase):
         )
         self.assertFalse(regressed["warm_no_regression_pass"])
         self.assertFalse(regressed["pass"])
+
+    def test_gate_records_build_load_and_storage_evidence(self) -> None:
+        walls = {
+            "cached_first": 45.0,
+            "direct_first": 43.0,
+            "direct_second": 43.2,
+            "cached_second": 45.2,
+        }
+        loads = {
+            "cached_first": 2.7,
+            "direct_first": 0.04,
+            "direct_second": 0.05,
+            "cached_second": 2.8,
+        }
+        result = evaluate_gate(
+            _analysis(),
+            walls,
+            minimum_cold_saving_seconds=0.5,
+            build_result={"build_seconds": 267.0},
+            extension_load_seconds=loads,
+            storage_bytes={"prebuilt_package": 10, "cached_jit_tree": 20},
+        )
+
+        self.assertEqual(result["native_extension_build_seconds"], 267.0)
+        self.assertAlmostEqual(
+            result["native_extension_load_seconds"]["direct_saving"],
+            2.705,
+        )
+        self.assertEqual(
+            result["native_extension_storage_bytes"]["prebuilt_package"], 10
+        )
 
 
 if __name__ == "__main__":

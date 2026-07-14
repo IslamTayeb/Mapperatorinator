@@ -22,6 +22,8 @@ REMOTE_BRANCH=${MAPPERATORINATOR_REMOTE_BRANCH:?Set MAPPERATORINATOR_REMOTE_BRAN
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 AOT_MANIFEST=${AOT_NATIVE_EXTENSION_MANIFEST:?Set the external prebuilt manifest path}
 AOT_MANIFEST_SHA256=${AOT_NATIVE_EXTENSION_MANIFEST_SHA256:?Set the exact manifest hash}
+AOT_BUILD_RESULT=${AOT_NATIVE_EXTENSION_BUILD_RESULT:?Set the external build result path}
+AOT_BUILD_RESULT_SHA256=${AOT_NATIVE_EXTENSION_BUILD_RESULT_SHA256:?Set the exact build result hash}
 AOT_EXTENSION_CACHE_ROOT=${AOT_NATIVE_EXTENSION_CACHE_ROOT:?Set the exact cached load_inline root}
 RUN_ROOT="$WORK/runs/aot-native-full-song-reciprocal-${SLURM_JOB_ID:-manual}"
 SMI_TEMP="$WORK/logs/.aot-native-full-song-reciprocal-${SLURM_JOB_ID:-manual}.nvidia-smi.csv"
@@ -52,7 +54,7 @@ if [[ "$(git -C "$REPO" rev-parse "$REMOTE_REF")" != "$COMMIT" ]]; then
   echo "remote ref differs from MAPPERATORINATOR_COMMIT" >&2
   exit 2
 fi
-for required in "$PYTHON" "$AUDIO" "$AOT_MANIFEST"; do
+for required in "$PYTHON" "$AUDIO" "$AOT_MANIFEST" "$AOT_BUILD_RESULT"; do
   if [[ ! -e "$required" ]]; then
     echo "missing required input: $required" >&2
     exit 2
@@ -64,6 +66,10 @@ if [[ ! -d "$AOT_EXTENSION_CACHE_ROOT" ]]; then
 fi
 if [[ ! "$AOT_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
   echo "AOT manifest hash must be 64 lowercase hex characters" >&2
+  exit 2
+fi
+if [[ ! "$AOT_BUILD_RESULT_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "AOT build-result hash must be 64 lowercase hex characters" >&2
   exit 2
 fi
 
@@ -94,6 +100,8 @@ echo "repo=$REPO"
 echo "audio=$AUDIO"
 echo "aot_manifest=$AOT_MANIFEST"
 echo "aot_manifest_sha256=$AOT_MANIFEST_SHA256"
+echo "aot_build_result=$AOT_BUILD_RESULT"
+echo "aot_build_result_sha256=$AOT_BUILD_RESULT_SHA256"
 echo "aot_extension_cache_root=$AOT_EXTENSION_CACHE_ROOT"
 echo "run_root=$RUN_ROOT"
 if [[ -n "${SLURM_JOB_ID:-}" ]]; then
@@ -128,12 +136,16 @@ cd "$REPO"
   --audio "$AUDIO" \
   --manifest "$AOT_MANIFEST" \
   --manifest-sha256 "$AOT_MANIFEST_SHA256" \
+  --build-result "$AOT_BUILD_RESULT" \
+  --build-result-sha256 "$AOT_BUILD_RESULT_SHA256" \
   --extension-cache-root "$AOT_EXTENSION_CACHE_ROOT" \
   --run-root "$RUN_ROOT" \
   --minimum-cold-saving-seconds 0.5
 
 for artifact in \
   "$RUN_ROOT/manifest-validation.json" \
+  "$RUN_ROOT/copied-manifest-validation.json" \
+  "$RUN_ROOT/native-extension-build.json" \
   "$RUN_ROOT/reciprocal-analysis.json" \
   "$RUN_ROOT/aot-gate.json" \
   "$RUN_ROOT/extension-load/cached_first.json" \

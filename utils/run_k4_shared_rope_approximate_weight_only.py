@@ -69,7 +69,12 @@ def _enrich_initialization_evidence(
     )
 
 
-def run(config_name: str, overrides: list[str], output_init_json: Path) -> None:
+def run(
+    config_name: str,
+    overrides: list[str],
+    output_init_json: Path,
+    output_extension_json: Path | None = None,
+) -> None:
     """Install every candidate while sharing RoPE only on the main model.
 
     ``inference.main`` loads the main binding before its separate timing binding.
@@ -107,15 +112,34 @@ def run(config_name: str, overrides: list[str], output_init_json: Path) -> None:
         inference.load_model_with_engine = original_loader
         stack.close()
     _enrich_initialization_evidence(output_init_json, main_stats)
+    if output_extension_json is not None:
+        from osuT5.osuT5.inference.optimized.kernels.native_extension import (
+            loaded_extension_records,
+        )
+
+        records = loaded_extension_records()
+        if not records:
+            raise RuntimeError("shared-RoPE runtime loaded no native extensions")
+        output_extension_json.parent.mkdir(parents=True, exist_ok=True)
+        output_extension_json.write_text(
+            json.dumps(records, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config-name", default="profile_salvalai")
     parser.add_argument("--output-init-json", type=Path, required=True)
+    parser.add_argument("--output-extension-json", type=Path)
     parser.add_argument("overrides", nargs="*")
     parsed = parser.parse_args()
-    run(parsed.config_name, parsed.overrides, parsed.output_init_json)
+    run(
+        parsed.config_name,
+        parsed.overrides,
+        parsed.output_init_json,
+        parsed.output_extension_json,
+    )
 
 
 if __name__ == "__main__":

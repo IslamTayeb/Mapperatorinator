@@ -16,6 +16,8 @@ WORK=${MAPPERATORINATOR_WORK:-/work/imt11/Mapperatorinator}
 REPO=${MAPPERATORINATOR_REPO:?Set MAPPERATORINATOR_REPO to the clean scout worktree}
 COMMIT=${MAPPERATORINATOR_COMMIT:?Set MAPPERATORINATOR_COMMIT to the pushed scout commit}
 BRANCH=${MAPPERATORINATOR_BRANCH:?Set MAPPERATORINATOR_BRANCH to the scout branch}
+REMOTE=${MAPPERATORINATOR_REMOTE:-origin}
+REMOTE_BRANCH=${MAPPERATORINATOR_REMOTE_BRANCH:?Set MAPPERATORINATOR_REMOTE_BRANCH}
 RUN_ROOT="$WORK/runs/aot-native-extension-load-${SLURM_JOB_ID:-manual}"
 
 if [[ ! -d "$REPO/.git" && ! -f "$REPO/.git" ]]; then
@@ -33,6 +35,15 @@ if [[ "$(git -C "$REPO" rev-parse HEAD)" != "$COMMIT" ]]; then
 fi
 if [[ "$(git -C "$REPO" branch --show-current)" != "$BRANCH" ]]; then
   echo "scout worktree differs from MAPPERATORINATOR_BRANCH" >&2
+  exit 2
+fi
+REMOTE_REF="refs/remotes/$REMOTE/$REMOTE_BRANCH"
+if ! git -C "$REPO" show-ref --verify --quiet "$REMOTE_REF"; then
+  echo "missing fetched remote ref $REMOTE_REF" >&2
+  exit 2
+fi
+if [[ "$(git -C "$REPO" rev-parse "$REMOTE_REF")" != "$COMMIT" ]]; then
+  echo "remote ref differs from MAPPERATORINATOR_COMMIT" >&2
   exit 2
 fi
 if [[ ! -x "$PYTHON" ]]; then
@@ -57,6 +68,7 @@ echo "host=$(hostname)"
 echo "job_id=${SLURM_JOB_ID:-manual}"
 echo "commit=$COMMIT"
 echo "branch=$BRANCH"
+echo "remote_ref=$REMOTE_REF"
 echo "repo=$REPO"
 echo "python=$PYTHON"
 echo "run_root=$RUN_ROOT"

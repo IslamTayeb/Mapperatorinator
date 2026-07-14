@@ -30,6 +30,7 @@ ANALYZER_ROLES = {
     "candidate_second": "direct_second",
     "baseline_second": "cached_second",
 }
+EXPECTED_SHARED_COMPOSITION = "k4-split-kv-mixed-weight-shared-rope-v1"
 
 
 def _profile_path(output: Path) -> Path:
@@ -54,7 +55,7 @@ def _validate_extension_evidence(
     manifest_extensions: dict[str, Any],
     *,
     mode: str,
-) -> None:
+) -> float:
     expected_mode = "direct" if mode == "direct" else "load_inline"
     if set(records) != set(manifest_extensions):
         raise RuntimeError(
@@ -73,6 +74,140 @@ def _validate_extension_evidence(
                 f"{mode} extension {name} used {record.get('mode')}, "
                 f"expected {expected_mode}"
             )
+        load_seconds = record.get("load_seconds")
+        if (
+            isinstance(load_seconds, bool)
+            or not isinstance(load_seconds, (int, float))
+            or not math.isfinite(float(load_seconds))
+            or float(load_seconds) <= 0.0
+        ):
+            raise RuntimeError(
+                f"{mode} extension {name} lacks a positive load duration"
+            )
+    return sum(float(record["load_seconds"]) for record in records.values())
+
+
+def _validate_shared_initialization(
+    payload: dict[str, Any],
+    *,
+    role: str,
+) -> dict[str, Any]:
+    if payload.get("combined_runtime") != EXPECTED_SHARED_COMPOSITION:
+        raise RuntimeError(f"{role} did not execute the shared-RoPE composition")
+    shared = payload.get("shared_rope")
+    if not isinstance(shared, dict):
+        raise RuntimeError(f"{role} shared-RoPE evidence is missing")
+    expected = {
+        "version": "shared-decoder-rope-v1",
+        "scope": "main-model-only",
+        "incremental_exactness_claim": True,
+        "original_decoder_forward_required": True,
+    }
+    failures = {
+        key: {"expected": value, "actual": shared.get(key)}
+        for key, value in expected.items()
+        if shared.get(key) != value
+    }
+    stats = shared.get("stats")
+    if not isinstance(stats, dict):
+        failures["stats"] = {"expected": "object", "actual": type(stats).__name__}
+    else:
+        for key in (
+            "forwards",
+            "computes",
+            "reuses",
+            "expected_computes",
+            "expected_reuses",
+        ):
+            value = stats.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                failures[f"stats.{key}"] = {
+                    "expected": "positive integer",
+                    "actual": value,
+                }
+        if stats.get("computes") != stats.get("expected_computes"):
+            failures["stats.computes"] = {
+                "expected": stats.get("expected_computes"),
+                "actual": stats.get("computes"),
+            }
+        if stats.get("reuses") != stats.get("expected_reuses"):
+            failures["stats.reuses"] = {
+                "expected": stats.get("expected_reuses"),
+                "actual": stats.get("reuses"),
+            }
+    if failures:
+        raise RuntimeError(f"{role} shared-RoPE evidence is invalid: {failures}")
+    return shared
+
+
+def _tree_size_bytes(root: Path) -> int:
+    root = root.resolve()
+    if not root.is_dir():
+        raise RuntimeError(f"storage root is missing: {root}")
+    total = 0
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            raise RuntimeError(f"storage root contains an unsupported symlink: {path}")
+        if path.is_file():
+            total += path.stat().st_size
+    return total
+
+
+def _validate_build_result(
+    path: Path,
+    *,
+    expected_sha256: str,
+    expected_commit: str,
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    from osuT5.osuT5.inference.optimized.kernels.native_extension import (
+        _sha256_file,
+    )
+
+    path = path.resolve()
+    if _sha256_file(path) != expected_sha256:
+        raise RuntimeError("native extension build-result hash mismatch")
+    payload = _load_json(path, name="native extension build result")
+    if payload.get("source_commit") != expected_commit:
+        raise RuntimeError("native extension build result commit mismatch")
+    build_seconds = payload.get("build_seconds")
+    if (
+        isinstance(build_seconds, bool)
+        or not isinstance(build_seconds, (int, float))
+        or not math.isfinite(float(build_seconds))
+        or float(build_seconds) <= 0.0
+    ):
+        raise RuntimeError("native extension build result lacks build_seconds")
+    if payload.get("packaged") != manifest:
+        raise RuntimeError("native extension build result packaged manifest mismatch")
+    records = payload.get("extensions")
+    manifest_extensions = manifest.get("extensions")
+    if not isinstance(records, dict) or not isinstance(manifest_extensions, dict):
+        raise RuntimeError("native extension build result lacks extension records")
+    if set(records) != set(manifest_extensions):
+        raise RuntimeError("native extension build result extension set mismatch")
+    for name, expected in manifest_extensions.items():
+        record = records.get(name)
+        if not isinstance(record, dict) or record.get("mode") != "load_inline":
+            raise RuntimeError(
+                f"native extension build result {name} is not a JIT build"
+            )
+        for key in ("source_sha256", "library_sha256", "functions"):
+            if record.get(key) != expected.get(key):
+                raise RuntimeError(
+                    f"native extension build result {name} differs in {key}"
+                )
+        load_seconds = record.get("load_seconds")
+        if (
+            isinstance(load_seconds, bool)
+            or not isinstance(load_seconds, (int, float))
+            or not math.isfinite(float(load_seconds))
+            or float(load_seconds) <= 0.0
+        ):
+            raise RuntimeError(
+                f"native extension build result {name} lacks build/load duration"
+            )
+    return payload
 
 
 def evaluate_gate(
@@ -80,6 +215,9 @@ def evaluate_gate(
     process_walls: dict[str, float],
     *,
     minimum_cold_saving_seconds: float,
+    build_result: dict[str, Any] | None = None,
+    extension_load_seconds: dict[str, float] | None = None,
+    storage_bytes: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     if set(process_walls) != set(RUN_ORDER):
         raise ValueError("process wall roles are incomplete")
@@ -116,7 +254,7 @@ def evaluate_gate(
     )
     cold_pass = cold_saving >= minimum_cold_saving_seconds
     warm_pass = warm_delta <= 0.0
-    return {
+    result = {
         "schema_version": 1,
         "minimum_cold_saving_seconds": minimum_cold_saving_seconds,
         "process_wall_seconds": process_walls,
@@ -130,6 +268,41 @@ def evaluate_gate(
         "exact_parity_pass": exact_pass,
         "pass": cold_pass and warm_pass and exact_pass,
     }
+    if build_result is not None:
+        result["native_extension_build_seconds"] = float(
+            build_result["build_seconds"]
+        )
+    if extension_load_seconds is not None:
+        if set(extension_load_seconds) != set(RUN_ORDER):
+            raise ValueError("extension-load timing roles are incomplete")
+        cached_load = [
+            float(extension_load_seconds["cached_first"]),
+            float(extension_load_seconds["cached_second"]),
+        ]
+        direct_load = [
+            float(extension_load_seconds["direct_first"]),
+            float(extension_load_seconds["direct_second"]),
+        ]
+        result["native_extension_load_seconds"] = {
+            "runs": extension_load_seconds,
+            "cached_median": statistics.median(cached_load),
+            "direct_median": statistics.median(direct_load),
+            "direct_saving": (
+                statistics.median(cached_load) - statistics.median(direct_load)
+            ),
+        }
+    if storage_bytes is not None:
+        invalid_storage = {
+            key: value
+            for key, value in storage_bytes.items()
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        }
+        if invalid_storage:
+            raise ValueError(
+                f"invalid native extension storage sizes: {invalid_storage}"
+            )
+        result["native_extension_storage_bytes"] = storage_bytes
+    return result
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -153,12 +326,37 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         expected_manifest_sha256=args.manifest_sha256,
         extension_cache_root=args.extension_cache_root,
     )
+    external_manifest = _load_json(args.manifest, name="native extension manifest")
+    build_result = _validate_build_result(
+        args.build_result,
+        expected_sha256=args.build_result_sha256,
+        expected_commit=args.commit,
+        manifest=external_manifest,
+    )
     (run_root / "manifest-validation.json").write_text(
         json.dumps(preflight, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    package = run_root / "prebuilt-extension-package"
+    shutil.copytree(args.manifest.resolve().parent, package)
+    local_manifest = package / args.manifest.name
     local_cache = run_root / "cached-extension-cache"
     shutil.copytree(args.extension_cache_root, local_cache)
+    copied_preflight = validate_packaged_manifest(
+        local_manifest,
+        expected_source_commit=args.commit,
+        expected_manifest_sha256=args.manifest_sha256,
+        extension_cache_root=local_cache,
+    )
+    (run_root / "copied-manifest-validation.json").write_text(
+        json.dumps(copied_preflight, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    shutil.copy2(args.build_result, run_root / "native-extension-build.json")
+    storage_bytes = {
+        "prebuilt_package": _tree_size_bytes(package),
+        "cached_jit_tree": _tree_size_bytes(local_cache),
+    }
     common_overrides = (
         f"audio_path={args.audio}",
         "device=cuda",
@@ -181,7 +379,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         common_overrides += ("inference_generation_compile=false",)
 
     process_walls: dict[str, float] = {}
+    extension_load_seconds: dict[str, float] = {}
     profile_paths: dict[str, Path] = {}
+    initialization_evidence: dict[str, dict[str, Any]] = {}
     manifest_extensions = preflight["extensions"]
     for role in RUN_ORDER:
         mode = "direct" if role.startswith("direct") else "cached"
@@ -198,7 +398,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         env["PYTHONHASHSEED"] = "0"
         env["TOKENIZERS_PARALLELISM"] = "false"
         if mode == "direct":
-            env[MANIFEST_ENV] = str(args.manifest.resolve())
+            env[MANIFEST_ENV] = str(local_manifest)
         else:
             env.pop(MANIFEST_ENV, None)
         for directory in (
@@ -211,7 +411,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             directory.mkdir(parents=True, exist_ok=True)
         command = [
             str(args.python),
-            str(REPO_ROOT / "utils" / "run_k4_approximate_weight_only.py"),
+            str(
+                REPO_ROOT
+                / "utils"
+                / "run_k4_shared_rope_approximate_weight_only.py"
+            ),
             "--config-name",
             "profile_salvalai",
             "--output-init-json",
@@ -243,14 +447,30 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         profile_payload = _load_json(profile, name=f"{role} profile")
         validate_weight(profile_payload, role="candidate")
         validate_k4(profile_payload, role="candidate", block_size=4)
-        _validate_extension_evidence(
+        extension_load_seconds[role] = _validate_extension_evidence(
             _load_json(extension_json, name=f"{role} extension evidence"),
             manifest_extensions,
             mode=mode,
         )
         if not init_json.is_file() or not init_json.stat().st_size:
             raise RuntimeError(f"{role} initialization evidence is missing")
+        initialization_evidence[role] = _load_json(
+            init_json,
+            name=f"{role} initialization evidence",
+        )
+        _validate_shared_initialization(initialization_evidence[role], role=role)
         profile_paths[role] = profile
+
+    shared_material = {
+        role: {
+            "combined_runtime": evidence["combined_runtime"],
+            "shared_rope": evidence["shared_rope"],
+        }
+        for role, evidence in initialization_evidence.items()
+    }
+    first_shared = shared_material[RUN_ORDER[0]]
+    if any(value != first_shared for value in shared_material.values()):
+        raise RuntimeError("cached/direct shared-RoPE initialization evidence diverged")
 
     analysis_paths = {
         analyzer_role: profile_paths[run_role]
@@ -270,7 +490,34 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         analysis,
         process_walls,
         minimum_cold_saving_seconds=args.minimum_cold_saving_seconds,
+        build_result=build_result,
+        extension_load_seconds=extension_load_seconds,
+        storage_bytes=storage_bytes,
     )
+    gate["shared_rope_initialization"] = first_shared
+    gate["performance"] = {
+        key: analysis["metrics"][key]
+        for key in (
+            "timing_model_seconds",
+            "timing_tokens",
+            "timing_tps",
+            "main_model_seconds",
+            "main_tokens",
+            "main_tps",
+            "complete_request_wall_seconds",
+            "cold_process_outer_wall_seconds",
+            "peak_cuda_memory_allocated_mb",
+        )
+    }
+    gate["exactness"] = {
+        "token_and_stopping_divergence": analysis["parity"][
+            "token_and_stopping_divergence"
+        ],
+        "dispatch_cache_topology": analysis["parity"][
+            "dispatch_cache_topology"
+        ],
+        "output_divergence": analysis["parity"]["output_divergence"],
+    }
     (run_root / "aot-gate.json").write_text(
         json.dumps(gate, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -287,6 +534,8 @@ def main() -> None:
     parser.add_argument("--audio", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--manifest-sha256", required=True)
+    parser.add_argument("--build-result", type=Path, required=True)
+    parser.add_argument("--build-result-sha256", required=True)
     parser.add_argument("--extension-cache-root", type=Path, required=True)
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--minimum-cold-saving-seconds", type=float, default=0.5)
