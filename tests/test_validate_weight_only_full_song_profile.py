@@ -275,6 +275,7 @@ def test_timing_native_self_contract_retains_cross_and_main_composition() -> Non
     cached_record["optimized_dispatch_capture_hits"][
         "native_q1_rope_cache_self_attention"
     ] = 0
+    cached_record["optimized_dispatch_capture_hits"]["q1_bmm_cross_attention"] = 0
     profile["generation"].insert(1, cached_record)
 
     report = validate_timing_scout(profile, initialization, role="candidate")
