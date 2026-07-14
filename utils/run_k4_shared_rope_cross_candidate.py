@@ -1,8 +1,7 @@
-"""Compose one cross-region delta with the current K4 mixed/shared-RoPE base."""
+"""Compose one cross delta with K4/K1, shared RoPE, mixed weights, and INT8 MLP."""
 
 from __future__ import annotations
 
-from contextlib import ExitStack
 import json
 from pathlib import Path
 import sys
@@ -16,16 +15,9 @@ from osuT5.osuT5.inference.optimized.kernels.weight_only_runtime import (  # noq
     CROSS_FP16_PACKED,
     CROSS_SPLIT8,
 )
-from osuT5.osuT5.inference.optimized.scout.shared_rope import (  # noqa: E402
-    SharedRopeStats,
-    shared_decoder_rope_context,
-)
-from osuT5.osuT5.inference.optimized.single.k8_runtime import (  # noqa: E402
-    install_k8_candidate,
-)
 from utils.run_approximate_weight_only import run_with_initializer  # noqa: E402
 from utils.run_k4_shared_rope_approximate_weight_only import (  # noqa: E402
-    _validated_shared_rope_evidence,
+    run as run_combined,
 )
 
 
@@ -36,7 +28,7 @@ def _enrich_evidence(
     output_init_json: Path,
     *,
     mode: str,
-    stats: SharedRopeStats,
+    composition_version: str,
 ) -> None:
     try:
         payload = json.loads(output_init_json.read_text(encoding="utf-8"))
@@ -47,13 +39,17 @@ def _enrich_evidence(
     cross = payload.get("cross_candidate")
     if not isinstance(cross, dict) or cross.get("mode") != mode:
         raise RuntimeError("cross candidate initialization mode was not recorded")
-    if "shared_rope" in payload or "combined_runtime" in payload:
-        raise RuntimeError("cross candidate evidence already contains composition wiring")
-    payload["combined_runtime"] = f"k4-split-kv-mixed-weight-shared-rope-{mode}-v1"
-    payload["shared_rope"] = _validated_shared_rope_evidence(stats)
+    if payload.get("combined_runtime") != composition_version:
+        raise RuntimeError("cross candidate composition identity was not recorded")
+    if not isinstance(payload.get("shared_rope"), dict):
+        raise RuntimeError("cross candidate shared-RoPE evidence is missing")
+    if "cross_runtime" in payload:
+        raise RuntimeError("cross candidate evidence already contains cross wiring")
     payload["cross_runtime"] = {
         **cross,
-        "incremental_control": "k4-split-kv-mixed-weight-shared-rope-v1",
+        "incremental_control": (
+            "k4-split-kv-mixed-weight-shared-rope-k1-remainder-int8-mlp-v1"
+        ),
         "original_decoder_forward_required": True,
     }
     output_init_json.write_text(
@@ -73,41 +69,37 @@ def run(
         raise ValueError(
             f"cross candidate mode must be one of {sorted(CROSS_CANDIDATE_MODES)}"
         )
-    import inference
+    composition_version = (
+        "k4-split-kv-mixed-weight-shared-rope-k1-remainder-int8-mlp-"
+        f"{mode}-v1"
+    )
 
-    original_loader = inference.load_model_with_engine
-    stack = ExitStack()
-    main_stats = SharedRopeStats()
-    loaded_bindings = 0
+    def weight_runner(
+        nested_config_name: str,
+        nested_overrides: list[str],
+        nested_output_init_json: Path,
+    ) -> None:
+        run_with_initializer(
+            nested_config_name,
+            nested_overrides,
+            nested_output_init_json,
+            initializer_name="initialize_approximate_int8_mlp_weight_only_cross",
+            initializer_kwargs={"mode": mode},
+        )
 
-    def candidate_loader(*loader_args, **loader_kwargs):
-        nonlocal loaded_bindings
-        binding, tokenizer = original_loader(*loader_args, **loader_kwargs)
-        loaded_bindings += 1
-        if loaded_bindings == 1:
-            stack.enter_context(
-                shared_decoder_rope_context(binding.raw_model, stats=main_stats)
-            )
-        return binding, tokenizer
-
-    inference.load_model_with_engine = candidate_loader
-    try:
-        with install_k8_candidate(block_size=4):
-            run_with_initializer(
-                config_name,
-                overrides,
-                output_init_json,
-                initializer_name="initialize_approximate_weight_only_cross",
-                initializer_kwargs={"mode": mode},
-            )
-        if loaded_bindings < 2:
-            raise RuntimeError(
-                "cross candidate expected separate main and timing bindings"
-            )
-    finally:
-        inference.load_model_with_engine = original_loader
-        stack.close()
-    _enrich_evidence(output_init_json, mode=mode, stats=main_stats)
+    run_combined(
+        config_name,
+        overrides,
+        output_init_json,
+        graph_remainders=True,
+        weight_runner=weight_runner,
+        composition_version=composition_version,
+    )
+    _enrich_evidence(
+        output_init_json,
+        mode=mode,
+        composition_version=composition_version,
+    )
 
 
 __all__ = ["CROSS_CANDIDATE_MODES", "run"]
