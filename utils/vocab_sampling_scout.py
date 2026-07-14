@@ -5,11 +5,10 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 import math
-import statistics
 from typing import Any, Iterator
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 RESULT_CLASS = "verifier-only-component-sizing"
 RNG_POLICY = "counter_request_seed_window_prompt_v2"
 
@@ -128,6 +127,10 @@ class VocabSamplingObserver:
         self.total_eager_observations = 0
         self.wasted_graph_observations = 0
         self.dropped_observations = 0
+        self.observed_vocab_counts: dict[int, int] = {}
+        self.observed_descriptors_by_vocab_size: dict[
+            int, set[tuple[tuple[str, tuple[Any, ...]], ...]]
+        ] = {}
 
     def begin_capture(self) -> None:
         if self.capture_depth != 0:
@@ -188,11 +191,6 @@ class VocabSamplingObserver:
         self._record(buffers, source="k4_graph_final_step")
 
     def _record(self, buffers: dict[str, Any], *, source: str) -> None:
-        import torch
-
-        if len(self.samples) >= self.max_samples:
-            self.dropped_observations += 1
-            return
         sample = VocabSample(
             raw_logits=buffers["raw_logits"].detach().float().cpu().clone(),
             pre_top_p=buffers["pre_top_p"].detach().float().cpu().clone(),
@@ -205,7 +203,57 @@ class VocabSamplingObserver:
             source=source,
         )
         sample.validate()
-        self.samples.append(sample)
+        vocab_size = sample.vocab_size
+        observed_descriptors = self.observed_descriptors_by_vocab_size.setdefault(
+            vocab_size,
+            set(),
+        )
+        if (
+            observed_descriptors
+            and sample.processor_descriptor not in observed_descriptors
+        ):
+            raise RuntimeError(
+                "vocabulary scout cannot size multiple TopP configurations for one "
+                f"score shape: vocab_size={vocab_size}"
+            )
+        observed_descriptors.add(sample.processor_descriptor)
+        self.observed_vocab_counts[vocab_size] = (
+            self.observed_vocab_counts.get(vocab_size, 0) + 1
+        )
+        replacement_index: int | None = None
+        if len(self.samples) >= self.max_samples:
+            stored_counts: dict[int, int] = {}
+            for stored in self.samples:
+                stored_counts[stored.vocab_size] = (
+                    stored_counts.get(stored.vocab_size, 0) + 1
+                )
+            shape_count = len(set(stored_counts) | {vocab_size})
+            target_per_shape = max(1, self.max_samples // shape_count)
+            needs_rebalance = stored_counts.get(vocab_size, 0) < target_per_shape
+            replacement_index = next(
+                (
+                    index
+                    for index in range(len(self.samples) - 1, -1, -1)
+                    if stored_counts[self.samples[index].vocab_size] > target_per_shape
+                ),
+                None,
+            )
+            if needs_rebalance and replacement_index is None:
+                raise RuntimeError(
+                    "vocabulary scout sample cap cannot retain every observed shape: "
+                    f"max_samples={self.max_samples} "
+                    f"stored_vocab_sizes={sorted(stored_counts)} "
+                    f"new_vocab_size={vocab_size}"
+                )
+            if not needs_rebalance:
+                replacement_index = None
+                self.dropped_observations += 1
+                return
+        if replacement_index is None:
+            self.samples.append(sample)
+        else:
+            self.samples[replacement_index] = sample
+            self.dropped_observations += 1
 
 
 @contextmanager
@@ -323,6 +371,51 @@ def _sampling_with_threshold(scores: Any, threshold: Any):
     )
 
 
+def _representatives_by_vocab_size(
+    samples: list[VocabSample],
+) -> dict[int, dict[str, VocabSample]]:
+    grouped: dict[int, list[VocabSample]] = {}
+    for sample in samples:
+        grouped.setdefault(sample.vocab_size, []).append(sample)
+    representatives: dict[int, dict[str, VocabSample]] = {}
+    for vocab_size, shape_samples in sorted(grouped.items()):
+        descriptors = {sample.processor_descriptor for sample in shape_samples}
+        if len(descriptors) != 1:
+            raise RuntimeError(
+                "vocabulary scout cannot size multiple TopP configurations for one "
+                f"score shape: vocab_size={vocab_size} "
+                f"descriptor_count={len(descriptors)}"
+            )
+        sizes = [sample.nucleus_size for sample in shape_samples]
+        targets = {
+            "min": min(sizes),
+            "p50": _percentile(sizes, 0.50),
+            "p95": _percentile(sizes, 0.95),
+            "max": max(sizes),
+        }
+        selected: dict[str, VocabSample] = {}
+        used: set[int] = set()
+        for label, target in targets.items():
+            candidates = sorted(
+                enumerate(shape_samples),
+                key=lambda pair: (
+                    abs(pair[1].nucleus_size - target),
+                    pair[0],
+                ),
+            )
+            index, sample = (
+                next(
+                    (index, sample) for index, sample in candidates if index not in used
+                )
+                if len(used) < len(shape_samples)
+                else candidates[0]
+            )
+            used.add(index)
+            selected[label] = sample
+        representatives[vocab_size] = selected
+    return representatives
+
+
 def _top_p_kwargs(descriptor: dict[str, Any]) -> dict[str, Any]:
     top_p = descriptor.get("top_p")
     filter_value = descriptor.get("filter_value")
@@ -415,104 +508,123 @@ def benchmark_existing_tail(
     for sample in samples:
         sample.validate()
 
-    sizes = [sample.nucleus_size for sample in samples]
-    targets = {
-        "min": min(sizes),
-        "p50": _percentile(sizes, 0.50),
-        "p95": _percentile(sizes, 0.95),
-        "max": max(sizes),
-    }
-    representatives: dict[str, VocabSample] = {}
-    used: set[int] = set()
-    for label, target in targets.items():
-        candidates = sorted(
-            enumerate(samples),
-            key=lambda pair: (abs(pair[1].nucleus_size - target), pair[0]),
-        )
-        index, sample = (
-            next((index, sample) for index, sample in candidates if index not in used)
-            if len(used) < len(samples)
-            else candidates[0]
-        )
-        used.add(index)
-        representatives[label] = sample
+    representatives = _representatives_by_vocab_size(samples)
 
     rows = []
     device = torch.device("cuda")
-    for label, sample in representatives.items():
-        top_p_rows = [
-            attributes
-            for name, attributes in sample.processor_descriptor
-            if name == "TopPLogitsWarper"
-        ]
-        if len(top_p_rows) != 1:
-            raise RuntimeError(
-                "captured descriptor must contain exactly one TopP warper"
+    for vocab_size, shape_representatives in representatives.items():
+        for label, sample in shape_representatives.items():
+            rows.append(
+                _benchmark_representative(
+                    label,
+                    sample,
+                    vocab_size=vocab_size,
+                    device=device,
+                    warmup=warmup,
+                    iterations=iterations,
+                    rounds=rounds,
+                    top_p_warper_cls=TopPLogitsWarper,
+                )
             )
-        descriptor = dict(top_p_rows[0])
-        top_p_kwargs = _top_p_kwargs(descriptor)
-        pre = sample.pre_top_p.to(device=device)
-        post = sample.post_top_p.to(device=device)
-        threshold = torch.tensor(sample.threshold, dtype=torch.float32, device=device)
-        input_ids = torch.zeros((1, 1), dtype=torch.long, device=device)
-        warper = TopPLogitsWarper(**top_p_kwargs)
-        top_p_graph, top_p_output = _capture_graph(
-            lambda: warper(input_ids, pre), warmup=warmup
+    worst_by_vocab_size = {
+        str(vocab_size): max(
+            row["combined_ms_per_step_worst"]
+            for row in rows
+            if row["vocab_size"] == vocab_size
         )
-        # Check while this graph's output is still the most recently captured
-        # allocation.  Do not depend on its storage surviving later captures.
-        _require_recaptured_tensor(
-            "TopP output",
-            top_p_output,
-            sample.post_top_p,
-            descriptor=descriptor,
-        )
-        sampling_graph, sampling_output = _capture_graph(
-            lambda: _sampling_with_threshold(post, threshold), warmup=warmup
-        )
-        if int(sampling_output.cpu().item()) != sample.selected_token:
-            raise RuntimeError(
-                "recaptured counter sampler differs from observed token: "
-                f"actual={int(sampling_output.cpu().item())} "
-                f"expected={sample.selected_token} descriptor={descriptor!r}"
-            )
-        combined_graph, combined_output = _capture_graph(
-            lambda: _sampling_with_threshold(warper(input_ids, pre), threshold),
-            warmup=warmup,
-        )
-        torch.cuda.synchronize()
-        if int(combined_output.cpu().item()) != sample.selected_token:
-            raise RuntimeError(
-                "combined TopP+sampler graph differs from observed token: "
-                f"actual={int(combined_output.cpu().item())} "
-                f"expected={sample.selected_token} descriptor={descriptor!r}"
-            )
-        top_p_ms = _time_graph(top_p_graph, iterations=iterations, rounds=rounds)
-        sampling_ms = _time_graph(sampling_graph, iterations=iterations, rounds=rounds)
-        combined_ms = _time_graph(combined_graph, iterations=iterations, rounds=rounds)
-        rows.append(
-            {
-                "representative": label,
-                "nucleus_size": sample.nucleus_size,
-                "top_p_ms_per_step_rounds": top_p_ms,
-                "sampling_ms_per_step_rounds": sampling_ms,
-                "combined_ms_per_step_rounds": combined_ms,
-                "top_p_ms_per_step_worst": max(top_p_ms),
-                "sampling_ms_per_step_worst": max(sampling_ms),
-                "combined_ms_per_step_worst": max(combined_ms),
-                "selected_token_exact": True,
-                "top_p_mask_exact": True,
-            }
-        )
+        for vocab_size in representatives
+    }
     return {
         "warmup": warmup,
         "iterations": iterations,
         "rounds": rounds,
         "reciprocal_order": ["top_p", "sampling", "combined"],
+        "observed_vocab_sizes": list(representatives),
+        "observed_score_shapes": [[1, vocab_size] for vocab_size in representatives],
         "representatives": rows,
-        "worst_combined_ms_per_step": max(
-            row["combined_ms_per_step_worst"] for row in rows
-        ),
+        "worst_combined_ms_per_step_by_vocab_size": worst_by_vocab_size,
+        "worst_combined_ms_per_step": max(worst_by_vocab_size.values()),
+    }
+
+
+def _benchmark_representative(
+    label: str,
+    sample: VocabSample,
+    *,
+    vocab_size: int,
+    device: Any,
+    warmup: int,
+    iterations: int,
+    rounds: int,
+    top_p_warper_cls: Any,
+) -> dict[str, Any]:
+    import torch
+
+    if sample.vocab_size != vocab_size:
+        raise RuntimeError(
+            f"representative width {sample.vocab_size} does not match group {vocab_size}"
+        )
+    top_p_rows = [
+        attributes
+        for name, attributes in sample.processor_descriptor
+        if name == "TopPLogitsWarper"
+    ]
+    if len(top_p_rows) != 1:
+        raise RuntimeError("captured descriptor must contain exactly one TopP warper")
+    descriptor = dict(top_p_rows[0])
+    top_p_kwargs = _top_p_kwargs(descriptor)
+    pre = sample.pre_top_p.to(device=device)
+    post = sample.post_top_p.to(device=device)
+    threshold = torch.tensor(sample.threshold, dtype=torch.float32, device=device)
+    input_ids = torch.zeros((1, 1), dtype=torch.long, device=device)
+    warper = top_p_warper_cls(**top_p_kwargs)
+    top_p_graph, top_p_output = _capture_graph(
+        lambda: warper(input_ids, pre), warmup=warmup
+    )
+    _require_recaptured_tensor(
+        "TopP output",
+        top_p_output,
+        sample.post_top_p,
+        descriptor=descriptor,
+    )
+    sampling_graph, sampling_output = _capture_graph(
+        lambda: _sampling_with_threshold(post, threshold), warmup=warmup
+    )
+    sampling_token = int(sampling_output.cpu().item())
+    if sampling_token != sample.selected_token:
+        raise RuntimeError(
+            "recaptured counter sampler differs from observed token: "
+            f"actual={sampling_token} expected={sample.selected_token} "
+            f"descriptor={descriptor!r}"
+        )
+    combined_graph, combined_output = _capture_graph(
+        lambda: _sampling_with_threshold(warper(input_ids, pre), threshold),
+        warmup=warmup,
+    )
+    torch.cuda.synchronize()
+    combined_token = int(combined_output.cpu().item())
+    if combined_token != sample.selected_token:
+        raise RuntimeError(
+            "combined TopP+sampler graph differs from observed token: "
+            f"actual={combined_token} expected={sample.selected_token} "
+            f"descriptor={descriptor!r}"
+        )
+    top_p_ms = _time_graph(top_p_graph, iterations=iterations, rounds=rounds)
+    sampling_ms = _time_graph(sampling_graph, iterations=iterations, rounds=rounds)
+    combined_ms = _time_graph(combined_graph, iterations=iterations, rounds=rounds)
+    return {
+        "representative": label,
+        "vocab_size": vocab_size,
+        "score_shape": [1, vocab_size],
+        "nucleus_size": sample.nucleus_size,
+        "top_p_ms_per_step_rounds": top_p_ms,
+        "sampling_ms_per_step_rounds": sampling_ms,
+        "combined_ms_per_step_rounds": combined_ms,
+        "top_p_ms_per_step_worst": max(top_p_ms),
+        "sampling_ms_per_step_worst": max(sampling_ms),
+        "combined_ms_per_step_worst": max(combined_ms),
+        "selected_token_exact": True,
+        "top_p_mask_exact": True,
     }
 
 
@@ -535,13 +647,155 @@ def summarize(
     )
     if not observer.samples:
         raise ValueError("vocabulary scout captured no samples")
-    combined_ms = _finite_nonnegative(
+    nucleus_sizes = [sample.nucleus_size for sample in observer.samples]
+    samples_by_vocab_size: dict[int, list[VocabSample]] = {}
+    for sample in observer.samples:
+        samples_by_vocab_size.setdefault(sample.vocab_size, []).append(sample)
+    vocab_sizes = sorted(samples_by_vocab_size)
+    observed_vocab_sizes = sorted(observer.observed_vocab_counts)
+    if observed_vocab_sizes != vocab_sizes or any(
+        isinstance(count, bool) or not isinstance(count, int) or count <= 0
+        for count in observer.observed_vocab_counts.values()
+    ):
+        raise RuntimeError(
+            "stored samples do not cover every observed vocabulary size: "
+            f"observed_counts={observer.observed_vocab_counts} "
+            f"stored={vocab_sizes}"
+        )
+    descriptor_counts = {
+        vocab_size: len(
+            {
+                sample.processor_descriptor
+                for sample in samples_by_vocab_size[vocab_size]
+            }
+        )
+        for vocab_size in vocab_sizes
+    }
+    unsupported_descriptors = {
+        vocab_size: count
+        for vocab_size, count in descriptor_counts.items()
+        if count != 1
+    }
+    if unsupported_descriptors:
+        raise RuntimeError(
+            "vocabulary scout cannot claim coverage for multiple TopP "
+            f"configurations per shape: {unsupported_descriptors}"
+        )
+    component_vocab_sizes = component.get("observed_vocab_sizes")
+    if component_vocab_sizes != vocab_sizes:
+        raise RuntimeError(
+            "component timing does not cover every observed vocabulary size: "
+            f"observed={vocab_sizes} timed={component_vocab_sizes!r}"
+        )
+    expected_score_shapes = [[1, vocab_size] for vocab_size in vocab_sizes]
+    if component.get("observed_score_shapes") != expected_score_shapes:
+        raise RuntimeError(
+            "component timing does not cover every observed score shape: "
+            f"expected={expected_score_shapes} "
+            f"timed={component.get('observed_score_shapes')!r}"
+        )
+    representatives = component.get("representatives")
+    if not isinstance(representatives, list):
+        raise TypeError("component representatives must be a list")
+    coverage_by_vocab_size = {vocab_size: set() for vocab_size in vocab_sizes}
+    row_worst_by_vocab_size = {vocab_size: [] for vocab_size in vocab_sizes}
+    seen_representatives: set[tuple[int, str]] = set()
+    for row in representatives:
+        if not isinstance(row, dict):
+            raise TypeError("each component representative must be an object")
+        vocab_size = row.get("vocab_size")
+        label = row.get("representative")
+        if vocab_size not in coverage_by_vocab_size or label not in {
+            "min",
+            "p50",
+            "p95",
+            "max",
+        }:
+            raise RuntimeError(
+                "component contains an unsupported representative: "
+                f"vocab_size={vocab_size!r} representative={label!r}"
+            )
+        identity = (vocab_size, label)
+        if identity in seen_representatives:
+            raise RuntimeError(
+                "component repeats a vocabulary representative: "
+                f"vocab_size={vocab_size} representative={label}"
+            )
+        seen_representatives.add(identity)
+        if row.get("score_shape") != [1, vocab_size]:
+            raise RuntimeError(
+                "component representative score shape is inconsistent: "
+                f"vocab_size={vocab_size} score_shape={row.get('score_shape')!r}"
+            )
+        row_worst = _finite_nonnegative(
+            f"representative.{vocab_size}.{label}.combined_ms_per_step_worst",
+            row.get("combined_ms_per_step_worst"),
+        )
+        if row_worst <= 0.0:
+            raise RuntimeError("component representative timings must be positive")
+        row_worst_by_vocab_size[vocab_size].append(row_worst)
+        coverage_by_vocab_size[vocab_size].add(label)
+    required_labels = {"min", "p50", "p95", "max"}
+    incomplete_coverage = {
+        vocab_size: sorted(required_labels - labels)
+        for vocab_size, labels in coverage_by_vocab_size.items()
+        if labels != required_labels
+    }
+    if incomplete_coverage:
+        raise RuntimeError(
+            "component representatives do not cover every observed vocabulary shape: "
+            f"missing={incomplete_coverage}"
+        )
+    raw_worst_by_vocab_size = component.get("worst_combined_ms_per_step_by_vocab_size")
+    if not isinstance(raw_worst_by_vocab_size, dict):
+        raise TypeError("component per-vocabulary worst timings must be an object")
+    expected_keys = {str(vocab_size) for vocab_size in vocab_sizes}
+    if set(raw_worst_by_vocab_size) != expected_keys:
+        raise RuntimeError(
+            "component per-vocabulary timings do not cover every observed shape: "
+            f"expected={sorted(expected_keys)} "
+            f"got={sorted(raw_worst_by_vocab_size)}"
+        )
+    reported_worst_by_vocab_size = {
+        vocab_size: _finite_nonnegative(
+            f"worst_combined_ms_per_step_by_vocab_size.{vocab_size}",
+            raw_worst_by_vocab_size[str(vocab_size)],
+        )
+        for vocab_size in vocab_sizes
+    }
+    if any(value <= 0.0 for value in reported_worst_by_vocab_size.values()):
+        raise RuntimeError("component per-vocabulary worst timings must be positive")
+    worst_by_vocab_size = {
+        vocab_size: max(row_worst_by_vocab_size[vocab_size])
+        for vocab_size in vocab_sizes
+    }
+    inconsistent_vocab_worst = {
+        vocab_size: {
+            "reported": reported_worst_by_vocab_size[vocab_size],
+            "computed": worst_by_vocab_size[vocab_size],
+        }
+        for vocab_size in vocab_sizes
+        if not math.isclose(
+            reported_worst_by_vocab_size[vocab_size],
+            worst_by_vocab_size[vocab_size],
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+    }
+    if inconsistent_vocab_worst:
+        raise RuntimeError(
+            "component per-vocabulary worst timing is inconsistent with "
+            f"representative rows: {inconsistent_vocab_worst}"
+        )
+    combined_ms = max(worst_by_vocab_size.values())
+    reported_combined_ms = _finite_nonnegative(
         "worst_combined_ms_per_step", component.get("worst_combined_ms_per_step")
     )
-    nucleus_sizes = [sample.nucleus_size for sample in observer.samples]
-    vocab_sizes = {sample.vocab_size for sample in observer.samples}
-    if len(vocab_sizes) != 1:
-        raise RuntimeError(f"captured vocabulary size changed: {sorted(vocab_sizes)}")
+    if not math.isclose(combined_ms, reported_combined_ms, rel_tol=0.0, abs_tol=1e-12):
+        raise RuntimeError(
+            "component worst timing is inconsistent with per-vocabulary timings: "
+            f"reported={reported_combined_ms} computed={combined_ms}"
+        )
     device_tail_main = combined_ms * fixed_main_steps / 1000.0
     projection_main = mixed_projection_ms_per_step * fixed_main_steps / 1000.0
     ideal_main = device_tail_main + projection_main
@@ -569,6 +823,14 @@ def summarize(
                 observer.wasted_graph_observations
             ),
             "dropped_observations": observer.dropped_observations,
+            "observed_samples_by_vocab_size": {
+                str(vocab_size): observer.observed_vocab_counts[vocab_size]
+                for vocab_size in vocab_sizes
+            },
+            "stored_samples_by_vocab_size": {
+                str(vocab_size): len(samples_by_vocab_size[vocab_size])
+                for vocab_size in vocab_sizes
+            },
             "k4_graph_sampling_stride": 4,
             "graph_sample_semantics": (
                 "final_physical step per K4 block, excluding blocks whose final "
@@ -576,7 +838,39 @@ def summarize(
             ),
         },
         "distribution": {
-            "vocab_size": next(iter(vocab_sizes)),
+            "vocab_sizes": vocab_sizes,
+            "score_shapes": expected_score_shapes,
+            "samples_by_vocab_size": {
+                str(vocab_size): len(samples_by_vocab_size[vocab_size])
+                for vocab_size in vocab_sizes
+            },
+            "nucleus_size_by_vocab_size": {
+                str(vocab_size): {
+                    "min": min(
+                        sample.nucleus_size
+                        for sample in samples_by_vocab_size[vocab_size]
+                    ),
+                    "p50": _percentile(
+                        [
+                            sample.nucleus_size
+                            for sample in samples_by_vocab_size[vocab_size]
+                        ],
+                        0.50,
+                    ),
+                    "p95": _percentile(
+                        [
+                            sample.nucleus_size
+                            for sample in samples_by_vocab_size[vocab_size]
+                        ],
+                        0.95,
+                    ),
+                    "max": max(
+                        sample.nucleus_size
+                        for sample in samples_by_vocab_size[vocab_size]
+                    ),
+                }
+                for vocab_size in vocab_sizes
+            },
             "nucleus_size_min": min(nucleus_sizes),
             "nucleus_size_p50": _percentile(nucleus_sizes, 0.50),
             "nucleus_size_p95": _percentile(nucleus_sizes, 0.95),
@@ -588,6 +882,19 @@ def summarize(
             "fixed_main_steps": fixed_main_steps,
             "fixed_timing_steps": fixed_timing_steps,
             "existing_top_p_sampling_ms_per_step": combined_ms,
+            "existing_top_p_sampling_worst_across_shapes_ms_per_step": combined_ms,
+            "existing_top_p_sampling_ms_per_step_by_vocab_size": {
+                str(vocab_size): worst_by_vocab_size[vocab_size]
+                for vocab_size in vocab_sizes
+            },
+            "worst_case_vocab_sizes": [
+                vocab_size
+                for vocab_size in vocab_sizes
+                if worst_by_vocab_size[vocab_size] == combined_ms
+            ],
+            "ceiling_cost_policy": (
+                "charge the worst observed score-shape tail to every fixed step"
+            ),
             "mixed_projection_ms_per_step": mixed_projection_ms_per_step,
             "ideal_main_top_p_sampling_seconds": device_tail_main,
             "ideal_main_projection_seconds": projection_main,
