@@ -23,7 +23,7 @@ from .runtime_context import active_prefix_self_attention_context
 
 
 K8_BLOCK_SIZE = 8
-RNG_POLICY = "counter_prompt_hash_v1"
+RNG_POLICY = "counter_request_seed_window_prompt_v2"
 _GENERIC_SCORE_PROCESSORS = {
     "TopKLogitsWarper",
     "TopPLogitsWarper",
@@ -44,11 +44,19 @@ def _require_batch1_long(name: str, value: torch.Tensor) -> torch.Tensor:
     return value
 
 
-def _prompt_seed(input_ids: torch.Tensor) -> int:
-    """Stable per-window seed; the one host copy is charged as setup."""
+def _prompt_seed(
+    input_ids: torch.Tensor,
+    *,
+    request_seed: int,
+    window_identity: int,
+) -> int:
+    """Stable request/window stream seed; the host copy is charged as setup."""
 
     values = input_ids.detach().cpu().reshape(-1).tolist()
     state = 0xCBF29CE484222325
+    for value in (request_seed, window_identity):
+        state ^= int(value) & 0xFFFFFFFFFFFFFFFF
+        state = (state * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
     for value in values:
         state ^= int(value) & 0xFFFFFFFFFFFFFFFF
         state = (state * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
@@ -78,6 +86,7 @@ class K8DeviceState:
         max_length: int,
         pad_token_id: int,
         eos_token_ids: torch.Tensor,
+        rng_seed: int,
     ) -> "K8DeviceState":
         input_ids = _require_batch1_long("input_ids", input_ids)
         if isinstance(max_length, bool) or not isinstance(max_length, int):
@@ -109,7 +118,7 @@ class K8DeviceState:
             eos_token_ids=eos_token_ids.to(
                 device=input_ids.device, dtype=torch.long
             ).contiguous(),
-            rng_seed=torch.full_like(length, _prompt_seed(input_ids)),
+            rng_seed=torch.full_like(length, int(rng_seed)),
             rng_counter=torch.zeros_like(length),
             monotonic_has_time_shift=torch.zeros(
                 (1,), dtype=torch.bool, device=input_ids.device
@@ -146,6 +155,7 @@ class K8DeviceState:
         *,
         pad_token_id: int,
         eos_token_ids: torch.Tensor,
+        rng_seed: int,
     ) -> None:
         input_ids = _require_batch1_long("input_ids", input_ids)
         if input_ids.device != self.sequence.device:
@@ -162,7 +172,7 @@ class K8DeviceState:
         self.logical_length.fill_(self.max_length)
         self.unfinished.fill_(True)
         self.pad_token.fill_(int(pad_token_id))
-        self.rng_seed.fill_(_prompt_seed(input_ids))
+        self.rng_seed.fill_(int(rng_seed))
         self.rng_counter.zero_()
         self.monotonic_has_time_shift.zero_()
         self.monotonic_last_value.zero_()
@@ -356,6 +366,7 @@ class K8LogitsProcessor:
             position = (self.state.physical_length - int(offset)).clamp(min=0)
             prior = self.state.sequence.gather(1, position.view(1, 1)).reshape(1)
             matches = (prior[:, None] == token_values[None, :]).any(dim=1)
+            matches &= self.state.physical_length >= int(offset)
             matches &= ~assigned
             temperature = torch.where(
                 matches,
@@ -518,13 +529,18 @@ class _ChildGraphSequence:
     executable: Any
     model_graph: torch.cuda.CUDAGraph
     tail_graph: torch.cuda.CUDAGraph
+    device: torch.device
     closed: bool = False
+    executable_closed: bool = False
+    parent_closed: bool = False
 
     @classmethod
     def build(
         cls,
         model_graph: torch.cuda.CUDAGraph,
         tail_graph: torch.cuda.CUDAGraph,
+        *,
+        device: torch.device | None = None,
     ) -> "_ChildGraphSequence":
         if not hasattr(model_graph, "raw_cuda_graph") or not hasattr(
             tail_graph, "raw_cuda_graph"
@@ -534,56 +550,101 @@ class _ChildGraphSequence:
             )
         from cuda.bindings import runtime
 
-        parent, = _cuda_check(runtime.cudaGraphCreate(0), "cudaGraphCreate")
-        previous = None
-        try:
-            for _ in range(K8_BLOCK_SIZE):
-                for child in (model_graph, tail_graph):
-                    dependencies = None if previous is None else (previous,)
-                    node, = _cuda_check(
-                        runtime.cudaGraphAddChildGraphNode(
-                            parent,
-                            dependencies,
-                            0 if previous is None else 1,
-                            runtime.cudaGraph_t(child.raw_cuda_graph()),
-                        ),
-                        "cudaGraphAddChildGraphNode",
-                    )
-                    previous = node
-            executable, = _cuda_check(
-                runtime.cudaGraphInstantiate(parent, 0),
-                "cudaGraphInstantiate",
-            )
-        except Exception:
-            _cuda_status(runtime.cudaGraphDestroy(parent), "cudaGraphDestroy")
-            raise
-        return cls(parent, executable, model_graph, tail_graph)
+        if device is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        device = torch.device(device)
+        with torch.cuda.device(device):
+            parent, = _cuda_check(runtime.cudaGraphCreate(0), "cudaGraphCreate")
+            previous = None
+            try:
+                for _ in range(K8_BLOCK_SIZE):
+                    for child in (model_graph, tail_graph):
+                        dependencies = None if previous is None else (previous,)
+                        node, = _cuda_check(
+                            runtime.cudaGraphAddChildGraphNode(
+                                parent,
+                                dependencies,
+                                0 if previous is None else 1,
+                                runtime.cudaGraph_t(child.raw_cuda_graph()),
+                            ),
+                            "cudaGraphAddChildGraphNode",
+                        )
+                        previous = node
+                executable, = _cuda_check(
+                    runtime.cudaGraphInstantiate(parent, 0),
+                    "cudaGraphInstantiate",
+                )
+            except Exception:
+                _cuda_status(runtime.cudaGraphDestroy(parent), "cudaGraphDestroy")
+                raise
+        return cls(parent, executable, model_graph, tail_graph, device)
 
     def replay(self) -> None:
         if self.closed:
             raise RuntimeError("K8 parent graph is closed")
         from cuda.bindings import runtime
 
-        stream = runtime.cudaStream_t(torch.cuda.current_stream().cuda_stream)
-        _cuda_status(
-            runtime.cudaGraphLaunch(self.executable, stream),
-            "cudaGraphLaunch",
-        )
+        with torch.cuda.device(self.device):
+            stream = runtime.cudaStream_t(torch.cuda.current_stream().cuda_stream)
+            _cuda_status(
+                runtime.cudaGraphLaunch(self.executable, stream),
+                "cudaGraphLaunch",
+            )
 
     def close(self) -> None:
         if self.closed:
             return
         from cuda.bindings import runtime
 
-        _cuda_status(
-            runtime.cudaGraphExecDestroy(self.executable),
-            "cudaGraphExecDestroy",
-        )
-        _cuda_status(
-            runtime.cudaGraphDestroy(self.parent_graph),
-            "cudaGraphDestroy",
-        )
-        self.closed = True
+        with torch.cuda.device(self.device):
+            if not self.executable_closed:
+                _cuda_status(
+                    runtime.cudaGraphExecDestroy(self.executable),
+                    "cudaGraphExecDestroy",
+                )
+                self.executable_closed = True
+            if not self.parent_closed:
+                _cuda_status(
+                    runtime.cudaGraphDestroy(self.parent_graph),
+                    "cudaGraphDestroy",
+                )
+                self.parent_closed = True
+        self.closed = self.executable_closed and self.parent_closed
+
+
+@dataclass(slots=True)
+class _K8GraphLifecycle:
+    active_cache_id: int | None = None
+    graphs: dict[int, _ChildGraphSequence] = field(default_factory=dict)
+
+    def activate(self, graph_cache: dict[Any, Any]) -> None:
+        cache_id = id(graph_cache)
+        if self.active_cache_id is not None and self.active_cache_id != cache_id:
+            self.close_all()
+        self.active_cache_id = cache_id
+
+    def register(self, graph: _ChildGraphSequence) -> None:
+        if graph.closed:
+            raise RuntimeError("cannot register a closed K8 child graph")
+        self.graphs[id(graph)] = graph
+
+    def close_all(self) -> None:
+        first_error: Exception | None = None
+        remaining: dict[int, _ChildGraphSequence] = {}
+        for identity, graph in tuple(self.graphs.items()):
+            try:
+                graph.close()
+            except Exception as exc:
+                remaining[identity] = graph
+                if first_error is None:
+                    first_error = exc
+        self.graphs = remaining
+        self.active_cache_id = None
+        if first_error is not None:
+            raise first_error
+
+
+_ACTIVE_K8_LIFECYCLE: _K8GraphLifecycle | None = None
 
 
 @dataclass(slots=True)
@@ -605,7 +666,11 @@ class _K8RuntimeSlot:
     signature: tuple[Any, ...]
 
 
-def _freeze_processor_value(value: Any) -> Any:
+def _freeze_processor_value(
+    value: Any,
+    *,
+    d2h: dict[str, int] | None = None,
+) -> Any:
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     if isinstance(value, slice):
@@ -613,29 +678,40 @@ def _freeze_processor_value(value: Any) -> Any:
     if isinstance(value, torch.Tensor):
         if value.numel() > 4096:
             return (tuple(value.shape), str(value.dtype), str(value.device))
+        if d2h is not None and value.device.type != "cpu":
+            d2h["calls"] = d2h.get("calls", 0) + 1
+            d2h["bytes"] = d2h.get("bytes", 0) + (
+                value.numel() * value.element_size()
+            )
         return (
             tuple(value.shape),
             str(value.dtype),
             tuple(value.detach().cpu().reshape(-1).tolist()),
         )
     if isinstance(value, (list, tuple)):
-        return tuple(_freeze_processor_value(item) for item in value)
+        return tuple(
+            _freeze_processor_value(item, d2h=d2h) for item in value
+        )
     if isinstance(value, dict):
         return tuple(sorted(
-            (str(key), _freeze_processor_value(item))
+            (str(key), _freeze_processor_value(item, d2h=d2h))
             for key, item in value.items()
         ))
     return type(value).__name__
 
 
-def _processor_signature(processors: Any) -> tuple[Any, ...]:
+def _processor_signature(
+    processors: Any,
+    *,
+    d2h: dict[str, int] | None = None,
+) -> tuple[Any, ...]:
     rows = []
     for processor in processors:
         attributes = getattr(processor, "__dict__", {})
         rows.append((
             type(processor).__name__,
             tuple(sorted(
-                (name, _freeze_processor_value(value))
+                (name, _freeze_processor_value(value, d2h=d2h))
                 for name, value in attributes.items()
                 if not name.startswith("_state_")
                 and not name.endswith("_by_device")
@@ -643,6 +719,23 @@ def _processor_signature(processors: Any) -> tuple[Any, ...]:
             )),
         ))
     return tuple(rows)
+
+
+def _request_seed(generator: Any, device: torch.device) -> int:
+    if isinstance(generator, (list, tuple)):
+        if len(generator) != 1:
+            raise ValueError("K8 batch-one decoding accepts one generator")
+        generator = generator[0]
+    if generator is not None:
+        if not isinstance(generator, torch.Generator):
+            raise TypeError("K8 generator must be a torch.Generator")
+        return int(generator.initial_seed())
+    if device.type != "cuda":
+        raise RuntimeError("K8 request seed fallback requires a CUDA device")
+    index = device.index
+    if index is None:
+        index = torch.cuda.current_device()
+    return int(torch.cuda.default_generators[index].initial_seed())
 
 
 def _runtime_slot(
@@ -653,13 +746,17 @@ def _runtime_slot(
     pad_token_id: int,
     eos_token_ids: torch.Tensor,
     logits_processor: Any,
+    processor_signature: tuple[Any, ...],
     vocab_size: int,
+    rng_seed: int,
+    do_sample: bool,
 ) -> _K8RuntimeSlot:
     signature = (
         max_length,
         tuple(int(value) for value in eos_token_ids.detach().cpu().tolist()),
-        _processor_signature(logits_processor),
+        processor_signature,
         str(input_ids.device),
+        bool(do_sample),
     )
     slots = holder.setdefault("__k8_runtime_slots__", {})
     slot = slots.get(signature)
@@ -669,6 +766,7 @@ def _runtime_slot(
             max_length=max_length,
             pad_token_id=pad_token_id,
             eos_token_ids=eos_token_ids,
+            rng_seed=rng_seed,
         )
         processor = K8LogitsProcessor.compile(
             logits_processor,
@@ -683,6 +781,7 @@ def _runtime_slot(
             input_ids,
             pad_token_id=pad_token_id,
             eos_token_ids=eos_token_ids,
+            rng_seed=rng_seed,
         )
         slot.processor.reset(prompt_length=input_ids.shape[1])
     return slot
@@ -721,35 +820,45 @@ def _capture_k8_entry(
     if not torch.cuda.is_available():
         raise RuntimeError("K8 graph capture requires CUDA")
     started = time.perf_counter()
-    torch.cuda.reset_peak_memory_stats(state.sequence.device)
-    static_inputs = _clone_static_graph_inputs(model_inputs)
-    model_graph = torch.cuda.CUDAGraph(keep_graph=True)
-    with torch.cuda.graph(model_graph):
-        with active_prefix_self_attention_context(active_prefix_length):
-            outputs = model(**static_inputs, return_dict=True)
-    snapshots = _snapshot_tensors(state, processor, static_inputs)
-    tail_graph = torch.cuda.CUDAGraph(keep_graph=True)
-    with torch.cuda.graph(tail_graph):
-        _one_step_tail(
-            logits=outputs.logits,
-            processor=processor,
-            state=state,
-            static_inputs=static_inputs,
-            do_sample=do_sample,
+    device = state.sequence.device
+    with torch.cuda.device(device):
+        torch.cuda.reset_peak_memory_stats(device)
+        static_inputs = _clone_static_graph_inputs(model_inputs)
+        model_graph = torch.cuda.CUDAGraph(keep_graph=True)
+        with torch.cuda.graph(model_graph):
+            with active_prefix_self_attention_context(active_prefix_length):
+                outputs = model(**static_inputs, return_dict=True)
+        snapshots = _snapshot_tensors(state, processor, static_inputs)
+        tail_graph = torch.cuda.CUDAGraph(keep_graph=True)
+        with torch.cuda.graph(tail_graph):
+            _one_step_tail(
+                logits=outputs.logits,
+                processor=processor,
+                state=state,
+                static_inputs=static_inputs,
+                do_sample=do_sample,
+            )
+        for tensor, snapshot in snapshots:
+            tensor.copy_(snapshot)
+        parent = _ChildGraphSequence.build(
+            model_graph,
+            tail_graph,
+            device=device,
         )
-    for tensor, snapshot in snapshots:
-        tensor.copy_(snapshot)
-    parent = _ChildGraphSequence.build(model_graph, tail_graph)
-    torch.cuda.synchronize(state.sequence.device)
-    return _K8GraphEntry(
-        parent=parent,
-        static_inputs=static_inputs,
-        state=state,
-        processor=processor,
-        outputs=outputs,
-        capture_seconds=time.perf_counter() - started,
-        peak_vram_bytes=torch.cuda.max_memory_allocated(state.sequence.device),
-    )
+        try:
+            torch.cuda.synchronize(device)
+            return _K8GraphEntry(
+                parent=parent,
+                static_inputs=static_inputs,
+                state=state,
+                processor=processor,
+                outputs=outputs,
+                capture_seconds=time.perf_counter() - started,
+                peak_vram_bytes=torch.cuda.max_memory_allocated(device),
+            )
+        except Exception:
+            parent.close()
+            raise
 
 
 def _k8_eligible(cur_len: int, max_length: int, bucket_size: int) -> bool:
@@ -804,9 +913,18 @@ def _sync_model_kwargs_after_k8(
     model_kwargs["cache_position"] = entry.static_inputs["cache_position"]
     if "decoder_attention_mask" in model_kwargs:
         original = model_kwargs["decoder_attention_mask"]
-        model_kwargs["decoder_attention_mask"] = torch.ones(
+        if (
+            not isinstance(original, torch.Tensor)
+            or original.ndim != 2
+            or tuple(original.shape[:1]) != (1,)
+            or original.shape[1] > cur_len
+        ):
+            raise ValueError("K8 decoder attention mask must be [1, <=cur_len]")
+        extended = torch.ones(
             (1, cur_len), dtype=original.dtype, device=original.device
         )
+        extended[:, : original.shape[1]].copy_(original)
+        model_kwargs["decoder_attention_mask"] = extended
 
 
 def k8_active_prefix_decode_generate(
@@ -842,8 +960,12 @@ def k8_active_prefix_decode_generate(
         generation_config.output_logits,
     )):
         raise ValueError("K8 supports tensor outputs only")
+    lifecycle = _ACTIVE_K8_LIFECYCLE
+    if lifecycle is None:
+        raise RuntimeError("K8 decode must run inside install_k8_candidate()")
     pad_token_id = int(generation_config._pad_token_tensor.reshape(-1)[0].item())
-    batch_size, cur_len = input_ids.shape
+    _, cur_len = input_ids.shape
+    generator = model_kwargs.pop("generator", None)
     model_kwargs = model._get_initial_cache_position(
         cur_len, input_ids.device, model_kwargs
     )
@@ -855,6 +977,37 @@ def k8_active_prefix_decode_generate(
     )
     if stable_encoder_holder is None:
         raise RuntimeError("K8 requires persistent request-local runtime state")
+    graph_cache = shared_graph_cache if shared_graph_cache is not None else {}
+    lifecycle.activate(graph_cache)
+    window_identity = int(
+        stable_encoder_holder.get("__k8_window_serial__", 0)
+    ) + 1
+    stable_encoder_holder["__k8_window_serial__"] = window_identity
+    current_request_seed = _request_seed(generator, input_ids.device)
+    stored_request_seed = stable_encoder_holder.setdefault(
+        "__k8_request_seed__",
+        current_request_seed,
+    )
+    if int(stored_request_seed) != current_request_seed:
+        raise RuntimeError("K8 request-local generator seed changed mid-session")
+
+    prompt_seed_started = time.perf_counter()
+    rng_seed = _prompt_seed(
+        input_ids,
+        request_seed=current_request_seed,
+        window_identity=window_identity,
+    )
+    prompt_seed_seconds = time.perf_counter() - prompt_seed_started
+    processor_d2h: dict[str, int] = {"calls": 0, "bytes": 0}
+    processor_signature_started = time.perf_counter()
+    processor_signature = _processor_signature(
+        logits_processor,
+        d2h=processor_d2h,
+    )
+    processor_signature_seconds = (
+        time.perf_counter() - processor_signature_started
+    )
+    do_sample = bool(generation_config.do_sample)
     slot = _runtime_slot(
         stable_encoder_holder,
         input_ids=input_ids,
@@ -862,18 +1015,19 @@ def k8_active_prefix_decode_generate(
         pad_token_id=pad_token_id,
         eos_token_ids=eos_ids,
         logits_processor=logits_processor,
+        processor_signature=processor_signature,
         vocab_size=int(model.config.vocab_size),
+        rng_seed=rng_seed,
+        do_sample=do_sample,
     )
     state = slot.state
     processor = slot.processor
-    graph_cache = shared_graph_cache if shared_graph_cache is not None else {}
     prompt_length = int(cur_len)
     stats = {
         "k8_candidate": True,
-        "window_serial": int(
-            stable_encoder_holder.get("__k8_window_serial__", 0)
-        ) + 1,
+        "window_serial": window_identity,
         "block_size": K8_BLOCK_SIZE,
+        "prefill_steps": 0,
         "eligible_steps": 0,
         "block_replays": 0,
         "remainder_steps": 0,
@@ -888,9 +1042,19 @@ def k8_active_prefix_decode_generate(
         "rng_policy": RNG_POLICY,
         "rng_exact": False,
         "rng_drift": "documented_counter_based_per_window",
+        "rng_request_seed": current_request_seed,
+        "rng_window_identity": window_identity,
+        "rng_early_eos_isolation": True,
+        "sampling_mode": "sample" if do_sample else "greedy",
+        "prompt_seed_d2h_copy_calls": 1,
+        "prompt_seed_d2h_copy_bytes": input_ids.numel() * input_ids.element_size(),
+        "prompt_seed_setup_seconds": prompt_seed_seconds,
+        "processor_signature_d2h_copy_calls": processor_d2h["calls"],
+        "processor_signature_d2h_copy_bytes": processor_d2h["bytes"],
+        "processor_signature_setup_seconds": processor_signature_seconds,
         "parent_backend": "cuda_python_child_graphs",
     }
-    stable_encoder_holder["__k8_window_serial__"] = stats["window_serial"]
+    stable_encoder_holder["__k8_latest_stats__"] = stats
 
     is_prefill = True
     finished = False
@@ -907,6 +1071,7 @@ def k8_active_prefix_decode_generate(
                 with profile_range("generation.encoder_prefill"):
                     outputs = model(**model_inputs, return_dict=True)
                 is_prefill = False
+                stats["prefill_steps"] += 1
             else:
                 prefix = _bucketed_prefix_length(
                     cur_len, active_prefix_bucket_size, max_length
@@ -928,7 +1093,7 @@ def k8_active_prefix_decode_generate(
             scores_step = processor(outputs.logits[:, -1, :])
             token = (
                 _sample_counter(scores_step, state)
-                if generation_config.do_sample
+                if do_sample
                 else torch.argmax(scores_step, dim=-1)
             )
             active = state.append(token)
@@ -947,7 +1112,7 @@ def k8_active_prefix_decode_generate(
         model_inputs = model.prepare_inputs_for_generation(
             active_ids, **model_kwargs
         )
-        key = ("k8_candidate", id(state), prefix, tuple(
+        key = ("k8_candidate", id(state), prefix, do_sample, tuple(
             (name, tuple(value.shape), str(value.dtype), str(value.device))
             if isinstance(value, torch.Tensor)
             else (name, type(value).__name__, id(value))
@@ -965,8 +1130,13 @@ def k8_active_prefix_decode_generate(
                 active_prefix_length=prefix,
                 state=state,
                 processor=processor,
-                do_sample=bool(generation_config.do_sample),
+                do_sample=do_sample,
             )
+            try:
+                lifecycle.register(entry.parent)
+            except Exception:
+                entry.parent.close()
+                raise
             raw_entry = {
                 "k8_candidate": True,
                 "runtime_entry": entry,
@@ -1023,6 +1193,13 @@ def k8_active_prefix_decode_generate(
     stats["physical_steps"] = stats["logical_steps"] + stats["wasted_steps"]
     if stats["physical_steps"] - stats["logical_steps"] != stats["wasted_steps"]:
         raise RuntimeError("K8 physical/logical/wasted step accounting diverged")
+    accounted_steps = (
+        stats["prefill_steps"]
+        + stats["eligible_steps"]
+        + stats["remainder_steps"]
+    )
+    if stats["physical_steps"] != accounted_steps:
+        raise RuntimeError("K8 prefill/eligible/remainder work accounting diverged")
     return state.sequence[:, :cur_len]
 
 
@@ -1030,14 +1207,23 @@ def k8_active_prefix_decode_generate(
 def install_k8_candidate() -> Iterator[None]:
     """Temporarily install K8 only for an explicit candidate runner."""
 
+    global _ACTIVE_K8_LIFECYCLE
     from . import engine
 
+    if _ACTIVE_K8_LIFECYCLE is not None:
+        raise RuntimeError("K8 candidate context cannot be nested")
+    lifecycle = _K8GraphLifecycle()
     previous = engine.active_prefix_decode_generate
+    _ACTIVE_K8_LIFECYCLE = lifecycle
     engine.active_prefix_decode_generate = k8_active_prefix_decode_generate
     try:
         yield
     finally:
         engine.active_prefix_decode_generate = previous
+        try:
+            lifecycle.close_all()
+        finally:
+            _ACTIVE_K8_LIFECYCLE = None
 
 
 __all__ = [
