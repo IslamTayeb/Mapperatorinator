@@ -120,7 +120,7 @@ def _manifest() -> dict:
             "disabled_reason": "approximate_weight_only",
         },
     }
-    return {
+    manifest = {
         "composition_version": (
             "k4-split-kv-mixed-weight-shared-rope-k1-remainder-int8-mlp-v1"
         ),
@@ -145,6 +145,7 @@ def _manifest() -> dict:
         },
         "main_generation_records": [
             {
+                "generated_tokens": 12,
                 "optimized_dispatch_mode": "approximate_weight_only_batch1",
                 "optimized_dispatch_policy": dispatch_policy,
                 "optimized_dispatch_capture_hits": {
@@ -163,13 +164,13 @@ def _manifest() -> dict:
                         "prefill_steps": 1,
                         "eligible_steps": 8,
                         "block_replays": 2,
-                        "remainder_steps": 1,
+                        "remainder_steps": 6,
                         "remainder_backend": "cuda_graph",
-                        "remainder_graph_replays": 1,
+                        "remainder_graph_replays": 6,
                         "eager_remainder_steps": 0,
-                        "physical_steps": 10,
-                        "logical_steps": 10,
-                        "wasted_steps": 0,
+                        "physical_steps": 15,
+                        "logical_steps": 12,
+                        "wasted_steps": 3,
                         "rng_policy": "counter_request_seed_window_prompt_v2",
                         "rng_exact": False,
                         "rng_early_eos_isolation": True,
@@ -179,6 +180,23 @@ def _manifest() -> dict:
             }
         ],
     }
+    cached_record = copy.deepcopy(manifest["main_generation_records"][0])
+    cached_record["generated_tokens"] = 5
+    cached_record["optimized_dispatch_capture_hits"] = {
+        name: 0 for name in cached_record["optimized_dispatch_capture_hits"]
+    }
+    cached_record["optimized_cuda_graphs"]["k8_candidate"].update(
+        prefill_steps=1,
+        eligible_steps=4,
+        block_replays=1,
+        remainder_steps=0,
+        remainder_graph_replays=0,
+        physical_steps=5,
+        logical_steps=5,
+        wasted_steps=0,
+    )
+    manifest["main_generation_records"].append(cached_record)
+    return manifest
 
 
 def test_summary_uses_literal_incremental_baselines_and_excludes_mlp() -> None:
@@ -230,7 +248,16 @@ def test_retained_manifest_accepts_exact_live_composition() -> None:
     report = _validate_retained_composition_manifest(_manifest())
 
     assert report["pass"]
-    assert report["k1"] == {"records": 1, "remainder_steps": 1, "physical_steps": 10}
+    assert report["k1"] == {
+        "records": 2,
+        "remainder_steps": 6,
+        "remainder_graph_replays": 6,
+        "eager_remainder_steps": 0,
+        "physical_steps": 20,
+        "logical_steps": 17,
+        "k4_padding_steps": 3,
+    }
+    assert report["dispatch_totals"]["int8_weight_mlp_tail"] == 24
     assert report["excluded_already_int8_regions"] == ["mlp_fc1", "mlp_fc2"]
 
 
@@ -285,6 +312,31 @@ def test_real_tensor_capture_context_installs_and_restores_retained_hooks(
     assert events[-2:] == ["runtime_exit", "rope_exit"]
 
 
+def _set_excess_k4_padding(value: dict) -> None:
+    record = value["main_generation_records"][0]
+    record["generated_tokens"] = 11
+    record["optimized_cuda_graphs"]["k8_candidate"].update(
+        physical_steps=15,
+        logical_steps=11,
+        wasted_steps=4,
+    )
+
+
+def _set_k1_only_padding(value: dict) -> None:
+    record = value["main_generation_records"][0]
+    record["generated_tokens"] = 4
+    record["optimized_cuda_graphs"]["k8_candidate"].update(
+        prefill_steps=1,
+        eligible_steps=0,
+        block_replays=0,
+        remainder_steps=4,
+        remainder_graph_replays=4,
+        physical_steps=5,
+        logical_steps=4,
+        wasted_steps=1,
+    )
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
@@ -319,8 +371,22 @@ def test_real_tensor_capture_context_installs_and_restores_retained_hooks(
         (
             lambda value: value["main_generation_records"][0]["optimized_cuda_graphs"][
                 "k8_candidate"
-            ].update(wasted_steps=1),
-            "wasted physical steps",
+            ].update(remainder_graph_replays=5),
+            "own every remainder step",
+        ),
+        (
+            lambda value: value["main_generation_records"][0]["optimized_cuda_graphs"][
+                "k8_candidate"
+            ].update(eager_remainder_steps=1),
+            "fell back to eager",
+        ),
+        (
+            _set_excess_k4_padding,
+            "padding exceeds one partial block",
+        ),
+        (
+            _set_k1_only_padding,
+            "padding occurred without a K4 block replay",
         ),
         (
             lambda value: value["main_generation_records"][0][

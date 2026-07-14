@@ -144,7 +144,11 @@ def _validate_weight_state_metadata(metadata: Any) -> dict[str, Any]:
     return value
 
 
-def _validate_dispatch_policy(record: dict[str, Any], *, index: int) -> None:
+def _validate_dispatch_policy(
+    record: dict[str, Any],
+    *,
+    index: int,
+) -> dict[str, int]:
     if record.get("optimized_dispatch_mode") != "approximate_weight_only_batch1":
         raise RuntimeError(f"main generation record {index} changed dispatch mode")
     policy = _object(
@@ -186,7 +190,11 @@ def _validate_dispatch_policy(record: dict[str, Any], *, index: int) -> None:
         name=f"main_generation[{index}].optimized_dispatch_capture_hits",
     )
     values = {
-        name: _positive_int(hits.get(name), name=f"dispatch_hits.{name}")
+        name: _positive_int(
+            hits.get(name),
+            name=f"dispatch_hits.{name}",
+            allow_zero=True,
+        )
         for name in REQUIRED_DISPATCHES
     }
     if values["weight_only_self_attention_block"] != values[
@@ -217,9 +225,14 @@ def _validate_dispatch_policy(record: dict[str, Any], *, index: int) -> None:
         raise RuntimeError("split-KV aggregate dispatch count diverged")
     if split_total > values["weight_only_self_attention_block"]:
         raise RuntimeError("split-KV dispatch count exceeds self-attention ownership")
+    return values
 
 
-def _validate_k1_zero_waste(record: dict[str, Any], *, index: int) -> dict[str, int]:
+def _validate_k1_captured_remainder(
+    record: dict[str, Any],
+    *,
+    index: int,
+) -> dict[str, int]:
     graphs = _object(
         record.get("optimized_cuda_graphs"),
         name=f"main_generation[{index}].optimized_cuda_graphs",
@@ -254,8 +267,12 @@ def _validate_k1_zero_waste(record: dict[str, Any], *, index: int) -> dict[str, 
         raise RuntimeError("captured K1 fell back to eager remainder steps")
     if counts["remainder_graph_replays"] != counts["remainder_steps"]:
         raise RuntimeError("captured K1 did not own every remainder step")
-    if counts["wasted_steps"] != 0 or counts["physical_steps"] != counts["logical_steps"]:
-        raise RuntimeError("K4/K1 retained runtime executed wasted physical steps")
+    if counts["physical_steps"] - counts["logical_steps"] != counts["wasted_steps"]:
+        raise RuntimeError("K4 physical/logical/padding accounting diverged")
+    if counts["wasted_steps"] >= 4:
+        raise RuntimeError("K4 post-EOS physical padding exceeds one partial block")
+    if counts["wasted_steps"] > 0 and counts["block_replays"] <= 0:
+        raise RuntimeError("K4 post-EOS padding occurred without a K4 block replay")
     if counts["eligible_steps"] != 4 * counts["block_replays"]:
         raise RuntimeError("K4 block replay accounting diverged")
     if counts["physical_steps"] != (
@@ -264,6 +281,12 @@ def _validate_k1_zero_waste(record: dict[str, Any], *, index: int) -> dict[str, 
         + counts["remainder_steps"]
     ):
         raise RuntimeError("K4/K1 physical-step accounting diverged")
+    generated_tokens = _positive_int(
+        record.get("generated_tokens"),
+        name=f"main_generation[{index}].generated_tokens",
+    )
+    if counts["logical_steps"] != generated_tokens:
+        raise RuntimeError("K4/K1 logical steps diverge from generated tokens")
     expected_rng = {
         "rng_policy": "counter_request_seed_window_prompt_v2",
         "rng_exact": False,
@@ -311,15 +334,37 @@ def _validate_retained_composition_manifest(manifest: Any) -> dict[str, Any]:
     records = value.get("main_generation_records")
     if not isinstance(records, list) or not records:
         raise RuntimeError("retained composition has no main generation records")
-    totals = {"records": len(records), "remainder_steps": 0, "physical_steps": 0}
+    totals = {
+        "records": len(records),
+        "remainder_steps": 0,
+        "remainder_graph_replays": 0,
+        "eager_remainder_steps": 0,
+        "physical_steps": 0,
+        "logical_steps": 0,
+        "k4_padding_steps": 0,
+    }
+    dispatch_totals = {name: 0 for name in REQUIRED_DISPATCHES}
     for index, raw in enumerate(records):
         record = _object(raw, name=f"main_generation[{index}]")
-        _validate_dispatch_policy(record, index=index)
-        counts = _validate_k1_zero_waste(record, index=index)
+        dispatch = _validate_dispatch_policy(record, index=index)
+        for name, count in dispatch.items():
+            dispatch_totals[name] += count
+        counts = _validate_k1_captured_remainder(record, index=index)
         totals["remainder_steps"] += counts["remainder_steps"]
+        totals["remainder_graph_replays"] += counts["remainder_graph_replays"]
+        totals["eager_remainder_steps"] += counts["eager_remainder_steps"]
         totals["physical_steps"] += counts["physical_steps"]
+        totals["logical_steps"] += counts["logical_steps"]
+        totals["k4_padding_steps"] += counts["wasted_steps"]
     if totals["remainder_steps"] <= 0 or totals["physical_steps"] <= 0:
         raise RuntimeError("retained K1 evidence contains no real decode work")
+    missing_dispatch = [
+        name for name, count in dispatch_totals.items() if count <= 0
+    ]
+    if missing_dispatch:
+        raise RuntimeError(
+            f"retained composition never captured dispatches {missing_dispatch}"
+        )
     return {
         "composition_version": RETAINED_COMPOSITION_VERSION,
         "baseline_by_region": dict(CURRENT_BASELINE),
@@ -327,6 +372,7 @@ def _validate_retained_composition_manifest(manifest: Any) -> dict[str, Any]:
         "weight_state": weight_state,
         "shared_rope": shared_rope,
         "k1": totals,
+        "dispatch_totals": dispatch_totals,
         "pass": True,
     }
 
