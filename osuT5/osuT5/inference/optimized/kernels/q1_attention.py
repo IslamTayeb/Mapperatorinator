@@ -16,20 +16,35 @@ def _device_capability(device: torch.device) -> tuple[int, int]:
     return torch.cuda.get_device_capability(device)
 
 
+def _split_kv_q1_eligible(
+    *,
+    dtype: torch.dtype,
+    device_type: str,
+    active_prefix_length: int,
+    capability: tuple[int, int],
+) -> bool:
+    return (
+        dtype == torch.float32
+        and device_type == "cuda"
+        and active_prefix_length in _SPLIT_KV_Q1_PREFIXES
+        and capability == (7, 5)
+    )
+
+
 def native_q1_rope_cache_attention_variant(
     qkv: torch.Tensor,
     active_prefix_length: int,
 ) -> str:
     """Select the measured SM75 FP32 split-KV path without changing fallbacks."""
 
-    if (
-        not isinstance(qkv, torch.Tensor)
-        or qkv.dtype != torch.float32
-        or not qkv.is_cuda
-        or active_prefix_length not in _SPLIT_KV_Q1_PREFIXES
-    ):
+    if not isinstance(qkv, torch.Tensor) or not qkv.is_cuda:
         return _ACCEPTED_ROPE_CACHE_VARIANT
-    if _device_capability(qkv.device) != (7, 5):
+    if not _split_kv_q1_eligible(
+        dtype=qkv.dtype,
+        device_type=qkv.device.type,
+        active_prefix_length=active_prefix_length,
+        capability=_device_capability(qkv.device),
+    ):
         return _ACCEPTED_ROPE_CACHE_VARIANT
     return _SPLIT_KV_ROPE_CACHE_VARIANT
 
