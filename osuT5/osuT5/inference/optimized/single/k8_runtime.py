@@ -724,7 +724,7 @@ class _StaticInputArena:
     static_inputs: dict[str, Any]
     signature: tuple[Any, ...]
     tensor_addresses: tuple[tuple[str, int], ...]
-    refreshed_window_identity: int
+    refreshed_window_identity: tuple[int, int]
 
     @staticmethod
     def _tensor_addresses(values: dict[str, Any]) -> tuple[tuple[str, int], ...]:
@@ -743,7 +743,7 @@ class _StaticInputArena:
         cls,
         model_inputs: dict[str, Any],
         *,
-        window_identity: int,
+        window_identity: tuple[int, int],
     ) -> "_StaticInputArena":
         static_inputs = _clone_static_graph_inputs(model_inputs)
         return cls(
@@ -757,7 +757,7 @@ class _StaticInputArena:
         self,
         model_inputs: dict[str, Any],
         *,
-        window_identity: int,
+        window_identity: tuple[int, int],
     ) -> None:
         self.validate_tensor_addresses()
         if window_identity == self.refreshed_window_identity:
@@ -1183,6 +1183,19 @@ def k8_active_prefix_decode_generate(
         request_state.get("__k8_window_serial__", 0)
     ) + 1
     request_state["__k8_window_serial__"] = window_identity
+    persistent_request_serial = request_state.get(
+        "__persistent_request_serial__",
+        0,
+    )
+    if (
+        isinstance(persistent_request_serial, bool)
+        or not isinstance(persistent_request_serial, int)
+        or persistent_request_serial < 0
+    ):
+        raise RuntimeError(
+            "persistent request serial must be a non-negative integer"
+        )
+    arena_window_identity = (persistent_request_serial, window_identity)
     current_request_seed = _request_seed(generator, input_ids.device)
     stored_request_seed = request_state.setdefault(
         "__k8_request_seed__",
@@ -1396,7 +1409,7 @@ def k8_active_prefix_decode_generate(
             shared_static_input_arena
             and (
                 arena is None
-                or arena.refreshed_window_identity != window_identity
+                or arena.refreshed_window_identity != arena_window_identity
             )
         )
         if not shared_static_input_arena or first_arena_use_this_window:
@@ -1418,11 +1431,14 @@ def k8_active_prefix_decode_generate(
             if arena is None:
                 arena = _StaticInputArena.create(
                     model_inputs,
-                    window_identity=window_identity,
+                    window_identity=arena_window_identity,
                 )
                 slot.static_input_arena = arena
             else:
-                arena.refresh(model_inputs, window_identity=window_identity)
+                arena.refresh(
+                    model_inputs,
+                    window_identity=arena_window_identity,
+                )
             stats["static_input_arena_refreshes"] += 1
             stats["static_input_arena_refresh_copy_calls"] += copy_calls
             stats["static_input_arena_refresh_copy_bytes"] += copy_bytes

@@ -180,7 +180,7 @@ def test_shared_static_input_arena_preserves_addresses_and_refreshes_once_per_wi
         "decoder_attention_mask": torch.zeros((1, 1, 1, 8)),
         "past_key_values": marker,
     }
-    arena = _StaticInputArena.create(first, window_identity=1)
+    arena = _StaticInputArena.create(first, window_identity=(0, 1))
     pointers = {
         name: value.data_ptr()
         for name, value in arena.static_inputs.items()
@@ -194,9 +194,9 @@ def test_shared_static_input_arena_preserves_addresses_and_refreshes_once_per_wi
         "past_key_values": marker,
     }
 
-    arena.refresh(second, window_identity=2)
+    arena.refresh(second, window_identity=(0, 2))
 
-    assert arena.refreshed_window_identity == 2
+    assert arena.refreshed_window_identity == (0, 2)
     assert arena.static_inputs["decoder_input_ids"].tolist() == [[9]]
     assert arena.static_inputs["cache_position"].tolist() == [7]
     assert {
@@ -205,7 +205,18 @@ def test_shared_static_input_arena_preserves_addresses_and_refreshes_once_per_wi
         if isinstance(value, torch.Tensor)
     } == pointers
     with pytest.raises(RuntimeError, match="refreshed twice"):
-        arena.refresh(second, window_identity=2)
+        arena.refresh(second, window_identity=(0, 2))
+
+
+def test_shared_arena_refresh_identity_includes_persistent_request_serial():
+    first = {"decoder_input_ids": torch.tensor([[3]])}
+    arena = _StaticInputArena.create(first, window_identity=(1, 1))
+    second = {"decoder_input_ids": torch.tensor([[9]])}
+
+    arena.refresh(second, window_identity=(2, 1))
+
+    assert arena.refreshed_window_identity == (2, 1)
+    assert arena.static_inputs["decoder_input_ids"].tolist() == [[9]]
 
 
 def test_prefill_eos_window_requires_zero_shared_arena_refreshes():
@@ -253,17 +264,17 @@ def test_shared_static_input_arena_rejects_signature_or_owner_changes():
     marker = object()
     arena = _StaticInputArena.create(
         {"decoder_input_ids": torch.tensor([[3]]), "cache": marker},
-        window_identity=1,
+        window_identity=(0, 1),
     )
     with pytest.raises(RuntimeError, match="signature changed"):
         arena.refresh(
             {"decoder_input_ids": torch.tensor([[3, 4]]), "cache": marker},
-            window_identity=2,
+            window_identity=(0, 2),
         )
     with pytest.raises(RuntimeError, match="signature changed"):
         arena.refresh(
             {"decoder_input_ids": torch.tensor([[3]]), "cache": object()},
-            window_identity=2,
+            window_identity=(0, 2),
         )
 
     arena.static_inputs["decoder_input_ids"] = torch.tensor([[3]])

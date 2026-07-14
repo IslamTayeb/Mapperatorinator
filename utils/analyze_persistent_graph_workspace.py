@@ -13,7 +13,9 @@ from typing import Any
 LABELS = ("timing_context", "main_generation")
 PASSES = ("cold", "warm1", "warm2")
 WARM_PASSES = ("warm1", "warm2")
-TOPOLOGY_VERSION = "selected-k4-k1-int8-fp16-cross-persistent-graphs-v1"
+TOPOLOGY_VERSION = (
+    "selected-k4-k1-int8-fp16-cross-shared-arena-persistent-graphs-v2"
+)
 VRAM_GROWTH_TOLERANCE_BYTES = 16 * 1024 * 1024
 
 
@@ -50,6 +52,55 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _arena_storage_identity(value: Any, *, name: str) -> tuple[Any, ...]:
+    rows = _list(value, name=name)
+    result = []
+    for index, raw in enumerate(rows):
+        row = _object(raw, name=f"{name}[{index}]")
+        refreshed = _list(
+            row.get("refreshed_window_identity"),
+            name=f"{name}[{index}].refreshed_window_identity",
+        )
+        if len(refreshed) != 2:
+            raise ValueError(f"{name}[{index}] refresh identity must have two values")
+        for part_index, part in enumerate(refreshed):
+            _integer(part, name=f"{name}[{index}].refresh[{part_index}]")
+        addresses = _list(
+            row.get("tensor_addresses"),
+            name=f"{name}[{index}].tensor_addresses",
+        )
+        if not addresses:
+            raise ValueError(f"{name}[{index}] tensor addresses must be non-empty")
+        address_identity = []
+        for address_index, raw_address in enumerate(addresses):
+            address = _object(
+                raw_address,
+                name=f"{name}[{index}].tensor_addresses[{address_index}]",
+            )
+            tensor_name = address.get("name")
+            if not isinstance(tensor_name, str) or not tensor_name:
+                raise ValueError(f"{name}[{index}] tensor name must be non-empty")
+            address_identity.append(
+                (
+                    tensor_name,
+                    _integer(
+                        address.get("data_ptr"),
+                        name=f"{name}[{index}].data_ptr",
+                        minimum=1,
+                    ),
+                )
+            )
+        result.append(
+            (
+                row.get("state_signature"),
+                row.get("slot_signature"),
+                row.get("input_signature"),
+                tuple(address_identity),
+            )
+        )
+    return tuple(result)
 
 
 def _profile_metrics(path: Path) -> dict[str, Any]:
@@ -159,7 +210,11 @@ def _profile_metrics(path: Path) -> dict[str, Any]:
             last_persistent.get("encoder_storage"),
             name=f"{label}.persistent_workspace.encoder_storage",
         )
-        if not cache_storage or not encoder_storage:
+        arena_storage = _list(
+            last_persistent.get("arena_storage"),
+            name=f"{label}.persistent_workspace.arena_storage",
+        )
+        if not cache_storage or not encoder_storage or not arena_storage:
             raise ValueError(f"{label} persistent storage evidence must be non-empty")
         labels[label] = {
             "records": len(rows),
@@ -192,6 +247,11 @@ def _profile_metrics(path: Path) -> dict[str, Any]:
             "dispatch_policies": dispatch_policies,
             "cache_storage": cache_storage,
             "encoder_storage": encoder_storage,
+            "arena_storage": arena_storage,
+            "arena_storage_identity": _arena_storage_identity(
+                arena_storage,
+                name=f"{label}.persistent_workspace.arena_storage",
+            ),
             "cross_request_graph_hits": max(
                 int(
                     _object(
@@ -295,6 +355,10 @@ def analyze(manifest_path: Path) -> dict[str, Any]:
                 "encoder_storage": (
                     left["encoder_storage"] == right["encoder_storage"]
                 ),
+                "arena_storage": (
+                    left["arena_storage_identity"]
+                    == right["arena_storage_identity"]
+                ),
             }
         exactness["passes"][pass_name] = comparison
     exactness_pass = all(
@@ -368,6 +432,17 @@ def analyze(manifest_path: Path) -> dict[str, Any]:
             for pass_name in PASSES
         }
         final_workspace = _object(final_workspaces[0], name=f"final.workspace.{role}")
+        arena_identities = {
+            pass_name: _arena_storage_identity(
+                workspace_rows[pass_name].get("arena_storage"),
+                name=f"{pass_name}.workspace.{role}.arena_storage",
+            )
+            for pass_name in PASSES
+        }
+        final_arena_identity = _arena_storage_identity(
+            final_workspace.get("arena_storage"),
+            name=f"final.workspace.{role}.arena_storage",
+        )
         stable_workspace_fields = (
             "signature",
             "graph_count",
@@ -402,16 +477,22 @@ def analyze(manifest_path: Path) -> dict[str, Any]:
                 == workspace_rows["warm2"].get(field)
                 for field in stable_workspace_fields
             ),
+            "stable_arena_storage": (
+                arena_identities["cold"]
+                == arena_identities["warm1"]
+                == arena_identities["warm2"]
+            ),
             "final_snapshot_matches_warm2": all(
                 workspace_rows["warm2"].get(field) == final_workspace.get(field)
                 for field in stable_workspace_fields
-            ),
+            ) and arena_identities["warm2"] == final_arena_identity,
             "graphs_and_storage_nonempty": (
                 int(workspace_rows["cold"].get("graph_count", 0)) > 0
                 and int(workspace_rows["cold"].get("encoder_slot_count", 0)) > 0
                 and int(workspace_rows["cold"].get("cache_count", 0)) > 0
                 and bool(workspace_rows["cold"].get("encoder_storage"))
                 and bool(workspace_rows["cold"].get("cache_storage"))
+                and bool(arena_identities["cold"])
             ),
             "inactive_at_boundaries": all(
                 item.get("in_use") is False

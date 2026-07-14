@@ -89,6 +89,13 @@ def test_runner_reuses_two_bindings_and_closes_pools(monkeypatch, tmp_path: Path
         "shared_decoder_rope_context",
         lambda *args, **kwargs: nullcontext(),
     )
+    install_calls = []
+
+    def fake_install(**kwargs):
+        install_calls.append(kwargs)
+        return nullcontext()
+
+    monkeypatch.setattr(runner, "install_k8_candidate", fake_install)
     cuda_calls = []
     monkeypatch.setattr(runner.torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(
@@ -140,3 +147,12 @@ def test_runner_reuses_two_bindings_and_closes_pools(monkeypatch, tmp_path: Path
     assert payload["results"]["warm1"]["cuda_peak_stats_reset"] is True
     assert payload["results"]["warm2"]["cuda_peak_stats_reset"] is True
     assert cuda_calls.count(("reset", 0)) == 3
+    assert install_calls == [
+        {
+            "block_size": 4,
+            "graph_remainders": True,
+            "shared_static_input_arena": True,
+        }
+    ]
+    initialization_payload = json.loads(initialization.read_text(encoding="utf-8"))
+    assert "shared-arena" in initialization_payload["topology_version"]

@@ -39,7 +39,9 @@ from utils.run_approximate_weight_only import (  # noqa: E402
 )
 
 
-TOPOLOGY_VERSION = "selected-k4-k1-int8-fp16-cross-persistent-graphs-v1"
+TOPOLOGY_VERSION = (
+    "selected-k4-k1-int8-fp16-cross-shared-arena-persistent-graphs-v2"
+)
 
 
 def _profile_path(result_path: Path) -> Path:
@@ -148,6 +150,7 @@ def run(
                         "block_size=4",
                         "graph_remainders=true",
                         "shared_rope=true",
+                        "shared_static_input_arena=true",
                     ),
                 )
             )
@@ -166,6 +169,7 @@ def run(
                         "block_size=4",
                         "graph_remainders=true",
                         "timing_native_self=true",
+                        "shared_static_input_arena=true",
                     ),
                 )
             )
@@ -178,7 +182,11 @@ def run(
     final_pool_summary: dict[str, Any] = {}
     close_completed = False
     try:
-        with install_k8_candidate(block_size=4, graph_remainders=True):
+        with install_k8_candidate(
+            block_size=4,
+            graph_remainders=True,
+            shared_static_input_arena=True,
+        ):
             with fixed_seed_processor_generation(inference, base_seed=args.seed):
                 for label in ("cold", "warm1", "warm2"):
                     pass_args = copy.deepcopy(args)

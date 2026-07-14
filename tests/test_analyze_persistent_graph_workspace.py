@@ -41,6 +41,17 @@ def _profile(
             "device": "cuda:0",
         }
     ]
+    arena_storage = [
+        {
+            "state_signature": "sig",
+            "slot_signature": "slot",
+            "refreshed_window_identity": [1, 44],
+            "input_signature": "inputs",
+            "tensor_addresses": [
+                {"name": "decoder_input_ids", "data_ptr": 789}
+            ],
+        }
+    ]
     generation = []
     for index, profile_label in enumerate(("timing_context", "main_generation")):
         generation.append(
@@ -71,6 +82,7 @@ def _profile(
                                 "device": "cuda:0",
                             }
                         ],
+                        "arena_storage": arena_storage,
                     }
                 },
                 "cuda_memory_allocated_mb": 150.0,
@@ -139,6 +151,17 @@ def _manifest(tmp_path: Path, *, warm_capture: float = 0.0) -> Path:
                 "device": "cuda:0",
             }
         ],
+        "arena_storage": [
+            {
+                "state_signature": "sig",
+                "slot_signature": "slot",
+                "refreshed_window_identity": [1, 44],
+                "input_signature": "inputs",
+                "tensor_addresses": [
+                    {"name": "decoder_input_ids", "data_ptr": 789}
+                ],
+            }
+        ],
         "in_use": False,
         "closed": False,
     }
@@ -160,7 +183,8 @@ def _manifest(tmp_path: Path, *, warm_capture: float = 0.0) -> Path:
             {
                 "schema_version": 1,
                 "topology_version": (
-                    "selected-k4-k1-int8-fp16-cross-persistent-graphs-v1"
+                    "selected-k4-k1-int8-fp16-cross-shared-arena-"
+                    "persistent-graphs-v2"
                 ),
                 "main": {"initialized": True},
                 "timing": {"initialized": True},
@@ -174,7 +198,8 @@ def _manifest(tmp_path: Path, *, warm_capture: float = 0.0) -> Path:
             {
                 "schema_version": 2,
                 "topology_version": (
-                    "selected-k4-k1-int8-fp16-cross-persistent-graphs-v1"
+                    "selected-k4-k1-int8-fp16-cross-shared-arena-"
+                    "persistent-graphs-v2"
                 ),
                 "initialization_path": str(initialization),
                 "results": {
@@ -275,6 +300,20 @@ def test_analyzer_rejects_warm_workspace_address_growth(tmp_path: Path) -> None:
 
     assert report["pool_pass"] is False
     assert report["pass"] is False
+
+
+def test_analyzer_rejects_warm_arena_address_change(tmp_path: Path) -> None:
+    manifest_path = _manifest(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["results"]["warm1"]["pool_summary"]["main"]["workspaces"][0][
+        "arena_storage"
+    ][0]["tensor_addresses"][0]["data_ptr"] += 1
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    report = analyze(manifest_path)
+
+    assert report["pool_checks"]["main"]["stable_arena_storage"] is False
+    assert report["pool_pass"] is False
 
 
 def test_analyzer_rejects_memory_growth_between_warm_passes(tmp_path: Path) -> None:

@@ -13,6 +13,7 @@ from osuT5.osuT5.inference.optimized.single import state as state_module
 from osuT5.osuT5.inference.optimized.single.decode_loop import (
     _stable_encoder_outputs,
 )
+from osuT5.osuT5.inference.optimized.single.k8_runtime import _StaticInputArena
 
 
 class _Model(torch.nn.Module):
@@ -71,6 +72,15 @@ def test_a1_a2_reuse_one_workspace_and_reset_cross_cache(monkeypatch):
 
     with _lease(first, model):
         assert first.cache_for_window(model, batch_size=1, num_beams=1, cfg_scale=1.0) is cache
+        holder = first.active_prefix_decode_kwargs()["stable_encoder_holder"]
+        holder["__k8_runtime_slots__"] = {
+            ("slot",): SimpleNamespace(
+                static_input_arena=_StaticInputArena.create(
+                    {"decoder_input_ids": torch.tensor([[3]])},
+                    window_identity=(1, 1),
+                )
+            )
+        }
         first._workspace().session.graph_cache[("graph",)] = {
             "active_prefix_length": 128,
             "capture_seconds": 0.2,
@@ -92,6 +102,10 @@ def test_a1_a2_reuse_one_workspace_and_reset_cross_cache(monkeypatch):
     assert summary["resident_slots"] == 1
     assert summary["borrow_count"] == 2
     assert summary["request_count"] == 2
+    arena = summary["workspaces"][0]["arena_storage"]
+    assert len(arena) == 1
+    assert arena[0]["refreshed_window_identity"] == [1, 1]
+    assert arena[0]["tensor_addresses"][0]["name"] == "decoder_input_ids"
 
 
 def test_a_b_a_encoder_shapes_reuse_stable_shape_slots(monkeypatch):

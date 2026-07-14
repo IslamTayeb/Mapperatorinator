@@ -136,6 +136,30 @@ class _PersistentWorkspace:
             len(holder.get("__persistent_encoder_slots__", {}))
             for holder in self.session.stable_encoder_holders.values()
         )
+        arena_storage = []
+        for signature, holder in self.session.stable_encoder_holders.items():
+            for slot_signature, slot in holder.get(
+                "__k8_runtime_slots__",
+                {},
+            ).items():
+                arena = getattr(slot, "static_input_arena", None)
+                if arena is None:
+                    continue
+                arena.validate_tensor_addresses()
+                arena_storage.append(
+                    {
+                        "state_signature": repr(signature),
+                        "slot_signature": repr(slot_signature),
+                        "refreshed_window_identity": list(
+                            arena.refreshed_window_identity
+                        ),
+                        "input_signature": repr(arena.signature),
+                        "tensor_addresses": [
+                            {"name": name, "data_ptr": int(data_ptr)}
+                            for name, data_ptr in arena.tensor_addresses
+                        ],
+                    }
+                )
         encoder_storage = []
         for signature, holder in self.session.stable_encoder_holders.items():
             slots = holder.get("__persistent_encoder_slots__", {})
@@ -180,6 +204,7 @@ class _PersistentWorkspace:
             "cross_request_graph_hits": cross_request_hits,
             "encoder_slot_count": encoder_slots,
             "encoder_storage": encoder_storage,
+            "arena_storage": arena_storage,
             "cache_count": len(self.session.caches),
             "cache_storage": cache_storage,
             "in_use": self.in_use,
