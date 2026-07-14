@@ -41,6 +41,26 @@ EXPECTED_PREFILLS = 87
 BUCKET_SIZE = 64
 DEFAULT_WARMUP = 3
 DEFAULT_ITERATIONS = 5
+EXPECTED_MAIN_DECODE_BUCKETS = (
+    128,
+    192,
+    256,
+    320,
+    384,
+    448,
+    512,
+    576,
+    640,
+    704,
+    768,
+    832,
+)
+ACCEPTED_MAIN_DISPATCHES = (
+    "q1_bmm_cross_attention",
+    "native_q1_self_attention",
+    "native_q1_rope_cache_self_attention",
+    "native_cross_mlp_tail",
+)
 
 
 @dataclass(slots=True)
@@ -166,6 +186,201 @@ def _git_head() -> str:
         capture_output=True,
         text=True,
     ).stdout.strip()
+
+
+def _sha256_json(value: Any) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _load_inference_profile(result_path: str | Path) -> dict[str, Any]:
+    result_path = Path(result_path)
+    profile_path = result_path.with_suffix(result_path.suffix + ".profile.json")
+    if not profile_path.is_file():
+        raise RuntimeError(f"full song did not write inference profile {profile_path}")
+    payload = json.loads(profile_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise RuntimeError("full-song inference profile has an unsupported schema")
+    return payload
+
+
+def accepted_main_profile_signature(
+    payload: dict[str, Any],
+    *,
+    expected_version: str,
+) -> dict[str, Any]:
+    """Validate and canonicalize the live accepted main-generation profile."""
+
+    metadata = payload.get("metadata")
+    generation = payload.get("generation")
+    if not isinstance(metadata, dict) or not isinstance(generation, list):
+        raise RuntimeError("inference profile must expose metadata and generation records")
+    expected_metadata = {
+        "precision": "fp32",
+        "attn_implementation": "sdpa",
+        "inference_engine": "optimized",
+        "use_server": False,
+        "parallel": False,
+    }
+    changed_metadata = {
+        key: metadata.get(key)
+        for key, value in expected_metadata.items()
+        if metadata.get(key) != value
+    }
+    if changed_metadata:
+        raise RuntimeError(
+            "prefill scout did not run the accepted FP32 single-song topology: "
+            f"{changed_metadata}"
+        )
+
+    records = [
+        record
+        for record in generation
+        if isinstance(record, dict)
+        and record.get("profile_label") == "main_generation"
+    ]
+    if len(records) != EXPECTED_PREFILLS:
+        raise RuntimeError(
+            "accepted main profile must contain one record per live prefill: "
+            f"expected={EXPECTED_PREFILLS} got={len(records)}"
+        )
+    records.sort(key=lambda record: int(record.get("sequence_index", -1)))
+    indexes = [record.get("sequence_index") for record in records]
+    if indexes != list(range(EXPECTED_PREFILLS)):
+        raise RuntimeError("accepted main profile sequence indexes are not contiguous")
+
+    token_material: list[list[int]] = []
+    stopping_material: list[dict[str, Any]] = []
+    dispatch_hits = {name: 0 for name in ACCEPTED_MAIN_DISPATCHES}
+    for record in records:
+        required_values = {
+            "precision": "fp32",
+            "decoder_loop_backend": "active_prefix_cuda_graph",
+            "torch_compile_enabled": False,
+            "optimized_effective_config_version": expected_version,
+            "optimized_dispatch_mode": "accepted_batch1",
+            "optimized_batched_super_timing": False,
+            "native_cross_mlp_tail_requested": True,
+            "native_cross_mlp_tail_enabled": True,
+        }
+        changed = {
+            key: record.get(key)
+            for key, value in required_values.items()
+            if record.get(key) != value
+        }
+        if changed:
+            raise RuntimeError(
+                "main generation record bypassed the accepted topology: "
+                f"sequence={record.get('sequence_index')} changed={changed}"
+            )
+
+        policy = record.get("optimized_dispatch_policy")
+        if not isinstance(policy, dict):
+            raise RuntimeError("main generation record is missing dispatch policy")
+        for name in ACCEPTED_MAIN_DISPATCHES:
+            entry = policy.get(name)
+            if not isinstance(entry, dict) or entry != {
+                "requested": True,
+                "enabled": True,
+                "disabled_reason": None,
+            }:
+                raise RuntimeError(
+                    "main generation dispatch policy changed: "
+                    f"sequence={record.get('sequence_index')} {name}={entry!r}"
+                )
+
+        hits = record.get("optimized_dispatch_capture_hits")
+        if not isinstance(hits, dict) or set(hits) != set(ACCEPTED_MAIN_DISPATCHES):
+            raise RuntimeError("main generation record has an invalid dispatch-hit manifest")
+        for name in ACCEPTED_MAIN_DISPATCHES:
+            value = hits[name]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise RuntimeError(f"main dispatch hit count {name} must be non-negative")
+            dispatch_hits[name] += value
+
+        tokens = record.get("generated_token_ids")
+        if not isinstance(tokens, list) or any(
+            isinstance(token, bool) or not isinstance(token, int) for token in tokens
+        ):
+            raise RuntimeError("main generation record does not expose integer token IDs")
+        generated_tokens = record.get("generated_tokens")
+        if (
+            isinstance(generated_tokens, bool)
+            or not isinstance(generated_tokens, int)
+            or generated_tokens != len(tokens)
+        ):
+            raise RuntimeError("main generation token count is not self-consistent")
+        token_material.append(tokens)
+        stopping_material.append(
+            {
+                "sequence_index": record["sequence_index"],
+                "generated_tokens": generated_tokens,
+                "final_token": tokens[-1] if tokens else None,
+            }
+        )
+
+    for name in (
+        "q1_bmm_cross_attention",
+        "native_q1_rope_cache_self_attention",
+        "native_cross_mlp_tail",
+    ):
+        if dispatch_hits[name] <= 0:
+            raise RuntimeError(f"accepted main run never captured specialized dispatch {name}")
+
+    final_record = max(
+        records,
+        key=lambda record: (
+            int(record.get("decode_graph_count_after", -1)),
+            int(record["sequence_index"]),
+        ),
+    )
+    graph_summary = final_record.get("optimized_cuda_graphs")
+    if not isinstance(graph_summary, dict):
+        raise RuntimeError("accepted main profile is missing CUDA-graph summary")
+    raw_buckets = graph_summary.get("buckets")
+    if not isinstance(raw_buckets, dict):
+        raise RuntimeError("accepted main CUDA-graph buckets must be an object")
+    bucket_counts: dict[int, int] = {}
+    for raw_prefix, raw_entry in raw_buckets.items():
+        if not isinstance(raw_entry, dict):
+            raise RuntimeError(f"accepted graph bucket {raw_prefix!r} must be an object")
+        try:
+            prefix = int(raw_prefix)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"accepted graph bucket {raw_prefix!r} is invalid") from exc
+        if str(prefix) != str(raw_prefix):
+            raise RuntimeError(f"accepted graph bucket {raw_prefix!r} is non-canonical")
+        replay_count = raw_entry.get("decode_replays")
+        graph_count = raw_entry.get("graph_count")
+        if (
+            isinstance(replay_count, bool)
+            or not isinstance(replay_count, int)
+            or replay_count <= 0
+            or isinstance(graph_count, bool)
+            or not isinstance(graph_count, int)
+            or graph_count <= 0
+        ):
+            raise RuntimeError(
+                f"accepted graph bucket {prefix} must have positive graph/replay counts"
+            )
+        bucket_counts[prefix] = replay_count
+    if tuple(sorted(bucket_counts)) != EXPECTED_MAIN_DECODE_BUCKETS:
+        raise RuntimeError(
+            "accepted live decode buckets changed: "
+            f"expected={list(EXPECTED_MAIN_DECODE_BUCKETS)} "
+            f"got={dict(sorted(bucket_counts.items()))}"
+        )
+    if int(graph_summary.get("graph_count", -1)) != len(EXPECTED_MAIN_DECODE_BUCKETS):
+        raise RuntimeError("accepted CUDA-graph count does not match its live buckets")
+
+    return {
+        "expected_version": expected_version,
+        "main_records": len(records),
+        "token_stream_sha256": _sha256_json(token_material),
+        "stopping_sha256": _sha256_json(stopping_material),
+        "dispatch_hits": dispatch_hits,
+        "decode_bucket_replay_counts": dict(sorted(bucket_counts.items())),
+    }
 
 
 def _snapshot_tensor(value: torch.Tensor) -> torch.Tensor:
@@ -716,12 +931,22 @@ def _run_song(
     processor = captured.get("processor")
     if processor is None or not isinstance(processor.last_generation_stats, dict):
         raise RuntimeError("full song did not expose main generation stats")
+    runtime = getattr(processor, "inference_runtime", None)
+    preset = getattr(runtime, "preset", None)
+    expected_version = getattr(preset, "version", None)
+    if not isinstance(expected_version, str) or not expected_version:
+        raise RuntimeError("full song did not retain the accepted optimized preset")
+    profile_signature = accepted_main_profile_signature(
+        _load_inference_profile(result_path),
+        expected_version=expected_version,
+    )
     return {
         "model": processor.model,
         "generated": generated,
         "result_path": str(result_path),
         "main_stats": dict(processor.last_generation_stats),
         "request_seconds": request_seconds,
+        "profile_signature": profile_signature,
     }
 
 
@@ -796,6 +1021,10 @@ def run(args: Any, *, output_path: Path, warmup: int, iterations: int) -> dict[s
     captured_bytes = Path(captured["result_path"]).read_bytes()
     if baseline_bytes != captured_bytes:
         raise RuntimeError("prefill capture changed the accepted final .osu bytes")
+    if baseline["profile_signature"] != captured["profile_signature"]:
+        raise RuntimeError(
+            "prefill capture changed accepted tokens, stopping, dispatch, or graph manifest"
+        )
     gc.collect()
     torch.cuda.empty_cache()
     fp32_model = captured["model"]
@@ -888,6 +1117,14 @@ def run(args: Any, *, output_path: Path, warmup: int, iterations: int) -> dict[s
             "capture_final_osu_exact": True,
             "baseline_osu_sha256": hashlib.sha256(baseline_bytes).hexdigest(),
             "capture_osu_sha256": hashlib.sha256(captured_bytes).hexdigest(),
+            "main_token_stream_sha256": baseline["profile_signature"][
+                "token_stream_sha256"
+            ],
+            "main_stopping_sha256": baseline["profile_signature"]["stopping_sha256"],
+            "accepted_dispatch_hits": baseline["profile_signature"]["dispatch_hits"],
+            "accepted_decode_bucket_replay_counts": baseline["profile_signature"][
+                "decode_bucket_replay_counts"
+            ],
             "unique_exact_signatures": len({prefill_signature(record, mode="exact") for record in records}),
             "unique_bucket64_signatures": len({prefill_signature(record, mode="bucket64") for record in records}),
             "prompt_tokens": sum(record.prompt_length for record in records),

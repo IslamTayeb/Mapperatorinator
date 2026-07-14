@@ -6,7 +6,10 @@ import torch
 from transformers.modeling_outputs import BaseModelOutput
 
 from utils.profile_prefill_graph_scout import (
+    ACCEPTED_MAIN_DISPATCHES,
+    EXPECTED_MAIN_DECODE_BUCKETS,
     PrefillRecord,
+    accepted_main_profile_signature,
     bucket_prompt_length,
     capture_main_prefills,
     clone_graph_inputs,
@@ -243,3 +246,119 @@ def test_timing_pair_rejects_aliases(alias):
             main_binding=main_binding,
             main_tokenizer=main_tokenizer,
         )
+
+
+def _accepted_main_profile():
+    generation = []
+    buckets = {
+        str(prefix): {
+            "graph_count": 1,
+            "decode_replays": index + 1,
+            "capture_seconds": 0.01,
+        }
+        for index, prefix in enumerate(EXPECTED_MAIN_DECODE_BUCKETS)
+    }
+    for index in range(87):
+        hits = {name: 0 for name in ACCEPTED_MAIN_DISPATCHES}
+        if index == 0:
+            hits.update(
+                {
+                    "q1_bmm_cross_attention": 12,
+                    "native_q1_rope_cache_self_attention": 12,
+                    "native_cross_mlp_tail": 12,
+                }
+            )
+        generation.append(
+            {
+                "profile_label": "main_generation",
+                "sequence_index": index,
+                "precision": "fp32",
+                "generated_tokens": 2,
+                "generated_token_ids": [index, index + 1],
+                "decoder_loop_backend": "active_prefix_cuda_graph",
+                "torch_compile_enabled": False,
+                "optimized_effective_config_version": "accepted-test",
+                "optimized_batched_super_timing": False,
+                "optimized_dispatch_mode": "accepted_batch1",
+                "optimized_dispatch_policy": {
+                    name: {
+                        "requested": True,
+                        "enabled": True,
+                        "disabled_reason": None,
+                    }
+                    for name in ACCEPTED_MAIN_DISPATCHES
+                },
+                "native_cross_mlp_tail_requested": True,
+                "native_cross_mlp_tail_enabled": True,
+                "optimized_dispatch_capture_hits": hits,
+                "decode_graph_count_after": len(EXPECTED_MAIN_DECODE_BUCKETS),
+                "optimized_cuda_graphs": {
+                    "graph_count": len(EXPECTED_MAIN_DECODE_BUCKETS),
+                    "decode_replays": sum(
+                        entry["decode_replays"] for entry in buckets.values()
+                    ),
+                    "capture_seconds": 0.12,
+                    "buckets": buckets,
+                },
+            }
+        )
+    return {
+        "schema_version": 1,
+        "metadata": {
+            "precision": "fp32",
+            "attn_implementation": "sdpa",
+            "inference_engine": "optimized",
+            "use_server": False,
+            "parallel": False,
+        },
+        "generation": generation,
+    }
+
+
+def test_accepted_main_profile_records_live_topology_tokens_and_832_bucket():
+    signature = accepted_main_profile_signature(
+        _accepted_main_profile(),
+        expected_version="accepted-test",
+    )
+
+    assert signature["main_records"] == 87
+    assert signature["dispatch_hits"] == {
+        "q1_bmm_cross_attention": 12,
+        "native_q1_self_attention": 0,
+        "native_q1_rope_cache_self_attention": 12,
+        "native_cross_mlp_tail": 12,
+    }
+    assert tuple(signature["decode_bucket_replay_counts"]) == (
+        *EXPECTED_MAIN_DECODE_BUCKETS,
+    )
+    assert signature["decode_bucket_replay_counts"][832] > 0
+    assert len(signature["token_stream_sha256"]) == 64
+    assert len(signature["stopping_sha256"]) == 64
+
+
+def test_accepted_main_profile_fails_on_dispatch_or_live_bucket_drift():
+    payload = _accepted_main_profile()
+    payload["generation"][3]["optimized_dispatch_policy"][
+        "q1_bmm_cross_attention"
+    ]["enabled"] = False
+    with pytest.raises(RuntimeError, match="dispatch policy changed"):
+        accepted_main_profile_signature(payload, expected_version="accepted-test")
+
+    payload = _accepted_main_profile()
+    del payload["generation"][-1]["optimized_cuda_graphs"]["buckets"]["832"]
+    for record in payload["generation"]:
+        record["optimized_cuda_graphs"]["graph_count"] -= 1
+    with pytest.raises(RuntimeError, match="live decode buckets changed"):
+        accepted_main_profile_signature(payload, expected_version="accepted-test")
+
+
+def test_accepted_main_profile_fails_on_missing_token_or_prefill_record():
+    payload = _accepted_main_profile()
+    payload["generation"][0]["generated_token_ids"] = None
+    with pytest.raises(RuntimeError, match="integer token IDs"):
+        accepted_main_profile_signature(payload, expected_version="accepted-test")
+
+    payload = _accepted_main_profile()
+    payload["generation"].pop()
+    with pytest.raises(RuntimeError, match="one record per live prefill"):
+        accepted_main_profile_signature(payload, expected_version="accepted-test")
