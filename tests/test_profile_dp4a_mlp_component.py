@@ -14,6 +14,7 @@ from utils.profile_dp4a_mlp_component import (
     CONFIGS,
     DECODER_LAYERS,
     FIXED_MAIN_STEPS,
+    _dynamic_quantization_reference,
     _integer_linear_reference,
     _live_entries,
     _quantized_reference,
@@ -172,6 +173,22 @@ def test_integer_dp4a_reference_uses_observed_quantized_activation() -> None:
     assert torch.equal(actual, expected)
 
 
+def test_dynamic_quantization_reference_checks_scale_rounding_and_minus_128() -> None:
+    values = torch.tensor([[-2.0, -0.5, 0.0, 1.0, 2.0]], dtype=torch.float32)
+    scale = torch.tensor([2.0 / 127.0])
+    quantized = torch.round(values / scale).clamp(-127, 127).to(torch.int8)
+
+    valid = _dynamic_quantization_reference(values, quantized, scale)
+    assert valid["pass"]
+    assert not valid["contains_minus_128"]
+
+    bad_scale = _dynamic_quantization_reference(values, quantized, scale * 2)
+    assert not bad_scale["pass"]
+    bad_quantized = quantized.clone()
+    bad_quantized[0, 0] = -128
+    assert not _dynamic_quantization_reference(values, bad_quantized, scale)["pass"]
+
+
 def test_two_stage_quantized_reference_preserves_residual_and_zero_gelu() -> None:
     def linear(rows: int, columns: int) -> Int8PackedLinear:
         return Int8PackedLinear(
@@ -192,11 +209,19 @@ def test_two_stage_quantized_reference_preserves_residual_and_zero_gelu() -> Non
         torch.ones(1),
     )
 
-    reference, evidence = _quantized_reference(residual, pack, state)
+    reference, evidence = _quantized_reference(
+        residual,
+        torch.ones(768),
+        pack,
+        state,
+        eps=1e-5,
+    )
 
     assert torch.equal(reference, residual)
     assert evidence["fc1_kernel_vs_quantized_reference"]["max_abs"] == 0.0
     assert evidence["fc2_kernel_vs_quantized_reference"]["max_abs"] == 0.0
+    assert evidence["fc1_dynamic_quantization"]["pass"] is False
+    assert evidence["fc2_dynamic_quantization"]["pass"] is True
 
 
 def test_dcc_wrapper_pins_clean_pushed_2080_ti_worktree() -> None:

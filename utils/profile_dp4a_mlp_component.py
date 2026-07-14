@@ -333,10 +333,60 @@ def _integer_linear_reference(
     return value
 
 
+def _dynamic_quantization_reference(
+    values: torch.Tensor,
+    quantized: torch.Tensor,
+    activation_scale: torch.Tensor,
+    *,
+    norm_weight: torch.Tensor | None = None,
+    eps: float | None = None,
+) -> dict[str, Any]:
+    reference = values.detach().float().cpu().view(-1)
+    if norm_weight is not None:
+        if eps is None:
+            raise ValueError("normalized dynamic-quantization reference requires eps")
+        weight = norm_weight.detach().float().cpu().view(-1)
+        if reference.shape != weight.shape:
+            raise ValueError("dynamic-quantization norm/input shape mismatch")
+        reference = reference * weight * torch.rsqrt(
+            reference.square().mean() + float(eps)
+        )
+    observed_scale = float(activation_scale.detach().float().cpu().item())
+    maximum = float(reference.abs().max().item())
+    expected_scale = maximum / 127.0 if maximum > 0.0 else 1.0
+    scale_error = abs(observed_scale - expected_scale)
+    scale_tolerance = max(1e-7, abs(expected_scale) * 2e-5)
+    quantized_cpu = quantized.detach().cpu().view(-1)
+    reconstructed = quantized_cpu.float() * observed_scale
+    reconstruction_max_abs = float((reconstructed - reference).abs().max().item())
+    rounding_tolerance = max(observed_scale, expected_scale) * 0.501 + 2e-6
+    contains_minus_128 = bool((quantized_cpu == -128).any().item())
+    passed = (
+        math.isfinite(observed_scale)
+        and observed_scale > 0.0
+        and scale_error <= scale_tolerance
+        and reconstruction_max_abs <= rounding_tolerance
+        and not contains_minus_128
+    )
+    return {
+        "observed_scale": observed_scale,
+        "reference_scale": expected_scale,
+        "scale_abs_error": scale_error,
+        "scale_tolerance": scale_tolerance,
+        "reconstruction_max_abs": reconstruction_max_abs,
+        "rounding_tolerance": rounding_tolerance,
+        "contains_minus_128": contains_minus_128,
+        "pass": passed,
+    }
+
+
 def _quantized_reference(
     input: torch.Tensor,
+    norm_weight: torch.Tensor,
     pack: Any,
     state: tuple[torch.Tensor, ...],
+    *,
+    eps: float,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     output, activated, fc1_quantized, fc1_scale, fc2_quantized, fc2_scale = state
     fc1_pre_gelu = _integer_linear_reference(fc1_quantized, fc1_scale, pack.fc1)
@@ -346,6 +396,18 @@ def _quantized_reference(
     fc2_reference = _integer_linear_reference(fc2_quantized, fc2_scale, pack.fc2)
     final_reference = fc2_reference.view_as(input.cpu()) + input.detach().cpu()
     activated_cpu = activated.detach().float().cpu().view(-1)
+    fc1_quantization = _dynamic_quantization_reference(
+        input,
+        fc1_quantized,
+        fc1_scale,
+        norm_weight=norm_weight,
+        eps=eps,
+    )
+    fc2_quantization = _dynamic_quantization_reference(
+        activated,
+        fc2_quantized,
+        fc2_scale,
+    )
     return final_reference, {
         "fc1_kernel_vs_quantized_reference": _drift(fc1_reference, activated_cpu),
         "fc2_kernel_vs_quantized_reference": _drift(final_reference, output),
@@ -353,6 +415,8 @@ def _quantized_reference(
         "fc2_activation_scale": float(fc2_scale.item()),
         "fc1_saturation_count": int((fc1_quantized.abs() == 127).sum().item()),
         "fc2_saturation_count": int((fc2_quantized.abs() == 127).sum().item()),
+        "fc1_dynamic_quantization": fc1_quantization,
+        "fc2_dynamic_quantization": fc2_quantization,
     }
 
 
@@ -628,8 +692,10 @@ def profile_component(
             torch.cuda.synchronize()
             reference, quantized = _quantized_reference(
                 capture.hidden_states,
+                layer.final_layer_norm.weight,
                 pack,
                 direct_state,
+                eps=eps,
             )
             observed = observations[config][0]
             output_reference_drift = _drift(reference, observed)
@@ -646,6 +712,8 @@ def profile_component(
                     output_reference_drift["max_abs"] <= QUANTIZED_REFERENCE_MAX_ABS
                     and fc1_reference_drift["max_abs"]
                     <= QUANTIZED_REFERENCE_MAX_ABS
+                    and quantized["fc1_dynamic_quantization"]["pass"]
+                    and quantized["fc2_dynamic_quantization"]["pass"]
                 ),
                 "candidate_vs_current_scalar_int8": _drift(baseline, observed),
                 "quantized_activation": quantized,
