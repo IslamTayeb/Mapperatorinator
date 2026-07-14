@@ -17,6 +17,7 @@ WORK=${MAPPERATORINATOR_WORK:-/work/imt11/Mapperatorinator}
 REPO=${MAPPERATORINATOR_REPO:?Set MAPPERATORINATOR_REPO to the clean worktree}
 COMMIT=${MAPPERATORINATOR_COMMIT:?Set MAPPERATORINATOR_COMMIT to the pushed commit}
 BRANCH=${MAPPERATORINATOR_BRANCH:?Set MAPPERATORINATOR_BRANCH to the branch}
+REMOTE=${MAPPERATORINATOR_REMOTE:-islamtayeb}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_ROOT="$WORK/runs/coalesced-split-kv-component-${SLURM_JOB_ID:-manual}"
 
@@ -44,10 +45,10 @@ if [[ "$(git -C "$REPO" branch --show-current)" != "$BRANCH" ]]; then
   echo "worktree differs from MAPPERATORINATOR_BRANCH" >&2
   exit 2
 fi
-REMOTE_REF="refs/remotes/origin/$BRANCH"
+REMOTE_REF="refs/remotes/$REMOTE/$BRANCH"
 if ! git -C "$REPO" show-ref --verify --quiet "$REMOTE_REF" \
   || [[ "$(git -C "$REPO" rev-parse "$REMOTE_REF")" != "$COMMIT" ]]; then
-  echo "pushed origin branch does not match MAPPERATORINATOR_COMMIT" >&2
+  echo "pushed $REMOTE branch does not match MAPPERATORINATOR_COMMIT" >&2
   exit 2
 fi
 if [[ ! -f "$AUDIO" ]]; then
@@ -81,6 +82,7 @@ echo "host=$(hostname)"
 echo "job_id=${SLURM_JOB_ID:-manual}"
 echo "commit=$COMMIT"
 echo "branch=$BRANCH"
+echo "remote=$REMOTE"
 echo "repo=$REPO"
 echo "python=$PYTHON"
 echo "ffmpeg=$(command -v ffmpeg)"
