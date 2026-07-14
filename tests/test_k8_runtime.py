@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import fields
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -140,6 +141,72 @@ def test_static_handoff_updates_token_positions_and_causal_mask_in_place():
 def test_raw_child_graph_api_fails_loudly_when_torch_does_not_expose_handle():
     with pytest.raises(RuntimeError, match="raw_cuda_graph"):
         _ChildGraphSequence.build(object(), object())
+
+
+def test_child_graph_sequence_accepts_exact_cuda_binding_return_shapes(monkeypatch):
+    from cuda.bindings import runtime
+
+    success = runtime.cudaError_t.cudaSuccess
+    calls = []
+    node_count = 0
+
+    def create(flags):
+        calls.append(("create", flags))
+        return success, "parent"
+
+    def add(parent, dependencies, dependency_count, child):
+        nonlocal node_count
+        node_count += 1
+        node = f"node-{node_count}"
+        calls.append(("add", parent, dependencies, dependency_count, child, node))
+        return success, node
+
+    def instantiate(parent, flags):
+        calls.append(("instantiate", parent, flags))
+        return success, "executable"
+
+    def launch(executable, stream):
+        calls.append(("launch", executable, stream))
+        return (success,)
+
+    def destroy_executable(executable):
+        calls.append(("destroy_executable", executable))
+        return (success,)
+
+    def destroy_graph(graph):
+        calls.append(("destroy_graph", graph))
+        return (success,)
+
+    monkeypatch.setattr(runtime, "cudaGraphCreate", create)
+    monkeypatch.setattr(runtime, "cudaGraphAddChildGraphNode", add)
+    monkeypatch.setattr(runtime, "cudaGraphInstantiate", instantiate)
+    monkeypatch.setattr(runtime, "cudaGraphLaunch", launch)
+    monkeypatch.setattr(runtime, "cudaGraphExecDestroy", destroy_executable)
+    monkeypatch.setattr(runtime, "cudaGraphDestroy", destroy_graph)
+    monkeypatch.setattr(runtime, "cudaGraph_t", lambda handle: ("graph", handle))
+    monkeypatch.setattr(runtime, "cudaStream_t", lambda handle: ("stream", handle))
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda: SimpleNamespace(cuda_stream=99),
+    )
+    model_graph = SimpleNamespace(raw_cuda_graph=lambda: 11)
+    tail_graph = SimpleNamespace(raw_cuda_graph=lambda: 22)
+
+    sequence = _ChildGraphSequence.build(model_graph, tail_graph)
+    sequence.replay()
+    sequence.close()
+    sequence.close()
+
+    assert calls[0] == ("create", 0)
+    add_calls = [row for row in calls if row[0] == "add"]
+    assert len(add_calls) == 16
+    assert add_calls[0][2:4] == (None, 0)
+    assert add_calls[1][2:4] == (("node-1",), 1)
+    assert ("instantiate", "parent", 0) in calls
+    assert ("launch", "executable", ("stream", 99)) in calls
+    assert calls.count(("destroy_executable", "executable")) == 1
+    assert calls.count(("destroy_graph", "parent")) == 1
 
 
 def test_opt_in_install_restores_default_even_on_exception(monkeypatch):
