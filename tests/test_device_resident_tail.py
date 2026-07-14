@@ -95,6 +95,34 @@ def test_model_input_update_is_in_place() -> None:
     assert {name: value.data_ptr() for name, value in inputs.items()} == pointers
 
 
+def test_fixed_tail_updates_static_model_handoff_each_step() -> None:
+    state = DeviceSequenceState.allocate(
+        torch.tensor([[1, 2]]),
+        max_length=8,
+        pad_token_id=0,
+        eos_token_ids=(9,),
+    )
+    static_inputs = {
+        "decoder_input_ids": torch.tensor([[2]]),
+        "cache_position": torch.tensor([1]),
+        "position_ids": torch.tensor([[1]]),
+    }
+
+    fixed_block_tail(
+        state=state,
+        start_length=2,
+        raw_logits_steps=[_logits(4), _logits(5), _logits(6), _logits(7)],
+        logits_processor=_IdentityProcessor(),
+        stopping_criteria=_EosOrLength(eos=9, max_length=8),
+        do_sample=False,
+        static_model_inputs=static_inputs,
+    )
+
+    assert static_inputs["decoder_input_ids"].tolist() == [[7]]
+    assert static_inputs["cache_position"].tolist() == [5]
+    assert static_inputs["position_ids"].tolist() == [[5]]
+
+
 @pytest.mark.parametrize(
     ("field", "replacement", "error"),
     [

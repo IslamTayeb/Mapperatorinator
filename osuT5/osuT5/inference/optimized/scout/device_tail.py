@@ -201,6 +201,7 @@ def fixed_block_tail(
     logits_processor,
     stopping_criteria,
     do_sample: bool,
+    static_model_inputs: dict[str, Any] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run an unrolled tail block over fixed raw logits.
 
@@ -255,6 +256,8 @@ def fixed_block_tail(
         else:
             next_tokens = torch.argmax(scores, dim=-1)
         active_tokens = state.append(next_tokens)
+        if static_model_inputs is not None:
+            update_one_token_model_inputs(static_model_inputs, active_tokens)
         stopped = stopping_criteria(
             state.sequence[:, : active_length + 1],
             None,

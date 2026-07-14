@@ -100,6 +100,7 @@ cd "$REPO"
   --output-path "$RUN_ROOT/baseline-capture" \
   --warmup 3 \
   --iterations 10 \
+  --samples-per-prefix 3 \
   audio_path="$AUDIO" \
   device=cuda \
   precision=fp32 \
