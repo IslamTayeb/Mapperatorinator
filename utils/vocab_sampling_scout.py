@@ -156,6 +156,19 @@ class VocabSamplingObserver:
         }
         self.current = {}
 
+    def register_graph_alias(self, parent: Any, alias: Any | None) -> None:
+        """Associate another executable parent with the same captured tail buffers."""
+
+        if alias is None:
+            return
+        buffers = self.graph_buffers.get(id(parent))
+        if buffers is None:
+            raise RuntimeError("cannot alias unregistered K4 sampling buffers")
+        existing = self.graph_buffers.get(id(alias))
+        if existing is not None and existing is not buffers:
+            raise RuntimeError("K4 sampling alias is already registered differently")
+        self.graph_buffers[id(alias)] = buffers
+
     def abort_capture(self) -> None:
         self.capture_depth = 0
         self.current = {}
@@ -301,6 +314,11 @@ def install_vocab_sampling_observer(
         try:
             entry = original_capture(*args, **kwargs)
             observer.finish_capture(entry.parent, state=entry.state)
+            # K1 remainders launch a distinct parent executable built from the
+            # same captured model/tail graphs.  The observer patches every
+            # parent replay, so both executable identities must resolve to the
+            # one set of static sampling buffers.
+            observer.register_graph_alias(entry.parent, entry.remainder_parent)
             return entry
         except Exception:
             observer.abort_capture()

@@ -127,6 +127,74 @@ def test_observer_records_bounded_graph_and_eager_samples() -> None:
     assert observer.samples[0].nucleus_size == 2
 
 
+def test_observer_registers_k1_remainder_parent_as_sampling_alias() -> None:
+    observer = VocabSamplingObserver(max_samples=2)
+    parent = object()
+    remainder_parent = object()
+    sample = _sample()
+    buffers = {
+        **_buffers(sample),
+        "physical_length": torch.tensor([8]),
+        "logical_length": torch.tensor([64]),
+    }
+    observer.graph_buffers[id(parent)] = buffers
+
+    observer.register_graph_alias(parent, remainder_parent)
+    observer.observe_graph_replay(parent)
+    observer.observe_graph_replay(remainder_parent)
+
+    assert observer.graph_buffers[id(remainder_parent)] is buffers
+    assert observer.total_graph_observations == 2
+    assert [stored.source for stored in observer.samples] == [
+        "k4_graph_final_step",
+        "k4_graph_final_step",
+    ]
+
+
+def test_observer_rejects_conflicting_graph_alias() -> None:
+    observer = VocabSamplingObserver(max_samples=1)
+    parent = object()
+    alias = object()
+    observer.graph_buffers[id(parent)] = {"source": "parent"}
+    observer.graph_buffers[id(alias)] = {"source": "alias"}
+
+    with pytest.raises(RuntimeError, match="registered differently"):
+        observer.register_graph_alias(parent, alias)
+
+
+def test_capture_patch_registers_block_and_remainder_parent_buffers(monkeypatch) -> None:
+    observer = VocabSamplingObserver(max_samples=1)
+    parent = object()
+    remainder_parent = object()
+    sample = _sample()
+    state = SimpleNamespace(
+        physical_length=torch.tensor([8]),
+        logical_length=torch.tensor([64]),
+    )
+
+    def fake_capture(*_args, **_kwargs):
+        observer.current = {
+            name: value
+            for name, value in _buffers(sample).items()
+            if name != "processor_descriptor"
+        }
+        observer.current_descriptor = sample.processor_descriptor
+        return SimpleNamespace(
+            parent=parent,
+            remainder_parent=remainder_parent,
+            state=state,
+        )
+
+    monkeypatch.setattr(k8_runtime, "_capture_k8_entry", fake_capture)
+    with install_vocab_sampling_observer(observer):
+        entry = k8_runtime._capture_k8_entry()
+
+    assert entry.parent is parent
+    assert observer.graph_buffers[id(parent)] is observer.graph_buffers[
+        id(remainder_parent)
+    ]
+
+
 def test_observer_reserves_coverage_for_a_late_vocab_at_the_sample_cap() -> None:
     observer = VocabSamplingObserver(max_samples=2)
     observer._record(_buffers(_sample(nucleus_size=1)), source="eager_remainder")
