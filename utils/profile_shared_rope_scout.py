@@ -197,15 +197,31 @@ def _short_loop_argmax_tokens(
     static_inputs: dict[str, Any],
     cache: Any,
     cache_snapshots: list[Any],
+    active_prefix_length: int,
     steps: int = SHORT_LOOP_STEPS,
 ) -> list[int]:
     if steps <= 0:
         raise ValueError("short-loop steps must be positive")
     tensor_snapshots = _snapshot_static_tensors(static_inputs)
+    cache_position = int(static_inputs["cache_position"].item())
+    if (
+        isinstance(active_prefix_length, bool)
+        or not isinstance(active_prefix_length, int)
+        or active_prefix_length <= cache_position
+    ):
+        raise ValueError(
+            "active prefix must contain the captured cache position: "
+            f"prefix={active_prefix_length!r}, cache_position={cache_position}"
+        )
+    # Accepted graphs are fixed to one active-prefix bucket.  A graph entry may
+    # retain the final cache position used in that bucket, so blindly replaying
+    # four steps can cross the fixed KV extent and launch an out-of-bounds
+    # native-q1 kernel.  Keep as many reciprocal exactness steps as fit.
+    safe_steps = min(steps, active_prefix_length - cache_position)
     tokens: list[int] = []
     try:
         _restore_all_cache(cache, cache_snapshots)
-        for _ in range(steps):
+        for _ in range(safe_steps):
             captured.graph.replay()
             torch.cuda.synchronize()
             logits = _model_logits(captured.outputs)
@@ -431,12 +447,14 @@ def profile_shared_rope_scout(
             static_inputs=inputs,
             cache=cache,
             cache_snapshots=snapshots,
+            active_prefix_length=prefix,
         )
         candidate_tokens = _short_loop_argmax_tokens(
             candidate,
             static_inputs=inputs,
             cache=cache,
             cache_snapshots=snapshots,
+            active_prefix_length=prefix,
         )
         call_stats = capture_stats_by_prefix[prefix]
         call_accounting = (
@@ -478,7 +496,8 @@ def profile_shared_rope_scout(
                 "accepted": accepted_tokens,
                 "shared_rope": candidate_tokens,
                 "exact": accepted_tokens == candidate_tokens,
-                "steps": SHORT_LOOP_STEPS,
+                "requested_steps": SHORT_LOOP_STEPS,
+                "executed_steps": len(accepted_tokens),
             },
             "graph_checks": checks,
             "graph_details": details,

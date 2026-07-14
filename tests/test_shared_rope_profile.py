@@ -86,6 +86,13 @@ def test_live_graph_manifest_rejects_nonpositive_counts_and_duplicate_prefixes()
         _validate_live_accepted_graph_cache(duplicate)
 
 
+def test_short_loop_source_caps_replays_at_fixed_prefix_boundary():
+    source = (ROOT / "utils/profile_shared_rope_scout.py").read_text()
+
+    assert "safe_steps = min(steps, active_prefix_length - cache_position)" in source
+    assert '"executed_steps": len(accepted_tokens)' in source
+
+
 def test_live_graph_manifest_requires_exact_current_bucket_topology():
     missing = _live_graph_cache()
     del missing[(ALL_BUCKETS[-1],)]
