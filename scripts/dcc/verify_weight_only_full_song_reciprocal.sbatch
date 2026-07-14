@@ -989,19 +989,14 @@ ANALYSIS_DISPATCH_ARGS=(
 if [[ "$REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL" == true ]]; then
   ANALYSIS_EXACT_ARGS=(
     --require-exact-label timing_context
+    --require-exact-label main_generation
     --require-exact-dispatch-label timing_context
   )
   ANALYSIS_DISPATCH_ARGS=(
     --allow-dispatch-delta
-      'records.main_generation[[]*].optimized_dispatch_capture_hits'
-    --allow-optional-dispatch-delta
       'records.main_generation[[]*].optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8_coalesced'
-    --allow-optional-dispatch-delta
-      'records.main_generation[[]*].optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8_coalesced_prefix_*'
-    --allow-optional-dispatch-delta
-      'records.main_generation[[]*].optimized_dispatch_capture_hits.*'
-    --allow-optional-dispatch-delta
-      'records.main_generation[[]*].optimized_cuda_graphs.*'
+    --allow-dispatch-delta
+      'records.main_generation[[]*].optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8_coalesced_*'
   )
 elif [[ "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
   ANALYSIS_EXACT_ARGS=(
@@ -1157,6 +1152,7 @@ grep -q "^mode=$ANALYSIS_MODE$" "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q "^parity.claim=$ANALYSIS_CLAIM$" "$RUN_ROOT/reciprocal-analysis.txt"
 if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
   || "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true \
+  || "$REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL" == true \
   || ( "$REQUIRE_CROSS_INCREMENTAL" == true \
     && "$CROSS_CANDIDATE_MODE" == split8_attention ) ]]; then
   grep -q '^parity.cross_candidate_exact=true$' \
@@ -1178,7 +1174,7 @@ elif [[ "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
     EXPECTED_EXACT_LABELS=timing_context,main_generation
   fi
 elif [[ "$REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL" == true ]]; then
-  EXPECTED_EXACT_LABELS=timing_context
+  EXPECTED_EXACT_LABELS=timing_context,main_generation
   EXPECTED_EXACT_DISPATCH_LABELS=timing_context
 elif [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then
   EXPECTED_EXACT_LABELS=timing_context

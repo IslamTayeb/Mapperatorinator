@@ -21,6 +21,7 @@ def test_thin_wrapper_pins_exact_incremental_pair() -> None:
     assert "REQUIRE_EXACT_TIMING=true" in source
     assert "REQUIRE_K4_CANDIDATE=true" in source
     assert "REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL=true" in source
+    assert "#SBATCH --time=00:30:00" in source
 
 
 def test_base_wrapper_validates_init_dispatch_and_same_commit() -> None:
@@ -37,6 +38,8 @@ def test_base_wrapper_validates_init_dispatch_and_same_commit() -> None:
         "coalesced-split-kv-v1"
     ) in source
     assert "--require-exact-label timing_context" in source
+    assert "--require-exact-label main_generation" in source
+    assert "EXPECTED_EXACT_DISPATCH_LABELS=timing_context" in source
     assert "coalesced-split-kv-validation.json" in source
     assert "metric.fixed_8294_main_seconds=" in source
     assert "metric.complete_request_wall_seconds=" in source
