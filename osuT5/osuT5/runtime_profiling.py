@@ -53,6 +53,7 @@ def generation_profile_context(
         native_q1_self_attention: bool = False,
         native_q1_rope_cache_self_attention: bool = False,
         native_cross_mlp_tail: bool = False,
+        approximate_weight_only_state=None,
         optimized_expected_dtype: torch.dtype = torch.float32,
         optimized_dispatch_counts: dict[str, int] | None = None,
 ) -> Iterator[None]:
@@ -91,7 +92,20 @@ def generation_profile_context(
         optimized_decoder_layer_context = decoder_layer_runtime_hooks_context(
             DecoderLayerRuntimeHooks()
         )
-        if native_cross_mlp_tail:
+        if native_cross_mlp_tail and approximate_weight_only_state is not None:
+            raise ValueError(
+                "native cross+MLP and approximate weight-only hooks are mutually exclusive"
+            )
+        if approximate_weight_only_state is not None:
+            from osuT5.osuT5.inference.optimized.kernels.weight_only_runtime import (
+                approximate_weight_only_runtime_context,
+            )
+
+            optimized_decoder_layer_context = approximate_weight_only_runtime_context(
+                approximate_weight_only_state,
+                dispatch_counts=optimized_dispatch_counts,
+            )
+        elif native_cross_mlp_tail:
             from osuT5.osuT5.inference.optimized.single.runtime_context import (
                 decoder_layer_runtime_context,
             )

@@ -799,18 +799,48 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
                 Whether to return the attentions tensors of all attention layers. See `attentions` under
                 returned tensors for more detail.
         """
-        residual = hidden_states
         layer_name = f"decoder.layer{self.self_attn.layer_idx}"
         profile_ranges = detail_ranges_enabled()
-        if profile_ranges:
-            with profile_range(f"{layer_name}.self_attn_norm"):
-                hidden_states = self.self_attn_layer_norm(hidden_states)
+        runtime_hooks = decoder_layer_runtime_hooks()
+        optimized_self_forward = runtime_hooks.self_attention_block_forward
+        optimized_self_outputs = None
+        if optimized_self_forward is not None:
+            optimized_self_outputs = optimized_self_forward(
+                module=self,
+                hidden_states=hidden_states,
+                past_key_value=past_key_value,
+                attention_mask=attention_mask,
+                cache_position=cache_position,
+                position_ids=position_ids,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                output_attentions=bool(output_attentions),
+                layer_name=layer_name,
+            )
+        if optimized_self_outputs is not None:
+            hidden_states, self_attn_outputs = optimized_self_outputs
         else:
-            hidden_states = self.self_attn_layer_norm(hidden_states)
+            residual = hidden_states
+            if profile_ranges:
+                with profile_range(f"{layer_name}.self_attn_norm"):
+                    hidden_states = self.self_attn_layer_norm(hidden_states)
+            else:
+                hidden_states = self.self_attn_layer_norm(hidden_states)
 
-        # Self Attention
-        if profile_ranges:
-            with profile_range(f"{layer_name}.self_attn"):
+            # Self Attention
+            if profile_ranges:
+                with profile_range(f"{layer_name}.self_attn"):
+                    self_attn_outputs = self.self_attn(
+                        hidden_states=hidden_states,
+                        past_key_value=past_key_value,
+                        attention_mask=attention_mask,
+                        cache_position=cache_position,
+                        position_ids=position_ids,
+                        cu_seqlens=cu_seqlens,
+                        max_seqlen=max_seqlen,
+                        output_attentions=output_attentions
+                    )
+            else:
                 self_attn_outputs = self.self_attn(
                     hidden_states=hidden_states,
                     past_key_value=past_key_value,
@@ -821,27 +851,14 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
                     max_seqlen=max_seqlen,
                     output_attentions=output_attentions
                 )
-        else:
-            self_attn_outputs = self.self_attn(
-                hidden_states=hidden_states,
-                past_key_value=past_key_value,
-                attention_mask=attention_mask,
-                cache_position=cache_position,
-                position_ids=position_ids,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                output_attentions=output_attentions
-            )
-        hidden_states = self_attn_outputs[0]
-        if profile_ranges:
-            with profile_range(f"{layer_name}.self.residual"):
+            hidden_states = self_attn_outputs[0]
+            if profile_ranges:
+                with profile_range(f"{layer_name}.self.residual"):
+                    hidden_states = residual + hidden_states
+            else:
                 hidden_states = residual + hidden_states
-        else:
-            hidden_states = residual + hidden_states
 
-        optimized_tail_forward = (
-            decoder_layer_runtime_hooks().cross_mlp_tail_forward
-        )
+        optimized_tail_forward = runtime_hooks.cross_mlp_tail_forward
         if optimized_tail_forward is not None:
             optimized_outputs = optimized_tail_forward(
                 module=self,
@@ -1323,7 +1340,19 @@ class VarWhisperDecoder(VarWhisperPreTrainedModel):
                 if encoder_hidden_states is not None:
                     all_cross_attentions += (layer_outputs[2],)
 
-        if detail_ranges_enabled():
+        optimized_final_norm_forward = (
+            decoder_layer_runtime_hooks().decoder_final_norm_forward
+        )
+        optimized_final_norm = None
+        if optimized_final_norm_forward is not None:
+            optimized_final_norm = optimized_final_norm_forward(
+                module=self.layer_norm,
+                hidden_states=hidden_states,
+                output_hidden_states=bool(output_hidden_states),
+            )
+        if optimized_final_norm is not None:
+            hidden_states = optimized_final_norm
+        elif detail_ranges_enabled():
             with profile_range("decoder.final_norm"):
                 hidden_states = self.layer_norm(hidden_states)
         else:
@@ -1639,7 +1668,18 @@ class VarWhisperForConditionalGeneration(WhisperGenerationMixin, VarWhisperPreTr
             return_dict=return_dict,
             cache_position=cache_position,
         )
-        if detail_ranges_enabled():
+        optimized_projection_forward = (
+            decoder_layer_runtime_hooks().output_projection_forward
+        )
+        optimized_logits = None
+        if optimized_projection_forward is not None:
+            optimized_logits = optimized_projection_forward(
+                module=self.proj_out,
+                hidden_states=outputs[0],
+            )
+        if optimized_logits is not None:
+            lm_logits = optimized_logits
+        elif detail_ranges_enabled():
             with profile_range("decoder.output_projection"):
                 lm_logits = self.proj_out(outputs[0])
         else:
