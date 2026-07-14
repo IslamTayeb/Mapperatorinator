@@ -1,6 +1,31 @@
+import os
+from pathlib import Path
+import subprocess
+import sys
+
 import pytest
 
 from utils.summarize_k4_mask_reuse_reciprocal import decide, text_report
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SUMMARIZER = ROOT / "utils/summarize_k4_mask_reuse_reciprocal.py"
+
+
+def test_direct_script_launcher_imports_repo_utils_outside_repo(tmp_path) -> None:
+    environment = dict(os.environ)
+    environment.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [sys.executable, str(SUMMARIZER), "--help"],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--baseline-first-profile" in result.stdout
 
 
 def _metric(baseline: float, candidate: float, savings=(0.1, 0.1)):

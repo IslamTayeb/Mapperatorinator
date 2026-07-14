@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import argparse
+from importlib import import_module
 import json
 import math
 from pathlib import Path
+import sys
 from typing import Any, Mapping
 
-from utils.analyze_reciprocal_full_song_candidate import analyze
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+analyze = import_module("utils.analyze_reciprocal_full_song_candidate").analyze
 
 
 SCHEMA_VERSION = "mapperatorinator.k4-shared-rope-mask-reuse-reciprocal.v3"
