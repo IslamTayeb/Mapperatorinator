@@ -8,7 +8,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from ...audio_preparation import audio_array_metadata, validate_preloaded_audio
+from ..audio_preparation import audio_array_metadata, validate_preloaded_audio
 
 
 @dataclass(frozen=True, slots=True)
