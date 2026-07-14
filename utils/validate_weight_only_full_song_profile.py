@@ -189,22 +189,26 @@ def validate_profile(payload: Any, *, role: str) -> dict[str, Any]:
             candidate_policy = policy.get("approximate_weight_only")
             candidate_main = candidate and label == "main_generation"
             if candidate:
-                expected_candidate_policy = {
-                    "requested": True,
-                    "enabled": candidate_main,
-                    "disabled_reason": None if candidate_main else "timing_context",
-                    "result_class": "documented-drift",
-                    "exactness_claim": False,
-                }
+                expected_candidate_policy = (
+                    {
+                        "requested": True,
+                        "enabled": True,
+                        "disabled_reason": None,
+                        "result_class": "documented-drift",
+                        "exactness_claim": False,
+                    }
+                    if candidate_main
+                    else None
+                )
                 if candidate_policy != expected_candidate_policy:
                     raise WeightOnlyProfileError(
                         f"{name} has invalid mixed-weight dispatch policy: "
                         f"expected {expected_candidate_policy}, got {candidate_policy}"
                     )
-                _metadata(
-                    record.get("approximate_weight_only"),
-                    name=f"{name}.approximate_weight_only",
-                )
+                if "approximate_weight_only" in record:
+                    raise WeightOnlyProfileError(
+                        f"{name} must keep mixed-weight initialization metadata top-level"
+                    )
             else:
                 if candidate_policy is not None:
                     raise WeightOnlyProfileError(

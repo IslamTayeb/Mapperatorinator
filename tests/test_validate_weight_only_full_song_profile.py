@@ -74,15 +74,15 @@ def _record(label: str, *, candidate: bool) -> dict:
                 "native_q1_rope_cache_self_attention_split_kv_8_prefix_640": 7,
             }
         )
-    if candidate:
+    if candidate and not timing:
         policy["approximate_weight_only"] = {
             "requested": True,
-            "enabled": not timing,
-            "disabled_reason": "timing_context" if timing else None,
+            "enabled": True,
+            "disabled_reason": None,
             "result_class": "documented-drift",
             "exactness_claim": False,
         }
-        record["approximate_weight_only"] = _metadata()
+    if candidate:
         hits.update(
             {
                 key: 0
@@ -163,7 +163,13 @@ def test_candidate_rejects_zero_main_or_nonzero_timing_dispatch() -> None:
     timing_policy = _profile(candidate=True)
     timing_policy["generation"][0]["optimized_dispatch_policy"][
         "approximate_weight_only"
-    ]["disabled_reason"] = None
+    ] = {
+        "requested": True,
+        "enabled": False,
+        "disabled_reason": "timing_context",
+        "result_class": "documented-drift",
+        "exactness_claim": False,
+    }
     with pytest.raises(WeightOnlyProfileError, match="invalid mixed-weight dispatch"):
         validate_profile(timing_policy, role="candidate")
 
