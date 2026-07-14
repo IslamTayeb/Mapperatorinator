@@ -17,6 +17,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+import torch
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -103,6 +105,7 @@ class ConfirmationRuntime:
         prompt_width = int(prompt.shape[1])
         index = self._indices[label]
         target_steps = None
+        fixed_work_eos_ids: list[int] = []
         original_eos = None
         engine_module = None
         if self._mode == "replay-fixed-work":
@@ -113,8 +116,15 @@ class ConfirmationRuntime:
             target_steps = int(counts[index])
             generate_kwargs["max_length"] = prompt_width + target_steps
             from osuT5.osuT5.inference.optimized.single import engine as engine_module
+            from osuT5.osuT5.event import ContextType
 
             original_eos = engine_module.eos_token_ids
+            fixed_work_eos_ids = original_eos(
+                kwargs["tokenizer"],
+                lookback_time=float(generate_kwargs.get("lookback_time", 0.0)),
+                lookahead_time=float(generate_kwargs.get("lookahead_time", 0.0)),
+                context_type=ContextType(str(context_type)),
+            )
             engine_module.eos_token_ids = lambda *args, **kwargs: []
         call_kwargs = dict(kwargs)
         call_kwargs["generate_kwargs"] = generate_kwargs
@@ -132,12 +142,35 @@ class ConfirmationRuntime:
             raise RuntimeError(
                 f"fixed-work {label}[{index}] executed {logical_steps} steps, expected {target_steps}"
             )
+        consumer_steps = logical_steps
+        if target_steps is not None and fixed_work_eos_ids:
+            generated = result[0, prompt_width:]
+            eos = torch.tensor(
+                fixed_work_eos_ids,
+                dtype=generated.dtype,
+                device=generated.device,
+            )
+            positions = torch.nonzero(torch.isin(generated, eos), as_tuple=False)
+            if positions.numel() > 0:
+                consumer_steps = int(positions[0, 0].item()) + 1
+                result = result[:, : prompt_width + consumer_steps]
+                from osuT5.osuT5.inference.generation_utils import build_generation_stats
+
+                rebuilt = build_generation_stats(
+                    result,
+                    model_kwargs,
+                    getattr(kwargs["tokenizer"], "pad_id", None),
+                    float(stats["elapsed_seconds"]),
+                )
+                stats = {**stats, **rebuilt}
+            stats["fixed_work_logical_steps"] = logical_steps
         self.records.append(
             {
                 "profile_label": label,
                 "window_index": index,
                 "prompt_width": prompt_width,
                 "logical_steps": logical_steps,
+                "consumer_steps": consumer_steps,
                 "declared_generated_tokens": int(stats.get("generated_tokens", 0)),
                 "target_steps": target_steps,
             }
