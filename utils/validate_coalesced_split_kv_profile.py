@@ -38,8 +38,8 @@ def validate_profile(payload: Any, *, role: str) -> dict[str, Any]:
     if not isinstance(generation, list) or not generation:
         raise CoalescedProfileError("profile.generation must be non-empty")
     totals = {label: {GENERIC: 0, SPLIT: 0, COALESCED: 0} for label in PROFILE_LABELS}
-    standard_prefix_totals: dict[int, int] = {}
-    prefix_totals: dict[int, int] = {}
+    standard_prefix_totals = {label: {} for label in PROFILE_LABELS}
+    prefix_totals = {label: {} for label in PROFILE_LABELS}
     seen = {label: False for label in PROFILE_LABELS}
     for index, raw in enumerate(generation):
         record = _object(raw, name=f"profile.generation[{index}]")
@@ -71,8 +71,9 @@ def validate_profile(payload: Any, *, role: str) -> dict[str, Any]:
                     )
                 if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                     raise CoalescedProfileError(f"{key} must be non-negative int")
-                standard_prefix_totals[prefix] = (
-                    standard_prefix_totals.get(prefix, 0) + value
+                label_standard_prefix_totals = standard_prefix_totals[label]
+                label_standard_prefix_totals[prefix] = (
+                    label_standard_prefix_totals.get(prefix, 0) + value
                 )
                 continue
             if not key.startswith(PREFIX):
@@ -86,28 +87,34 @@ def validate_profile(payload: Any, *, role: str) -> dict[str, Any]:
                 raise CoalescedProfileError(f"unsupported coalesced prefix {suffix}")
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise CoalescedProfileError(f"{key} must be non-negative int")
-            prefix_totals[prefix] = prefix_totals.get(prefix, 0) + value
+            label_prefix_totals = prefix_totals[label]
+            label_prefix_totals[prefix] = label_prefix_totals.get(prefix, 0) + value
     missing = [label for label, present in seen.items() if not present]
     if missing:
         raise CoalescedProfileError(f"profile is missing labels {missing}")
-    if totals["timing_context"][COALESCED] != 0:
+    if totals["timing_context"][COALESCED] != 0 or prefix_totals["timing_context"]:
         raise CoalescedProfileError("timing generation must not execute coalesced split-KV")
     main = totals["main_generation"]
-    if main[SPLIT] != sum(standard_prefix_totals.values()):
+    main_standard_prefix_totals = standard_prefix_totals["main_generation"]
+    main_prefix_totals = prefix_totals["main_generation"]
+    if main[SPLIT] != sum(main_standard_prefix_totals.values()):
         raise CoalescedProfileError(
             "accepted split-KV aggregate does not equal per-prefix counts"
         )
     if role == "baseline":
-        if main[COALESCED] != 0 or prefix_totals:
+        if main[COALESCED] != 0 or main_prefix_totals:
             raise CoalescedProfileError("baseline unexpectedly executed coalesced split-KV")
     else:
         if main[COALESCED] <= 0:
             raise CoalescedProfileError("candidate did not execute coalesced split-KV")
-        if main[COALESCED] != sum(prefix_totals.values()):
+        if main[COALESCED] != sum(main_prefix_totals.values()):
             raise CoalescedProfileError(
                 "coalesced split-KV aggregate does not equal per-prefix counts"
             )
-        if not standard_prefix_totals or prefix_totals != standard_prefix_totals:
+        if (
+            not main_standard_prefix_totals
+            or main_prefix_totals != main_standard_prefix_totals
+        ):
             raise CoalescedProfileError(
                 "candidate did not execute every live eligible split-KV prefix"
             )
@@ -121,8 +128,10 @@ def validate_profile(payload: Any, *, role: str) -> dict[str, Any]:
         "role": role,
         "timing_counts": totals["timing_context"],
         "main_counts": main,
-        "accepted_split_prefix_counts": dict(sorted(standard_prefix_totals.items())),
-        "coalesced_prefix_counts": dict(sorted(prefix_totals.items())),
+        "accepted_split_prefix_counts": dict(
+            sorted(main_standard_prefix_totals.items())
+        ),
+        "coalesced_prefix_counts": dict(sorted(main_prefix_totals.items())),
         "pass": True,
     }
 
