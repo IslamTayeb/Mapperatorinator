@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -205,6 +206,19 @@ def _validate_candidate(
         raise ValueError("candidate lacks per-row main join waits")
     if any(_number(value, name="candidate.row_join") < 0 for value in waits):
         raise ValueError("candidate row join wait is invalid")
+    digests = external.get("encoder_output_sha256_per_window")
+    if not isinstance(digests, list) or len(digests) != windows or any(
+        not isinstance(digest, str) or len(digest) != 64 for digest in digests
+    ):
+        raise ValueError("candidate lacks every overlapped encoder-output digest")
+    aggregate = external.get("encoder_output_aggregate_sha256")
+    if not isinstance(aggregate, str) or len(aggregate) != 64:
+        raise ValueError("candidate lacks aggregate overlapped encoder digest")
+    expected_aggregate = hashlib.sha256()
+    for digest in digests:
+        expected_aggregate.update(digest.encode("ascii"))
+    if aggregate != expected_aggregate.hexdigest():
+        raise ValueError("candidate aggregate overlapped encoder digest is invalid")
     return external
 
 
@@ -417,6 +431,26 @@ def analyze(
         for role in profiles
     }
     material_exactness = _material_exactness(material_audits)
+    overlap_material_exactness = {
+        "candidate_runs_equal": (
+            candidate_evidence["candidate_first"][
+                "encoder_output_sha256_per_window"
+            ]
+            == candidate_evidence["candidate_second"][
+                "encoder_output_sha256_per_window"
+            ]
+        ),
+        "last_overlap_matches_consumed_encoder": all(
+            candidate_evidence[role]["encoder_output_sha256_per_window"][-1]
+            == material_audits[role]["stages"]["main_generation"]["encoder"][
+                "sha256"
+            ]
+            for role in ("candidate_first", "candidate_second")
+        ),
+    }
+    overlap_material_exactness["pass"] = all(
+        overlap_material_exactness.values()
+    )
     reciprocal = compare_reciprocal_profiles(
         profile_paths["baseline_first"],
         profile_paths["candidate_second"],
@@ -489,6 +523,7 @@ def analyze(
         and all(row["pass"] for row in exact_orders.values())
         and candidate_repeat["pass"]
         and material_exactness["pass"]
+        and overlap_material_exactness["pass"]
     )
     no_order_regression = all(
         order["complete_request_seconds_saved"] >= 0.0 for order in orders
@@ -526,6 +561,7 @@ def analyze(
         "candidate_repeatability": candidate_repeat,
         "material_audits": material_audits,
         "raw_material_and_rng_exactness": material_exactness,
+        "overlapped_encoder_material_exactness": overlap_material_exactness,
         "reciprocal_exactness": reciprocal,
     }
 

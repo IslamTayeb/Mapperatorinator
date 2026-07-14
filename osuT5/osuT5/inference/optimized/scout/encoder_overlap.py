@@ -515,6 +515,20 @@ class ExactMainEncoderOverlap:
                 for value in row.values()
             )
         )
+        encoder_output_sha256_per_window = None
+        encoder_output_aggregate_sha256 = None
+        if synchronize:
+            encoder_output_sha256_per_window = [
+                _tensor_material(
+                    row.hidden,
+                    name=f"overlap.encoder_outputs.{index}",
+                )[0]["sha256"]
+                for index, row in enumerate(self._rows)
+            ]
+            aggregate = hashlib.sha256()
+            for digest in encoder_output_sha256_per_window:
+                aggregate.update(digest.encode("ascii"))
+            encoder_output_aggregate_sha256 = aggregate.hexdigest()
         result = {
             "version": OVERLAP_VERSION,
             "result_class": "exact-output-candidate",
@@ -553,6 +567,8 @@ class ExactMainEncoderOverlap:
             "pinned_input_bytes": pinned_input_bytes,
             "device_input_copy_bytes": pinned_input_bytes,
             "output_store_bytes": output_bytes,
+            "encoder_output_sha256_per_window": encoder_output_sha256_per_window,
+            "encoder_output_aggregate_sha256": encoder_output_aggregate_sha256,
             "baseline_allocated_vram_bytes": self._baseline_allocated,
             "baseline_reserved_vram_bytes": self._baseline_reserved,
             "peak_allocated_vram_bytes": (
