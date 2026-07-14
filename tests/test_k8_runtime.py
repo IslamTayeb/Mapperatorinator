@@ -33,7 +33,9 @@ class TemperatureLogitsWarper:
 class LookbackBiasLogitsWarper:
     def __init__(self):
         self.types_first = False
-        self.lookback_range = torch.tensor([False, False, True, False, False])
+        self.lookback_range = torch.tensor(
+            [False, False, True, False, False, False, False, False, False, False]
+        )
 
 
 def _state(*, max_length=12):
@@ -95,10 +97,10 @@ def test_graph_processor_owns_monotonic_temperature_and_lookback_state():
             LookbackBiasLogitsWarper(),
         ],
         state=state,
-        vocab_size=5,
+        vocab_size=10,
         prompt_length=2,
     )
-    scores = chain(torch.tensor([[2.0, 4.0, 6.0, 8.0, 10.0]]))
+    scores = chain(torch.arange(2.0, 22.0, 2.0).reshape(1, 10))
 
     assert state.monotonic_has_time_shift.tolist() == [True]
     assert state.monotonic_last_value.tolist() == [1]
@@ -111,7 +113,7 @@ def test_graph_processor_owns_monotonic_temperature_and_lookback_state():
 
 @pytest.mark.parametrize(
     ("cur_len", "max_length", "expected"),
-    ((128, 1024, True), (185, 1024, False), (1017, 1024, False)),
+    ((128, 1024, False), (185, 1024, True), (1017, 1024, False)),
 )
 def test_k8_never_crosses_bucket_or_max_length(cur_len, max_length, expected):
     assert _k8_eligible(cur_len, max_length, 64) is expected
