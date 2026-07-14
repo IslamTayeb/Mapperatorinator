@@ -31,6 +31,7 @@ from utils.profile_native_prefix_dtype_scout import (  # noqa: E402
     _all_cache_snapshots,
     _assert_scout_args,
     _cache_from_static_inputs,
+    _entry_prefix,
     _load_args,
     _model_logits,
     _observe_full_graph,
@@ -38,13 +39,48 @@ from utils.profile_native_prefix_dtype_scout import (  # noqa: E402
     _restore_all_cache,
     _verify_full_graph,
     _capture_cuda_graph,
-    validate_accepted_graph_cache,
 )
 
 
 SCHEMA_VERSION = "mapperatorinator.shared-rope-scout.v1"
 REQUIRED_MAIN_SAVING_SECONDS = 1.503
 SHORT_LOOP_STEPS = 4
+
+
+def _validate_live_accepted_graph_cache(
+    graph_cache: dict[Any, dict[str, Any]],
+) -> dict[int, dict[str, Any]]:
+    """Validate the accepted topology while consuming this run's replay counts."""
+
+    if not isinstance(graph_cache, dict):
+        raise TypeError("ProductionDecodeSession.graph_cache must be a dict")
+    by_prefix: dict[int, dict[str, Any]] = {}
+    for entry in graph_cache.values():
+        if not isinstance(entry, dict):
+            raise TypeError("graph_cache entries must be dicts")
+        prefix = _entry_prefix(entry)
+        if prefix in by_prefix:
+            raise RuntimeError(f"accepted graph cache repeats prefix {prefix}")
+        required = ("graph", "outputs", "static_inputs", "decode_replays")
+        missing = [name for name in required if name not in entry]
+        if missing:
+            raise RuntimeError(f"accepted prefix {prefix} is missing {missing}")
+        count = entry["decode_replays"]
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise RuntimeError(
+                f"accepted prefix {prefix} has invalid decode_replays={count!r}"
+            )
+        by_prefix[prefix] = entry
+    if tuple(sorted(by_prefix)) != ALL_BUCKETS:
+        counts = {
+            prefix: entry["decode_replays"]
+            for prefix, entry in sorted(by_prefix.items())
+        }
+        raise RuntimeError(
+            f"accepted graph cache must contain current buckets {list(ALL_BUCKETS)}, "
+            f"got counts {counts}"
+        )
+    return dict(sorted(by_prefix.items()))
 
 
 def _git_head() -> str:
@@ -310,7 +346,9 @@ def profile_shared_rope_scout(
     model = run["model"]
     model.eval()
     plan = build_shared_rope_plan(model)
-    accepted_entries = validate_accepted_graph_cache(run["session"].graph_cache)
+    accepted_entries = _validate_live_accepted_graph_cache(
+        run["session"].graph_cache
+    )
     selected = {prefix: accepted_entries[prefix] for prefix in ALL_BUCKETS}
     live_counts = {
         prefix: int(entry["decode_replays"])
