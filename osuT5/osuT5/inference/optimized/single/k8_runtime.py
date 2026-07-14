@@ -506,6 +506,12 @@ def _cuda_check(result: tuple[Any, ...], operation: str) -> tuple[Any, ...]:
     return result[1:]
 
 
+def _cuda_status(result: tuple[Any, ...], operation: str) -> None:
+    payload = _cuda_check(result, operation)
+    if payload:
+        raise RuntimeError(f"{operation} returned unexpected payload {payload!r}")
+
+
 @dataclass(slots=True)
 class _ChildGraphSequence:
     parent_graph: Any
@@ -549,7 +555,7 @@ class _ChildGraphSequence:
                 "cudaGraphInstantiate",
             )
         except Exception:
-            runtime.cudaGraphDestroy(parent)
+            _cuda_status(runtime.cudaGraphDestroy(parent), "cudaGraphDestroy")
             raise
         return cls(parent, executable, model_graph, tail_graph)
 
@@ -559,8 +565,8 @@ class _ChildGraphSequence:
         from cuda.bindings import runtime
 
         stream = runtime.cudaStream_t(torch.cuda.current_stream().cuda_stream)
-        _cuda_check(
-            (runtime.cudaGraphLaunch(self.executable, stream),),
+        _cuda_status(
+            runtime.cudaGraphLaunch(self.executable, stream),
             "cudaGraphLaunch",
         )
 
@@ -569,12 +575,12 @@ class _ChildGraphSequence:
             return
         from cuda.bindings import runtime
 
-        _cuda_check(
-            (runtime.cudaGraphExecDestroy(self.executable),),
+        _cuda_status(
+            runtime.cudaGraphExecDestroy(self.executable),
             "cudaGraphExecDestroy",
         )
-        _cuda_check(
-            (runtime.cudaGraphDestroy(self.parent_graph),),
+        _cuda_status(
+            runtime.cudaGraphDestroy(self.parent_graph),
             "cudaGraphDestroy",
         )
         self.closed = True
