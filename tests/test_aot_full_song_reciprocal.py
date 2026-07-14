@@ -63,7 +63,7 @@ class AotFullSongReciprocalTest(unittest.TestCase):
         self.assertIn('"direct_second"', source)
         self.assertIn('"cached_second"', source)
         self.assertIn("subprocess.run(", source)
-        self.assertIn('env[MANIFEST_ENV] = str(args.manifest.resolve())', source)
+        self.assertIn('env[MANIFEST_ENV] = str(local_manifest)', source)
         self.assertIn('env.pop(MANIFEST_ENV, None)', source)
         self.assertIn('mode="exact-fp32"', source)
         self.assertIn(
