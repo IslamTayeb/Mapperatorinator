@@ -229,6 +229,7 @@ def test_cross_wrappers_pin_k1_int8_control_and_one_candidate_mode(
 ) -> None:
     source = wrapper.read_text(encoding="utf-8")
 
+    assert "#SBATCH --time=00:30:00" in source
     assert (
         "BASELINE_RUNNER="
         "utils/run_k4_shared_rope_k1_remainder_int8_mlp_weight_only.py"
