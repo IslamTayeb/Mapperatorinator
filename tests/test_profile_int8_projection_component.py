@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 from utils.profile_int8_projection_component import (
     FIXED_MAIN_SAVING_GATE_SECONDS,
     MEASURED_INT8_VS_FP16_MLP_SPEEDUP,
+    REQUIRED_DISPATCHES,
+    _retained_real_tensor_context,
     _validate_retained_composition_manifest,
     summarize_component,
 )
@@ -227,6 +232,57 @@ def test_retained_manifest_accepts_exact_live_composition() -> None:
     assert report["pass"]
     assert report["k1"] == {"records": 1, "remainder_steps": 1, "physical_steps": 10}
     assert report["excluded_already_int8_regions"] == ["mlp_fc1", "mlp_fc2"]
+
+
+def test_real_tensor_capture_context_installs_and_restores_retained_hooks(
+    monkeypatch,
+) -> None:
+    from osuT5.osuT5.inference.optimized.scout import shared_rope
+    from osuT5.osuT5 import runtime_profiling
+
+    events: list[str] = []
+
+    @contextmanager
+    def fake_rope(model, *, stats):
+        del model
+        events.append("rope_enter")
+        stats.forwards = 1
+        try:
+            yield stats
+        finally:
+            events.append("rope_exit")
+
+    @contextmanager
+    def fake_generation(**kwargs):
+        events.append("runtime_enter")
+        counts = kwargs["optimized_dispatch_counts"]
+        counts.update({name: 1 for name in REQUIRED_DISPATCHES})
+        try:
+            yield
+        finally:
+            events.append("runtime_exit")
+
+    monkeypatch.setattr(shared_rope, "shared_decoder_rope_context", fake_rope)
+    monkeypatch.setattr(runtime_profiling, "generation_profile_context", fake_generation)
+    state = SimpleNamespace(validate_owner=lambda model: events.append("validate_owner"))
+
+    with _retained_real_tensor_context(torch.nn.Module(), state, prefix=128):
+        events.append("capture")
+
+    assert events == [
+        "validate_owner",
+        "rope_enter",
+        "runtime_enter",
+        "capture",
+        "runtime_exit",
+        "rope_exit",
+    ]
+
+    events.clear()
+    with pytest.raises(RuntimeError, match="capture failed"):
+        with _retained_real_tensor_context(torch.nn.Module(), state, prefix=128):
+            raise RuntimeError("capture failed")
+    assert events[-2:] == ["runtime_exit", "rope_exit"]
 
 
 @pytest.mark.parametrize(
