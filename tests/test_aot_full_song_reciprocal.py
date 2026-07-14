@@ -34,10 +34,10 @@ def _analysis(*, warm_delta: float = -0.1) -> dict:
             "cold_process_outer_wall_seconds": {
                 "candidate_minus_baseline": -1.8,
                 "run_values": {
-                    "cached_first": 44.5,
-                    "direct_first": 42.7,
-                    "direct_second": 42.9,
-                    "cached_second": 44.7,
+                    "baseline_first": 44.5,
+                    "candidate_first": 42.7,
+                    "candidate_second": 42.9,
+                    "baseline_second": 44.7,
                 },
             },
         },

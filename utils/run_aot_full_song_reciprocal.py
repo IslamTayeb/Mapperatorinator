@@ -292,11 +292,15 @@ def evaluate_gate(
         raise ValueError("reciprocal warm/cold metrics are missing")
     warm_delta = float(warm["candidate_minus_baseline"])
     cold_profile_saving = -float(cold_profile["candidate_minus_baseline"])
-    profile_cold_walls = cold_profile.get("run_values")
-    if not isinstance(profile_cold_walls, dict) or set(profile_cold_walls) != set(
-        RUN_ORDER
-    ):
+    raw_profile_cold_walls = cold_profile.get("run_values")
+    if not isinstance(raw_profile_cold_walls, dict) or set(
+        raw_profile_cold_walls
+    ) != set(ANALYZER_ROLES):
         raise ValueError("profile cold-process walls are incomplete")
+    profile_cold_walls = {
+        run_role: float(raw_profile_cold_walls[analyzer_role])
+        for analyzer_role, run_role in ANALYZER_ROLES.items()
+    }
     wall_reconciliation = {
         role: {
             "external_process_wall_seconds": float(process_walls[role]),
