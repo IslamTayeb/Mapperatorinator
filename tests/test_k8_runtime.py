@@ -12,6 +12,7 @@ from osuT5.osuT5.inference.optimized.single.k8_runtime import (
     K8DeviceState,
     K8LogitsProcessor,
     _ChildGraphSequence,
+    _K8DecoderMaskStorage,
     _K8GraphLifecycle,
     _capture_k8_entry,
     _k8_eligible,
@@ -168,6 +169,65 @@ def test_runtime_slot_separates_sampling_modes():
     assert greedy.signature[-1] is False
 
 
+def test_runtime_slot_owns_and_resets_one_request_local_decoder_mask_buffer():
+    holder = {}
+    processors = [MonotonicTimeShiftLogitsProcessor()]
+    signature = _processor_signature(processors)
+    common = dict(
+        input_ids=torch.tensor([[1, 5]]),
+        max_length=12,
+        pad_token_id=0,
+        eos_token_ids=torch.tensor([9]),
+        logits_processor=processors,
+        processor_signature=signature,
+        vocab_size=10,
+        rng_seed=123,
+        do_sample=True,
+        reuse_decoder_attention_mask=True,
+    )
+
+    first = _runtime_slot(
+        holder,
+        decoder_attention_mask=torch.tensor([[0, 1]]),
+        **common,
+    )
+    storage = first.decoder_attention_mask
+    assert storage is not None
+    pointer = storage.buffer.data_ptr()
+    storage.sync(torch.tensor([[0, 1, 1]]), cur_len=6)
+
+    second = _runtime_slot(
+        holder,
+        decoder_attention_mask=torch.tensor([[0, 0, 1]]),
+        **common,
+    )
+
+    assert second is first
+    assert second.decoder_attention_mask is storage
+    assert storage.buffer.data_ptr() == pointer
+    assert storage.buffer[0, :6].tolist() == [0, 0, 1, 1, 1, 1]
+    assert storage.active_length == 3
+    assert storage.sync_calls == 0
+    assert storage.allocation_count == 1
+
+
+def test_runtime_slot_reuse_fails_without_a_request_mask():
+    with pytest.raises(ValueError, match="requires decoder_attention_mask"):
+        _runtime_slot(
+            {},
+            input_ids=torch.tensor([[1, 5]]),
+            max_length=12,
+            pad_token_id=0,
+            eos_token_ids=torch.tensor([9]),
+            logits_processor=[MonotonicTimeShiftLogitsProcessor()],
+            processor_signature=("monotonic",),
+            vocab_size=10,
+            rng_seed=123,
+            do_sample=True,
+            reuse_decoder_attention_mask=True,
+        )
+
+
 def test_graph_processor_owns_monotonic_temperature_and_lookback_state():
     state = _state()
     chain = K8LogitsProcessor.compile(
@@ -305,6 +365,83 @@ def test_left_padding_survives_two_k8_handoffs_with_position_progression():
     assert static_inputs["cache_position"].tolist() == [19]
     assert static_inputs["decoder_position_ids"].tolist() == [[19]]
     assert model_kwargs["cache_position"] is static_inputs["cache_position"]
+
+
+def test_reused_decoder_mask_preserves_contents_and_allocation_across_handoffs():
+    static_inputs = {"cache_position": torch.tensor([3])}
+    entry = SimpleNamespace(static_inputs=static_inputs)
+    storage = _K8DecoderMaskStorage.allocate(
+        torch.tensor([[0, 0, 1, 1]]),
+        max_length=24,
+    )
+    pointer = storage.buffer.data_ptr()
+    model_kwargs = {
+        "cache_position": torch.tensor([3]),
+        "decoder_attention_mask": torch.tensor([[0, 0, 1, 1]]),
+    }
+
+    _sync_model_kwargs_after_k8(
+        model_kwargs,
+        entry,
+        cur_len=8,
+        mask_storage=storage,
+    )
+    first = model_kwargs["decoder_attention_mask"]
+    _sync_model_kwargs_after_k8(
+        model_kwargs,
+        entry,
+        cur_len=12,
+        mask_storage=storage,
+    )
+    second = model_kwargs["decoder_attention_mask"]
+
+    assert first.tolist() == [[0, 0, 1, 1, 1, 1, 1, 1]]
+    assert second.tolist() == [[0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]]
+    assert first.data_ptr() == second.data_ptr() == pointer
+    assert storage.summary() == {
+        "enabled": True,
+        "allocation_count": 1,
+        "buffer_capacity_elements": 24,
+        "buffer_bytes": 24 * torch.tensor([], dtype=torch.long).element_size(),
+        "buffer_dtype": "torch.int64",
+        "buffer_device": "cpu",
+        "active_length": 12,
+        "reset_calls": 1,
+        "sync_calls": 2,
+        "owned_reuse_calls": 1,
+        "external_copy_calls": 1,
+        "external_copy_bytes": 4 * torch.tensor([], dtype=torch.long).element_size(),
+        "tail_fill_calls": 0,
+        "activated_elements": 8,
+    }
+
+
+def test_reused_decoder_mask_fails_loudly_on_shape_dtype_capacity_and_owner():
+    storage = _K8DecoderMaskStorage.allocate(
+        torch.tensor([[0, 1]]),
+        max_length=8,
+    )
+
+    with pytest.raises(ValueError, match=r"shape \[1, sequence\]"):
+        storage.sync(torch.ones((2, 2), dtype=torch.long), cur_len=4)
+    with pytest.raises(TypeError, match="dtype changed"):
+        storage.sync(torch.ones((1, 2), dtype=torch.float32), cur_len=4)
+    with pytest.raises(ValueError, match="cur_len is out of range"):
+        storage.sync(torch.ones((1, 2), dtype=torch.long), cur_len=9)
+    owned = storage.sync(torch.tensor([[0, 1]]), cur_len=4)
+    with pytest.raises(RuntimeError, match="external request storage"):
+        storage.reset(owned)
+
+
+def test_reused_decoder_mask_rejects_device_change_when_cuda_is_available():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the cross-device ownership check")
+    storage = _K8DecoderMaskStorage.allocate(
+        torch.tensor([[0, 1]], device="cuda"),
+        max_length=8,
+    )
+    with pytest.raises(ValueError, match="device changed"):
+        storage.sync(torch.tensor([[0, 1]]), cur_len=4)
 
 
 def test_raw_child_graph_api_fails_loudly_when_torch_does_not_expose_handle():
@@ -523,10 +660,14 @@ def test_k8_lifecycle_closes_graphs_at_session_transition_and_context_exit():
     first_cache = {}
     second_cache = {}
 
-    with install_k8_candidate(block_size=4):
+    with install_k8_candidate(
+        block_size=4,
+        reuse_decoder_attention_mask=True,
+    ):
         lifecycle = k8_runtime._ACTIVE_K8_LIFECYCLE
         assert isinstance(lifecycle, _K8GraphLifecycle)
         assert k8_runtime._ACTIVE_BLOCK_SIZE == 4
+        assert k8_runtime._ACTIVE_REUSE_DECODER_ATTENTION_MASK is True
         lifecycle.activate(first_cache)
         lifecycle.register(first)
         lifecycle.activate(first_cache)
@@ -539,6 +680,7 @@ def test_k8_lifecycle_closes_graphs_at_session_transition_and_context_exit():
     assert second.close_calls == 1
     assert k8_runtime._ACTIVE_K8_LIFECYCLE is None
     assert k8_runtime._ACTIVE_BLOCK_SIZE is None
+    assert k8_runtime._ACTIVE_REUSE_DECODER_ATTENTION_MASK is None
 
 
 def test_opt_in_install_restores_default_even_on_exception(monkeypatch):
@@ -554,6 +696,7 @@ def test_opt_in_install_restores_default_even_on_exception(monkeypatch):
             raise RuntimeError("boom")
     assert engine.active_prefix_decode_generate is default
     assert k8_runtime._ACTIVE_BLOCK_SIZE is None
+    assert k8_runtime._ACTIVE_REUSE_DECODER_ATTENTION_MASK is None
 
 
 @pytest.mark.parametrize("block_size", (0, 2, 3, 5, 16))
@@ -566,6 +709,12 @@ def test_install_rejects_unsupported_block_sizes(block_size):
 def test_install_rejects_non_integer_block_size():
     with pytest.raises(TypeError, match="block size must be an integer"):
         with install_k8_candidate(block_size=True):
+            pass
+
+
+def test_install_rejects_non_bool_decoder_mask_reuse_policy():
+    with pytest.raises(TypeError, match="reuse_decoder_attention_mask must be a bool"):
+        with install_k8_candidate(reuse_decoder_attention_mask=1):
             pass
 
 
@@ -679,6 +828,54 @@ def test_k1_only_latest_window_does_not_report_stale_k8_graph_stats():
     assert report["block_replays"] == 0
     assert report["remainder_steps"] == 3
     assert report["physical_steps"] == report["logical_steps"] == 4
+
+
+def test_session_reports_decoder_mask_reuse_evidence_only_when_present():
+    session = ProductionDecodeSession()
+    signature = ("shape",)
+    session.active_state_signature = signature
+    session.stable_encoder_holders[signature] = {
+        "__k8_latest_stats__": {
+            "k8_candidate": True,
+            "decoder_attention_mask_reuse_requested": True,
+            "decoder_attention_mask_reuse": {
+                "enabled": True,
+                "allocation_count": 1,
+                "buffer_capacity_elements": 1024,
+                "buffer_bytes": 8192,
+                "buffer_dtype": "torch.int64",
+                "buffer_device": "cuda:0",
+                "active_length": 640,
+                "reset_calls": 1,
+                "sync_calls": 12,
+                "owned_reuse_calls": 11,
+                "external_copy_calls": 1,
+                "external_copy_bytes": 128,
+                "tail_fill_calls": 0,
+                "activated_elements": 48,
+            },
+        }
+    }
+
+    candidate = session.graph_profile_summary()["k8_candidate"]
+
+    assert candidate["decoder_attention_mask_reuse_requested"] is True
+    assert candidate["decoder_attention_mask_reuse"] == {
+        "enabled": True,
+        "allocation_count": 1,
+        "buffer_capacity_elements": 1024,
+        "buffer_bytes": 8192,
+        "buffer_dtype": "torch.int64",
+        "buffer_device": "cuda:0",
+        "active_length": 640,
+        "reset_calls": 1,
+        "sync_calls": 12,
+        "owned_reuse_calls": 11,
+        "external_copy_calls": 1,
+        "external_copy_bytes": 128,
+        "tail_fill_calls": 0,
+        "activated_elements": 48,
+    }
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
