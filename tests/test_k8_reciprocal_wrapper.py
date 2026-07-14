@@ -1,4 +1,6 @@
 from pathlib import Path
+import subprocess
+import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,3 +49,15 @@ def test_wrapper_keeps_generated_artifacts_outside_git_and_json_text_only():
     assert ".md" not in source
     assert ".html" not in source
     assert ".png" not in source
+
+
+def test_validator_is_directly_executable_from_repo_root():
+    result = subprocess.run(
+        [sys.executable, "utils/validate_k8_reciprocal.py", "--help"],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
