@@ -1,3 +1,4 @@
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -48,8 +49,14 @@ def test_source_preserves_stable_boundary_and_original_id_sampling() -> None:
     assert "constexpr int kTopK = 256" in source
     assert "constexpr int kCandidatesPerChunk = kTopK + 1" in source
     assert "left_score == right_score && left_id < right_id" in source
-    assert "retained_scores[kTopK - 1] == retained_scores[kTopK]" in source
+    cursor_barrier = source.index("// Lane zero consumes every cursor")
+    merge_start = source.index("if (lane == 0)", cursor_barrier)
+    assert "__syncthreads();" in source[cursor_barrier:merge_start]
+    assert "retained_scores[kept_count - 1]" in source
+    assert "retained_scores[kept_count]" in source
     assert "Sort only the retained bounded set by token id" in source
+    assert "fabsf(scratch[lane] - boundary) <= tolerance" in source
+    assert "sample_threshold <= 0.0f || sample_threshold >= 1.0f" in source
     assert "atomicMin(&selected_position, lane)" in source
     assert "int* __restrict__ kept_count_output" in source
     assert "unsigned char* __restrict__ overflow_output" in source
@@ -58,6 +65,9 @@ def test_source_preserves_stable_boundary_and_original_id_sampling() -> None:
         ROOT / "osuT5/osuT5/inference/optimized/scout/__init__.py"
     ).read_text(encoding="utf-8")
     assert "top256_sampler" not in package_init
+    assert "--use_fast_math" not in inspect.getsource(
+        top256_sampler._load_top256_extension
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float64])
@@ -132,21 +142,36 @@ def test_bounded_reference_matches_real_top_p_and_original_order(threshold) -> N
     assert reference["kept_count"] == expected_count
 
 
-def test_reference_overflows_above_256_and_on_boundary_tie() -> None:
+def test_reference_overflows_above_256() -> None:
     large_nucleus = torch.zeros((1, 300), dtype=torch.float32)
-    tie_boundary = torch.arange(300, 0, -1, dtype=torch.float32).reshape(1, 300)
-    tie_boundary[0, 255:257] = tie_boundary[0, 255]
 
     assert bounded_reference(
         large_nucleus,
         0.25,
         top_p=0.9,
     )["overflow"]
-    assert bounded_reference(
-        tie_boundary,
-        0.25,
-        top_p=0.999999,
-    )["overflow"]
+
+
+def test_reference_overflows_on_tie_at_actual_nucleus_cutoff() -> None:
+    scores = torch.zeros((1, 8), dtype=torch.float32)
+
+    result = bounded_reference(scores, 0.23, top_p=0.5)
+
+    assert result["kept_count"] == 4
+    assert result["overflow"]
+
+
+def test_reference_overflows_near_original_id_cdf_boundary() -> None:
+    scores = torch.tensor([[4.0, 1.0, 3.0, 2.0]], dtype=torch.float32)
+    filtered = TopPLogitsWarper(top_p=0.9)(
+        torch.zeros((1, 1), dtype=torch.long), scores
+    )
+    cdf = torch.softmax(filtered, dim=-1).cumsum(dim=-1)
+    threshold = float(cdf[0, 0])
+
+    result = bounded_reference(scores, threshold, top_p=0.9)
+
+    assert result["overflow"]
 
 
 def test_negative_infinity_padding_does_not_create_a_false_boundary_tie() -> None:

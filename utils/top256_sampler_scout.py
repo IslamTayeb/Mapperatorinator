@@ -97,12 +97,21 @@ def bounded_reference(
     sorted_scores, sorted_ids = torch.sort(
         scores[0], descending=True, stable=True
     )
-    tie_overflow = (
-        scores.shape[1] > top_k
-        and torch.isfinite(sorted_scores[top_k - 1])
-        and sorted_scores[top_k - 1] == sorted_scores[top_k]
+    cutoff_tie_overflow = (
+        kept_count < scores.shape[1]
+        and torch.isfinite(sorted_scores[kept_count - 1])
+        and sorted_scores[kept_count - 1] == sorted_scores[kept_count]
     )
-    overflow = kept_count > top_k or bool(tie_overflow)
+    probabilities = torch.softmax(filtered, dim=-1)
+    cdf = probabilities.cumsum(dim=-1)
+    threshold_boundary_overflow = bool(
+        ((cdf - float(threshold)).abs() <= 1.0e-6).any()
+    )
+    overflow = (
+        kept_count > top_k
+        or bool(cutoff_tie_overflow)
+        or threshold_boundary_overflow
+    )
     if overflow:
         token = -1
     else:

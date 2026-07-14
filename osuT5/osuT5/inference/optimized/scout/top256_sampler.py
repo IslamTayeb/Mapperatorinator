@@ -156,14 +156,18 @@ __global__ void merge_nucleus_sample_kernel(
     __shared__ float maximum;
     __shared__ float total_mass;
     __shared__ float retained_mass;
-    __shared__ unsigned char overflow;
+    __shared__ unsigned int overflow;
 
     const int lane = threadIdx.x;
     if (lane < kMaxChunks) {
         cursors[lane] = 0;
     }
+    // Lane zero consumes every cursor in the serial k-way merge.  The
+    // initialization is distributed across lanes, so the merge cannot begin
+    // until all cursor writes are visible.
+    __syncthreads();
     if (lane == 0) {
-        overflow = *invalid_input != 0u ? 1 : 0;
+        overflow = *invalid_input != 0u ? 1u : 0u;
         kept_count = 0;
         selected_position = kTopK;
         for (int rank = 0; rank <= kTopK; ++rank) {
@@ -196,7 +200,12 @@ __global__ void merge_nucleus_sample_kernel(
         }
         maximum = retained_scores[0];
         if (!isfinite(maximum) || retained_ids[0] == INT_MAX) {
-            overflow = 1;
+            overflow = 1u;
+        }
+        const float sample_threshold = threshold[0];
+        if (!isfinite(sample_threshold) ||
+                sample_threshold <= 0.0f || sample_threshold >= 1.0f) {
+            overflow = 1u;
         }
     }
     __syncthreads();
@@ -218,7 +227,7 @@ __global__ void merge_nucleus_sample_kernel(
     if (lane == 0) {
         total_mass = scratch[0];
         if (!isfinite(total_mass) || total_mass <= 0.0f) {
-            overflow = 1;
+            overflow = 1u;
         }
         float cumulative = 0.0f;
         const float target = top_p * total_mass;
@@ -229,7 +238,7 @@ __global__ void merge_nucleus_sample_kernel(
             const float tolerance = kBoundaryRelativeEpsilon * total_mass;
             if (fabsf(prior - target) <= tolerance ||
                     fabsf(cumulative - target) <= tolerance) {
-                overflow = 1;
+                overflow = 1u;
                 break;
             }
             if (cumulative >= target) {
@@ -237,14 +246,15 @@ __global__ void merge_nucleus_sample_kernel(
             }
         }
         if (cumulative < target || kept_count <= 0 || kept_count > kTopK) {
-            overflow = 1;
+            overflow = 1u;
         }
-        // A tie across the top-256 boundary cannot be assigned the same
-        // implementation-defined ordering as torch.sort, so force fallback.
-        if (vocab_size > kTopK &&
-                isfinite(retained_scores[kTopK - 1]) &&
-                retained_scores[kTopK - 1] == retained_scores[kTopK]) {
-            overflow = 1;
+        // Transformers sorts the full row to choose a nucleus.  A finite tie
+        // across the actual retained/removed cutoff can select different
+        // token ids under a bounded stable ordering, so force exact fallback.
+        if (!overflow && kept_count < vocab_size &&
+                isfinite(retained_scores[kept_count - 1]) &&
+                retained_scores[kept_count - 1] == retained_scores[kept_count]) {
+            overflow = 1u;
         }
     }
     __syncthreads();
@@ -293,7 +303,7 @@ __global__ void merge_nucleus_sample_kernel(
     if (lane == 0) {
         retained_mass = scratch[0];
         if (!isfinite(retained_mass) || retained_mass <= 0.0f) {
-            overflow = 1;
+            overflow = 1u;
         }
     }
     __syncthreads();
@@ -307,8 +317,15 @@ __global__ void merge_nucleus_sample_kernel(
         __syncthreads();
     }
     if (!overflow && lane < kept_count) {
-        const float cdf = scratch[lane] / retained_mass;
-        if (cdf >= threshold[0]) {
+        const float boundary = threshold[0] * retained_mass;
+        const float tolerance = kBoundaryRelativeEpsilon * retained_mass;
+        if (fabsf(scratch[lane] - boundary) <= tolerance) {
+            atomicExch(&overflow, 1u);
+        }
+    }
+    __syncthreads();
+    if (!overflow && lane < kept_count) {
+        if (scratch[lane] >= threshold[0] * retained_mass) {
             atomicMin(&selected_position, lane);
         }
     }
@@ -321,7 +338,7 @@ __global__ void merge_nucleus_sample_kernel(
             selected_position = kept_count - 1;
         }
         *kept_count_output = kept_count;
-        *overflow_output = overflow;
+        *overflow_output = static_cast<unsigned char>(overflow != 0u);
         *token = overflow ? -1 : static_cast<int64_t>(retained_ids[selected_position]);
     }
 }
@@ -431,7 +448,7 @@ def _load_top256_extension() -> Any:
                     cpp_sources=_CPP_SOURCE,
                     cuda_sources=_CUDA_SOURCE,
                     functions=None,
-                    extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"],
+                    extra_cuda_cflags=["-O3", "-lineinfo"],
                     with_cuda=True,
                     verbose=False,
                 )
