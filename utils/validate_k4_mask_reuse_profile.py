@@ -37,6 +37,9 @@ def validate(payload: Any, *, role: str) -> dict[str, Any]:
             "sync_calls": 0,
             "owned_reuse_calls": 0,
             "external_copy_calls": 0,
+            "reuse_opportunities": 0,
+            "records_with_reuse_opportunity": 0,
+            "records_without_reuse_opportunity": 0,
             "allocation_count_max": 0,
             "buffer_bytes_max": 0,
         }
@@ -107,16 +110,23 @@ def validate(payload: Any, *, role: str) -> dict[str, Any]:
             raise ValueError(f"generation[{index}] used a per-block mask fill")
         if values["sync_calls"] != block_replays:
             raise ValueError(f"generation[{index}] mask sync/block accounting diverged")
-        if (
-            values["owned_reuse_calls"] + values["external_copy_calls"]
-            != values["sync_calls"]
-        ):
+        if values["external_copy_calls"] > block_replays:
+            raise ValueError(
+                f"generation[{index}] copied more external masks than block handoffs"
+            )
+        reuse_opportunities = block_replays - values["external_copy_calls"]
+        if values["owned_reuse_calls"] != reuse_opportunities:
             raise ValueError(f"generation[{index}] mask ownership accounting diverged")
-        if values["sync_calls"] > 1 and values["owned_reuse_calls"] < 1:
-            raise ValueError(f"generation[{index}] never reused owned mask storage")
         row["sync_calls"] += values["sync_calls"]
         row["owned_reuse_calls"] += values["owned_reuse_calls"]
         row["external_copy_calls"] += values["external_copy_calls"]
+        row["reuse_opportunities"] += reuse_opportunities
+        opportunity_key = (
+            "records_with_reuse_opportunity"
+            if reuse_opportunities > 0
+            else "records_without_reuse_opportunity"
+        )
+        row[opportunity_key] += 1
         row["allocation_count_max"] = max(
             row["allocation_count_max"], values["allocation_count"]
         )
@@ -128,6 +138,12 @@ def validate(payload: Any, *, role: str) -> dict[str, Any]:
             raise ValueError(f"profile lacks K4 work for {label}")
         if role == "candidate" and row["sync_calls"] != row["block_replays"]:
             raise ValueError(f"candidate aggregate mask accounting diverged for {label}")
+        if role == "candidate" and (
+            row["owned_reuse_calls"] != row["reuse_opportunities"]
+        ):
+            raise ValueError(
+                f"candidate aggregate reuse opportunities diverged for {label}"
+            )
     return {
         "schema_version": 1,
         "role": role,
