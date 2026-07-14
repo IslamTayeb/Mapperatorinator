@@ -75,6 +75,7 @@ require_artifacts() {
   local artifact
   for artifact in "$@"; do
     [[ -s "$artifact" ]] || fail "$name did not produce required artifact: $artifact"
+    sha256sum "$artifact" >> "$SUITE_ROOT/child-artifacts.sha256"
   done
 }
 
@@ -82,91 +83,10 @@ classify_gate() {
   local name=$1
   local status=$2
   local report=$3
-
-  "$PYTHON" - "$name" "$status" "$report" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-name, raw_status, raw_report = sys.argv[1:]
-status = int(raw_status)
-report = json.loads(Path(raw_report).read_text(encoding="utf-8"))
-
-def reject(message: str) -> None:
-    raise SystemExit(f"{name} gate classification failed: {message}")
-
-if name == "cross":
-    fp32_checks = [
-        bool(entry.get("checks_pass"))
-        for entry in report.get("variants", {}).values()
-        if entry.get("kv_storage_dtype") == "torch.float32"
-    ]
-    promoted = bool(report.get("summary", {}).get("any_fp32_promotion_pass"))
-    if not fp32_checks or not all(fp32_checks):
-        reject("FP32 correctness checks failed or are missing")
-    if status == 0 and promoted:
-        pass
-    elif status == 3 and not promoted:
-        pass
-    else:
-        reject(f"unexpected exit/promotion pair status={status}, promoted={promoted}")
-elif name == "conditional":
-    if status != 0:
-        reject(f"unexpected exit status {status}")
-    if report.get("decision", {}).get("pass") is not True:
-        reject("CUDA conditional capability decision did not pass")
-elif name == "fp16_split":
-    summary = report.get("summary", {})
-    invariants = summary.get("invariants_pass")
-    sizing = summary.get("sizing_pass")
-    if invariants is not True:
-        reject("FP16 cache, memory, or drift invariants failed")
-    if status == 0 and sizing is True:
-        pass
-    elif status == 3 and sizing is False:
-        pass
-    else:
-        reject(f"unexpected exit/sizing pair status={status}, sizing={sizing}")
-elif name == "int8_mlp":
-    summary = report.get("summary", {})
-    invariants = summary.get("invariants_pass")
-    sizing = summary.get("sizing_pass")
-    if invariants is not True:
-        reject("INT8 invariants failed")
-    if status == 0 and sizing is True:
-        pass
-    elif status == 3 and sizing is False:
-        pass
-    else:
-        reject(f"unexpected exit/sizing pair status={status}, sizing={sizing}")
-elif name == "vocab":
-    if status != 0:
-        reject(f"unexpected exit status {status}")
-    ceiling = report.get("fixed_work_ceiling", {})
-    clears = ceiling.get("main_ceiling_clears_threshold")
-    if not isinstance(clears, bool):
-        reject("fixed-work ceiling decision must be a bool")
-    expected = (
-        "retain_for_candidate_kernel" if clears else "stop_below_main_component_gate"
-    )
-    if report.get("decision") != expected:
-        reject("vocabulary decision is inconsistent with its fixed-work ceiling")
-elif name == "shared_rope":
-    summary = report.get("summary", {})
-    exact = summary.get("exact_pass")
-    accounting = summary.get("rope_call_accounting_pass")
-    promoted = summary.get("promotion_pass")
-    if exact is not True or accounting is not True:
-        reject("shared RoPE exactness or call accounting failed")
-    if status == 0 and promoted is True:
-        pass
-    elif status == 3 and promoted is False:
-        pass
-    else:
-        reject(f"unexpected exit/promotion pair status={status}, promoted={promoted}")
-else:
-    reject("unknown gate")
-PY
+  "$PYTHON" "$LADDER_REPO/utils/classify_500tps_kernel_component_gate.py" \
+    --name "$name" \
+    --status "$status" \
+    --report "$report"
 }
 
 run_gate() {
@@ -198,6 +118,7 @@ run_gate() {
 
 mkdir -p "$WORK/logs"
 mkdir "$SUITE_ROOT"
+: > "$SUITE_ROOT/child-artifacts.sha256"
 
 [[ -x "$PYTHON" ]] || fail "missing environment Python: $PYTHON"
 validate_checkout \

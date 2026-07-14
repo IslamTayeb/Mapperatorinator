@@ -1,6 +1,11 @@
 from pathlib import Path
 import unittest
 
+from utils.classify_500tps_kernel_component_gate import (
+    GateClassificationError,
+    classify_gate,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/dcc/profile_500tps_kernel_component_ladder.sbatch"
@@ -36,19 +41,77 @@ class KernelComponentLadderTest(unittest.TestCase):
         ):
             self.assertIn(artifact, source)
         self.assertIn('require_artifacts "$name" "$report" "$@"', source)
+        self.assertIn('sha256sum "$artifact" >> "$SUITE_ROOT/child-artifacts.sha256"', source)
         self.assertIn('classify_gate "$name" "$status" "$report"', source)
-        self.assertIn('status == 3 and not promoted', source)
-        self.assertIn('status == 3 and sizing is False', source)
-        self.assertIn('if not isinstance(clears, bool):', source)
-        self.assertIn('vocabulary decision is inconsistent', source)
-        self.assertIn('elif name == "shared_rope":', source)
-        self.assertIn('shared RoPE exactness or call accounting failed', source)
+        self.assertIn('classify_500tps_kernel_component_gate.py', source)
         self.assertIn('MAPPERATORINATOR_REMOTE_REF="$remote_ref"', source)
         self.assertIn('#SBATCH --time=02:00:00', source)
         self.assertIn('LADDER_REMOTE_BRANCH=codex/500tps-kernel-component-ladder', source)
         self.assertIn('MAPPERATORINATOR_LADDER_REPO:?', source)
         self.assertIn('MAPPERATORINATOR_LADDER_COMMIT:?', source)
         self.assertNotIn('BASH_SOURCE[0]', source)
+
+    def test_classifier_accepts_promoted_and_valid_negative_results(self) -> None:
+        classify_gate(
+            "cross",
+            0,
+            {
+                "variants": {
+                    "accepted": {
+                        "kv_storage_dtype": "torch.float32",
+                        "checks_pass": True,
+                    }
+                },
+                "summary": {"any_fp32_promotion_pass": True},
+            },
+        )
+        classify_gate(
+            "fp16_split",
+            3,
+            {"summary": {"invariants_pass": True, "sizing_pass": False}},
+        )
+        classify_gate(
+            "shared_rope",
+            3,
+            {
+                "summary": {
+                    "exact_pass": True,
+                    "rope_call_accounting_pass": True,
+                    "promotion_pass": False,
+                }
+            },
+        )
+
+    def test_classifier_rejects_string_booleans_and_exit_mismatches(self) -> None:
+        with self.assertRaisesRegex(GateClassificationError, "JSON boolean"):
+            classify_gate(
+                "cross",
+                0,
+                {
+                    "variants": {
+                        "bad": {
+                            "kv_storage_dtype": "torch.float32",
+                            "checks_pass": "false",
+                        }
+                    },
+                    "summary": {"any_fp32_promotion_pass": True},
+                },
+            )
+        with self.assertRaisesRegex(GateClassificationError, "unexpected exit/sizing"):
+            classify_gate(
+                "int8_mlp",
+                0,
+                {"summary": {"invariants_pass": True, "sizing_pass": False}},
+            )
+        with self.assertRaisesRegex(GateClassificationError, "inconsistent"):
+            classify_gate(
+                "vocab",
+                0,
+                {
+                    "fixed_work_ceiling": {"main_ceiling_clears_threshold": False},
+                    "decision": "retain_for_candidate_kernel",
+                },
+            )
 
 
 if __name__ == "__main__":
