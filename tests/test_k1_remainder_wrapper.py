@@ -1,4 +1,6 @@
 from pathlib import Path
+import subprocess
+import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,3 +41,19 @@ def test_candidate_runner_only_enables_opt_in_remainder_graphs() -> None:
 
     assert "graph_remainders=True" in source
     assert "run_k4_shared_rope_approximate_weight_only import run" in source
+
+
+def test_candidate_runner_is_directly_executable_outside_repo(tmp_path) -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "utils/run_k4_shared_rope_k1_remainder.py"),
+            "--help",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
