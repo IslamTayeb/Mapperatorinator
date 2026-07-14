@@ -174,6 +174,26 @@ def test_cross_wrappers_pin_shared_control_and_one_candidate_mode(
     assert "control unexpectedly contains cross runtime" in general
 
 
+def test_cross_analysis_declares_only_the_selected_cross_dispatch_counter() -> None:
+    source = WRAPPER.read_text(encoding="utf-8")
+    cross_block = source.split(
+        'elif [[ "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then',
+        maxsplit=1,
+    )[1].split(
+        'elif [[ "$REQUIRE_EXACT_TIMING" == true ]]; then',
+        maxsplit=1,
+    )[0]
+
+    assert "ANALYSIS_DISPATCH_ARGS=(" in cross_block
+    assert "fp16_packed_cross_projection_candidate" in cross_block
+    assert "split8_cross_attention_candidate" in cross_block
+    assert "native_cross_mlp_tail_*" not in cross_block
+    assert (
+        "'records.main_generation[[]*].optimized_dispatch_capture_hits'"
+        not in cross_block
+    )
+
+
 @pytest.mark.parametrize(
     "runner",
     (

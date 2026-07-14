@@ -785,6 +785,27 @@ elif [[ "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
     --require-exact-label timing_context
     --require-exact-dispatch-label timing_context
   )
+  ANALYSIS_DISPATCH_ARGS=(
+    --allow-optional-dispatch-delta 'optimized_result_class'
+  )
+  case "$CROSS_CANDIDATE_MODE" in
+    fp16_packed_projections)
+      ANALYSIS_DISPATCH_ARGS+=(
+        --allow-dispatch-delta
+          'records.main_generation[[]*].optimized_dispatch_capture_hits.fp16_packed_cross_projection_candidate'
+      )
+      ;;
+    split8_attention)
+      ANALYSIS_DISPATCH_ARGS+=(
+        --allow-dispatch-delta
+          'records.main_generation[[]*].optimized_dispatch_capture_hits.split8_cross_attention_candidate'
+      )
+      ;;
+    *)
+      echo "cross analysis received unsupported mode: $CROSS_CANDIDATE_MODE" >&2
+      exit 2
+      ;;
+  esac
   if [[ "$CROSS_CANDIDATE_MODE" == split8_attention ]]; then
     ANALYSIS_EXACT_ARGS+=(--require-exact-label main_generation)
   fi
