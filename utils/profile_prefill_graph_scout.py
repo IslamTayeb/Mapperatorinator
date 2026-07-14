@@ -118,6 +118,39 @@ def restore_rng_state(snapshot: RngSnapshot) -> None:
         torch.cuda.set_rng_state_all([state.clone() for state in snapshot.cuda])
 
 
+def load_timing_pair(
+    args: Any,
+    *,
+    loader,
+    needs_separate,
+    main_binding: Any,
+    main_tokenizer: Any,
+) -> tuple[Any | None, Any | None]:
+    """Mirror production timing-model selection without aliasing the main model."""
+
+    if not needs_separate(args):
+        return None, None
+    timing_model, timing_tokenizer = loader(
+        args.model_path,
+        args.train,
+        args.device,
+        max_batch_size=args.max_batch_size,
+        use_server=args.use_server,
+        precision=args.precision,
+        attn_implementation=args.attn_implementation,
+        gamemode=args.gamemode,
+        auto_select_gamemode_model=False,
+        inference_engine=args.inference_engine,
+    )
+    if timing_model is None or timing_tokenizer is None:
+        raise RuntimeError("separate timing loader returned an incomplete model/tokenizer pair")
+    if timing_model is main_binding:
+        raise RuntimeError("separate timing model loader aliased the main model binding")
+    if timing_tokenizer is main_tokenizer:
+        raise RuntimeError("separate timing tokenizer loader aliased the main tokenizer")
+    return timing_model, timing_tokenizer
+
+
 def bucket_prompt_length(length: int, *, bucket_size: int = BUCKET_SIZE) -> int:
     if isinstance(length, bool) or not isinstance(length, int) or length <= 0:
         raise ValueError("prompt length must be a positive integer")
@@ -635,6 +668,8 @@ def _run_song(
     *,
     binding: Any,
     tokenizer: Any,
+    timing_model: Any,
+    timing_tokenizer: Any,
     generation_config: Any,
     beatmap_config: Any,
     output_path: Path,
@@ -670,8 +705,8 @@ def _run_song(
             beatmap_config=beatmap_config,
             model=binding,
             tokenizer=tokenizer,
-            timing_model=binding,
-            timing_tokenizer=tokenizer,
+            timing_model=timing_model,
+            timing_tokenizer=timing_tokenizer,
             verbose=False,
         )
         torch.cuda.synchronize()
@@ -697,6 +732,7 @@ def run(args: Any, *, output_path: Path, warmup: int, iterations: int) -> dict[s
         get_config,
         load_model_with_engine,
         setup_inference_environment,
+        should_load_separate_timing_model,
     )
 
     _assert_scout_args(args)
@@ -719,12 +755,21 @@ def run(args: Any, *, output_path: Path, warmup: int, iterations: int) -> dict[s
         auto_select_gamemode_model=args.auto_select_gamemode_model,
         inference_engine=args.inference_engine,
     )
+    timing_model, timing_tokenizer = load_timing_pair(
+        args,
+        loader=load_model_with_engine,
+        needs_separate=should_load_separate_timing_model,
+        main_binding=binding,
+        main_tokenizer=tokenizer,
+    )
     generation_config, beatmap_config = get_config(args)
     reciprocal_rng = snapshot_rng_state()
     baseline = _run_song(
         args,
         binding=binding,
         tokenizer=tokenizer,
+        timing_model=timing_model,
+        timing_tokenizer=timing_tokenizer,
         generation_config=generation_config,
         beatmap_config=beatmap_config,
         output_path=output_path / "baseline",
@@ -736,6 +781,8 @@ def run(args: Any, *, output_path: Path, warmup: int, iterations: int) -> dict[s
         args,
         binding=binding,
         tokenizer=tokenizer,
+        timing_model=timing_model,
+        timing_tokenizer=timing_tokenizer,
         generation_config=generation_config,
         beatmap_config=beatmap_config,
         output_path=output_path / "capture",

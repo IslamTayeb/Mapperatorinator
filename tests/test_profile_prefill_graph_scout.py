@@ -1,4 +1,5 @@
 from types import MethodType, SimpleNamespace
+from unittest.mock import call
 
 import pytest
 import torch
@@ -11,6 +12,7 @@ from utils.profile_prefill_graph_scout import (
     clone_graph_inputs,
     compare_observations,
     copy_graph_inputs,
+    load_timing_pair,
     prefill_signature,
     Observation,
     restore_rng_state,
@@ -162,3 +164,82 @@ def test_rng_restore_fails_if_cuda_device_inventory_changes(monkeypatch):
 
     with pytest.raises(RuntimeError, match="state count changed"):
         restore_rng_state(snapshot)
+
+
+def _timing_args():
+    return SimpleNamespace(
+        model_path="model-path",
+        train=object(),
+        device="cuda",
+        max_batch_size=1,
+        use_server=False,
+        precision="fp32",
+        attn_implementation="sdpa",
+        gamemode=3,
+        inference_engine="optimized",
+    )
+
+
+def test_timing_pair_loads_distinct_base_model_when_production_requires_it():
+    args = _timing_args()
+    main_binding, main_tokenizer = object(), object()
+    timing_binding, timing_tokenizer = object(), object()
+    calls = []
+
+    def loader(*positional, **kwargs):
+        calls.append(call(*positional, **kwargs))
+        return timing_binding, timing_tokenizer
+
+    actual = load_timing_pair(
+        args,
+        loader=loader,
+        needs_separate=lambda value: value is args,
+        main_binding=main_binding,
+        main_tokenizer=main_tokenizer,
+    )
+
+    assert actual == (timing_binding, timing_tokenizer)
+    assert calls == [
+        call(
+            "model-path",
+            args.train,
+            "cuda",
+            max_batch_size=1,
+            use_server=False,
+            precision="fp32",
+            attn_implementation="sdpa",
+            gamemode=3,
+            auto_select_gamemode_model=False,
+            inference_engine="optimized",
+        )
+    ]
+
+
+def test_timing_pair_stays_unset_when_production_shares_the_main_model():
+    def unexpected_loader(*args, **kwargs):
+        raise AssertionError("shared timing selection must not load another model")
+
+    assert load_timing_pair(
+        _timing_args(),
+        loader=unexpected_loader,
+        needs_separate=lambda args: False,
+        main_binding=object(),
+        main_tokenizer=object(),
+    ) == (None, None)
+
+
+@pytest.mark.parametrize("alias", ["model", "tokenizer"])
+def test_timing_pair_rejects_aliases(alias):
+    args = _timing_args()
+    main_binding, main_tokenizer = object(), object()
+    timing_binding = main_binding if alias == "model" else object()
+    timing_tokenizer = main_tokenizer if alias == "tokenizer" else object()
+
+    with pytest.raises(RuntimeError, match=f"aliased the main {alias}"):
+        load_timing_pair(
+            args,
+            loader=lambda *args, **kwargs: (timing_binding, timing_tokenizer),
+            needs_separate=lambda args: True,
+            main_binding=main_binding,
+            main_tokenizer=main_tokenizer,
+        )
