@@ -29,11 +29,6 @@ try:
         _profile_precision,
         summarize_osu_structure,
     )
-    from utils.summarize_complete_request_wall import (
-        ALL_SUPPORTED_STAGE_NAMES,
-        FINAL_WRITE_STAGES,
-        GROUP_STAGE_NAMES,
-    )
 except ModuleNotFoundError:  # Direct ``python utils/...py`` execution.
     from nsight_agent_profile import (  # type: ignore[no-redef]
         PROFILE_GRAPH_CACHE_RECORD_KEYS,
@@ -45,15 +40,49 @@ except ModuleNotFoundError:  # Direct ``python utils/...py`` execution.
         _profile_precision,
         summarize_osu_structure,
     )
-    from summarize_complete_request_wall import (  # type: ignore[no-redef]
-        ALL_SUPPORTED_STAGE_NAMES,
-        FINAL_WRITE_STAGES,
-        GROUP_STAGE_NAMES,
-    )
 
 
 SCHEMA_VERSION = "mapperatorinator.reciprocal-full-song-candidate.v1"
 PROFILE_SCHEMA_VERSION = 1
+FINAL_WRITE_STAGES = frozenset({"write_osu", "write_osz"})
+GROUP_STAGE_NAMES = {
+    "pre_request_setup_load": frozenset(
+        {
+            "compile_args",
+            "setup_inference_environment",
+            "load_main_model",
+            "load_timing_model",
+            "load_diffusion_model",
+            "build_generation_config",
+        }
+    ),
+    "request_setup": frozenset({"validate_inputs", "setup_processors"}),
+    "audio_preparation": frozenset({"audio_load", "audio_segment"}),
+    "timing_generation": frozenset(
+        {
+            "super_timing_generation",
+            "timing_context_generation",
+            "load_reference_timing",
+        }
+    ),
+    "timing_postprocess": frozenset(
+        {"super_timing_postprocess", "timing_context_postprocess"}
+    ),
+    "main_generation": frozenset({"main_generation"}),
+    "merge_resnap_postprocess_write": frozenset(
+        {
+            "merge_generated_events",
+            "derive_timing_from_generated_events",
+            "resnap_events",
+            "diffusion_position_generation",
+            "postprocess_generate_osu",
+            "merge_with_reference_beatmap",
+            "write_osu",
+            "write_osz",
+        }
+    ),
+}
+ALL_SUPPORTED_STAGE_NAMES = frozenset().union(*GROUP_STAGE_NAMES.values())
 RUN_ORDER = (
     "baseline_first",
     "candidate_first",
