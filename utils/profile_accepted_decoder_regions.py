@@ -17,7 +17,7 @@ import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -42,6 +42,7 @@ SCHEMA_VERSION = 1
 REQUIRED_HEADROOM_SECONDS = 1.412
 GRAPH_WARMUP = 100
 GRAPH_ITERATIONS = 1_000
+MAX_RECIPROCAL_GRAPH_DRIFT_PCT = 5.0
 REGIONS = (
     "self_norm_qkv",
     "fused_self_attention",
@@ -56,6 +57,8 @@ REGIONS = (
 _ATTENTION_SUFFIXES = {
     ".self.qkv_proj": "self_norm_qkv",
     ".self.rope": "fused_self_attention",
+    ".self.cache_update": "fused_self_attention",
+    ".self.sdpa": "fused_self_attention",
     ".self.rope_cache_native_q1": "fused_self_attention",
     ".self.out_proj": "self_out_residual",
     ".cross.q_proj": "cross_norm_q",
@@ -64,11 +67,15 @@ _ATTENTION_SUFFIXES = {
 }
 _DECODER_LAYER_SUFFIXES = {
     ".self_attn_norm": "self_norm_qkv",
+    ".self.residual": "self_out_residual",
     ".cross_attn_norm": "cross_norm_q",
+    ".cross.residual": "cross_out_residual",
     ".mlp_norm": "mlp",
     ".mlp.fc1": "mlp",
     ".mlp.activation": "mlp",
+    ".mlp.activation_dropout": "mlp",
     ".mlp.fc2": "mlp",
+    ".mlp.output_dropout_residual": "mlp",
 }
 _FINAL_MARKERS = {
     "decoder.final_norm": "final_norm_logits",
@@ -180,6 +187,7 @@ def _profile_bucket(
     warmup: int,
     iterations: int,
     trace_path: Path | None,
+    context_factory: Callable[[int, bool], Any] = _accepted_context,
 ) -> dict[str, Any]:
     if warmup < 1 or iterations < 1:
         raise ValueError("warmup and iterations must be positive")
@@ -190,14 +198,14 @@ def _profile_bucket(
     snapshots = _all_cache_snapshots(cache, cache_position)
 
     _restore_and_synchronize(cache, snapshots)
-    production_graph = _time_graph(
+    production_graph_before = _time_graph(
         accepted_graph,
         warmup=GRAPH_WARMUP,
         iters=GRAPH_ITERATIONS,
     )
     _restore_and_synchronize(cache, snapshots)
 
-    with _accepted_context(prefix, detail_ranges=False):
+    with context_factory(prefix, detail_ranges=False):
         for _ in range(warmup):
             _restore_and_synchronize(cache, snapshots)
             model(**static_inputs, return_dict=True)
@@ -208,7 +216,7 @@ def _profile_bucket(
         torch.profiler.ProfilerActivity.CPU,
         torch.profiler.ProfilerActivity.CUDA,
     ]
-    with _accepted_context(prefix, detail_ranges=True):
+    with context_factory(prefix, detail_ranges=True):
         with torch.profiler.profile(
             activities=activities,
             record_shapes=True,
@@ -234,8 +242,32 @@ def _profile_bucket(
         profiler.key_averages(),
         iterations=iterations,
     )
+    _restore_and_synchronize(cache, snapshots)
+    production_graph_after = _time_graph(
+        accepted_graph,
+        warmup=GRAPH_WARMUP,
+        iters=GRAPH_ITERATIONS,
+    )
+    _restore_and_synchronize(cache, snapshots)
     event_mean = sum(elapsed_ms) / len(elapsed_ms)
     assigned = sum(regions_ms.values())
+    production_graph = max(
+        (production_graph_before, production_graph_after),
+        key=lambda value: float(value["ms_per_call"]),
+    )
+    if not all(
+        bool(value.get("memory_stable"))
+        for value in (production_graph_before, production_graph_after)
+    ):
+        raise RuntimeError("reciprocal production graph timing changed GPU allocation")
+    before_ms = float(production_graph_before["ms_per_call"])
+    after_ms = float(production_graph_after["ms_per_call"])
+    reciprocal_drift_pct = abs(before_ms - after_ms) / min(before_ms, after_ms) * 100.0
+    if reciprocal_drift_pct > MAX_RECIPROCAL_GRAPH_DRIFT_PCT:
+        raise RuntimeError(
+            "reciprocal production graph timing drifted by "
+            f"{reciprocal_drift_pct:.3f}% (limit {MAX_RECIPROCAL_GRAPH_DRIFT_PCT:.3f}%)"
+        )
     production_graph_ms = float(production_graph["ms_per_call"])
     calibration_scale = production_graph_ms / event_mean
     calibrated_regions = {
@@ -244,6 +276,17 @@ def _profile_bucket(
     return {
         "production_graph_ms_per_call": production_graph_ms,
         "production_graph_timing": production_graph,
+        "production_graph_timing_reciprocal": {
+            "before": production_graph_before,
+            "after": production_graph_after,
+            "selected": (
+                "before"
+                if production_graph is production_graph_before
+                else "after"
+            ),
+            "drift_pct": reciprocal_drift_pct,
+            "maximum_drift_pct": MAX_RECIPROCAL_GRAPH_DRIFT_PCT,
+        },
         "cuda_event_ms_per_call": {
             "mean": event_mean,
             "minimum": min(elapsed_ms),
@@ -258,14 +301,14 @@ def _profile_bucket(
         "raw_detail_range_device_us_total": raw_marker_us,
         "range_coverage": {
             "self_out_residual": (
-                "named range covers self out projection; residual add is in unattributed time"
+                "named ranges cover self out projection and residual add"
             ),
             "cross_out_residual": (
-                "named range covers cross out projection; residual add is in unattributed time"
+                "named ranges cover cross out projection and residual add"
             ),
             "mlp": (
-                "named ranges cover norm/fc1/activation/fc2; dropout and residual add are "
-                "in unattributed time"
+                "named ranges cover norm, fc1, activation, activation dropout, fc2, "
+                "output dropout, and residual add"
             ),
         },
     }

@@ -1009,6 +1009,8 @@ def test_semantic_nvtx_views_do_not_claim_graph_replay_attribution(tmp_path):
         [
             [60, 60, 3, 20, 10, 30, "mapperatorinator.generation.sampling"],
             [40, 40, 2, 20, 15, 25, "mapperatorinator.decoder.layer0.self_attn_norm"],
+            [30, 30, 2, 15, 10, 20, "mapperatorinator.decoder.layer0.self.residual"],
+            [20, 20, 2, 10, 5, 15, "mapperatorinator.decoder.layer0.cross.residual"],
         ],
     )
 
@@ -1018,6 +1020,8 @@ def test_semantic_nvtx_views_do_not_claim_graph_replay_attribution(tmp_path):
     assert view["nested_ranges_may_overlap"]
     assert view["generation_regions"]["sampling"]["calls"] == 3
     assert view["decoder_regions"]["self_norm_qkv"][0]["total_ns"] == 40
+    assert view["decoder_regions"]["self_out_residual"][0]["total_ns"] == 30
+    assert view["decoder_regions"]["cross_out_residual"][0]["total_ns"] == 20
 
 
 def test_extract_sqlite_requires_current_columns_and_unique_stage_ranges(tmp_path):

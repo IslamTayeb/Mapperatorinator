@@ -834,7 +834,7 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
             )
         hidden_states = self_attn_outputs[0]
         if profile_ranges:
-            with profile_range(f"{layer_name}.self_attn_out_residual"):
+            with profile_range(f"{layer_name}.self.residual"):
                 hidden_states = residual + hidden_states
         else:
             hidden_states = residual + hidden_states
@@ -893,7 +893,7 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
                 )
             hidden_states = cross_attn_outputs[0]
             if profile_ranges:
-                with profile_range(f"{layer_name}.cross_attn_out_residual"):
+                with profile_range(f"{layer_name}.cross.residual"):
                     hidden_states = residual + hidden_states
             else:
                 hidden_states = residual + hidden_states
@@ -915,17 +915,38 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
                 hidden_states = self.activation_fn(hidden_states)
         else:
             hidden_states = self.activation_fn(hidden_states)
-        hidden_states = nn.functional.dropout(hidden_states, p=self.activation_dropout, training=self.training)
+        if profile_ranges:
+            with profile_range(f"{layer_name}.mlp.activation_dropout"):
+                hidden_states = nn.functional.dropout(
+                    hidden_states,
+                    p=self.activation_dropout,
+                    training=self.training,
+                )
+        else:
+            hidden_states = nn.functional.dropout(
+                hidden_states,
+                p=self.activation_dropout,
+                training=self.training,
+            )
         if profile_ranges:
             with profile_range(f"{layer_name}.mlp.fc2"):
                 hidden_states = self.fc2(hidden_states)
         else:
             hidden_states = self.fc2(hidden_states)
-        hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         if profile_ranges:
-            with profile_range(f"{layer_name}.mlp.out_residual"):
+            with profile_range(f"{layer_name}.mlp.output_dropout_residual"):
+                hidden_states = nn.functional.dropout(
+                    hidden_states,
+                    p=self.dropout,
+                    training=self.training,
+                )
                 hidden_states = residual + hidden_states
         else:
+            hidden_states = nn.functional.dropout(
+                hidden_states,
+                p=self.dropout,
+                training=self.training,
+            )
             hidden_states = residual + hidden_states
 
         outputs = (hidden_states,) + self_attn_outputs[1:] + cross_attn_outputs[1:]

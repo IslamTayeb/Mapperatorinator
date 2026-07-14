@@ -380,7 +380,14 @@ def compare_exact(reference: dict[str, Any], candidate: dict[str, Any]) -> dict[
 
 
 @torch.no_grad()
-def profile(args, *, mode: str, batch_size: int, seed: int) -> dict[str, Any]:
+def profile(
+    args,
+    *,
+    mode: str,
+    batch_size: int,
+    seed: int,
+    artifacts: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if not torch.cuda.is_available():
         raise RuntimeError("batched super-timing profiling requires CUDA")
     _assert_args(args, batch_size=batch_size, mode=mode)
@@ -610,6 +617,16 @@ def profile(args, *, mode: str, batch_size: int, seed: int) -> dict[str, Any]:
         },
     }
     report["gates"]["pass"] = all(report["gates"].values())
+    if artifacts is not None:
+        artifacts.clear()
+        artifacts.update(
+            model=model,
+            bound_model=bound_model,
+            runtime=runtime,
+            profiler=profiler,
+            generator=generator,
+            report=report,
+        )
     return report
 
 

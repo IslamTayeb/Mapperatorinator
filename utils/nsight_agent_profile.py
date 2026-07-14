@@ -867,10 +867,16 @@ def _semantic_nvtx_views(report: Mapping[str, Any]) -> dict[str, Any]:
     decoder_patterns = (
         ("self_norm_qkv", r"\.self_attn_norm$|\.self\.qkv_proj$"),
         ("fused_self_attention", r"\.self_attn$|\.self\.rope_cache_native_q1$"),
-        ("self_out_residual", r"\.self\.out_proj$|\.self_attn_out_residual$"),
+        (
+            "self_out_residual",
+            r"\.self\.out_proj$|\.self\.residual$|\.self_attn_out_residual$",
+        ),
         ("cross_norm_q", r"\.cross_attn_norm$|\.cross\.q_proj$|\.cross_q$"),
         ("q1_bmm_cross", r"\.cross\.sdpa$|\.cross_bmm$"),
-        ("cross_out_residual", r"\.cross\.out_proj$|\.cross_attn_out_residual$|\.cross_out$"),
+        (
+            "cross_out_residual",
+            r"\.cross\.out_proj$|\.cross\.residual$|\.cross_attn_out_residual$|\.cross_out$",
+        ),
         ("mlp", r"\.mlp(?:\.|$)|\.mlp_norm$|\.native_cross_mlp_tail\.mlp$"),
         ("final_norm_logits", r"decoder\.final_norm$|decoder\.output_projection$"),
     )
