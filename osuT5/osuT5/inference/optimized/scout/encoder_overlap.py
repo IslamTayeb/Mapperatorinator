@@ -2,29 +2,80 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 import torch
 from transformers.modeling_outputs import BaseModelOutput
 
-from .encoder_store import (
-    ENCODER_CONDITIONING_KEYS,
-    SUPPORTED_LABELS,
-    _conditioning_digest,
-    _tensor_contract,
-    _window_conditioning,
-)
-
-
 OVERLAP_VERSION = "exact-b1-main-encoder-overlap-v1"
+MATERIAL_AUDIT_VERSION = "encoder-cross-kv-material-audit-v1"
+SUPPORTED_LABELS = ("timing_context", "main_generation")
+ENCODER_CONDITIONING_KEYS = (
+    "beatmap_idx",
+    "difficulty",
+    "mapper_idx",
+    "song_position",
+)
 
 
 class EncoderOverlapError(RuntimeError):
     pass
+
+
+def _conditioning_digest(rows: Sequence[dict[str, torch.Tensor]]) -> str:
+    digest = hashlib.sha256()
+    for index, row in enumerate(rows):
+        digest.update(str(index).encode("ascii"))
+        for key in sorted(row):
+            value = row[key].detach().contiguous().cpu()
+            digest.update(key.encode("utf-8"))
+            digest.update(str(value.dtype).encode("ascii"))
+            digest.update(str(tuple(value.shape)).encode("ascii"))
+            digest.update(value.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _window_conditioning(
+    processor: Any,
+    generation_config: Any,
+    frame_times: torch.Tensor,
+    song_length_ms: float,
+) -> list[dict[str, torch.Tensor]]:
+    static = processor._get_model_cond_kwargs(generation_config)
+    unsupported = sorted(set(static) - set(ENCODER_CONDITIONING_KEYS))
+    if unsupported:
+        raise EncoderOverlapError(
+            f"encoder overlap does not own conditioning keys {unsupported}"
+        )
+    rows: list[dict[str, torch.Tensor]] = []
+    for raw_time in frame_times:
+        frame_time = float(raw_time.item())
+        row = {key: value.detach().clone() for key, value in static.items()}
+        if processor.do_song_position_embed:
+            row["song_position"] = torch.tensor(
+                [[
+                    frame_time / song_length_ms,
+                    (frame_time + processor.miliseconds_per_sequence)
+                    / song_length_ms,
+                ]],
+                dtype=torch.float32,
+            )
+        rows.append(row)
+    return rows
+
+
+def _tensor_contract(value: torch.Tensor) -> dict[str, Any]:
+    return {
+        "shape": list(value.shape),
+        "stride": list(value.stride()),
+        "dtype": str(value.dtype),
+        "device": str(value.device),
+    }
 
 
 def _conditioning_equal(
@@ -558,6 +609,213 @@ class ExactMainEncoderOverlap:
             self._stream.synchronize()
 
 
+def _tensor_material(value: torch.Tensor, *, name: str) -> tuple[dict[str, Any], int]:
+    if not isinstance(value, torch.Tensor):
+        raise EncoderOverlapError(f"{name} must be a tensor")
+    if not value.is_floating_point() or not bool(torch.isfinite(value).all().item()):
+        raise EncoderOverlapError(f"{name} must be finite floating-point material")
+    contiguous = value.detach().contiguous().cpu()
+    raw = contiguous.view(torch.uint8).numpy().tobytes()
+    return (
+        {
+            "name": name,
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "contract": _tensor_contract(value),
+            "bytes": len(raw),
+        },
+        len(raw),
+    )
+
+
+def _rng_material() -> dict[str, str]:
+    result = {
+        "cpu": hashlib.sha256(
+            torch.get_rng_state().contiguous().numpy().tobytes()
+        ).hexdigest()
+    }
+    if torch.cuda.is_available():
+        result["cuda"] = hashlib.sha256(
+            torch.cuda.get_rng_state().contiguous().cpu().numpy().tobytes()
+        ).hexdigest()
+    return result
+
+
+@dataclass
+class EncoderMaterialAudit:
+    """Capture exact last-window encoder and cross-KV bytes for both arms."""
+
+    _processors: list[Any] = field(default_factory=list, init=False, repr=False)
+    _labels: list[str] = field(default_factory=list, init=False, repr=False)
+    _stages: dict[str, dict[str, Any]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+
+    def register_processor(self, processor: Any) -> None:
+        if processor in self._processors:
+            raise EncoderOverlapError("material-audit processor registered twice")
+        if len(self._processors) >= 2:
+            raise EncoderOverlapError("material audit supports exactly two processors")
+        self._processors.append(processor)
+
+    def capture(self, processor: Any, *, profile_label: str) -> None:
+        expected = SUPPORTED_LABELS[len(self._labels)] if len(self._labels) < 2 else None
+        if profile_label != expected:
+            raise EncoderOverlapError(
+                f"material audit expected {expected!r}, got {profile_label!r}"
+            )
+        if processor not in self._processors:
+            raise EncoderOverlapError("material audit saw an unregistered processor")
+        if profile_label == "timing_context":
+            self._labels.append(profile_label)
+            self._stages[profile_label] = {
+                "profile_label": profile_label,
+                "captured": False,
+                "reason": "avoid_synchronizing_main_encoder_overlap_stream",
+                "copied_bytes": 0,
+                "copy_and_hash_seconds": 0.0,
+            }
+            profiler = getattr(processor, "profiler", None)
+            set_metadata = getattr(profiler, "set_metadata", None)
+            if callable(set_metadata):
+                set_metadata(optimized_encoder_material_audit=self.evidence())
+            return
+        state = getattr(processor, "decode_session_state", None)
+        signature = getattr(state, "active_state_signature", None)
+        if signature is None:
+            raise EncoderOverlapError("material audit lacks an active decode signature")
+        holders = getattr(state, "stable_encoder_holders", None)
+        caches = getattr(state, "caches", None)
+        if not isinstance(holders, dict) or not isinstance(caches, dict):
+            raise EncoderOverlapError("material audit lacks stable encoder/cache state")
+        holder = holders.get(signature)
+        cache = caches.get(signature)
+        encoder_outputs = holder.get("encoder_outputs") if isinstance(holder, dict) else None
+        encoder_hidden = getattr(encoder_outputs, "last_hidden_state", None)
+        cross = getattr(cache, "cross_attention_cache", None)
+        layers = getattr(cross, "layers", None)
+        if not isinstance(encoder_hidden, torch.Tensor):
+            raise EncoderOverlapError("material audit lacks raw encoder output")
+        if not isinstance(layers, (list, tuple)) or not layers:
+            raise EncoderOverlapError("material audit lacks cross-attention cache layers")
+        if not all(bool(getattr(layer, "is_initialized", False)) for layer in layers):
+            raise EncoderOverlapError("material audit found uninitialized cross cache")
+        updated = getattr(cache, "is_updated", None)
+        if not isinstance(updated, dict) or not all(
+            bool(updated.get(index)) for index in range(len(layers))
+        ):
+            raise EncoderOverlapError("material audit found incomplete cross-cache ownership")
+
+        torch.cuda.synchronize(processor.model.device)
+        started = time.perf_counter()
+        encoder, copied_bytes = _tensor_material(
+            encoder_hidden,
+            name="encoder.last_hidden_state",
+        )
+        cross_rows: list[dict[str, Any]] = []
+        for index, layer in enumerate(layers):
+            keys, key_bytes = _tensor_material(
+                getattr(layer, "keys", None),
+                name=f"cross.layers.{index}.keys",
+            )
+            values, value_bytes = _tensor_material(
+                getattr(layer, "values", None),
+                name=f"cross.layers.{index}.values",
+            )
+            copied_bytes += key_bytes + value_bytes
+            cross_rows.append({"layer": index, "keys": keys, "values": values})
+        torch.cuda.synchronize(processor.model.device)
+        copy_seconds = time.perf_counter() - started
+        aggregate = hashlib.sha256()
+        aggregate.update(encoder["sha256"].encode("ascii"))
+        for row in cross_rows:
+            aggregate.update(row["keys"]["sha256"].encode("ascii"))
+            aggregate.update(row["values"]["sha256"].encode("ascii"))
+        stage = {
+            "profile_label": profile_label,
+            "captured": True,
+            "encoder": encoder,
+            "cross_kv": cross_rows,
+            "aggregate_sha256": aggregate.hexdigest(),
+            "copied_bytes": copied_bytes,
+            "copy_and_hash_seconds": copy_seconds,
+            "rng_after_stage": _rng_material(),
+            "cross_layer_count": len(cross_rows),
+        }
+        self._labels.append(profile_label)
+        self._stages[profile_label] = stage
+        profiler = getattr(processor, "profiler", None)
+        set_metadata = getattr(profiler, "set_metadata", None)
+        if callable(set_metadata):
+            set_metadata(optimized_encoder_material_audit=self.evidence())
+
+    def evidence(self) -> dict[str, Any]:
+        return {
+            "version": MATERIAL_AUDIT_VERSION,
+            "production_default": False,
+            "labels_completed": list(self._labels),
+            "processor_count": len(self._processors),
+            "stages": self._stages,
+            "total_copied_bytes": sum(
+                int(stage["copied_bytes"]) for stage in self._stages.values()
+            ),
+            "total_copy_and_hash_seconds": sum(
+                float(stage["copy_and_hash_seconds"])
+                for stage in self._stages.values()
+            ),
+        }
+
+    def finalize(self) -> dict[str, Any]:
+        if tuple(self._labels) != SUPPORTED_LABELS or len(self._processors) != 2:
+            raise EncoderOverlapError(
+                "material audit requires two processors and timing/main completion"
+            )
+        result = self.evidence()
+        for label in SUPPORTED_LABELS:
+            stage = result["stages"].get(label)
+            if not isinstance(stage, dict):
+                raise EncoderOverlapError(f"material audit lacks {label} evidence")
+        if result["stages"]["timing_context"] != {
+            "profile_label": "timing_context",
+            "captured": False,
+            "reason": "avoid_synchronizing_main_encoder_overlap_stream",
+            "copied_bytes": 0,
+            "copy_and_hash_seconds": 0.0,
+        }:
+            raise EncoderOverlapError("timing material audit unexpectedly synchronized")
+        if result["stages"]["main_generation"].get("cross_layer_count", 0) <= 0:
+            raise EncoderOverlapError("material audit lacks main raw material")
+        return result
+
+
+@contextmanager
+def install_encoder_material_audit(
+    processor_class: type,
+) -> Iterator[EncoderMaterialAudit]:
+    audit = EncoderMaterialAudit()
+    original_init = processor_class.__init__
+    original_generate = processor_class.generate
+
+    def init_with_audit(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        audit.register_processor(self)
+
+    def generate_with_audit(self, *args, **kwargs):
+        profile_label = kwargs.get("profile_label")
+        result = original_generate(self, *args, **kwargs)
+        audit.capture(self, profile_label=profile_label)
+        return result
+
+    processor_class.__init__ = init_with_audit
+    processor_class.generate = generate_with_audit
+    try:
+        yield audit
+    finally:
+        processor_class.__init__ = original_init
+        processor_class.generate = original_generate
+
+
 @contextmanager
 def install_exact_main_encoder_overlap(
     processor_class: type,
@@ -617,9 +875,12 @@ def install_exact_main_encoder_overlap(
 
 
 __all__ = [
+    "EncoderMaterialAudit",
     "EncoderOverlapError",
     "ExactMainEncoderOverlap",
+    "MATERIAL_AUDIT_VERSION",
     "OVERLAP_VERSION",
     "graph_manifest",
+    "install_encoder_material_audit",
     "install_exact_main_encoder_overlap",
 ]
