@@ -76,6 +76,13 @@ export TORCH_CUDA_ARCH_LIST=7.5
 export TMPDIR="$WORK/tmp"
 export TOKENIZERS_PARALLELISM=false
 export PYTHONHASHSEED=0
+CUDA_LAUNCH_BLOCKING_VALUE=${MAPPERATORINATOR_CUDA_LAUNCH_BLOCKING:-0}
+if [[ "$CUDA_LAUNCH_BLOCKING_VALUE" != "0" && "$CUDA_LAUNCH_BLOCKING_VALUE" != "1" ]]; then
+  echo "MAPPERATORINATOR_CUDA_LAUNCH_BLOCKING must be 0 or 1" >&2
+  exit 2
+fi
+export CUDA_LAUNCH_BLOCKING="$CUDA_LAUNCH_BLOCKING_VALUE"
+export TORCH_SHOW_CPP_STACKTRACES=1
 
 GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1)
 if [[ "$GPU_NAME" != "NVIDIA GeForce RTX 2080 Ti" ]]; then
@@ -94,6 +101,7 @@ echo "audio=$AUDIO"
 echo "run_root=$RUN_ROOT"
 echo "ffmpeg=$(command -v ffmpeg)"
 echo "ffprobe=$(command -v ffprobe)"
+echo "cuda_launch_blocking=$CUDA_LAUNCH_BLOCKING"
 if [[ -n "${SLURM_JOB_ID:-}" ]]; then
   scontrol show job -o "$SLURM_JOB_ID"
 fi
