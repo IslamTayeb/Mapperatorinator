@@ -26,15 +26,21 @@ def run(
     output_init_json: Path,
     output_extension_json: Path | None = None,
 ) -> None:
-    run_combined(
-        config_name,
-        overrides,
-        output_init_json,
-        output_extension_json,
-        graph_remainders=True,
-        weight_runner=run_int8_weight_only,
-        composition_version=COMPOSITION_VERSION,
-    )
+    kwargs = {
+        "graph_remainders": True,
+        "weight_runner": run_int8_weight_only,
+        "composition_version": COMPOSITION_VERSION,
+    }
+    if output_extension_json is None:
+        run_combined(config_name, overrides, output_init_json, **kwargs)
+    else:
+        run_combined(
+            config_name,
+            overrides,
+            output_init_json,
+            output_extension_json,
+            **kwargs,
+        )
 
 
 def main() -> None:

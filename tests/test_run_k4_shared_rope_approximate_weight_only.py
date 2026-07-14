@@ -278,6 +278,38 @@ def test_k1_int8_runner_composes_graph_remainders_with_one_overlay(
     ]
 
 
+def test_k1_int8_runner_threads_explicit_extension_evidence(monkeypatch, tmp_path) -> None:
+    calls = []
+
+    def fake_combined(config_name, overrides, output, extension_output, **kwargs):
+        calls.append((config_name, list(overrides), output, extension_output, kwargs))
+
+    monkeypatch.setattr(k1_int8_combined, "run_combined", fake_combined)
+    output = tmp_path / "init.json"
+    extension_output = tmp_path / "extensions.json"
+
+    k1_int8_combined.run(
+        "profile_salvalai",
+        ["seed=12345"],
+        output,
+        extension_output,
+    )
+
+    assert calls == [
+        (
+            "profile_salvalai",
+            ["seed=12345"],
+            output,
+            extension_output,
+            {
+                "graph_remainders": True,
+                "weight_runner": k1_int8_combined.run_int8_weight_only,
+                "composition_version": k1_int8_combined.COMPOSITION_VERSION,
+            },
+        )
+    ]
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     (
