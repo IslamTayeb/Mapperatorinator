@@ -12,6 +12,7 @@ from utils.profile_device_resident_tail import (
     PROMOTION_SAVING_SECONDS,
     _RawTailCapture,
     _bucketed_prefix,
+    _mutable_tensor_templates,
     summarize,
 )
 
@@ -76,6 +77,22 @@ def test_raw_capture_is_transparent_and_retains_one_contiguous_block() -> None:
         "_OffsetProcessor"
     ]
     assert capture not in anchor.logits_processors
+
+
+def test_mutable_tensor_templates_cover_nested_state_and_restore_in_place() -> None:
+    first = torch.tensor([1.0])
+    second = torch.tensor([2.0])
+    root = SimpleNamespace(state={"first": first, "nested": [second, first]})
+
+    templates = _mutable_tensor_templates(root)
+    first.add_(10)
+    second.mul_(10)
+    for tensor, template in templates:
+        tensor.copy_(template)
+
+    assert first.tolist() == [1.0]
+    assert second.tolist() == [2.0]
+    assert len(templates) == 2
 
 
 def test_summary_charges_only_live_coverage_and_clears_gate() -> None:

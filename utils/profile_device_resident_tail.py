@@ -96,6 +96,37 @@ def _clone_processor_list(processors) -> LogitsProcessorList:
     return LogitsProcessorList(copy.deepcopy(list(processors)))
 
 
+def _mutable_tensor_templates(root: Any) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Snapshot tensor-backed processor state for deterministic graph replay."""
+
+    templates: list[tuple[torch.Tensor, torch.Tensor]] = []
+    visited: set[int] = set()
+
+    def visit(value: Any) -> None:
+        identity = id(value)
+        if identity in visited:
+            return
+        visited.add(identity)
+        if isinstance(value, torch.Tensor):
+            templates.append((value, value.detach().clone()))
+            return
+        if isinstance(value, dict):
+            for item in value.values():
+                visit(item)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                visit(item)
+            return
+        attributes = getattr(value, "__dict__", None)
+        if isinstance(attributes, dict):
+            for item in attributes.values():
+                visit(item)
+
+    visit(root)
+    return templates
+
+
 @dataclass(slots=True)
 class TailAnchor:
     prefix: int
@@ -248,6 +279,7 @@ def _capture_candidate_graph(
     state = _new_device_state(anchor, block_size)
     processors = _clone_processor_list(anchor.logits_processors)
     criteria = copy.deepcopy(anchor.stopping_criteria)
+    mutable_templates = _mutable_tensor_templates((processors, criteria))
     template = {
         "sequence": state.sequence.detach().clone(),
         "physical_length": state.physical_length.detach().clone(),
@@ -260,6 +292,8 @@ def _capture_candidate_graph(
         state.physical_length.copy_(template["physical_length"])
         state.logical_length.copy_(template["logical_length"])
         state.unfinished.copy_(template["unfinished"])
+        for tensor, tensor_template in mutable_templates:
+            tensor.copy_(tensor_template)
         return fixed_block_tail(
             state=state,
             start_length=int(anchor.input_ids.shape[1]),
