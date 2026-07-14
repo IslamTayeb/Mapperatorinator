@@ -861,6 +861,7 @@ def k8_active_prefix_decode_generate(
     state = slot.state
     processor = slot.processor
     graph_cache = shared_graph_cache if shared_graph_cache is not None else {}
+    prompt_length = int(cur_len)
     stats = {
         "k8_candidate": True,
         "window_serial": int(
@@ -875,8 +876,12 @@ def k8_active_prefix_decode_generate(
         "copy_bytes": 0,
         "capture_seconds": 0.0,
         "peak_vram_bytes": 0,
+        "physical_steps": 0,
+        "logical_steps": 0,
         "wasted_steps": 0,
         "rng_policy": RNG_POLICY,
+        "rng_exact": False,
+        "rng_drift": "documented_counter_based_per_window",
         "parent_backend": "cuda_python_child_graphs",
     }
     stable_encoder_holder["__k8_window_serial__"] = stats["window_serial"]
@@ -1008,6 +1013,10 @@ def k8_active_prefix_decode_generate(
         _sync_model_kwargs_after_k8(model_kwargs, entry, cur_len=cur_len)
         finished = not unfinished
 
+    stats["logical_steps"] = cur_len - prompt_length
+    stats["physical_steps"] = stats["logical_steps"] + stats["wasted_steps"]
+    if stats["physical_steps"] - stats["logical_steps"] != stats["wasted_steps"]:
+        raise RuntimeError("K8 physical/logical/wasted step accounting diverged")
     return state.sequence[:, :cur_len]
 
 
