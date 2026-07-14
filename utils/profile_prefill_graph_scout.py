@@ -653,6 +653,7 @@ def _run_song(
     }
 
 
+@torch.no_grad()
 def run(args: Any, *, output_path: Path, warmup: int, iterations: int) -> dict[str, Any]:
     from inference import (
         compile_args,
@@ -709,6 +710,8 @@ def run(args: Any, *, output_path: Path, warmup: int, iterations: int) -> dict[s
     captured_bytes = Path(captured["result_path"]).read_bytes()
     if baseline_bytes != captured_bytes:
         raise RuntimeError("prefill capture changed the accepted final .osu bytes")
+    gc.collect()
+    torch.cuda.empty_cache()
     fp32_model = captured["model"]
     if fp32_model.dtype != torch.float32:
         raise TypeError(f"accepted source model must be FP32, got {fp32_model.dtype}")
