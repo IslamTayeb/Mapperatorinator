@@ -452,16 +452,19 @@ def test_capture_uses_state_device_guard_and_closes_parent_on_late_failure(
             self.close_calls += 1
 
     parent = Parent()
+    synchronize_calls = []
+
+    def synchronize(device):
+        synchronize_calls.append(torch.device(device))
+        if len(synchronize_calls) == 3:
+            raise RuntimeError("late failure")
+
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "device", device_guard)
     monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda device: None)
     monkeypatch.setattr(torch.cuda, "CUDAGraph", Graph)
     monkeypatch.setattr(torch.cuda, "graph", lambda graph: device_guard("cuda:2"))
-    monkeypatch.setattr(
-        torch.cuda,
-        "synchronize",
-        lambda device: (_ for _ in ()).throw(RuntimeError("late failure")),
-    )
+    monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
     monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda device: 0)
     monkeypatch.setattr(k8_runtime, "_clone_static_graph_inputs", lambda values: values)
     monkeypatch.setattr(k8_runtime, "_snapshot_tensors", lambda *args: [])
@@ -487,6 +490,7 @@ def test_capture_uses_state_device_guard_and_closes_parent_on_late_failure(
         )
 
     assert parent.close_calls == 1
+    assert synchronize_calls == [torch.device("cuda", 2)] * 3
     assert device_guards[0] == torch.device("cuda", 2)
 
 
