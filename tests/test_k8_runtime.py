@@ -444,6 +444,24 @@ def test_reused_decoder_mask_rejects_device_change_when_cuda_is_available():
         storage.sync(torch.tensor([[0, 1]]), cur_len=4)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_reused_decoder_mask_has_no_cuda_allocation_growth_across_sync_and_reset():
+    original = torch.tensor([[0, 0, 1, 1]], device="cuda")
+    next_request = torch.tensor([[0, 1, 1]], device="cuda")
+    storage = _K8DecoderMaskStorage.allocate(original, max_length=32)
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_allocated()
+    active = original
+    for length in (8, 12, 16, 20, 24, 28, 32):
+        active = storage.sync(active, cur_len=length)
+    storage.reset(next_request)
+    torch.cuda.synchronize()
+
+    assert torch.cuda.memory_allocated() == allocated
+    assert storage.allocation_count == 1
+    assert storage.buffer.data_ptr() == active.data_ptr()
+
+
 def test_raw_child_graph_api_fails_loudly_when_torch_does_not_expose_handle():
     with pytest.raises(RuntimeError, match="raw_cuda_graph"):
         _ChildGraphSequence.build(object(), object())
