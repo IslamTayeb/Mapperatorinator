@@ -63,7 +63,7 @@ def _load_natural(root: Path, variant: str, count: int) -> list[Any]:
     return runs
 
 
-def _fixed_profile_metrics(profile_path: Path) -> tuple[float, float]:
+def _fixed_profile_metrics(profile_path: Path) -> tuple[float, float, float]:
     payload = _json(profile_path)
     metadata = payload.get("metadata")
     if not isinstance(metadata, dict):
@@ -86,9 +86,17 @@ def _fixed_profile_metrics(profile_path: Path) -> tuple[float, float]:
     request_wall = float(final["finished_at_perf_counter_seconds"]) - float(
         validate["started_at_perf_counter_seconds"]
     )
-    if not math.isfinite(request_wall) or request_wall <= 0.0:
-        raise CandidateAnalysisError("fixed profile request wall is invalid")
-    return main_model, request_wall
+    cold_outer_wall = float(final["finished_at_perf_counter_seconds"]) - float(
+        stages[0]["started_at_perf_counter_seconds"]
+    )
+    if (
+        not math.isfinite(request_wall)
+        or request_wall <= 0.0
+        or not math.isfinite(cold_outer_wall)
+        or cold_outer_wall <= 0.0
+    ):
+        raise CandidateAnalysisError("fixed profile request/cold wall is invalid")
+    return main_model, request_wall, cold_outer_wall
 
 
 def _load_fixed(root: Path, variant: str, count: int) -> list[dict[str, float]]:
@@ -121,13 +129,16 @@ def _load_fixed(root: Path, variant: str, count: int) -> list[dict[str, float]]:
         ):
             raise CandidateAnalysisError("fixed-work target/logical steps diverged")
         manifest_hashes.add(evidence.get("manifest_sha256"))
-        model_seconds, request_wall = _fixed_profile_metrics(Path(evidence["profile_path"]))
+        model_seconds, request_wall, cold_outer_wall = _fixed_profile_metrics(
+            Path(evidence["profile_path"])
+        )
         rows.append(
             {
                 "main_steps": float(EXPECTED_MAIN_STEPS),
                 "main_model_seconds": model_seconds,
                 "fixed_work_tps": EXPECTED_MAIN_STEPS / model_seconds,
                 "complete_request_wall_seconds": request_wall,
+                "cold_process_outer_wall_seconds": cold_outer_wall,
                 "peak_cuda_memory_allocated_mb": float(
                     evidence["cuda_memory"]["max_allocated_bytes"]
                 )
@@ -259,6 +270,9 @@ def analyze(
             "candidate_request_wall_seconds": _summary(
                 [row["complete_request_wall_seconds"] for row in candidate_fixed]
             ),
+            "candidate_cold_process_outer_wall_seconds": _summary(
+                [row["cold_process_outer_wall_seconds"] for row in candidate_fixed]
+            ),
         },
         "natural_salvalai": {
             "baseline_main_tps": _summary([run.metrics["main_tps"] for run in baseline_natural]),
@@ -268,6 +282,12 @@ def analyze(
             ),
             "candidate_request_wall_seconds": _summary(
                 [run.metrics["complete_request_wall_seconds"] for run in candidate_natural]
+            ),
+            "baseline_cold_process_outer_wall_seconds": _summary(
+                [run.metrics["cold_process_outer_wall_seconds"] for run in baseline_natural]
+            ),
+            "candidate_cold_process_outer_wall_seconds": _summary(
+                [run.metrics["cold_process_outer_wall_seconds"] for run in candidate_natural]
             ),
             "divergence": natural_divergence,
         },
@@ -282,6 +302,18 @@ def analyze(
             "candidate_complete_request_wall_seconds": sum(
                 row["candidate_complete_request_wall_seconds"] for row in suite_rows
             ),
+            "baseline_process_wall_seconds": (
+                int(baseline_suite_evidence["process_finished_time_ns"])
+                - int(baseline_suite_evidence["process_started_time_ns"])
+            )
+            / 1e9,
+            "candidate_process_wall_seconds": (
+                int(candidate_suite_evidence["process_finished_time_ns"])
+                - int(candidate_suite_evidence["process_started_time_ns"])
+            )
+            / 1e9,
+            "baseline_startup": baseline_suite_evidence["startup"],
+            "candidate_startup": candidate_suite_evidence["startup"],
             "candidate_memory_stability": candidate_memory,
         },
     }
@@ -299,9 +331,11 @@ def text_report(report: dict[str, Any]) -> str:
         f"fixed_work.candidate_tps_minimum={fixed['minimum']:.9f}",
         f"natural.candidate_main_tps_median={natural['candidate_main_tps']['median']:.9f}",
         f"natural.candidate_request_wall_median={natural['candidate_request_wall_seconds']['median']:.9f}",
+        f"natural.candidate_cold_process_outer_wall_median={natural['candidate_cold_process_outer_wall_seconds']['median']:.9f}",
         f"five_song.candidate_aggregate_main_tps={suite['candidate_aggregate_main_tps']:.9f}",
         f"five_song.baseline_complete_request_wall_seconds={suite['baseline_complete_request_wall_seconds']:.9f}",
         f"five_song.candidate_complete_request_wall_seconds={suite['candidate_complete_request_wall_seconds']:.9f}",
+        f"five_song.candidate_process_wall_seconds={suite['candidate_process_wall_seconds']:.9f}",
         f"five_song.memory_stable={str(suite['candidate_memory_stability']['pass']).lower()}",
     ]
     for row in suite["songs"]:
