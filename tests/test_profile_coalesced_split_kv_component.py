@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -39,6 +40,16 @@ def _graph_entry(prefix: int, count: int):
         "outputs": object(),
         "static_inputs": {},
     }
+
+
+def test_component_wrapper_fits_one_backfill_window() -> None:
+    root = Path(__file__).resolve().parents[1]
+    source = (
+        root / "scripts/dcc/profile_coalesced_split_kv_component.sbatch"
+    ).read_text(encoding="utf-8")
+
+    assert "#SBATCH --gres=gpu:2080:1" in source
+    assert "#SBATCH --time=00:30:00" in source
 
 
 def test_summary_requires_full_coverage_correctness_and_half_second_saving() -> None:
