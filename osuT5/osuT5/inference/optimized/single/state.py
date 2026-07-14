@@ -143,64 +143,54 @@ class ProductionDecodeSession:
             ),
             "buckets": dict(sorted(buckets.items(), key=lambda item: int(item[0]))),
         }
-        k8_entries = [
-            entry for entry in self.graph_cache.values()
-            if entry.get("k8_candidate") is True
-        ]
-        if k8_entries:
-            snapshots = []
-            seen_stats: set[int] = set()
-            for entry in k8_entries:
-                stats = entry.get("k8_stats", {})
-                if id(stats) not in seen_stats:
-                    snapshots.append(stats)
-                    seen_stats.add(id(stats))
-            latest_serial = max(
-                int(row.get("window_serial", 0)) for row in snapshots
-            )
-            snapshots = [
-                row for row in snapshots
-                if int(row.get("window_serial", 0)) == latest_serial
-            ]
-            latest = snapshots[-1]
+        latest = None
+        if self.active_state_signature is not None:
+            holder = self.stable_encoder_holders.get(self.active_state_signature, {})
+            candidate = holder.get("__k8_latest_stats__")
+            if isinstance(candidate, dict) and candidate.get("k8_candidate") is True:
+                latest = candidate
+        if latest is not None:
             result["k8_candidate"] = {
                 "block_size": int(latest.get("block_size", 8)),
-                "eligible_steps": sum(
-                    int(row.get("eligible_steps", 0)) for row in snapshots
-                ),
-                "block_replays": sum(
-                    int(row.get("block_replays", 0)) for row in snapshots
-                ),
-                "remainder_steps": sum(
-                    int(row.get("remainder_steps", 0)) for row in snapshots
-                ),
-                "status_reads": sum(
-                    int(row.get("status_reads", 0)) for row in snapshots
-                ),
-                "copy_calls": sum(
-                    int(row.get("copy_calls", 0)) for row in snapshots
-                ),
-                "copy_bytes": sum(
-                    int(row.get("copy_bytes", 0)) for row in snapshots
-                ),
-                "capture_seconds": sum(
-                    float(row.get("capture_seconds", 0.0)) for row in snapshots
-                ),
-                "peak_vram_bytes": max(
-                    int(row.get("peak_vram_bytes", 0)) for row in snapshots
-                ),
-                "physical_steps": sum(
-                    int(row.get("physical_steps", 0)) for row in snapshots
-                ),
-                "logical_steps": sum(
-                    int(row.get("logical_steps", 0)) for row in snapshots
-                ),
-                "wasted_steps": sum(
-                    int(row.get("wasted_steps", 0)) for row in snapshots
-                ),
+                "prefill_steps": int(latest.get("prefill_steps", 0)),
+                "eligible_steps": int(latest.get("eligible_steps", 0)),
+                "block_replays": int(latest.get("block_replays", 0)),
+                "remainder_steps": int(latest.get("remainder_steps", 0)),
+                "status_reads": int(latest.get("status_reads", 0)),
+                "copy_calls": int(latest.get("copy_calls", 0)),
+                "copy_bytes": int(latest.get("copy_bytes", 0)),
+                "capture_seconds": float(latest.get("capture_seconds", 0.0)),
+                "peak_vram_bytes": int(latest.get("peak_vram_bytes", 0)),
+                "physical_steps": int(latest.get("physical_steps", 0)),
+                "logical_steps": int(latest.get("logical_steps", 0)),
+                "wasted_steps": int(latest.get("wasted_steps", 0)),
                 "rng_policy": latest.get("rng_policy"),
                 "rng_exact": bool(latest.get("rng_exact", False)),
                 "rng_drift": latest.get("rng_drift"),
+                "rng_request_seed": int(latest.get("rng_request_seed", 0)),
+                "rng_window_identity": int(latest.get("rng_window_identity", 0)),
+                "rng_early_eos_isolation": bool(
+                    latest.get("rng_early_eos_isolation", False)
+                ),
+                "sampling_mode": latest.get("sampling_mode"),
+                "prompt_seed_d2h_copy_calls": int(
+                    latest.get("prompt_seed_d2h_copy_calls", 0)
+                ),
+                "prompt_seed_d2h_copy_bytes": int(
+                    latest.get("prompt_seed_d2h_copy_bytes", 0)
+                ),
+                "prompt_seed_setup_seconds": float(
+                    latest.get("prompt_seed_setup_seconds", 0.0)
+                ),
+                "processor_signature_d2h_copy_calls": int(
+                    latest.get("processor_signature_d2h_copy_calls", 0)
+                ),
+                "processor_signature_d2h_copy_bytes": int(
+                    latest.get("processor_signature_d2h_copy_bytes", 0)
+                ),
+                "processor_signature_setup_seconds": float(
+                    latest.get("processor_signature_setup_seconds", 0.0)
+                ),
                 "parent_backend": latest.get("parent_backend"),
             }
         return result
