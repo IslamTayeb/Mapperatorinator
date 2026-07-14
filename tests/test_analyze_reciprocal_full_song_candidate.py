@@ -336,6 +336,36 @@ def test_relaxed_mode_reports_token_stopping_structure_and_map_divergence(
     assert parity["output_divergence"]["final_map_equal"] is False
 
 
+def test_relaxed_analyzer_can_report_stage_selective_precision(tmp_path: Path) -> None:
+    profiles = _four_runs(tmp_path)
+    for role in ("candidate_first", "candidate_second"):
+        path = profiles[role]
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["generation"][0]["precision"] = "fp16"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(CandidateAnalysisError, match="consistent precision"):
+        analyze(profiles, mode="relaxed")
+
+    report = analyze(
+        profiles,
+        mode="relaxed",
+        allow_mixed_stage_precision=True,
+    )
+    assert report["workload"]["baseline_stage_precisions"] == {
+        "timing_context": "fp32",
+        "main_generation": "fp32",
+    }
+    assert report["workload"]["candidate_stage_precisions"] == {
+        "timing_context": "fp16",
+        "main_generation": "fp32",
+    }
+    assert report["runs"]["candidate_first"]["stage_precisions"] == {
+        "timing_context": "fp16",
+        "main_generation": "fp32",
+    }
+
+
 def test_relaxed_gate_requires_timing_tokens_stopping_and_dispatch_exact(
     tmp_path: Path,
 ) -> None:

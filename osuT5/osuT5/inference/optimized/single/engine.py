@@ -194,7 +194,10 @@ def _generate_window(
     allow_batched_decode: bool = False,
     specialized_dispatch_batch_size: int | None = None,
     approximate_weight_only_state: Any | None = None,
+    allow_specialized_timing_dispatch: bool = False,
 ):
+    if not isinstance(allow_specialized_timing_dispatch, bool):
+        raise TypeError("specialized timing dispatch flag must be boolean")
     expected_dtype = preset.torch_dtype
     if model.dtype != expected_dtype:
         raise TypeError(
@@ -237,6 +240,10 @@ def _generate_window(
     sync_model_timing = bool(generate_kwargs.pop("sync_model_timing", False))
     if context_type is not None:
         context_type = ContextType(context_type)
+    if allow_specialized_timing_dispatch and context_type != ContextType.TIMING:
+        raise ValueError(
+            "specialized timing dispatch may be enabled only for timing context"
+        )
     if precision != preset.precision or cfg_scale != 1.0:
         raise ValueError("optimized single runtime configuration changed after validation.")
     if batch_size != 1 and not allow_batched_decode:
@@ -263,6 +270,9 @@ def _generate_window(
         and specialized_batch
         and context_type != ContextType.TIMING
     )
+    specialized_context_enabled = (
+        context_type != ContextType.TIMING or allow_specialized_timing_dispatch
+    )
     batched_policy_disabled_reason = (
         "batch_gt_1"
         if batch_size > 1
@@ -273,13 +283,16 @@ def _generate_window(
     q1_bmm_cross_attention = specialized_batch
     native_q1_self_attention = (
         specialized_batch
-        and context_type != ContextType.TIMING
+        and specialized_context_enabled
         and not approximate_weight_only_enabled
     )
     native_q1_rope_cache_self_attention = native_q1_self_attention
     native_cross_mlp_tail = (
         specialized_batch
-        and _native_cross_mlp_tail_enabled(context_type=context_type)
+        and (
+            _native_cross_mlp_tail_enabled(context_type=context_type)
+            or allow_specialized_timing_dispatch
+        )
         and not approximate_weight_only_enabled
     )
     effective_native_q1_rope_cache_self_attention = (
@@ -445,7 +458,7 @@ def _generate_window(
                 ),
             },
             "effective_native_q1_rope_cache_self_attention": {
-                "requested": specialized_batch and context_type != ContextType.TIMING,
+                "requested": specialized_batch and specialized_context_enabled,
                 "enabled": effective_native_q1_rope_cache_self_attention,
                 "owner": effective_native_q1_owner,
                 "kernel": (
@@ -509,6 +522,23 @@ def _generate_window(
             - graph_decode_replays_before
         ),
         "optimized_cuda_graphs": context_state.graph_profile_summary(),
+        "optimized_specialized_timing_dispatch": {
+            "requested": allow_specialized_timing_dispatch,
+            "enabled": bool(
+                allow_specialized_timing_dispatch
+                and specialized_batch
+                and native_q1_rope_cache_self_attention
+                and native_cross_mlp_tail
+            ),
+            "result_class": (
+                "documented-drift"
+                if allow_specialized_timing_dispatch
+                else None
+            ),
+            "exactness_claim": (
+                False if allow_specialized_timing_dispatch else None
+            ),
+        },
     })
     if approximate_weight_only_state is not None:
         stats["optimized_dispatch_policy"]["approximate_weight_only"] = {
