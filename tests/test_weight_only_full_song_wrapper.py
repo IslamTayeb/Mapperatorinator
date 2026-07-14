@@ -1,5 +1,6 @@
 import subprocess
 from pathlib import Path
+import sys
 
 import pytest
 import torch
@@ -170,6 +171,29 @@ def test_cross_wrappers_pin_shared_control_and_one_candidate_mode(
     assert '--cross-mode "$validation_cross_mode"' in general
     assert "missing cross runtime evidence" in general
     assert "control unexpectedly contains cross runtime" in general
+
+
+@pytest.mark.parametrize(
+    "runner",
+    (
+        "run_k4_shared_rope_fp16_cross.py",
+        "run_k4_shared_rope_split8_cross.py",
+    ),
+)
+def test_cross_candidate_runner_bootstraps_repo_from_unrelated_cwd(
+    runner,
+    tmp_path,
+) -> None:
+    completed = subprocess.run(
+        [sys.executable, str(ROOT / "utils" / runner), "--help"],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "--output-init-json" in completed.stdout
 
 
 def test_general_wrapper_requires_k4_metadata_for_every_profile() -> None:
