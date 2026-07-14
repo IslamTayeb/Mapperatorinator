@@ -18,7 +18,12 @@ from osuT5.osuT5.model.custom_transformers.modeling_varwhisper import (
 )
 
 
-def _state(owner, *, int8_mlp=False) -> weight_only_runtime.ApproximateWeightOnlyState:
+def _state(
+    owner,
+    *,
+    int8_mlp: bool = False,
+    cross_mode: str = weight_only_runtime.CROSS_ACCEPTED,
+) -> weight_only_runtime.ApproximateWeightOnlyState:
     projection = torch.nn.Linear(4, 8, bias=False)
     norm = torch.nn.RMSNorm(4)
     packed = SimpleNamespace(
@@ -41,6 +46,8 @@ def _state(owner, *, int8_mlp=False) -> weight_only_runtime.ApproximateWeightOnl
         reserved_bytes_delta=128,
         retained_fp32_source_weight_bytes=256,
         packed_weight_bytes=128,
+        cross_mode=cross_mode,
+        cross_packs=None,
         int8_mlp_packs={} if int8_mlp else None,
         int8_mlp_extension_init_seconds=1.5 if int8_mlp else 0.0,
         int8_mlp_pack_seconds=0.25 if int8_mlp else 0.0,
@@ -107,6 +114,15 @@ def test_state_owner_and_metadata_fail_loudly() -> None:
         "cross_query",
         "cross_output",
     ]
+    assert metadata["cross_candidate"] == {
+        "mode": "accepted",
+        "scope": "main-model-only",
+        "attention_accumulation": "fp32",
+        "production_selector_unchanged": True,
+        "result_class": "control",
+        "exactness_claim": False,
+        "accepted_q1_bmm": True,
+    }
     assert "fp32_weight_regions" not in metadata
     assert metadata["outputs_per_block"] == {
         "self_qkv": 4,
@@ -257,6 +273,88 @@ def test_fp16_runtime_rejects_weight_only_initialization() -> None:
         runtime.initialize_approximate_weight_only(torch.nn.Module())
     with pytest.raises(TypeError, match="requires the FP32 preset"):
         runtime.initialize_approximate_int8_mlp_weight_only(torch.nn.Module())
+    with pytest.raises(TypeError, match="requires the FP32 optimized preset"):
+        runtime.initialize_approximate_int8_mlp_weight_only_cross(
+            torch.nn.Module(),
+            mode=weight_only_runtime.CROSS_SPLIT8,
+        )
+
+
+def test_cross_candidate_initialization_is_explicit_mode_owned(monkeypatch) -> None:
+    owner = torch.nn.Module()
+    state = _state(owner)
+    object.__setattr__(state, "cross_mode", weight_only_runtime.CROSS_FP16_PACKED)
+    calls = []
+
+    def initialize(cls, model, *, cross_mode="accepted"):
+        calls.append((model, cross_mode))
+        return state
+
+    monkeypatch.setattr(
+        weight_only_runtime.ApproximateWeightOnlyState,
+        "initialize",
+        classmethod(initialize),
+    )
+    runtime = engine.OptimizedSingleRuntime(engine.OPTIMIZED_PRESETS["fp32"])
+
+    metadata = runtime.initialize_approximate_weight_only_cross(
+        owner,
+        mode=weight_only_runtime.CROSS_FP16_PACKED,
+    )
+
+    assert metadata["cross_candidate"]["mode"] == "fp16_packed_projections"
+    assert calls == [(owner, "fp16_packed_projections")]
+    with pytest.raises(RuntimeError, match="different mixed-weight cross mode"):
+        runtime.initialize_approximate_weight_only_cross(
+            owner,
+            mode=weight_only_runtime.CROSS_SPLIT8,
+        )
+    with pytest.raises(ValueError, match="must be fp16_packed"):
+        engine.OptimizedSingleRuntime(
+            engine.OPTIMIZED_PRESETS["fp32"]
+        ).initialize_approximate_weight_only_cross(owner, mode="accepted")
+
+
+def test_cross_int8_composition_initialization_is_owned_and_idempotent(
+    monkeypatch,
+) -> None:
+    owner = torch.nn.Module()
+    state = _state(
+        owner,
+        int8_mlp=True,
+        cross_mode=weight_only_runtime.CROSS_SPLIT8,
+    )
+    calls = []
+
+    def initialize(cls, model, *, cross_mode="accepted", int8_mlp=False):
+        calls.append((model, cross_mode, int8_mlp))
+        return state
+
+    monkeypatch.setattr(
+        weight_only_runtime.ApproximateWeightOnlyState,
+        "initialize",
+        classmethod(initialize),
+    )
+    runtime = engine.OptimizedSingleRuntime(engine.OPTIMIZED_PRESETS["fp32"])
+
+    first = runtime.initialize_approximate_int8_mlp_weight_only_cross(
+        owner,
+        mode=weight_only_runtime.CROSS_SPLIT8,
+    )
+    second = runtime.initialize_approximate_int8_mlp_weight_only_cross(
+        owner,
+        mode=weight_only_runtime.CROSS_SPLIT8,
+    )
+
+    assert first == second == state.metadata()
+    assert calls == [(owner, weight_only_runtime.CROSS_SPLIT8, True)]
+    assert first["int8_mlp_overlay"]["dispatch_counter"] == "int8_weight_mlp_tail"
+    assert first["cross_candidate"]["mode"] == weight_only_runtime.CROSS_SPLIT8
+    with pytest.raises(RuntimeError, match="different mixed-weight INT8/cross"):
+        runtime.initialize_approximate_int8_mlp_weight_only_cross(
+            owner,
+            mode=weight_only_runtime.CROSS_FP16_PACKED,
+        )
 
 
 def test_profile_metadata_is_unchanged_until_explicit_initialization(monkeypatch) -> None:

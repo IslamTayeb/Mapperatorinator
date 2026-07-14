@@ -575,6 +575,44 @@ class OptimizedSingleRuntime:
         object.__setattr__(self, "_approximate_weight_only_state", state)
         return state.metadata()
 
+    def initialize_approximate_weight_only_cross(
+        self,
+        model: torch.nn.Module,
+        *,
+        mode: str,
+    ) -> dict[str, Any]:
+        """Initialize one explicit cross-region delta on the mixed runtime.
+
+        This interface is intentionally absent from public selectors.  The
+        reciprocal runners own it, and a runtime instance cannot switch modes
+        after packing model-owned weights.
+        """
+
+        if self.preset.precision != "fp32":
+            raise TypeError("cross candidate requires the FP32 optimized preset")
+        from ..kernels.weight_only_runtime import (
+            ApproximateWeightOnlyState,
+            CROSS_MODES,
+        )
+
+        if mode not in CROSS_MODES or mode == "accepted":
+            raise ValueError(
+                "cross candidate mode must be fp16_packed_projections or "
+                "split8_attention"
+            )
+        existing = self._approximate_weight_only_state
+        if existing is not None:
+            existing.validate_owner(model)
+            if existing.cross_mode != mode:
+                raise RuntimeError(
+                    "optimized runtime already owns a different mixed-weight "
+                    f"cross mode: {existing.cross_mode!r}"
+                )
+            return existing.metadata()
+        state = ApproximateWeightOnlyState.initialize(model, cross_mode=mode)
+        object.__setattr__(self, "_approximate_weight_only_state", state)
+        return state.metadata()
+
     def initialize_approximate_int8_mlp_weight_only(
         self,
         model: torch.nn.Module,
@@ -591,10 +629,50 @@ class OptimizedSingleRuntime:
                 raise RuntimeError(
                     "mixed-weight state was initialized without the INT8 MLP overlay"
                 )
+            if existing.cross_mode != "accepted":
+                raise RuntimeError(
+                    "INT8-only initialization cannot reuse a cross-candidate state"
+                )
             return existing.metadata()
         from ..kernels.weight_only_runtime import ApproximateWeightOnlyState
 
         state = ApproximateWeightOnlyState.initialize(model, int8_mlp=True)
+        object.__setattr__(self, "_approximate_weight_only_state", state)
+        return state.metadata()
+
+    def initialize_approximate_int8_mlp_weight_only_cross(
+        self,
+        model: torch.nn.Module,
+        *,
+        mode: str,
+    ) -> dict[str, Any]:
+        """Compose one cross candidate with the explicit INT8 MLP overlay."""
+        if self.preset.precision != "fp32":
+            raise TypeError("cross+INT8 candidate requires the FP32 optimized preset")
+        from ..kernels.weight_only_runtime import (
+            ApproximateWeightOnlyState,
+            CROSS_MODES,
+        )
+
+        if mode not in CROSS_MODES or mode == "accepted":
+            raise ValueError(
+                "cross+INT8 candidate mode must be fp16_packed_projections or "
+                "split8_attention"
+            )
+        existing = self._approximate_weight_only_state
+        if existing is not None:
+            existing.validate_owner(model)
+            if not existing.int8_mlp_enabled or existing.cross_mode != mode:
+                raise RuntimeError(
+                    "optimized runtime already owns a different mixed-weight "
+                    "INT8/cross composition"
+                )
+            return existing.metadata()
+        state = ApproximateWeightOnlyState.initialize(
+            model,
+            cross_mode=mode,
+            int8_mlp=True,
+        )
         object.__setattr__(self, "_approximate_weight_only_state", state)
         return state.metadata()
 

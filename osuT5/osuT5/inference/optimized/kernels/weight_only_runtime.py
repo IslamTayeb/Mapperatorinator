@@ -45,6 +45,10 @@ MLP_FC2_OUTPUTS_PER_BLOCK = 4
 FINAL_LOGITS_OUTPUTS_PER_BLOCK = 2
 ACCEPTED_Q1_VARIANT = "accepted"
 SPLIT_KV_Q1_VARIANT = "split_kv_8"
+CROSS_ACCEPTED = "accepted"
+CROSS_FP16_PACKED = "fp16_packed_projections"
+CROSS_SPLIT8 = "split8_attention"
+CROSS_MODES = frozenset({CROSS_ACCEPTED, CROSS_FP16_PACKED, CROSS_SPLIT8})
 
 
 def _norm_eps(module: torch.nn.Module) -> float:
@@ -139,6 +143,8 @@ class ApproximateWeightOnlyState:
     reserved_bytes_delta: int
     retained_fp32_source_weight_bytes: int
     packed_weight_bytes: int
+    cross_mode: str
+    cross_packs: dict[int, tuple[PackedLinear, PackedLinear]] | None
     int8_mlp_packs: dict[int, Any] | None = None
     int8_mlp_extension_init_seconds: float = 0.0
     int8_mlp_pack_seconds: float = 0.0
@@ -149,10 +155,16 @@ class ApproximateWeightOnlyState:
         cls,
         model: torch.nn.Module,
         *,
+        cross_mode: str = CROSS_ACCEPTED,
         int8_mlp: bool = False,
     ) -> "ApproximateWeightOnlyState":
         if not isinstance(model, torch.nn.Module):
             raise TypeError("weight-only candidate owner must be a torch module")
+        if cross_mode not in CROSS_MODES:
+            raise ValueError(
+                f"cross candidate mode must be one of {sorted(CROSS_MODES)}, "
+                f"got {cross_mode!r}"
+            )
         if model.training:
             raise RuntimeError("weight-only candidate requires eval mode")
         layers, final_norm, final_projection = _locate_candidate_modules(model)
@@ -207,6 +219,10 @@ class ApproximateWeightOnlyState:
             preload_int8_mlp_extension()
             torch.cuda.synchronize()
             int8_extension_seconds = time.perf_counter() - int8_extension_start
+        if cross_mode == CROSS_SPLIT8:
+            from ..scout.cross_attention import preload_cross_attention_scout
+
+            preload_cross_attention_scout()
         torch.cuda.synchronize()
         extension_seconds = time.perf_counter() - extension_start
         extension_allocated_after = torch.cuda.memory_allocated(device)
@@ -216,6 +232,17 @@ class ApproximateWeightOnlyState:
         reserved_before = torch.cuda.memory_reserved(device)
         pack_start = time.perf_counter()
         packs = {id(layer): DecoderWeightPack.from_layer(layer) for layer in layers}
+        cross_packs = (
+            {
+                id(layer): (
+                    PackedLinear.from_module(layer.cross_attn.Wq),
+                    PackedLinear.from_module(layer.cross_attn.Wo),
+                )
+                for layer in layers
+            }
+            if cross_mode == CROSS_FP16_PACKED
+            else None
+        )
         projection_pack = PackedLinear.from_module(final_projection)
         int8_packs = None
         int8_pack_seconds = 0.0
@@ -242,6 +269,14 @@ class ApproximateWeightOnlyState:
             report = pack.memory_report()
             source_bytes += report["retained_fp32_source_weight_bytes"]
             packed_bytes += report["packed_weight_bytes"]
+        if cross_packs is not None:
+            for query_pack, output_pack in cross_packs.values():
+                source_bytes += (
+                    query_pack.source_weight_bytes + output_pack.source_weight_bytes
+                )
+                packed_bytes += (
+                    query_pack.packed_weight_bytes + output_pack.packed_weight_bytes
+                )
         return cls(
             owner_ref=weakref.ref(model),
             layer_packs=packs,
@@ -260,6 +295,8 @@ class ApproximateWeightOnlyState:
             reserved_bytes_delta=reserved_after - reserved_before,
             retained_fp32_source_weight_bytes=source_bytes,
             packed_weight_bytes=packed_bytes + int8_packed_bytes,
+            cross_mode=cross_mode,
+            cross_packs=cross_packs,
             int8_mlp_packs=int8_packs,
             int8_mlp_extension_init_seconds=int8_extension_seconds,
             int8_mlp_pack_seconds=int8_pack_seconds,
@@ -276,6 +313,19 @@ class ApproximateWeightOnlyState:
         except KeyError as exc:
             raise RuntimeError("weight-only candidate received an unowned decoder layer") from exc
 
+    def cross_pack_for_layer(
+        self,
+        layer: torch.nn.Module,
+    ) -> tuple[PackedLinear, PackedLinear]:
+        if self.cross_mode != CROSS_FP16_PACKED or self.cross_packs is None:
+            raise RuntimeError("FP16 cross projections are not initialized")
+        try:
+            return self.cross_packs[id(layer)]
+        except KeyError as exc:
+            raise RuntimeError(
+                "cross projection candidate received an unowned decoder layer"
+            ) from exc
+
     @property
     def int8_mlp_enabled(self) -> bool:
         return self.int8_mlp_packs is not None
@@ -289,22 +339,55 @@ class ApproximateWeightOnlyState:
             raise RuntimeError("INT8 MLP overlay received an unowned decoder layer") from exc
 
     def metadata(self) -> dict[str, Any]:
+        fp16_regions = [
+            "self_qkv",
+            "self_output",
+            "mlp_fc1",
+            "mlp_fc2",
+            "final_logits",
+        ]
+        fp32_regions = ["cross_query", "cross_output"]
+        cross_candidate = {
+            "mode": self.cross_mode,
+            "scope": "main-model-only",
+            "attention_accumulation": "fp32",
+            "production_selector_unchanged": True,
+        }
+        if self.cross_mode == CROSS_FP16_PACKED:
+            fp16_regions.extend(("cross_query", "cross_output"))
+            fp32_regions = []
+            cross_candidate.update(
+                {
+                    "result_class": "documented-drift",
+                    "exactness_claim": False,
+                    "packed_projection_weights": True,
+                }
+            )
+        elif self.cross_mode == CROSS_SPLIT8:
+            cross_candidate.update(
+                {
+                    "result_class": "exactness-required",
+                    "exactness_claim": True,
+                    "split_count": 8,
+                    "fp32_query_kv_output": True,
+                }
+            )
+        else:
+            cross_candidate.update(
+                {
+                    "result_class": "control",
+                    "exactness_claim": False,
+                    "accepted_q1_bmm": True,
+                }
+            )
         metadata = {
             "version": "approximate-fp16-weights-fp32-state-v2",
             "result_class": "documented-drift",
             "exactness_claim": False,
             "fp32_activations_caches_reductions_logits": True,
-            "fp16_weight_regions": [
-                "self_qkv",
-                "self_output",
-                "mlp_fc1",
-                "mlp_fc2",
-                "final_logits",
-            ],
-            "fp32_selected_decode_matrix_regions": [
-                "cross_query",
-                "cross_output",
-            ],
+            "fp16_weight_regions": fp16_regions,
+            "fp32_selected_decode_matrix_regions": fp32_regions,
+            "cross_candidate": cross_candidate,
             "outputs_per_block": {
                 "self_qkv": SELF_QKV_OUTPUTS_PER_BLOCK,
                 "self_output": SELF_OUT_OUTPUTS_PER_BLOCK,
@@ -471,30 +554,70 @@ def _cross_mlp_tail_forward(
     )
     pack = state.pack_for_layer(module)
 
-    with profile_range(f"{layer_name}.weight_only.cross_q_fp32"):
-        query_states = native_one_token_rmsnorm_linear(
-            hidden_states,
-            module.cross_attn_layer_norm.weight,
-            module.cross_attn.Wq.weight,
-            module.cross_attn.Wq.bias,
-            eps=_norm_eps(module.cross_attn_layer_norm),
-            outputs_per_block=8,
-        ).view(1, 1, module.cross_attn.num_heads, module.cross_attn.head_dim).transpose(1, 2)
-    with profile_range(f"{layer_name}.weight_only.cross_bmm_fp32"):
-        cross_output = _q1_bmm_cross_attention(
-            query_states,
-            key_states,
-            value_states,
-            expected_dtype=torch.float32,
-        )
-    with profile_range(f"{layer_name}.weight_only.cross_out_fp32"):
-        hidden_states = native_one_token_linear_residual(
-            cross_output,
-            hidden_states,
-            module.cross_attn.Wo.weight,
-            module.cross_attn.Wo.bias,
-            outputs_per_block=8,
-        )
+    if state.cross_mode == CROSS_FP16_PACKED:
+        query_pack, output_pack = state.cross_pack_for_layer(module)
+        with profile_range(f"{layer_name}.weight_only.cross_q_fp16_weight"):
+            query_states = weight_only_rmsnorm_linear(
+                hidden_states,
+                module.cross_attn_layer_norm.weight,
+                query_pack,
+                eps=_norm_eps(module.cross_attn_layer_norm),
+                outputs_per_block=8,
+            ).view(
+                1, 1, module.cross_attn.num_heads, module.cross_attn.head_dim
+            ).transpose(1, 2)
+    else:
+        with profile_range(f"{layer_name}.weight_only.cross_q_fp32"):
+            query_states = native_one_token_rmsnorm_linear(
+                hidden_states,
+                module.cross_attn_layer_norm.weight,
+                module.cross_attn.Wq.weight,
+                module.cross_attn.Wq.bias,
+                eps=_norm_eps(module.cross_attn_layer_norm),
+                outputs_per_block=8,
+            ).view(
+                1, 1, module.cross_attn.num_heads, module.cross_attn.head_dim
+            ).transpose(1, 2)
+    if state.cross_mode == CROSS_SPLIT8:
+        from ..scout.cross_attention import cross_attention_split
+
+        with profile_range(f"{layer_name}.weight_only.cross_split8_fp32"):
+            cross_output = cross_attention_split(
+                query_states.contiguous(),
+                key_states,
+                value_states,
+                8,
+            )
+    else:
+        with profile_range(f"{layer_name}.weight_only.cross_bmm_fp32"):
+            cross_output = _q1_bmm_cross_attention(
+                query_states,
+                key_states,
+                value_states,
+                expected_dtype=torch.float32,
+            )
+    cross_output = cross_output.transpose(1, 2).contiguous().view(
+        1,
+        1,
+        module.cross_attn.all_head_size,
+    )
+    if state.cross_mode == CROSS_FP16_PACKED:
+        with profile_range(f"{layer_name}.weight_only.cross_out_fp16_weight"):
+            hidden_states = weight_only_linear_residual(
+                cross_output,
+                hidden_states,
+                output_pack,
+                outputs_per_block=8,
+            )
+    else:
+        with profile_range(f"{layer_name}.weight_only.cross_out_fp32"):
+            hidden_states = native_one_token_linear_residual(
+                cross_output,
+                hidden_states,
+                module.cross_attn.Wo.weight,
+                module.cross_attn.Wo.bias,
+                outputs_per_block=8,
+            )
     if state.int8_mlp_enabled:
         from ..scout.int8_mlp import int8_weight_mlp_residual
 
@@ -522,7 +645,16 @@ def _cross_mlp_tail_forward(
         dispatch_counts["weight_only_mlp_tail"] += 1
         if state.int8_mlp_enabled:
             dispatch_counts["int8_weight_mlp_tail"] += 1
-        dispatch_counts["q1_bmm_cross_attention"] += 1
+        if state.cross_mode == CROSS_SPLIT8:
+            dispatch_counts["split8_q1_cross_attention_candidate"] = (
+                dispatch_counts.get("split8_q1_cross_attention_candidate", 0) + 1
+            )
+        else:
+            dispatch_counts["q1_bmm_cross_attention"] += 1
+        if state.cross_mode == CROSS_FP16_PACKED:
+            dispatch_counts["fp16_packed_cross_projection_candidate"] = (
+                dispatch_counts.get("fp16_packed_cross_projection_candidate", 0) + 1
+            )
     return (hidden_states,) + self_attn_outputs[1:] + (past_key_value,)
 
 
@@ -600,5 +732,9 @@ def approximate_weight_only_runtime_context(
 
 __all__ = [
     "ApproximateWeightOnlyState",
+    "CROSS_ACCEPTED",
+    "CROSS_FP16_PACKED",
+    "CROSS_MODES",
+    "CROSS_SPLIT8",
     "approximate_weight_only_runtime_context",
 ]
