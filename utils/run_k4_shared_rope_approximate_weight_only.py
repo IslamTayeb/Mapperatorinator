@@ -50,6 +50,8 @@ def _validated_shared_rope_evidence(stats: SharedRopeStats) -> dict:
 def _enrich_initialization_evidence(
     output_init_json: Path,
     stats: SharedRopeStats,
+    *,
+    composition_version: str = COMPOSITION_VERSION,
 ) -> None:
     try:
         payload = json.loads(output_init_json.read_text(encoding="utf-8"))
@@ -61,7 +63,7 @@ def _enrich_initialization_evidence(
         raise TypeError("mixed-weight initialization evidence must be an object")
     if "shared_rope" in payload or "combined_runtime" in payload:
         raise RuntimeError("combined initialization evidence already contains wiring")
-    payload["combined_runtime"] = COMPOSITION_VERSION
+    payload["combined_runtime"] = composition_version
     payload["shared_rope"] = _validated_shared_rope_evidence(stats)
     output_init_json.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
@@ -75,6 +77,8 @@ def run(
     output_init_json: Path,
     *,
     graph_remainders: bool = False,
+    weight_runner=None,
+    composition_version: str = COMPOSITION_VERSION,
 ) -> None:
     """Install every candidate while sharing RoPE only on the main model.
 
@@ -85,6 +89,9 @@ def run(
     """
 
     import inference
+
+    if weight_runner is None:
+        weight_runner = run_weight_only
 
     original_loader = inference.load_model_with_engine
     stack = ExitStack()
@@ -107,7 +114,7 @@ def run(
         if graph_remainders:
             install_options["graph_remainders"] = True
         with install_k8_candidate(**install_options):
-            run_weight_only(config_name, overrides, output_init_json)
+            weight_runner(config_name, overrides, output_init_json)
         if loaded_bindings < 2:
             raise RuntimeError(
                 "combined full-song runner expected separate main and timing bindings"
@@ -115,7 +122,11 @@ def run(
     finally:
         inference.load_model_with_engine = original_loader
         stack.close()
-    _enrich_initialization_evidence(output_init_json, main_stats)
+    _enrich_initialization_evidence(
+        output_init_json,
+        main_stats,
+        composition_version=composition_version,
+    )
 
 
 def main() -> None:

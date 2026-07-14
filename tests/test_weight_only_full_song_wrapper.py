@@ -16,10 +16,24 @@ SHARED_ROPE_WRAPPER = (
     ROOT
     / "scripts/dcc/verify_k4_split_weight_shared_rope_full_song_reciprocal.sbatch"
 )
+INT8_MLP_WRAPPER = (
+    ROOT
+    / "scripts/dcc/verify_k4_split_weight_shared_rope_int8_mlp_reciprocal.sbatch"
+)
+K1_INT8_MLP_WRAPPER = (
+    ROOT
+    / "scripts/dcc/verify_k4_shared_rope_k1_remainder_int8_mlp_reciprocal.sbatch"
+)
 
 
 def test_weight_only_full_song_wrapper_has_valid_bash_syntax() -> None:
-    for wrapper in (WRAPPER, K4_WRAPPER, SHARED_ROPE_WRAPPER):
+    for wrapper in (
+        WRAPPER,
+        K4_WRAPPER,
+        SHARED_ROPE_WRAPPER,
+        INT8_MLP_WRAPPER,
+        K1_INT8_MLP_WRAPPER,
+    ):
         subprocess.run(["bash", "-n", str(wrapper)], check=True)
 
 
@@ -121,6 +135,67 @@ def test_shared_rope_wrapper_compares_against_exact_combined_control() -> None:
     assert "parity.cross_candidate_exact=true" in general
     assert "shared-RoPE did not execute" in general
     assert 'runtime_candidate=$candidate' in general
+
+
+def test_int8_mlp_wrapper_uses_exact_combined_control_and_incremental_gate() -> None:
+    source = INT8_MLP_WRAPPER.read_text(encoding="utf-8")
+
+    assert (
+        "export BASELINE_RUNNER="
+        "utils/run_k4_shared_rope_approximate_weight_only.py"
+    ) in source
+    assert (
+        "export CANDIDATE_RUNNER="
+        "utils/run_k4_shared_rope_int8_mlp_weight_only.py"
+    ) in source
+    assert "export REQUIRE_EXACT_TIMING=true" in source
+    assert "export REQUIRE_K4_CANDIDATE=true" in source
+    assert "export REQUIRE_INT8_MLP_INCREMENTAL=true" in source
+
+    general = WRAPPER.read_text(encoding="utf-8")
+    assert "REQUIRE_INT8_MLP_INCREMENTAL=${REQUIRE_INT8_MLP_INCREMENTAL:-false}" in general
+    assert "validate_int8_mlp_full_song_profile.py" in general
+    assert "INT8 MLP count must equal" not in general
+    assert "INT8 MLP gate requires the shared-RoPE combined control" in general
+    int8_analysis = general.split(
+        'if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then\n'
+        "  # Both arms already own",
+        1,
+    )[1].split(
+        'elif [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then',
+        1,
+    )[0]
+    assert (
+        "records.main_generation[[]*].optimized_dispatch_capture_hits.int8_weight_mlp_tail"
+        in int8_analysis
+    )
+    assert (
+        "--allow-optional-dispatch-delta\n"
+        "      'records.main_generation[[]*].optimized_dispatch_capture_hits.*'"
+        in int8_analysis
+    )
+    assert "native_cross_mlp_tail_*" not in int8_analysis
+    assert "--require-exact-label timing_context" in int8_analysis
+    assert "--require-exact-dispatch-label timing_context" in int8_analysis
+
+
+def test_k1_int8_wrapper_layers_only_int8_over_exact_remainder_control() -> None:
+    source = K1_INT8_MLP_WRAPPER.read_text(encoding="utf-8")
+
+    assert "#SBATCH --gres=gpu:2080:1" in source
+    assert "export BASELINE_RUNNER=utils/run_k4_shared_rope_k1_remainder.py" in source
+    assert (
+        "export CANDIDATE_RUNNER="
+        "utils/run_k4_shared_rope_k1_remainder_int8_mlp_weight_only.py"
+    ) in source
+    assert "export REQUIRE_K1_REMAINDER_INCREMENTAL=false" in source
+    assert "export REQUIRE_INT8_MLP_INCREMENTAL=true" in source
+
+    general = WRAPPER.read_text(encoding="utf-8")
+    assert "INT8_K1_COMPOSITION=true" in general
+    assert '|| "$INT8_K1_COMPOSITION" == true' in general
+    assert "utils/validate_k1_remainder_profile.py" in general
+    assert "utils/validate_int8_mlp_full_song_profile.py" in general
 
 
 def test_general_wrapper_requires_k4_metadata_for_every_profile() -> None:

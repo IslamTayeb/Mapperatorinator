@@ -6,6 +6,10 @@ from types import SimpleNamespace
 import pytest
 
 from utils import run_k4_shared_rope_approximate_weight_only as combined
+from utils import run_k4_shared_rope_int8_mlp_weight_only as int8_combined
+from utils import (
+    run_k4_shared_rope_k1_remainder_int8_mlp_weight_only as k1_int8_combined,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -202,6 +206,61 @@ def test_combined_runner_enables_k1_remainder_graphs_only_when_requested(
 
     assert calls == [{"block_size": 4, "graph_remainders": True}]
     monkeypatch.setattr(inference, "load_model_with_engine", original_loader)
+
+
+def test_int8_combined_runner_selects_overlay_without_replacing_other_layers(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    calls = []
+
+    def fake_combined(config_name, overrides, output, **kwargs):
+        calls.append((config_name, list(overrides), output, kwargs))
+
+    monkeypatch.setattr(int8_combined, "run_combined", fake_combined)
+    output = tmp_path / "init.json"
+
+    int8_combined.run("profile_salvalai", ["seed=12345"], output)
+
+    assert calls == [
+        (
+            "profile_salvalai",
+            ["seed=12345"],
+            output,
+            {
+                "weight_runner": int8_combined.run_int8_weight_only,
+                "composition_version": int8_combined.COMPOSITION_VERSION,
+            },
+        )
+    ]
+
+
+def test_k1_int8_runner_composes_graph_remainders_with_one_overlay(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    calls = []
+
+    def fake_combined(config_name, overrides, output, **kwargs):
+        calls.append((config_name, list(overrides), output, kwargs))
+
+    monkeypatch.setattr(k1_int8_combined, "run_combined", fake_combined)
+    output = tmp_path / "init.json"
+
+    k1_int8_combined.run("profile_salvalai", ["seed=12345"], output)
+
+    assert calls == [
+        (
+            "profile_salvalai",
+            ["seed=12345"],
+            output,
+            {
+                "graph_remainders": True,
+                "weight_runner": k1_int8_combined.run_int8_weight_only,
+                "composition_version": k1_int8_combined.COMPOSITION_VERSION,
+            },
+        )
+    ]
 
 
 @pytest.mark.parametrize(

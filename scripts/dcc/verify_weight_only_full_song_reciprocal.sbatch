@@ -28,6 +28,7 @@ REQUIRE_EXACT_TIMING=${REQUIRE_EXACT_TIMING:-true}
 REQUIRE_K4_CANDIDATE=${REQUIRE_K4_CANDIDATE:-false}
 REQUIRE_SHARED_ROPE_INCREMENTAL=${REQUIRE_SHARED_ROPE_INCREMENTAL:-false}
 REQUIRE_K1_REMAINDER_INCREMENTAL=${REQUIRE_K1_REMAINDER_INCREMENTAL:-false}
+REQUIRE_INT8_MLP_INCREMENTAL=${REQUIRE_INT8_MLP_INCREMENTAL:-false}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_LABEL=${RUN_LABEL:-split-weight-full-song-reciprocal}
 RUN_ROOT="$WORK/runs/$RUN_LABEL-${SLURM_JOB_ID:-manual}"
@@ -35,6 +36,7 @@ EXTENSION_JOB_KEY=${SLURM_JOB_ID:-manual}
 EXTENSION_CACHE_ROOT_OVERRIDE=${EXTENSION_CACHE_ROOT_OVERRIDE:-}
 BASELINE_EXTENSION_KEY_OVERRIDE=${BASELINE_EXTENSION_KEY_OVERRIDE:-}
 CANDIDATE_EXTENSION_KEY_OVERRIDE=${CANDIDATE_EXTENSION_KEY_OVERRIDE:-}
+INT8_K1_COMPOSITION=false
 
 if [[ "$BASELINE_COMMIT" != "$CANDIDATE_COMMIT" ]]; then
   echo "split+weight reciprocal requires one shared baseline/candidate commit" >&2
@@ -91,12 +93,41 @@ if [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" != true \
   echo "REQUIRE_K1_REMAINDER_INCREMENTAL must be true or false" >&2
   exit 2
 fi
-if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
-  && "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true ]]; then
-  echo "shared-RoPE and K1-remainder incremental gates are mutually exclusive" >&2
+if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" != true \
+  && "$REQUIRE_INT8_MLP_INCREMENTAL" != false ]]; then
+  echo "REQUIRE_INT8_MLP_INCREMENTAL must be true or false" >&2
   exit 2
 fi
-if [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true ]]; then
+enabled_incremental_modes=0
+for enabled in \
+  "$REQUIRE_SHARED_ROPE_INCREMENTAL" \
+  "$REQUIRE_K1_REMAINDER_INCREMENTAL" \
+  "$REQUIRE_INT8_MLP_INCREMENTAL"; do
+  if [[ "$enabled" == true ]]; then
+    enabled_incremental_modes=$((enabled_incremental_modes + 1))
+  fi
+done
+if (( enabled_incremental_modes > 1 )); then
+  echo "shared-RoPE, K1-remainder, and INT8 MLP gates are mutually exclusive" >&2
+  exit 2
+fi
+if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then
+  if [[ "$REQUIRE_K4_CANDIDATE" != true || "$REQUIRE_EXACT_TIMING" != true ]]; then
+    echo "INT8 MLP gate requires K4 and exact timing" >&2
+    exit 2
+  fi
+  if [[ "$BASELINE_RUNNER" == utils/run_k4_shared_rope_k1_remainder.py \
+    && "$CANDIDATE_RUNNER" \
+      == utils/run_k4_shared_rope_k1_remainder_int8_mlp_weight_only.py ]]; then
+    INT8_K1_COMPOSITION=true
+  elif [[ "$BASELINE_RUNNER" \
+      != utils/run_k4_shared_rope_approximate_weight_only.py \
+    || "$CANDIDATE_RUNNER" \
+      != utils/run_k4_shared_rope_int8_mlp_weight_only.py ]]; then
+    echo "INT8 MLP gate requires the shared-RoPE combined control or exact K1-remainder control" >&2
+    exit 2
+  fi
+elif [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true ]]; then
   if [[ "$REQUIRE_K4_CANDIDATE" != true || "$REQUIRE_EXACT_TIMING" != true ]]; then
     echo "K1-remainder gate requires K4 and exact timing" >&2
     exit 2
@@ -303,6 +334,8 @@ echo "require_exact_timing=$REQUIRE_EXACT_TIMING"
 echo "require_k4_candidate=$REQUIRE_K4_CANDIDATE"
 echo "require_shared_rope_incremental=$REQUIRE_SHARED_ROPE_INCREMENTAL"
 echo "require_k1_remainder_incremental=$REQUIRE_K1_REMAINDER_INCREMENTAL"
+echo "require_int8_mlp_incremental=$REQUIRE_INT8_MLP_INCREMENTAL"
+echo "int8_k1_composition=$INT8_K1_COMPOSITION"
 echo "audio=$AUDIO"
 echo "run_root=$RUN_ROOT"
 echo "extension_cache_mode=$EXTENSION_CACHE_MODE"
@@ -499,6 +532,19 @@ run_profile() {
       --role "$validation_role" \
       > "$RUN_ROOT/$role.weight-only-validation.json"
   )
+  if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then
+    local int8_validation_role=baseline
+    if [[ "$candidate" == 1 ]]; then
+      int8_validation_role=candidate
+    fi
+    (
+      cd "$CANDIDATE_REPO"
+      "$PYTHON" utils/validate_int8_mlp_full_song_profile.py \
+        --profile "$profile" \
+        --role "$int8_validation_role" \
+        > "$RUN_ROOT/$role.int8-mlp-validation.json"
+    )
+  fi
   local k4_validation_role=baseline
   if [[ "$runtime_candidate" == 1 && "$REQUIRE_K4_CANDIDATE" == true ]]; then
     k4_validation_role=candidate
@@ -511,9 +557,10 @@ run_profile() {
       --block-size 4 \
       > "$RUN_ROOT/$role.k4-validation.json"
   )
-  if [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true ]]; then
+  if [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true \
+    || "$INT8_K1_COMPOSITION" == true ]]; then
     local remainder_role=control
-    if [[ "$candidate" == 1 ]]; then
+    if [[ "$candidate" == 1 || "$INT8_K1_COMPOSITION" == true ]]; then
       remainder_role=candidate
     fi
     (
@@ -635,12 +682,15 @@ PY
 
 INITIALIZATION_ROLES=candidate_first,candidate_second
 if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
-  || "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true ]]; then
+  || "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true \
+  || "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then
   INITIALIZATION_ROLES=baseline_first,candidate_first,candidate_second,baseline_second
 fi
 "$PYTHON" - "$RUN_ROOT" "$INITIALIZATION_ROLES" \
   "$REQUIRE_SHARED_ROPE_INCREMENTAL" \
-  "$REQUIRE_K1_REMAINDER_INCREMENTAL" <<'PY'
+  "$REQUIRE_K1_REMAINDER_INCREMENTAL" \
+  "$REQUIRE_INT8_MLP_INCREMENTAL" \
+  "$INT8_K1_COMPOSITION" <<'PY'
 import json
 import math
 import statistics
@@ -650,7 +700,9 @@ from pathlib import Path
 root = Path(sys.argv[1])
 roles = tuple(sys.argv[2].split(","))
 require_shared_rope = sys.argv[3] == "true"
-shared_rope_both_arms = sys.argv[4] == "true"
+shared_rope_both_arms = sys.argv[4] == "true" or sys.argv[5] == "true"
+require_int8_mlp = sys.argv[5] == "true"
+int8_k1_composition = sys.argv[6] == "true"
 runs = {}
 required_numbers = (
     "initialization_wall_seconds",
@@ -724,6 +776,27 @@ if require_shared_rope or shared_rope_both_arms:
                     f"{role}: combined control unexpectedly enabled shared RoPE"
                 )
 
+if require_int8_mlp:
+    for role in ("baseline_first", "baseline_second"):
+        if "int8_mlp_overlay" in runs[role]:
+            raise SystemExit(f"{role}: K1 control unexpectedly enabled INT8 MLP")
+        if runs[role].get("combined_runtime") \
+            != "k4-split-kv-mixed-weight-shared-rope-v1":
+            raise SystemExit(f"{role}: K1 control composition identity is wrong")
+    for role in ("candidate_first", "candidate_second"):
+        overlay = runs[role].get("int8_mlp_overlay")
+        if not isinstance(overlay, dict):
+            raise SystemExit(f"{role}: missing INT8 MLP initialization evidence")
+        if overlay.get("dispatch_counter") != "int8_weight_mlp_tail":
+            raise SystemExit(f"{role}: INT8 MLP dispatch ownership is wrong")
+        expected_runtime = (
+            "k4-split-kv-mixed-weight-shared-rope-k1-remainder-int8-mlp-v1"
+            if int8_k1_composition
+            else "k4-split-kv-mixed-weight-shared-rope-int8-mlp-v1"
+        )
+        if runs[role].get("combined_runtime") != expected_runtime:
+            raise SystemExit(f"{role}: INT8 K1 composition identity is wrong")
+
 summary = {
     "schema_version": 1,
     "result_class": "documented-drift",
@@ -754,7 +827,25 @@ ANALYSIS_DISPATCH_ARGS=(
   --allow-optional-dispatch-delta
     'records.main_generation[[]*].optimized_cuda_graphs.*'
 )
-if [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then
+  # Both arms already own K4, split-KV, mixed weights, shared RoPE, and captured K1
+  # remainders. The candidate replaces the single mixed MLP hook with INT8;
+  # token-dependent graph counts may therefore differ in main generation.
+  ANALYSIS_EXACT_ARGS=(
+    --require-exact-label timing_context
+    --require-exact-dispatch-label timing_context
+  )
+  ANALYSIS_DISPATCH_ARGS=(
+    --allow-dispatch-delta
+      'records.main_generation[[]*].optimized_dispatch_capture_hits'
+    --allow-dispatch-delta
+      'records.main_generation[[]*].optimized_dispatch_capture_hits.int8_weight_mlp_tail'
+    --allow-optional-dispatch-delta
+      'records.main_generation[[]*].optimized_dispatch_capture_hits.*'
+    --allow-optional-dispatch-delta
+      'records.main_generation[[]*].optimized_cuda_graphs.*'
+  )
+elif [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true ]]; then
   ANALYSIS_EXACT_ARGS=(
     --require-exact-label timing_context
     --require-exact-label main_generation
@@ -827,7 +918,8 @@ for artifact in \
     exit 2
   fi
 done
-if [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true \
+  || "$INT8_K1_COMPOSITION" == true ]]; then
   for role in baseline_first candidate_first candidate_second baseline_second; do
     artifact="$RUN_ROOT/$role.k1-remainder-validation.json"
     if [[ ! -s "$artifact" ]]; then
@@ -836,7 +928,17 @@ if [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true ]]; then
     fi
   done
 fi
-if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then
+  for role in baseline_first candidate_first candidate_second baseline_second; do
+    artifact="$RUN_ROOT/$role.int8-mlp-validation.json"
+    if [[ ! -s "$artifact" ]]; then
+      echo "missing required INT8 MLP artifact: $artifact" >&2
+      exit 2
+    fi
+  done
+fi
+if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
+  || "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then
   for artifact in \
     "$RUN_ROOT/candidate-initialization/baseline_first.json" \
     "$RUN_ROOT/candidate-initialization/baseline_second.json"; do
@@ -863,6 +965,9 @@ if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
   EXPECTED_EXACT_DISPATCH_LABELS=$EXPECTED_EXACT_LABELS
 elif [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true ]]; then
   EXPECTED_EXACT_LABELS=timing_context,main_generation
+elif [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then
+  EXPECTED_EXACT_LABELS=timing_context
+  EXPECTED_EXACT_DISPATCH_LABELS=$EXPECTED_EXACT_LABELS
 elif [[ "$REQUIRE_EXACT_TIMING" == true ]]; then
   EXPECTED_EXACT_LABELS=timing_context
   EXPECTED_EXACT_DISPATCH_LABELS=$EXPECTED_EXACT_LABELS

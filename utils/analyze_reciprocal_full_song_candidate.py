@@ -112,6 +112,7 @@ INVARIANT_EFFECTIVE_CONFIG = {
     "native_q1_self_attention": True,
     "native_q1_rope_cache_self_attention": True,
 }
+FIXED_MAIN_STEPS = 8_294
 
 
 class CandidateAnalysisError(ValueError):
@@ -474,6 +475,7 @@ def _parse_run(
         "main_model_seconds": main_model,
         "main_tokens": float(main_tokens),
         "main_tps": main_tps,
+        "fixed_8294_main_seconds": main_model * FIXED_MAIN_STEPS / main_tokens,
         "main_outer_stage_wall_seconds": main_stage.wall_seconds,
         "final_postprocess_write_seconds": final_postprocess,
         "complete_request_wall_seconds": complete_wall,
@@ -980,6 +982,9 @@ def analyze(
             "cold_process_stage_sum": "sum of measured stage walls from compile_args through final write",
             "cold_process_outer_wall": "compile_args start through final write finish",
             "reciprocal_order": "baseline,candidate,candidate,baseline",
+            "fixed_8294_main_seconds": (
+                "main synchronized model time scaled to exactly 8294 generated steps"
+            ),
         },
         "workload": workload,
         "parity": parity,

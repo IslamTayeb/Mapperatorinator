@@ -275,7 +275,12 @@ def test_exact_fp32_reports_reciprocal_order_aware_metrics(tmp_path: Path) -> No
     tps = report["metrics"]["main_tps"]
     assert tps["direction"] == "higher_is_better"
     assert tps["improvement"] > 0
+    fixed = report["metrics"]["fixed_8294_main_seconds"]
+    assert fixed["direction"] == "lower_is_better"
+    assert fixed["baseline_median"] == pytest.approx(10.2 * 8294 / 4)
+    assert fixed["candidate_median"] == pytest.approx(8.2 * 8294 / 4)
     assert "metric.complete_request_wall_seconds=" in text_report(report)
+    assert "metric.fixed_8294_main_seconds=" in text_report(report)
 
 
 def test_exact_dispatch_delta_requires_a_used_explicit_pattern(tmp_path: Path) -> None:
