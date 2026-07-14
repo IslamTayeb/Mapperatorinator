@@ -632,7 +632,7 @@ def test_generate_window_preserves_custom_generate_dispatch(monkeypatch):
     assert "encoder_stabilization" not in stats
 
 
-def test_generate_window_exposes_encoder_copy_counters_only_for_detail_profile(
+def test_generate_window_exposes_encoder_copy_counters_for_synchronized_profile(
     monkeypatch,
 ):
     captured = {}
@@ -675,13 +675,11 @@ def test_generate_window_exposes_encoder_copy_counters_only_for_detail_profile(
         "generation_profile_context",
         lambda **kwargs: nullcontext(),
     )
-    monkeypatch.setattr(engine_module, "detail_ranges_enabled", lambda: True)
-
     _, stats = engine_module._generate_window(
         FakeModel(),
         object(),
         {"inputs": torch.tensor([[1]], dtype=torch.long)},
-        {"precision": "fp32"},
+        {"precision": "fp32", "sync_model_timing": True},
         context_state=FakeContextState(),
         preset=OPTIMIZED_PRESETS["fp32"],
     )

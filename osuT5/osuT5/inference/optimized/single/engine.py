@@ -12,7 +12,6 @@ import torch
 
 from ....event import ContextType
 from ....runtime_profiling import (
-    detail_ranges_enabled,
     generation_profile_context,
     profile_range,
 )
@@ -286,7 +285,7 @@ def _generate_window(
     )
     encoder_stabilization_stats = (
         _new_encoder_stabilization_stats()
-        if detail_ranges_enabled()
+        if sync_model_timing
         else None
     )
     custom_generate = partial(
