@@ -138,8 +138,14 @@ elif name == "vocab":
     if status != 0:
         reject(f"unexpected exit status {status}")
     ceiling = report.get("fixed_work_ceiling", {})
-    if "main_ceiling_clears_threshold" not in ceiling:
-        reject("missing fixed-work ceiling decision")
+    clears = ceiling.get("main_ceiling_clears_threshold")
+    if not isinstance(clears, bool):
+        reject("fixed-work ceiling decision must be a bool")
+    expected = (
+        "retain_for_candidate_kernel" if clears else "stop_below_main_component_gate"
+    )
+    if report.get("decision") != expected:
+        reject("vocabulary decision is inconsistent with its fixed-work ceiling")
 else:
     reject("unknown gate")
 PY

@@ -37,6 +37,8 @@ class KernelComponentLadderTest(unittest.TestCase):
         self.assertIn('classify_gate "$name" "$status" "$report"', source)
         self.assertIn('status == 3 and not promoted', source)
         self.assertIn('status == 3 and sizing is False', source)
+        self.assertIn('if not isinstance(clears, bool):', source)
+        self.assertIn('vocabulary decision is inconsistent', source)
         self.assertIn('#SBATCH --time=02:00:00', source)
         self.assertIn('LADDER_REMOTE_BRANCH=codex/500tps-kernel-component-ladder', source)
         self.assertIn('MAPPERATORINATOR_LADDER_REPO:?', source)
