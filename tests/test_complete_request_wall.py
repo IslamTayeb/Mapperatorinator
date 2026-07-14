@@ -49,6 +49,8 @@ def _profile(role: str, *, scale: float = 1.0):
 def test_summarizes_complete_request_groups_and_paired_overhead():
     report = summarize(_profile("control"), _profile("budget", scale=1.1))
 
+    assert report["measurement_scope"]["authoritative_performance_role"] == "control"
+    assert report["measurement_scope"]["stage_boundary_cuda_synchronization"] is True
     control = report["control"]
     assert control["request_to_output"]["wall_seconds"] == pytest.approx(11.8)
     assert control["cold_in_process"]["wall_seconds"] == pytest.approx(13.8)
