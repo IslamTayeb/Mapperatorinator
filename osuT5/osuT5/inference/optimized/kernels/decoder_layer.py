@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import torch
-from torch.utils.cpp_extension import load_inline
+
+from .native_extension import load_inline_or_prebuilt as load_inline
 
 
 _NATIVE_DECODER_LAYER = None
