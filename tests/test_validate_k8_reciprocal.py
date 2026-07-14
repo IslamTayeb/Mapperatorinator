@@ -19,14 +19,20 @@ def _osu(path: Path, *, x: int) -> Path:
     return path
 
 
-def _k8(*, logical: int = 3, physical: int = 9, block_replays: int = 1) -> dict:
+def _k8(
+    *,
+    block_size: int = 8,
+    logical: int = 3,
+    physical: int = 9,
+    block_replays: int = 1,
+) -> dict:
     wasted = physical - logical
     return {
-        "block_size": 8,
+        "block_size": block_size,
         "prefill_steps": 1,
-        "eligible_steps": 8 * block_replays,
+        "eligible_steps": block_size * block_replays,
         "block_replays": block_replays,
-        "remainder_steps": physical - 1 - 8 * block_replays,
+        "remainder_steps": physical - 1 - block_size * block_replays,
         "status_reads": 2,
         "copy_calls": 4,
         "copy_bytes": 64,
@@ -53,6 +59,22 @@ def _k8(*, logical: int = 3, physical: int = 9, block_replays: int = 1) -> dict:
     }
 
 
+def _block_stats(block_size: int, logical: int) -> dict:
+    if block_size == 1:
+        return _k8(
+            block_size=1,
+            logical=logical,
+            physical=logical,
+            block_replays=max(0, logical - 1),
+        )
+    return _k8(
+        block_size=block_size,
+        logical=logical,
+        physical=1 + block_size,
+        block_replays=1,
+    )
+
+
 def _profile(
     result: Path,
     *,
@@ -60,6 +82,8 @@ def _profile(
     main_tokens: list[int],
     main_seconds: float,
     k8: dict | None = None,
+    block_size: int = 8,
+    stage_seconds: float = 2.0,
 ) -> dict:
     content = result.read_bytes()
     metadata = {key: "same" for key in exact.CONTRACT_METADATA_KEYS}
@@ -91,7 +115,7 @@ def _profile(
     }
     if candidate:
         main["optimized_cuda_graphs"]["k8_candidate"] = k8 or _k8(
-            logical=len(main_tokens)
+            logical=len(main_tokens), block_size=block_size
         )
     timing = {
         "profile_label": "timing_context",
@@ -106,15 +130,14 @@ def _profile(
         "optimized_cuda_graphs": {"graph_count": 1, "decode_replays": 2},
     }
     if candidate:
-        timing["optimized_cuda_graphs"]["k8_candidate"] = _k8(
-            logical=2,
-            physical=9,
+        timing["optimized_cuda_graphs"]["k8_candidate"] = _block_stats(
+            block_size, 2
         )
     return {
         "schema_version": 1,
         "metadata": metadata,
-        "summary": {"stage_wall_seconds": {"inference": 2.0}},
-        "stages": [{"name": "inference", "wall_seconds": 2.0}],
+        "summary": {"stage_wall_seconds": {"inference": stage_seconds}},
+        "stages": [{"name": "inference", "wall_seconds": stage_seconds}],
         "generation": [timing, main],
     }
 
@@ -178,6 +201,30 @@ def _summarize(paths: dict[str, Path], *, scope: str = "smoke") -> dict:
     )
 
 
+def _counter_profiles(tmp_path: Path) -> dict[str, Path]:
+    output = _osu(tmp_path / "counter.osu", x=64)
+    tokens = [1, 2, 3]
+    profiles = {}
+    for name, block_size, seconds in (
+        ("baseline_first", 1, 1.0),
+        ("candidate_second", 4, 0.8),
+        ("candidate_first", 4, 0.8),
+        ("baseline_second", 1, 1.0),
+    ):
+        profiles[name] = _write(
+            tmp_path / f"{name}.json",
+            _profile(
+                output,
+                candidate=True,
+                main_tokens=tokens,
+                main_seconds=seconds,
+                k8=_block_stats(block_size, len(tokens)),
+                block_size=block_size,
+            ),
+        )
+    return profiles
+
+
 def test_changed_tokens_are_reported_but_do_not_fake_fixed_work(tmp_path):
     report = _summarize(_profiles(tmp_path, diverge=True))
 
@@ -198,6 +245,73 @@ def test_changed_tokens_are_reported_but_do_not_fake_fixed_work(tmp_path):
     assert candidate["logical_steps"] == 3
     assert candidate["physical_steps"] == 9
     assert candidate["wasted_steps"] == 6
+    full = report["orders"]["baseline_first"]["full_decode"]
+    assert full["evidence_class"] == "natural_work_end_to_end"
+    assert full["baseline_generated_tokens"] == 5
+    assert full["candidate_logical_steps"] == 5
+    assert full["candidate_physical_steps"] == 18
+    assert full["candidate_wasted_steps"] == 13
+    assert full["baseline_model_elapsed_seconds"] == 1.5
+    assert full["candidate_model_elapsed_seconds"] == 1.3
+
+
+def test_natural_wall_can_pass_when_logical_tps_is_slower(tmp_path):
+    paths = _profiles(tmp_path, diverge=True)
+    for name in ("candidate_first", "candidate_second"):
+        payload = json.loads(paths[name].read_text())
+        payload["generation"][1]["model_elapsed_seconds"] = 1.2
+        payload["generation"][1]["wall_seconds"] = 1.3
+        payload["summary"]["stage_wall_seconds"]["inference"] = 1.5
+        payload["stages"][0]["wall_seconds"] = 1.5
+        _write(paths[name], payload)
+
+    report = _summarize(paths)
+
+    assert report["feasibility_pass"]
+    assert report["reciprocal_main_logical_tps_speedup_pct"] < 0
+    assert report["reciprocal_complete_request_stage_wall_speedup_pct"] == 25.0
+    for order in report["orders"].values():
+        assert order["full_decode"]["complete_request_stage_wall_speedup_pct"] == 25.0
+
+
+def test_natural_wall_must_improve_in_both_reciprocal_orders(tmp_path):
+    paths = _profiles(tmp_path, diverge=True)
+    payload = json.loads(paths["candidate_first"].read_text())
+    payload["summary"]["stage_wall_seconds"]["inference"] = 2.1
+    payload["stages"][0]["wall_seconds"] = 2.1
+    _write(paths["candidate_first"], payload)
+
+    report = _summarize(paths)
+
+    assert not report["feasibility_pass"]
+    assert any(
+        "candidate_first natural-work complete-stage wall speedup" in failure
+        for failure in report["failures"]
+    )
+
+
+def test_k1_counter_control_makes_k4_fixed_work_explicit(tmp_path):
+    report = gate.summarize(
+        _counter_profiles(tmp_path),
+        scope="smoke",
+        minimum_smoke_speedup_pct=0.0,
+        full_fixed_work_saving_seconds=0.1,
+        candidate_block_size=4,
+        baseline_block_size=1,
+    )
+
+    assert report["feasibility_pass"]
+    assert report["comparison_mode"] == "counter_control_vs_counter_candidate"
+    assert report["fixed_work"]["available"]
+    assert report["baseline_counter_totals"]["baseline_first"]["main_generation"][
+        "block_replays"
+    ] == 2
+    assert report["orders"]["baseline_first"]["full_decode"]["evidence_class"] == (
+        "fixed_work_counter_rng"
+    )
+    assert report["orders"]["baseline_first"]["main_generation"]["candidate"][
+        "wasted_steps"
+    ] == 2
 
 
 def test_exact_fixed_work_can_pass_full_saving_gate(tmp_path):
