@@ -243,7 +243,16 @@ def analyze(
                 "candidate_main_tps": candidate.metrics["main_tps"],
                 "baseline_complete_request_wall_seconds": baseline.metrics["complete_request_wall_seconds"],
                 "candidate_complete_request_wall_seconds": candidate.metrics["complete_request_wall_seconds"],
-                "token_divergence": _token_divergence(baseline, candidate, "main_generation"),
+                "timing_token_divergence": _token_divergence(
+                    baseline,
+                    candidate,
+                    "timing_context",
+                ),
+                "main_token_divergence": _token_divergence(
+                    baseline,
+                    candidate,
+                    "main_generation",
+                ),
                 "structure_divergence": _structure_divergence(baseline, candidate),
             }
         )
@@ -342,7 +351,8 @@ def text_report(report: dict[str, Any]) -> str:
         lines.append(
             f"song.{row['name']}.candidate_main_tps={row['candidate_main_tps']:.9f},"
             f"candidate_request_wall={row['candidate_complete_request_wall_seconds']:.9f},"
-            f"token_count_delta={row['token_divergence']['token_count_delta']},"
+            f"token_count_delta={row['main_token_divergence']['token_count_delta']},"
+            f"stopping_equal={str(row['main_token_divergence']['stopping_equal']).lower()},"
             f"objects_delta={row['structure_divergence']['scalar_deltas']['hit_objects']}"
         )
     return "\n".join(lines) + "\n"
