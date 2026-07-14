@@ -22,6 +22,8 @@ def test_wrapper_uses_full_fp32_optimized_reciprocal_order_and_launchers() -> No
     assert '[[ "$PROFILE_CONFIG" != profile_salvalai ]]' in source
     assert "precision=fp32" in source
     assert "inference_engine=optimized" in source
+    assert "profile_detail_ranges=false" in source
+    assert "profile_cuda_capture=false" in source
     assert "profile_pass_kind=untraced_control" in source
     assert '"$PYTHON" inference.py --config-name "$PROFILE_CONFIG"' in source
     assert '"$PYTHON" utils/run_approximate_weight_only.py' in source

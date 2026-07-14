@@ -168,6 +168,8 @@ COMMON_OVERRIDES=(
   num_beams=1
   seed=12345
   profile_inference=true
+  profile_detail_ranges=false
+  profile_cuda_capture=false
   profile_pass_kind=untraced_control
 )
 
