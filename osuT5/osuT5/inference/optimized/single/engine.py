@@ -849,11 +849,15 @@ class OptimizedSingleRuntime:
                 "optimized single runtime requires ProductionDecodeSession."
             )
         inputs = model_kwargs.get("inputs")
-        if not isinstance(inputs, torch.Tensor) or inputs.ndim < 1:
-            raise TypeError("optimized runtime requires tensor model inputs")
+        if isinstance(inputs, torch.Tensor) and inputs.ndim >= 1:
+            batch_size = int(inputs.shape[0])
+        elif self._persistent_graph_workspace_pool is not None:
+            raise TypeError("persistent graph workspace requires tensor model inputs")
+        else:
+            batch_size = 1
         with context_state.window_lease(
             model,
-            batch_size=int(inputs.shape[0]),
+            batch_size=batch_size,
             num_beams=int(generate_kwargs.get("num_beams", 1)),
             cfg_scale=float(generate_kwargs.get("cfg_scale", 1.0)),
         ):
