@@ -49,6 +49,7 @@ def _k8(*, logical: int = 3, physical: int = 9, block_replays: int = 1) -> dict:
         "processor_signature_d2h_copy_bytes": 32,
         "processor_signature_setup_seconds": 0.02,
         "parent_backend": "cuda_python_child_graphs",
+        "capture_state_restore_synchronized": True,
     }
 
 
@@ -301,3 +302,29 @@ def test_logical_steps_must_match_generated_tokens(tmp_path):
 
     assert not report["feasibility_pass"]
     assert any("does not equal generated_tokens" in failure for failure in report["failures"])
+
+
+def test_candidate_requires_synchronized_capture_restore_evidence(tmp_path):
+    paths = _profiles(tmp_path)
+    payload = json.loads(paths["candidate_first"].read_text())
+    stats = payload["generation"][1]["optimized_cuda_graphs"]["k8_candidate"]
+    stats.pop("capture_state_restore_synchronized")
+    _write(paths["candidate_first"], payload)
+
+    report = _summarize(paths)
+
+    assert not report["feasibility_pass"]
+    assert any("lacks synchronized capture restore" in failure for failure in report["failures"])
+
+
+def test_candidate_graph_cache_signature_must_repeat(tmp_path):
+    paths = _profiles(tmp_path)
+    payload = json.loads(paths["candidate_first"].read_text())
+    payload["generation"][1]["optimized_cuda_graphs"]["decode_replays"] += 1
+    _write(paths["candidate_first"], payload)
+
+    report = _summarize(paths)
+
+    assert not report["feasibility_pass"]
+    assert not report["graph_cache_repeatability"]["candidate_pass"]
+    assert "candidate reciprocal graph-cache signatures differ" in report["failures"]

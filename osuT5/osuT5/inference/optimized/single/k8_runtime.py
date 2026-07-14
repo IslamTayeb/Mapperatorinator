@@ -808,6 +808,22 @@ def _snapshot_tensors(
     return [(value, value.detach().clone()) for value in tensors.values()]
 
 
+def _restore_snapshot_tensors(
+    snapshots: list[tuple[torch.Tensor, torch.Tensor]],
+    *,
+    device: torch.device,
+) -> None:
+    """Order capture-time writes before restoring persistent K8 state."""
+
+    # torch.cuda.graph captures on a side stream and capture_end does not make
+    # the caller's stream wait for that work.  Without this synchronization,
+    # tail-capture writes to sequence/RNG/processor state can race these copies.
+    torch.cuda.synchronize(device)
+    for tensor, snapshot in snapshots:
+        tensor.copy_(snapshot)
+    torch.cuda.synchronize(device)
+
+
 def _capture_k8_entry(
     model,
     model_inputs: dict[str, Any],
@@ -838,8 +854,7 @@ def _capture_k8_entry(
                 static_inputs=static_inputs,
                 do_sample=do_sample,
             )
-        for tensor, snapshot in snapshots:
-            tensor.copy_(snapshot)
+        _restore_snapshot_tensors(snapshots, device=device)
         parent = _ChildGraphSequence.build(
             model_graph,
             tail_graph,
@@ -1053,6 +1068,7 @@ def k8_active_prefix_decode_generate(
         "processor_signature_d2h_copy_bytes": processor_d2h["bytes"],
         "processor_signature_setup_seconds": processor_signature_seconds,
         "parent_backend": "cuda_python_child_graphs",
+        "capture_state_restore_synchronized": True,
     }
     stable_encoder_holder["__k8_latest_stats__"] = stats
 

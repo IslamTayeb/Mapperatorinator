@@ -1219,6 +1219,28 @@ def test_profile_transparency_ignores_graph_capture_time_but_not_replay_shape(tm
     assert replay_report["graph_cache_check"]["status"] == "FAIL"
 
 
+def test_graph_cache_signature_ignores_only_volatile_runtime_telemetry():
+    left = {
+        "decode_replays": 24,
+        "capture_seconds": 0.1,
+        "prompt_seed_setup_seconds": 0.01,
+        "processor_signature_setup_seconds": 0.02,
+        "peak_vram_bytes": 100,
+        "rng_window_identity": 3,
+    }
+    right = {
+        **left,
+        "capture_seconds": 0.9,
+        "prompt_seed_setup_seconds": 0.03,
+        "processor_signature_setup_seconds": 0.04,
+        "peak_vram_bytes": 200,
+    }
+
+    assert nsight._canonicalize_graph_cache_value(left) == nsight._canonicalize_graph_cache_value(right)
+    right["decode_replays"] = 32
+    assert nsight._canonicalize_graph_cache_value(left) != nsight._canonicalize_graph_cache_value(right)
+
+
 def test_profile_transparency_detects_token_count_stop_and_graph_drift(tmp_path):
     control = _inference_profile(tmp_path / "control.profile.json")
     traced = _inference_profile(

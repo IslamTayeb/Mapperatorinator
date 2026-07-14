@@ -18,6 +18,7 @@ from osuT5.osuT5.inference.optimized.single.k8_runtime import (
     _processor_signature,
     _prompt_seed,
     _request_seed,
+    _restore_snapshot_tensors,
     _runtime_slot,
     _sync_model_kwargs_after_k8,
     _update_static_model_inputs,
@@ -238,6 +239,33 @@ def test_static_handoff_updates_token_positions_and_causal_mask_in_place():
     assert inputs["decoder_position_ids"].tolist() == [[5]]
     assert inputs["decoder_attention_mask"][0, 0, 0, 5].item() == 0
     assert {name: value.data_ptr() for name, value in inputs.items()} == pointers
+
+
+def test_capture_snapshot_restore_waits_for_side_stream_before_copy(monkeypatch):
+    order = []
+
+    class Tensor:
+        def copy_(self, snapshot):
+            order.append(("copy", snapshot))
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "synchronize",
+        lambda device: order.append(("synchronize", device)),
+    )
+    device = torch.device("cuda", 0)
+
+    _restore_snapshot_tensors(
+        [(Tensor(), "sequence"), (Tensor(), "lookback")],
+        device=device,
+    )
+
+    assert order == [
+        ("synchronize", device),
+        ("copy", "sequence"),
+        ("copy", "lookback"),
+        ("synchronize", device),
+    ]
 
 
 def test_left_padding_survives_two_k8_handoffs_with_position_progression():
@@ -540,6 +568,7 @@ def test_session_reports_latest_k8_window_independent_of_graph_entries():
         "processor_signature_d2h_copy_bytes": 32,
         "processor_signature_setup_seconds": 0.02,
         "parent_backend": "cuda_python_child_graphs",
+        "capture_state_restore_synchronized": True,
     }
     signature = ("shape",)
     session.active_state_signature = signature
@@ -580,6 +609,7 @@ def test_session_reports_latest_k8_window_independent_of_graph_entries():
         "processor_signature_d2h_copy_bytes": 32,
         "processor_signature_setup_seconds": 0.02,
         "parent_backend": "cuda_python_child_graphs",
+        "capture_state_restore_synchronized": True,
     }
 
 
