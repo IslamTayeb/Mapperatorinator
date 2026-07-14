@@ -24,6 +24,21 @@ def _load_inline(**kwargs):
     return load_inline(**kwargs)
 
 
+_CPP_SOURCE = r"""
+#include <torch/extension.h>
+
+torch::Tensor cross_attention_one_pass(
+    torch::Tensor query,
+    torch::Tensor keys,
+    torch::Tensor values);
+torch::Tensor cross_attention_split(
+    torch::Tensor query,
+    torch::Tensor keys,
+    torch::Tensor values,
+    int64_t splits);
+"""
+
+
 _CUDA_SOURCE = r"""
 #include <torch/extension.h>
 
@@ -340,7 +355,7 @@ def _load_cross_attention_extension():
     if _CROSS_ATTENTION_EXTENSION is None:
         _CROSS_ATTENTION_EXTENSION = _load_inline(
             name="mapperatorinator_cross_attention_split_kv_scout",
-            cpp_sources="",
+            cpp_sources=_CPP_SOURCE,
             cuda_sources=_CUDA_SOURCE,
             functions=["cross_attention_one_pass", "cross_attention_split"],
             extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"],
