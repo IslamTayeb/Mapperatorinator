@@ -10,7 +10,7 @@ def test_control_delegate_retains_int8_and_captured_remainders(monkeypatch, tmp_
     def fake_run(config_name, overrides, output, **kwargs):
         calls.append((config_name, overrides, output, kwargs))
 
-    monkeypatch.setattr(control, "run_control", fake_run)
+    monkeypatch.setattr(control, "_control_runner", lambda: fake_run)
     output = tmp_path / "control.json"
     control._run_delegate("profile_salvalai", ["seed=12345"], output)
 
@@ -33,7 +33,7 @@ def test_candidate_delegate_changes_only_timing_precision(monkeypatch, tmp_path)
     def fake_run(config_name, overrides, output, **kwargs):
         calls.append((config_name, overrides, output, kwargs))
 
-    monkeypatch.setattr(candidate, "run_hybrid", fake_run)
+    monkeypatch.setattr(candidate, "_hybrid_runner", lambda: fake_run)
     output = tmp_path / "candidate.json"
     candidate._run_delegate("profile_salvalai", ["seed=12345"], output)
 
@@ -58,8 +58,8 @@ def test_both_arms_declare_one_shared_composition(monkeypatch, tmp_path: Path):
     def fake_shared(delegate, config_name, overrides, output, **kwargs):
         calls.append((delegate, config_name, overrides, output, kwargs))
 
-    monkeypatch.setattr(control, "run_with_main_shared_rope", fake_shared)
-    monkeypatch.setattr(candidate, "run_with_main_shared_rope", fake_shared)
+    monkeypatch.setattr(control, "_shared_runner", lambda: fake_shared)
+    monkeypatch.setattr(candidate, "_shared_runner", lambda: fake_shared)
     control_output = tmp_path / "control.json"
     candidate_output = tmp_path / "candidate.json"
     control.run("profile_salvalai", [], control_output)

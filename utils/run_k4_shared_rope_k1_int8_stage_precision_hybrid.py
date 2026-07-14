@@ -11,16 +11,27 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from utils.run_k4_shared_rope_k1_int8_stage_aware_control import (  # noqa: E402
-    COMPOSITION_VERSION,
-    INITIALIZER,
+COMPOSITION_VERSION = (
+    "k4-split-kv-mixed-weight-shared-rope-k1-remainder-int8-mlp-"
+    "stage-precision-v1"
 )
-from utils.run_k4_stage_precision_hybrid import run as run_hybrid  # noqa: E402
-from utils.run_main_shared_rope_delegate import run_with_main_shared_rope  # noqa: E402
+INITIALIZER = "initialize_approximate_int8_mlp_weight_only"
+
+
+def _hybrid_runner():
+    from utils.run_k4_stage_precision_hybrid import run
+
+    return run
+
+
+def _shared_runner():
+    from utils.run_main_shared_rope_delegate import run_with_main_shared_rope
+
+    return run_with_main_shared_rope
 
 
 def _run_delegate(config_name: str, overrides: list[str], output_init_json: Path) -> None:
-    run_hybrid(
+    _hybrid_runner()(
         config_name,
         overrides,
         output_init_json,
@@ -30,7 +41,7 @@ def _run_delegate(config_name: str, overrides: list[str], output_init_json: Path
 
 
 def run(config_name: str, overrides: list[str], output_init_json: Path) -> None:
-    run_with_main_shared_rope(
+    _shared_runner()(
         _run_delegate,
         config_name,
         overrides,
