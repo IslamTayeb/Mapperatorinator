@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 import inspect
 import unittest
+from unittest.mock import call, patch
 
 import torch
 
@@ -8,6 +9,7 @@ from utils.profile_native_prefix_dtype_scout import (
     ALL_BUCKETS,
     BUCKET_COUNTS,
     REQUIRED_CHECKS,
+    _accepted_main_session_run,
     _bucket_entry,
     _fp32_parity_gate,
     _full_model_variant_context,
@@ -46,6 +48,184 @@ def _cache(dtype):
 
 
 class ProfileNativePrefixDtypeScoutTest(unittest.TestCase):
+    def _accepted_run_args(self):
+        return SimpleNamespace(
+            seed=12345,
+            model_path="model-path",
+            train=object(),
+            device="cuda",
+            max_batch_size=1,
+            use_server=False,
+            precision="fp32",
+            attn_implementation="sdpa",
+            lora_path="main-mode-lora",
+            gamemode=3,
+            auto_select_gamemode_model=True,
+            inference_engine="optimized",
+        )
+
+    def test_accepted_run_loads_and_uses_distinct_base_timing_binding(self):
+        import inference
+        from osuT5.osuT5.inference import Processor
+
+        args = self._accepted_run_args()
+        main_binding = object()
+        main_tokenizer = object()
+        timing_binding = object()
+        timing_tokenizer = object()
+        main_processor_model = object()
+        main_session = object()
+        timing_processor = SimpleNamespace(
+            model=timing_binding,
+            decode_session_state=object(),
+        )
+        main_processor = SimpleNamespace(
+            model=main_processor_model,
+            decode_session_state=main_session,
+        )
+
+        def original_processor_generate(processor, *positional, **kwargs):
+            return (processor, positional, kwargs)
+
+        def fake_generate(*positional, **kwargs):
+            self.assertIs(kwargs["model"], main_binding)
+            self.assertIs(kwargs["tokenizer"], main_tokenizer)
+            self.assertIs(kwargs["timing_model"], timing_binding)
+            self.assertIs(kwargs["timing_tokenizer"], timing_tokenizer)
+            Processor.generate(timing_processor, profile_label="timing_context")
+            Processor.generate(main_processor, profile_label="main_generation")
+            return "generated", "/tmp/result.osu"
+
+        with (
+            patch.object(inference, "compile_args"),
+            patch.object(inference, "setup_inference_environment"),
+            patch.object(
+                inference,
+                "load_model_with_engine",
+                side_effect=[
+                    (main_binding, main_tokenizer),
+                    (timing_binding, timing_tokenizer),
+                ],
+            ) as loader,
+            patch.object(
+                inference,
+                "should_load_separate_timing_model",
+                return_value=True,
+            ) as separate_timing,
+            patch.object(
+                inference,
+                "get_config",
+                return_value=("generation", "beatmap"),
+            ),
+            patch.object(inference, "generate", side_effect=fake_generate),
+            patch.object(Processor, "generate", original_processor_generate),
+        ):
+            run = _accepted_main_session_run(args, output_path=SimpleNamespace())
+
+        separate_timing.assert_called_once_with(args)
+        self.assertEqual(
+            loader.call_args_list,
+            [
+                call(
+                    "model-path",
+                    args.train,
+                    "cuda",
+                    max_batch_size=1,
+                    use_server=False,
+                    precision="fp32",
+                    attn_implementation="sdpa",
+                    lora_path="main-mode-lora",
+                    gamemode=3,
+                    auto_select_gamemode_model=True,
+                    inference_engine="optimized",
+                ),
+                call(
+                    "model-path",
+                    args.train,
+                    "cuda",
+                    max_batch_size=1,
+                    use_server=False,
+                    precision="fp32",
+                    attn_implementation="sdpa",
+                    gamemode=3,
+                    auto_select_gamemode_model=False,
+                    inference_engine="optimized",
+                ),
+            ],
+        )
+        self.assertIs(run["processor"], main_processor)
+        self.assertIs(run["session"], main_session)
+        self.assertIs(run["model"], main_processor_model)
+        self.assertIs(run["tokenizer"], main_tokenizer)
+        self.assertIs(run["timing_model"], timing_binding)
+        self.assertIs(run["timing_tokenizer"], timing_tokenizer)
+
+    def test_accepted_run_rejects_aliased_separate_timing_loader(self):
+        import inference
+
+        args = self._accepted_run_args()
+        binding = object()
+        tokenizer = object()
+        with (
+            patch.object(inference, "compile_args"),
+            patch.object(inference, "setup_inference_environment"),
+            patch.object(
+                inference,
+                "load_model_with_engine",
+                side_effect=[(binding, tokenizer), (binding, object())],
+            ),
+            patch.object(
+                inference,
+                "should_load_separate_timing_model",
+                return_value=True,
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "aliased the main model"):
+                _accepted_main_session_run(args, output_path=SimpleNamespace())
+
+    def test_accepted_run_rejects_incomplete_separate_timing_loader(self):
+        import inference
+
+        args = self._accepted_run_args()
+        with (
+            patch.object(inference, "compile_args"),
+            patch.object(inference, "setup_inference_environment"),
+            patch.object(
+                inference,
+                "load_model_with_engine",
+                side_effect=[(object(), object()), (None, object())],
+            ),
+            patch.object(
+                inference,
+                "should_load_separate_timing_model",
+                return_value=True,
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "incomplete"):
+                _accepted_main_session_run(args, output_path=SimpleNamespace())
+
+    def test_accepted_run_rejects_aliased_separate_timing_tokenizer(self):
+        import inference
+
+        args = self._accepted_run_args()
+        tokenizer = object()
+        with (
+            patch.object(inference, "compile_args"),
+            patch.object(inference, "setup_inference_environment"),
+            patch.object(
+                inference,
+                "load_model_with_engine",
+                side_effect=[(object(), tokenizer), (object(), tokenizer)],
+            ),
+            patch.object(
+                inference,
+                "should_load_separate_timing_model",
+                return_value=True,
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "aliased the main tokenizer"):
+                _accepted_main_session_run(args, output_path=SimpleNamespace())
+
     def test_shared_specialized_context_does_not_replace_decoder_forward(self):
         source = inspect.getsource(_full_model_variant_context)
 
