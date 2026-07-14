@@ -17,6 +17,115 @@ from torch import nn
 SUPPORTED_BLOCK_SIZES = (1, 4, 8, 16)
 
 
+@dataclass(frozen=True, slots=True)
+class GraphCompatibleStoppingPolicy:
+    """Capture-safe batch-one EOS/max-length stopping.
+
+    This is deliberately narrower than Transformers' general stopping API.
+    The accepted Mapperatorinator configuration contains exactly one
+    ``MaxLengthCriteria`` and one ``EosTokenCriteria``.  We validate that
+    configuration before capture, then use equality/reduction operations that
+    CUDA graphs support instead of ``torch.isin``.
+    """
+
+    eos_token_ids: torch.Tensor
+    max_length: int
+
+    @classmethod
+    def from_transformers(
+        cls,
+        stopping_criteria: Any,
+        *,
+        state: "DeviceSequenceState",
+    ) -> "GraphCompatibleStoppingPolicy":
+        # Keep Transformers out of this opt-in module's import path until a
+        # caller explicitly asks to adapt its stopping criteria.
+        from transformers.generation.stopping_criteria import (
+            EosTokenCriteria,
+            MaxLengthCriteria,
+            StoppingCriteriaList,
+        )
+
+        state.validate()
+        if not isinstance(stopping_criteria, StoppingCriteriaList):
+            raise TypeError(
+                "device-tail capture requires a Transformers StoppingCriteriaList"
+            )
+        max_length_criteria = []
+        eos_criteria = []
+        unsupported = []
+        for criterion in stopping_criteria:
+            if type(criterion) is MaxLengthCriteria:
+                max_length_criteria.append(criterion)
+            elif type(criterion) is EosTokenCriteria:
+                eos_criteria.append(criterion)
+            else:
+                unsupported.append(type(criterion).__name__)
+        if unsupported:
+            raise ValueError(
+                "device-tail capture does not support stopping criteria: "
+                + ", ".join(unsupported)
+            )
+        if len(max_length_criteria) != 1 or len(eos_criteria) != 1:
+            raise ValueError(
+                "device-tail capture requires exactly one MaxLengthCriteria "
+                "and one EosTokenCriteria"
+            )
+
+        criterion_max_length = max_length_criteria[0].max_length
+        if (
+            isinstance(criterion_max_length, bool)
+            or not isinstance(criterion_max_length, int)
+            or criterion_max_length != state.max_length
+        ):
+            raise ValueError(
+                "MaxLengthCriteria must match the device sequence max_length"
+            )
+        criterion_eos = eos_criteria[0].eos_token_id
+        if not isinstance(criterion_eos, torch.Tensor):
+            raise TypeError("EosTokenCriteria must expose tensor token ids")
+        if criterion_eos.ndim != 1 or criterion_eos.numel() < 1:
+            raise ValueError("EosTokenCriteria token ids must be a non-empty vector")
+        criterion_values = sorted(
+            set(int(value) for value in criterion_eos.detach().cpu().tolist())
+        )
+        state_values = sorted(
+            set(int(value) for value in state.eos_token_ids.detach().cpu().tolist())
+        )
+        if criterion_values != state_values:
+            raise ValueError(
+                "EosTokenCriteria token ids must match the device sequence state"
+            )
+        return cls(
+            # Reuse the state's fixed-address device storage.  The adapter is
+            # built before capture, so no device transfer occurs in the graph.
+            eos_token_ids=state.eos_token_ids,
+            max_length=state.max_length,
+        )
+
+    def stopped(
+        self,
+        active_tokens: torch.Tensor,
+        next_length: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return per-row stop state using graph-compatible tensor operations."""
+
+        if (
+            active_tokens.shape != (1,)
+            or active_tokens.dtype != torch.long
+            or active_tokens.device != self.eos_token_ids.device
+        ):
+            raise ValueError("active_tokens must be one device torch.long token")
+        if (
+            next_length.shape != (1,)
+            or next_length.dtype != torch.long
+            or next_length.device != self.eos_token_ids.device
+        ):
+            raise ValueError("next_length must be one device torch.long value")
+        eos = (active_tokens[:, None] == self.eos_token_ids[None, :]).any(dim=1)
+        return eos | (next_length >= self.max_length)
+
+
 def _require_batch1_long(name: str, value: torch.Tensor) -> torch.Tensor:
     if not isinstance(value, torch.Tensor):
         raise TypeError(f"{name} must be a tensor")
@@ -128,7 +237,12 @@ class DeviceSequenceState:
         if self.sequence.shape[1] != self.max_length:
             raise ValueError("sequence width must equal max_length")
 
-    def append(self, next_tokens: torch.Tensor) -> torch.Tensor:
+    def append(
+        self,
+        next_tokens: torch.Tensor,
+        *,
+        stopping_policy: GraphCompatibleStoppingPolicy | None = None,
+    ) -> torch.Tensor:
         """Append one sampled token without a host read or dynamic allocation."""
 
         self.validate()
@@ -152,12 +266,19 @@ class DeviceSequenceState:
             self.physical_length.view(1, 1),
             active_tokens.view(1, 1),
         )
-        eos = (active_tokens.unsqueeze(1) == self.eos_token_ids.unsqueeze(0)).any(
-            dim=1
-        )
         next_length = self.physical_length + 1
-        maxed = next_length >= self.max_length
-        just_stopped = self.unfinished & (eos | maxed)
+        if stopping_policy is None:
+            stopped = (
+                active_tokens.unsqueeze(1) == self.eos_token_ids.unsqueeze(0)
+            ).any(dim=1) | (next_length >= self.max_length)
+        else:
+            if (
+                stopping_policy.eos_token_ids is not self.eos_token_ids
+                or stopping_policy.max_length != self.max_length
+            ):
+                raise ValueError("stopping policy must be compiled for this state")
+            stopped = stopping_policy.stopped(active_tokens, next_length)
+        just_stopped = self.unfinished & stopped
         self.logical_length.copy_(
             torch.where(just_stopped, next_length, self.logical_length)
         )
@@ -199,7 +320,7 @@ def fixed_block_tail(
     start_length: int,
     raw_logits_steps: list[torch.Tensor],
     logits_processor,
-    stopping_criteria,
+    stopping_policy: GraphCompatibleStoppingPolicy,
     do_sample: bool,
     static_model_inputs: dict[str, Any] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -217,6 +338,13 @@ def fixed_block_tail(
             f"{len(raw_logits_steps)}"
         )
     state.validate()
+    if not isinstance(stopping_policy, GraphCompatibleStoppingPolicy):
+        raise TypeError("stopping_policy must be graph-compatible")
+    if (
+        stopping_policy.eos_token_ids is not state.eos_token_ids
+        or stopping_policy.max_length != state.max_length
+    ):
+        raise ValueError("stopping policy must be compiled for this state")
     if isinstance(start_length, bool) or not isinstance(start_length, int):
         raise TypeError("start_length must be an integer")
     if start_length < 0:
@@ -255,25 +383,12 @@ def fixed_block_tail(
             ).squeeze(1)
         else:
             next_tokens = torch.argmax(scores, dim=-1)
-        active_tokens = state.append(next_tokens)
+        active_tokens = state.append(
+            next_tokens,
+            stopping_policy=stopping_policy,
+        )
         if static_model_inputs is not None:
             update_one_token_model_inputs(static_model_inputs, active_tokens)
-        stopped = stopping_criteria(
-            state.sequence[:, : active_length + 1],
-            None,
-        )
-        if not isinstance(stopped, torch.Tensor) or stopped.shape != (1,):
-            raise RuntimeError("stopping criteria must return one batch value")
-        stopped = stopped.to(dtype=torch.bool)
-        just_stopped = state.unfinished & stopped
-        state.logical_length.copy_(
-            torch.where(
-                just_stopped,
-                torch.full_like(state.logical_length, active_length + 1),
-                state.logical_length,
-            )
-        )
-        state.unfinished.bitwise_and_(~stopped)
         generated[step].copy_(active_tokens)
         continue_values[step].copy_(state.unfinished)
     return generated, continue_values
@@ -281,6 +396,7 @@ def fixed_block_tail(
 
 __all__ = [
     "DeviceSequenceState",
+    "GraphCompatibleStoppingPolicy",
     "SUPPORTED_BLOCK_SIZES",
     "fixed_block_tail",
     "update_one_token_model_inputs",

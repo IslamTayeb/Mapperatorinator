@@ -25,6 +25,7 @@ from transformers import LogitsProcessor, LogitsProcessorList  # noqa: E402
 
 from osuT5.osuT5.inference.optimized.scout.device_tail import (  # noqa: E402
     DeviceSequenceState,
+    GraphCompatibleStoppingPolicy,
     fixed_block_tail,
 )
 from utils.profile_native_prefix_dtype_scout import (  # noqa: E402
@@ -380,10 +381,12 @@ def _eager_dynamic_tail(
     torch.Tensor,
 ]:
     input_ids = anchor.input_ids.detach().clone()
+    if input_ids.shape[1] + block_size > anchor.max_length:
+        raise ValueError("eager tail block exceeds the accepted max_length")
     unfinished = torch.ones((1,), dtype=torch.bool, device=input_ids.device)
     logical_length = torch.full(
         (1,),
-        max(anchor.max_length, input_ids.shape[1] + block_size + 1),
+        anchor.max_length,
         dtype=torch.long,
         device=input_ids.device,
     )
@@ -430,9 +433,11 @@ def _eager_dynamic_tail(
 
 
 def _new_device_state(anchor: TailAnchor, block_size: int) -> DeviceSequenceState:
+    if anchor.input_ids.shape[1] + block_size > anchor.max_length:
+        raise ValueError("device tail block exceeds the accepted max_length")
     return DeviceSequenceState.allocate(
         anchor.input_ids,
-        max_length=max(anchor.max_length, anchor.input_ids.shape[1] + block_size + 1),
+        max_length=anchor.max_length,
         pad_token_id=anchor.pad_token_id,
         eos_token_ids=anchor.eos_token_ids,
     )
@@ -446,6 +451,10 @@ def _capture_candidate_graph(
     state = _new_device_state(anchor, block_size)
     processors = _clone_processor_list(anchor.logits_processors)
     criteria = copy.deepcopy(anchor.stopping_criteria)
+    stopping_policy = GraphCompatibleStoppingPolicy.from_transformers(
+        criteria,
+        state=state,
+    )
     mutable_templates = _mutable_tensor_templates((processors, criteria))
     start_length = int(anchor.input_ids.shape[1])
     static_model_inputs = {
@@ -480,7 +489,7 @@ def _capture_candidate_graph(
             start_length=start_length,
             raw_logits_steps=anchor.raw_logits_steps[:block_size],
             logits_processor=processors,
-            stopping_criteria=criteria,
+            stopping_policy=stopping_policy,
             do_sample=anchor.do_sample,
             static_model_inputs=static_model_inputs,
         )
