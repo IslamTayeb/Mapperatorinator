@@ -592,14 +592,11 @@ class OptimizedSingleRuntime:
             raise TypeError("cross candidate requires the FP32 optimized preset")
         from ..kernels.weight_only_runtime import (
             ApproximateWeightOnlyState,
-            CROSS_MODES,
+            CROSS_FP16_PACKED,
         )
 
-        if mode not in CROSS_MODES or mode == "accepted":
-            raise ValueError(
-                "cross candidate mode must be fp16_packed_projections or "
-                "split8_attention"
-            )
+        if mode != CROSS_FP16_PACKED:
+            raise ValueError("cross candidate mode must be fp16_packed_projections")
         existing = self._approximate_weight_only_state
         if existing is not None:
             existing.validate_owner(model)
@@ -651,13 +648,12 @@ class OptimizedSingleRuntime:
             raise TypeError("cross+INT8 candidate requires the FP32 optimized preset")
         from ..kernels.weight_only_runtime import (
             ApproximateWeightOnlyState,
-            CROSS_MODES,
+            CROSS_FP16_PACKED,
         )
 
-        if mode not in CROSS_MODES or mode == "accepted":
+        if mode != CROSS_FP16_PACKED:
             raise ValueError(
-                "cross+INT8 candidate mode must be fp16_packed_projections or "
-                "split8_attention"
+                "cross+INT8 candidate mode must be fp16_packed_projections"
             )
         existing = self._approximate_weight_only_state
         if existing is not None:

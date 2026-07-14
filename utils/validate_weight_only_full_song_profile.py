@@ -26,11 +26,9 @@ FP32_SELECTED_DECODE_MATRIX_REGIONS = ("cross_query", "cross_output")
 CROSS_MODES = (
     "accepted",
     "fp16_packed_projections",
-    "split8_attention",
 )
 CROSS_DISPATCHES = (
     "fp16_packed_cross_projection_candidate",
-    "split8_q1_cross_attention_candidate",
 )
 SPLIT_KV_DISPATCH = "native_q1_rope_cache_self_attention_split_kv_8"
 SPLIT_KV_PREFIX = f"{SPLIT_KV_DISPATCH}_prefix_"
@@ -108,13 +106,9 @@ def _metadata(
             "result_class": "documented-drift",
             "exactness_claim": False,
             "packed_projection_weights": True,
-        }
-    else:
-        expected_specific = {
-            "result_class": "exactness-required",
-            "exactness_claim": True,
-            "split_count": 8,
-            "fp32_query_kv_output": True,
+            "projection_delta_only": True,
+            "accepted_q1_bmm": True,
+            "incremental_exactness_required": True,
         }
     cross_failures.update(
         {
@@ -418,18 +412,15 @@ def validate_profile(
                         f"{name}.hits.q1_bmm_cross_attention must be an integer"
                     )
                 expected = {
-                    "accepted": (expected_tail_count, 0, 0),
+                    "accepted": (expected_tail_count, 0),
                     "fp16_packed_projections": (
                         expected_tail_count,
                         expected_tail_count,
-                        0,
                     ),
-                    "split8_attention": (0, 0, expected_tail_count),
                 }[cross_mode]
                 actual = (
                     q1_bmm,
                     cross_counts["fp16_packed_cross_projection_candidate"],
-                    cross_counts["split8_q1_cross_attention_candidate"],
                 )
                 if actual != expected:
                     if cross_mode == "accepted":

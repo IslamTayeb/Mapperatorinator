@@ -47,8 +47,7 @@ ACCEPTED_Q1_VARIANT = "accepted"
 SPLIT_KV_Q1_VARIANT = "split_kv_8"
 CROSS_ACCEPTED = "accepted"
 CROSS_FP16_PACKED = "fp16_packed_projections"
-CROSS_SPLIT8 = "split8_attention"
-CROSS_MODES = frozenset({CROSS_ACCEPTED, CROSS_FP16_PACKED, CROSS_SPLIT8})
+CROSS_MODES = frozenset({CROSS_ACCEPTED, CROSS_FP16_PACKED})
 
 
 def _norm_eps(module: torch.nn.Module) -> float:
@@ -219,10 +218,6 @@ class ApproximateWeightOnlyState:
             preload_int8_mlp_extension()
             torch.cuda.synchronize()
             int8_extension_seconds = time.perf_counter() - int8_extension_start
-        if cross_mode == CROSS_SPLIT8:
-            from ..scout.cross_attention import preload_cross_attention_scout
-
-            preload_cross_attention_scout()
         torch.cuda.synchronize()
         extension_seconds = time.perf_counter() - extension_start
         extension_allocated_after = torch.cuda.memory_allocated(device)
@@ -361,15 +356,9 @@ class ApproximateWeightOnlyState:
                     "result_class": "documented-drift",
                     "exactness_claim": False,
                     "packed_projection_weights": True,
-                }
-            )
-        elif self.cross_mode == CROSS_SPLIT8:
-            cross_candidate.update(
-                {
-                    "result_class": "exactness-required",
-                    "exactness_claim": True,
-                    "split_count": 8,
-                    "fp32_query_kv_output": True,
+                    "projection_delta_only": True,
+                    "accepted_q1_bmm": True,
+                    "incremental_exactness_required": True,
                 }
             )
         else:
@@ -578,24 +567,13 @@ def _cross_mlp_tail_forward(
             ).view(
                 1, 1, module.cross_attn.num_heads, module.cross_attn.head_dim
             ).transpose(1, 2)
-    if state.cross_mode == CROSS_SPLIT8:
-        from ..scout.cross_attention import cross_attention_split
-
-        with profile_range(f"{layer_name}.weight_only.cross_split8_fp32"):
-            cross_output = cross_attention_split(
-                query_states.contiguous(),
-                key_states,
-                value_states,
-                8,
-            )
-    else:
-        with profile_range(f"{layer_name}.weight_only.cross_bmm_fp32"):
-            cross_output = _q1_bmm_cross_attention(
-                query_states,
-                key_states,
-                value_states,
-                expected_dtype=torch.float32,
-            )
+    with profile_range(f"{layer_name}.weight_only.cross_bmm_fp32"):
+        cross_output = _q1_bmm_cross_attention(
+            query_states,
+            key_states,
+            value_states,
+            expected_dtype=torch.float32,
+        )
     cross_output = cross_output.transpose(1, 2).contiguous().view(
         1,
         1,
@@ -645,12 +623,7 @@ def _cross_mlp_tail_forward(
         dispatch_counts["weight_only_mlp_tail"] += 1
         if state.int8_mlp_enabled:
             dispatch_counts["int8_weight_mlp_tail"] += 1
-        if state.cross_mode == CROSS_SPLIT8:
-            dispatch_counts["split8_q1_cross_attention_candidate"] = (
-                dispatch_counts.get("split8_q1_cross_attention_candidate", 0) + 1
-            )
-        else:
-            dispatch_counts["q1_bmm_cross_attention"] += 1
+        dispatch_counts["q1_bmm_cross_attention"] += 1
         if state.cross_mode == CROSS_FP16_PACKED:
             dispatch_counts["fp16_packed_cross_projection_candidate"] = (
                 dispatch_counts.get("fp16_packed_cross_projection_candidate", 0) + 1
@@ -735,6 +708,5 @@ __all__ = [
     "CROSS_ACCEPTED",
     "CROSS_FP16_PACKED",
     "CROSS_MODES",
-    "CROSS_SPLIT8",
     "approximate_weight_only_runtime_context",
 ]

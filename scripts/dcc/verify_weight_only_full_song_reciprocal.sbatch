@@ -132,7 +132,6 @@ if [[ "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
   fi
   case "$CROSS_CANDIDATE_MODE:$CANDIDATE_RUNNER" in
     fp16_packed_projections:utils/run_k4_shared_rope_fp16_cross.py) ;;
-    split8_attention:utils/run_k4_shared_rope_split8_cross.py) ;;
     *)
       echo "cross candidate mode/runner pairing is invalid" >&2
       exit 2
@@ -872,6 +871,14 @@ if require_cross:
         if role.startswith("candidate"):
             if not isinstance(runtime, dict) or runtime.get("mode") != cross_mode:
                 raise SystemExit(f"{role}: missing cross runtime evidence")
+            for key in (
+                "incremental_exactness_required",
+                "packed_projection_delta_only",
+                "accepted_q1_bmm_required",
+                "original_decoder_forward_required",
+            ):
+                if runtime.get(key) is not True:
+                    raise SystemExit(f"{role}: cross runtime did not require {key}")
         elif runtime is not None:
             raise SystemExit(f"{role}: control unexpectedly contains cross runtime")
 
@@ -908,24 +915,13 @@ ANALYSIS_DISPATCH_ARGS=(
 if [[ "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
   ANALYSIS_EXACT_ARGS=(
     --require-exact-label timing_context
+    --require-exact-label main_generation
     --require-exact-dispatch-label timing_context
   )
-  if [[ "$CROSS_CANDIDATE_MODE" == split8_attention ]]; then
-    ANALYSIS_EXACT_ARGS+=(--require-exact-label main_generation)
-  fi
   ANALYSIS_DISPATCH_ARGS=(
+    --allow-optional-dispatch-delta 'optimized_result_class'
     --allow-dispatch-delta
-      'records.main_generation[[]*].optimized_dispatch_capture_hits'
-    --allow-dispatch-delta
-      'records.main_generation[[]*].optimized_dispatch_capture_hits.q1_bmm_cross_attention'
-    --allow-optional-dispatch-delta
       'records.main_generation[[]*].optimized_dispatch_capture_hits.fp16_packed_cross_projection_candidate'
-    --allow-optional-dispatch-delta
-      'records.main_generation[[]*].optimized_dispatch_capture_hits.split8_q1_cross_attention_candidate'
-    --allow-optional-dispatch-delta
-      'records.main_generation[[]*].optimized_dispatch_capture_hits.*'
-    --allow-optional-dispatch-delta
-      'records.main_generation[[]*].optimized_cuda_graphs.*'
   )
 elif [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then
   # Both arms already own K4, split-KV, mixed weights, shared RoPE, and captured K1
@@ -1056,8 +1052,7 @@ grep -q "^mode=$ANALYSIS_MODE$" "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q "^parity.claim=$ANALYSIS_CLAIM$" "$RUN_ROOT/reciprocal-analysis.txt"
 if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
   || "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true \
-  || ( "$REQUIRE_CROSS_INCREMENTAL" == true \
-    && "$CROSS_CANDIDATE_MODE" == split8_attention ) ]]; then
+  || "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
   grep -q '^parity.cross_candidate_exact=true$' \
     "$RUN_ROOT/reciprocal-analysis.txt"
 fi
@@ -1071,11 +1066,8 @@ if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
 elif [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true ]]; then
   EXPECTED_EXACT_LABELS=timing_context,main_generation
 elif [[ "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
-  EXPECTED_EXACT_LABELS=timing_context
+  EXPECTED_EXACT_LABELS=timing_context,main_generation
   EXPECTED_EXACT_DISPATCH_LABELS=timing_context
-  if [[ "$CROSS_CANDIDATE_MODE" == split8_attention ]]; then
-    EXPECTED_EXACT_LABELS=timing_context,main_generation
-  fi
 elif [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then
   EXPECTED_EXACT_LABELS=timing_context
   EXPECTED_EXACT_DISPATCH_LABELS=$EXPECTED_EXACT_LABELS

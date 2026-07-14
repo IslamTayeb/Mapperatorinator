@@ -149,25 +149,12 @@ def _cross_profile(mode: str) -> dict:
                 "result_class": "documented-drift",
                 "exactness_claim": False,
                 "packed_projection_weights": True,
+                "projection_delta_only": True,
+                "accepted_q1_bmm": True,
+                "incremental_exactness_required": True,
             }
         )
         hits["fp16_packed_cross_projection_candidate"] = 12
-    elif mode == "split8_attention":
-        cross.clear()
-        cross.update(
-            {
-                "mode": mode,
-                "scope": "main-model-only",
-                "attention_accumulation": "fp32",
-                "production_selector_unchanged": True,
-                "result_class": "exactness-required",
-                "exactness_claim": True,
-                "split_count": 8,
-                "fp32_query_kv_output": True,
-            }
-        )
-        hits["q1_bmm_cross_attention"] = 0
-        hits["split8_q1_cross_attention_candidate"] = 12
     else:
         raise AssertionError(mode)
     return profile
@@ -196,29 +183,8 @@ def test_candidate_requires_enabled_main_and_disabled_timing_dispatch() -> None:
     }
 
 
-@pytest.mark.parametrize(
-    ("mode", "dispatch"),
-    (
-        (
-            "fp16_packed_projections",
-            {
-                "fp16_packed_cross_projection_candidate": 12,
-                "split8_q1_cross_attention_candidate": 0,
-            },
-        ),
-        (
-            "split8_attention",
-            {
-                "fp16_packed_cross_projection_candidate": 0,
-                "split8_q1_cross_attention_candidate": 12,
-            },
-        ),
-    ),
-)
-def test_cross_candidate_modes_require_truthful_metadata_and_dispatch(
-    mode,
-    dispatch,
-) -> None:
+def test_selected_cross_candidate_requires_truthful_metadata_and_dispatch() -> None:
+    mode = "fp16_packed_projections"
     report = validate_profile(
         _cross_profile(mode),
         role="candidate",
@@ -226,11 +192,13 @@ def test_cross_candidate_modes_require_truthful_metadata_and_dispatch(
     )
 
     assert report["cross_mode"] == mode
-    assert report["main_cross_candidate_dispatch_counts"] == dispatch
+    assert report["main_cross_candidate_dispatch_counts"] == {
+        "fp16_packed_cross_projection_candidate": 12,
+    }
 
 
 def test_cross_candidate_mode_mismatch_fails_loudly() -> None:
-    with pytest.raises(WeightOnlyProfileError, match="invalid mixed-weight metadata"):
+    with pytest.raises(WeightOnlyProfileError, match="cross_mode must"):
         validate_profile(
             _cross_profile("fp16_packed_projections"),
             role="candidate",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -7,6 +8,9 @@ import torch
 from transformers.activations import GELUActivation
 
 from osuT5.osuT5.inference.optimized.kernels import weight_only_runtime
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class _FakeEncoderDecoderCache:
@@ -73,11 +77,7 @@ def _exercise(
 
     def accepted_bmm(*args, **kwargs):
         calls.append("accepted_bmm")
-        return torch.zeros((1, 12, 1, 64))
-
-    def split8(*args, **kwargs):
-        calls.append("split8")
-        assert args[-1] == 8
+        assert kwargs == {"expected_dtype": torch.float32}
         return torch.zeros((1, 12, 1, 64))
 
     def native_out(*args, **kwargs):
@@ -106,9 +106,6 @@ def _exercise(
         "int8_weight_mlp_residual",
         lambda hidden, *args, **kwargs: calls.append("int8_mlp") or hidden,
     )
-    from osuT5.osuT5.inference.optimized.scout import cross_attention
-
-    monkeypatch.setattr(cross_attention, "cross_attention_split", split8)
     counts = {
         "weight_only_mlp_tail": 0,
         "q1_bmm_cross_attention": 0,
@@ -143,45 +140,37 @@ def test_fp16_packed_cross_changes_only_projection_kernels(monkeypatch) -> None:
     }
 
 
-def test_split8_cross_retains_fp32_projections_and_replaces_only_attention(
-    monkeypatch,
-) -> None:
-    counts, calls = _exercise(monkeypatch, weight_only_runtime.CROSS_SPLIT8)
+def test_fp16_packed_cross_preserves_the_int8_mlp_overlay(monkeypatch) -> None:
+    counts, calls = _exercise(
+        monkeypatch,
+        weight_only_runtime.CROSS_FP16_PACKED,
+        int8_mlp=True,
+    )
 
-    assert calls == ["native_q", "split8", "native_out", "mlp"]
-    assert counts == {
-        "weight_only_mlp_tail": 1,
-        "q1_bmm_cross_attention": 0,
-        "split8_q1_cross_attention_candidate": 1,
-    }
-
-
-@pytest.mark.parametrize(
-    ("mode", "expected_cross_calls"),
-    (
-        (
-            weight_only_runtime.CROSS_FP16_PACKED,
-            ["packed_q", "accepted_bmm", "packed_out"],
-        ),
-        (
-            weight_only_runtime.CROSS_SPLIT8,
-            ["native_q", "split8", "native_out"],
-        ),
-    ),
-)
-def test_each_cross_mode_preserves_the_int8_mlp_overlay(
-    monkeypatch,
-    mode,
-    expected_cross_calls,
-) -> None:
-    counts, calls = _exercise(monkeypatch, mode, int8_mlp=True)
-
-    assert calls == expected_cross_calls + ["int8_mlp"]
+    assert calls == ["packed_q", "accepted_bmm", "packed_out", "int8_mlp"]
     assert counts["weight_only_mlp_tail"] == 1
     assert counts["int8_weight_mlp_tail"] == 1
+    assert counts["q1_bmm_cross_attention"] == 1
 
 
-@pytest.mark.parametrize("mode", ["bad", "", None])
+def test_selected_composition_has_no_split8_cross_runtime_surface() -> None:
+    for path in (
+        ROOT / "osuT5/osuT5/inference/optimized/kernels/weight_only_runtime.py",
+        ROOT / "osuT5/osuT5/inference/optimized/single/engine.py",
+        ROOT / "utils/run_k4_shared_rope_cross_candidate.py",
+        ROOT / "scripts/dcc/verify_weight_only_full_song_reciprocal.sbatch",
+    ):
+        source = path.read_text(encoding="utf-8")
+        assert "cross_attention_split" not in source
+        assert "CROSS_SPLIT8" not in source
+        assert "split8_attention" not in source
+    assert not (
+        ROOT / "osuT5/osuT5/inference/optimized/scout/cross_attention.py"
+    ).exists()
+    assert not (ROOT / "utils/run_k4_shared_rope_split8_cross.py").exists()
+
+
+@pytest.mark.parametrize("mode", ["bad", "split8_attention", "", None])
 def test_state_rejects_unsupported_cross_modes_before_cuda(mode) -> None:
     with pytest.raises(ValueError, match="cross candidate mode"):
         weight_only_runtime.ApproximateWeightOnlyState.initialize(

@@ -13,7 +13,6 @@ if str(REPO_ROOT) not in sys.path:
 
 from osuT5.osuT5.inference.optimized.kernels.weight_only_runtime import (  # noqa: E402
     CROSS_FP16_PACKED,
-    CROSS_SPLIT8,
 )
 from utils.run_approximate_weight_only import run_with_initializer  # noqa: E402
 from utils.run_k4_shared_rope_approximate_weight_only import (  # noqa: E402
@@ -21,7 +20,7 @@ from utils.run_k4_shared_rope_approximate_weight_only import (  # noqa: E402
 )
 
 
-CROSS_CANDIDATE_MODES = frozenset({CROSS_FP16_PACKED, CROSS_SPLIT8})
+CROSS_CANDIDATE_MODES = frozenset({CROSS_FP16_PACKED})
 
 
 def _enrich_evidence(
@@ -50,6 +49,9 @@ def _enrich_evidence(
         "incremental_control": (
             "k4-split-kv-mixed-weight-shared-rope-k1-remainder-int8-mlp-v1"
         ),
+        "incremental_exactness_required": True,
+        "packed_projection_delta_only": True,
+        "accepted_q1_bmm_required": True,
         "original_decoder_forward_required": True,
     }
     output_init_json.write_text(

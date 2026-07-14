@@ -1,5 +1,7 @@
+import os
 import subprocess
 from pathlib import Path
+import sys
 
 import pytest
 import torch
@@ -27,11 +29,6 @@ K1_INT8_MLP_WRAPPER = (
 FP16_CROSS_WRAPPER = (
     ROOT / "scripts/dcc/verify_k4_shared_rope_fp16_cross_reciprocal.sbatch"
 )
-SPLIT8_CROSS_WRAPPER = (
-    ROOT / "scripts/dcc/verify_k4_shared_rope_split8_cross_reciprocal.sbatch"
-)
-
-
 def test_weight_only_full_song_wrapper_has_valid_bash_syntax() -> None:
     for wrapper in (
         WRAPPER,
@@ -40,7 +37,6 @@ def test_weight_only_full_song_wrapper_has_valid_bash_syntax() -> None:
         INT8_MLP_WRAPPER,
         K1_INT8_MLP_WRAPPER,
         FP16_CROSS_WRAPPER,
-        SPLIT8_CROSS_WRAPPER,
     ):
         subprocess.run(["bash", "-n", str(wrapper)], check=True)
 
@@ -207,38 +203,19 @@ def test_k1_int8_wrapper_layers_only_int8_over_exact_remainder_control() -> None
     assert "utils/validate_int8_mlp_full_song_profile.py" in general
 
 
-@pytest.mark.parametrize(
-    ("wrapper", "mode", "runner"),
-    (
-        (
-            FP16_CROSS_WRAPPER,
-            "fp16_packed_projections",
-            "utils/run_k4_shared_rope_fp16_cross.py",
-        ),
-        (
-            SPLIT8_CROSS_WRAPPER,
-            "split8_attention",
-            "utils/run_k4_shared_rope_split8_cross.py",
-        ),
-    ),
-)
-def test_cross_wrappers_pin_k1_int8_control_and_one_candidate_mode(
-    wrapper,
-    mode,
-    runner,
-) -> None:
-    source = wrapper.read_text(encoding="utf-8")
+def test_selected_cross_wrapper_pins_k1_int8_control_and_fp16_projection_delta() -> None:
+    source = FP16_CROSS_WRAPPER.read_text(encoding="utf-8")
 
     assert "#SBATCH --time=00:30:00" in source
     assert (
         "BASELINE_RUNNER="
         "utils/run_k4_shared_rope_k1_remainder_int8_mlp_weight_only.py"
     ) in source
-    assert f"CANDIDATE_RUNNER={runner}" in source
+    assert "CANDIDATE_RUNNER=utils/run_k4_shared_rope_fp16_cross.py" in source
     assert "REQUIRE_K4_CANDIDATE=true" in source
     assert "REQUIRE_SHARED_ROPE_INCREMENTAL=false" in source
     assert "REQUIRE_CROSS_INCREMENTAL=true" in source
-    assert f"CROSS_CANDIDATE_MODE={mode}" in source
+    assert "CROSS_CANDIDATE_MODE=fp16_packed_projections" in source
 
     general = WRAPPER.read_text(encoding="utf-8")
     assert "cross candidate mode/runner pairing is invalid" in general
@@ -248,6 +225,54 @@ def test_cross_wrappers_pin_k1_int8_control_and_one_candidate_mode(
     assert "CROSS_K1_INT8_COMPOSITION=true" in general
     assert "metric.fixed_8294_main_seconds=" in general
     assert "metric.complete_request_wall_seconds=" in general
+    assert "incremental_exactness_required" in general
+    assert "packed_projection_delta_only" in general
+    assert "accepted_q1_bmm_required" in general
+    assert "parity.cross_candidate_exact=true" in general
+
+
+def test_selected_cross_analysis_allows_only_the_projection_dispatch_delta() -> None:
+    source = WRAPPER.read_text(encoding="utf-8")
+    analysis = source.split("ANALYSIS_MODE=relaxed", maxsplit=1)[1]
+    cross_block = analysis.split(
+        'if [[ "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then',
+        maxsplit=1,
+    )[1].split(
+        'elif [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then',
+        maxsplit=1,
+    )[0]
+
+    assert "--require-exact-label timing_context" in cross_block
+    assert "--require-exact-label main_generation" in cross_block
+    assert "fp16_packed_cross_projection_candidate" in cross_block
+    assert "split8" not in cross_block
+    assert "native_cross_mlp_tail_*" not in cross_block
+    assert (
+        "'records.main_generation[[]*].optimized_dispatch_capture_hits'"
+        not in cross_block
+    )
+    assert (
+        "'records.main_generation[[]*].optimized_dispatch_capture_hits.*'"
+        not in cross_block
+    )
+
+
+def test_selected_cross_runner_bootstraps_repo_from_unrelated_cwd(tmp_path) -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "utils/run_k4_shared_rope_fp16_cross.py"),
+            "--help",
+        ],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": ""},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "--output-init-json" in completed.stdout
 
 
 def test_general_wrapper_requires_k4_metadata_for_every_profile() -> None:

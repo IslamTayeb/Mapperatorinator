@@ -4,17 +4,15 @@ import pytest
 
 from osuT5.osuT5.inference.optimized.kernels.weight_only_runtime import (
     CROSS_FP16_PACKED,
-    CROSS_SPLIT8,
 )
 from utils import run_k4_shared_rope_cross_candidate as candidate
 
 
-@pytest.mark.parametrize("mode", [CROSS_FP16_PACKED, CROSS_SPLIT8])
 def test_cross_runner_composes_k1_int8_and_records_incremental_mode(
     monkeypatch,
     tmp_path,
-    mode,
 ) -> None:
+    mode = CROSS_FP16_PACKED
     calls = []
     def weight_run(
         config_name,
@@ -87,6 +85,10 @@ def test_cross_runner_composes_k1_int8_and_records_incremental_mode(
     assert payload["cross_runtime"]["incremental_control"] == (
         "k4-split-kv-mixed-weight-shared-rope-k1-remainder-int8-mlp-v1"
     )
+    assert payload["cross_runtime"]["incremental_exactness_required"] is True
+    assert payload["cross_runtime"]["packed_projection_delta_only"] is True
+    assert payload["cross_runtime"]["accepted_q1_bmm_required"] is True
+    assert payload["cross_runtime"]["original_decoder_forward_required"] is True
     assert payload["combined_runtime"].endswith(f"int8-mlp-{mode}-v1")
     assert payload["shared_rope"]["stats"]["reuses"] == 22
     assert calls == [
@@ -99,11 +101,12 @@ def test_cross_runner_composes_k1_int8_and_records_incremental_mode(
     ]
 
 
-def test_cross_runner_rejects_control_mode_before_loading(tmp_path) -> None:
+@pytest.mark.parametrize("mode", ["accepted", "split8_attention", "bad"])
+def test_cross_runner_rejects_unselected_mode_before_loading(tmp_path, mode) -> None:
     with pytest.raises(ValueError, match="cross candidate mode"):
         candidate.run(
             "profile_salvalai",
             [],
             tmp_path / "init.json",
-            mode="accepted",
+            mode=mode,
         )
