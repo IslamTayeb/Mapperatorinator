@@ -11,6 +11,8 @@ import sys
 import time
 from typing import Any
 
+import torch
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -76,6 +78,26 @@ def run(
     main_init: dict[str, Any] | None = None
     timing_init: dict[str, Any] | None = None
     pool_initial: dict[str, Any] = {}
+
+    def pool_snapshot() -> dict[str, Any]:
+        if len(cached) != 2:
+            raise RuntimeError("persistent graph scout has not loaded both model roles")
+        return {
+            role: binding.runtime._persistent_graph_workspace_pool.summary()
+            for role, (binding, _) in zip(("main", "timing"), cached, strict=True)
+        }
+
+    def cuda_memory_snapshot() -> dict[str, int] | None:
+        if not torch.cuda.is_available():
+            return None
+        torch.cuda.synchronize()
+        device = torch.cuda.current_device()
+        return {
+            "allocated_bytes": int(torch.cuda.memory_allocated(device)),
+            "reserved_bytes": int(torch.cuda.memory_reserved(device)),
+            "max_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
+            "max_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
+        }
 
     def persistent_loader(*loader_args, **loader_kwargs):
         nonlocal load_index, main_init, timing_init
@@ -163,11 +185,10 @@ def run(
                         "result_path": str(result_path),
                         "profile_path": str(_profile_path(result_path)),
                         "process_call_wall_seconds": process_call_wall_seconds,
+                        "pool_summary": pool_snapshot(),
+                        "cuda_memory": cuda_memory_snapshot(),
                     }
-            for role, (binding, _) in zip(("main", "timing"), cached, strict=True):
-                final_pool_summary[role] = (
-                    binding.runtime._persistent_graph_workspace_pool.summary()
-                )
+            final_pool_summary = pool_snapshot()
             for binding, _ in cached:
                 binding.runtime.close_persistent_graph_workspace_scout()
             close_completed = True

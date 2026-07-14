@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -181,6 +181,43 @@ def test_bounded_slots_evict_only_inactive_workspace(monkeypatch):
     assert summary["max_resident_slots"] == 1
 
 
+def test_failed_eviction_close_retains_graph_ownership_for_retry():
+    model = _Model()
+    pool = _pool(model, max_slots=1)
+    first = pool.new_request()
+    with _lease(first, model):
+        workspace = first._workspace()
+
+    calls = 0
+    graph = SimpleNamespace(closed=False)
+
+    def close():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("synthetic close failure")
+        graph.closed = True
+
+    graph.close = close
+    workspace.lifecycle.graphs[id(graph)] = graph
+
+    second = pool.new_request()
+    with pytest.raises(RuntimeError, match="synthetic close failure"):
+        with _lease(second, model, batch_size=2):
+            pass
+
+    failed_summary = pool.summary()
+    assert failed_summary["resident_slots"] == 1
+    assert failed_summary["workspaces_evicted"] == 0
+    assert graph.closed is False
+
+    with _lease(second, model, batch_size=2):
+        pass
+    assert graph.closed is True
+    assert calls == 2
+    assert pool.summary()["workspaces_evicted"] == 1
+
+
 def test_close_is_idempotent_and_closes_child_graph_once():
     model = _Model()
     pool = _pool(model)
@@ -218,6 +255,39 @@ def test_model_tensor_version_change_invalidates_pool():
 
     with pytest.raises(RuntimeError, match="addresses or versions changed"):
         pool.new_request()
+
+
+def test_model_forward_topology_change_invalidates_pool():
+    model = _Model()
+    pool = _pool(model)
+
+    def replacement(self, value):
+        return self.projection(value)
+
+    model.forward = MethodType(replacement, model)
+    with pytest.raises(RuntimeError, match="forward topology changed"):
+        pool.new_request()
+
+
+def test_foreign_model_and_mismatched_cache_signature_fail_loudly(monkeypatch):
+    monkeypatch.setattr(state_module, "get_cache", lambda *args, **kwargs: _Cache())
+    model = _Model()
+    foreign = _Model()
+    pool = _pool(model)
+    request = pool.new_request()
+
+    with pytest.raises(RuntimeError, match="differs from its pool owner"):
+        with _lease(request, foreign):
+            pass
+
+    with _lease(request, model, batch_size=1):
+        with pytest.raises(RuntimeError, match="active workspace signature"):
+            request.cache_for_window(
+                model,
+                batch_size=2,
+                num_beams=1,
+                cfg_scale=1.0,
+            )
 
 
 def test_persistent_encoder_slots_reject_auxiliary_outputs():

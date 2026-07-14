@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from utils.analyze_persistent_graph_workspace import analyze
 
 
@@ -46,8 +48,8 @@ def _profile(
                 "profile_label": profile_label,
                 "sequence_index": index,
                 "model_elapsed_seconds": 2.0 + index,
-                "generated_tokens": 10 + index,
-                "output_tokens": 10 + index,
+                "generated_tokens": 2,
+                "output_tokens": 2 + index,
                 "prompt_tokens": 2,
                 "generated_token_ids": [index, index + 1],
                 "decode_graph_capture_seconds_delta": capture_seconds / 2,
@@ -58,6 +60,17 @@ def _profile(
                     "persistent_workspace": {
                         "cross_request_graph_hits": cross_request_hits,
                         "cache_storage": cache_storage,
+                        "encoder_storage": [
+                            {
+                                "state_signature": "sig",
+                                "slot_signature": "encoder",
+                                "data_ptr": 456,
+                                "shape": [1, 8, 4],
+                                "stride": [32, 4, 1],
+                                "dtype": "torch.float32",
+                                "device": "cuda:0",
+                            }
+                        ],
                     }
                 },
                 "cuda_memory_allocated_mb": 150.0,
@@ -98,28 +111,84 @@ def _manifest(tmp_path: Path, *, warm_capture: float = 0.0) -> Path:
         graph_delta=0,
         cross_request_hits=9,
     )
-    pool = {
-        "workspaces_created": 1,
-        "workspaces_evicted": 0,
-        "max_resident_slots": 1,
-        "request_count": 2,
+    workspace = {
+        "signature": "sig",
+        "graph_count": 2,
+        "encoder_slot_count": 1,
+        "encoder_storage": [
+            {
+                "data_ptr": 456,
+                "shape": [1, 8, 4],
+                "dtype": "torch.float32",
+                "device": "cuda:0",
+            }
+        ],
+        "cache_count": 1,
+        "cache_storage": [
+            {
+                "data_ptr": 123,
+                "shape": [1, 2, 3, 4],
+                "dtype": "torch.float32",
+                "device": "cuda:0",
+            }
+        ],
+        "in_use": False,
         "closed": False,
     }
+
+    def pool(request_count: int) -> dict:
+        return {
+            "workspaces_created": 1,
+            "workspaces_evicted": 0,
+            "max_resident_slots": 1,
+            "resident_slots": 1,
+            "request_count": request_count,
+            "closed": False,
+            "workspaces": [workspace],
+        }
+
+    initialization = tmp_path / "initialization.json"
+    initialization.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "topology_version": (
+                    "selected-k4-k1-int8-fp16-cross-persistent-graphs-v1"
+                ),
+                "main": {"initialized": True},
+                "timing": {"initialized": True},
+            }
+        ),
+        encoding="utf-8",
+    )
     path = tmp_path / "manifest.json"
     path.write_text(
         json.dumps(
             {
+                "schema_version": 1,
+                "topology_version": (
+                    "selected-k4-k1-int8-fp16-cross-persistent-graphs-v1"
+                ),
+                "initialization_path": str(initialization),
                 "results": {
                     "cold": {
                         "profile_path": str(cold),
                         "process_call_wall_seconds": 7.0,
+                        "pool_summary": {
+                            "main": pool(1),
+                            "timing": pool(1),
+                        },
                     },
                     "warm": {
                         "profile_path": str(warm),
                         "process_call_wall_seconds": 6.0,
+                        "pool_summary": {
+                            "main": pool(2),
+                            "timing": pool(2),
+                        },
                     },
                 },
-                "final_pool_summary": {"main": pool, "timing": pool},
+                "final_pool_summary": {"main": pool(2), "timing": pool(2)},
                 "close_completed": True,
             }
         ),
@@ -135,6 +204,8 @@ def test_analyzer_accepts_exact_capture_free_warm_request(tmp_path: Path) -> Non
     assert report["exactness_pass"] is True
     assert report["capture_gate"]["pass"] is True
     assert report["cross_request_graph_hits"] == 18
+    assert report["pool_pass"] is True
+    assert report["memory_gate"]["pass"] is True
 
 
 def test_analyzer_rejects_warm_recapture(tmp_path: Path) -> None:
@@ -142,3 +213,29 @@ def test_analyzer_rejects_warm_recapture(tmp_path: Path) -> None:
 
     assert report["pass"] is False
     assert report["capture_gate"]["pass"] is False
+
+
+def test_analyzer_fails_loudly_without_token_evidence(tmp_path: Path) -> None:
+    manifest_path = _manifest(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    warm_profile_path = Path(manifest["results"]["warm"]["profile_path"])
+    warm_profile = json.loads(warm_profile_path.read_text(encoding="utf-8"))
+    del warm_profile["generation"][0]["generated_token_ids"]
+    warm_profile_path.write_text(json.dumps(warm_profile), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="generated_token_ids"):
+        analyze(manifest_path)
+
+
+def test_analyzer_rejects_warm_workspace_address_growth(tmp_path: Path) -> None:
+    manifest_path = _manifest(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["results"]["warm"]["pool_summary"]["main"]["workspaces"][0][
+        "encoder_storage"
+    ][0]["data_ptr"] += 1
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    report = analyze(manifest_path)
+
+    assert report["pool_pass"] is False
+    assert report["pass"] is False

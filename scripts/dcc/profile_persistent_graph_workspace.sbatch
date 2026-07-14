@@ -162,3 +162,6 @@ done
 grep -q '^pass=true$' "$RUN_ROOT/analysis.txt"
 grep -q '^exactness_pass=true$' "$RUN_ROOT/analysis.txt"
 grep -q '^capture_pass=true$' "$RUN_ROOT/analysis.txt"
+grep -q '^pool_pass=true$' "$RUN_ROOT/analysis.txt"
+grep -q '^memory_pass=true$' "$RUN_ROOT/analysis.txt"
+grep -q '^close_pass=true$' "$RUN_ROOT/analysis.txt"

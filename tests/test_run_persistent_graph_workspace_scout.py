@@ -89,6 +89,7 @@ def test_runner_reuses_two_bindings_and_closes_pools(monkeypatch, tmp_path: Path
         "shared_decoder_rope_context",
         lambda *args, **kwargs: nullcontext(),
     )
+    monkeypatch.setattr(runner.torch.cuda, "is_available", lambda: False)
 
     manifest = tmp_path / "manifest.json"
     initialization = tmp_path / "initialization.json"
@@ -109,3 +110,6 @@ def test_runner_reuses_two_bindings_and_closes_pools(monkeypatch, tmp_path: Path
     payload = json.loads(manifest.read_text(encoding="utf-8"))
     assert payload["close_completed"] is True
     assert set(payload["results"]) == {"cold", "warm"}
+    assert payload["results"]["cold"]["pool_summary"]["main"]["request_count"] == 0
+    assert payload["results"]["warm"]["pool_summary"]["main"]["request_count"] == 0
+    assert payload["results"]["cold"]["cuda_memory"] is None

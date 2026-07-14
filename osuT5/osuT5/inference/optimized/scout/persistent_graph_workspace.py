@@ -6,6 +6,7 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import fields, is_dataclass
 import threading
+from types import MethodType
 from typing import Any, Iterator
 import weakref
 
@@ -75,6 +76,35 @@ def _model_fingerprint(model: torch.nn.Module) -> tuple[tuple[Any, ...], ...]:
     return tuple(rows)
 
 
+def _callable_fingerprint(value: Any) -> tuple[Any, ...]:
+    if isinstance(value, MethodType):
+        return ("bound_method", id(value.__self__), id(value.__func__))
+    return ("callable", id(value))
+
+
+def _model_topology_fingerprint(
+    model: torch.nn.Module,
+) -> tuple[tuple[Any, ...], ...]:
+    """Fingerprint the installed model forwards and eval/training topology."""
+
+    return tuple(
+        (
+            name,
+            type(module).__module__,
+            type(module).__qualname__,
+            bool(module.training),
+            _callable_fingerprint(module.forward),
+        )
+        for name, module in model.named_modules()
+    )
+
+
+def _decode_callable_fingerprint() -> tuple[Any, ...]:
+    from ..single import engine
+
+    return _callable_fingerprint(engine.active_prefix_decode_generate)
+
+
 class _PersistentWorkspace:
     def __init__(self, signature: tuple[Any, ...]):
         self.signature = signature
@@ -106,6 +136,24 @@ class _PersistentWorkspace:
             len(holder.get("__persistent_encoder_slots__", {}))
             for holder in self.session.stable_encoder_holders.values()
         )
+        encoder_storage = []
+        for signature, holder in self.session.stable_encoder_holders.items():
+            slots = holder.get("__persistent_encoder_slots__", {})
+            for slot_signature, output in slots.items():
+                tensor = getattr(output, "last_hidden_state", None)
+                if not isinstance(tensor, torch.Tensor):
+                    raise RuntimeError("persistent encoder slot lost tensor storage")
+                encoder_storage.append(
+                    {
+                        "state_signature": repr(signature),
+                        "slot_signature": repr(slot_signature),
+                        "data_ptr": int(tensor.data_ptr()),
+                        "shape": list(tensor.shape),
+                        "stride": list(tensor.stride()),
+                        "dtype": str(tensor.dtype),
+                        "device": str(tensor.device),
+                    }
+                )
         cache_storage = []
         for signature, cache in self.session.caches.items():
             for kind in ("self_attention_cache", "cross_attention_cache"):
@@ -131,6 +179,7 @@ class _PersistentWorkspace:
             "graph_count": self.session.graph_count,
             "cross_request_graph_hits": cross_request_hits,
             "encoder_slot_count": encoder_slots,
+            "encoder_storage": encoder_storage,
             "cache_count": len(self.session.caches),
             "cache_storage": cache_storage,
             "in_use": self.in_use,
@@ -155,6 +204,8 @@ class PersistentGraphWorkspacePool:
             raise ValueError("persistent graph max_slots must be a positive integer")
         self._owner_ref = weakref.ref(model)
         self._model_fingerprint = _model_fingerprint(model)
+        self._model_topology_fingerprint = _model_topology_fingerprint(model)
+        self._decode_callable_fingerprint = _decode_callable_fingerprint()
         self._packed_state_ref = packed_state
         self._packed_fingerprint = _owned_tensor_fingerprint(packed_state)
         self.topology_signature = topology_signature
@@ -179,6 +230,10 @@ class PersistentGraphWorkspacePool:
             raise RuntimeError("persistent graph workspace model was destroyed")
         if _model_fingerprint(model) != self._model_fingerprint:
             raise RuntimeError("persistent graph model tensor addresses or versions changed")
+        if _model_topology_fingerprint(model) != self._model_topology_fingerprint:
+            raise RuntimeError("persistent graph model forward topology changed")
+        if _decode_callable_fingerprint() != self._decode_callable_fingerprint:
+            raise RuntimeError("persistent graph decode callable topology changed")
         if _owned_tensor_fingerprint(self._packed_state_ref) != self._packed_fingerprint:
             raise RuntimeError("persistent packed-weight tensor addresses or versions changed")
         return model
@@ -207,8 +262,11 @@ class PersistentGraphWorkspacePool:
             )
             if evict_signature is None:
                 raise RuntimeError("all persistent graph workspace slots are active")
-            evicted = self._workspaces.pop(evict_signature)
+            evicted = self._workspaces[evict_signature]
+            # Keep ownership until every child graph closes.  A failed close must
+            # remain retryable rather than orphaning a live CUDA graph.
             evicted.close()
+            del self._workspaces[evict_signature]
             self._workspaces_evicted += 1
         workspace = _PersistentWorkspace(signature)
         self._workspaces[signature] = workspace
@@ -227,6 +285,10 @@ class PersistentGraphWorkspacePool:
     ) -> Iterator[_PersistentWorkspace]:
         with self._lock:
             self._validate_owner()
+            if request.pool is not self:
+                raise RuntimeError("persistent request belongs to another workspace pool")
+            if request._active_workspace is not None:
+                raise RuntimeError("persistent request already owns a workspace lease")
             if any(candidate.in_use for candidate in self._workspaces.values()):
                 raise RuntimeError(
                     "persistent graph workspace does not allow concurrent use"
@@ -302,6 +364,9 @@ class PersistentDecodeRequest(ProductionDecodeSession):
         num_beams: int,
         cfg_scale: float,
     ):
+        owner = self.pool._validate_owner()
+        if model is not owner:
+            raise RuntimeError("persistent request model differs from its pool owner")
         signature = ProductionDecodeSession._state_signature(
             model,
             batch_size=batch_size,
@@ -317,6 +382,12 @@ class PersistentDecodeRequest(ProductionDecodeSession):
 
     def cache_for_window(self, model, **kwargs):
         workspace = self._workspace()
+        state_signature = ProductionDecodeSession._state_signature(model, **kwargs)
+        expected_signature = state_signature + self.pool.topology_signature
+        if workspace.signature != expected_signature:
+            raise RuntimeError(
+                "persistent cache request differs from the active workspace signature"
+            )
         cache = workspace.session.cache_for_window(model, **kwargs)
         holder = workspace.session.stable_encoder_holders[
             workspace.session.active_state_signature
