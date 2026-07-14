@@ -10,6 +10,10 @@ from utils import run_k4_vocab_sampling_scout
 from utils.vocab_sampling_scout import (
     VocabSample,
     VocabSamplingObserver,
+    _capture_graph,
+    _processor_descriptor,
+    _require_recaptured_tensor,
+    _top_p_kwargs,
     benchmark_existing_tail,
     install_vocab_sampling_observer,
     summarize,
@@ -17,7 +21,16 @@ from utils.vocab_sampling_scout import (
 
 
 def _descriptor(top_p: float = 0.9):
-    return (("TopPLogitsWarper", (("top_p", top_p),)),)
+    return (
+        (
+            "TopPLogitsWarper",
+            (
+                ("top_p", top_p),
+                ("filter_value", -torch.inf),
+                ("min_tokens_to_keep", 1),
+            ),
+        ),
+    )
 
 
 def _sample(*, nucleus_size: int = 2) -> VocabSample:
@@ -143,6 +156,77 @@ def test_patch_observes_real_eager_top_p_and_counter_sample() -> None:
     assert sample.selected_token == int(token.item())
     assert sample.nucleus_size == int(torch.isfinite(post).sum().item())
     assert sample.processor_descriptor == _descriptor()
+
+
+def test_top_p_descriptor_preserves_every_constructor_parameter() -> None:
+    warper = TopPLogitsWarper(
+        top_p=0.75,
+        filter_value=-123.0,
+        min_tokens_to_keep=2,
+    )
+    descriptor = dict(_processor_descriptor(SimpleNamespace(processors=[warper]))[0][1])
+
+    assert _top_p_kwargs(descriptor) == {
+        "top_p": 0.75,
+        "filter_value": -123.0,
+        "min_tokens_to_keep": 2,
+    }
+
+
+def test_capture_graph_replays_once_before_returning_static_output(monkeypatch) -> None:
+    from contextlib import contextmanager
+
+    output = torch.tensor([-1])
+    state = {"capturing": False, "replays": 0}
+
+    class FakeGraph:
+        def replay(self):
+            state["replays"] += 1
+            output.fill_(7)
+
+    @contextmanager
+    def fake_capture(_graph):
+        state["capturing"] = True
+        try:
+            yield
+        finally:
+            state["capturing"] = False
+
+    def callable_():
+        if not state["capturing"]:
+            output.fill_(3)
+        return output
+
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", FakeGraph)
+    monkeypatch.setattr(torch.cuda, "graph", fake_capture)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    graph, actual = _capture_graph(callable_, warmup=1)
+
+    assert isinstance(graph, FakeGraph)
+    assert state["replays"] == 1
+    assert actual.item() == 7
+
+
+def test_recapture_mismatch_reports_quantitative_diagnostics() -> None:
+    descriptor = {
+        "top_p": 0.9,
+        "filter_value": -torch.inf,
+        "min_tokens_to_keep": 1,
+    }
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"mismatch_count=2 finite_mask_mismatch_count=1 "
+            r"finite_max_abs=1.0.*min_tokens_to_keep"
+        ),
+    ):
+        _require_recaptured_tensor(
+            "TopP output",
+            torch.tensor([[1.0, 2.0, -torch.inf]]),
+            torch.tensor([[1.0, 3.0, 4.0]]),
+            descriptor=descriptor,
+        )
 
 
 def test_summary_computes_fixed_main_and_request_zero_cost_ceilings() -> None:

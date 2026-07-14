@@ -44,7 +44,15 @@ def _processor_descriptor(processor: Any) -> tuple[tuple[str, tuple[Any, ...]], 
     for item in processor.processors:
         name = type(item).__name__
         attributes: list[Any] = []
-        for field in ("temperature", "top_p", "top_k", "min_p", "types_first"):
+        for field in (
+            "temperature",
+            "top_p",
+            "top_k",
+            "min_p",
+            "types_first",
+            "filter_value",
+            "min_tokens_to_keep",
+        ):
             value = getattr(item, field, None)
             if isinstance(value, (bool, int, float, str)):
                 attributes.append((field, value))
@@ -86,9 +94,7 @@ class VocabSample:
                 raise ValueError(f"{name} must use CPU FP32 storage")
             if value.ndim != 2 or value.shape[0] != 1:
                 raise ValueError(f"{name} must have shape [1, vocab]")
-        if not (
-            self.raw_logits.shape == self.pre_top_p.shape == self.post_top_p.shape
-        ):
+        if not (self.raw_logits.shape == self.pre_top_p.shape == self.post_top_p.shape):
             raise ValueError("sample score tensors must share one shape")
         if not 0.0 < self.threshold < 1.0:
             raise ValueError("counter threshold must be inside (0, 1)")
@@ -193,9 +199,9 @@ class VocabSamplingObserver:
             post_top_p=buffers["post_top_p"].detach().float().cpu().clone(),
             threshold=float(buffers["threshold"].detach().float().cpu().item()),
             selected_token=int(buffers["token"].detach().cpu().item()),
-            processor_descriptor=tuple(buffers.get(
-                "processor_descriptor", self.current_descriptor
-            )),
+            processor_descriptor=tuple(
+                buffers.get("processor_descriptor", self.current_descriptor)
+            ),
             source=source,
         )
         sample.validate()
@@ -234,9 +240,11 @@ def install_vocab_sampling_observer(
         probabilities = torch.nn.functional.softmax(scores, dim=-1)
         threshold = state.counter_uniform().to(dtype=probabilities.dtype)
         cdf = probabilities.cumsum(dim=-1)
-        token = torch.searchsorted(cdf[0], threshold).clamp(
-            max=probabilities.shape[-1] - 1
-        ).to(dtype=torch.long)
+        token = (
+            torch.searchsorted(cdf[0], threshold)
+            .clamp(max=probabilities.shape[-1] - 1)
+            .to(dtype=torch.long)
+        )
         observer.observe_sampling(threshold, token)
         return token
 
@@ -279,6 +287,10 @@ def _capture_graph(callable_, *, warmup: int):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         output = callable_()
+    # Capture records work but does not materialize a fresh value in every
+    # output allocation.  Validate the same lifecycle used by production:
+    # launch once, then synchronize before inspecting the static output.
+    graph.replay()
     torch.cuda.synchronize()
     return graph, output
 
@@ -304,9 +316,81 @@ def _sampling_with_threshold(scores: Any, threshold: Any):
 
     probabilities = torch.nn.functional.softmax(scores, dim=-1)
     cdf = probabilities.cumsum(dim=-1)
-    return torch.searchsorted(cdf[0], threshold).clamp(
-        max=probabilities.shape[-1] - 1
-    ).to(dtype=torch.long)
+    return (
+        torch.searchsorted(cdf[0], threshold)
+        .clamp(max=probabilities.shape[-1] - 1)
+        .to(dtype=torch.long)
+    )
+
+
+def _top_p_kwargs(descriptor: dict[str, Any]) -> dict[str, Any]:
+    top_p = descriptor.get("top_p")
+    filter_value = descriptor.get("filter_value")
+    min_tokens = descriptor.get("min_tokens_to_keep")
+    if not isinstance(top_p, float) or not 0.0 < top_p < 1.0:
+        raise RuntimeError("captured TopP descriptor lacks one valid top_p")
+    if (
+        isinstance(filter_value, bool)
+        or not isinstance(filter_value, (int, float))
+        or math.isnan(float(filter_value))
+    ):
+        raise RuntimeError("captured TopP descriptor lacks one valid filter_value")
+    if (
+        isinstance(min_tokens, bool)
+        or not isinstance(min_tokens, int)
+        or min_tokens < 1
+    ):
+        raise RuntimeError(
+            "captured TopP descriptor lacks one valid min_tokens_to_keep"
+        )
+    return {
+        "top_p": top_p,
+        "filter_value": float(filter_value),
+        "min_tokens_to_keep": min_tokens,
+    }
+
+
+def _require_recaptured_tensor(
+    name: str,
+    actual: Any,
+    expected: Any,
+    *,
+    descriptor: dict[str, Any],
+) -> None:
+    import torch
+
+    actual_cpu = actual.detach().float().cpu()
+    expected_cpu = expected.detach().float().cpu()
+    if torch.equal(actual_cpu, expected_cpu):
+        return
+    if actual_cpu.shape != expected_cpu.shape:
+        raise RuntimeError(
+            f"recaptured {name} shape differs from observed real tensor: "
+            f"actual={tuple(actual_cpu.shape)} expected={tuple(expected_cpu.shape)} "
+            f"descriptor={descriptor!r}"
+        )
+    equal = actual_cpu == expected_cpu
+    mismatch_count = int((~equal).sum().item())
+    finite_actual = torch.isfinite(actual_cpu)
+    finite_expected = torch.isfinite(expected_cpu)
+    finite_mask_mismatch_count = int((finite_actual ^ finite_expected).sum().item())
+    jointly_finite = finite_actual & finite_expected
+    finite_max_abs = (
+        float(
+            (actual_cpu[jointly_finite] - expected_cpu[jointly_finite])
+            .abs()
+            .max()
+            .item()
+        )
+        if bool(jointly_finite.any())
+        else 0.0
+    )
+    raise RuntimeError(
+        f"recaptured {name} differs from observed real tensor: "
+        f"mismatch_count={mismatch_count} "
+        f"finite_mask_mismatch_count={finite_mask_mismatch_count} "
+        f"finite_max_abs={finite_max_abs} descriptor={descriptor!r}"
+    )
 
 
 def benchmark_existing_tail(
@@ -342,11 +426,14 @@ def benchmark_existing_tail(
     used: set[int] = set()
     for label, target in targets.items():
         candidates = sorted(
-            enumerate(samples), key=lambda pair: (abs(pair[1].nucleus_size - target), pair[0])
+            enumerate(samples),
+            key=lambda pair: (abs(pair[1].nucleus_size - target), pair[0]),
         )
-        index, sample = next(
-            (index, sample) for index, sample in candidates if index not in used
-        ) if len(used) < len(samples) else candidates[0]
+        index, sample = (
+            next((index, sample) for index, sample in candidates if index not in used)
+            if len(used) < len(samples)
+            else candidates[0]
+        )
         used.add(index)
         representatives[label] = sample
 
@@ -359,54 +446,64 @@ def benchmark_existing_tail(
             if name == "TopPLogitsWarper"
         ]
         if len(top_p_rows) != 1:
-            raise RuntimeError("captured descriptor must contain exactly one TopP warper")
+            raise RuntimeError(
+                "captured descriptor must contain exactly one TopP warper"
+            )
         descriptor = dict(top_p_rows[0])
-        top_p = descriptor.get("top_p")
-        if not isinstance(top_p, float) or not 0.0 < top_p < 1.0:
-            raise RuntimeError("captured processor descriptor lacks one valid top_p")
+        top_p_kwargs = _top_p_kwargs(descriptor)
         pre = sample.pre_top_p.to(device=device)
         post = sample.post_top_p.to(device=device)
         threshold = torch.tensor(sample.threshold, dtype=torch.float32, device=device)
         input_ids = torch.zeros((1, 1), dtype=torch.long, device=device)
-        warper = TopPLogitsWarper(top_p=top_p)
+        warper = TopPLogitsWarper(**top_p_kwargs)
         top_p_graph, top_p_output = _capture_graph(
             lambda: warper(input_ids, pre), warmup=warmup
+        )
+        # Check while this graph's output is still the most recently captured
+        # allocation.  Do not depend on its storage surviving later captures.
+        _require_recaptured_tensor(
+            "TopP output",
+            top_p_output,
+            sample.post_top_p,
+            descriptor=descriptor,
         )
         sampling_graph, sampling_output = _capture_graph(
             lambda: _sampling_with_threshold(post, threshold), warmup=warmup
         )
+        if int(sampling_output.cpu().item()) != sample.selected_token:
+            raise RuntimeError(
+                "recaptured counter sampler differs from observed token: "
+                f"actual={int(sampling_output.cpu().item())} "
+                f"expected={sample.selected_token} descriptor={descriptor!r}"
+            )
         combined_graph, combined_output = _capture_graph(
             lambda: _sampling_with_threshold(warper(input_ids, pre), threshold),
             warmup=warmup,
         )
         torch.cuda.synchronize()
-        if not torch.equal(top_p_output.cpu(), sample.post_top_p):
-            raise RuntimeError("recaptured TopP output differs from observed real tensor")
-        if int(sampling_output.cpu().item()) != sample.selected_token:
-            raise RuntimeError("recaptured counter sampler differs from observed token")
         if int(combined_output.cpu().item()) != sample.selected_token:
-            raise RuntimeError("combined TopP+sampler graph differs from observed token")
-        top_p_ms = _time_graph(
-            top_p_graph, iterations=iterations, rounds=rounds
+            raise RuntimeError(
+                "combined TopP+sampler graph differs from observed token: "
+                f"actual={int(combined_output.cpu().item())} "
+                f"expected={sample.selected_token} descriptor={descriptor!r}"
+            )
+        top_p_ms = _time_graph(top_p_graph, iterations=iterations, rounds=rounds)
+        sampling_ms = _time_graph(sampling_graph, iterations=iterations, rounds=rounds)
+        combined_ms = _time_graph(combined_graph, iterations=iterations, rounds=rounds)
+        rows.append(
+            {
+                "representative": label,
+                "nucleus_size": sample.nucleus_size,
+                "top_p_ms_per_step_rounds": top_p_ms,
+                "sampling_ms_per_step_rounds": sampling_ms,
+                "combined_ms_per_step_rounds": combined_ms,
+                "top_p_ms_per_step_worst": max(top_p_ms),
+                "sampling_ms_per_step_worst": max(sampling_ms),
+                "combined_ms_per_step_worst": max(combined_ms),
+                "selected_token_exact": True,
+                "top_p_mask_exact": True,
+            }
         )
-        sampling_ms = _time_graph(
-            sampling_graph, iterations=iterations, rounds=rounds
-        )
-        combined_ms = _time_graph(
-            combined_graph, iterations=iterations, rounds=rounds
-        )
-        rows.append({
-            "representative": label,
-            "nucleus_size": sample.nucleus_size,
-            "top_p_ms_per_step_rounds": top_p_ms,
-            "sampling_ms_per_step_rounds": sampling_ms,
-            "combined_ms_per_step_rounds": combined_ms,
-            "top_p_ms_per_step_worst": max(top_p_ms),
-            "sampling_ms_per_step_worst": max(sampling_ms),
-            "combined_ms_per_step_worst": max(combined_ms),
-            "selected_token_exact": True,
-            "top_p_mask_exact": True,
-        })
     return {
         "warmup": warmup,
         "iterations": iterations,
@@ -450,9 +547,11 @@ def summarize(
     ideal_main = device_tail_main + projection_main
     request_steps = fixed_main_steps + fixed_timing_steps
     ideal_request = (
-        combined_ms + mixed_projection_ms_per_step
-    ) * request_steps / 1000.0
-    descriptors = sorted({repr(sample.processor_descriptor) for sample in observer.samples})
+        (combined_ms + mixed_projection_ms_per_step) * request_steps / 1000.0
+    )
+    descriptors = sorted(
+        {repr(sample.processor_descriptor) for sample in observer.samples}
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "result_class": RESULT_CLASS,
@@ -496,7 +595,8 @@ def summarize(
             "ideal_complete_request_total_seconds": ideal_request,
             "promotion_threshold_seconds": promotion_threshold_seconds,
             "main_ceiling_clears_threshold": ideal_main >= promotion_threshold_seconds,
-            "request_ceiling_clears_threshold": ideal_request >= promotion_threshold_seconds,
+            "request_ceiling_clears_threshold": ideal_request
+            >= promotion_threshold_seconds,
             "ceiling_interpretation": (
                 "impossible zero-cost ceiling; any candidate retains nonzero work"
             ),
