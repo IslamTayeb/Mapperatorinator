@@ -145,19 +145,30 @@ def summarize_component(
             failures[prefix] = bucket_failures
     if total_replays < measured_replays:
         raise ValueError("total replay count cannot be smaller than measured count")
-    weighted_seconds = {name: value / 1000.0 for name, value in totals_ms.items()}
-    speedup = weighted_seconds["fp16_weight"] / weighted_seconds["int8_weight"]
-    main_saving = weighted_seconds["fp16_weight"] - weighted_seconds["int8_weight"]
+    measured_seconds = {name: value / 1000.0 for name, value in totals_ms.items()}
+    speedup = measured_seconds["fp16_weight"] / measured_seconds["int8_weight"]
+    measured_main_saving = (
+        measured_seconds["fp16_weight"] - measured_seconds["int8_weight"]
+    )
+    projection_scale = total_replays / measured_replays
+    projected_seconds = {
+        name: value * projection_scale for name, value in measured_seconds.items()
+    }
+    projected_main_saving = (
+        projected_seconds["fp16_weight"] - projected_seconds["int8_weight"]
+    )
     request_scale = (FIXED_MAIN_STEPS + FIXED_TIMING_STEPS) / FIXED_MAIN_STEPS
     return {
         "measured_replays": measured_replays,
         "total_replays": int(total_replays),
         "coverage_fraction": measured_replays / total_replays,
-        "weighted_mlp_seconds": weighted_seconds,
+        "measured_weighted_mlp_seconds": measured_seconds,
+        "projected_all_live_replays_mlp_seconds": projected_seconds,
         "int8_vs_fp16_local_speedup": speedup,
         "minimum_local_speedup": MIN_LOCAL_SPEEDUP,
-        "fixed_work_main_saving_seconds": main_saving,
-        "warm_request_saving_seconds_estimate": main_saving * request_scale,
+        "conservative_measured_main_saving_seconds": measured_main_saving,
+        "fixed_work_main_saving_seconds": projected_main_saving,
+        "warm_request_saving_seconds_estimate": projected_main_saving * request_scale,
         "request_estimate_timing_to_main_step_ratio": FIXED_TIMING_STEPS / FIXED_MAIN_STEPS,
         "invariant_failures": failures,
         "invariants_pass": not failures,

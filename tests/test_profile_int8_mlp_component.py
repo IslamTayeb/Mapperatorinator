@@ -39,13 +39,20 @@ def test_summary_weights_live_counts_and_requires_1p4x_local_speedup() -> None:
 
     expected_fp16 = DECODER_LAYERS * (1000 * 0.28 + 250 * 0.32) / 1000
     expected_int8 = DECODER_LAYERS * (1000 * 0.18 + 250 * 0.20) / 1000
-    assert report["weighted_mlp_seconds"]["fp16_weight"] == pytest.approx(expected_fp16)
-    assert report["weighted_mlp_seconds"]["int8_weight"] == pytest.approx(expected_int8)
+    assert report["measured_weighted_mlp_seconds"]["fp16_weight"] == pytest.approx(
+        expected_fp16
+    )
+    assert report["measured_weighted_mlp_seconds"]["int8_weight"] == pytest.approx(
+        expected_int8
+    )
     assert report["int8_vs_fp16_local_speedup"] == pytest.approx(
         expected_fp16 / expected_int8
     )
-    assert report["fixed_work_main_saving_seconds"] == pytest.approx(
+    assert report["conservative_measured_main_saving_seconds"] == pytest.approx(
         expected_fp16 - expected_int8
+    )
+    assert report["fixed_work_main_saving_seconds"] == pytest.approx(
+        2 * (expected_fp16 - expected_int8)
     )
     assert report["coverage_fraction"] == 0.5
     assert report["sizing_pass"]
