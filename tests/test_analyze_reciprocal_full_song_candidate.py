@@ -323,7 +323,10 @@ def test_relaxed_mode_reports_token_stopping_structure_and_map_divergence(
     assert parity["cross_candidate_exact"] is False
     assert parity["token_and_stopping_divergence"]["main_generation"][
         "aligned_mismatches"
-    ] == 2
+    ] == 1
+    assert parity["token_and_stopping_divergence"]["main_generation"][
+        "token_count_delta"
+    ] == -1
     assert not parity["token_and_stopping_divergence"]["main_generation"][
         "stopping_equal"
     ]
