@@ -14,7 +14,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from utils.run_main_shared_rope_delegate import SHARED_STAGE_COMPOSITION_VERSION
+from utils.run_main_shared_rope_delegate import (  # noqa: E402
+    SHARED_STAGE_COMPOSITION_VERSION,
+)
 
 
 HYBRID_VERSION = "timing-fp16-main-mixed-fp32-k4-v1"
