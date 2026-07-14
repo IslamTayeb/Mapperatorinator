@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import copy
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -291,6 +296,50 @@ def test_timing_native_self_contract_rejects_cross_mlp_or_missing_marker() -> No
     initialization.pop("timing_native_self_scout")
     with pytest.raises(WeightOnlyProfileError, match="must be an object"):
         validate_timing_scout(profile, initialization, role="candidate")
+
+
+def test_timing_native_self_validator_runs_outside_repo_with_empty_pythonpath(
+    tmp_path: Path,
+) -> None:
+    profile, initialization = _timing_scout_profile()
+    profile_path = tmp_path / "profile.json"
+    initialization_path = tmp_path / "initialization.json"
+    profile_path.write_text(json.dumps(profile), encoding="utf-8")
+    initialization_path.write_text(json.dumps(initialization), encoding="utf-8")
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "utils/validate_fp32_timing_native_self_profile.py"
+    )
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = ""
+
+    help_result = subprocess.run(
+        [sys.executable, str(script), "--help"],
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "--initialization" in help_result.stdout
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--profile",
+            str(profile_path),
+            "--initialization",
+            str(initialization_path),
+            "--role",
+            "candidate",
+        ],
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout)["pass"] is True
 
 
 def test_cross_candidate_mode_mismatch_fails_loudly() -> None:
