@@ -92,14 +92,18 @@ def test_q1_kernel_import_does_not_build_and_loader_is_singleton(monkeypatch):
     assert calls[0]["functions"] == [
         "q1_attention",
         "q1_rope_cache_attention",
+        "split_kv_q1_rope_cache_attention",
     ]
     assert calls[0]["extra_cuda_cflags"] == ["-O3"]
     source = calls[0]["cuda_sources"]
     assert "#include <cuda_fp16.h>" in source
     assert "#include <c10/cuda/CUDAGuard.h>" in source
-    assert source.count("c10::cuda::CUDAGuard") == 2
+    assert source.count("c10::cuda::CUDAGuard") == 3
     assert source.count("__global__ void q1_attention_kernel(") == 1
     assert source.count("__global__ void q1_rope_cache_attention_kernel(") == 1
+    assert source.count("__global__ void split_kv_prepare_rope_cache_kernel(") == 1
+    assert source.count("__global__ void split_kv_partial_kernel(") == 1
+    assert source.count("__global__ void split_kv_merge_kernel(") == 1
     assert "q1_attention_half_kernel" not in source
     assert "q1_rope_cache_attention_half_kernel" not in source
     assert "q1_attention_kernel<float, block_size>" in source
@@ -136,7 +140,10 @@ def test_q1_kernel_import_does_not_build_and_loader_is_singleton(monkeypatch):
         assert "float denom = 0.0f" in body
         assert "float numer = 0.0f" in body
         assert "extern __shared__ float shared_mem[]" in body
-    assert source.count('asm("trap;")') == 1
+    assert source.count('asm("trap;")') == 2
+    assert "split-KV q1 requires fp32 storage" in source
+    assert "constexpr int split_count = 8;" in source
+    assert "properties.major == 7 && properties.minor == 5" in source
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
@@ -155,6 +162,10 @@ def test_q1_wrappers_preserve_dtype_mask_conversion_and_argument_order(
 
         def q1_rope_cache_attention(self, *args):
             calls.append(("rope", args))
+            return args[0]
+
+        def split_kv_q1_rope_cache_attention(self, *args):
+            calls.append(("split_rope", args))
             return args[0]
 
     monkeypatch.setattr(q1_attention, "_NATIVE_Q1_ATTENTION", _Extension())
@@ -206,6 +217,64 @@ def test_q1_wrappers_preserve_dtype_mask_conversion_and_argument_order(
     assert args[6].is_contiguous()
     assert args[7] == 7
     assert all(args[index].dtype == dtype for index in range(5))
+
+
+def test_fp32_sm75_live_prefix_routes_split8_and_other_cases_fall_back(
+    monkeypatch,
+):
+    from osuT5.osuT5.inference.optimized.kernels import q1_attention
+
+    qkv = torch.zeros((1, 1, 3, 2, 4), dtype=torch.float32)
+    calls = []
+
+    class _Extension:
+        def q1_rope_cache_attention(self, *args):
+            calls.append(("accepted", args))
+            return args[0]
+
+        def split_kv_q1_rope_cache_attention(self, *args):
+            calls.append(("split8", args))
+            return args[0]
+
+    monkeypatch.setattr(q1_attention, "_NATIVE_Q1_ATTENTION", _Extension())
+    monkeypatch.setattr(q1_attention, "_validate_rope_cache_inputs", lambda *args: None)
+    monkeypatch.setattr(q1_attention, "_native_mask", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        q1_attention,
+        "native_q1_rope_cache_attention_variant",
+        lambda qkv, prefix: "split_kv_8" if prefix == 640 else "accepted",
+    )
+    arguments = (
+        qkv,
+        torch.zeros((1, 2, 832, 4)),
+        torch.zeros((1, 2, 832, 4)),
+        torch.zeros((1, 1, 4)),
+        torch.zeros((1, 1, 4)),
+        torch.tensor([1]),
+        None,
+    )
+
+    q1_attention.native_q1_rope_cache_attention(*arguments, 640)
+    q1_attention.native_q1_rope_cache_attention(*arguments, 128)
+
+    assert [kind for kind, _ in calls] == ["split8", "accepted"]
+    assert calls[0][1][-1] == 640
+    assert calls[1][1][-1] == 128
+
+
+def test_split_kv_policy_is_fp32_sm75_and_live_prefix_only(monkeypatch):
+    from osuT5.osuT5.inference.optimized.kernels import q1_attention
+
+    assert q1_attention.native_q1_rope_cache_attention_variant(
+        torch.zeros((1, 1, 3, 2, 4)), 640
+    ) == "accepted"
+    assert q1_attention.native_q1_rope_cache_attention_variant(
+        torch.zeros((1, 1, 3, 2, 4), dtype=torch.float16), 640
+    ) == "accepted"
+    assert tuple(sorted(q1_attention._SPLIT_KV_Q1_PREFIXES)) == tuple(
+        range(192, 833, 64)
+    )
+    assert q1_attention._SPLIT_KV_Q1_SPLITS == 8
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
@@ -367,6 +436,12 @@ def test_fused_generation_context_installs_only_fused_hook(monkeypatch):
         hooks = attention_runtime_hooks()
         assert hooks.sdpa_attention_forward is None
         assert hooks.q1_rope_cache_self_attention_forward is not None
+        assert (
+            hooks.q1_rope_cache_self_attention_forward.keywords[
+                "native_q1_rope_cache_attention_variant"
+            ]
+            is q1_attention.native_q1_rope_cache_attention_variant
+        )
 
 
 def test_fp16_generation_context_uses_the_same_dispatch_policy(monkeypatch):
