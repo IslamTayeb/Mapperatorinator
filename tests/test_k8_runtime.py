@@ -23,6 +23,7 @@ from osuT5.osuT5.inference.optimized.single.k8_runtime import (
     _sync_model_kwargs_after_k8,
     _update_static_model_inputs,
     install_k8_candidate,
+    k8_active_prefix_decode_generate,
 )
 from osuT5.osuT5.inference.optimized.single.state import ProductionDecodeSession
 
@@ -135,6 +136,18 @@ def test_later_window_seed_is_independent_of_prior_overshoot_counter():
     )
 
     assert after_overshoot == clean_replay
+
+
+def test_k8_budget_recorder_is_owned_by_runtime_and_fails_loudly_on_bad_type():
+    with pytest.raises(TypeError, match="UntracedBudgetRecorder"):
+        k8_active_prefix_decode_generate(
+            object(),
+            torch.tensor([[1]], dtype=torch.long),
+            [],
+            [],
+            SimpleNamespace(),
+            untraced_budget_recorder=object(),
+        )
 
 
 def test_explicit_request_generator_seed_is_used_without_consuming_state():

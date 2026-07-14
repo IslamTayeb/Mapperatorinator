@@ -12,6 +12,7 @@ from torch import nn
 from transformers.modeling_outputs import BaseModelOutput
 
 from ....runtime_profiling import profile_range
+from .budget import UntracedBudgetRecorder, budget_region
 from .decode_loop import (
     _bucketed_prefix_length,
     _capture_decode_cuda_graph,
@@ -997,6 +998,17 @@ def k8_active_prefix_decode_generate(
 ) -> torch.LongTensor:
     """Opt-in full-model+tail K8 loop; defaults never select this callable."""
 
+    untraced_budget_recorder = model_kwargs.pop(
+        "untraced_budget_recorder",
+        None,
+    )
+    if untraced_budget_recorder is not None and not isinstance(
+        untraced_budget_recorder,
+        UntracedBudgetRecorder,
+    ):
+        raise TypeError(
+            "untraced_budget_recorder must be an UntracedBudgetRecorder"
+        )
     del cuda_graph_warmup, cuda_graph_min_decode_steps
     if synced_gpus or streamer is not None:
         raise ValueError("K8 does not support synced_gpus or streamers")
@@ -1044,22 +1056,23 @@ def k8_active_prefix_decode_generate(
     if int(stored_request_seed) != current_request_seed:
         raise RuntimeError("K8 request-local generator seed changed mid-session")
 
-    prompt_seed_started = time.perf_counter()
-    rng_seed = _prompt_seed(
-        input_ids,
-        request_seed=current_request_seed,
-        window_identity=window_identity,
-    )
-    prompt_seed_seconds = time.perf_counter() - prompt_seed_started
-    processor_d2h: dict[str, int] = {"calls": 0, "bytes": 0}
-    processor_signature_started = time.perf_counter()
-    processor_signature = _processor_signature(
-        logits_processor,
-        d2h=processor_d2h,
-    )
-    processor_signature_seconds = (
-        time.perf_counter() - processor_signature_started
-    )
+    with budget_region(untraced_budget_recorder, "sync"):
+        prompt_seed_started = time.perf_counter()
+        rng_seed = _prompt_seed(
+            input_ids,
+            request_seed=current_request_seed,
+            window_identity=window_identity,
+        )
+        prompt_seed_seconds = time.perf_counter() - prompt_seed_started
+        processor_d2h: dict[str, int] = {"calls": 0, "bytes": 0}
+        processor_signature_started = time.perf_counter()
+        processor_signature = _processor_signature(
+            logits_processor,
+            d2h=processor_d2h,
+        )
+        processor_signature_seconds = (
+            time.perf_counter() - processor_signature_started
+        )
     do_sample = bool(generation_config.do_sample)
     slot = _runtime_slot(
         stable_encoder_holder,
@@ -1122,31 +1135,37 @@ def k8_active_prefix_decode_generate(
             model_inputs = model.prepare_inputs_for_generation(
                 active_ids, **model_kwargs
             )
-            with profile_range("generation.encoder_prefill"):
-                outputs = model(**model_inputs, return_dict=True)
+            with budget_region(untraced_budget_recorder, "prefill"):
+                with profile_range("generation.encoder_prefill"):
+                    outputs = model(**model_inputs, return_dict=True)
             is_prefill = False
             stats["prefill_steps"] += 1
-            model_kwargs = model._update_model_kwargs_for_generation(
-                outputs,
-                model_kwargs,
-                is_encoder_decoder=model.config.is_encoder_decoder,
-            )
-            if stable_encoder_holder is not None:
-                encoder_outputs = model_kwargs.get("encoder_outputs")
-                if encoder_outputs is not None:
-                    model_kwargs["encoder_outputs"] = _stable_encoder_outputs(
-                        stable_encoder_holder, encoder_outputs
-                    )
-            scores_step = processor(outputs.logits[:, -1, :])
-            token = (
-                _sample_counter(scores_step, state)
-                if do_sample
-                else torch.argmax(scores_step, dim=-1)
-            )
-            active = state.append(token)
-            processor.observe(active)
+            with budget_region(untraced_budget_recorder, "cache_update"):
+                model_kwargs = model._update_model_kwargs_for_generation(
+                    outputs,
+                    model_kwargs,
+                    is_encoder_decoder=model.config.is_encoder_decoder,
+                )
+                if stable_encoder_holder is not None:
+                    encoder_outputs = model_kwargs.get("encoder_outputs")
+                    if encoder_outputs is not None:
+                        model_kwargs["encoder_outputs"] = _stable_encoder_outputs(
+                            stable_encoder_holder, encoder_outputs
+                        )
+            with budget_region(untraced_budget_recorder, "logits_processors"):
+                scores_step = processor(outputs.logits[:, -1, :])
+            with budget_region(untraced_budget_recorder, "sampling"):
+                token = (
+                    _sample_counter(scores_step, state)
+                    if do_sample
+                    else torch.argmax(scores_step, dim=-1)
+                )
+            with budget_region(untraced_budget_recorder, "append_stopping"):
+                active = state.append(token)
+                processor.observe(active)
             stats["status_reads"] += 1
-            unfinished = bool(state.unfinished.item())
+            with budget_region(untraced_budget_recorder, "sync"):
+                unfinished = bool(state.unfinished.item())
             cur_len += 1
             finished = not unfinished
             del outputs
@@ -1166,31 +1185,37 @@ def k8_active_prefix_decode_generate(
             prefix = _bucketed_prefix_length(
                 cur_len, active_prefix_bucket_size, max_length
             )
-            with active_prefix_self_attention_context(prefix):
-                outputs = model(**model_inputs, return_dict=True)
+            with budget_region(untraced_budget_recorder, "decode_replay"):
+                with active_prefix_self_attention_context(prefix):
+                    outputs = model(**model_inputs, return_dict=True)
             stats["remainder_steps"] += 1
             stats["eager_remainder_steps"] += 1
-            model_kwargs = model._update_model_kwargs_for_generation(
-                outputs,
-                model_kwargs,
-                is_encoder_decoder=model.config.is_encoder_decoder,
-            )
-            if stable_encoder_holder is not None:
-                encoder_outputs = model_kwargs.get("encoder_outputs")
-                if encoder_outputs is not None:
-                    model_kwargs["encoder_outputs"] = _stable_encoder_outputs(
-                        stable_encoder_holder, encoder_outputs
-                    )
-            scores_step = processor(outputs.logits[:, -1, :])
-            token = (
-                _sample_counter(scores_step, state)
-                if do_sample
-                else torch.argmax(scores_step, dim=-1)
-            )
-            active = state.append(token)
-            processor.observe(active)
+            with budget_region(untraced_budget_recorder, "cache_update"):
+                model_kwargs = model._update_model_kwargs_for_generation(
+                    outputs,
+                    model_kwargs,
+                    is_encoder_decoder=model.config.is_encoder_decoder,
+                )
+                if stable_encoder_holder is not None:
+                    encoder_outputs = model_kwargs.get("encoder_outputs")
+                    if encoder_outputs is not None:
+                        model_kwargs["encoder_outputs"] = _stable_encoder_outputs(
+                            stable_encoder_holder, encoder_outputs
+                        )
+            with budget_region(untraced_budget_recorder, "logits_processors"):
+                scores_step = processor(outputs.logits[:, -1, :])
+            with budget_region(untraced_budget_recorder, "sampling"):
+                token = (
+                    _sample_counter(scores_step, state)
+                    if do_sample
+                    else torch.argmax(scores_step, dim=-1)
+                )
+            with budget_region(untraced_budget_recorder, "append_stopping"):
+                active = state.append(token)
+                processor.observe(active)
             stats["status_reads"] += 1
-            unfinished = bool(state.unfinished.item())
+            with budget_region(untraced_budget_recorder, "sync"):
+                unfinished = bool(state.unfinished.item())
             cur_len += 1
             finished = not unfinished
             del outputs
@@ -1223,16 +1248,28 @@ def k8_active_prefix_decode_generate(
                 if isinstance(value, torch.Tensor):
                     stats["copy_calls"] += 1
                     stats["copy_bytes"] += value.numel() * value.element_size()
-            entry = _capture_k8_entry(
-                model,
-                model_inputs,
-                active_prefix_length=prefix,
-                state=state,
-                processor=processor,
-                do_sample=do_sample,
-                block_size=block_size,
-                graph_remainders=graph_remainders,
-            )
+            with budget_region(untraced_budget_recorder, "graph_capture"):
+                entry = _capture_k8_entry(
+                    model,
+                    model_inputs,
+                    active_prefix_length=prefix,
+                    state=state,
+                    processor=processor,
+                    do_sample=do_sample,
+                    block_size=block_size,
+                    graph_remainders=graph_remainders,
+                )
+                if untraced_budget_recorder is not None:
+                    for name, destination in entry.static_inputs.items():
+                        source = model_inputs.get(name)
+                        if isinstance(source, torch.Tensor) and isinstance(
+                            destination,
+                            torch.Tensor,
+                        ):
+                            untraced_budget_recorder.record_copy(
+                                source,
+                                destination,
+                            )
             try:
                 lifecycle.register(entry.parent)
                 if entry.remainder_parent is not None:
@@ -1260,21 +1297,26 @@ def k8_active_prefix_decode_generate(
             raw_entry["k8_stats"] = stats
             if entry.state is not state or entry.processor is not processor:
                 raise RuntimeError("K8 graph resolved the wrong persistent state")
-            for name, static_value in entry.static_inputs.items():
-                if not isinstance(static_value, torch.Tensor):
-                    continue
-                current = model_inputs.get(name)
-                if not isinstance(current, torch.Tensor):
-                    raise RuntimeError(f"K8 model input {name} stopped being a tensor")
-                if (
-                    current.shape != static_value.shape
-                    or current.dtype != static_value.dtype
-                    or current.device != static_value.device
-                ):
-                    raise RuntimeError(f"K8 model input {name} changed signature")
-                static_value.copy_(current)
-                stats["copy_calls"] += 1
-                stats["copy_bytes"] += current.numel() * current.element_size()
+            with budget_region(untraced_budget_recorder, "graph_input_copies"):
+                for name, static_value in entry.static_inputs.items():
+                    if not isinstance(static_value, torch.Tensor):
+                        continue
+                    current = model_inputs.get(name)
+                    if not isinstance(current, torch.Tensor):
+                        raise RuntimeError(
+                            f"K8 model input {name} stopped being a tensor"
+                        )
+                    if (
+                        current.shape != static_value.shape
+                        or current.dtype != static_value.dtype
+                        or current.device != static_value.device
+                    ):
+                        raise RuntimeError(f"K8 model input {name} changed signature")
+                    static_value.copy_(current)
+                    if untraced_budget_recorder is not None:
+                        untraced_budget_recorder.record_copy(current, static_value)
+                    stats["copy_calls"] += 1
+                    stats["copy_bytes"] += current.numel() * current.element_size()
         replay_steps = block_size if block_eligible else 1
         if block_eligible:
             stats["eligible_steps"] += block_size
@@ -1289,20 +1331,27 @@ def k8_active_prefix_decode_generate(
             stats["remainder_steps"] += 1
             stats["remainder_graph_replays"] += 1
             replay_range = "generation.k1_remainder_graph_replay"
-        with profile_range(replay_range):
-            parent.replay()
+        with budget_region(untraced_budget_recorder, "decode_replay"):
+            with profile_range(replay_range):
+                parent.replay()
         raw_entry["decode_replays"] += replay_steps
         stats["status_reads"] += 1
-        status = torch.stack((
-            state.physical_length[0],
-            state.logical_length[0],
-            state.unfinished[0].to(dtype=torch.long),
-        )).cpu().tolist()
+        with budget_region(untraced_budget_recorder, "sync"):
+            status_device = torch.stack((
+                state.physical_length[0],
+                state.logical_length[0],
+                state.unfinished[0].to(dtype=torch.long),
+            ))
+            status_host = status_device.cpu()
+            if untraced_budget_recorder is not None:
+                untraced_budget_recorder.record_copy(status_device, status_host)
+            status = status_host.tolist()
         physical_length, logical_length = (int(status[0]), int(status[1]))
         unfinished = bool(status[2])
         stats["wasted_steps"] += max(0, physical_length - logical_length)
         cur_len = physical_length if unfinished else logical_length
-        _sync_model_kwargs_after_k8(model_kwargs, entry, cur_len=cur_len)
+        with budget_region(untraced_budget_recorder, "cache_update"):
+            _sync_model_kwargs_after_k8(model_kwargs, entry, cur_len=cur_len)
         finished = not unfinished
 
     stats["logical_steps"] = cur_len - prompt_length
