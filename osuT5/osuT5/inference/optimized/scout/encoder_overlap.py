@@ -503,6 +503,18 @@ class ExactMainEncoderOverlap:
         output_bytes = sum(
             row.hidden.numel() * row.hidden.element_size() for row in self._rows
         )
+        pinned_input_bytes = (
+            (
+                self._pinned_frames.numel() * self._pinned_frames.element_size()
+                if self._pinned_frames is not None
+                else 0
+            )
+            + sum(
+                value.numel() * value.element_size()
+                for row in self._pinned_conditioning
+                for value in row.values()
+            )
+        )
         result = {
             "version": OVERLAP_VERSION,
             "result_class": "exact-output-candidate",
@@ -538,6 +550,8 @@ class ExactMainEncoderOverlap:
             ),
             "main_join_wait_seconds": join_seconds,
             "per_row_main_join_wait_seconds": per_row_join,
+            "pinned_input_bytes": pinned_input_bytes,
+            "device_input_copy_bytes": pinned_input_bytes,
             "output_store_bytes": output_bytes,
             "baseline_allocated_vram_bytes": self._baseline_allocated,
             "baseline_reserved_vram_bytes": self._baseline_reserved,

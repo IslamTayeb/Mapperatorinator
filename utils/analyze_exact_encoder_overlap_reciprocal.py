@@ -189,6 +189,8 @@ def _validate_candidate(
     ):
         _number(external.get(key), name=f"candidate.{key}")
     for key in (
+        "pinned_input_bytes",
+        "device_input_copy_bytes",
         "output_store_bytes",
         "peak_allocated_vram_bytes",
         "peak_reserved_vram_bytes",
@@ -428,6 +430,16 @@ def analyze(
         ("baseline_second", "candidate_first"),
     )
     metrics = {role: _profile_metrics(profile) for role, profile in profiles.items()}
+    for role in metrics:
+        metrics[role]["runner_wall_seconds"] = _number(
+            evidence[role].get("run_wall_seconds"),
+            name=f"{role}.run_wall_seconds",
+            positive=True,
+        )
+        metrics[role]["runtime_initialization_seconds"] = _number(
+            initialization[role].get("initialization_wall_seconds"),
+            name=f"{role}.initialization_wall_seconds",
+        )
     orders: list[dict[str, Any]] = []
     exact_orders: dict[str, Any] = {}
     for baseline_role, candidate_role in pairs:
@@ -454,6 +466,9 @@ def analyze(
                 ),
                 "main_stage_seconds_saved": (
                     baseline["main_stage_seconds"] - candidate["main_stage_seconds"]
+                ),
+                "runner_wall_seconds_saved": (
+                    baseline["runner_wall_seconds"] - candidate["runner_wall_seconds"]
                 ),
             }
         )
