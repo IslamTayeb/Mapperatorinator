@@ -23,9 +23,14 @@ def compile_extension() -> dict[str, object]:
     started = time.perf_counter()
     extension = preload_int8_mlp_extension()
     elapsed = time.perf_counter() - started
-    exported = getattr(extension, "int8_weight_mlp_residual", None)
-    if not callable(exported):
-        raise RuntimeError("compiled extension is missing int8_weight_mlp_residual binding")
+    bindings = (
+        "int8_weight_mlp_residual",
+        "int8_weight_rmsnorm_linear",
+        "int8_weight_linear_residual",
+    )
+    missing = [name for name in bindings if not callable(getattr(extension, name, None))]
+    if missing:
+        raise RuntimeError(f"compiled extension is missing bindings: {missing}")
     module_path = Path(getattr(extension, "__file__", ""))
     if not module_path.is_file() or module_path.stat().st_size <= 0:
         raise RuntimeError(f"compiled extension path is missing or empty: {module_path}")
@@ -36,7 +41,7 @@ def compile_extension() -> dict[str, object]:
         "torch_cuda_version": torch.version.cuda,
         "extension_path": str(module_path),
         "extension_bytes": module_path.stat().st_size,
-        "exported_binding": "int8_weight_mlp_residual",
+        "exported_bindings": list(bindings),
         "compile_load_seconds": elapsed,
         "pass": True,
     }
