@@ -150,6 +150,18 @@ def test_concurrent_borrow_fails_loudly():
                 pass
 
 
+def test_concurrent_borrow_with_different_signature_also_fails_loudly():
+    model = _Model()
+    pool = _pool(model)
+    first = pool.new_request()
+    second = pool.new_request()
+
+    with _lease(first, model, batch_size=1):
+        with pytest.raises(RuntimeError, match="concurrent use"):
+            with _lease(second, model, batch_size=2):
+                pass
+
+
 def test_bounded_slots_evict_only_inactive_workspace(monkeypatch):
     monkeypatch.setattr(state_module, "get_cache", lambda *args, **kwargs: _Cache())
     model = _Model()

@@ -106,12 +106,33 @@ class _PersistentWorkspace:
             len(holder.get("__persistent_encoder_slots__", {}))
             for holder in self.session.stable_encoder_holders.values()
         )
+        cache_storage = []
+        for signature, cache in self.session.caches.items():
+            for kind in ("self_attention_cache", "cross_attention_cache"):
+                storage = getattr(cache, kind, None)
+                for layer_index, layer in enumerate(getattr(storage, "layers", ())):
+                    for name in ("keys", "values"):
+                        tensor = getattr(layer, name, None)
+                        if isinstance(tensor, torch.Tensor):
+                            cache_storage.append(
+                                {
+                                    "state_signature": repr(signature),
+                                    "kind": kind,
+                                    "layer": layer_index,
+                                    "name": name,
+                                    "data_ptr": int(tensor.data_ptr()),
+                                    "shape": list(tensor.shape),
+                                    "dtype": str(tensor.dtype),
+                                    "device": str(tensor.device),
+                                }
+                            )
         return {
             "signature": repr(self.signature),
             "graph_count": self.session.graph_count,
             "cross_request_graph_hits": cross_request_hits,
             "encoder_slot_count": encoder_slots,
             "cache_count": len(self.session.caches),
+            "cache_storage": cache_storage,
             "in_use": self.in_use,
             "closed": self.closed,
         }
@@ -206,9 +227,11 @@ class PersistentGraphWorkspacePool:
     ) -> Iterator[_PersistentWorkspace]:
         with self._lock:
             self._validate_owner()
+            if any(candidate.in_use for candidate in self._workspaces.values()):
+                raise RuntimeError(
+                    "persistent graph workspace does not allow concurrent use"
+                )
             workspace = self._workspace(signature)
-            if workspace.in_use:
-                raise RuntimeError("persistent graph workspace does not allow concurrent use")
             workspace.in_use = True
             self._clock += 1
             workspace.last_used = self._clock
