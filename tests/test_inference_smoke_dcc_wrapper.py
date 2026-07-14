@@ -35,6 +35,25 @@ def test_reciprocal_native_extension_caches_are_commit_keyed_and_reused() -> Non
     assert source.count('"$CANDIDATE_TORCH_EXTENSIONS_DIR"') >= 5
 
 
+def test_existing_extension_cache_override_is_commit_exact() -> None:
+    source = WRAPPER.read_text(encoding="utf-8")
+
+    assert "EXTENSION_CACHE_ROOT_OVERRIDE=${EXTENSION_CACHE_ROOT_OVERRIDE:-}" in source
+    assert "BASELINE_EXTENSION_KEY_OVERRIDE=${BASELINE_EXTENSION_KEY_OVERRIDE:-}" in source
+    assert "CANDIDATE_EXTENSION_KEY_OVERRIDE=${CANDIDATE_EXTENSION_KEY_OVERRIDE:-}" in source
+    assert 'EXTENSION_CACHE_MODE=existing_override' in source
+    assert 'EXTENSION_JOB_ROOT=$(realpath -e "$EXTENSION_CACHE_ROOT_OVERRIDE")' in source
+    assert (
+        '[[ "$BASELINE_EXTENSION_KEY_OVERRIDE" != "$BASELINE_EXTENSION_KEY" ]]'
+        in source
+    )
+    assert (
+        '[[ "$CANDIDATE_EXTENSION_KEY_OVERRIDE" != "$CANDIDATE_EXTENSION_KEY" ]]'
+        in source
+    )
+    assert 'native extension cache path/commit pairing is not exact' in source
+
+
 def test_native_extension_preload_wall_is_a_separate_json_artifact() -> None:
     source = WRAPPER.read_text(encoding="utf-8")
 
@@ -47,3 +66,16 @@ def test_native_extension_preload_wall_is_a_separate_json_artifact() -> None:
     assert 'local compiler_cache="$RUN_ROOT/compiler-cache/$label"' in source
     assert 'export TORCHINDUCTOR_CACHE_DIR="$compiler_cache/torch_inductor"' in source
     assert 'export TRITON_CACHE_DIR="$compiler_cache/triton"' in source
+
+
+def test_all_reciprocal_profiles_are_authoritative_untraced_controls() -> None:
+    source = WRAPPER.read_text(encoding="utf-8")
+
+    assert "profile_inference=true" in source
+    assert "profile_detail_ranges=false" in source
+    assert "profile_cuda_capture=false" in source
+    assert "profile_pass_kind=untraced_control" in source
+    assert 'metadata.get("profile_pass_kind") != "untraced_control"' in source
+    assert 'metadata.get("authoritative_performance") is not True' in source
+    assert 'metadata.get("profile_detail_ranges") is not False' in source
+    assert 'metadata.get("profile_cuda_capture") is not False' in source

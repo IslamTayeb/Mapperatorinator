@@ -29,6 +29,9 @@ AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_LABEL=${RUN_LABEL:-smoke}
 RUN_ROOT="$WORK/runs/inference-${RUN_LABEL}-${SLURM_JOB_ID:-manual}"
 EXTENSION_JOB_KEY=${SLURM_JOB_ID:-manual}
+EXTENSION_CACHE_ROOT_OVERRIDE=${EXTENSION_CACHE_ROOT_OVERRIDE:-}
+BASELINE_EXTENSION_KEY_OVERRIDE=${BASELINE_EXTENSION_KEY_OVERRIDE:-}
+CANDIDATE_EXTENSION_KEY_OVERRIDE=${CANDIDATE_EXTENSION_KEY_OVERRIDE:-}
 
 sanitize_extension_key() {
   local raw=$1
@@ -51,9 +54,56 @@ if [[ "$BASELINE_COMMIT" != "$CANDIDATE_COMMIT" ]] \
   echo "extension_key=$BASELINE_EXTENSION_KEY" >&2
   exit 2
 fi
-EXTENSION_JOB_ROOT="$WORK/torch_extensions/reciprocal-$EXTENSION_JOB_KEY"
+if [[ -z "$EXTENSION_CACHE_ROOT_OVERRIDE" ]]; then
+  if [[ -n "$BASELINE_EXTENSION_KEY_OVERRIDE" || -n "$CANDIDATE_EXTENSION_KEY_OVERRIDE" ]]; then
+    echo "extension key overrides require EXTENSION_CACHE_ROOT_OVERRIDE" >&2
+    exit 2
+  fi
+  EXTENSION_CACHE_MODE=job_local
+  EXTENSION_JOB_ROOT="$WORK/torch_extensions/reciprocal-$EXTENSION_JOB_KEY"
+else
+  if [[ "$EXTENSION_CACHE_ROOT_OVERRIDE" != /* ]]; then
+    echo "EXTENSION_CACHE_ROOT_OVERRIDE must be absolute" >&2
+    exit 2
+  fi
+  if [[ -z "$BASELINE_EXTENSION_KEY_OVERRIDE" || -z "$CANDIDATE_EXTENSION_KEY_OVERRIDE" ]]; then
+    echo "existing extension cache reuse requires both commit key overrides" >&2
+    exit 2
+  fi
+  if [[ "$BASELINE_EXTENSION_KEY_OVERRIDE" != "$BASELINE_EXTENSION_KEY" ]]; then
+    echo "baseline extension key override does not match BASELINE_COMMIT" >&2
+    exit 2
+  fi
+  if [[ "$CANDIDATE_EXTENSION_KEY_OVERRIDE" != "$CANDIDATE_EXTENSION_KEY" ]]; then
+    echo "candidate extension key override does not match CANDIDATE_COMMIT" >&2
+    exit 2
+  fi
+  if [[ ! -d "$EXTENSION_CACHE_ROOT_OVERRIDE" ]]; then
+    echo "existing extension cache root does not exist" >&2
+    exit 2
+  fi
+  EXTENSION_CACHE_MODE=existing_override
+  EXTENSION_JOB_ROOT=$(realpath -e "$EXTENSION_CACHE_ROOT_OVERRIDE")
+fi
 BASELINE_TORCH_EXTENSIONS_DIR="$EXTENSION_JOB_ROOT/$BASELINE_EXTENSION_KEY"
 CANDIDATE_TORCH_EXTENSIONS_DIR="$EXTENSION_JOB_ROOT/$CANDIDATE_EXTENSION_KEY"
+if [[ "$EXTENSION_CACHE_MODE" == existing_override ]]; then
+  for pair in \
+    "$BASELINE_TORCH_EXTENSIONS_DIR:$BASELINE_EXTENSION_KEY" \
+    "$CANDIDATE_TORCH_EXTENSIONS_DIR:$CANDIDATE_EXTENSION_KEY"; do
+    extension_dir=${pair%%:*}
+    expected_key=${pair##*:}
+    if [[ ! -d "$extension_dir" ]]; then
+      echo "missing existing native extension cache for commit key $expected_key" >&2
+      exit 2
+    fi
+    resolved_extension_dir=$(realpath -e "$extension_dir")
+    if [[ "$resolved_extension_dir" != "$EXTENSION_JOB_ROOT/$expected_key" ]]; then
+      echo "native extension cache path/commit pairing is not exact" >&2
+      exit 2
+    fi
+  done
+fi
 
 if [[ ! -x "$ENV/bin/python" ]]; then
   echo "missing environment Python at $ENV/bin/python" >&2
@@ -150,6 +200,7 @@ echo "profile_config=$PROFILE_CONFIG"
 echo "precision=$PRECISION"
 echo "regression_tolerance_pct=$REGRESSION_TOLERANCE_PCT"
 echo "run_root=$RUN_ROOT"
+echo "extension_cache_mode=$EXTENSION_CACHE_MODE"
 echo "extension_job_root=$EXTENSION_JOB_ROOT"
 echo "baseline_torch_extensions_dir=$BASELINE_TORCH_EXTENSIONS_DIR"
 echo "candidate_torch_extensions_dir=$CANDIDATE_TORCH_EXTENSIONS_DIR"
@@ -187,6 +238,9 @@ COMMON_OVERRIDES=(
   num_beams=1
   seed=12345
   profile_inference=true
+  profile_detail_ranges=false
+  profile_cuda_capture=false
+  profile_pass_kind=untraced_control
 )
 
 preload_native_extensions() {
@@ -358,6 +412,15 @@ for label, engine in expected.items():
         raise SystemExit(f"{label}: inference engine metadata mismatch")
     if profile.get("metadata", {}).get("precision") != precision:
         raise SystemExit(f"{label}: precision metadata mismatch")
+    metadata = profile.get("metadata", {})
+    if metadata.get("profile_pass_kind") != "untraced_control":
+        raise SystemExit(f"{label}: profile pass kind is not authoritative untraced")
+    if metadata.get("authoritative_performance") is not True:
+        raise SystemExit(f"{label}: authoritative_performance is not true")
+    if metadata.get("profile_detail_ranges") is not False:
+        raise SystemExit(f"{label}: profile_detail_ranges must be false")
+    if metadata.get("profile_cuda_capture") is not False:
+        raise SystemExit(f"{label}: profile_cuda_capture must be false")
 print("inference_reciprocal_smoke_gate=PASS")
 PY
 
