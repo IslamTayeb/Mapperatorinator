@@ -3,7 +3,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WRAPPER = ROOT / "scripts/dcc/profile_k4_mask_reuse_full_song_reciprocal.sbatch"
+WRAPPER = (
+    ROOT
+    / "scripts/dcc/profile_k4_shared_rope_mask_reuse_full_song_reciprocal.sbatch"
+)
 
 
 def test_wrapper_has_valid_bash_syntax():
@@ -20,9 +23,15 @@ def test_wrapper_runs_exact_reciprocal_control_and_candidate_order():
     )
     positions = [source.index(value) for value in expected]
     assert positions == sorted(positions)
-    assert "utils/run_k4_approximate_weight_only.py control" in source
-    assert "utils/run_k4_mask_reuse_approximate_weight_only.py candidate" in source
+    assert source.count(
+        "utils/run_k4_shared_rope_approximate_weight_only.py control"
+    ) == 2
+    assert source.count(
+        "utils/run_k4_shared_rope_mask_reuse_approximate_weight_only.py candidate"
+    ) == 2
     assert source.count("utils/validate_k4_mask_reuse_profile.py") == 1
+    assert "utils/validate_k4_shared_rope_mask_reuse_initialization.py" in source
+    assert "shared-rope-initialization-validation.json" in source
     assert "utils/summarize_k4_mask_reuse_reciprocal.py" in source
 
 

@@ -51,7 +51,7 @@ def test_incrementally_exact_pairwise_wall_win_promotes():
     assert report["result_class"] == "promotion"
     assert (
         report["incremental_exactness_scope"]
-        == "mask-reuse-vs-relaxed-k4-mixed-control"
+        == "mask-reuse-vs-relaxed-k4-split-weight-shared-rope-control"
     )
     assert "promotion_pass=true" in text_report(report)
 

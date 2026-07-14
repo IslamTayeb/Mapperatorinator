@@ -1,4 +1,4 @@
-"""Run K=4 mixed weights with request-local decoder-mask reuse enabled."""
+"""Add request-local decoder-mask reuse to the shared-RoPE K4 runtime."""
 
 from __future__ import annotations
 
@@ -11,18 +11,18 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from osuT5.osuT5.inference.optimized.single.k8_runtime import (  # noqa: E402
-    install_k8_candidate,
+from utils.run_k4_shared_rope_approximate_weight_only import (  # noqa: E402
+    run as run_shared_rope,
 )
-from utils.run_approximate_weight_only import run as run_weight_only  # noqa: E402
 
 
 def run(config_name: str, overrides: list[str], output_init_json: Path) -> None:
-    with install_k8_candidate(
-        block_size=4,
+    run_shared_rope(
+        config_name,
+        overrides,
+        output_init_json,
         reuse_decoder_attention_mask=True,
-    ):
-        run_weight_only(config_name, overrides, output_init_json)
+    )
 
 
 def main() -> None:

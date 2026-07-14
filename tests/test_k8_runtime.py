@@ -646,7 +646,9 @@ def test_capture_uses_state_device_guard_and_closes_parent_on_late_failure(
     state = SimpleNamespace(
         sequence=SimpleNamespace(device=torch.device("cuda", 2))
     )
-    model = lambda **kwargs: SimpleNamespace(logits=torch.zeros((1, 1, 4)))
+    def model(**kwargs):
+        del kwargs
+        return SimpleNamespace(logits=torch.zeros((1, 1, 4)))
 
     with pytest.raises(RuntimeError, match="late failure"):
         _capture_k8_entry(

@@ -1,4 +1,4 @@
-"""Decide incremental parity for mask reuse atop relaxed K4+mixed inference."""
+"""Decide mask reuse atop the relaxed K4+split+mixed+shared-RoPE stack."""
 
 from __future__ import annotations
 
@@ -11,8 +11,10 @@ from typing import Any, Mapping
 from utils.analyze_reciprocal_full_song_candidate import analyze
 
 
-SCHEMA_VERSION = "mapperatorinator.k4-mask-reuse-reciprocal.v2"
-INCREMENTAL_EXACTNESS_SCOPE = "mask-reuse-vs-relaxed-k4-mixed-control"
+SCHEMA_VERSION = "mapperatorinator.k4-shared-rope-mask-reuse-reciprocal.v3"
+INCREMENTAL_EXACTNESS_SCOPE = (
+    "mask-reuse-vs-relaxed-k4-split-weight-shared-rope-control"
+)
 WALL_METRICS = (
     "main_outer_stage_wall_seconds",
     "complete_request_wall_seconds",

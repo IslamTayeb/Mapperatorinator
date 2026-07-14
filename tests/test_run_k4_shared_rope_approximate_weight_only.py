@@ -68,12 +68,16 @@ def test_combined_runner_scopes_shared_rope_to_main_and_restores_everything(
             events.append(("rope-exit", model))
 
     @contextmanager
-    def fake_k4(*, block_size):
-        events.append(("k4-enter", block_size))
+    def fake_k4(*, block_size, reuse_decoder_attention_mask):
+        events.append(
+            ("k4-enter", block_size, reuse_decoder_attention_mask)
+        )
         try:
             yield
         finally:
-            events.append(("k4-exit", block_size))
+            events.append(
+                ("k4-exit", block_size, reuse_decoder_attention_mask)
+            )
 
     def fake_weight_run(config_name, overrides, output_init_json):
         events.append(("weight", config_name, list(overrides)))
@@ -99,12 +103,12 @@ def test_combined_runner_scopes_shared_rope_to_main_and_restores_everything(
     combined.run("profile_salvalai", ["seed=12345"], output)
 
     assert events == [
-        ("k4-enter", 4),
+        ("k4-enter", 4, False),
         ("weight", "profile_salvalai", ["seed=12345"]),
         ("load", main_model),
         ("rope-enter", main_model),
         ("load", timing_model),
-        ("k4-exit", 4),
+        ("k4-exit", 4, False),
         ("rope-exit", main_model),
     ]
     assert inference.load_model_with_engine is fake_loader
@@ -123,8 +127,9 @@ def test_combined_runner_restores_loader_and_context_on_failure(monkeypatch) -> 
     events: list[str] = []
 
     @contextmanager
-    def fake_k4(*, block_size):
+    def fake_k4(*, block_size, reuse_decoder_attention_mask):
         assert block_size == 4
+        assert reuse_decoder_attention_mask is False
         events.append("k4-enter")
         try:
             yield

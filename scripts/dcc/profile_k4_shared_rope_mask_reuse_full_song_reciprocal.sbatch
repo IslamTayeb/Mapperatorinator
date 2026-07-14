@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=k4-mask-reuse-recip
+#SBATCH --job-name=k4-rope-mask-recip
 #SBATCH --partition=gpu-common
 #SBATCH --account=romerolab
 #SBATCH --cpus-per-task=8
@@ -20,8 +20,8 @@ BRANCH=${MAPPERATORINATOR_BRANCH:?Set MAPPERATORINATOR_BRANCH}
 REMOTE=${MAPPERATORINATOR_REMOTE:-origin}
 REMOTE_BRANCH=${MAPPERATORINATOR_REMOTE_BRANCH:?Set MAPPERATORINATOR_REMOTE_BRANCH}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
-RUN_ROOT="$WORK/runs/k4-mask-reuse-reciprocal-${SLURM_JOB_ID:-manual}"
-EXTENSIONS="$WORK/torch_extensions/k4-mask-reuse-$COMMIT"
+RUN_ROOT="$WORK/runs/k4-shared-rope-mask-reuse-reciprocal-${SLURM_JOB_ID:-manual}"
+EXTENSIONS="$WORK/torch_extensions/k4-shared-rope-mask-reuse-$COMMIT"
 
 if [[ ! -d "$REPO/.git" && ! -f "$REPO/.git" ]]; then
   echo "missing scout worktree at $REPO" >&2
@@ -62,7 +62,7 @@ for tool in ffmpeg ffprobe; do
 done
 GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1)
 if [[ "$GPU_NAME" != "NVIDIA GeForce RTX 2080 Ti" ]]; then
-  echo "K4 mask reuse reciprocal requires RTX 2080 Ti, got $GPU_NAME" >&2
+  echo "K4 shared-RoPE mask reuse reciprocal requires RTX 2080 Ti, got $GPU_NAME" >&2
   exit 2
 fi
 
@@ -172,13 +172,23 @@ run_profile() {
 }
 
 run_profile baseline_first \
-  utils/run_k4_approximate_weight_only.py control
+  utils/run_k4_shared_rope_approximate_weight_only.py control
 run_profile candidate_first \
-  utils/run_k4_mask_reuse_approximate_weight_only.py candidate
+  utils/run_k4_shared_rope_mask_reuse_approximate_weight_only.py candidate
 run_profile candidate_second \
-  utils/run_k4_mask_reuse_approximate_weight_only.py candidate
+  utils/run_k4_shared_rope_mask_reuse_approximate_weight_only.py candidate
 run_profile baseline_second \
-  utils/run_k4_approximate_weight_only.py control
+  utils/run_k4_shared_rope_approximate_weight_only.py control
+
+(
+  cd "$REPO"
+  "$PYTHON" utils/validate_k4_shared_rope_mask_reuse_initialization.py \
+    --baseline-first-initialization "$RUN_ROOT/baseline_first.initialization.json" \
+    --candidate-first-initialization "$RUN_ROOT/candidate_first.initialization.json" \
+    --candidate-second-initialization "$RUN_ROOT/candidate_second.initialization.json" \
+    --baseline-second-initialization "$RUN_ROOT/baseline_second.initialization.json" \
+    > "$RUN_ROOT/shared-rope-initialization-validation.json"
+)
 
 BASELINE_FIRST=$(<"$RUN_ROOT/baseline_first.profile-path.txt")
 CANDIDATE_FIRST=$(<"$RUN_ROOT/candidate_first.profile-path.txt")
@@ -209,7 +219,8 @@ for artifact in \
   "$RUN_ROOT/baseline_first.mask-validation.json" \
   "$RUN_ROOT/candidate_first.mask-validation.json" \
   "$RUN_ROOT/candidate_second.mask-validation.json" \
-  "$RUN_ROOT/baseline_second.mask-validation.json"; do
+  "$RUN_ROOT/baseline_second.mask-validation.json" \
+  "$RUN_ROOT/shared-rope-initialization-validation.json"; do
   if [[ ! -s "$artifact" ]]; then
     echo "missing required K4 mask reuse artifact: $artifact" >&2
     exit 2

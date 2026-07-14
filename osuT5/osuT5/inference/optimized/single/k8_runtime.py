@@ -14,7 +14,6 @@ from transformers.modeling_outputs import BaseModelOutput
 from ....runtime_profiling import profile_range
 from .decode_loop import (
     _bucketed_prefix_length,
-    _capture_decode_cuda_graph,
     _clone_static_graph_inputs,
     _max_cache_shape,
     _stable_encoder_outputs,
@@ -1276,7 +1275,6 @@ def k8_active_prefix_decode_generate(
 
     is_prefill = True
     finished = False
-    scores = None
     while not finished:
         if is_prefill or not _k8_eligible(
             cur_len,
