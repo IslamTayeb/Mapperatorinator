@@ -545,6 +545,10 @@ def summarize(
 ) -> dict[str, Any]:
     if set(paths) != set(RUN_NAMES):
         raise GateError(f"profile paths must be exactly {RUN_NAMES}")
+    if candidate_block_size not in (1, 4, 8):
+        raise GateError("candidate_block_size must be 1, 4, or 8")
+    if baseline_block_size not in (None, 1, 4, 8):
+        raise GateError("baseline_block_size must be None, 1, 4, or 8")
     profiles = {name: _load(paths[name]) for name in RUN_NAMES}
     failures: list[str] = []
     for name, profile in profiles.items():
@@ -646,7 +650,11 @@ def summarize(
         )
         orders[order]["full_decode"]["fixed_work"] = full_decode_fixed
         orders[order]["full_decode"]["evidence_class"] = (
-            "fixed_work_counter_rng"
+            (
+                "fixed_work_accepted_vs_counter_rng"
+                if baseline_block_size is None
+                else "fixed_work_counter_rng"
+            )
             if full_decode_fixed
             else "natural_work_end_to_end"
         )
@@ -692,7 +700,11 @@ def summarize(
         order["main_generation"]["fixed_work_model_seconds_saving"]
         for order in orders.values()
     ]
-    full_fixed_work_available = all(value is not None for value in fixed_work_savings)
+    full_fixed_work_available = (
+        all(value is not None for value in fixed_work_savings)
+        and all(order["full_decode"]["fixed_work"] for order in orders.values())
+        and all(order["output"]["artifact_equal"] for order in orders.values())
+    )
     full_fixed_work_saving = (
         mean(float(value) for value in fixed_work_savings)
         if full_fixed_work_available

@@ -60,7 +60,8 @@ def test_wrapper_and_submitter_fail_loudly_on_provenance_and_gpu_state():
 def test_wrapper_keeps_generated_artifacts_outside_git_and_json_text_only():
     source = (ROOT / "scripts/dcc/verify_k8_reciprocal.sbatch").read_text()
 
-    assert 'RUN_ROOT="$WORK/runs/k8-reciprocal-' in source
+    assert 'RUN_TAG=${RUN_TAG:-k8-reciprocal}' in source
+    assert 'RUN_ROOT="$WORK/runs/$RUN_TAG-' in source
     assert "gate.json" in source
     assert "gate.txt" in source
     assert ".md" not in source
