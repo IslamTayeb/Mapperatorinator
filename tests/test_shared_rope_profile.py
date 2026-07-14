@@ -8,6 +8,7 @@ from utils.profile_shared_rope_scout import (
     REQUIRED_MAIN_SAVING_SECONDS,
     SCHEMA_VERSION,
     _validate_report,
+    decision_exit_code,
     summarize_shared_rope,
 )
 from utils.profile_native_prefix_dtype_scout import ALL_BUCKETS
@@ -75,6 +76,7 @@ def test_weighted_gate_charges_setup_and_unmeasured_buckets_get_zero_credit():
 def test_exactness_or_call_accounting_blocks_promotion():
     report = _report(saving_ms=1.0)
     assert report["summary"]["promotion_pass"] is True
+    assert decision_exit_code(report) == 0
 
     report["buckets"]["128"]["exact_pass"] = False
     report["summary"] = summarize_shared_rope(
@@ -83,6 +85,7 @@ def test_exactness_or_call_accounting_blocks_promotion():
         install_setup_seconds=0.0,
     )
     assert report["summary"]["promotion_pass"] is False
+    assert decision_exit_code(report) == 1
 
     report = _report(saving_ms=1.0)
     report["buckets"]["576"]["rope_call_accounting_pass"] = False
@@ -92,6 +95,16 @@ def test_exactness_or_call_accounting_blocks_promotion():
         install_setup_seconds=0.0,
     )
     assert report["summary"]["promotion_pass"] is False
+    assert decision_exit_code(report) == 1
+
+
+def test_performance_only_negative_uses_exit_three():
+    report = _report(saving_ms=0.01)
+
+    assert report["summary"]["exact_pass"] is True
+    assert report["summary"]["rope_call_accounting_pass"] is True
+    assert report["summary"]["performance_pass"] is False
+    assert decision_exit_code(report) == 3
 
 
 def test_report_validation_fails_on_bad_coverage_timing_or_decision():
