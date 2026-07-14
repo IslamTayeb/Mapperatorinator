@@ -192,5 +192,8 @@ class ProductionDecodeSession:
                     latest.get("processor_signature_setup_seconds", 0.0)
                 ),
                 "parent_backend": latest.get("parent_backend"),
+                "capture_state_restore_synchronized": bool(
+                    latest.get("capture_state_restore_synchronized", False)
+                ),
             }
         return result

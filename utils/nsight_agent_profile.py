@@ -2345,12 +2345,22 @@ def _profile_label_signature(profile: Mapping[str, Any], label: str) -> dict[str
     }
 
 
+VOLATILE_GRAPH_CACHE_KEYS = frozenset(
+    {
+        "capture_seconds",
+        "prompt_seed_setup_seconds",
+        "processor_signature_setup_seconds",
+        "peak_vram_bytes",
+    }
+)
+
+
 def _canonicalize_graph_cache_value(value: Any) -> Any:
     if isinstance(value, dict):
         return {
             key: _canonicalize_graph_cache_value(child)
             for key, child in value.items()
-            if key != "capture_seconds"
+            if key not in VOLATILE_GRAPH_CACHE_KEYS
         }
     if isinstance(value, list):
         return [_canonicalize_graph_cache_value(child) for child in value]

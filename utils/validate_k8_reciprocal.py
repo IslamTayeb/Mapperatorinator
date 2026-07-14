@@ -297,6 +297,10 @@ def _validate_k8_profile(
                 failures.append(f"{name}.{label}[{record_index}] has invalid sampling mode")
             if stats.get("parent_backend") != "cuda_python_child_graphs":
                 failures.append(f"{name}.{label}[{record_index}] has wrong parent backend")
+            if stats.get("capture_state_restore_synchronized") is not True:
+                failures.append(
+                    f"{name}.{label}[{record_index}] lacks synchronized capture restore"
+                )
             if values["eligible_steps"] != block_size * values["block_replays"]:
                 failures.append(f"{name}.{label}[{record_index}] block accounting diverged")
             if (
@@ -543,6 +547,24 @@ def summarize(
         name: nsight._profile_graph_cache_signature(profile, LABELS)
         for name, profile in profiles.items()
     }
+    baseline_graph_repeat = (
+        graph_signatures["baseline_first"].get("status") == "available"
+        and graph_signatures["baseline_second"].get("status") == "available"
+        and graph_signatures["baseline_first"].get("sha256")
+        == graph_signatures["baseline_second"].get("sha256")
+    )
+    candidate_graph_repeat = (
+        graph_signatures["candidate_first"].get("status") == "available"
+        and graph_signatures["candidate_second"].get("status") == "available"
+        and graph_signatures["candidate_first"].get("sha256")
+        == graph_signatures["candidate_second"].get("sha256")
+    )
+    if not baseline_graph_repeat:
+        failures.append("baseline reciprocal graph-cache signatures differ")
+    if not candidate_graph_repeat:
+        failures.append("candidate reciprocal graph-cache signatures differ")
+    if failures:
+        promotion_pass = False
     for order, (baseline_name, candidate_name) in order_specs.items():
         baseline_signature = graph_signatures[baseline_name]
         candidate_signature = graph_signatures[candidate_name]
@@ -562,6 +584,10 @@ def summarize(
         "contract_checks": contracts,
         "artifacts": artifacts,
         "graph_cache_signatures": graph_signatures,
+        "graph_cache_repeatability": {
+            "baseline_pass": baseline_graph_repeat,
+            "candidate_pass": candidate_graph_repeat,
+        },
         "baseline_repeatability": baseline_repeatability,
         "candidate_repeatability": candidate_repeatability,
         "candidate_k8_totals": candidate_stats,
