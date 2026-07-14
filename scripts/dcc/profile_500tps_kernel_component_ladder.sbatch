@@ -14,7 +14,8 @@ set -euo pipefail
 WORK=${MAPPERATORINATOR_WORK:-/work/imt11/Mapperatorinator}
 ROOT=${MAPPERATORINATOR_WORKTREE_ROOT:-/hpc/group/romerolab/imt11/projects/Mapperatorinator-worktrees}
 SUITE_ROOT="$WORK/runs/500tps-kernel-component-ladder-${SLURM_JOB_ID:-manual}"
-LADDER_REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+LADDER_REPO=${MAPPERATORINATOR_LADDER_REPO:?Set MAPPERATORINATOR_LADDER_REPO to the clean DCC ladder worktree}
+LADDER_COMMIT=${MAPPERATORINATOR_LADDER_COMMIT:?Set MAPPERATORINATOR_LADDER_COMMIT to the exact pushed ladder commit}
 LADDER_BRANCH=${MAPPERATORINATOR_LADDER_BRANCH:-codex/500tps-kernel-component-ladder-dcc}
 LADDER_REMOTE_BRANCH=codex/500tps-kernel-component-ladder
 ENV=${MAPPERATORINATOR_ENV:-/hpc/group/romerolab/imt11/envs/mapperatorinator}
@@ -174,7 +175,7 @@ mkdir "$SUITE_ROOT"
 
 [[ -x "$PYTHON" ]] || fail "missing environment Python: $PYTHON"
 validate_checkout \
-  ladder "$LADDER_REPO" "$(git -C "$LADDER_REPO" rev-parse HEAD)" \
+  ladder "$LADDER_REPO" "$LADDER_COMMIT" \
   "$LADDER_BRANCH" "$LADDER_REMOTE_BRANCH"
 
 GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1)
@@ -194,7 +195,7 @@ validate_checkout vocab "$VOCAB_REPO" "$VOCAB_COMMIT" "$VOCAB_BRANCH"
   echo "gpu=$GPU_NAME"
   echo "suite_root=$SUITE_ROOT"
   echo "ladder_repo=$LADDER_REPO"
-  echo "ladder_commit=$(git -C "$LADDER_REPO" rev-parse HEAD)"
+  echo "ladder_commit=$LADDER_COMMIT"
   echo "ladder_branch=$LADDER_BRANCH"
   echo "cross=$CROSS_COMMIT"
   echo "conditional=$CONDITIONAL_COMMIT"

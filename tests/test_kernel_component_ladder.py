@@ -39,6 +39,9 @@ class KernelComponentLadderTest(unittest.TestCase):
         self.assertIn('status == 3 and sizing is False', source)
         self.assertIn('#SBATCH --time=02:00:00', source)
         self.assertIn('LADDER_REMOTE_BRANCH=codex/500tps-kernel-component-ladder', source)
+        self.assertIn('MAPPERATORINATOR_LADDER_REPO:?', source)
+        self.assertIn('MAPPERATORINATOR_LADDER_COMMIT:?', source)
+        self.assertNotIn('BASH_SOURCE[0]', source)
 
 
 if __name__ == "__main__":
