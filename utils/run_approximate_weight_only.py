@@ -16,12 +16,17 @@ if str(REPO_ROOT) not in sys.path:
 from utils.fixed_seed_inference import fixed_seed_processor_generation
 
 
-def _load_args(config_name: str, overrides: list[str]):
+def _load_args(
+    config_name: str,
+    overrides: list[str],
+    *,
+    repo_root: Path = REPO_ROOT,
+):
     import config  # noqa: F401
     import hydra
     from omegaconf import DictConfig, OmegaConf
 
-    config_dir = REPO_ROOT / "configs" / "inference"
+    config_dir = repo_root / "configs" / "inference"
     resolved_name = config_name.removeprefix("inference/")
     with hydra.initialize_config_dir(
         config_dir=str(config_dir),
@@ -97,6 +102,11 @@ def run(config_name: str, overrides: list[str], output_init_json: Path) -> None:
         raise ValueError("weight-only candidate requires use_server=false")
     if not args.profile_inference:
         raise ValueError("weight-only validation requires profile_inference=true")
+    if args.super_timing or args.generate_positions:
+        raise ValueError(
+            "weight-only reciprocal runner supports Processor timing/main only; "
+            "super_timing and generate_positions must be false"
+        )
 
     original_loader = inference.load_model_with_engine
     initialized = False

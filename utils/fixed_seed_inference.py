@@ -33,6 +33,17 @@ def reset_rng(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def rng_state_fingerprints() -> dict[str, str]:
+    fingerprints = {
+        "cpu": hashlib.sha256(torch.get_rng_state().numpy().tobytes()).hexdigest(),
+    }
+    if torch.cuda.is_available():
+        fingerprints["cuda"] = hashlib.sha256(
+            torch.cuda.get_rng_state().cpu().numpy().tobytes()
+        ).hexdigest()
+    return fingerprints
+
+
 @contextmanager
 def fixed_seed_processor_generation(inference_module, *, base_seed: int) -> Iterator[None]:
     """Reset RNG at each named generation stage and restore the class method."""
@@ -48,12 +59,17 @@ def fixed_seed_processor_generation(inference_module, *, base_seed: int) -> Iter
             )
         seed = stage_seed(base_seed, profile_label)
         reset_rng(seed)
+        fingerprints = rng_state_fingerprints()
         profiler = getattr(self, "profiler", None)
         set_metadata = getattr(profiler, "set_metadata", None)
         if callable(set_metadata):
             set_metadata(
                 reciprocal_seed_policy=SEED_POLICY_VERSION,
                 **{f"reciprocal_seed_{profile_label}": seed},
+                **{
+                    f"reciprocal_rng_{device}_sha256_{profile_label}": digest
+                    for device, digest in fingerprints.items()
+                },
             )
         return original_generate(self, *args, **kwargs)
 

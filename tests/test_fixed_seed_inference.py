@@ -8,8 +8,10 @@ from utils.fixed_seed_inference import (
     SEED_POLICY_VERSION,
     fixed_seed_processor_generation,
     reset_rng,
+    rng_state_fingerprints,
     stage_seed,
 )
+from utils.run_fixed_seed_inference import _target_repo
 
 
 def test_stage_seed_is_stable_and_label_specific() -> None:
@@ -22,6 +24,14 @@ def test_stage_seed_is_stable_and_label_specific() -> None:
         stage_seed(12345, "")
 
 
+def test_target_repo_requires_inference_and_config_tree(tmp_path) -> None:
+    with pytest.raises(ValueError, match="lacks inference.py"):
+        _target_repo(tmp_path)
+    (tmp_path / "inference.py").write_text("", encoding="utf-8")
+    (tmp_path / "configs" / "inference").mkdir(parents=True)
+    assert _target_repo(tmp_path) == tmp_path.resolve()
+
+
 def test_reset_rng_repeats_cpu_torch_and_numpy() -> None:
     reset_rng(717)
     first = (torch.rand(3), np.random.random(3))
@@ -29,6 +39,12 @@ def test_reset_rng_repeats_cpu_torch_and_numpy() -> None:
     second = (torch.rand(3), np.random.random(3))
     assert torch.equal(first[0], second[0])
     assert np.array_equal(first[1], second[1])
+    reset_rng(717)
+    first_fingerprint = rng_state_fingerprints()["cpu"]
+    torch.rand(1)
+    assert rng_state_fingerprints()["cpu"] != first_fingerprint
+    reset_rng(717)
+    assert rng_state_fingerprints()["cpu"] == first_fingerprint
 
 
 def test_processor_patch_reseeds_each_stage_and_restores(monkeypatch) -> None:
@@ -65,3 +81,4 @@ def test_processor_patch_reseeds_each_stage_and_restores(monkeypatch) -> None:
     assert metadata["reciprocal_seed_timing_context"] == stage_seed(
         12345, "timing_context"
     )
+    assert len(metadata["reciprocal_rng_cpu_sha256_main_generation"]) == 64
