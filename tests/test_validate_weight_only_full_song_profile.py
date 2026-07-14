@@ -175,6 +175,7 @@ def test_candidate_requires_enabled_main_and_disabled_timing_dispatch() -> None:
         "weight_only_mlp_tail": 12,
         "weight_only_final_projection": 1,
     }
+    assert report["main_q1_bmm_cross_attention_count"] == 12
     assert report["main_effective_self_attention_counts"] == {
         "native_q1_rope_cache_self_attention": 12,
         "native_q1_rope_cache_self_attention_split_kv_8": 10,
@@ -195,6 +196,7 @@ def test_selected_cross_candidate_requires_truthful_metadata_and_dispatch() -> N
     assert report["main_cross_candidate_dispatch_counts"] == {
         "fp16_packed_cross_projection_candidate": 12,
     }
+    assert report["main_q1_bmm_cross_attention_count"] == 12
 
 
 def test_cross_candidate_mode_mismatch_fails_loudly() -> None:

@@ -743,12 +743,17 @@ from pathlib import Path
 root = Path(sys.argv[1])
 roles = tuple(sys.argv[2].split(","))
 require_shared_rope = sys.argv[3] == "true"
-shared_rope_both_arms = sys.argv[4] == "true" or sys.argv[5] == "true"
+require_k1_remainder = sys.argv[4] == "true"
 require_int8_mlp = sys.argv[5] == "true"
 int8_k1_composition = sys.argv[6] == "true"
 require_cross = sys.argv[7] == "true"
 cross_mode = sys.argv[8]
 cross_k1_int8_composition = sys.argv[9] == "true"
+shared_rope_both_arms = (
+    require_k1_remainder
+    or require_int8_mlp
+    or cross_k1_int8_composition
+)
 runs = {}
 required_numbers = (
     "initialization_wall_seconds",
@@ -897,6 +902,16 @@ summary = {
     encoding="utf-8",
 )
 PY
+
+if [[ "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
+  (
+    cd "$CANDIDATE_REPO"
+    "$PYTHON" utils/validate_fp16_cross_reciprocal_manifest.py \
+      --run-root "$RUN_ROOT" \
+      --cross-mode "$CROSS_CANDIDATE_MODE" \
+      > "$RUN_ROOT/fp16-cross-reciprocal-manifest.json"
+  )
+fi
 
 ANALYSIS_MODE=relaxed
 ANALYSIS_CLAIM=relaxed-nonexact
@@ -1047,6 +1062,11 @@ if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
     fi
   done
 fi
+if [[ "$REQUIRE_CROSS_INCREMENTAL" == true \
+  && ! -s "$RUN_ROOT/fp16-cross-reciprocal-manifest.json" ]]; then
+  echo "missing required FP16 cross reciprocal manifest" >&2
+  exit 2
+fi
 
 grep -q "^mode=$ANALYSIS_MODE$" "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q "^parity.claim=$ANALYSIS_CLAIM$" "$RUN_ROOT/reciprocal-analysis.txt"
@@ -1094,5 +1114,6 @@ grep -q '^metric.peak_cuda_memory_allocated_mb=' \
 grep -q '^metric.setup_plus_capture_seconds=' \
   "$RUN_ROOT/reciprocal-analysis.txt"
 find "$RUN_ROOT" -type f \
-  \( -name '*.profile.json' -o -name '*analysis.json' -o -name '*summary.json' \) \
+  \( -name '*.profile.json' -o -name '*analysis.json' -o -name '*summary.json' \
+    -o -name '*manifest.json' \) \
   -print0 | sort -z | xargs -0 sha256sum

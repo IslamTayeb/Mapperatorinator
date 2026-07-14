@@ -229,6 +229,25 @@ def test_selected_cross_wrapper_pins_k1_int8_control_and_fp16_projection_delta()
     assert "packed_projection_delta_only" in general
     assert "accepted_q1_bmm_required" in general
     assert "parity.cross_candidate_exact=true" in general
+    assert "validate_fp16_cross_reciprocal_manifest.py" in general
+    assert "fp16-cross-reciprocal-manifest.json" in general
+
+
+def test_cross_composition_classifies_shared_rope_as_common_to_all_arms() -> None:
+    source = WRAPPER.read_text(encoding="utf-8")
+    initialization = source.split(
+        '"$PYTHON" - "$RUN_ROOT" "$INITIALIZATION_ROLES"', maxsplit=1
+    )[1].split("ANALYSIS_MODE=relaxed", maxsplit=1)[0]
+
+    assert 'cross_k1_int8_composition = sys.argv[9] == "true"' in initialization
+    assert (
+        "shared_rope_both_arms = (\n"
+        "    require_k1_remainder\n"
+        "    or require_int8_mlp\n"
+        "    or cross_k1_int8_composition\n"
+        ")"
+    ) in initialization
+    assert "shared_roles = roles if shared_rope_both_arms" in initialization
 
 
 def test_selected_cross_analysis_allows_only_the_projection_dispatch_delta() -> None:

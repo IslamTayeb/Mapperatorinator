@@ -229,6 +229,7 @@ def validate_profile(
 
     totals = {key: 0 for key in WEIGHT_ONLY_DISPATCHES}
     cross_totals = {key: 0 for key in CROSS_DISPATCHES}
+    candidate_q1_bmm_total = 0
     baseline_main_dispatch_totals = {
         "q1_bmm_cross_attention": 0,
         "native_cross_mlp_tail": 0,
@@ -430,6 +431,7 @@ def validate_profile(
                     raise WeightOnlyProfileError(
                         f"{name} cross dispatch tuple must be {expected}, got {actual}"
                     )
+                candidate_q1_bmm_total += q1_bmm
             else:
                 for key in (
                     "native_q1_rope_cache_self_attention",
@@ -504,6 +506,7 @@ def validate_profile(
         "candidate_disabled_for_timing": candidate,
         "main_weight_only_dispatch_counts": totals,
         "main_cross_candidate_dispatch_counts": cross_totals,
+        "main_q1_bmm_cross_attention_count": candidate_q1_bmm_total,
         "baseline_main_dispatch_counts": baseline_main_dispatch_totals,
         "timing_effective_self_attention_counts": effective_self_attention_totals[
             "timing_context"
