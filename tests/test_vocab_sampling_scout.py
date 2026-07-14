@@ -102,6 +102,26 @@ def test_patch_context_restores_after_failure() -> None:
     assert k8_runtime._sample_counter is original
 
 
+def test_patch_observes_real_eager_top_p_and_counter_sample() -> None:
+    observer = VocabSamplingObserver(max_samples=1)
+    warper = TopPLogitsWarper(top_p=0.9)
+    processor = SimpleNamespace(processors=[warper])
+    state = SimpleNamespace(counter_uniform=lambda: torch.tensor([0.25]))
+    raw = torch.tensor([[4.0, 3.0, 2.0, 1.0]])
+
+    with install_vocab_sampling_observer(observer):
+        observer.observe_processor(processor, raw)
+        post = warper(torch.zeros((1, 1), dtype=torch.long), raw)
+        token = k8_runtime._sample_counter(post, state)
+
+    assert len(observer.samples) == 1
+    sample = observer.samples[0]
+    assert sample.source == "eager_remainder"
+    assert sample.selected_token == int(token.item())
+    assert sample.nucleus_size == int(torch.isfinite(post).sum().item())
+    assert sample.processor_descriptor == _descriptor()
+
+
 def test_summary_computes_fixed_main_and_request_zero_cost_ceilings() -> None:
     observer = VocabSamplingObserver(max_samples=8)
     observer.samples = [_sample(nucleus_size=value) for value in (1, 2, 3, 4)]
@@ -192,4 +212,3 @@ def test_runner_scopes_observer_k4_and_weight_candidate(monkeypatch, tmp_path) -
     ]
     assert output.is_file()
     assert report["production_wiring_changed"] is False
-
