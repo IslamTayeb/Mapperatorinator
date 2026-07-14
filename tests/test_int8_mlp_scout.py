@@ -22,11 +22,13 @@ def test_extension_is_cold_singleton_with_explicit_manual_binding(monkeypatch) -
     assert int8_mlp.preload_int8_mlp_extension() is extension
     assert int8_mlp.preload_int8_mlp_extension() is extension
     assert len(calls) == 1
-    assert calls[0]["name"] == "mapperatorinator_int8_mlp_scout_v1"
+    assert calls[0]["name"] == "mapperatorinator_int8_projection_scout_v2"
     assert "functions" not in calls[0]
     assert "torch::Tensor int8_weight_mlp_residual(" in calls[0]["cpp_sources"]
     assert "PYBIND11_MODULE(TORCH_EXTENSION_NAME, module)" in calls[0]["cpp_sources"]
     assert '&int8_weight_mlp_residual' in calls[0]["cpp_sources"]
+    assert '&int8_weight_rmsnorm_linear' in calls[0]["cpp_sources"]
+    assert '&int8_weight_linear_residual' in calls[0]["cpp_sources"]
 
 
 def test_cuda_source_uses_int8_storage_and_fp32_state_accumulation() -> None:
@@ -99,6 +101,34 @@ def test_cpu_input_fails_before_extension_build(monkeypatch) -> None:
         )
 
 
+def test_projection_cpu_inputs_fail_before_extension_build(monkeypatch) -> None:
+    packed = int8_mlp.Int8PackedLinear(
+        weight=torch.zeros((4, 4), dtype=torch.int8),
+        scale=torch.ones(4),
+        bias=None,
+        source_weight_bytes=64,
+    )
+    monkeypatch.setattr(
+        int8_mlp,
+        "_load_int8_mlp_extension",
+        lambda: (_ for _ in ()).throw(AssertionError("must not build")),
+    )
+
+    with pytest.raises(RuntimeError, match="CUDA tensor"):
+        int8_mlp.int8_weight_rmsnorm_linear(
+            torch.zeros((1, 1, 4)),
+            torch.ones(4),
+            packed,
+            eps=1e-5,
+        )
+    with pytest.raises(RuntimeError, match="CUDA tensor"):
+        int8_mlp.int8_weight_linear_residual(
+            torch.zeros((1, 1, 4)),
+            torch.zeros((1, 1, 4)),
+            packed,
+        )
+
+
 def test_wrapper_preserves_pack_argument_order_and_fp32_output(monkeypatch) -> None:
     calls = []
 
@@ -152,6 +182,82 @@ def test_wrapper_preserves_pack_argument_order_and_fp32_output(monkeypatch) -> N
             4,
         )
     ]
+
+
+def test_projection_wrappers_preserve_fp32_state_and_argument_order(monkeypatch) -> None:
+    calls = []
+
+    class Extension:
+        @staticmethod
+        def int8_weight_rmsnorm_linear(*args):
+            calls.append(("norm", args))
+            return torch.zeros((1, 1, 8), dtype=torch.float32)
+
+        @staticmethod
+        def int8_weight_linear_residual(*args):
+            calls.append(("residual", args))
+            return args[1]
+
+    monkeypatch.setattr(int8_mlp, "_INT8_MLP_EXTENSION", Extension())
+    monkeypatch.setattr(int8_mlp, "_require_fp32_cuda", lambda *args, **kwargs: None)
+    monkeypatch.setattr(int8_mlp, "_require_int8_pack", lambda *args, **kwargs: None)
+    hidden = torch.zeros((1, 1, 4), dtype=torch.float32)
+    residual = torch.zeros((1, 1, 8), dtype=torch.float32)
+    norm = torch.ones(4, dtype=torch.float32)
+    packed = int8_mlp.Int8PackedLinear(
+        weight=torch.ones((8, 4), dtype=torch.int8),
+        scale=torch.ones(8),
+        bias=torch.zeros(8),
+        source_weight_bytes=128,
+    )
+
+    normalized = int8_mlp.int8_weight_rmsnorm_linear(
+        hidden,
+        norm,
+        packed,
+        eps=1e-5,
+        outputs_per_block=2,
+    )
+    added = int8_mlp.int8_weight_linear_residual(
+        hidden,
+        residual,
+        packed,
+        outputs_per_block=4,
+    )
+
+    assert normalized.dtype == torch.float32
+    assert added is residual
+    assert calls == [
+        (
+            "norm",
+            (hidden, norm, packed.weight, packed.scale, packed.bias, 1e-5, 2),
+        ),
+        (
+            "residual",
+            (hidden, residual, packed.weight, packed.scale, packed.bias, 4),
+        ),
+    ]
+
+
+def test_projection_wrappers_reject_unsupported_outputs_per_block(monkeypatch) -> None:
+    packed = int8_mlp.Int8PackedLinear(
+        weight=torch.ones((4, 4), dtype=torch.int8),
+        scale=torch.ones(4),
+        bias=None,
+        source_weight_bytes=64,
+    )
+    monkeypatch.setattr(int8_mlp, "_require_fp32_cuda", lambda *args, **kwargs: None)
+    monkeypatch.setattr(int8_mlp, "_require_int8_pack", lambda *args, **kwargs: None)
+    hidden = torch.zeros((1, 1, 4))
+
+    with pytest.raises(ValueError, match="2, 4, or 8"):
+        int8_mlp.int8_weight_rmsnorm_linear(
+            hidden, hidden.view(4), packed, eps=1e-5, outputs_per_block=3
+        )
+    with pytest.raises(ValueError, match="2, 4, or 8"):
+        int8_mlp.int8_weight_linear_residual(
+            hidden, hidden, packed, outputs_per_block=3
+        )
 
 
 def test_pack_memory_separates_int8_weights_fp32_scales_and_sources() -> None:

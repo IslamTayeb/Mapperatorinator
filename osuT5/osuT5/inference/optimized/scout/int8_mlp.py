@@ -36,11 +36,31 @@ torch::Tensor int8_weight_mlp_residual(
     double eps, int64_t fc1_outputs_per_block,
     int64_t fc2_outputs_per_block);
 
+torch::Tensor int8_weight_rmsnorm_linear(
+    torch::Tensor input, torch::Tensor norm_weight,
+    torch::Tensor weight, torch::Tensor scale,
+    c10::optional<torch::Tensor> bias,
+    double eps, int64_t outputs_per_block);
+
+torch::Tensor int8_weight_linear_residual(
+    torch::Tensor input, torch::Tensor residual,
+    torch::Tensor weight, torch::Tensor scale,
+    c10::optional<torch::Tensor> bias,
+    int64_t outputs_per_block);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     module.def(
         "int8_weight_mlp_residual",
         &int8_weight_mlp_residual,
         "INT8 weight-only one-token MLP residual (CUDA)");
+    module.def(
+        "int8_weight_rmsnorm_linear",
+        &int8_weight_rmsnorm_linear,
+        "INT8 weight-only one-token RMSNorm plus linear (CUDA)");
+    module.def(
+        "int8_weight_linear_residual",
+        &int8_weight_linear_residual,
+        "INT8 weight-only one-token linear plus residual (CUDA)");
 }
 """
 
@@ -276,6 +296,82 @@ torch::Tensor int8_weight_mlp_residual(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
+
+torch::Tensor int8_weight_rmsnorm_linear(
+        torch::Tensor input, torch::Tensor norm_weight,
+        torch::Tensor weight, torch::Tensor scale,
+        c10::optional<torch::Tensor> bias,
+        double eps, int64_t outputs_per_block) {
+    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+    TORCH_CHECK(input.scalar_type() == torch::kFloat32 && input.is_contiguous(),
+        "input activations must remain contiguous FP32");
+    TORCH_CHECK(input.dim() == 3 && input.size(0) == 1 && input.size(1) == 1,
+        "input must have shape [1, 1, input_dim]");
+    TORCH_CHECK(norm_weight.is_cuda() && norm_weight.device() == input.device(),
+        "norm weight must use the input CUDA device");
+    TORCH_CHECK(norm_weight.scalar_type() == torch::kFloat32
+        && norm_weight.is_contiguous(),
+        "norm weight must remain contiguous FP32");
+    check_outputs_per_block(outputs_per_block);
+    check_quantized_linear(input, weight, scale, "linear");
+    const int input_dim = static_cast<int>(input.size(2));
+    const int output_dim = static_cast<int>(weight.size(0));
+    TORCH_CHECK(weight.size(1) == input_dim,
+        "linear input dimension must equal activation dimension");
+    TORCH_CHECK(norm_weight.numel() == input_dim,
+        "norm weight/input dimension mismatch");
+    const float* bias_ptr = check_bias(bias, input, output_dim, "linear");
+    c10::cuda::CUDAGuard guard(input.device());
+    auto normalized = torch::empty_like(input);
+    auto output = torch::empty({1, 1, output_dim}, input.options());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    rmsnorm_fp32_kernel<<<1, 256, 0, stream>>>(
+        input.data_ptr<float>(), norm_weight.data_ptr<float>(),
+        normalized.data_ptr<float>(), input_dim, static_cast<float>(eps));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    launch_int8_linear<false, false>(
+        normalized, weight, scale, bias_ptr, nullptr,
+        output, outputs_per_block, stream);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+torch::Tensor int8_weight_linear_residual(
+        torch::Tensor input, torch::Tensor residual,
+        torch::Tensor weight, torch::Tensor scale,
+        c10::optional<torch::Tensor> bias,
+        int64_t outputs_per_block) {
+    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+    TORCH_CHECK(input.scalar_type() == torch::kFloat32 && input.is_contiguous(),
+        "input activations must remain contiguous FP32");
+    TORCH_CHECK(input.dim() == 3 && input.size(0) == 1 && input.size(1) == 1,
+        "input must have shape [1, 1, input_dim]");
+    TORCH_CHECK(residual.is_cuda() && residual.device() == input.device(),
+        "residual must use the input CUDA device");
+    TORCH_CHECK(residual.scalar_type() == torch::kFloat32
+        && residual.is_contiguous(),
+        "residual must remain contiguous FP32");
+    TORCH_CHECK(residual.dim() == 3 && residual.size(0) == 1
+        && residual.size(1) == 1,
+        "residual must have shape [1, 1, output_dim]");
+    check_outputs_per_block(outputs_per_block);
+    check_quantized_linear(input, weight, scale, "linear");
+    const int input_dim = static_cast<int>(input.size(2));
+    const int output_dim = static_cast<int>(weight.size(0));
+    TORCH_CHECK(weight.size(1) == input_dim,
+        "linear input dimension must equal activation dimension");
+    TORCH_CHECK(residual.size(2) == output_dim,
+        "residual output dimension mismatch");
+    const float* bias_ptr = check_bias(bias, input, output_dim, "linear");
+    c10::cuda::CUDAGuard guard(input.device());
+    auto output = torch::empty_like(residual);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_int8_linear<true, false>(
+        input, weight, scale, bias_ptr, residual.data_ptr<float>(),
+        output, outputs_per_block, stream);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
 """
 
 
@@ -283,7 +379,7 @@ def _load_int8_mlp_extension():
     global _INT8_MLP_EXTENSION
     if _INT8_MLP_EXTENSION is None:
         _INT8_MLP_EXTENSION = _load_inline(
-            name="mapperatorinator_int8_mlp_scout_v1",
+            name="mapperatorinator_int8_projection_scout_v2",
             cpp_sources=_CPP_SOURCE,
             cuda_sources=_CUDA_SOURCE,
             extra_cuda_cflags=["-O3", "--use_fast_math", "-gencode=arch=compute_75,code=sm_75"],
@@ -434,10 +530,66 @@ def int8_weight_mlp_residual(
     )
 
 
+def int8_weight_rmsnorm_linear(
+    input: torch.Tensor,
+    norm_weight: torch.Tensor,
+    pack: Int8PackedLinear,
+    *,
+    eps: float,
+    outputs_per_block: int = 4,
+) -> torch.Tensor:
+    """Run FP32 RMSNorm and one INT8-weight linear projection."""
+
+    _require_fp32_cuda(input, name="input")
+    _require_fp32_cuda(norm_weight, name="norm weight")
+    _require_int8_pack(pack, name="linear")
+    if pack.weight.device != input.device or norm_weight.device != input.device:
+        raise ValueError("projection tensors must use the input device")
+    if outputs_per_block not in (2, 4, 8):
+        raise ValueError("outputs_per_block must be 2, 4, or 8")
+    return _load_int8_mlp_extension().int8_weight_rmsnorm_linear(
+        input,
+        norm_weight,
+        pack.weight,
+        pack.scale,
+        pack.bias,
+        float(eps),
+        int(outputs_per_block),
+    )
+
+
+def int8_weight_linear_residual(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    pack: Int8PackedLinear,
+    *,
+    outputs_per_block: int = 4,
+) -> torch.Tensor:
+    """Run one INT8-weight linear projection and add an FP32 residual."""
+
+    _require_fp32_cuda(input, name="input")
+    _require_fp32_cuda(residual, name="residual")
+    _require_int8_pack(pack, name="linear")
+    if pack.weight.device != input.device or residual.device != input.device:
+        raise ValueError("projection tensors must use the input device")
+    if outputs_per_block not in (2, 4, 8):
+        raise ValueError("outputs_per_block must be 2, 4, or 8")
+    return _load_int8_mlp_extension().int8_weight_linear_residual(
+        input,
+        residual,
+        pack.weight,
+        pack.scale,
+        pack.bias,
+        int(outputs_per_block),
+    )
+
+
 __all__ = [
     "Int8MlpPack",
     "Int8PackedLinear",
+    "int8_weight_linear_residual",
     "int8_weight_mlp_residual",
+    "int8_weight_rmsnorm_linear",
     "preload_int8_mlp_extension",
     "symmetric_int8_per_row",
 ]
