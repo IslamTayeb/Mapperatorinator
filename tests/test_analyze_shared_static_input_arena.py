@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 import pytest
 
 from utils.analyze_shared_static_input_arena import (
@@ -141,6 +143,42 @@ def _profiles() -> dict:
     }
 
 
+def _append_prefill_eos_window(profiles: dict) -> None:
+    for profile in profiles.values():
+        source = next(
+            record
+            for record in profile["generation"]
+            if record["profile_label"] == "main_generation"
+        )
+        record = copy.deepcopy(source)
+        runtime = record["optimized_cuda_graphs"]["k8_candidate"]
+        runtime.update({
+            "eligible_steps": 0,
+            "block_replays": 0,
+            "remainder_steps": 0,
+            "remainder_graph_replays": 0,
+            "physical_steps": 1,
+            "logical_steps": 1,
+            "static_input_arena_refreshes": 0,
+            "static_input_arena_refresh_copy_calls": 0,
+            "static_input_arena_refresh_copy_bytes": 0,
+            "static_input_arena_graph_entries": 0,
+            "copy_calls": 0,
+        })
+        timing = runtime["transition_timing"]
+        timing.update({
+            "model_wall_seconds": 0.0,
+            "accounted_wall_seconds": 0.0,
+            "unattributed_wall_seconds": 0.0,
+            "reconciliation_error_fraction": 0.0,
+        })
+        for stage in timing["stages"].values():
+            stage.update({"calls": 0, "wall_seconds": 0.0})
+        for device in timing["device"].values():
+            device.update({"calls": 0, "seconds": 0.0})
+        profile["generation"].append(record)
+
+
 def test_shared_arena_gate_requires_exact_parity_and_point_three_seconds():
     report = analyze(_reciprocal(), _profiles())
 
@@ -152,6 +190,33 @@ def test_shared_arena_gate_requires_exact_parity_and_point_three_seconds():
         "candidate_median": 4.0,
     }
     assert report["dispatch_metadata_exact"] is True
+
+
+def test_shared_arena_gate_accepts_prefill_eos_zero_refresh_window():
+    profiles = _profiles()
+    _append_prefill_eos_window(profiles)
+
+    report = analyze(_reciprocal(), profiles)
+
+    main = report["transitions"]["candidate_first"]["main_generation"]
+    assert main["records"] == 2
+    assert main["measured_records"] == 1
+    assert main["static_input_arena_refreshes"] == 1
+    assert main["static_input_arena_refresh_copy_calls"] == 4
+
+
+def test_shared_arena_gate_rejects_refresh_for_prefill_eos_window():
+    profiles = _profiles()
+    _append_prefill_eos_window(profiles)
+    runtime = profiles["candidate_first"]["generation"][-1][
+        "optimized_cuda_graphs"
+    ]["k8_candidate"]
+    runtime["static_input_arena_refreshes"] = 1
+    runtime["static_input_arena_refresh_copy_calls"] = 4
+    runtime["static_input_arena_refresh_copy_bytes"] = 256
+
+    with pytest.raises(ValueError, match="zero graph replays require zero"):
+        analyze(_reciprocal(), profiles)
 
 
 def test_shared_arena_gate_stops_below_declared_saving():

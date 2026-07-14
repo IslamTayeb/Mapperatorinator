@@ -685,6 +685,40 @@ def _tensor_copy_size(model_inputs: dict[str, Any]) -> tuple[int, int]:
     )
 
 
+def _expected_static_input_arena_refreshes(
+    *,
+    block_replays: int,
+    remainder_graph_replays: int,
+) -> int:
+    """Return one only when this window actually entered a captured graph."""
+
+    for name, value in (
+        ("block_replays", block_replays),
+        ("remainder_graph_replays", remainder_graph_replays),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise RuntimeError(f"{name} must be a non-negative integer")
+    return int(block_replays + remainder_graph_replays > 0)
+
+
+def _validate_static_input_arena_refreshes(
+    stats: dict[str, Any],
+    *,
+    enabled: bool,
+) -> None:
+    if not enabled:
+        return
+    expected = _expected_static_input_arena_refreshes(
+        block_replays=stats["block_replays"],
+        remainder_graph_replays=stats["remainder_graph_replays"],
+    )
+    if stats["static_input_arena_refreshes"] != expected:
+        raise RuntimeError(
+            "shared static-input arena requires one refresh for graph-using "
+            "windows and zero refreshes for prefill-only windows"
+        )
+
+
 @dataclass(slots=True)
 class _StaticInputArena:
     static_inputs: dict[str, Any]
@@ -1566,8 +1600,10 @@ def k8_active_prefix_decode_generate(
     )
     if stats["physical_steps"] != accounted_steps:
         raise RuntimeError("K8 prefill/eligible/remainder work accounting diverged")
-    if shared_static_input_arena and stats["static_input_arena_refreshes"] != 1:
-        raise RuntimeError("shared static-input arena requires one refresh per window")
+    _validate_static_input_arena_refreshes(
+        stats,
+        enabled=shared_static_input_arena,
+    )
     if transition_timing:
         timing_stats = stats["transition_timing"]
         accounted = sum(

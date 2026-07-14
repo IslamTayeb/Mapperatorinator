@@ -15,6 +15,7 @@ from osuT5.osuT5.inference.optimized.single.k8_runtime import (
     _K8GraphLifecycle,
     _StaticInputArena,
     _capture_k8_entry,
+    _expected_static_input_arena_refreshes,
     _k8_eligible,
     _processor_signature,
     _prompt_seed,
@@ -23,6 +24,7 @@ from osuT5.osuT5.inference.optimized.single.k8_runtime import (
     _runtime_slot,
     _sync_model_kwargs_after_k8,
     _update_static_model_inputs,
+    _validate_static_input_arena_refreshes,
     install_k8_candidate,
 )
 from osuT5.osuT5.inference.optimized.single.state import ProductionDecodeSession
@@ -204,6 +206,47 @@ def test_shared_static_input_arena_preserves_addresses_and_refreshes_once_per_wi
     } == pointers
     with pytest.raises(RuntimeError, match="refreshed twice"):
         arena.refresh(second, window_identity=2)
+
+
+def test_prefill_eos_window_requires_zero_shared_arena_refreshes():
+    stats = {
+        "block_replays": 0,
+        "remainder_graph_replays": 0,
+        "static_input_arena_refreshes": 0,
+    }
+
+    assert _expected_static_input_arena_refreshes(
+        block_replays=0,
+        remainder_graph_replays=0,
+    ) == 0
+    _validate_static_input_arena_refreshes(stats, enabled=True)
+    stats["static_input_arena_refreshes"] = 1
+    with pytest.raises(RuntimeError, match="zero refreshes for prefill-only"):
+        _validate_static_input_arena_refreshes(stats, enabled=True)
+
+
+@pytest.mark.parametrize(
+    ("block_replays", "remainder_graph_replays"),
+    ((1, 0), (0, 1), (3, 2)),
+)
+def test_graph_using_window_requires_one_shared_arena_refresh(
+    block_replays,
+    remainder_graph_replays,
+):
+    stats = {
+        "block_replays": block_replays,
+        "remainder_graph_replays": remainder_graph_replays,
+        "static_input_arena_refreshes": 1,
+    }
+
+    assert _expected_static_input_arena_refreshes(
+        block_replays=block_replays,
+        remainder_graph_replays=remainder_graph_replays,
+    ) == 1
+    _validate_static_input_arena_refreshes(stats, enabled=True)
+    stats["static_input_arena_refreshes"] = 0
+    with pytest.raises(RuntimeError, match="one refresh for graph-using"):
+        _validate_static_input_arena_refreshes(stats, enabled=True)
 
 
 def test_shared_static_input_arena_rejects_signature_or_owner_changes():
