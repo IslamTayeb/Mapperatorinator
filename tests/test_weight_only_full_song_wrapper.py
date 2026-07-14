@@ -55,6 +55,9 @@ def test_timing_native_self_wrapper_is_narrow_and_fixed_work() -> None:
     assert "REQUIRE_EXACT_TIMING=false" in source
     assert "FIXED_TIMING_TOKENS=${FIXED_TIMING_TOKENS:-821}" in source
     assert "utils/validate_fp32_timing_native_self_profile.py" in general
+    assert "local timing_native_self_validation_args=()" in general
+    assert 'timing_native_self_validation_args+=(--timing-native-self)' in general
+    assert '"${timing_native_self_validation_args[@]}" \\' in general
     assert '--fixed-timing-tokens "$FIXED_TIMING_TOKENS"' in general
     assert "metric.fixed_timing_context_model_seconds_at_" in general
 

@@ -381,12 +381,6 @@ def validate_profile(
                 prefix_totals[prefix] = prefix_totals.get(prefix, 0) + value
 
             if label == "timing_context":
-                if timing_native_self and effective[
-                    "native_q1_rope_cache_self_attention"
-                ] <= 0:
-                    raise WeightOnlyProfileError(
-                        f"{name} timing context did not execute native self-attention"
-                    )
                 if not timing_native_self and any(
                     effective[key] != 0
                     for key in (
@@ -467,6 +461,15 @@ def validate_profile(
                     if key in baseline_main_dispatch_totals:
                         baseline_main_dispatch_totals[key] += value
 
+    timing_effective = effective_self_attention_totals["timing_context"]
+    if (
+        timing_native_self
+        and timing_effective["native_q1_rope_cache_self_attention"] <= 0
+    ):
+        raise WeightOnlyProfileError(
+            "timing context did not execute native self-attention across any record"
+        )
+
     main_effective = effective_self_attention_totals["main_generation"]
     if candidate:
         missing_dispatch = {key: value for key, value in totals.items() if value <= 0}
@@ -525,9 +528,7 @@ def validate_profile(
         "main_weight_only_dispatch_counts": totals,
         "main_cross_candidate_dispatch_counts": cross_totals,
         "baseline_main_dispatch_counts": baseline_main_dispatch_totals,
-        "timing_effective_self_attention_counts": effective_self_attention_totals[
-            "timing_context"
-        ],
+        "timing_effective_self_attention_counts": timing_effective,
         "main_effective_self_attention_counts": main_effective,
     }
 

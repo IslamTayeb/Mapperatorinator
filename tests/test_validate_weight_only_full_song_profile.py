@@ -271,6 +271,11 @@ def _timing_scout_profile() -> tuple[dict, dict]:
 
 def test_timing_native_self_contract_retains_cross_and_main_composition() -> None:
     profile, initialization = _timing_scout_profile()
+    cached_record = copy.deepcopy(profile["generation"][0])
+    cached_record["optimized_dispatch_capture_hits"][
+        "native_q1_rope_cache_self_attention"
+    ] = 0
+    profile["generation"].insert(1, cached_record)
 
     report = validate_timing_scout(profile, initialization, role="candidate")
 
@@ -282,6 +287,24 @@ def test_timing_native_self_contract_retains_cross_and_main_composition() -> Non
     assert report["base_composition"]["cross_mode"] == "fp16_packed_projections"
     assert report["fixed_timing_work_required"] is True
     assert report["complete_request_wall_required"] is True
+
+
+def test_timing_native_self_contract_requires_at_least_one_capture_hit() -> None:
+    profile, _ = _timing_scout_profile()
+    profile["generation"][0]["optimized_dispatch_capture_hits"][
+        "native_q1_rope_cache_self_attention"
+    ] = 0
+
+    with pytest.raises(
+        WeightOnlyProfileError,
+        match="did not execute native self-attention across any record",
+    ):
+        validate_profile(
+            profile,
+            role="candidate",
+            cross_mode="fp16_packed_projections",
+            timing_native_self=True,
+        )
 
 
 def test_timing_native_self_contract_rejects_cross_mlp_or_missing_marker() -> None:

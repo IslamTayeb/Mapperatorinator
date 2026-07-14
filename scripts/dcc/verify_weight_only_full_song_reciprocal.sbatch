@@ -590,12 +590,18 @@ run_profile() {
   elif [[ "$REQUIRE_CROSS_INCREMENTAL" == true && "$candidate" == 1 ]]; then
     validation_cross_mode=$CROSS_CANDIDATE_MODE
   fi
+  local timing_native_self_validation_args=()
+  if [[ "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" == true \
+    && "$candidate" == 1 ]]; then
+    timing_native_self_validation_args+=(--timing-native-self)
+  fi
   (
     cd "$CANDIDATE_REPO"
     "$PYTHON" utils/validate_weight_only_full_song_profile.py \
       --profile "$profile" \
       --role "$validation_role" \
       --cross-mode "$validation_cross_mode" \
+      "${timing_native_self_validation_args[@]}" \
       > "$RUN_ROOT/$role.weight-only-validation.json"
   )
   if [[ "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" == true ]]; then
