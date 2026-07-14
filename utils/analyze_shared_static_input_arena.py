@@ -188,6 +188,16 @@ def _transition_summary(
             refresh_calls = runtime.get("static_input_arena_refresh_copy_calls", 0)
             refresh_bytes = runtime.get("static_input_arena_refresh_copy_bytes", 0)
             current_graph_entries = runtime.get("static_input_arena_graph_entries", 0)
+            replay_counts = {
+                name: runtime.get(name)
+                for name in ("block_replays", "remainder_graph_replays")
+            }
+            if any(
+                isinstance(item, bool) or not isinstance(item, int) or item < 0
+                for item in replay_counts.values()
+            ):
+                raise ValueError(f"{role}.{label}[{index}] has invalid graph replays")
+            expected_refreshes = int(sum(replay_counts.values()) > 0)
             if any(
                 isinstance(item, bool) or not isinstance(item, int) or item < 0
                 for item in (
@@ -198,10 +208,21 @@ def _transition_summary(
                 )
             ):
                 raise ValueError(f"{role}.{label}[{index}] has invalid arena counters")
-            if candidate and (refresh != 1 or refresh_calls != 4 or refresh_bytes <= 0):
-                raise ValueError(
-                    f"{role}.{label}[{index}] must refresh exactly four tensors once"
-                )
+            if candidate:
+                if expected_refreshes == 1 and (
+                    refresh != 1 or refresh_calls != 4 or refresh_bytes <= 0
+                ):
+                    raise ValueError(
+                        f"{role}.{label}[{index}] graph-using window must refresh "
+                        "exactly four tensors once"
+                    )
+                if expected_refreshes == 0 and any(
+                    (refresh, refresh_calls, refresh_bytes, current_graph_entries)
+                ):
+                    raise ValueError(
+                        f"{role}.{label}[{index}] zero graph replays require zero "
+                        "arena refreshes and captures"
+                    )
             if not candidate and any((refresh, refresh_calls, refresh_bytes)):
                 raise ValueError(f"{role}.{label}[{index}] baseline used an arena")
             if not candidate and current_graph_entries:
