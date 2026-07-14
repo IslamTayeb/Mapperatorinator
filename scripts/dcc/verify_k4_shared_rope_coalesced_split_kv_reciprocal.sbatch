@@ -17,7 +17,6 @@ export REQUIRE_EXACT_TIMING=true
 export REQUIRE_K4_CANDIDATE=true
 export REQUIRE_SHARED_ROPE_INCREMENTAL=false
 export REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL=true
-export CANDIDATE_REMOTE=${CANDIDATE_REMOTE:-islamtayeb}
 export RUN_LABEL=${RUN_LABEL:-k4-shared-rope-coalesced-split-kv-reciprocal}
 
 source "${CANDIDATE_REPO:?Set CANDIDATE_REPO}/scripts/dcc/verify_weight_only_full_song_reciprocal.sbatch"
