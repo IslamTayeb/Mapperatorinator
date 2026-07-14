@@ -575,7 +575,10 @@ def _text_report(report: dict[str, Any]) -> str:
         "fixed_while_speedup_vs_pct="
         + json.dumps(fixed["while_speedup_vs_pct"], sort_keys=True),
     ]
-    for stop, value in sorted(report["forced_stop"].items(), key=lambda row: int(row[0])):
+    ordered_stops = sorted(
+        report["forced_stop"].items(), key=lambda row: int(row[0])
+    )
+    for stop, value in ordered_stops:
         lines.append(
             f"forced_stop={stop} pass={value['pass']} "
             f"expected_physical_steps={json.dumps(value['expected_physical_steps'], sort_keys=True)}"
