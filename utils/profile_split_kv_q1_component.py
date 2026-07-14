@@ -57,6 +57,30 @@ def split_counts_for_prefix(prefix: int) -> tuple[int, ...]:
     return (1,) if prefix == 128 else (2, 4, 8)
 
 
+def validate_split_mask(
+    mask: torch.Tensor | None,
+    *,
+    prefix: int,
+    split_counts: tuple[int, ...],
+) -> None:
+    """Reject a measured split whose complete mask would have zero mass."""
+
+    if mask is None:
+        return
+    flattened = mask.reshape(-1)
+    if flattened.numel() != prefix:
+        raise ValueError("attention mask must match the active prefix")
+    for split_count in split_counts:
+        for split in range(split_count):
+            begin = prefix * split // split_count
+            end = prefix * (split + 1) // split_count
+            if bool(torch.isneginf(flattened[begin:end]).all().item()):
+                raise RuntimeError(
+                    "split-KV profiler rejects an all-masked partition "
+                    f"(prefix={prefix}, split_count={split_count}, split={split})"
+                )
+
+
 def _candidate_pass(entry: dict[str, Any]) -> tuple[bool, list[str]]:
     failures: list[str] = []
     verifier = entry.get("verifier")
@@ -95,6 +119,17 @@ def summarize_split_kv(
     selected: dict[str, Any] = {}
     failures: dict[str, Any] = {}
     for raw_prefix, bucket in sorted(buckets.items(), key=lambda item: int(item[0])):
+        accepted_verifier = bucket.get("accepted_verifier")
+        if not isinstance(accepted_verifier, dict) or not bool(
+            accepted_verifier.get("pass")
+        ):
+            raise ValueError(
+                f"bucket {raw_prefix} accepted cache verifier did not pass"
+            )
+        if not bool(bucket.get("accepted_memory_stable")):
+            raise ValueError(
+                f"bucket {raw_prefix} accepted control was not memory stable"
+            )
         count = int(bucket["decode_replays"])
         accepted_ms = float(bucket["accepted_ms_per_call"])
         if count <= 0 or accepted_ms <= 0 or not math.isfinite(accepted_ms):
@@ -237,6 +272,12 @@ def profile_split_kv_component(
     for prefix, accepted in selected_entries.items():
         capture = _capture_representative_layer(model, accepted["static_inputs"], prefix=prefix)
         qkv, keys, values, cos, sin, mask = _attention_inputs(capture)
+        split_counts = split_counts_for_prefix(prefix)
+        validate_split_mask(
+            mask,
+            prefix=prefix,
+            split_counts=split_counts,
+        )
         snapshots = _all_cache_snapshots(capture.past_key_value, capture.cache_position)
 
         def accepted_call() -> torch.Tensor:
@@ -245,7 +286,7 @@ def profile_split_kv_component(
             )
 
         calls: dict[str, Callable[[], torch.Tensor]] = {"accepted": accepted_call}
-        for split_count in split_counts_for_prefix(prefix):
+        for split_count in split_counts:
             calls[f"split_{split_count}"] = (
                 lambda split_count=split_count: split_kv_q1_rope_cache_attention(
                     qkv,

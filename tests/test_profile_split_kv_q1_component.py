@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import pytest
+import torch
+
 from utils.profile_split_kv_q1_component import (
     MAX_ABS_DRIFT,
     split_counts_for_prefix,
     summarize_split_kv,
+    validate_split_mask,
 )
 
 
@@ -23,6 +27,8 @@ def _candidate(ms: float, *, drift: float = 0.0, passed: bool = True):
 def _bucket(accepted: float, count: int, candidates: dict):
     return {
         "accepted_ms_per_call": accepted,
+        "accepted_memory_stable": True,
+        "accepted_verifier": {"pass": True},
         "decode_replays": count,
         "candidates": candidates,
     }
@@ -88,3 +94,29 @@ def test_summary_passes_both_declared_gates() -> None:
     assert report["weighted_local_speedup"] == 4.0
     assert report["projected_main_saving_seconds"] == 2.7
     assert report["promotion_pass"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("accepted_memory_stable", False, "memory stable"),
+        ("accepted_verifier", {"pass": False}, "cache verifier"),
+    ],
+)
+def test_summary_rejects_an_invalid_accepted_control(field, value, error) -> None:
+    bucket = _bucket(1.0, 300, {"split_8": _candidate(0.25)})
+    bucket[field] = value
+
+    with pytest.raises(ValueError, match=error):
+        summarize_split_kv({"640": bucket}, total_replays=600)
+
+
+def test_split_mask_rejects_an_all_masked_partition() -> None:
+    mask = torch.zeros(8)
+    mask[:2] = -torch.inf
+
+    with pytest.raises(RuntimeError, match="all-masked partition"):
+        validate_split_mask(mask, prefix=8, split_counts=(4,))
+
+    validate_split_mask(torch.zeros(8), prefix=8, split_counts=(2, 4))
+    validate_split_mask(None, prefix=8, split_counts=(2, 4))
