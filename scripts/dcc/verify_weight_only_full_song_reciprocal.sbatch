@@ -30,7 +30,9 @@ REQUIRE_SHARED_ROPE_INCREMENTAL=${REQUIRE_SHARED_ROPE_INCREMENTAL:-false}
 REQUIRE_K1_REMAINDER_INCREMENTAL=${REQUIRE_K1_REMAINDER_INCREMENTAL:-false}
 REQUIRE_INT8_MLP_INCREMENTAL=${REQUIRE_INT8_MLP_INCREMENTAL:-false}
 REQUIRE_CROSS_INCREMENTAL=${REQUIRE_CROSS_INCREMENTAL:-false}
+REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL=${REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL:-false}
 CROSS_CANDIDATE_MODE=${CROSS_CANDIDATE_MODE:-accepted}
+FIXED_TIMING_TOKENS=${FIXED_TIMING_TOKENS:-821}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_LABEL=${RUN_LABEL:-split-weight-full-song-reciprocal}
 RUN_ROOT="$WORK/runs/$RUN_LABEL-${SLURM_JOB_ID:-manual}"
@@ -106,12 +108,22 @@ if [[ "$REQUIRE_CROSS_INCREMENTAL" != true \
   echo "REQUIRE_CROSS_INCREMENTAL must be true or false" >&2
   exit 2
 fi
+if [[ "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" != true \
+  && "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" != false ]]; then
+  echo "REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL must be true or false" >&2
+  exit 2
+fi
+if ! [[ "$FIXED_TIMING_TOKENS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "FIXED_TIMING_TOKENS must be a positive integer" >&2
+  exit 2
+fi
 enabled_incremental_modes=0
 for enabled in \
   "$REQUIRE_SHARED_ROPE_INCREMENTAL" \
   "$REQUIRE_K1_REMAINDER_INCREMENTAL" \
   "$REQUIRE_INT8_MLP_INCREMENTAL" \
-  "$REQUIRE_CROSS_INCREMENTAL"; do
+  "$REQUIRE_CROSS_INCREMENTAL" \
+  "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL"; do
   if [[ "$enabled" == true ]]; then
     enabled_incremental_modes=$((enabled_incremental_modes + 1))
   fi
@@ -120,7 +132,22 @@ if (( enabled_incremental_modes > 1 )); then
   echo "shared-RoPE, K1-remainder, INT8 MLP, and cross gates are mutually exclusive" >&2
   exit 2
 fi
-if [[ "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" == true ]]; then
+  if [[ "$REQUIRE_K4_CANDIDATE" != true || "$REQUIRE_EXACT_TIMING" != false ]]; then
+    echo "timing-native-self gate requires K4 and documented timing drift" >&2
+    exit 2
+  fi
+  if [[ "$BASELINE_RUNNER" != utils/run_k4_shared_rope_fp16_cross.py \
+    || "$CANDIDATE_RUNNER" != utils/run_fp32_timing_native_self.py ]]; then
+    echo "timing-native-self gate requires the selected composed control and scout" >&2
+    exit 2
+  fi
+  if [[ "$CROSS_CANDIDATE_MODE" != fp16_packed_projections ]]; then
+    echo "timing-native-self gate requires selected FP16-packed cross mode" >&2
+    exit 2
+  fi
+  CROSS_K1_INT8_COMPOSITION=true
+elif [[ "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
   if [[ "$REQUIRE_K4_CANDIDATE" != true || "$REQUIRE_EXACT_TIMING" != true ]]; then
     echo "cross incremental gate requires K4 and exact timing" >&2
     exit 2
@@ -364,6 +391,8 @@ echo "require_k1_remainder_incremental=$REQUIRE_K1_REMAINDER_INCREMENTAL"
 echo "require_int8_mlp_incremental=$REQUIRE_INT8_MLP_INCREMENTAL"
 echo "int8_k1_composition=$INT8_K1_COMPOSITION"
 echo "require_cross_incremental=$REQUIRE_CROSS_INCREMENTAL"
+echo "require_timing_native_self_incremental=$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL"
+echo "fixed_timing_tokens=$FIXED_TIMING_TOKENS"
 echo "cross_candidate_mode=$CROSS_CANDIDATE_MODE"
 echo "cross_k1_int8_composition=$CROSS_K1_INT8_COMPOSITION"
 echo "audio=$AUDIO"
@@ -556,7 +585,9 @@ run_profile() {
     validation_role=candidate
   fi
   local validation_cross_mode=accepted
-  if [[ "$REQUIRE_CROSS_INCREMENTAL" == true && "$candidate" == 1 ]]; then
+  if [[ "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" == true ]]; then
+    validation_cross_mode=$CROSS_CANDIDATE_MODE
+  elif [[ "$REQUIRE_CROSS_INCREMENTAL" == true && "$candidate" == 1 ]]; then
     validation_cross_mode=$CROSS_CANDIDATE_MODE
   fi
   (
@@ -567,6 +598,20 @@ run_profile() {
       --cross-mode "$validation_cross_mode" \
       > "$RUN_ROOT/$role.weight-only-validation.json"
   )
+  if [[ "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" == true ]]; then
+    local timing_self_role=control
+    if [[ "$candidate" == 1 ]]; then
+      timing_self_role=candidate
+    fi
+    (
+      cd "$CANDIDATE_REPO"
+      "$PYTHON" utils/validate_fp32_timing_native_self_profile.py \
+        --profile "$profile" \
+        --initialization "$init_json" \
+        --role "$timing_self_role" \
+        > "$RUN_ROOT/$role.timing-native-self-validation.json"
+    )
+  fi
   if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true \
     || "$CROSS_K1_INT8_COMPOSITION" == true ]]; then
     local int8_validation_role=baseline
@@ -723,7 +768,8 @@ INITIALIZATION_ROLES=candidate_first,candidate_second
 if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
   || "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true \
   || "$REQUIRE_INT8_MLP_INCREMENTAL" == true \
-  || "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
+  || "$REQUIRE_CROSS_INCREMENTAL" == true \
+  || "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" == true ]]; then
   INITIALIZATION_ROLES=baseline_first,candidate_first,candidate_second,baseline_second
 fi
 "$PYTHON" - "$RUN_ROOT" "$INITIALIZATION_ROLES" \
@@ -912,7 +958,28 @@ ANALYSIS_DISPATCH_ARGS=(
   --allow-optional-dispatch-delta
     'records.main_generation[[]*].optimized_cuda_graphs.*'
 )
-if [[ "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" == true ]]; then
+  ANALYSIS_DISPATCH_ARGS=(
+    --allow-dispatch-delta
+      'records.timing_context[[]*].optimized_dispatch_mode'
+    --allow-dispatch-delta
+      'records.timing_context[[]*].optimized_dispatch_policy.*'
+    --allow-dispatch-delta
+      'records.timing_context[[]*].optimized_timing_native_self_scout.*'
+    --allow-dispatch-delta
+      'records.timing_context[[]*].optimized_dispatch_capture_hits'
+    --allow-dispatch-delta
+      'records.timing_context[[]*].optimized_dispatch_capture_hits.*'
+    --allow-optional-dispatch-delta
+      'records.timing_context[[]*].optimized_cuda_graphs.*'
+    --allow-optional-dispatch-delta
+      'records.main_generation[[]*].optimized_dispatch_capture_hits'
+    --allow-optional-dispatch-delta
+      'records.main_generation[[]*].optimized_dispatch_capture_hits.*'
+    --allow-optional-dispatch-delta
+      'records.main_generation[[]*].optimized_cuda_graphs.*'
+  )
+elif [[ "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
   ANALYSIS_EXACT_ARGS=(
     --require-exact-label timing_context
     --require-exact-label main_generation
@@ -985,6 +1052,7 @@ fi
     --candidate-second-profile "$CANDIDATE_SECOND" \
     --baseline-second-profile "$BASELINE_SECOND" \
     --mode "$ANALYSIS_MODE" \
+    --fixed-timing-tokens "$FIXED_TIMING_TOKENS" \
     "${ANALYSIS_EXACT_ARGS[@]}" \
     --require-dispatch-declaration \
     "${ANALYSIS_DISPATCH_ARGS[@]}" \
@@ -1035,9 +1103,19 @@ if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true \
     fi
   done
 fi
+if [[ "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" == true ]]; then
+  for role in baseline_first candidate_first candidate_second baseline_second; do
+    artifact="$RUN_ROOT/$role.timing-native-self-validation.json"
+    if [[ ! -s "$artifact" ]]; then
+      echo "missing required timing-native-self artifact: $artifact" >&2
+      exit 2
+    fi
+  done
+fi
 if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
   || "$REQUIRE_INT8_MLP_INCREMENTAL" == true \
-  || "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
+  || "$REQUIRE_CROSS_INCREMENTAL" == true \
+  || "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" == true ]]; then
   for artifact in \
     "$RUN_ROOT/candidate-initialization/baseline_first.json" \
     "$RUN_ROOT/candidate-initialization/baseline_second.json"; do
@@ -1087,6 +1165,8 @@ grep -q '^dispatch.declaration_pass=true$' "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^metric.timing_model_seconds=' "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^metric.main_model_seconds=' "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^metric.fixed_8294_main_seconds=' "$RUN_ROOT/reciprocal-analysis.txt"
+grep -q "^metric.fixed_timing_context_model_seconds_at_${FIXED_TIMING_TOKENS}_tokens=" \
+  "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^metric.complete_request_wall_seconds=' \
   "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^metric.peak_cuda_memory_allocated_mb=' \

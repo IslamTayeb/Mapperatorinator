@@ -280,6 +280,20 @@ def test_exact_fp32_reports_reciprocal_order_aware_metrics(tmp_path: Path) -> No
     assert fixed["baseline_median"] == pytest.approx(10.2 * 8294 / 4)
     assert fixed["candidate_median"] == pytest.approx(8.2 * 8294 / 4)
     assert "metric.complete_request_wall_seconds=" in text_report(report)
+
+
+def test_fixed_timing_work_is_normalized_from_authoritative_tps(tmp_path: Path) -> None:
+    report = analyze(_four_runs(tmp_path), fixed_timing_tokens=821)
+
+    metric = report["metrics"][
+        "fixed_timing_context_model_seconds_at_821_tokens"
+    ]
+    assert metric["baseline_median"] == pytest.approx(821.0)
+    assert report["measurement_scope"]["fixed_timing_tokens"] == 821
+
+    (tmp_path / "bad").mkdir()
+    with pytest.raises(CandidateAnalysisError, match="positive integer"):
+        analyze(_four_runs(tmp_path / "bad"), fixed_timing_tokens=0)
     assert "metric.fixed_8294_main_seconds=" in text_report(report)
 
 

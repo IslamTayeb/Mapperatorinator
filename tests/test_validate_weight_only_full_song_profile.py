@@ -8,6 +8,11 @@ from utils.validate_weight_only_full_song_profile import (
     WeightOnlyProfileError,
     validate_profile,
 )
+from utils.validate_fp32_timing_native_self_profile import (
+    COMPOSITION_VERSION as TIMING_COMPOSITION_VERSION,
+    VERSION as TIMING_SCOUT_VERSION,
+    validate as validate_timing_scout,
+)
 
 
 def _metadata() -> dict:
@@ -195,6 +200,97 @@ def test_selected_cross_candidate_requires_truthful_metadata_and_dispatch() -> N
     assert report["main_cross_candidate_dispatch_counts"] == {
         "fp16_packed_cross_projection_candidate": 12,
     }
+
+
+def _timing_scout_metadata() -> dict:
+    return {
+        "version": TIMING_SCOUT_VERSION,
+        "scope": "timing-context-only",
+        "precision": "fp32",
+        "torch_dtype": "torch.float32",
+        "result_class": "documented-drift",
+        "exactness_claim": False,
+        "native_q1_self_attention": True,
+        "native_q1_rope_cache_self_attention": True,
+        "split_kv_selector": True,
+        "q1_bmm_cross_attention_retained": True,
+        "native_cross_mlp_tail_retained_disabled": True,
+        "approximate_weight_only_retained_disabled": True,
+        "original_decoder_forward_retained": True,
+        "production_selector_unchanged": True,
+    }
+
+
+def _timing_scout_profile() -> tuple[dict, dict]:
+    profile = _cross_profile("fp16_packed_projections")
+    for record in profile["generation"]:
+        record["precision"] = "fp32"
+    timing = profile["generation"][0]
+    policy = timing["optimized_dispatch_policy"]
+    hits = timing["optimized_dispatch_capture_hits"]
+    timing["optimized_dispatch_mode"] = "fp32_timing_native_self_batch1"
+    policy["native_q1_self_attention"] = {"enabled": True}
+    policy["native_q1_rope_cache_self_attention"] = {"enabled": True}
+    policy["native_cross_mlp_tail"] = {"enabled": False}
+    policy["effective_native_q1_rope_cache_self_attention"] = {
+        "requested": True,
+        "enabled": True,
+        "owner": "accepted_attention_hook",
+        "kernel": "native_q1_rope_cache_attention",
+        "standard_attention_hook_enabled": True,
+        "split_kv_selector_enabled": True,
+        "disabled_reason": None,
+    }
+    policy["timing_native_self_scout"] = {
+        "requested": True,
+        "enabled": True,
+        "disabled_reason": None,
+        "result_class": "documented-drift",
+        "exactness_claim": False,
+    }
+    timing["optimized_timing_native_self_scout"] = _timing_scout_metadata()
+    hits["native_q1_rope_cache_self_attention"] = 12
+    hits["native_q1_self_attention"] = 0
+    initialization = {
+        "timing_native_self_scout": {
+            **_timing_scout_metadata(),
+            "composition_version": TIMING_COMPOSITION_VERSION,
+            "incremental_control": "selected-k1-int8-fp16-cross",
+            "timing_model_distinct_from_main": True,
+            "fixed_timing_work_required": True,
+            "complete_request_wall_required": True,
+        }
+    }
+    return profile, initialization
+
+
+def test_timing_native_self_contract_retains_cross_and_main_composition() -> None:
+    profile, initialization = _timing_scout_profile()
+
+    report = validate_timing_scout(profile, initialization, role="candidate")
+
+    timing = report["dispatch_totals"]["timing_context"]
+    assert timing["native_rope_cache_self"] == 12
+    assert timing["split_kv"] == 0
+    assert timing["q1_bmm_cross"] == 10
+    assert timing["native_cross_mlp"] == 0
+    assert report["base_composition"]["cross_mode"] == "fp16_packed_projections"
+    assert report["fixed_timing_work_required"] is True
+    assert report["complete_request_wall_required"] is True
+
+
+def test_timing_native_self_contract_rejects_cross_mlp_or_missing_marker() -> None:
+    profile, initialization = _timing_scout_profile()
+    profile["generation"][0]["optimized_dispatch_capture_hits"][
+        "native_cross_mlp_tail"
+    ] = 1
+    with pytest.raises(WeightOnlyProfileError, match="native cross/MLP"):
+        validate_timing_scout(profile, initialization, role="candidate")
+
+    profile, initialization = _timing_scout_profile()
+    initialization.pop("timing_native_self_scout")
+    with pytest.raises(WeightOnlyProfileError, match="must be an object"):
+        validate_timing_scout(profile, initialization, role="candidate")
 
 
 def test_cross_candidate_mode_mismatch_fails_loudly() -> None:

@@ -29,6 +29,9 @@ K1_INT8_MLP_WRAPPER = (
 FP16_CROSS_WRAPPER = (
     ROOT / "scripts/dcc/verify_k4_shared_rope_fp16_cross_reciprocal.sbatch"
 )
+TIMING_NATIVE_SELF_WRAPPER = (
+    ROOT / "scripts/dcc/verify_fp32_timing_native_self_reciprocal.sbatch"
+)
 def test_weight_only_full_song_wrapper_has_valid_bash_syntax() -> None:
     for wrapper in (
         WRAPPER,
@@ -37,8 +40,23 @@ def test_weight_only_full_song_wrapper_has_valid_bash_syntax() -> None:
         INT8_MLP_WRAPPER,
         K1_INT8_MLP_WRAPPER,
         FP16_CROSS_WRAPPER,
+        TIMING_NATIVE_SELF_WRAPPER,
     ):
         subprocess.run(["bash", "-n", str(wrapper)], check=True)
+
+
+def test_timing_native_self_wrapper_is_narrow_and_fixed_work() -> None:
+    source = TIMING_NATIVE_SELF_WRAPPER.read_text(encoding="utf-8")
+    general = WRAPPER.read_text(encoding="utf-8")
+
+    assert "BASELINE_RUNNER=utils/run_k4_shared_rope_fp16_cross.py" in source
+    assert "CANDIDATE_RUNNER=utils/run_fp32_timing_native_self.py" in source
+    assert "REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL=true" in source
+    assert "REQUIRE_EXACT_TIMING=false" in source
+    assert "FIXED_TIMING_TOKENS=${FIXED_TIMING_TOKENS:-821}" in source
+    assert "utils/validate_fp32_timing_native_self_profile.py" in general
+    assert '--fixed-timing-tokens "$FIXED_TIMING_TOKENS"' in general
+    assert "metric.fixed_timing_context_model_seconds_at_" in general
 
 
 def test_wrapper_uses_full_fp32_optimized_reciprocal_order_and_launchers() -> None:
