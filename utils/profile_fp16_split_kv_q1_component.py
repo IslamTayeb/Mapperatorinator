@@ -187,6 +187,10 @@ def summarize(
         accepted = float(entry["accepted_fp16"]["ms_per_call"])
         if not math.isfinite(accepted) or accepted <= 0:
             raise ValueError(f"prefix {prefix} has invalid accepted timing")
+        if not entry["accepted_fp16"].get("cache_verifier", {}).get("pass"):
+            raise ValueError(f"prefix {prefix} accepted cache verifier failed")
+        if not entry["accepted_fp16"].get("memory_stable"):
+            raise ValueError(f"prefix {prefix} accepted timing allocated memory")
         accepted_ms += count * accepted
         split = entry.get("split_kv_8_fp16")
         if split is None:
@@ -350,6 +354,11 @@ def profile_fp16_split_kv_component(
         for name, call in calls.items():
             _restore_all_cache(capture.past_key_value, snapshots)
             graphs[name] = _capture_cuda_graph(call, context=nullcontext, warmup=0)
+            if (
+                not isinstance(graphs[name].outputs, torch.Tensor)
+                or graphs[name].outputs.dtype != torch.float16
+            ):
+                raise TypeError(f"{name} must return FP16 tensor storage")
 
         if "split_kv_8_fp16" in graphs:
             timings, rounds, memory = reciprocal_timings(
@@ -383,6 +392,7 @@ def profile_fp16_split_kv_component(
         bucket: dict[str, Any] = {
             "decode_replays": live_counts[prefix],
             "selector": selector if selector == "split_kv_8" else "accepted_fallback",
+            "storage_dtype": str(qkv.dtype),
             "accepted_fp16": {
                 "ms_per_call": timings["accepted_fp16"],
                 "capture_seconds": graphs["accepted_fp16"].setup_seconds,

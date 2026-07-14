@@ -135,6 +135,32 @@ def test_summary_rejects_drift_even_when_candidate_is_faster() -> None:
     assert not report["promotion_pass"]
 
 
+def test_summary_fails_loudly_when_accepted_control_is_invalid() -> None:
+    accepted = _accepted()
+    accepted["cache_verifier"] = {"pass": False}
+    buckets = {
+        "128": {
+            "selector": "accepted_fallback",
+            "accepted_fp16": accepted,
+        },
+        "576": {
+            "selector": "split_kv_8",
+            "accepted_fp16": _accepted(),
+            "split_kv_8_fp16": _split(),
+        },
+        "640": {
+            "selector": "split_kv_8",
+            "accepted_fp16": _accepted(),
+            "split_kv_8_fp16": _split(),
+        },
+    }
+    with pytest.raises(ValueError, match="accepted cache verifier failed"):
+        profile.summarize(
+            buckets,
+            live_counts={128: 1, 576: 1, 640: 1},
+        )
+
+
 def test_reciprocal_timing_alternates_order_and_restores(monkeypatch) -> None:
     timings = {"accepted_fp16": 0.2, "split_kv_8_fp16": 0.1}
     restores = []
@@ -177,6 +203,7 @@ def test_dcc_wrapper_is_fp16_sentinel_only_and_fail_loud() -> None:
         "MAPPERATORINATOR_COMMIT:?",
         "MAPPERATORINATOR_BRANCH:?",
         'rev-parse "$REMOTE/$BRANCH"',
+        "MAPPERATORINATOR_REMOTE:-origin",
         "NVIDIA GeForce RTX 2080 Ti",
         "precision=fp16",
         "profile_fp16_split_kv_q1_component.py",

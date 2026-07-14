@@ -250,6 +250,8 @@ def test_supported_sm75_live_prefix_routes_split8_and_other_cases_fall_back(
     monkeypatch.setattr(q1_attention, "_NATIVE_Q1_ATTENTION", _Extension())
     monkeypatch.setattr(q1_attention, "_validate_rope_cache_inputs", lambda *args: None)
     monkeypatch.setattr(q1_attention, "_native_mask", lambda *args, **kwargs: None)
+    monkeypatch.setattr(q1_attention, "_device_capability", lambda device: (7, 5))
+    monkeypatch.setattr(q1_attention, "_split_kv_q1_eligible", lambda **kwargs: True)
     monkeypatch.setattr(
         q1_attention,
         "native_q1_rope_cache_attention_variant",
@@ -349,6 +351,7 @@ def test_explicit_split_and_accepted_component_wrappers_share_validation(
     )
     monkeypatch.setattr(q1_attention, "_native_mask", lambda *args, **kwargs: None)
     monkeypatch.setattr(q1_attention, "_device_capability", lambda device: (7, 5))
+    monkeypatch.setattr(q1_attention, "_split_kv_q1_eligible", lambda **kwargs: True)
 
     accepted = q1_attention.accepted_q1_rope_cache_attention(*arguments)
     split = q1_attention.split_kv_q1_rope_cache_attention(*arguments)
@@ -382,6 +385,7 @@ def test_explicit_split_wrapper_rejects_unsupported_contract_before_build(
     )
     monkeypatch.setattr(q1_attention, "_native_mask", lambda *args, **kwargs: None)
     monkeypatch.setattr(q1_attention, "_device_capability", lambda device: (8, 0))
+    monkeypatch.setattr(q1_attention, "_split_kv_q1_eligible", lambda **kwargs: False)
     monkeypatch.setattr(
         q1_attention,
         "_load_native_q1_attention",
