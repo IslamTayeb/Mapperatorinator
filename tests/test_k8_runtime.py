@@ -23,6 +23,7 @@ from osuT5.osuT5.inference.optimized.single.k8_runtime import (
     _sync_model_kwargs_after_k8,
     _update_static_model_inputs,
     install_k8_candidate,
+    k8_block_size_context,
 )
 from osuT5.osuT5.inference.optimized.single.state import ProductionDecodeSession
 
@@ -143,6 +144,22 @@ def test_explicit_request_generator_seed_is_used_without_consuming_state():
 
     assert _request_seed(generator, torch.device("cpu")) == 9876
     assert torch.equal(generator.get_state(), before)
+
+
+def test_stage_local_block_size_requires_active_candidate_and_restores(monkeypatch):
+    with pytest.raises(RuntimeError, match="requires an installed candidate"):
+        with k8_block_size_context(1):
+            pass
+
+    lifecycle = object()
+    monkeypatch.setattr(k8_runtime, "_ACTIVE_K8_LIFECYCLE", lifecycle)
+    monkeypatch.setattr(k8_runtime, "_ACTIVE_BLOCK_SIZE", 4)
+
+    with k8_block_size_context(1):
+        assert k8_runtime._ACTIVE_BLOCK_SIZE == 1
+
+    assert k8_runtime._ACTIVE_K8_LIFECYCLE is lifecycle
+    assert k8_runtime._ACTIVE_BLOCK_SIZE == 4
 
 
 def test_runtime_slot_separates_sampling_modes():

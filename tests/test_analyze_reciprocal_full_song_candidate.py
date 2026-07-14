@@ -283,6 +283,32 @@ def test_exact_fp32_reports_reciprocal_order_aware_metrics(tmp_path: Path) -> No
     assert "metric.fixed_8294_main_seconds=" in text_report(report)
 
 
+def test_fixed_work_normalization_uses_each_arms_measured_tps(tmp_path: Path) -> None:
+    report = analyze(
+        _four_runs(tmp_path),
+        fixed_timing_tokens=821,
+        fixed_main_tokens=8294,
+    )
+
+    fixed_main = report["metrics"][
+        "fixed_main_generation_model_seconds_at_8294_tokens"
+    ]
+    assert fixed_main["baseline_median"] == pytest.approx(8294 / (4 / 10.2))
+    assert fixed_main["candidate_median"] == pytest.approx(8294 / (4 / 8.2))
+    assert report["measurement_scope"]["fixed_work_tokens"] == {
+        "timing_context": 821,
+        "main_generation": 8294,
+    }
+    text = text_report(report)
+    assert "metric.fixed_timing_context_model_seconds_at_821_tokens=" in text
+    assert "metric.fixed_main_generation_model_seconds_at_8294_tokens=" in text
+
+
+def test_fixed_work_requires_positive_integer_counts(tmp_path: Path) -> None:
+    with pytest.raises(CandidateAnalysisError, match="positive integer"):
+        analyze(_four_runs(tmp_path), fixed_main_tokens=0)
+
+
 def test_exact_dispatch_delta_requires_a_used_explicit_pattern(tmp_path: Path) -> None:
     profiles = _four_runs(tmp_path, split_kv=True)
     with pytest.raises(CandidateAnalysisError, match="undeclared"):
@@ -339,6 +365,36 @@ def test_relaxed_mode_reports_token_stopping_structure_and_map_divergence(
     assert parity["output_divergence"]["scalar_deltas"]["timing_points"] == 1
     assert parity["output_divergence"]["scalar_deltas"]["hit_objects"] == 1
     assert parity["output_divergence"]["final_map_equal"] is False
+
+
+def test_relaxed_analyzer_can_report_stage_selective_precision(tmp_path: Path) -> None:
+    profiles = _four_runs(tmp_path)
+    for role in ("candidate_first", "candidate_second"):
+        path = profiles[role]
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["generation"][0]["precision"] = "fp16"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(CandidateAnalysisError, match="consistent precision"):
+        analyze(profiles, mode="relaxed")
+
+    report = analyze(
+        profiles,
+        mode="relaxed",
+        allow_mixed_stage_precision=True,
+    )
+    assert report["workload"]["baseline_stage_precisions"] == {
+        "timing_context": "fp32",
+        "main_generation": "fp32",
+    }
+    assert report["workload"]["candidate_stage_precisions"] == {
+        "timing_context": "fp16",
+        "main_generation": "fp32",
+    }
+    assert report["runs"]["candidate_first"]["stage_precisions"] == {
+        "timing_context": "fp16",
+        "main_generation": "fp32",
+    }
 
 
 def test_relaxed_gate_requires_timing_tokens_stopping_and_dispatch_exact(
