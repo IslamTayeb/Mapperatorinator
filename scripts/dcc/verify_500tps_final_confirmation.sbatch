@@ -23,12 +23,16 @@ RUN_LABEL=${RUN_LABEL:-500tps-final-confirmation}
 RUN_ROOT="$WORK/runs/$RUN_LABEL-${SLURM_JOB_ID:-manual}"
 CANONICAL_SALVALAI=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 FIVE_SONG_ROOT=${FIVE_SONG_ROOT:-$WORK/data/five-song-profile}
-NATURAL_REPETITIONS=${NATURAL_REPETITIONS:-2}
+NATURAL_REPETITIONS=${NATURAL_REPETITIONS:-5}
 FIXED_REPETITIONS=${FIXED_REPETITIONS:-5}
 EXPECTED_MAIN_STEPS=${EXPECTED_MAIN_STEPS:-8294}
+CANDIDATE_RUNTIME_SPEC_SOURCE=${CANDIDATE_RUNTIME_SPEC:-}
+CANDIDATE_RUNTIME_NAME=${CANDIDATE_RUNTIME_NAME:-k4-split-kv-mixed-weight-shared-rope-k1-remainder-int8-mlp-v1}
+CANDIDATE_RUNTIME_FACTORY=${CANDIDATE_RUNTIME_FACTORY:-utils.final_confirmation_runtime:kblock_shared_rope_weight_plugin}
+CANDIDATE_RUNTIME_KWARGS_JSON=${CANDIDATE_RUNTIME_KWARGS_JSON:-'{"block_size":4,"graph_remainders":true,"initializer_name":"initialize_approximate_int8_mlp_weight_only","shared_rope_binding_index":0,"initializer_binding_index":0,"minimum_bindings":1}'}
 
-if [[ "$NATURAL_REPETITIONS" != 2 || "$FIXED_REPETITIONS" != 5 ]]; then
-  echo "authoritative final confirmation requires 2 natural and 5 fixed repetitions" >&2
+if [[ "$NATURAL_REPETITIONS" != 5 || "$FIXED_REPETITIONS" != 5 ]]; then
+  echo "authoritative final confirmation requires 5 natural and 5 fixed repetitions" >&2
   exit 2
 fi
 if [[ "$EXPECTED_MAIN_STEPS" != 8294 ]]; then
@@ -122,6 +126,39 @@ finalize() {
 }
 trap finalize EXIT
 
+CANDIDATE_RUNTIME_SPEC_PATH="$RUN_ROOT/candidate-runtime-spec.json"
+"$PYTHON" - \
+  "$CANDIDATE_RUNTIME_SPEC_PATH" \
+  "$CANDIDATE_RUNTIME_SPEC_SOURCE" \
+  "$CANDIDATE_RUNTIME_NAME" \
+  "$CANDIDATE_RUNTIME_FACTORY" \
+  "$CANDIDATE_RUNTIME_KWARGS_JSON" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+output, source, name, factory, kwargs_json = sys.argv[1:]
+if source:
+    source_path = Path(source).expanduser().resolve()
+    if not source_path.is_file():
+        raise SystemExit(f"candidate runtime spec is missing: {source_path}")
+    payload = json.loads(source_path.read_text(encoding="utf-8"))
+else:
+    payload = {
+        "schema_version": "mapperatorinator.final-runtime-spec.v1",
+        "name": name,
+        "factory": factory,
+        "kwargs": json.loads(kwargs_json),
+    }
+if not isinstance(payload, dict):
+    raise SystemExit("candidate runtime spec root must be an object")
+Path(output).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+PY
+[[ -s "$CANDIDATE_RUNTIME_SPEC_PATH" ]] || {
+  echo "candidate runtime spec was not created" >&2
+  exit 2
+}
+
 SONG_MANIFEST="$RUN_ROOT/five-songs.json"
 "$PYTHON" - "$SONG_MANIFEST" "$CANONICAL_SALVALAI" "$FIVE_SONG_ROOT" <<'PY'
 import hashlib
@@ -164,7 +201,11 @@ run_fresh() {
   local candidate_args=()
   local manifest_args=()
   if [[ "$variant" == candidate ]]; then
-    candidate_args=(--candidate --initialization-path "$dir/initialization.json")
+    candidate_args=(
+      --candidate
+      --runtime-spec "$CANDIDATE_RUNTIME_SPEC_PATH"
+      --initialization-path "$dir/runtime.json"
+    )
   fi
   if [[ -n "$manifest" ]]; then
     manifest_args=(--manifest-path "$manifest")
@@ -187,10 +228,15 @@ run_fresh() {
 
 NATURAL_ROOT="$RUN_ROOT/natural-salvalai"
 mkdir -p "$NATURAL_ROOT"
-run_fresh "$NATURAL_ROOT" baseline 0 natural
-run_fresh "$NATURAL_ROOT" candidate 0 natural
-run_fresh "$NATURAL_ROOT" candidate 1 natural
-run_fresh "$NATURAL_ROOT" baseline 1 natural
+for index in 0 1 2 3 4; do
+  if (( index % 2 == 0 )); then
+    run_fresh "$NATURAL_ROOT" baseline "$index" natural
+    run_fresh "$NATURAL_ROOT" candidate "$index" natural
+  else
+    run_fresh "$NATURAL_ROOT" candidate "$index" natural
+    run_fresh "$NATURAL_ROOT" baseline "$index" natural
+  fi
+done
 
 FIXED_ROOT="$RUN_ROOT/fixed-work-salvalai"
 mkdir -p "$FIXED_ROOT/manifest-record/output"
@@ -222,7 +268,11 @@ for variant in baseline candidate; do
   dir="$RUN_ROOT/five-song-$variant"
   candidate_args=()
   if [[ "$variant" == candidate ]]; then
-    candidate_args=(--candidate --initialization-path "$dir/initialization.json")
+    candidate_args=(
+      --candidate
+      --runtime-spec "$CANDIDATE_RUNTIME_SPEC_PATH"
+      --initialization-path "$dir/runtime.json"
+    )
   fi
   (
     cd "$REPO"
