@@ -124,6 +124,13 @@ BUDGET_PROFILE=$(<"$RUN_ROOT/untraced_budget/profile-path.txt")
   --text-output "$RUN_ROOT/budget-summary.txt"
 [[ -s "$RUN_ROOT/budget-summary.json" ]] || die "missing budget summary"
 
+"$PYTHON" utils/summarize_complete_request_wall.py \
+  --control-profile "$CONTROL_PROFILE" \
+  --budget-profile "$BUDGET_PROFILE" \
+  --output "$RUN_ROOT/request-wall.json" \
+  --text-output "$RUN_ROOT/request-wall.txt"
+[[ -s "$RUN_ROOT/request-wall.json" ]] || die "missing request wall summary"
+
 "$PYTHON" - "$RUN_ROOT/budget-summary.json" "$RUN_ROOT/transparency.json" "$EXPECTED_MAIN_TOKENS" <<'PY'
 import json
 import sys
