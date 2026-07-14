@@ -18,6 +18,7 @@ REPO=${MAPPERATORINATOR_REPO:?Set MAPPERATORINATOR_REPO to the clean DCC worktre
 COMMIT=${MAPPERATORINATOR_COMMIT:?Set MAPPERATORINATOR_COMMIT}
 BRANCH=${MAPPERATORINATOR_BRANCH:?Set MAPPERATORINATOR_BRANCH}
 REMOTE=${MAPPERATORINATOR_REMOTE:-origin}
+REMOTE_BRANCH=${MAPPERATORINATOR_REMOTE_BRANCH:-$BRANCH}
 RUN_LABEL=${RUN_LABEL:-500tps-final-confirmation}
 RUN_ROOT="$WORK/runs/$RUN_LABEL-${SLURM_JOB_ID:-manual}"
 CANONICAL_SALVALAI=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
@@ -55,11 +56,23 @@ if [[ "$(git -C "$REPO" rev-parse HEAD)" != "$COMMIT" ]]; then
   echo "DCC worktree commit mismatch" >&2
   exit 2
 fi
-if [[ "$(git -C "$REPO" branch --show-current)" != "$BRANCH" ]]; then
-  echo "DCC worktree branch mismatch" >&2
+CURRENT_BRANCH=$(git -C "$REPO" branch --show-current)
+if [[ "$BRANCH" == DETACHED ]]; then
+  if [[ -n "$CURRENT_BRANCH" ]]; then
+    echo "DCC worktree must be detached" >&2
+    exit 2
+  fi
+else
+  if [[ "$CURRENT_BRANCH" != "$BRANCH" ]]; then
+    echo "DCC worktree branch mismatch" >&2
+    exit 2
+  fi
+fi
+if [[ -z "$REMOTE_BRANCH" || "$REMOTE_BRANCH" == DETACHED ]]; then
+  echo "MAPPERATORINATOR_REMOTE_BRANCH must name the pushed branch" >&2
   exit 2
 fi
-REMOTE_REF="refs/remotes/$REMOTE/$BRANCH"
+REMOTE_REF="refs/remotes/$REMOTE/$REMOTE_BRANCH"
 if ! git -C "$REPO" show-ref --verify --quiet "$REMOTE_REF" \
   || [[ "$(git -C "$REPO" rev-parse "$REMOTE_REF")" != "$COMMIT" ]]; then
   echo "pushed remote ref does not match exact confirmation commit" >&2
@@ -92,6 +105,7 @@ echo "host=$(hostname)"
 echo "job_id=${SLURM_JOB_ID:-manual}"
 echo "commit=$COMMIT"
 echo "branch=$BRANCH"
+echo "remote_branch=$REMOTE_BRANCH"
 echo "repo=$REPO"
 echo "run_root=$RUN_ROOT"
 echo "gpu=$GPU_NAME"
