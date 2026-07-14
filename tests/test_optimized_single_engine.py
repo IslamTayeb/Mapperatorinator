@@ -89,6 +89,13 @@ def test_runtime_metadata_exposes_two_fixed_accepted_presets():
             "native_decode_kernels": True,
             "native_q1_self_attention": True,
             "native_q1_rope_cache_self_attention": True,
+            "native_q1_rope_cache_split_kv": precision == "fp32",
+            "native_q1_rope_cache_split_kv_split_count": (
+                8 if precision == "fp32" else None
+            ),
+            "native_q1_rope_cache_split_kv_prefix_buckets": (
+                tuple(range(192, 833, 64)) if precision == "fp32" else ()
+            ),
             "native_cross_mlp_tail": True,
         }
 

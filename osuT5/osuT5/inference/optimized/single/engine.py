@@ -26,6 +26,8 @@ from .state import ProductionDecodeSession
 
 OPTIMIZED_ATTN_IMPLEMENTATION = "sdpa"
 ACTIVE_PREFIX_BUCKET_SIZE = 64
+SPLIT_KV_Q1_PREFIX_BUCKETS = tuple(range(192, 833, 64))
+SPLIT_KV_Q1_SPLIT_COUNT = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +132,17 @@ def _optimized_config_metadata(preset: OptimizedPreset) -> dict[str, Any]:
         "native_decode_kernels": True,
         "native_q1_self_attention": True,
         "native_q1_rope_cache_self_attention": True,
+        "native_q1_rope_cache_split_kv": preset.torch_dtype == torch.float32,
+        "native_q1_rope_cache_split_kv_split_count": (
+            SPLIT_KV_Q1_SPLIT_COUNT
+            if preset.torch_dtype == torch.float32
+            else None
+        ),
+        "native_q1_rope_cache_split_kv_prefix_buckets": (
+            SPLIT_KV_Q1_PREFIX_BUCKETS
+            if preset.torch_dtype == torch.float32
+            else ()
+        ),
         "native_cross_mlp_tail": True,
     }
 
