@@ -283,6 +283,24 @@ def test_exact_fp32_reports_reciprocal_order_aware_metrics(tmp_path: Path) -> No
     assert "metric.fixed_8294_main_seconds=" in text_report(report)
 
 
+def test_fixed_timing_work_is_normalized_from_authoritative_tps(tmp_path: Path) -> None:
+    report = analyze(_four_runs(tmp_path), fixed_timing_tokens=821)
+
+    metric = report["metrics"][
+        "fixed_timing_context_model_seconds_at_821_tokens"
+    ]
+    assert metric["baseline_median"] == pytest.approx(821.0)
+    assert report["measurement_scope"]["fixed_timing_tokens"] == 821
+    assert (
+        "metric.fixed_timing_context_model_seconds_at_821_tokens="
+        in text_report(report)
+    )
+
+    (tmp_path / "bad").mkdir()
+    with pytest.raises(CandidateAnalysisError, match="positive integer"):
+        analyze(_four_runs(tmp_path / "bad"), fixed_timing_tokens=0)
+
+
 def test_exact_dispatch_delta_requires_a_used_explicit_pattern(tmp_path: Path) -> None:
     profiles = _four_runs(tmp_path, split_kv=True)
     with pytest.raises(CandidateAnalysisError, match="undeclared"):
@@ -302,6 +320,50 @@ def test_exact_dispatch_delta_requires_a_used_explicit_pattern(tmp_path: Path) -
             profiles,
             allowed_dispatch_deltas=[*patterns, "records.*.does_not_exist"],
         )
+
+
+def test_declared_timing_dispatch_mapping_paths_are_used(tmp_path: Path) -> None:
+    profiles = _four_runs(tmp_path)
+    for role in ("candidate_first", "candidate_second"):
+        path = profiles[role]
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        record = next(
+            value
+            for value in payload["generation"]
+            if value["profile_label"] == "timing_context"
+        )
+        record["optimized_dispatch_mode"] = "fp32_timing_native_self_batch1"
+        record["optimized_dispatch_policy"] = {
+            "timing_native_self": {"requested": True, "enabled": True}
+        }
+        record["optimized_timing_native_self"] = {
+            "version": "fp32-timing-native-self-v1",
+            "exactness_claim": True,
+        }
+        record["optimized_dispatch_capture_hits"][
+            "native_q1_rope_cache_self_attention"
+        ] += 1
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    patterns = [
+        "records.timing_context[[]*].optimized_dispatch_mode",
+        "records.timing_context[[]*].optimized_dispatch_policy.*",
+        "records.timing_context[[]*].optimized_timing_native_self.*",
+        "records.timing_context[[]*].optimized_dispatch_capture_hits",
+    ]
+    report = analyze(
+        profiles,
+        mode="relaxed",
+        allowed_dispatch_deltas=patterns,
+        required_exact_labels=("timing_context", "main_generation"),
+        required_exact_dispatch_labels=("main_generation",),
+        require_dispatch_declaration=True,
+    )
+    topology = report["parity"]["dispatch_cache_topology"]
+
+    assert topology["pass"] is True
+    assert topology["unused_patterns"] == []
+    assert topology["undeclared_paths"] == []
 
 
 def test_exact_mode_rejects_token_or_final_map_divergence(tmp_path: Path) -> None:

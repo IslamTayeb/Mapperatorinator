@@ -113,6 +113,11 @@ INVARIANT_EFFECTIVE_CONFIG = {
     "native_q1_rope_cache_self_attention": True,
 }
 FIXED_MAIN_STEPS = 8_294
+DECLARABLE_DISPATCH_RECORD_KEYS = (
+    "optimized_dispatch_mode",
+    "optimized_dispatch_policy",
+    "optimized_timing_native_self",
+)
 
 
 class CandidateAnalysisError(ValueError):
@@ -577,8 +582,18 @@ def _validate_allowed_differences(
     undeclared: list[str] = []
     for difference in differences:
         path = str(difference["path"])
+        path_and_parents = [path]
+        parent = path
+        while "." in parent:
+            parent = parent.rsplit(".", 1)[0]
+            path_and_parents.append(parent)
         matches = [
-            pattern for pattern in all_patterns if fnmatch.fnmatchcase(path, pattern)
+            pattern
+            for pattern in all_patterns
+            if any(
+                fnmatch.fnmatchcase(candidate_path, pattern)
+                for candidate_path in path_and_parents
+            )
         ]
         if not matches:
             undeclared.append(path)
@@ -773,9 +788,21 @@ def _exact_dispatch_label_material(run: ParsedRun, label: str) -> list[dict[str,
     """Compare executed dispatch while ignoring explicit zero-only counter keys."""
 
     records = run.graph_signature["material"]["records"].get(label, [])
+    source_records = [
+        record
+        for record in run.profile.get("generation", [])
+        if isinstance(record, dict) and record.get("profile_label") == label
+    ]
+    if len(source_records) != len(records):
+        raise CandidateAnalysisError(
+            f"{run.role} {label} dispatch material/source record counts differ"
+        )
     normalized: list[dict[str, Any]] = []
-    for record in records:
+    for record, source in zip(records, source_records, strict=True):
         values = dict(record)
+        for key in DECLARABLE_DISPATCH_RECORD_KEYS:
+            if key in source:
+                values[key] = source[key]
         hits = values.get("optimized_dispatch_capture_hits")
         if isinstance(hits, dict):
             values["optimized_dispatch_capture_hits"] = {
@@ -943,6 +970,7 @@ def analyze(
     required_exact_labels: Sequence[str] = (),
     required_exact_dispatch_labels: Sequence[str] = (),
     require_dispatch_declaration: bool = False,
+    fixed_timing_tokens: int | None = None,
 ) -> dict[str, Any]:
     if mode not in MODES:
         raise CandidateAnalysisError(f"mode must be one of {MODES}")
@@ -953,6 +981,21 @@ def analyze(
         role: _parse_run(role, profile_paths[role], overrides.get(role))
         for role in RUN_ORDER
     }
+    if fixed_timing_tokens is not None:
+        if (
+            isinstance(fixed_timing_tokens, bool)
+            or not isinstance(fixed_timing_tokens, int)
+            or fixed_timing_tokens <= 0
+        ):
+            raise CandidateAnalysisError(
+                "fixed timing token count must be a positive integer"
+            )
+        metric = (
+            "fixed_timing_context_model_seconds_at_"
+            f"{fixed_timing_tokens}_tokens"
+        )
+        for run in runs.values():
+            run.metrics[metric] = fixed_timing_tokens / run.metrics["timing_tps"]
     sequences = {role: runs[role].stage_sequence for role in RUN_ORDER}
     _require_equal(sequences, name="stage sequence")
     workload = _validate_workloads(runs, mode=mode)
@@ -985,6 +1028,7 @@ def analyze(
             "fixed_8294_main_seconds": (
                 "main synchronized model time scaled to exactly 8294 generated steps"
             ),
+            "fixed_timing_tokens": fixed_timing_tokens,
         },
         "workload": workload,
         "parity": parity,
@@ -1101,6 +1145,7 @@ def _arguments() -> argparse.Namespace:
         action="store_true",
         help="fail relaxed mode on undeclared or unused dispatch/cache deltas",
     )
+    parser.add_argument("--fixed-timing-tokens", type=int)
     parser.add_argument("--json-output", type=Path, required=True)
     parser.add_argument("--text-output", type=Path, required=True)
     return parser.parse_args()
@@ -1119,6 +1164,7 @@ def main() -> None:
         required_exact_labels=args.require_exact_label,
         required_exact_dispatch_labels=args.require_exact_dispatch_label,
         require_dispatch_declaration=args.require_dispatch_declaration,
+        fixed_timing_tokens=args.fixed_timing_tokens,
     )
     args.json_output.parent.mkdir(parents=True, exist_ok=True)
     args.text_output.parent.mkdir(parents=True, exist_ok=True)

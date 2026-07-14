@@ -8,6 +8,13 @@ from utils.validate_weight_only_full_song_profile import (
     WeightOnlyProfileError,
     validate_profile,
 )
+from utils.run_selected_timing_native_self import (
+    COMPOSITION_VERSION as TIMING_COMPOSITION_VERSION,
+    SELECTED_MAIN_COMPOSITION,
+)
+from utils.validate_selected_timing_native_self_profile import (
+    validate as validate_timing_native_self,
+)
 
 
 def _metadata() -> dict:
@@ -197,6 +204,138 @@ def test_selected_cross_candidate_requires_truthful_metadata_and_dispatch() -> N
         "fp16_packed_cross_projection_candidate": 12,
     }
     assert report["main_q1_bmm_cross_attention_count"] == 12
+
+
+def _timing_metadata() -> dict:
+    return {
+        "version": "fp32-timing-native-self-v1",
+        "scope": "timing-context-only",
+        "precision": "fp32",
+        "torch_dtype": "torch.float32",
+        "result_class": "exact",
+        "exactness_claim": True,
+        "native_q1_self_attention": True,
+        "native_q1_rope_cache_self_attention": True,
+        "split_kv_selector": True,
+        "q1_bmm_cross_attention_retained": True,
+        "native_cross_mlp_tail_retained_disabled": True,
+        "approximate_weight_only_retained_disabled": True,
+        "original_decoder_forward_retained": True,
+        "production_selector_unchanged": True,
+    }
+
+
+def _selected_initialization(*, timing: bool) -> dict:
+    payload = {
+        "combined_runtime": SELECTED_MAIN_COMPOSITION,
+        "cross_candidate": {
+            "mode": "fp16_packed_projections",
+            "accepted_q1_bmm": True,
+        },
+        "cross_runtime": {
+            "incremental_exactness_required": True,
+            "packed_projection_delta_only": True,
+            "accepted_q1_bmm_required": True,
+            "original_decoder_forward_required": True,
+        },
+        "int8_mlp_overlay": {"dispatch_counter": "int8_weight_mlp_tail"},
+        "shared_rope": {"scope": "main-model-only"},
+    }
+    if timing:
+        payload["timing_native_self"] = {
+            **_timing_metadata(),
+            "composition_version": TIMING_COMPOSITION_VERSION,
+            "incremental_control": SELECTED_MAIN_COMPOSITION,
+            "timing_model_distinct_from_main": True,
+            "fixed_timing_work_required": True,
+            "complete_request_wall_required": True,
+        }
+    return payload
+
+
+def _selected_timing_profile(*, timing: bool) -> dict:
+    profile = _cross_profile("fp16_packed_projections")
+    for record in profile["generation"]:
+        record["precision"] = "fp32"
+    timing_record = profile["generation"][0]
+    timing_policy = timing_record["optimized_dispatch_policy"]
+    timing_policy["native_q1_self_attention"] = {"enabled": timing}
+    timing_policy["native_q1_rope_cache_self_attention"] = {"enabled": timing}
+    timing_policy["native_cross_mlp_tail"] = {"enabled": False}
+    if not timing:
+        return profile
+    record = timing_record
+    policy = record["optimized_dispatch_policy"]
+    hits = record["optimized_dispatch_capture_hits"]
+    record["optimized_dispatch_mode"] = "fp32_timing_native_self_batch1"
+    policy["effective_native_q1_rope_cache_self_attention"] = {
+        "requested": True,
+        "enabled": True,
+        "owner": "accepted_attention_hook",
+        "kernel": "native_q1_rope_cache_attention",
+        "standard_attention_hook_enabled": True,
+        "split_kv_selector_enabled": True,
+        "disabled_reason": None,
+    }
+    policy["timing_native_self"] = {
+        "requested": True,
+        "enabled": True,
+        "disabled_reason": None,
+        "result_class": "exact",
+        "exactness_claim": True,
+    }
+    record["optimized_timing_native_self"] = _timing_metadata()
+    hits["native_q1_rope_cache_self_attention"] = 12
+    hits["native_q1_self_attention"] = 0
+    return profile
+
+
+def test_selected_timing_native_self_contract_preserves_main_topology() -> None:
+    control = validate_timing_native_self(
+        _selected_timing_profile(timing=False),
+        _selected_initialization(timing=False),
+        role="control",
+    )
+    candidate = validate_timing_native_self(
+        _selected_timing_profile(timing=True),
+        _selected_initialization(timing=True),
+        role="candidate",
+    )
+
+    assert control["dispatch_totals"]["timing_context"][
+        "native_rope_cache_self"
+    ] == 0
+    assert candidate["dispatch_totals"]["timing_context"][
+        "native_rope_cache_self"
+    ] == 12
+    assert candidate["dispatch_totals"]["timing_context"]["q1_bmm_cross"] == 10
+    assert candidate["base_composition"]["cross_mode"] == (
+        "fp16_packed_projections"
+    )
+    assert candidate["fixed_main_tokens"] == 8_294
+    assert candidate["fixed_timing_tokens"] == 821
+
+
+def test_selected_timing_native_self_rejects_main_leak_or_false_exactness() -> None:
+    profile = _selected_timing_profile(timing=True)
+    profile["generation"][1]["optimized_dispatch_policy"][
+        "timing_native_self"
+    ] = {"enabled": True}
+    with pytest.raises(WeightOnlyProfileError, match="leaked"):
+        validate_timing_native_self(
+            profile,
+            _selected_initialization(timing=True),
+            role="candidate",
+        )
+
+    initialization = _selected_initialization(timing=True)
+    initialization["timing_native_self"]["exactness_claim"] = False
+    with pytest.raises(WeightOnlyProfileError, match="invalid metadata"):
+        validate_timing_native_self(
+            _selected_timing_profile(timing=True),
+            initialization,
+            role="candidate",
+        )
 
 
 def test_cross_candidate_mode_mismatch_fails_loudly() -> None:
