@@ -55,7 +55,11 @@ def test_cross_runner_composes_k1_int8_and_records_incremental_mode(
         graph_remainders,
         weight_runner,
         composition_version,
+        shared_static_input_arena,
+        transition_timing,
     ):
+        assert shared_static_input_arena is False
+        assert transition_timing is False
         calls.append(
             (
                 config_name,
