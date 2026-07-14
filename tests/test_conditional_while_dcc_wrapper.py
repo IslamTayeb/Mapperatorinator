@@ -20,6 +20,8 @@ def test_probe_wrapper_is_exact_clean_and_staged():
     assert "git -C \"$REPO\" rev-parse HEAD" in source
     assert "refs/remotes/$REMOTE/$BRANCH" in source
     assert "TORCH_CUDA_ARCH_LIST=7.5" in source
+    assert "NATIVE_BUILD_TOOLS" in source
+    assert "command -v ninja" in source
     assert "probe_cuda_conditional_while.py" in source
     assert "profile_conditional_while_real_prefix.py" in source
     assert source.index("probe_cuda_conditional_while.py") < source.index(

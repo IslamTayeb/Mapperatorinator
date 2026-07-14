@@ -19,6 +19,7 @@ BRANCH=${MAPPERATORINATOR_BRANCH:?Set MAPPERATORINATOR_BRANCH to the pushed bran
 REMOTE=${MAPPERATORINATOR_REMOTE:-origin}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_ROOT="$WORK/runs/conditional-while-probe-${SLURM_JOB_ID:-manual}"
+NATIVE_BUILD_TOOLS=${MAPPERATORINATOR_NATIVE_BUILD_TOOLS:-$WORK/cache/native-build-tools}
 
 fail() {
   echo "$*" >&2
@@ -37,9 +38,13 @@ git -C "$REPO" show-ref --verify --quiet "$REMOTE_REF" || fail "missing fetched 
 [[ -f "$AUDIO" ]] || fail "missing SALVALAI audio at $AUDIO"
 
 export PATH="$ENV/bin:$PATH"
+export PATH="$NATIVE_BUILD_TOOLS/bin:$PATH"
+export PYTHONPATH="$NATIVE_BUILD_TOOLS${PYTHONPATH:+:$PYTHONPATH}"
 for tool in ffmpeg ffprobe nvidia-smi; do
   command -v "$tool" >/dev/null 2>&1 || fail "missing required executable: $tool"
 done
+command -v ninja >/dev/null 2>&1 \
+  || fail "missing ninja in native build tools at $NATIVE_BUILD_TOOLS"
 GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 [[ "$GPU_COUNT" -eq 1 ]] || fail "expected exactly one allocated GPU, got $GPU_COUNT"
 GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader)
@@ -81,6 +86,8 @@ trap finalize EXIT
   echo "gpu=$GPU_NAME"
   echo "python=$ENV/bin/python"
   echo "nvcc=$ENV/bin/nvcc"
+  echo "ninja=$(command -v ninja)"
+  echo "native_build_tools=$NATIVE_BUILD_TOOLS"
   echo "audio=$AUDIO"
   echo "run_root=$RUN_ROOT"
   "$ENV/bin/nvcc" --version
