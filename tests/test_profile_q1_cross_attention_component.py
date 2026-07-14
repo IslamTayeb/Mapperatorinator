@@ -5,6 +5,7 @@ from pathlib import Path
 
 from utils.profile_q1_cross_attention_component import (
     FIXED_WORK_500_TPS_GAP_SECONDS,
+    SESSION_PROFILE_LABELS,
     _launch_metadata,
     summarize_component,
     summarize_projection_component,
@@ -18,6 +19,14 @@ def _variant(ms: float, *, drift: float = 0.0, fp16_kv: bool = False):
         "checks_pass": True,
         "kv_storage_dtype": "torch.float16" if fp16_kv else "torch.float32",
     }
+
+
+def test_processor_profile_labels_map_to_canonical_decode_sessions() -> None:
+    assert SESSION_PROFILE_LABELS == {
+        "timing_context": "timing_generation",
+        "main_generation": "main_generation",
+    }
+    assert "timing_generation" not in SESSION_PROFILE_LABELS
 
 
 def test_summary_weights_timing_and_main_and_exposes_500_gap() -> None:
