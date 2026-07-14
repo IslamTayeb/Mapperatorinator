@@ -45,6 +45,7 @@ MLP_FC2_OUTPUTS_PER_BLOCK = 4
 FINAL_LOGITS_OUTPUTS_PER_BLOCK = 2
 ACCEPTED_Q1_VARIANT = "accepted"
 SPLIT_KV_Q1_VARIANT = "split_kv_8"
+COALESCED_SPLIT_KV_Q1_VARIANT = "split_kv_8_coalesced"
 
 
 def _norm_eps(module: torch.nn.Module) -> float:
@@ -72,17 +73,28 @@ def _record_weight_only_self_attention_dispatch(
 ) -> None:
     """Record the effective native kernel selected inside the weight-owned hook."""
 
-    if variant not in {ACCEPTED_Q1_VARIANT, SPLIT_KV_Q1_VARIANT}:
+    if variant not in {
+        ACCEPTED_Q1_VARIANT,
+        SPLIT_KV_Q1_VARIANT,
+        COALESCED_SPLIT_KV_Q1_VARIANT,
+    }:
         raise RuntimeError(f"weight-only self-attention selected unknown q1 variant {variant!r}")
     if dispatch_counts is None:
         return
     dispatch_counts["weight_only_self_attention_block"] += 1
     dispatch_counts["native_q1_rope_cache_self_attention"] += 1
-    if variant == SPLIT_KV_Q1_VARIANT:
+    if variant in {SPLIT_KV_Q1_VARIANT, COALESCED_SPLIT_KV_Q1_VARIANT}:
         aggregate = "native_q1_rope_cache_self_attention_split_kv_8"
         prefix = f"{aggregate}_prefix_{prefix_length}"
         dispatch_counts[aggregate] = dispatch_counts.get(aggregate, 0) + 1
         dispatch_counts[prefix] = dispatch_counts.get(prefix, 0) + 1
+        if variant == COALESCED_SPLIT_KV_Q1_VARIANT:
+            coalesced = f"{aggregate}_coalesced"
+            coalesced_prefix = f"{coalesced}_prefix_{prefix_length}"
+            dispatch_counts[coalesced] = dispatch_counts.get(coalesced, 0) + 1
+            dispatch_counts[coalesced_prefix] = (
+                dispatch_counts.get(coalesced_prefix, 0) + 1
+            )
 
 
 def _locate_candidate_modules(

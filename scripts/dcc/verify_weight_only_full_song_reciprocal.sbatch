@@ -27,6 +27,7 @@ CANDIDATE_RUNNER=${CANDIDATE_RUNNER:-utils/run_approximate_weight_only.py}
 REQUIRE_EXACT_TIMING=${REQUIRE_EXACT_TIMING:-true}
 REQUIRE_K4_CANDIDATE=${REQUIRE_K4_CANDIDATE:-false}
 REQUIRE_SHARED_ROPE_INCREMENTAL=${REQUIRE_SHARED_ROPE_INCREMENTAL:-false}
+REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL=${REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL:-false}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_LABEL=${RUN_LABEL:-split-weight-full-song-reciprocal}
 RUN_ROOT="$WORK/runs/$RUN_LABEL-${SLURM_JOB_ID:-manual}"
@@ -85,7 +86,31 @@ if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" != true \
   echo "REQUIRE_SHARED_ROPE_INCREMENTAL must be true or false" >&2
   exit 2
 fi
-if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL" != true \
+  && "$REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL" != false ]]; then
+  echo "REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL must be true or false" >&2
+  exit 2
+fi
+if [[ "$REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL" == true ]]; then
+  if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
+    echo "coalesced and shared-RoPE incremental modes are mutually exclusive" >&2
+    exit 2
+  fi
+  if [[ "$REQUIRE_K4_CANDIDATE" != true || "$REQUIRE_EXACT_TIMING" != true ]]; then
+    echo "coalesced split-KV gate requires K4 and exact timing" >&2
+    exit 2
+  fi
+  if [[ "$BASELINE_RUNNER" \
+    != utils/run_k4_shared_rope_approximate_weight_only.py ]]; then
+    echo "coalesced split-KV gate requires the exact shared-stack control" >&2
+    exit 2
+  fi
+  if [[ "$CANDIDATE_RUNNER" \
+    != utils/run_k4_shared_rope_coalesced_split_kv.py ]]; then
+    echo "coalesced split-KV gate requires the exact candidate runner" >&2
+    exit 2
+  fi
+elif [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
   if [[ "$REQUIRE_K4_CANDIDATE" != true ]]; then
     echo "shared-RoPE incremental gate requires K4 contract validation" >&2
     exit 2
@@ -276,6 +301,7 @@ echo "candidate_runner=$CANDIDATE_RUNNER"
 echo "require_exact_timing=$REQUIRE_EXACT_TIMING"
 echo "require_k4_candidate=$REQUIRE_K4_CANDIDATE"
 echo "require_shared_rope_incremental=$REQUIRE_SHARED_ROPE_INCREMENTAL"
+echo "require_coalesced_split_kv_incremental=$REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL"
 echo "audio=$AUDIO"
 echo "run_root=$RUN_ROOT"
 echo "extension_cache_mode=$EXTENSION_CACHE_MODE"
@@ -472,6 +498,19 @@ run_profile() {
       --role "$validation_role" \
       > "$RUN_ROOT/$role.weight-only-validation.json"
   )
+  if [[ "$REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL" == true ]]; then
+    local coalesced_role=baseline
+    if [[ "$candidate" == 1 ]]; then
+      coalesced_role=candidate
+    fi
+    (
+      cd "$CANDIDATE_REPO"
+      "$PYTHON" utils/validate_coalesced_split_kv_profile.py \
+        --profile "$profile" \
+        --role "$coalesced_role" \
+        > "$RUN_ROOT/$role.coalesced-split-kv-validation.json"
+    )
+  fi
   local k4_validation_role=baseline
   if [[ "$runtime_candidate" == 1 && "$REQUIRE_K4_CANDIDATE" == true ]]; then
     k4_validation_role=candidate
@@ -594,11 +633,13 @@ summary = {
 PY
 
 INITIALIZATION_ROLES=candidate_first,candidate_second
-if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
+  || "$REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL" == true ]]; then
   INITIALIZATION_ROLES=baseline_first,candidate_first,candidate_second,baseline_second
 fi
 "$PYTHON" - "$RUN_ROOT" "$INITIALIZATION_ROLES" \
-  "$REQUIRE_SHARED_ROPE_INCREMENTAL" <<'PY'
+  "$REQUIRE_SHARED_ROPE_INCREMENTAL" \
+  "$REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL" <<'PY'
 import json
 import math
 import statistics
@@ -608,6 +649,7 @@ from pathlib import Path
 root = Path(sys.argv[1])
 roles = tuple(sys.argv[2].split(","))
 require_shared_rope = sys.argv[3] == "true"
+require_coalesced = sys.argv[4] == "true"
 runs = {}
 required_numbers = (
     "initialization_wall_seconds",
@@ -674,6 +716,40 @@ if require_shared_rope:
         if "shared_rope" in runs[role] or "combined_runtime" in runs[role]:
             raise SystemExit(f"{role}: combined control unexpectedly enabled shared RoPE")
 
+if require_coalesced:
+    for role in roles:
+        shared = runs[role].get("shared_rope")
+        if not isinstance(shared, dict) or shared.get("scope") != "main-model-only":
+            raise SystemExit(f"{role}: exact shared-stack base evidence is missing")
+        stats = shared.get("stats")
+        if not isinstance(stats, dict):
+            raise SystemExit(f"{role}: shared-RoPE stats are missing")
+        if stats.get("computes") != stats.get("expected_computes"):
+            raise SystemExit(f"{role}: shared-RoPE compute accounting failed")
+        if stats.get("reuses") != stats.get("expected_reuses"):
+            raise SystemExit(f"{role}: shared-RoPE reuse accounting failed")
+    for role in ("baseline_first", "baseline_second"):
+        if runs[role].get("combined_runtime") != (
+            "k4-split-kv-mixed-weight-shared-rope-v1"
+        ):
+            raise SystemExit(f"{role}: wrong shared-stack control version")
+        if "coalesced_split_kv" in runs[role]:
+            raise SystemExit(f"{role}: control unexpectedly enabled coalesced split-KV")
+    for role in ("candidate_first", "candidate_second"):
+        if runs[role].get("combined_runtime") != (
+            "k4-split-kv-coalesced-mixed-weight-shared-rope-v1"
+        ):
+            raise SystemExit(f"{role}: wrong coalesced candidate version")
+        evidence = runs[role].get("coalesced_split_kv")
+        if not isinstance(evidence, dict):
+            raise SystemExit(f"{role}: coalesced split-KV evidence is missing")
+        if evidence.get("scope") != (
+            "main-model-mixed-weight-self-attention-only"
+        ):
+            raise SystemExit(f"{role}: coalesced split-KV scope is wrong")
+        if evidence.get("exactness_claim") is not False:
+            raise SystemExit(f"{role}: coalesced split-KV must not claim exactness")
+
 summary = {
     "schema_version": 1,
     "result_class": "documented-drift",
@@ -716,6 +792,17 @@ if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
     --require-exact-dispatch-label main_generation
   )
   ANALYSIS_DISPATCH_ARGS=()
+elif [[ "$REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL" == true ]]; then
+  ANALYSIS_EXACT_ARGS=(
+    --require-exact-label timing_context
+    --require-exact-dispatch-label timing_context
+  )
+  ANALYSIS_DISPATCH_ARGS=(
+    --allow-dispatch-delta
+      'records.main_generation[[]*].optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8_coalesced'
+    --allow-dispatch-delta
+      'records.main_generation[[]*].optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8_coalesced_*'
+  )
 elif [[ "$REQUIRE_EXACT_TIMING" == true ]]; then
   ANALYSIS_EXACT_ARGS=(
     --require-exact-label timing_context
@@ -769,7 +856,8 @@ for artifact in \
     exit 2
   fi
 done
-if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
+  || "$REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL" == true ]]; then
   for artifact in \
     "$RUN_ROOT/candidate-initialization/baseline_first.json" \
     "$RUN_ROOT/candidate-initialization/baseline_second.json"; do
@@ -791,6 +879,8 @@ grep -q '^parity.candidate_repeat_stable=true$' "$RUN_ROOT/reciprocal-analysis.t
 EXPECTED_EXACT_LABELS=none
 if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
   EXPECTED_EXACT_LABELS=timing_context,main_generation
+elif [[ "$REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL" == true ]]; then
+  EXPECTED_EXACT_LABELS=timing_context
 elif [[ "$REQUIRE_EXACT_TIMING" == true ]]; then
   EXPECTED_EXACT_LABELS=timing_context
 fi
@@ -803,6 +893,16 @@ grep -q "^parity.required_exact_dispatch_labels=$EXPECTED_EXACT_LABELS$" \
 grep -q '^parity.required_exact_dispatch_labels_pass=true$' \
   "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^dispatch.declaration_pass=true$' "$RUN_ROOT/reciprocal-analysis.txt"
+if [[ "$REQUIRE_COALESCED_SPLIT_KV_INCREMENTAL" == true ]]; then
+  for role in baseline_first candidate_first candidate_second baseline_second; do
+    artifact="$RUN_ROOT/$role.coalesced-split-kv-validation.json"
+    if [[ ! -s "$artifact" ]]; then
+      echo "missing coalesced split-KV validation: $artifact" >&2
+      exit 2
+    fi
+    grep -q '"pass": true' "$artifact"
+  done
+fi
 grep -q '^metric.timing_model_seconds=' "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^metric.main_model_seconds=' "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^metric.complete_request_wall_seconds=' \

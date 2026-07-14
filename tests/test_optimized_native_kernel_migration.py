@@ -93,6 +93,7 @@ def test_q1_kernel_import_does_not_build_and_loader_is_singleton(monkeypatch):
         "q1_attention",
         "q1_rope_cache_attention",
         "split_kv_q1_rope_cache_attention",
+        "split_kv_q1_rope_cache_attention_coalesced",
     ]
     assert calls[0]["extra_cuda_cflags"] == ["-O3"]
     source = calls[0]["cuda_sources"]
@@ -103,6 +104,7 @@ def test_q1_kernel_import_does_not_build_and_loader_is_singleton(monkeypatch):
     assert source.count("__global__ void q1_rope_cache_attention_kernel(") == 1
     assert source.count("__global__ void split_kv_prepare_rope_cache_kernel(") == 1
     assert source.count("__global__ void split_kv_partial_kernel(") == 1
+    assert source.count("__global__ void split_kv_partial_coalesced_kernel(") == 1
     assert source.count("__global__ void split_kv_merge_kernel(") == 1
     assert "q1_attention_half_kernel" not in source
     assert "q1_rope_cache_attention_half_kernel" not in source
@@ -166,6 +168,10 @@ def test_q1_wrappers_preserve_dtype_mask_conversion_and_argument_order(
 
         def split_kv_q1_rope_cache_attention(self, *args):
             calls.append(("split_rope", args))
+            return args[0]
+
+        def split_kv_q1_rope_cache_attention_coalesced(self, *args):
+            calls.append(("coalesced_split_rope", args))
             return args[0]
 
     monkeypatch.setattr(q1_attention, "_NATIVE_Q1_ATTENTION", _Extension())
@@ -296,6 +302,72 @@ def test_split_kv_policy_is_fp32_sm75_and_live_prefix_only():
         }
         arguments.update(overrides)
         assert not q1_attention._split_kv_q1_eligible(**arguments)
+
+
+def test_coalesced_split_kv_is_explicit_and_keeps_accepted_fallback(monkeypatch):
+    from osuT5.osuT5.inference.optimized.kernels import q1_attention
+
+    qkv = torch.zeros((1, 1, 3, 2, 4), dtype=torch.float32)
+    calls = []
+
+    class _Extension:
+        def q1_rope_cache_attention(self, *args):
+            calls.append(("accepted", args))
+            return args[0]
+
+        def split_kv_q1_rope_cache_attention_coalesced(self, *args):
+            calls.append(("coalesced", args))
+            return args[0]
+
+    monkeypatch.setattr(q1_attention, "_NATIVE_Q1_ATTENTION", _Extension())
+    monkeypatch.setattr(q1_attention, "_validate_rope_cache_inputs", lambda *args: None)
+    monkeypatch.setattr(q1_attention, "_native_mask", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        q1_attention,
+        "native_q1_rope_cache_attention_variant",
+        lambda qkv, prefix: "split_kv_8" if prefix == 640 else "accepted",
+    )
+    arguments = (
+        qkv,
+        torch.zeros((1, 2, 832, 4)),
+        torch.zeros((1, 2, 832, 4)),
+        torch.zeros((1, 1, 4)),
+        torch.zeros((1, 1, 4)),
+        torch.tensor([1]),
+        None,
+    )
+
+    q1_attention.native_q1_rope_cache_attention_coalesced(*arguments, 640)
+    q1_attention.native_q1_rope_cache_attention_coalesced(*arguments, 128)
+
+    assert [kind for kind, _ in calls] == ["coalesced", "accepted"]
+    assert q1_attention.native_q1_rope_cache_attention_coalesced_variant(qkv, 640) == (
+        "split_kv_8_coalesced"
+    )
+    assert q1_attention.native_q1_rope_cache_attention_coalesced_variant(qkv, 128) == (
+        "accepted"
+    )
+
+
+def test_coalesced_source_uses_warp_coalescing_and_fail_loud_guards(monkeypatch):
+    from osuT5.osuT5.inference.optimized.kernels import q1_attention
+
+    calls = []
+    monkeypatch.setattr(q1_attention, "_NATIVE_Q1_ATTENTION", None)
+    monkeypatch.setattr(
+        q1_attention,
+        "load_inline",
+        lambda **kwargs: calls.append(kwargs) or SimpleNamespace(),
+    )
+
+    q1_attention.preload_native_q1_attention()
+    source = calls[0]["cuda_sources"]
+
+    assert "__shfl_down_sync(0xffffffffu, score, delta)" in source
+    assert "const int lane = tid & 31" in source
+    assert "const int warp = tid >> 5" in source
+    assert "coalesced split-KV q1 requires head_dim=64" in source
+    assert "largest_split <= block_size" in source
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
