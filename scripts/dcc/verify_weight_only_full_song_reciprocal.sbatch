@@ -169,6 +169,7 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export TMPDIR="$WORK/tmp"
 export TOKENIZERS_PARALLELISM=false
+export PYTHONHASHSEED=0
 
 echo "host=$(hostname)"
 echo "job_id=${SLURM_JOB_ID:-manual}"
