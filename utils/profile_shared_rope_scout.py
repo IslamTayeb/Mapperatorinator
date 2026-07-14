@@ -275,6 +275,23 @@ def _validate_report(report: dict[str, Any]) -> None:
         raise ValueError("shared-RoPE promotion decision is inconsistent")
 
 
+def decision_exit_code(report: dict[str, Any]) -> int:
+    summary = report.get("summary")
+    if not isinstance(summary, dict):
+        raise TypeError("shared-RoPE report summary must be an object")
+    if not bool(summary.get("exact_pass")) or not bool(
+        summary.get("rope_call_accounting_pass")
+    ):
+        return 1
+    if bool(summary.get("promotion_pass")):
+        return 0
+    if bool(summary.get("performance_pass")):
+        raise ValueError(
+            "shared-RoPE performance passed while promotion remained blocked"
+        )
+    return 3
+
+
 @torch.no_grad()
 def profile_shared_rope_scout(
     args,
@@ -535,8 +552,9 @@ def main() -> None:
     )
     cli.text_path.write_text(_text_report(report), encoding="utf-8")
     print(_text_report(report), end="")
-    if not report["summary"]["promotion_pass"]:
-        raise SystemExit(3)
+    exit_code = decision_exit_code(report)
+    if exit_code:
+        raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":
