@@ -183,8 +183,8 @@ class KernelComponentLadderTest(unittest.TestCase):
             "5f384760dff8520bc1ad0e11414f994d3024578b",
             "71c3ecdd80d1f3b33e856e8fad6f7f344aaeed9a",
             "f13e55e1bf1ad32629f2981738acb65aab09a45f",
-            "d0de363f6df44195f2b3b73c0797dd57bcab9440",
-            "680d4b05a4731805163463fad04a0a909a7c4d54",
+            "1b31295ac62c7fafe739f02bd72f73a11cdf1b67",
+            "9497aa79bc68776390cd579b4719dafe45ce947a",
         ):
             self.assertIn(commit, source)
 

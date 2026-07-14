@@ -43,12 +43,12 @@ VOCAB_COMMIT=f13e55e1bf1ad32629f2981738acb65aab09a45f
 VOCAB_BRANCH=codex/500tps-vocab-sampling-scout
 
 SHARED_ROPE_REPO="$ROOT/500tps-shared-rope-scout"
-SHARED_ROPE_COMMIT=d0de363f6df44195f2b3b73c0797dd57bcab9440
+SHARED_ROPE_COMMIT=1b31295ac62c7fafe739f02bd72f73a11cdf1b67
 SHARED_ROPE_BRANCH=codex/500tps-shared-rope-scout-dcc
 SHARED_ROPE_REMOTE_BRANCH=codex/500tps-shared-rope-scout
 
 PREFILL_REPO="$ROOT/500tps-prefill-graph-scout"
-PREFILL_COMMIT=680d4b05a4731805163463fad04a0a909a7c4d54
+PREFILL_COMMIT=9497aa79bc68776390cd579b4719dafe45ce947a
 PREFILL_BRANCH=codex/500tps-prefill-graph-scout-dcc
 PREFILL_REMOTE_BRANCH=codex/500tps-prefill-graph-scout
 
