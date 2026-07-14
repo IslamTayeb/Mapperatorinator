@@ -486,6 +486,80 @@ def summarize(payload: Any) -> dict[str, Any]:
     return result
 
 
+def add_control_comparison(
+    report: dict[str, Any],
+    control_payload: Any,
+) -> dict[str, Any]:
+    control = _object(control_payload, name="control_profile")
+    metadata = _object(control.get("metadata"), name="control_profile.metadata")
+    if metadata.get("profile_pass_kind") != "untraced_control":
+        raise ValueError("control profile must use profile_pass_kind=untraced_control")
+    summary = _object(control.get("summary"), name="control_profile.summary")
+    by_label = _object(
+        summary.get("generation_by_label"),
+        name="control_profile.summary.generation_by_label",
+    )
+    if set(by_label) != set(report["by_label"]):
+        raise ValueError("control and budget profile labels differ")
+
+    comparisons: dict[str, Any] = {}
+    control_total_seconds = 0.0
+    control_total_tokens = 0
+    control_total_records = 0
+    for label, budget in report["by_label"].items():
+        control_label = _object(
+            by_label[label],
+            name=f"control_profile.summary.generation_by_label.{label}",
+        )
+        control_seconds = _number(
+            control_label.get("model_elapsed_seconds"),
+            name=f"control_profile.summary.generation_by_label.{label}.model_elapsed_seconds",
+            positive=True,
+        )
+        control_tokens = _count(
+            control_label.get("generated_tokens"),
+            name=f"control_profile.summary.generation_by_label.{label}.generated_tokens",
+            positive=True,
+        )
+        control_records = _count(
+            control_label.get("records"),
+            name=f"control_profile.summary.generation_by_label.{label}.records",
+            positive=True,
+        )
+        if control_tokens != budget["generated_tokens"]:
+            raise ValueError(f"control and budget token counts differ for {label}")
+        if control_records != budget["records"]:
+            raise ValueError(f"control and budget record counts differ for {label}")
+        delta = budget["model_elapsed_seconds"] - control_seconds
+        comparisons[label] = {
+            "records": control_records,
+            "generated_tokens": control_tokens,
+            "control_model_elapsed_seconds": control_seconds,
+            "budget_model_elapsed_seconds": budget["model_elapsed_seconds"],
+            "instrumentation_overhead_seconds": delta,
+            "instrumentation_overhead_fraction": delta / control_seconds,
+        }
+        control_total_seconds += control_seconds
+        control_total_tokens += control_tokens
+        control_total_records += control_records
+
+    budget_total = report["overall"]["model_elapsed_seconds"]
+    report["paired_control"] = {
+        "by_label": comparisons,
+        "overall": {
+            "records": control_total_records,
+            "generated_tokens": control_total_tokens,
+            "control_model_elapsed_seconds": control_total_seconds,
+            "budget_model_elapsed_seconds": budget_total,
+            "instrumentation_overhead_seconds": budget_total - control_total_seconds,
+            "instrumentation_overhead_fraction": (
+                (budget_total - control_total_seconds) / control_total_seconds
+            ),
+        },
+    }
+    return report
+
+
 def _text_report(report: dict[str, Any]) -> str:
     overall = report["overall"]
     lines = [
@@ -506,17 +580,36 @@ def _text_report(report: dict[str, Any]) -> str:
             f"cuda_s:{region['cuda_event_seconds']:.9f},"
             f"copies:{region['copy_count']},bytes:{region['copy_bytes']}"
         )
+    paired = report.get("paired_control")
+    if isinstance(paired, dict) and isinstance(paired.get("overall"), dict):
+        comparison = paired["overall"]
+        lines.extend(
+            (
+                "control_model_elapsed_seconds="
+                f"{comparison['control_model_elapsed_seconds']:.9f}",
+                "instrumentation_overhead_seconds="
+                f"{comparison['instrumentation_overhead_seconds']:.9f}",
+                "instrumentation_overhead_fraction="
+                f"{comparison['instrumentation_overhead_fraction']:.9f}",
+            )
+        )
     return "\n".join(lines) + "\n"
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", type=Path, required=True)
+    parser.add_argument("--control-profile", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--text-output", type=Path)
     args = parser.parse_args()
 
     report = summarize(json.loads(args.profile.read_text(encoding="utf-8")))
+    if args.control_profile is not None:
+        report = add_control_comparison(
+            report,
+            json.loads(args.control_profile.read_text(encoding="utf-8")),
+        )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n",

@@ -10,7 +10,7 @@ from osuT5.osuT5.inference.optimized.single.budget import (
     BUDGET_REGION_NAMES,
     UntracedBudgetRecorder,
 )
-from utils.summarize_untraced_budget import summarize
+from utils.summarize_untraced_budget import add_control_comparison, summarize
 
 
 def _finished_budget(monkeypatch, *, elapsed: float = 1.0, tokens: int = 10):
@@ -108,6 +108,22 @@ def test_summarizer_validates_schema_and_reconciliation(monkeypatch, tmp_path):
     assert report["overall"]["records"] == 1
     assert report["overall"]["generated_tokens"] == 10
     assert report["overall"]["reconciliation_error_fraction"] <= 0.02
+    control = {
+        "metadata": {"profile_pass_kind": "untraced_control"},
+        "summary": {
+            "generation_by_label": {
+                "main_generation": {
+                    "records": 1,
+                    "generated_tokens": 10,
+                    "model_elapsed_seconds": 0.8,
+                }
+            }
+        },
+    }
+    add_control_comparison(report, control)
+    assert report["paired_control"]["overall"][
+        "instrumentation_overhead_fraction"
+    ] == pytest.approx(0.25)
 
     payload_path = tmp_path / "profile.json"
     payload_path.write_text(json.dumps(payload), encoding="utf-8")
