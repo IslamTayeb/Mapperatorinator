@@ -189,10 +189,18 @@ class ProductionDecodeSession:
                 "peak_vram_bytes": max(
                     int(row.get("peak_vram_bytes", 0)) for row in snapshots
                 ),
+                "physical_steps": sum(
+                    int(row.get("physical_steps", 0)) for row in snapshots
+                ),
+                "logical_steps": sum(
+                    int(row.get("logical_steps", 0)) for row in snapshots
+                ),
                 "wasted_steps": sum(
                     int(row.get("wasted_steps", 0)) for row in snapshots
                 ),
                 "rng_policy": latest.get("rng_policy"),
+                "rng_exact": bool(latest.get("rng_exact", False)),
+                "rng_drift": latest.get("rng_drift"),
                 "parent_backend": latest.get("parent_backend"),
             }
         return result

@@ -170,8 +170,12 @@ def test_session_reports_k8_counters_only_when_candidate_entries_exist():
         "copy_bytes": 64,
         "capture_seconds": 0.25,
         "peak_vram_bytes": 123,
+        "physical_steps": 18,
+        "logical_steps": 16,
         "wasted_steps": 2,
         "rng_policy": "counter_prompt_hash_v1",
+        "rng_exact": False,
+        "rng_drift": "documented_counter_based_per_window",
         "parent_backend": "cuda_python_child_graphs",
     }
     session.graph_cache[("candidate",)] = {
@@ -192,8 +196,12 @@ def test_session_reports_k8_counters_only_when_candidate_entries_exist():
         "copy_bytes": 64,
         "capture_seconds": 0.25,
         "peak_vram_bytes": 123,
+        "physical_steps": 18,
+        "logical_steps": 16,
         "wasted_steps": 2,
         "rng_policy": "counter_prompt_hash_v1",
+        "rng_exact": False,
+        "rng_drift": "documented_counter_based_per_window",
         "parent_backend": "cuda_python_child_graphs",
     }
 
