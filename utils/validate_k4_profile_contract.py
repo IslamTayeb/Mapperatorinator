@@ -35,7 +35,14 @@ def validate(payload: Any, *, role: str, block_size: int) -> dict[str, Any]:
         raise ValueError("profile.generation must be a non-empty list")
 
     totals = {
-        label: {"records": 0, "block_replays": 0, "eligible_steps": 0}
+        label: {
+            "records": 0,
+            "block_replays": 0,
+            "eligible_steps": 0,
+            "physical_steps": 0,
+            "logical_steps": 0,
+            "wasted_steps": 0,
+        }
         for label in LABELS
     }
     for index, raw_record in enumerate(generation):
@@ -102,8 +109,19 @@ def validate(payload: Any, *, role: str, block_size: int) -> dict[str, Any]:
             + values["remainder_steps"]
         ):
             raise ValueError(f"candidate generation[{index}] work accounting diverged")
+        generated_tokens = _nonnegative_int(
+            record.get("generated_tokens"),
+            name=f"generation[{index}].generated_tokens",
+        )
+        if values["logical_steps"] != generated_tokens:
+            raise ValueError(
+                f"candidate generation[{index}] logical steps do not match generated tokens"
+            )
         totals[label]["block_replays"] += values["block_replays"]
         totals[label]["eligible_steps"] += values["eligible_steps"]
+        totals[label]["physical_steps"] += values["physical_steps"]
+        totals[label]["logical_steps"] += values["logical_steps"]
+        totals[label]["wasted_steps"] += values["wasted_steps"]
 
     for label, values in totals.items():
         if values["records"] <= 0:

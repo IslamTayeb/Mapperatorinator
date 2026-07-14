@@ -26,9 +26,16 @@ def _profile(*, candidate: bool = True, block_replays: int = 2) -> dict:
     records = []
     for label in ("timing_context", "main_generation"):
         graphs = {}
+        generated_tokens = 1 + 4 * block_replays
         if candidate:
             graphs["k8_candidate"] = _candidate(block_replays)
-        records.append({"profile_label": label, "optimized_cuda_graphs": graphs})
+        records.append(
+            {
+                "profile_label": label,
+                "generated_tokens": generated_tokens,
+                "optimized_cuda_graphs": graphs,
+            }
+        )
     return {"generation": records}
 
 
@@ -38,6 +45,8 @@ def test_candidate_requires_positive_k4_usage_in_both_stages() -> None:
     assert report["pass"] is True
     assert report["labels"]["timing_context"]["eligible_steps"] == 8
     assert report["labels"]["main_generation"]["block_replays"] == 2
+    assert report["labels"]["main_generation"]["physical_steps"] == 9
+    assert report["labels"]["main_generation"]["logical_steps"] == 9
 
 
 def test_baseline_forbids_k4_metadata() -> None:
@@ -66,4 +75,12 @@ def test_candidate_fails_loudly_on_invalid_contract(field, value, message) -> No
     profile["generation"][0]["optimized_cuda_graphs"]["k8_candidate"][field] = value
 
     with pytest.raises(ValueError, match=message):
+        validate(profile, role="candidate", block_size=4)
+
+
+def test_candidate_logical_steps_match_profile_generated_tokens() -> None:
+    profile = _profile()
+    profile["generation"][0]["generated_tokens"] += 1
+
+    with pytest.raises(ValueError, match="do not match generated tokens"):
         validate(profile, role="candidate", block_size=4)
