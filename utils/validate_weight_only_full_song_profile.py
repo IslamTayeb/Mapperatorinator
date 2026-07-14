@@ -193,6 +193,7 @@ def validate_profile(
     *,
     role: str,
     cross_mode: str = "accepted",
+    timing_native_self: bool = False,
 ) -> dict[str, Any]:
     if role not in PROFILE_ROLES:
         raise WeightOnlyProfileError(f"role must be one of {PROFILE_ROLES}")
@@ -318,6 +319,16 @@ def validate_profile(
                     )
             expected_effective_self_attention = (
                 {
+                    "requested": True,
+                    "enabled": True,
+                    "owner": "accepted_attention_hook",
+                    "kernel": "native_q1_rope_cache_attention",
+                    "standard_attention_hook_enabled": True,
+                    "split_kv_selector_enabled": True,
+                    "disabled_reason": None,
+                }
+                if label == "timing_context" and timing_native_self
+                else {
                     "requested": False,
                     "enabled": False,
                     "owner": None,
@@ -350,6 +361,8 @@ def validate_profile(
             expected_mode = (
                 "approximate_weight_only_batch1"
                 if candidate_main
+                else "fp32_timing_native_self_batch1"
+                if label == "timing_context" and timing_native_self
                 else "accepted_batch1"
             )
             if record.get("optimized_dispatch_mode") != expected_mode:
@@ -369,7 +382,7 @@ def validate_profile(
                 prefix_totals[prefix] = prefix_totals.get(prefix, 0) + value
 
             if label == "timing_context":
-                if any(
+                if not timing_native_self and any(
                     effective[key] != 0
                     for key in (
                         "native_q1_rope_cache_self_attention",
@@ -450,6 +463,15 @@ def validate_profile(
                     if key in baseline_main_dispatch_totals:
                         baseline_main_dispatch_totals[key] += value
 
+    timing_effective = effective_self_attention_totals["timing_context"]
+    if (
+        timing_native_self
+        and timing_effective["native_q1_rope_cache_self_attention"] <= 0
+    ):
+        raise WeightOnlyProfileError(
+            "timing context did not execute native self-attention across any record"
+        )
+
     main_effective = effective_self_attention_totals["main_generation"]
     if candidate:
         missing_dispatch = {key: value for key, value in totals.items() if value <= 0}
@@ -504,13 +526,12 @@ def validate_profile(
         "cross_mode": cross_mode,
         "candidate_enabled_for_main": candidate,
         "candidate_disabled_for_timing": candidate,
+        "timing_native_self": timing_native_self,
         "main_weight_only_dispatch_counts": totals,
         "main_cross_candidate_dispatch_counts": cross_totals,
         "main_q1_bmm_cross_attention_count": candidate_q1_bmm_total,
         "baseline_main_dispatch_counts": baseline_main_dispatch_totals,
-        "timing_effective_self_attention_counts": effective_self_attention_totals[
-            "timing_context"
-        ],
+        "timing_effective_self_attention_counts": timing_effective,
         "main_effective_self_attention_counts": main_effective,
     }
 
@@ -520,12 +541,18 @@ def validate_profile_path(
     *,
     role: str,
     cross_mode: str = "accepted",
+    timing_native_self: bool = False,
 ) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise WeightOnlyProfileError(f"cannot read profile {path}: {exc}") from exc
-    return validate_profile(payload, role=role, cross_mode=cross_mode)
+    return validate_profile(
+        payload,
+        role=role,
+        cross_mode=cross_mode,
+        timing_native_self=timing_native_self,
+    )
 
 
 def main() -> None:
@@ -533,11 +560,13 @@ def main() -> None:
     parser.add_argument("--profile", type=Path, required=True)
     parser.add_argument("--role", choices=PROFILE_ROLES, required=True)
     parser.add_argument("--cross-mode", choices=CROSS_MODES, default="accepted")
+    parser.add_argument("--timing-native-self", action="store_true")
     args = parser.parse_args()
     result = validate_profile_path(
         args.profile,
         role=args.role,
         cross_mode=args.cross_mode,
+        timing_native_self=args.timing_native_self,
     )
     print(json.dumps(result, sort_keys=True))
 

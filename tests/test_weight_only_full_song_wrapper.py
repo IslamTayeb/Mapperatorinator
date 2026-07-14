@@ -29,6 +29,9 @@ K1_INT8_MLP_WRAPPER = (
 FP16_CROSS_WRAPPER = (
     ROOT / "scripts/dcc/verify_k4_shared_rope_fp16_cross_reciprocal.sbatch"
 )
+TIMING_NATIVE_SELF_WRAPPER = (
+    ROOT / "scripts/dcc/verify_selected_timing_native_self_reciprocal.sbatch"
+)
 def test_weight_only_full_song_wrapper_has_valid_bash_syntax() -> None:
     for wrapper in (
         WRAPPER,
@@ -37,6 +40,7 @@ def test_weight_only_full_song_wrapper_has_valid_bash_syntax() -> None:
         INT8_MLP_WRAPPER,
         K1_INT8_MLP_WRAPPER,
         FP16_CROSS_WRAPPER,
+        TIMING_NATIVE_SELF_WRAPPER,
     ):
         subprocess.run(["bash", "-n", str(wrapper)], check=True)
 
@@ -231,6 +235,40 @@ def test_selected_cross_wrapper_pins_k1_int8_control_and_fp16_projection_delta()
     assert "parity.cross_candidate_exact=true" in general
     assert "validate_fp16_cross_reciprocal_manifest.py" in general
     assert "fp16-cross-reciprocal-manifest.json" in general
+
+
+def test_selected_timing_native_self_wrapper_requires_exact_incremental_output() -> None:
+    source = TIMING_NATIVE_SELF_WRAPPER.read_text(encoding="utf-8")
+
+    assert "#SBATCH --gres=gpu:2080:1" in source
+    assert "BASELINE_RUNNER=utils/run_k4_shared_rope_fp16_cross.py" in source
+    assert "CANDIDATE_RUNNER=utils/run_selected_timing_native_self.py" in source
+    assert "REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL=true" in source
+    assert "CROSS_CANDIDATE_MODE=fp16_packed_projections" in source
+    assert "FIXED_TIMING_TOKENS=${FIXED_TIMING_TOKENS:-821}" in source
+
+    general = WRAPPER.read_text(encoding="utf-8")
+    timing = general.split(
+        'if [[ "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" == true ]]; then\n'
+        "  ANALYSIS_EXACT_ARGS=",
+        maxsplit=1,
+    )[1].split(
+        'elif [[ "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then',
+        maxsplit=1,
+    )[0]
+    assert "--require-exact-label timing_context" in timing
+    assert "--require-exact-label main_generation" in timing
+    assert "--require-exact-dispatch-label main_generation" in timing
+    assert "optimized_timing_native_self.*" in timing
+    assert "records.main_generation" not in timing
+    assert "--fixed-timing-tokens \"$FIXED_TIMING_TOKENS\"" in general
+    assert "validate_selected_timing_native_self_profile.py" in general
+    assert "parity.cross_candidate_exact=true" in general
+    assert "metric.fixed_8294_main_seconds=" in general
+    assert "fixed_timing_context_model_seconds_at_${FIXED_TIMING_TOKENS}_tokens" in general
+    assert "metric.complete_request_wall_seconds=" in general
+    assert "metric.peak_cuda_memory_allocated_mb=" in general
+    assert "metric.setup_plus_capture_seconds=" in general
 
 
 def test_cross_composition_classifies_shared_rope_as_common_to_all_arms() -> None:
