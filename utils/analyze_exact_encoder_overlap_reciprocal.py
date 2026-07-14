@@ -174,8 +174,23 @@ def _validate_candidate(
     windows = external.get("live_window_count")
     if isinstance(windows, bool) or not isinstance(windows, int) or windows <= 0:
         raise ValueError("candidate overlap live window count is invalid")
-    if external.get("main_model_generate_calls") != windows:
-        raise ValueError("candidate did not consume every exact B1 encoder row")
+    if (
+        external.get("timing_model_generate_calls") != windows
+        or external.get("main_model_generate_calls") != windows
+    ):
+        raise ValueError("candidate did not cover every exact B1 timing/main row")
+    rows_per_chunk = external.get("encoder_rows_per_chunk")
+    chunks = external.get("encoder_launch_chunks")
+    if (
+        not isinstance(rows_per_chunk, list)
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in rows_per_chunk
+        )
+        or sum(rows_per_chunk) != windows
+        or chunks != len(rows_per_chunk)
+    ):
+        raise ValueError("candidate did not partition every exact B1 encoder row")
     launch_window = external.get("launch_after_timing_window")
     if (
         isinstance(launch_window, bool)

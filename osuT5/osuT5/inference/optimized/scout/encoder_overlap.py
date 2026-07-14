@@ -153,6 +153,17 @@ class ExactMainEncoderOverlap:
     _stream: torch.cuda.Stream | None = field(default=None, init=False, repr=False)
     _encoder_start: torch.cuda.Event | None = field(default=None, init=False, repr=False)
     _encoder_end: torch.cuda.Event | None = field(default=None, init=False, repr=False)
+    _encoder_chunk_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = field(
+        default_factory=list,
+        init=False,
+        repr=False,
+    )
+    _encoder_rows_per_chunk: list[int] = field(
+        default_factory=list,
+        init=False,
+        repr=False,
+    )
+    _encoder: Any | None = field(default=None, init=False, repr=False)
     _timing_end: torch.cuda.Event | None = field(default=None, init=False, repr=False)
     _join_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = field(
         default_factory=list,
@@ -337,6 +348,67 @@ class ExactMainEncoderOverlap:
         self._active_label = profile_label
 
     @torch.no_grad()
+    def _enqueue_rows(self, count: int) -> None:
+        if (
+            self._stream is None
+            or self._encoder is None
+            or self._pinned_frames is None
+        ):
+            raise EncoderOverlapError("encoder row enqueue lacks initialized ownership")
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise EncoderOverlapError("encoder row enqueue count must be positive")
+        start_index = len(self._rows)
+        end_index = min(start_index + count, len(self._pinned_frames))
+        if start_index >= end_index:
+            raise EncoderOverlapError("encoder row enqueue exceeded live windows")
+        stream = self._stream
+        chunk_start = torch.cuda.Event(enable_timing=True)
+        chunk_end = torch.cuda.Event(enable_timing=True)
+        started = time.perf_counter()
+        try:
+            with torch.cuda.stream(stream):
+                chunk_start.record(stream)
+                for index in range(start_index, end_index):
+                    frame = self._pinned_frames[index : index + 1].to(
+                        self._main_processor.model.device,
+                        non_blocking=True,
+                    )
+                    kwargs = {
+                        key: value.to(
+                            self._main_processor.model.device,
+                            non_blocking=True,
+                        )
+                        for key, value in self._pinned_conditioning[index].items()
+                    }
+                    outputs = self._encoder(frames=frame, **kwargs, return_dict=True)
+                    hidden = getattr(outputs, "last_hidden_state", None)
+                    if not isinstance(hidden, torch.Tensor):
+                        raise EncoderOverlapError(
+                            f"main encoder row {index} lacks last_hidden_state"
+                        )
+                    if (
+                        hidden.dtype != torch.float32
+                        or hidden.device != self._main_processor.model.device
+                    ):
+                        raise EncoderOverlapError(
+                            f"main encoder row {index} changed storage dtype/device"
+                        )
+                    ready = torch.cuda.Event(enable_timing=True)
+                    ready.record(stream)
+                    self._rows.append(_OverlapRow(hidden=hidden, ready=ready))
+                chunk_end.record(stream)
+                if len(self._rows) == len(self._pinned_frames):
+                    end_event = torch.cuda.Event(enable_timing=True)
+                    end_event.record(stream)
+                    self._encoder_end = end_event
+        except BaseException:
+            stream.synchronize()
+            raise
+        self._launch_host_seconds += time.perf_counter() - started
+        self._encoder_chunk_events.append((chunk_start, chunk_end))
+        self._encoder_rows_per_chunk.append(end_index - start_index)
+
+    @torch.no_grad()
     def _launch(self) -> None:
         if self._main_processor is None or self._pinned_frames is None:
             raise EncoderOverlapError("overlap launch lacks main inputs")
@@ -355,43 +427,19 @@ class ExactMainEncoderOverlap:
         stream.wait_stream(current)
         encoder = self._main_processor.model.get_encoder()
         encoder.eval()
+        self._encoder = encoder
         start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        rows: list[_OverlapRow] = []
-        started = time.perf_counter()
         try:
             with torch.cuda.stream(stream):
                 start_event.record(stream)
-                for index in range(len(self._pinned_frames)):
-                    frame = self._pinned_frames[index : index + 1].to(
-                        device,
-                        non_blocking=True,
-                    )
-                    kwargs = {
-                        key: value.to(device, non_blocking=True)
-                        for key, value in self._pinned_conditioning[index].items()
-                    }
-                    outputs = encoder(frames=frame, **kwargs, return_dict=True)
-                    hidden = getattr(outputs, "last_hidden_state", None)
-                    if not isinstance(hidden, torch.Tensor):
-                        raise EncoderOverlapError(
-                            f"main encoder row {index} lacks last_hidden_state"
-                        )
-                    if hidden.dtype != torch.float32 or hidden.device != device:
-                        raise EncoderOverlapError(
-                            f"main encoder row {index} changed storage dtype/device"
-                        )
-                    ready = torch.cuda.Event(enable_timing=True)
-                    ready.record(stream)
-                    rows.append(_OverlapRow(hidden=hidden, ready=ready))
-                end_event.record(stream)
+            self._encoder_start = start_event
+            # Launch one encoder row per observed timing window. Subsequent
+            # timing calls add one row, retaining overlap without queueing work
+            # across an unknown future CUDA graph capture.
+            self._enqueue_rows(self._timing_calls)
         except BaseException:
             stream.synchronize()
             raise
-        self._launch_host_seconds = time.perf_counter() - started
-        self._encoder_start = start_event
-        self._encoder_end = end_event
-        self._rows = rows
 
     def before_timing_graph_capture(self) -> None:
         """Quiesce owned encoder work before a fresh timing CUDA graph capture."""
@@ -478,6 +526,7 @@ class ExactMainEncoderOverlap:
                 raise EncoderOverlapError(
                     "timing capture guard did not produce manifest growth"
                 )
+            self._enqueue_rows(1)
             return
         if manifest == self._previous_manifest:
             self._stable_observations += 1
@@ -558,6 +607,13 @@ class ExactMainEncoderOverlap:
                 raise EncoderOverlapError(
                     "timing graph manifest lacks a matching pre-capture barrier"
                 )
+            expected_rows = (
+                len(self._source_frames) if self._source_frames is not None else 0
+            )
+            if len(self._rows) != expected_rows or self._encoder_end is None:
+                raise EncoderOverlapError(
+                    f"timing overlap scheduled {len(self._rows)}/{expected_rows} encoder rows"
+                )
             event = torch.cuda.Event(enable_timing=True)
             event.record(torch.cuda.current_stream(processor.model.device))
             self._timing_end = event
@@ -591,12 +647,27 @@ class ExactMainEncoderOverlap:
             and self._encoder_end is not None
             and self._timing_end is not None
         ):
-            encoder_seconds = self._encoder_start.elapsed_time(self._encoder_end) / 1000.0
-            until_timing_end = max(
-                0.0,
-                self._encoder_start.elapsed_time(self._timing_end) / 1000.0,
+            encoder_seconds = sum(
+                start.elapsed_time(end) / 1000.0
+                for start, end in self._encoder_chunk_events
             )
-            overlap_seconds = min(encoder_seconds, until_timing_end)
+            timing_end_offset = max(
+                0.0, self._encoder_start.elapsed_time(self._timing_end) / 1000.0
+            )
+            overlap_seconds = sum(
+                max(
+                    0.0,
+                    min(
+                        self._encoder_start.elapsed_time(end) / 1000.0,
+                        timing_end_offset,
+                    )
+                    - max(
+                        0.0,
+                        self._encoder_start.elapsed_time(start) / 1000.0,
+                    ),
+                )
+                for start, end in self._encoder_chunk_events
+            )
             per_row_join = [
                 start.elapsed_time(end) / 1000.0
                 for start, end in self._join_events
@@ -662,6 +733,8 @@ class ExactMainEncoderOverlap:
             "low_priority_stream_priority": self._least_stream_priority,
             "pinned_input_setup_seconds": self._pinned_setup_seconds,
             "launch_host_seconds": self._launch_host_seconds,
+            "encoder_launch_chunks": len(self._encoder_rows_per_chunk),
+            "encoder_rows_per_chunk": list(self._encoder_rows_per_chunk),
             "encoder_elapsed_seconds": encoder_seconds,
             "encoder_overlap_with_timing_seconds": overlap_seconds,
             "encoder_after_timing_seconds": (

@@ -107,6 +107,8 @@ def test_guarded_manifest_growth_requires_one_barrier_per_fresh_graph(monkeypatc
     stream = SimpleNamespace(synchronize=lambda: None)
     manager._active_label = "timing_context"
     manager._stream = stream
+    enqueues = []
+    monkeypatch.setattr(manager, "_enqueue_rows", enqueues.append)
     manager._launch_manifest = {"graph_count": 1, "buckets": {"64": 1}}
     manager._current_manifest = copy = manager._launch_manifest.copy()
     monkeypatch.setattr(manager, "_publish", lambda _processor: None)
@@ -127,6 +129,7 @@ def test_guarded_manifest_growth_requires_one_barrier_per_fresh_graph(monkeypatc
     assert manager._pre_capture_barrier_count == 1
     assert manager._pending_capture_barriers == 0
     assert manager._guarded_manifest_growth[0]["capture_barriers"] == 1
+    assert enqueues == [1]
     assert not manager._manifest_changed_after_launch
 
 

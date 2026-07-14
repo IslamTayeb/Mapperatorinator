@@ -58,7 +58,10 @@ def _overlap():
         "labels_completed": ["timing_context", "main_generation"],
         "manifest_changed_after_launch": False,
         "live_window_count": 2,
+        "timing_model_generate_calls": 2,
         "main_model_generate_calls": 2,
+        "encoder_launch_chunks": 2,
+        "encoder_rows_per_chunk": [1, 1],
         "launch_after_timing_window": 1,
         "all_encoder_outputs_finite": True,
         "launch_manifest": {"graph_count": 2, "buckets": {"64": 1, "128": 1}},
@@ -146,6 +149,9 @@ def test_candidate_validation_requires_complete_exact_b1_overlap():
     # The production gate has 87 windows; use 3 here so launch after window 2 is valid.
     overlap["live_window_count"] = 3
     overlap["main_model_generate_calls"] = 3
+    overlap["timing_model_generate_calls"] = 3
+    overlap["encoder_launch_chunks"] = 3
+    overlap["encoder_rows_per_chunk"] = [1, 1, 1]
     overlap["launch_after_timing_window"] = 2
     overlap["per_row_main_join_wait_seconds"] = [0.03, 0.03, 0.04]
     overlap["encoder_output_sha256_per_window"] = ["e" * 64, "f" * 64, "0" * 64]
@@ -167,6 +173,9 @@ def test_candidate_validation_rejects_unguarded_or_broken_manifest_growth():
     overlap = _overlap()
     overlap["live_window_count"] = 3
     overlap["main_model_generate_calls"] = 3
+    overlap["timing_model_generate_calls"] = 3
+    overlap["encoder_launch_chunks"] = 3
+    overlap["encoder_rows_per_chunk"] = [1, 1, 1]
     overlap["launch_after_timing_window"] = 2
     overlap["per_row_main_join_wait_seconds"] = [0.03, 0.03, 0.04]
     overlap["encoder_output_sha256_per_window"] = ["e" * 64, "f" * 64, "0" * 64]
