@@ -112,6 +112,7 @@ finalize() {
 trap finalize EXIT
 
 cd "$REPO"
+export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 "$PYTHON" - "$RUN_ROOT/preload/evidence.json" <<'PY'
 import json
 import sys

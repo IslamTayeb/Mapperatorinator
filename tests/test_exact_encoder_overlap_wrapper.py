@@ -16,6 +16,7 @@ def test_wrapper_is_pinned_reciprocal_and_never_enables_batched_encoder():
     assert source.count("run_profile ") == 4
     assert "minimum-request-saving-seconds 1.0" in source
     assert "run_exact_encoder_overlap_full_song.py" in source
+    assert 'export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"' in source
     assert source.count("--initialization-path") == 1
     assert source.count("validate_weight_only_full_song_profile.py") == 1
     assert source.count("validate_k4_profile_contract.py") == 1
