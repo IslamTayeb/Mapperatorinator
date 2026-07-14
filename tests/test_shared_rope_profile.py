@@ -7,6 +7,7 @@ import pytest
 from utils.profile_shared_rope_scout import (
     REQUIRED_MAIN_SAVING_SECONDS,
     SCHEMA_VERSION,
+    _validate_live_accepted_graph_cache,
     _validate_report,
     decision_exit_code,
     summarize_shared_rope,
@@ -15,6 +16,19 @@ from utils.profile_native_prefix_dtype_scout import ALL_BUCKETS
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _live_graph_cache(*, changed_count: int | None = None):
+    entries = {}
+    for prefix in ALL_BUCKETS:
+        entries[(prefix,)] = {
+            "active_prefix_length": prefix,
+            "graph": object(),
+            "outputs": object(),
+            "static_inputs": {},
+            "decode_replays": changed_count if prefix == 128 and changed_count else 1,
+        }
+    return entries
 
 
 def _bucket(accepted_ms: float, candidate_ms: float, *, exact=True, calls=True):
@@ -49,6 +63,50 @@ def _report(*, saving_ms=1.0, count=1_000):
         "buckets": buckets,
         "summary": summary,
     }
+
+
+def test_live_graph_manifest_accepts_fresh_positive_replay_counts():
+    entries = _validate_live_accepted_graph_cache(
+        _live_graph_cache(changed_count=123)
+    )
+
+    assert tuple(entries) == ALL_BUCKETS
+    assert entries[128]["decode_replays"] == 123
+
+
+def test_live_graph_manifest_rejects_nonpositive_counts_and_duplicate_prefixes():
+    invalid = _live_graph_cache()
+    invalid[(128,)]["decode_replays"] = 0
+    with pytest.raises(RuntimeError, match="invalid decode_replays"):
+        _validate_live_accepted_graph_cache(invalid)
+
+    duplicate = _live_graph_cache()
+    duplicate[("duplicate",)] = dict(duplicate[(128,)])
+    with pytest.raises(RuntimeError, match="repeats prefix 128"):
+        _validate_live_accepted_graph_cache(duplicate)
+
+
+def test_live_graph_manifest_requires_exact_current_bucket_topology():
+    missing = _live_graph_cache()
+    del missing[(ALL_BUCKETS[-1],)]
+    with pytest.raises(RuntimeError, match="must contain current buckets"):
+        _validate_live_accepted_graph_cache(missing)
+
+    extra = _live_graph_cache()
+    extra[(ALL_BUCKETS[-1] + 64,)] = {
+        **extra[(ALL_BUCKETS[-1],)],
+        "active_prefix_length": ALL_BUCKETS[-1] + 64,
+    }
+    with pytest.raises(RuntimeError, match="must contain current buckets"):
+        _validate_live_accepted_graph_cache(extra)
+
+
+def test_live_graph_manifest_requires_every_accepted_entry_field():
+    missing = _live_graph_cache()
+    del missing[(128,)]["outputs"]
+
+    with pytest.raises(RuntimeError, match=r"prefix 128 is missing \['outputs'\]"):
+        _validate_live_accepted_graph_cache(missing)
 
 
 def test_weighted_gate_charges_setup_and_unmeasured_buckets_get_zero_credit():
