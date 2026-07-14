@@ -89,7 +89,27 @@ def test_runner_reuses_two_bindings_and_closes_pools(monkeypatch, tmp_path: Path
         "shared_decoder_rope_context",
         lambda *args, **kwargs: nullcontext(),
     )
-    monkeypatch.setattr(runner.torch.cuda, "is_available", lambda: False)
+    cuda_calls = []
+    monkeypatch.setattr(runner.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        runner.torch.cuda,
+        "synchronize",
+        lambda: cuda_calls.append("synchronize"),
+    )
+    monkeypatch.setattr(runner.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        runner.torch.cuda,
+        "reset_peak_memory_stats",
+        lambda device: cuda_calls.append(("reset", device)),
+    )
+    monkeypatch.setattr(runner.torch.cuda, "memory_allocated", lambda device: 100)
+    monkeypatch.setattr(runner.torch.cuda, "memory_reserved", lambda device: 200)
+    monkeypatch.setattr(
+        runner.torch.cuda,
+        "max_memory_allocated",
+        lambda device: 300,
+    )
+    monkeypatch.setattr(runner.torch.cuda, "max_memory_reserved", lambda device: 400)
 
     manifest = tmp_path / "manifest.json"
     initialization = tmp_path / "initialization.json"
@@ -100,7 +120,7 @@ def test_runner_reuses_two_bindings_and_closes_pools(monkeypatch, tmp_path: Path
         output_manifest=manifest,
     )
 
-    assert calls == 2
+    assert calls == 3
     assert source_loads == [True, False]
     assert inference.load_model_with_engine is source_loader
     assert all(
@@ -109,7 +129,14 @@ def test_runner_reuses_two_bindings_and_closes_pools(monkeypatch, tmp_path: Path
     )
     payload = json.loads(manifest.read_text(encoding="utf-8"))
     assert payload["close_completed"] is True
-    assert set(payload["results"]) == {"cold", "warm"}
+    assert set(payload["results"]) == {"cold", "warm1", "warm2"}
     assert payload["results"]["cold"]["pool_summary"]["main"]["request_count"] == 0
-    assert payload["results"]["warm"]["pool_summary"]["main"]["request_count"] == 0
-    assert payload["results"]["cold"]["cuda_memory"] is None
+    assert payload["results"]["warm1"]["pool_summary"]["main"]["request_count"] == 0
+    assert payload["results"]["warm2"]["pool_summary"]["main"]["request_count"] == 0
+    assert payload["results"]["cold"]["cuda_memory"]["max_allocated_bytes"] == 300
+    assert payload["results"]["warm1"]["cuda_memory"]["max_reserved_bytes"] == 400
+    assert payload["results"]["warm2"]["cuda_memory"]["allocated_bytes"] == 100
+    assert payload["results"]["cold"]["cuda_peak_stats_reset"] is True
+    assert payload["results"]["warm1"]["cuda_peak_stats_reset"] is True
+    assert payload["results"]["warm2"]["cuda_peak_stats_reset"] is True
+    assert cuda_calls.count(("reset", 0)) == 3

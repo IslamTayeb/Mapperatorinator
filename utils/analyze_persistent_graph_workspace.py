@@ -1,4 +1,4 @@
-"""Analyze one same-process cold/warm persistent graph workspace pair."""
+"""Analyze a same-process cold/warm-one/warm-two graph workspace plateau."""
 
 from __future__ import annotations
 
@@ -11,6 +11,8 @@ from typing import Any
 
 
 LABELS = ("timing_context", "main_generation")
+PASSES = ("cold", "warm1", "warm2")
+WARM_PASSES = ("warm1", "warm2")
 TOPOLOGY_VERSION = "selected-k4-k1-int8-fp16-cross-persistent-graphs-v1"
 VRAM_GROWTH_TOLERANCE_BYTES = 16 * 1024 * 1024
 
@@ -236,8 +238,8 @@ def analyze(manifest_path: Path) -> dict[str, Any]:
         json.loads(manifest_path.read_text(encoding="utf-8")),
         name="manifest",
     )
-    if manifest.get("schema_version") != 1:
-        raise ValueError("persistent graph manifest schema_version must be 1")
+    if manifest.get("schema_version") != 2:
+        raise ValueError("persistent graph manifest schema_version must be 2")
     if manifest.get("topology_version") != TOPOLOGY_VERSION:
         raise ValueError("persistent graph manifest topology version changed")
     initialization_path = Path(str(manifest.get("initialization_path", "")))
@@ -255,81 +257,116 @@ def analyze(manifest_path: Path) -> dict[str, Any]:
         if not _object(initialization.get(role), name=f"initialization.{role}"):
             raise ValueError(f"persistent graph {role} initialization is empty")
     results = _object(manifest.get("results"), name="manifest.results")
-    cold_result = _object(results.get("cold"), name="cold")
-    warm_result = _object(results.get("warm"), name="warm")
-    cold = _profile_metrics(Path(cold_result["profile_path"]))
-    warm = _profile_metrics(Path(warm_result["profile_path"]))
-    cold["process_call_wall_seconds"] = _number(
-        cold_result.get("process_call_wall_seconds"),
-        name="cold.process_call_wall_seconds",
-    )
-    warm["process_call_wall_seconds"] = _number(
-        warm_result.get("process_call_wall_seconds"),
-        name="warm.process_call_wall_seconds",
-    )
-    exactness: dict[str, Any] = {
-        "final_osu": cold["result_sha256"] == warm["result_sha256"],
-        "labels": {},
+    if set(results) != set(PASSES):
+        raise ValueError(f"persistent graph results must be exactly {list(PASSES)}")
+    result_rows = {
+        pass_name: _object(results.get(pass_name), name=pass_name)
+        for pass_name in PASSES
     }
-    for label in LABELS:
-        left = cold["labels"][label]
-        right = warm["labels"][label]
-        exactness["labels"][label] = {
-            "tokens": left["token_streams"] == right["token_streams"],
-            "stopping": left["stopping"] == right["stopping"],
-            "dispatch_mode": left["dispatch_modes"] == right["dispatch_modes"],
-            "dispatch_policy": left["dispatch_policies"] == right["dispatch_policies"],
-            "cache_storage": left["cache_storage"] == right["cache_storage"],
-            "encoder_storage": left["encoder_storage"] == right["encoder_storage"],
+    metrics = {
+        pass_name: _profile_metrics(Path(result_rows[pass_name]["profile_path"]))
+        for pass_name in PASSES
+    }
+    for pass_name in PASSES:
+        metrics[pass_name]["process_call_wall_seconds"] = _number(
+            result_rows[pass_name].get("process_call_wall_seconds"),
+            name=f"{pass_name}.process_call_wall_seconds",
+        )
+    cold = metrics["cold"]
+    warm2 = metrics["warm2"]
+    exactness: dict[str, Any] = {"reference": "cold", "passes": {}}
+    for pass_name in WARM_PASSES:
+        candidate = metrics[pass_name]
+        comparison: dict[str, Any] = {
+            "final_osu": cold["result_sha256"] == candidate["result_sha256"],
+            "labels": {},
         }
-    exactness_pass = exactness["final_osu"] and all(
-        all(checks.values()) for checks in exactness["labels"].values()
+        for label in LABELS:
+            left = cold["labels"][label]
+            right = candidate["labels"][label]
+            comparison["labels"][label] = {
+                "tokens": left["token_streams"] == right["token_streams"],
+                "stopping": left["stopping"] == right["stopping"],
+                "dispatch_mode": left["dispatch_modes"] == right["dispatch_modes"],
+                "dispatch_policy": (
+                    left["dispatch_policies"] == right["dispatch_policies"]
+                ),
+                "cache_storage": left["cache_storage"] == right["cache_storage"],
+                "encoder_storage": (
+                    left["encoder_storage"] == right["encoder_storage"]
+                ),
+            }
+        exactness["passes"][pass_name] = comparison
+    exactness_pass = all(
+        comparison["final_osu"]
+        and all(
+            all(checks.values())
+            for checks in comparison["labels"].values()
+        )
+        for comparison in exactness["passes"].values()
     )
-    cold_capture = sum(
-        cold["labels"][label]["capture_seconds"] for label in LABELS
-    )
-    warm_capture = sum(
-        warm["labels"][label]["capture_seconds"] for label in LABELS
-    )
-    warm_graph_delta = sum(
-        warm["labels"][label]["graph_count_delta"] for label in LABELS
-    )
-    warm_hits = sum(
-        warm["labels"][label]["cross_request_graph_hits"] for label in LABELS
-    )
+    capture_seconds = {
+        pass_name: sum(
+            metrics[pass_name]["labels"][label]["capture_seconds"]
+            for label in LABELS
+        )
+        for pass_name in PASSES
+    }
+    graph_deltas = {
+        pass_name: sum(
+            metrics[pass_name]["labels"][label]["graph_count_delta"]
+            for label in LABELS
+        )
+        for pass_name in WARM_PASSES
+    }
+    cross_request_hits = {
+        pass_name: sum(
+            metrics[pass_name]["labels"][label]["cross_request_graph_hits"]
+            for label in LABELS
+        )
+        for pass_name in WARM_PASSES
+    }
     final_pool = _object(
         manifest.get("final_pool_summary"),
         name="manifest.final_pool_summary",
     )
-    cold_pool = _object(
-        cold_result.get("pool_summary"),
-        name="cold.pool_summary",
-    )
-    warm_pool = _object(
-        warm_result.get("pool_summary"),
-        name="warm.pool_summary",
-    )
+    pools = {
+        pass_name: _object(
+            result_rows[pass_name].get("pool_summary"),
+            name=f"{pass_name}.pool_summary",
+        )
+        for pass_name in PASSES
+    }
     pool_checks = {}
     for role in ("main", "timing"):
-        cold_summary = _object(cold_pool.get(role), name=f"cold.pool_summary.{role}")
-        warm_summary = _object(warm_pool.get(role), name=f"warm.pool_summary.{role}")
+        summaries = {
+            pass_name: _object(
+                pools[pass_name].get(role),
+                name=f"{pass_name}.pool_summary.{role}",
+            )
+            for pass_name in PASSES
+        }
         summary = _object(final_pool.get(role), name=f"final_pool.{role}")
-        cold_workspaces = _list(
-            cold_summary.get("workspaces"),
-            name=f"cold.pool_summary.{role}.workspaces",
-        )
-        warm_workspaces = _list(
-            warm_summary.get("workspaces"),
-            name=f"warm.pool_summary.{role}.workspaces",
-        )
+        workspaces = {
+            pass_name: _list(
+                summaries[pass_name].get("workspaces"),
+                name=f"{pass_name}.pool_summary.{role}.workspaces",
+            )
+            for pass_name in PASSES
+        }
         final_workspaces = _list(
             summary.get("workspaces"),
             name=f"final_pool.{role}.workspaces",
         )
-        if not len(cold_workspaces) == len(warm_workspaces) == len(final_workspaces) == 1:
+        if not all(len(items) == 1 for items in (*workspaces.values(), final_workspaces)):
             raise ValueError(f"persistent graph {role} must retain exactly one workspace")
-        cold_workspace = _object(cold_workspaces[0], name=f"cold.workspace.{role}")
-        warm_workspace = _object(warm_workspaces[0], name=f"warm.workspace.{role}")
+        workspace_rows = {
+            pass_name: _object(
+                workspaces[pass_name][0],
+                name=f"{pass_name}.workspace.{role}",
+            )
+            for pass_name in PASSES
+        }
         final_workspace = _object(final_workspaces[0], name=f"final.workspace.{role}")
         stable_workspace_fields = (
             "signature",
@@ -341,130 +378,148 @@ def analyze(manifest_path: Path) -> dict[str, Any]:
         )
         pool_checks[role] = {
             "one_workspace": (
-                cold_summary.get("workspaces_created") == 1
-                and warm_summary.get("workspaces_created") == 1
+                all(item.get("workspaces_created") == 1 for item in summaries.values())
                 and summary.get("workspaces_created") == 1
             ),
             "no_eviction": all(
                 item.get("workspaces_evicted") == 0
-                for item in (cold_summary, warm_summary, summary)
+                for item in (*summaries.values(), summary)
             ),
             "bounded_resident": all(
                 item.get("max_resident_slots") == 1
                 and item.get("resident_slots") == 1
-                for item in (cold_summary, warm_summary, summary)
+                for item in (*summaries.values(), summary)
             ),
             "request_progression": (
-                cold_summary.get("request_count") == 1
-                and warm_summary.get("request_count") == 2
-                and summary.get("request_count") == 2
+                summaries["cold"].get("request_count") == 1
+                and summaries["warm1"].get("request_count") == 2
+                and summaries["warm2"].get("request_count") == 3
+                and summary.get("request_count") == 3
             ),
             "stable_workspace_storage": all(
-                cold_workspace.get(field) == warm_workspace.get(field)
+                workspace_rows["cold"].get(field)
+                == workspace_rows["warm1"].get(field)
+                == workspace_rows["warm2"].get(field)
                 for field in stable_workspace_fields
             ),
-            "final_snapshot_matches_warm": all(
-                warm_workspace.get(field) == final_workspace.get(field)
+            "final_snapshot_matches_warm2": all(
+                workspace_rows["warm2"].get(field) == final_workspace.get(field)
                 for field in stable_workspace_fields
             ),
             "graphs_and_storage_nonempty": (
-                int(cold_workspace.get("graph_count", 0)) > 0
-                and int(cold_workspace.get("encoder_slot_count", 0)) > 0
-                and int(cold_workspace.get("cache_count", 0)) > 0
-                and bool(cold_workspace.get("encoder_storage"))
-                and bool(cold_workspace.get("cache_storage"))
+                int(workspace_rows["cold"].get("graph_count", 0)) > 0
+                and int(workspace_rows["cold"].get("encoder_slot_count", 0)) > 0
+                and int(workspace_rows["cold"].get("cache_count", 0)) > 0
+                and bool(workspace_rows["cold"].get("encoder_storage"))
+                and bool(workspace_rows["cold"].get("cache_storage"))
             ),
             "inactive_at_boundaries": all(
                 item.get("in_use") is False
-                for item in (cold_workspace, warm_workspace, final_workspace)
+                for item in (*workspace_rows.values(), final_workspace)
             ),
             "open_before_verified_close": all(
                 item.get("closed") is False
-                for item in (cold_summary, warm_summary, summary)
+                for item in (*summaries.values(), summary)
             ),
         }
     pool_pass = all(all(checks.values()) for checks in pool_checks.values())
     close_pass = manifest.get("close_completed") is True
-    capture_pass = cold_capture > 0.0 and warm_capture <= 1e-9 and warm_graph_delta == 0
-    hits_pass = warm_hits > 0
+    capture_pass = (
+        capture_seconds["cold"] > 0.0
+        and all(capture_seconds[name] <= 1e-9 for name in WARM_PASSES)
+        and all(graph_deltas[name] == 0 for name in WARM_PASSES)
+    )
+    hits_pass = all(cross_request_hits[name] > 0 for name in WARM_PASSES)
     tolerance_mb = VRAM_GROWTH_TOLERANCE_BYTES / (1024 * 1024)
+    warm1 = metrics["warm1"]
     profile_memory_checks = {
         "current_allocated_bounded": (
-            warm["max_current_cuda_memory_allocated_mb"]
-            <= cold["max_current_cuda_memory_allocated_mb"] + tolerance_mb
+            warm2["max_current_cuda_memory_allocated_mb"]
+            <= warm1["max_current_cuda_memory_allocated_mb"] + tolerance_mb
         ),
         "peak_allocated_bounded": (
-            warm["peak_cuda_memory_allocated_mb"]
-            <= cold["peak_cuda_memory_allocated_mb"] + tolerance_mb
+            warm2["peak_cuda_memory_allocated_mb"]
+            <= warm1["peak_cuda_memory_allocated_mb"] + tolerance_mb
         ),
     }
     cuda_memory_checks: dict[str, bool] = {}
-    cold_cuda = cold_result.get("cuda_memory")
-    warm_cuda = warm_result.get("cuda_memory")
-    if cold_cuda is not None or warm_cuda is not None:
-        cold_cuda = _object(cold_cuda, name="cold.cuda_memory")
-        warm_cuda = _object(warm_cuda, name="warm.cuda_memory")
+    cuda_rows = {
+        pass_name: result_rows[pass_name].get("cuda_memory")
+        for pass_name in PASSES
+    }
+    peak_reset_checks: dict[str, bool] = {}
+    if any(value is not None for value in cuda_rows.values()):
+        parsed_cuda = {
+            pass_name: _object(value, name=f"{pass_name}.cuda_memory")
+            for pass_name, value in cuda_rows.items()
+        }
+        peak_reset_checks = {
+            pass_name: result_rows[pass_name].get("cuda_peak_stats_reset") is True
+            for pass_name in PASSES
+        }
         for field in (
             "allocated_bytes",
             "reserved_bytes",
             "max_allocated_bytes",
             "max_reserved_bytes",
         ):
-            cold_value = _integer(
-                cold_cuda.get(field),
-                name=f"cold.cuda_memory.{field}",
+            warm1_value = _integer(
+                parsed_cuda["warm1"].get(field),
+                name=f"warm1.cuda_memory.{field}",
             )
-            warm_value = _integer(
-                warm_cuda.get(field),
-                name=f"warm.cuda_memory.{field}",
+            warm2_value = _integer(
+                parsed_cuda["warm2"].get(field),
+                name=f"warm2.cuda_memory.{field}",
             )
             cuda_memory_checks[f"{field}_bounded"] = (
-                warm_value <= cold_value + VRAM_GROWTH_TOLERANCE_BYTES
+                warm2_value <= warm1_value + VRAM_GROWTH_TOLERANCE_BYTES
             )
     memory_pass = all(profile_memory_checks.values()) and all(
         cuda_memory_checks.values()
-    )
+    ) and all(peak_reset_checks.values())
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "manifest_path": str(manifest_path),
         "cold": cold,
-        "warm": warm,
+        "warm1": warm1,
+        "warm2": warm2,
         "savings": {
             "process_call_wall_seconds": (
                 cold["process_call_wall_seconds"]
-                - warm["process_call_wall_seconds"]
+                - warm2["process_call_wall_seconds"]
             ),
             "complete_request_wall_seconds": (
                 cold["complete_request_wall_seconds"]
-                - warm["complete_request_wall_seconds"]
+                - warm2["complete_request_wall_seconds"]
             ),
             "timing_model_seconds": (
                 cold["labels"]["timing_context"]["model_seconds"]
-                - warm["labels"]["timing_context"]["model_seconds"]
+                - warm2["labels"]["timing_context"]["model_seconds"]
             ),
             "timing_outer_wall_seconds": (
                 cold["labels"]["timing_context"]["outer_wall_seconds"]
-                - warm["labels"]["timing_context"]["outer_wall_seconds"]
+                - warm2["labels"]["timing_context"]["outer_wall_seconds"]
             ),
             "main_model_seconds": (
                 cold["labels"]["main_generation"]["model_seconds"]
-                - warm["labels"]["main_generation"]["model_seconds"]
+                - warm2["labels"]["main_generation"]["model_seconds"]
             ),
             "main_outer_wall_seconds": (
                 cold["labels"]["main_generation"]["outer_wall_seconds"]
-                - warm["labels"]["main_generation"]["outer_wall_seconds"]
+                - warm2["labels"]["main_generation"]["outer_wall_seconds"]
             ),
-            "graph_capture_seconds": cold_capture - warm_capture,
+            "graph_capture_seconds": (
+                capture_seconds["cold"] - capture_seconds["warm2"]
+            ),
         },
         "exactness": exactness,
         "exactness_pass": exactness_pass,
         "capture_gate": {
-            "cold_capture_seconds": cold_capture,
-            "warm_capture_seconds": warm_capture,
-            "warm_graph_count_delta": warm_graph_delta,
+            "capture_seconds": capture_seconds,
+            "warm_graph_count_delta": graph_deltas,
             "pass": capture_pass,
         },
-        "cross_request_graph_hits": warm_hits,
+        "cross_request_graph_hits": cross_request_hits,
         "cross_request_hits_pass": hits_pass,
         "pool_checks": pool_checks,
         "pool_pass": pool_pass,
@@ -472,6 +527,7 @@ def analyze(manifest_path: Path) -> dict[str, Any]:
             "tolerance_bytes": VRAM_GROWTH_TOLERANCE_BYTES,
             "profile_checks": profile_memory_checks,
             "allocator_checks": cuda_memory_checks,
+            "peak_reset_checks": peak_reset_checks,
             "pass": memory_pass,
         },
         "close_pass": close_pass,
@@ -497,9 +553,11 @@ def _text(report: dict[str, Any]) -> str:
             f"pool_pass={str(report['pool_pass']).lower()}",
             f"memory_pass={str(report['memory_gate']['pass']).lower()}",
             f"close_pass={str(report['close_pass']).lower()}",
-            f"cold_capture_seconds={report['capture_gate']['cold_capture_seconds']:.9f}",
-            f"warm_capture_seconds={report['capture_gate']['warm_capture_seconds']:.9f}",
-            f"cross_request_graph_hits={report['cross_request_graph_hits']}",
+            f"cold_capture_seconds={report['capture_gate']['capture_seconds']['cold']:.9f}",
+            f"warm1_capture_seconds={report['capture_gate']['capture_seconds']['warm1']:.9f}",
+            f"warm2_capture_seconds={report['capture_gate']['capture_seconds']['warm2']:.9f}",
+            f"warm1_cross_request_graph_hits={report['cross_request_graph_hits']['warm1']}",
+            f"warm2_cross_request_graph_hits={report['cross_request_graph_hits']['warm2']}",
             f"process_call_saving_seconds={savings['process_call_wall_seconds']:.9f}",
             f"complete_request_saving_seconds={savings['complete_request_wall_seconds']:.9f}",
             f"timing_model_saving_seconds={savings['timing_model_seconds']:.9f}",

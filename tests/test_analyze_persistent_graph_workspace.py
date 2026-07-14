@@ -104,12 +104,19 @@ def _manifest(tmp_path: Path, *, warm_capture: float = 0.0) -> Path:
         graph_delta=1,
         cross_request_hits=0,
     )
-    warm = _profile(
+    warm1 = _profile(
         tmp_path,
-        "warm",
+        "warm1",
         capture_seconds=warm_capture,
         graph_delta=0,
         cross_request_hits=9,
+    )
+    warm2 = _profile(
+        tmp_path,
+        "warm2",
+        capture_seconds=warm_capture,
+        graph_delta=0,
+        cross_request_hits=18,
     )
     workspace = {
         "signature": "sig",
@@ -165,7 +172,7 @@ def _manifest(tmp_path: Path, *, warm_capture: float = 0.0) -> Path:
     path.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "topology_version": (
                     "selected-k4-k1-int8-fp16-cross-persistent-graphs-v1"
                 ),
@@ -178,17 +185,46 @@ def _manifest(tmp_path: Path, *, warm_capture: float = 0.0) -> Path:
                             "main": pool(1),
                             "timing": pool(1),
                         },
+                        "cuda_peak_stats_reset": True,
+                        "cuda_memory": {
+                            "allocated_bytes": 100,
+                            "reserved_bytes": 200,
+                            "max_allocated_bytes": 300,
+                            "max_reserved_bytes": 400,
+                        },
                     },
-                    "warm": {
-                        "profile_path": str(warm),
+                    "warm1": {
+                        "profile_path": str(warm1),
                         "process_call_wall_seconds": 6.0,
                         "pool_summary": {
                             "main": pool(2),
                             "timing": pool(2),
                         },
+                        "cuda_peak_stats_reset": True,
+                        "cuda_memory": {
+                            "allocated_bytes": 100,
+                            "reserved_bytes": 200,
+                            "max_allocated_bytes": 300,
+                            "max_reserved_bytes": 400,
+                        },
+                    },
+                    "warm2": {
+                        "profile_path": str(warm2),
+                        "process_call_wall_seconds": 5.9,
+                        "pool_summary": {
+                            "main": pool(3),
+                            "timing": pool(3),
+                        },
+                        "cuda_peak_stats_reset": True,
+                        "cuda_memory": {
+                            "allocated_bytes": 100,
+                            "reserved_bytes": 200,
+                            "max_allocated_bytes": 300,
+                            "max_reserved_bytes": 400,
+                        },
                     },
                 },
-                "final_pool_summary": {"main": pool(2), "timing": pool(2)},
+                "final_pool_summary": {"main": pool(3), "timing": pool(3)},
                 "close_completed": True,
             }
         ),
@@ -203,7 +239,7 @@ def test_analyzer_accepts_exact_capture_free_warm_request(tmp_path: Path) -> Non
     assert report["pass"] is True
     assert report["exactness_pass"] is True
     assert report["capture_gate"]["pass"] is True
-    assert report["cross_request_graph_hits"] == 18
+    assert report["cross_request_graph_hits"] == {"warm1": 18, "warm2": 36}
     assert report["pool_pass"] is True
     assert report["memory_gate"]["pass"] is True
 
@@ -218,7 +254,7 @@ def test_analyzer_rejects_warm_recapture(tmp_path: Path) -> None:
 def test_analyzer_fails_loudly_without_token_evidence(tmp_path: Path) -> None:
     manifest_path = _manifest(tmp_path)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    warm_profile_path = Path(manifest["results"]["warm"]["profile_path"])
+    warm_profile_path = Path(manifest["results"]["warm1"]["profile_path"])
     warm_profile = json.loads(warm_profile_path.read_text(encoding="utf-8"))
     del warm_profile["generation"][0]["generated_token_ids"]
     warm_profile_path.write_text(json.dumps(warm_profile), encoding="utf-8")
@@ -230,7 +266,7 @@ def test_analyzer_fails_loudly_without_token_evidence(tmp_path: Path) -> None:
 def test_analyzer_rejects_warm_workspace_address_growth(tmp_path: Path) -> None:
     manifest_path = _manifest(tmp_path)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["results"]["warm"]["pool_summary"]["main"]["workspaces"][0][
+    manifest["results"]["warm1"]["pool_summary"]["main"]["workspaces"][0][
         "encoder_storage"
     ][0]["data_ptr"] += 1
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -239,3 +275,32 @@ def test_analyzer_rejects_warm_workspace_address_growth(tmp_path: Path) -> None:
 
     assert report["pool_pass"] is False
     assert report["pass"] is False
+
+
+def test_analyzer_rejects_memory_growth_between_warm_passes(tmp_path: Path) -> None:
+    manifest_path = _manifest(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["results"]["warm2"]["cuda_memory"]["reserved_bytes"] += (
+        17 * 1024 * 1024
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    report = analyze(manifest_path)
+
+    assert report["memory_gate"]["allocator_checks"][
+        "reserved_bytes_bounded"
+    ] is False
+    assert report["memory_gate"]["pass"] is False
+    assert report["pass"] is False
+
+
+def test_analyzer_requires_peak_reset_evidence(tmp_path: Path) -> None:
+    manifest_path = _manifest(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["results"]["warm2"]["cuda_peak_stats_reset"] = False
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    report = analyze(manifest_path)
+
+    assert report["memory_gate"]["peak_reset_checks"]["warm2"] is False
+    assert report["memory_gate"]["pass"] is False

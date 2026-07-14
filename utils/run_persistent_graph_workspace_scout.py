@@ -1,4 +1,4 @@
-"""Run two selected-stack songs in one process with persistent graph workspaces."""
+"""Run cold, warm-one, and warm-two songs with persistent graph workspaces."""
 
 from __future__ import annotations
 
@@ -99,6 +99,13 @@ def run(
             "max_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
         }
 
+    def reset_cuda_peak_memory() -> bool:
+        if not torch.cuda.is_available():
+            return False
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats(torch.cuda.current_device())
+        return True
+
     def persistent_loader(*loader_args, **loader_kwargs):
         nonlocal load_index, main_init, timing_init
         role = load_index % 2
@@ -107,9 +114,9 @@ def run(
         expected_auto_select = role == 0
         if auto_select is not expected_auto_select:
             raise RuntimeError("persistent graph model load order changed")
-        if pass_index > 1:
+        if pass_index > 2:
             raise RuntimeError("persistent graph scout observed an extra inference pass")
-        if pass_index == 1:
+        if pass_index in (1, 2):
             binding, tokenizer = cached[role]
             load_index += 1
             return binding, tokenizer
@@ -173,10 +180,11 @@ def run(
     try:
         with install_k8_candidate(block_size=4, graph_remainders=True):
             with fixed_seed_processor_generation(inference, base_seed=args.seed):
-                for label in ("cold", "warm"):
+                for label in ("cold", "warm1", "warm2"):
                     pass_args = copy.deepcopy(args)
                     pass_args.output_path = str(output_manifest.parent / label)
                     Path(pass_args.output_path).mkdir(parents=True, exist_ok=True)
+                    peak_stats_reset = reset_cuda_peak_memory()
                     started = time.perf_counter()
                     _, result_path = inference.main(pass_args)
                     process_call_wall_seconds = time.perf_counter() - started
@@ -187,6 +195,7 @@ def run(
                         "process_call_wall_seconds": process_call_wall_seconds,
                         "pool_summary": pool_snapshot(),
                         "cuda_memory": cuda_memory_snapshot(),
+                        "cuda_peak_stats_reset": peak_stats_reset,
                     }
             final_pool_summary = pool_snapshot()
             for binding, _ in cached:
@@ -198,8 +207,8 @@ def run(
             binding.runtime.close_persistent_graph_workspace_scout()
         stack.close()
 
-    if load_index != 4 or main_init is None or timing_init is None:
-        raise RuntimeError("persistent graph scout did not complete two model passes")
+    if load_index != 6 or main_init is None or timing_init is None:
+        raise RuntimeError("persistent graph scout did not complete three model passes")
     initialization = {
         "schema_version": 1,
         "topology_version": TOPOLOGY_VERSION,
@@ -216,7 +225,7 @@ def run(
     output_manifest.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "topology_version": TOPOLOGY_VERSION,
                 "initialization_path": str(output_init_json),
                 "results": results,
