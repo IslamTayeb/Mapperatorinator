@@ -1,11 +1,42 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from osuT5.osuT5.inference.optimized.scout import weight_only
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_production_import_does_not_import_weight_only_scout() -> None:
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(REPO_ROOT)
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import importlib, sys; "
+                "importlib.import_module('osuT5.osuT5.inference.optimized.single.engine'); "
+                "assert 'osuT5.osuT5.inference.optimized.scout.weight_only' "
+                "not in sys.modules; "
+                "assert 'torch.utils.cpp_extension' not in sys.modules"
+            ),
+        ],
+        cwd=REPO_ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_extension_is_cold_singleton_and_exposes_all_mixed_weight_kernels(

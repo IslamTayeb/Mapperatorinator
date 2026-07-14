@@ -599,6 +599,125 @@ def weight_only_mlp_residual(
     )
 
 
+def weight_only_prefix(
+    module: Any,
+    pack: DecoderWeightPack,
+    *,
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    past_key_value: Any,
+    cache_position: torch.Tensor,
+    position_ids: torch.Tensor,
+    active_prefix_length: int,
+    outputs_per_block: int = 8,
+) -> torch.Tensor:
+    """Run one decoder layer with FP16 matrices and otherwise-FP32 state."""
+
+    from .native_prefix import (
+        _cache_tensors,
+        _trim_mask,
+        framework_q1_attention,
+    )
+    from ..kernels.q1_attention import native_q1_rope_cache_attention
+
+    _require_fp32_activation(hidden_states, name="hidden states")
+    if hidden_states.shape[:2] != (1, 1):
+        raise ValueError("weight-only prefix requires one batch-one token")
+    if module.training or module.self_attn.training or module.cross_attn.training:
+        raise ValueError("weight-only prefix requires eval mode")
+    if not isinstance(cache_position, torch.Tensor) or (
+        cache_position.dtype != torch.long or cache_position.numel() != 1
+    ):
+        raise ValueError("cache_position must be a scalar int64 tensor")
+    if not isinstance(position_ids, torch.Tensor) or (
+        position_ids.dtype != torch.long or position_ids.shape != (1, 1)
+    ):
+        raise ValueError("position_ids must be a [1, 1] int64 tensor")
+    if int(active_prefix_length) <= 0:
+        raise ValueError("active_prefix_length must be positive")
+    layer_idx = int(module.self_attn.layer_idx)
+    if int(module.cross_attn.layer_idx) != layer_idx:
+        raise ValueError("self and cross attention layer indices must match")
+    self_keys, self_values = _cache_tensors(past_key_value, "self", layer_idx)
+    cross_keys, cross_values = _cache_tensors(past_key_value, "cross", layer_idx)
+    for name, value in (
+        ("self cache keys", self_keys),
+        ("self cache values", self_values),
+        ("cross cache keys", cross_keys),
+        ("cross cache values", cross_values),
+    ):
+        _require_fp32_activation(value, name=name)
+        if value.device != hidden_states.device:
+            raise ValueError(f"{name} device does not match hidden states")
+    if active_prefix_length > self_keys.shape[2]:
+        raise ValueError("active prefix exceeds self-cache storage")
+    active_mask = _trim_mask(attention_mask, active_prefix_length)
+
+    self_attn = module.self_attn
+    def norm_eps(owner: Any) -> float:
+        value = getattr(owner, "eps", None)
+        return float(torch.finfo(torch.float32).eps if value is None else value)
+
+    residual = hidden_states
+    qkv = weight_only_rmsnorm_linear(
+        hidden_states,
+        module.self_attn_layer_norm.weight,
+        pack.self_qkv,
+        eps=norm_eps(module.self_attn_layer_norm),
+        outputs_per_block=outputs_per_block,
+    ).view(1, 1, 3, self_attn.num_heads, self_attn.head_dim)
+    cos, sin = self_attn.rotary_emb(qkv, position_ids=position_ids)
+    self_output = native_q1_rope_cache_attention(
+        qkv,
+        self_keys,
+        self_values,
+        cos,
+        sin,
+        cache_position,
+        active_mask,
+        int(active_prefix_length),
+    )
+    self_output = self_output.transpose(1, 2).contiguous().view(
+        1, 1, self_attn.all_head_size
+    )
+    hidden_states = weight_only_linear_residual(
+        self_output,
+        residual,
+        pack.self_out,
+        outputs_per_block=outputs_per_block,
+    )
+
+    cross_attn = module.cross_attn
+    residual = hidden_states
+    query = weight_only_rmsnorm_linear(
+        hidden_states,
+        module.cross_attn_layer_norm.weight,
+        pack.cross_q,
+        eps=norm_eps(module.cross_attn_layer_norm),
+        outputs_per_block=outputs_per_block,
+    ).view(1, 1, cross_attn.num_heads, cross_attn.head_dim).transpose(1, 2)
+    cross_output = framework_q1_attention(
+        query,
+        cross_keys,
+        cross_values,
+        None,
+    ).transpose(1, 2).contiguous().view(1, 1, cross_attn.all_head_size)
+    hidden_states = weight_only_linear_residual(
+        cross_output,
+        residual,
+        pack.cross_out,
+        outputs_per_block=outputs_per_block,
+    )
+    return weight_only_mlp_residual(
+        hidden_states,
+        module.final_layer_norm.weight,
+        pack.fc1,
+        pack.fc2,
+        eps=norm_eps(module.final_layer_norm),
+        outputs_per_block=outputs_per_block,
+    )
+
+
 __all__ = [
     "DecoderWeightPack",
     "PackedLinear",
@@ -606,5 +725,6 @@ __all__ = [
     "weight_only_linear",
     "weight_only_linear_residual",
     "weight_only_mlp_residual",
+    "weight_only_prefix",
     "weight_only_rmsnorm_linear",
 ]
