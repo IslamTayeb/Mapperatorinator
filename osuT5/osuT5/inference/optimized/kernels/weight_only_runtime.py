@@ -106,6 +106,8 @@ class ApproximateWeightOnlyState:
     final_projection: torch.nn.Module
     final_projection_pack: PackedLinear
     extension_init_seconds: float
+    extension_allocated_bytes_delta: int
+    extension_reserved_bytes_delta: int
     pack_seconds: float
     allocated_bytes_delta: int
     reserved_bytes_delta: int
@@ -150,6 +152,11 @@ class ApproximateWeightOnlyState:
         if getattr(final_projection, "bias", None) is not None:
             _require_fp32_cuda(final_projection.bias, name="final projection bias")
 
+        device = layers[0].self_attn.Wqkv.weight.device
+        if device.type != "cuda":
+            raise RuntimeError("weight-only candidate source model must be on CUDA")
+        extension_allocated_before = torch.cuda.memory_allocated(device)
+        extension_reserved_before = torch.cuda.memory_reserved(device)
         extension_start = time.perf_counter()
         from .decoder_layer import preload_native_decoder_layer
         from .q1_attention import preload_native_q1_attention
@@ -159,10 +166,9 @@ class ApproximateWeightOnlyState:
         preload_weight_only_extension()
         torch.cuda.synchronize()
         extension_seconds = time.perf_counter() - extension_start
+        extension_allocated_after = torch.cuda.memory_allocated(device)
+        extension_reserved_after = torch.cuda.memory_reserved(device)
 
-        device = layers[0].self_attn.Wqkv.weight.device
-        if device.type != "cuda":
-            raise RuntimeError("weight-only candidate source model must be on CUDA")
         allocated_before = torch.cuda.memory_allocated(device)
         reserved_before = torch.cuda.memory_reserved(device)
         pack_start = time.perf_counter()
@@ -186,6 +192,12 @@ class ApproximateWeightOnlyState:
             final_projection=final_projection,
             final_projection_pack=projection_pack,
             extension_init_seconds=extension_seconds,
+            extension_allocated_bytes_delta=(
+                extension_allocated_after - extension_allocated_before
+            ),
+            extension_reserved_bytes_delta=(
+                extension_reserved_after - extension_reserved_before
+            ),
             pack_seconds=pack_seconds,
             allocated_bytes_delta=allocated_after - allocated_before,
             reserved_bytes_delta=reserved_after - reserved_before,
@@ -225,7 +237,11 @@ class ApproximateWeightOnlyState:
                 "final_logits": FINAL_LOGITS_OUTPUTS_PER_BLOCK,
             },
             "extension_init_seconds": self.extension_init_seconds,
+            "extension_allocated_bytes_delta": self.extension_allocated_bytes_delta,
+            "extension_reserved_bytes_delta": self.extension_reserved_bytes_delta,
             "weight_pack_seconds": self.pack_seconds,
+            "weight_pack_allocated_bytes_delta": self.allocated_bytes_delta,
+            "weight_pack_reserved_bytes_delta": self.reserved_bytes_delta,
             "allocated_bytes_delta": self.allocated_bytes_delta,
             "reserved_bytes_delta": self.reserved_bytes_delta,
             "retained_fp32_source_weight_bytes": self.retained_fp32_source_weight_bytes,

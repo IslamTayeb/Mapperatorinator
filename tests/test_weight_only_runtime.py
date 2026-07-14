@@ -33,6 +33,8 @@ def _state(owner) -> weight_only_runtime.ApproximateWeightOnlyState:
         final_projection=projection,
         final_projection_pack=packed,
         extension_init_seconds=3.0,
+        extension_allocated_bytes_delta=16,
+        extension_reserved_bytes_delta=32,
         pack_seconds=0.5,
         allocated_bytes_delta=64,
         reserved_bytes_delta=128,
@@ -85,6 +87,10 @@ def test_state_owner_and_metadata_fail_loudly() -> None:
         "mlp_fc2": 4,
         "final_logits": 2,
     }
+    assert metadata["extension_allocated_bytes_delta"] == 16
+    assert metadata["extension_reserved_bytes_delta"] == 32
+    assert metadata["weight_pack_allocated_bytes_delta"] == 64
+    assert metadata["weight_pack_reserved_bytes_delta"] == 128
 
 
 def test_runtime_initialization_is_idempotent_and_model_owned(monkeypatch) -> None:
