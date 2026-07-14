@@ -217,7 +217,7 @@ class ApproximateWeightOnlyState:
 
     def metadata(self) -> dict[str, Any]:
         return {
-            "version": "approximate-fp16-weights-fp32-state-v1",
+            "version": "approximate-fp16-weights-fp32-state-v2",
             "result_class": "documented-drift",
             "exactness_claim": False,
             "fp32_activations_caches_reductions_logits": True,
@@ -228,7 +228,10 @@ class ApproximateWeightOnlyState:
                 "mlp_fc2",
                 "final_logits",
             ],
-            "fp32_weight_regions": ["cross_query", "cross_output"],
+            "fp32_selected_decode_matrix_regions": [
+                "cross_query",
+                "cross_output",
+            ],
             "outputs_per_block": {
                 "self_qkv": SELF_QKV_OUTPUTS_PER_BLOCK,
                 "self_output": SELF_OUT_OUTPUTS_PER_BLOCK,
