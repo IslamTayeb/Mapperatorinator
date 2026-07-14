@@ -15,6 +15,7 @@ PROFILE_PASS_KINDS = frozenset(
     {
         "unspecified",
         "untraced_control",
+        "untraced_budget",
         "nsys_graph",
         "nsys_node",
         "ncu_kernel",
@@ -56,6 +57,7 @@ class InferenceProfiler:
         self.metadata: dict[str, Any] = {
             "profile_pass_kind": pass_kind,
             "authoritative_performance": pass_kind == "untraced_control",
+            "untraced_budget_enabled": pass_kind == "untraced_budget",
             "profile_detail_ranges": detail_ranges,
             "profile_cuda_capture": cuda_capture,
         } if enabled else {}
