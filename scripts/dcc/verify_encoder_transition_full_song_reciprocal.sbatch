@@ -103,6 +103,7 @@ export TRANSFORMERS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
 export TMPDIR="$WORK/tmp"
 export PYTHONHASHSEED=0
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export MAX_JOBS=${MAX_JOBS:-8}
 
 GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1)
@@ -137,6 +138,7 @@ payload = {
     "cuda_available": torch.cuda.is_available(),
     "storage_available_kb": int(available_kb),
     "python_hash_seed": os.environ.get("PYTHONHASHSEED"),
+    "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
 }
 if not payload["cuda_available"]:
     raise SystemExit("CUDA is unavailable")
@@ -249,7 +251,13 @@ run_profile() {
 import json
 import sys
 
-from utils.fixed_seed_inference import SEED_POLICY_VERSION, stage_seed
+from utils.fixed_seed_inference import (
+    DETERMINISM_POLICY_VERSION,
+    REQUIRED_CUBLAS_WORKSPACE_CONFIG,
+    SEED_POLICY_SOURCE_COMMIT,
+    SEED_POLICY_VERSION,
+    stage_seed,
+)
 
 profile_path, role = sys.argv[1:]
 metadata = json.load(open(profile_path, encoding="utf-8")).get("metadata")
@@ -257,6 +265,21 @@ if not isinstance(metadata, dict):
     raise SystemExit(f"{role}: profile metadata is missing")
 if metadata.get("reciprocal_seed_policy") != SEED_POLICY_VERSION:
     raise SystemExit(f"{role}: reciprocal seed policy is missing or wrong")
+if metadata.get("stage_seed_policy") != SEED_POLICY_VERSION:
+    raise SystemExit(f"{role}: standardized stage seed policy is missing or wrong")
+if metadata.get("stage_seed_policy_source_commit") != SEED_POLICY_SOURCE_COMMIT:
+    raise SystemExit(f"{role}: stage seed policy source commit is missing or wrong")
+if metadata.get("deterministic_algorithm_policy") != DETERMINISM_POLICY_VERSION:
+    raise SystemExit(f"{role}: deterministic algorithm policy is missing or wrong")
+if metadata.get("torch_deterministic_algorithms") is not True:
+    raise SystemExit(f"{role}: deterministic algorithms were not enabled")
+if metadata.get("cublas_workspace_config") != REQUIRED_CUBLAS_WORKSPACE_CONFIG:
+    raise SystemExit(f"{role}: deterministic CUBLAS workspace policy is missing")
+label_fingerprints = metadata.get("profile_label_seed_fingerprints")
+if not isinstance(label_fingerprints, dict):
+    raise SystemExit(f"{role}: profile-label seed fingerprints are missing")
+if set(label_fingerprints) != {"timing_context", "main_generation"}:
+    raise SystemExit(f"{role}: profile-label seed fingerprint coverage is incomplete")
 for label in ("timing_context", "main_generation"):
     if metadata.get(f"reciprocal_seed_{label}") != stage_seed(12345, label):
         raise SystemExit(f"{role}: reciprocal seed for {label} is wrong")
@@ -282,6 +305,17 @@ BASELINE_FIRST=$(<"$RUN_ROOT/baseline_first.profile-path.txt")
 CANDIDATE_FIRST=$(<"$RUN_ROOT/candidate_first.profile-path.txt")
 CANDIDATE_SECOND=$(<"$RUN_ROOT/candidate_second.profile-path.txt")
 BASELINE_SECOND=$(<"$RUN_ROOT/baseline_second.profile-path.txt")
+
+(
+  cd "$CANDIDATE_REPO"
+  "$PYTHON" utils/validate_reciprocal_stage_seed_profiles.py \
+    --baseline-first-profile "$BASELINE_FIRST" \
+    --candidate-first-profile "$CANDIDATE_FIRST" \
+    --candidate-second-profile "$CANDIDATE_SECOND" \
+    --baseline-second-profile "$BASELINE_SECOND" \
+    --base-seed 12345 \
+    --output "$RUN_ROOT/stage-seed-validation.json"
+)
 
 for role in candidate_first candidate_second; do
   profile=$(<"$RUN_ROOT/$role.profile-path.txt")
@@ -314,6 +348,7 @@ for artifact in \
   "$RUN_ROOT/preflight.json" \
   "$RUN_ROOT/baseline-extension-setup.json" \
   "$RUN_ROOT/candidate-extension-setup.json" \
+  "$RUN_ROOT/stage-seed-validation.json" \
   "$RUN_ROOT/candidate_first.encoder-stabilization.json" \
   "$RUN_ROOT/candidate_second.encoder-stabilization.json" \
   "$RUN_ROOT/reciprocal-analysis.json" \

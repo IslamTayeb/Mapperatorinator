@@ -9,9 +9,15 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 try:
-    from .fixed_seed_inference import fixed_seed_processor_generation
+    from .fixed_seed_inference import (
+        deterministic_inference_algorithms,
+        fixed_seed_processor_generation,
+    )
 except ImportError:  # Direct ``python utils/run_fixed_seed_inference.py`` execution.
-    from fixed_seed_inference import fixed_seed_processor_generation
+    from fixed_seed_inference import (
+        deterministic_inference_algorithms,
+        fixed_seed_processor_generation,
+    )
 
 
 def _target_repo(value: Path | None) -> Path:
@@ -61,8 +67,9 @@ def run(config_name: str, overrides: list[str], *, target_repo: Path | None = No
             "fixed-seed reciprocal runner supports Processor timing/main only; "
             "super_timing and generate_positions must be false"
         )
-    with fixed_seed_processor_generation(inference, base_seed=args.seed):
-        inference.main(args)
+    with deterministic_inference_algorithms():
+        with fixed_seed_processor_generation(inference, base_seed=args.seed):
+            inference.main(args)
 
 
 def main() -> None:
