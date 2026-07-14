@@ -348,7 +348,10 @@ def _cross_mlp_tail_forward(
     ):
         raise RuntimeError("weight-only cross+MLP requires initialized cross cache")
     key_states = _require_fp32_cuda(getattr(cache_layer, "keys", None), name="cross cache keys")
-    value_states = _require_fp32_cuda(getattr(cache_layer, "values", None), name="cross cache values")
+    value_states = _require_fp32_cuda(
+        getattr(cache_layer, "values", None),
+        name="cross cache values",
+    )
     pack = state.pack_for_layer(module)
 
     with profile_range(f"{layer_name}.weight_only.cross_q_fp32"):
@@ -401,7 +404,9 @@ def _defer_final_norm(
     if module is not state.final_norm:
         raise RuntimeError("weight-only candidate received an unowned final norm")
     if output_hidden_states:
-        raise RuntimeError("weight-only fused final projection does not support hidden-state output")
+        raise RuntimeError(
+            "weight-only fused final projection does not support hidden-state output"
+        )
     _require_fp32_cuda(hidden_states, name="decoder final hidden states")
     return hidden_states
 
