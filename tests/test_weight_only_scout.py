@@ -226,3 +226,37 @@ def test_pack_requires_fp32_cuda_source_without_silently_converting_bias(
         ("source weight", torch.float32),
         ("source bias", torch.float32),
     ]
+
+
+def test_same_seed_same_candidate_inputs_are_deterministic(monkeypatch) -> None:
+    class Extension:
+        @staticmethod
+        def weight_only_linear(input, *args):
+            return input.square()
+
+    monkeypatch.setattr(weight_only, "_WEIGHT_ONLY_EXTENSION", Extension())
+    monkeypatch.setattr(
+        weight_only,
+        "_require_fp32_activation",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        weight_only,
+        "_require_fp16_weight",
+        lambda *args, **kwargs: None,
+    )
+    packed = weight_only.PackedLinear(
+        weight=torch.ones((4, 4), dtype=torch.float16),
+        bias=None,
+        source_weight_bytes=64,
+    )
+
+    torch.manual_seed(12345)
+    first_input = torch.randn((1, 1, 4), dtype=torch.float32)
+    first = weight_only.weight_only_linear(first_input, packed)
+    torch.manual_seed(12345)
+    second_input = torch.randn((1, 1, 4), dtype=torch.float32)
+    second = weight_only.weight_only_linear(second_input, packed)
+
+    assert torch.equal(first_input, second_input)
+    assert torch.equal(first, second)

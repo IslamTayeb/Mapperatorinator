@@ -175,6 +175,17 @@ def test_final_norm_fusion_rejects_hidden_state_output() -> None:
         )
 
 
+def test_final_norm_fusion_rejects_cpu_storage() -> None:
+    state = _state(torch.nn.Module())
+    with pytest.raises(RuntimeError, match="CUDA tensor"):
+        weight_only_runtime._defer_final_norm(
+            state=state,
+            module=state.final_norm,
+            hidden_states=torch.zeros((1, 1, 4)),
+            output_hidden_states=False,
+        )
+
+
 def test_default_generation_profile_kwargs_do_not_expose_candidate(monkeypatch) -> None:
     captured = {}
 
