@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=encoder-overlap-recip
+#SBATCH --job-name=rope-encoder-overlap
 #SBATCH --partition=gpu-common
 #SBATCH --account=romerolab
 #SBATCH --cpus-per-task=8
@@ -20,9 +20,9 @@ BRANCH=${MAPPERATORINATOR_BRANCH:?Set MAPPERATORINATOR_BRANCH}
 REMOTE=${MAPPERATORINATOR_REMOTE:-origin}
 PROFILE_CONFIG=${PROFILE_CONFIG:-profile_salvalai}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
-RUN_LABEL=${RUN_LABEL:-exact-main-encoder-overlap-reciprocal}
+RUN_LABEL=${RUN_LABEL:-shared-rope-exact-encoder-overlap-reciprocal}
 RUN_ROOT="$WORK/runs/$RUN_LABEL-${SLURM_JOB_ID:-manual}"
-TORCH_EXTENSIONS_DIR="$WORK/torch_extensions/encoder-overlap-$COMMIT"
+TORCH_EXTENSIONS_DIR="$WORK/torch_extensions/shared-overlap-$COMMIT"
 
 if [[ "$PROFILE_CONFIG" != profile_salvalai ]]; then
   echo "exact overlap gate requires profile_salvalai" >&2
@@ -54,24 +54,20 @@ if [[ "$(git -C "$REPO" rev-parse "$REMOTE_REF")" != "$COMMIT" ]]; then
   echo "remote ref $REMOTE_REF does not match COMMIT" >&2
   exit 2
 fi
-if [[ ! -x "$PYTHON" ]]; then
-  echo "missing Python at $PYTHON" >&2
-  exit 2
-fi
-if [[ ! -f "$AUDIO" ]]; then
-  echo "missing audio at $AUDIO" >&2
+if [[ ! -x "$PYTHON" || ! -f "$AUDIO" ]]; then
+  echo "missing Python or SALVALAI audio" >&2
   exit 2
 fi
 
 export PATH="$(dirname "$PYTHON"):$PATH"
 for tool in ffmpeg ffprobe; do
-  if ! command -v "$tool" >/dev/null 2>&1; then
+  command -v "$tool" >/dev/null 2>&1 || {
     echo "missing required audio tool: $tool" >&2
     exit 2
-  fi
+  }
 done
 mkdir -p "$WORK/logs" "$WORK/tmp" "$WORK/cache" "$TORCH_EXTENSIONS_DIR" \
-  "$RUN_ROOT/preload"
+  "$RUN_ROOT/preload" "$RUN_ROOT/initialization"
 export XDG_CACHE_HOME="$WORK/cache"
 export HF_HOME="$WORK/cache/huggingface"
 export TRANSFORMERS_CACHE="$WORK/cache/huggingface"
@@ -127,22 +123,16 @@ import torch
 path = Path(sys.argv[1])
 torch.cuda.synchronize()
 started = time.perf_counter()
-from osuT5.osuT5.inference.optimized.kernels.decoder_layer import (
-    preload_native_decoder_layer,
-)
-from osuT5.osuT5.inference.optimized.kernels.q1_attention import (
-    preload_native_q1_attention,
-)
+from osuT5.osuT5.inference.optimized.kernels.decoder_layer import preload_native_decoder_layer
+from osuT5.osuT5.inference.optimized.kernels.q1_attention import preload_native_q1_attention
+from osuT5.osuT5.inference.optimized.kernels.weight_only import preload_weight_only_extension
 
 preload_native_q1_attention()
 preload_native_decoder_layer()
+preload_weight_only_extension()
 torch.cuda.synchronize()
 path.write_text(
-    json.dumps(
-        {"schema_version": 1, "wall_seconds": time.perf_counter() - started},
-        indent=2,
-    )
-    + "\n",
+    json.dumps({"schema_version": 1, "wall_seconds": time.perf_counter() - started}, indent=2) + "\n",
     encoding="utf-8",
 )
 PY
@@ -173,24 +163,39 @@ run_profile() {
   local mode=$2
   local output="$RUN_ROOT/$role"
   local evidence="$RUN_ROOT/$role.evidence.json"
-  if [[ -e "$output" || -e "$evidence" ]]; then
+  local initialization="$RUN_ROOT/initialization/$role.json"
+  local compiler_cache="$RUN_ROOT/compiler-cache/$role"
+  if [[ -e "$output" || -e "$evidence" || -e "$initialization" ]]; then
     echo "role output already exists: $role" >&2
     exit 2
   fi
-  mkdir -p "$output"
-  "$PYTHON" utils/run_exact_encoder_overlap_full_song.py \
-    --config-name "$PROFILE_CONFIG" \
-    --mode "$mode" \
-    --evidence-path "$evidence" \
-    output_path="$output" \
-    "${COMMON_OVERRIDES[@]}"
+  mkdir -p "$output" "$compiler_cache/torch_inductor" \
+    "$compiler_cache/triton" "$compiler_cache/cuda"
+  (
+    export TORCHINDUCTOR_CACHE_DIR="$compiler_cache/torch_inductor"
+    export TRITON_CACHE_DIR="$compiler_cache/triton"
+    export CUDA_CACHE_PATH="$compiler_cache/cuda"
+    "$PYTHON" utils/run_exact_encoder_overlap_full_song.py \
+      --config-name "$PROFILE_CONFIG" \
+      --mode "$mode" \
+      --evidence-path "$evidence" \
+      --initialization-path "$initialization" \
+      output_path="$output" \
+      "${COMMON_OVERRIDES[@]}"
+  )
   local profile
   profile=$(find "$output" -name '*.profile.json' -type f | sort | head -n 1)
-  if [[ -z "$profile" || ! -s "$profile" || ! -s "$evidence" ]]; then
-    echo "missing profile/evidence for $role" >&2
+  if [[ -z "$profile" || ! -s "$profile" || ! -s "$evidence" || ! -s "$initialization" ]]; then
+    echo "missing profile/evidence/initialization for $role" >&2
     exit 2
   fi
   printf '%s\n' "$profile" > "$RUN_ROOT/$role.profile-path.txt"
+  "$PYTHON" utils/validate_weight_only_full_song_profile.py \
+    --profile "$profile" --role candidate \
+    > "$RUN_ROOT/$role.weight-only-validation.json"
+  "$PYTHON" utils/validate_k4_profile_contract.py \
+    --profile "$profile" --role candidate --block-size 4 \
+    > "$RUN_ROOT/$role.k4-validation.json"
 }
 
 run_profile baseline_first baseline
@@ -207,12 +212,16 @@ set +e
 "$PYTHON" utils/analyze_exact_encoder_overlap_reciprocal.py \
   --baseline-first-profile "$BASELINE_FIRST" \
   --baseline-first-evidence "$RUN_ROOT/baseline_first.evidence.json" \
+  --baseline-first-initialization "$RUN_ROOT/initialization/baseline_first.json" \
   --candidate-second-profile "$CANDIDATE_SECOND" \
   --candidate-second-evidence "$RUN_ROOT/candidate_second.evidence.json" \
+  --candidate-second-initialization "$RUN_ROOT/initialization/candidate_second.json" \
   --candidate-first-profile "$CANDIDATE_FIRST" \
   --candidate-first-evidence "$RUN_ROOT/candidate_first.evidence.json" \
+  --candidate-first-initialization "$RUN_ROOT/initialization/candidate_first.json" \
   --baseline-second-profile "$BASELINE_SECOND" \
   --baseline-second-evidence "$RUN_ROOT/baseline_second.evidence.json" \
+  --baseline-second-initialization "$RUN_ROOT/initialization/baseline_second.json" \
   --base-seed 12345 \
   --minimum-request-saving-seconds 1.0 \
   --json-output "$RUN_ROOT/analysis.json" \

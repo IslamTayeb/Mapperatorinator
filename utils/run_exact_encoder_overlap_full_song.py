@@ -7,7 +7,7 @@ import json
 import math
 import sys
 import time
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 
 
@@ -15,7 +15,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from utils.fixed_seed_inference import fixed_seed_processor_generation  # noqa: E402
+from utils.run_k4_shared_rope_approximate_weight_only import (  # noqa: E402
+    COMPOSITION_VERSION,
+    run as run_current_topology,
+)
 
 
 def _load_args(config_name: str, overrides: list[str]):
@@ -65,24 +68,28 @@ def run(
     *,
     mode: str,
     evidence_path: Path,
+    initialization_path: Path,
 ) -> dict:
     import inference
 
     args = _load_args(config_name, overrides)
     _validate_args(args, mode=mode)
-    if mode == "candidate":
-        from osuT5.osuT5.inference.optimized.scout.encoder_overlap import (
-            install_exact_main_encoder_overlap,
-        )
-
-        overlap_context = install_exact_main_encoder_overlap(inference.Processor)
-    else:
-        overlap_context = nullcontext(None)
+    from osuT5.osuT5.inference.optimized.scout.encoder_overlap import (
+        install_encoder_material_audit,
+        install_exact_main_encoder_overlap,
+    )
 
     started = time.perf_counter()
-    with overlap_context as manager:
-        with fixed_seed_processor_generation(inference, base_seed=args.seed):
-            inference.main(args)
+    with ExitStack() as stack:
+        audit = stack.enter_context(
+            install_encoder_material_audit(inference.Processor)
+        )
+        manager = stack.enter_context(
+            install_exact_main_encoder_overlap(inference.Processor)
+            if mode == "candidate"
+            else nullcontext(None)
+        )
+        run_current_topology(config_name, overrides, initialization_path)
     run_wall_seconds = time.perf_counter() - started
     if not math.isfinite(run_wall_seconds) or run_wall_seconds <= 0:
         raise RuntimeError("encoder-overlap runner produced invalid wall time")
@@ -92,6 +99,9 @@ def run(
         "config_name": config_name,
         "seed": int(args.seed),
         "run_wall_seconds": run_wall_seconds,
+        "combined_runtime": COMPOSITION_VERSION,
+        "initialization_path": str(initialization_path),
+        "material_audit": audit.finalize(),
         "encoder_overlap": manager.finalize() if manager is not None else None,
     }
     evidence_path.parent.mkdir(parents=True, exist_ok=True)
@@ -107,6 +117,7 @@ def main() -> None:
     parser.add_argument("--config-name", default="profile_salvalai")
     parser.add_argument("--mode", choices=("baseline", "candidate"), required=True)
     parser.add_argument("--evidence-path", type=Path, required=True)
+    parser.add_argument("--initialization-path", type=Path, required=True)
     parser.add_argument("overrides", nargs="*")
     parsed = parser.parse_args()
     payload = run(
@@ -114,6 +125,7 @@ def main() -> None:
         parsed.overrides,
         mode=parsed.mode,
         evidence_path=parsed.evidence_path,
+        initialization_path=parsed.initialization_path,
     )
     print(json.dumps(payload, indent=2, sort_keys=True))
 

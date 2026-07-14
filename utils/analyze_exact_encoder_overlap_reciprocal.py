@@ -8,7 +8,11 @@ import math
 from pathlib import Path
 from typing import Any
 
-from osuT5.osuT5.inference.optimized.scout.encoder_overlap import OVERLAP_VERSION
+from osuT5.osuT5.inference.optimized.scout.encoder_overlap import (
+    MATERIAL_AUDIT_VERSION,
+    OVERLAP_VERSION,
+)
+from utils.run_k4_shared_rope_approximate_weight_only import COMPOSITION_VERSION
 from utils.fixed_seed_inference import SEED_POLICY_VERSION, stage_seed
 from utils.nsight_agent_profile import (
     _profile_graph_cache_signature,
@@ -202,6 +206,125 @@ def _validate_candidate(
     return external
 
 
+def _validate_initialization(payload: dict[str, Any], *, role: str) -> dict[str, Any]:
+    if payload.get("combined_runtime") != COMPOSITION_VERSION:
+        raise ValueError(f"{role} did not initialize the current combined runtime")
+    if payload.get("result_class") != "documented-drift":
+        raise ValueError(f"{role} mixed-weight result class changed")
+    if payload.get("exactness_claim") is not False:
+        raise ValueError(f"{role} mixed-weight runtime claimed exactness")
+    shared = payload.get("shared_rope")
+    if not isinstance(shared, dict) or shared.get("incremental_exactness_claim") is not True:
+        raise ValueError(f"{role} lacks exact shared-RoPE initialization evidence")
+    if shared.get("original_decoder_forward_required") is not True:
+        raise ValueError(f"{role} did not preserve the original decoder forward")
+    stats = shared.get("stats")
+    if not isinstance(stats, dict) or stats.get("reuses", 0) <= 0:
+        raise ValueError(f"{role} shared-RoPE reuse evidence is invalid")
+    return payload
+
+
+def _validate_material_audit(
+    profile: dict[str, Any],
+    evidence: dict[str, Any],
+    *,
+    role: str,
+) -> dict[str, Any]:
+    audit = evidence.get("material_audit")
+    metadata = profile.get("metadata")
+    internal = (
+        metadata.get("optimized_encoder_material_audit")
+        if isinstance(metadata, dict)
+        else None
+    )
+    if not isinstance(audit, dict) or audit != internal:
+        raise ValueError(f"{role} material audit is missing or differs from profile")
+    if audit.get("version") != MATERIAL_AUDIT_VERSION:
+        raise ValueError(f"{role} material audit version changed")
+    if audit.get("production_default") is not False:
+        raise ValueError(f"{role} material audit leaked into production defaults")
+    if audit.get("labels_completed") != list(LABELS):
+        raise ValueError(f"{role} material audit labels changed")
+    if audit.get("processor_count") != 2:
+        raise ValueError(f"{role} material audit processor topology changed")
+    copied = audit.get("total_copied_bytes")
+    seconds = audit.get("total_copy_and_hash_seconds")
+    if isinstance(copied, bool) or not isinstance(copied, int) or copied <= 0:
+        raise ValueError(f"{role} material audit copied no bytes")
+    _number(seconds, name=f"{role}.material_copy_seconds", positive=True)
+    stages = audit.get("stages")
+    if not isinstance(stages, dict) or set(stages) != set(LABELS):
+        raise ValueError(f"{role} material audit stages changed")
+    for label in LABELS:
+        stage = stages[label]
+        if not isinstance(stage, dict) or stage.get("profile_label") != label:
+            raise ValueError(f"{role}.{label} material audit is malformed")
+        if label == "timing_context":
+            expected = {
+                "profile_label": "timing_context",
+                "captured": False,
+                "reason": "avoid_synchronizing_main_encoder_overlap_stream",
+                "copied_bytes": 0,
+                "copy_and_hash_seconds": 0.0,
+            }
+            if stage != expected:
+                raise ValueError(f"{role} timing material audit synchronized overlap")
+            continue
+        if stage.get("captured") is not True:
+            raise ValueError(f"{role}.{label} raw material was not captured")
+        if not isinstance(stage.get("aggregate_sha256"), str) or len(
+            stage["aggregate_sha256"]
+        ) != 64:
+            raise ValueError(f"{role}.{label} lacks raw material digest")
+        if stage.get("cross_layer_count", 0) <= 0:
+            raise ValueError(f"{role}.{label} lacks cross-KV layers")
+        rows = stage.get("cross_kv")
+        if not isinstance(rows, list) or len(rows) != stage["cross_layer_count"]:
+            raise ValueError(f"{role}.{label} cross-KV material is incomplete")
+        rng = stage.get("rng_after_stage")
+        if not isinstance(rng, dict) or any(
+            not isinstance(rng.get(device), str) or len(rng[device]) != 64
+            for device in ("cpu", "cuda")
+        ):
+            raise ValueError(f"{role}.{label} final RNG material is incomplete")
+    return audit
+
+
+def _material_exactness(audits: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    labels: dict[str, Any] = {}
+    for label in ("main_generation",):
+        stages = {role: audit["stages"][label] for role, audit in audits.items()}
+        raw = {role: stage["aggregate_sha256"] for role, stage in stages.items()}
+        rng = {role: stage["rng_after_stage"] for role, stage in stages.items()}
+        detailed = {
+            role: {
+                "encoder": stage["encoder"],
+                "cross_kv": stage["cross_kv"],
+            }
+            for role, stage in stages.items()
+        }
+        labels[label] = {
+            "raw_encoder_cross_kv_equal": len(set(raw.values())) == 1
+            and len({json.dumps(value, sort_keys=True) for value in detailed.values()}) == 1,
+            "rng_after_stage_equal": len(
+                {json.dumps(value, sort_keys=True) for value in rng.values()}
+            )
+            == 1,
+            "aggregate_sha256": raw,
+            "rng_after_stage": rng,
+        }
+        labels[label]["pass"] = bool(
+            labels[label]["raw_encoder_cross_kv_equal"]
+            and labels[label]["rng_after_stage_equal"]
+        )
+    return {
+        "scope": "main last-window raw encoder and every cross-KV layer; timing "
+        "material copy intentionally omitted to preserve overlap",
+        "labels": labels,
+        "pass": all(row["pass"] for row in labels.values()),
+    }
+
+
 def _validate_baseline(profile: dict[str, Any], evidence: dict[str, Any]) -> None:
     if evidence.get("mode") != "baseline" or evidence.get("encoder_overlap") is not None:
         raise ValueError("baseline evidence unexpectedly contains overlap")
@@ -257,6 +380,7 @@ def _exact_signatures(
 def analyze(
     profile_paths: dict[str, Path],
     evidence_paths: dict[str, Path],
+    initialization_paths: dict[str, Path],
     *,
     base_seed: int,
     minimum_request_saving_seconds: float,
@@ -269,6 +393,13 @@ def analyze(
         role: _load(path, name=f"{role} evidence")
         for role, path in evidence_paths.items()
     }
+    initialization = {
+        role: _validate_initialization(
+            _load(path, name=f"{role} initialization"),
+            role=role,
+        )
+        for role, path in initialization_paths.items()
+    }
     for profile in profiles.values():
         _validate_seed(profile, base_seed=base_seed)
     for role in ("baseline_first", "baseline_second"):
@@ -277,6 +408,13 @@ def analyze(
         role: _validate_candidate(profiles[role], evidence[role])
         for role in ("candidate_second", "candidate_first")
     }
+    material_audits = {
+        role: _validate_material_audit(
+            profiles[role], evidence[role], role=role
+        )
+        for role in profiles
+    }
+    material_exactness = _material_exactness(material_audits)
     reciprocal = compare_reciprocal_profiles(
         profile_paths["baseline_first"],
         profile_paths["candidate_second"],
@@ -335,6 +473,7 @@ def analyze(
         and reciprocal["output_artifact_pass"]
         and all(row["pass"] for row in exact_orders.values())
         and candidate_repeat["pass"]
+        and material_exactness["pass"]
     )
     no_order_regression = all(
         order["complete_request_seconds_saved"] >= 0.0 for order in orders
@@ -356,15 +495,22 @@ def analyze(
         "performance_pass": performance_pass,
         "exactness_pass": exactness_pass,
         "cache_evidence_scope": (
-            "accepted graph/cache behavior signature; KV values are not copied to CPU"
+            "accepted graph/cache behavior signature plus byte-exact last-window "
+            "raw encoder and every cross-KV layer"
         ),
         "profiles": {key: str(value) for key, value in profile_paths.items()},
         "evidence": {key: str(value) for key, value in evidence_paths.items()},
+        "initialization": {
+            key: str(value) for key, value in initialization_paths.items()
+        },
+        "initialization_evidence": initialization,
         "metrics": metrics,
         "orders": orders,
         "candidate_overlap": candidate_evidence,
         "exact_orders": exact_orders,
         "candidate_repeatability": candidate_repeat,
+        "material_audits": material_audits,
+        "raw_material_and_rng_exactness": material_exactness,
         "reciprocal_exactness": reciprocal,
     }
 
@@ -407,6 +553,7 @@ def main() -> None:
     ):
         parser.add_argument(f"--{role}-profile", type=Path, required=True)
         parser.add_argument(f"--{role}-evidence", type=Path, required=True)
+        parser.add_argument(f"--{role}-initialization", type=Path, required=True)
     parser.add_argument("--base-seed", type=int, default=12345)
     parser.add_argument("--minimum-request-saving-seconds", type=float, default=1.0)
     parser.add_argument("--json-output", type=Path, required=True)
@@ -423,6 +570,7 @@ def main() -> None:
     report = analyze(
         {key: getattr(args, f"{key}_profile") for key in keys},
         {key: getattr(args, f"{key}_evidence") for key in keys},
+        {key: getattr(args, f"{key}_initialization") for key in keys},
         base_seed=args.base_seed,
         minimum_request_saving_seconds=args.minimum_request_saving_seconds,
     )

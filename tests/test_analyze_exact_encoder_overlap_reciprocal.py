@@ -2,11 +2,16 @@ import copy
 
 import pytest
 
-from osuT5.osuT5.inference.optimized.scout.encoder_overlap import OVERLAP_VERSION
+from osuT5.osuT5.inference.optimized.scout.encoder_overlap import (
+    MATERIAL_AUDIT_VERSION,
+    OVERLAP_VERSION,
+)
 from utils.analyze_exact_encoder_overlap_reciprocal import (
     _exact_signatures,
+    _material_exactness,
     _text,
     _validate_candidate,
+    _validate_material_audit,
 )
 
 
@@ -66,6 +71,49 @@ def _overlap():
     }
 
 
+def _material_audit(digest: str = "a" * 64):
+    tensor = {
+        "name": "encoder.last_hidden_state",
+        "sha256": digest,
+        "contract": {
+            "shape": [1, 2, 3],
+            "stride": [6, 3, 1],
+            "dtype": "torch.float32",
+            "device": "cuda:0",
+        },
+        "bytes": 24,
+    }
+    stages = {
+        "timing_context": {
+            "profile_label": "timing_context",
+            "captured": False,
+            "reason": "avoid_synchronizing_main_encoder_overlap_stream",
+            "copied_bytes": 0,
+            "copy_and_hash_seconds": 0.0,
+        },
+        "main_generation": {
+            "profile_label": "main_generation",
+            "captured": True,
+            "encoder": tensor,
+            "cross_kv": [{"layer": 0, "keys": tensor, "values": tensor}],
+            "aggregate_sha256": digest,
+            "copied_bytes": 72,
+            "copy_and_hash_seconds": 0.01,
+            "rng_after_stage": {"cpu": "b" * 64, "cuda": "c" * 64},
+            "cross_layer_count": 1,
+        },
+    }
+    return {
+        "version": MATERIAL_AUDIT_VERSION,
+        "production_default": False,
+        "labels_completed": ["timing_context", "main_generation"],
+        "processor_count": 2,
+        "stages": stages,
+        "total_copied_bytes": 72,
+        "total_copy_and_hash_seconds": 0.01,
+    }
+
+
 def test_exact_signatures_cover_tokens_stopping_and_graph_cache():
     baseline = _profile()
     candidate = copy.deepcopy(baseline)
@@ -90,6 +138,30 @@ def test_candidate_validation_requires_complete_exact_b1_overlap():
     overlap["manifest_changed_after_launch"] = True
     with pytest.raises(ValueError, match="contract changed"):
         _validate_candidate(profile, evidence)
+
+
+def test_material_audit_requires_profile_identity_and_raw_kv_rng_exactness():
+    audit = _material_audit()
+    profile = {
+        "metadata": {"optimized_encoder_material_audit": copy.deepcopy(audit)}
+    }
+    evidence = {"material_audit": audit}
+    assert _validate_material_audit(profile, evidence, role="baseline_first") is audit
+
+    audits = {
+        role: copy.deepcopy(audit)
+        for role in (
+            "baseline_first",
+            "candidate_second",
+            "candidate_first",
+            "baseline_second",
+        )
+    }
+    assert _material_exactness(audits)["pass"]
+    audits["candidate_first"]["stages"]["main_generation"][
+        "aggregate_sha256"
+    ] = "d" * 64
+    assert not _material_exactness(audits)["pass"]
 
 
 def test_text_report_contains_overlap_and_timing_costs():

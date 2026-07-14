@@ -9,6 +9,7 @@ from osuT5.osuT5.inference.optimized.scout.encoder_overlap import (
     EncoderOverlapError,
     ExactMainEncoderOverlap,
     graph_manifest,
+    install_encoder_material_audit,
     install_exact_main_encoder_overlap,
 )
 
@@ -147,6 +148,30 @@ def test_temporary_hooks_restore_init_generate_and_model_generate():
         assert marker == {"marker": "main_generation"}
 
     assert (_Processor.__init__, _Processor.generate, _Processor.model_generate) == originals
+
+
+def test_material_audit_hooks_restore_init_and_generate(monkeypatch):
+    originals = (_Processor.__init__, _Processor.generate)
+    frames = torch.zeros((1, 4))
+    with install_encoder_material_audit(_Processor) as audit:
+        captured = []
+        monkeypatch.setattr(
+            audit,
+            "capture",
+            lambda processor, *, profile_label: captured.append(
+                (processor.marker, profile_label)
+            ),
+        )
+        processor = _Processor("main")
+        processor.generate(
+            sequences=(frames, torch.tensor([0]), 1.0),
+            generation_config=object(),
+            profile_label="main_generation",
+        )
+        assert audit._processors == [processor]
+        assert captured == [("main", "main_generation")]
+
+    assert (_Processor.__init__, _Processor.generate) == originals
 
 
 @pytest.mark.parametrize("stable", [True, 0, 1, -1, 1.5])
