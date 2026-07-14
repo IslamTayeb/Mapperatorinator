@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import FrozenInstanceError
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -58,8 +60,8 @@ def _loader_kwargs(**overrides):
 
 def test_runtime_metadata_exposes_two_fixed_accepted_presets():
     expected_versions = {
-        "fp32": "accepted-fp32-native-cross-mlp-289-v2",
-        "fp16": "accepted-fp16-all-fused-v1",
+        "fp32": "accepted-fp32-native-cross-mlp-289-v3",
+        "fp16": "accepted-fp16-all-fused-v2",
     }
     for precision, version in expected_versions.items():
         metadata = OptimizedSingleRuntime(
@@ -464,7 +466,7 @@ def test_runtime_overlays_structure_without_changing_sampling(monkeypatch):
 def test_single_loader_binds_each_immutable_precision_preset():
     for precision in ("fp32", "fp16"):
         raw_model = SimpleNamespace(
-            generation_config=SimpleNamespace(disable_compile=False),
+            generation_config=SimpleNamespace(disable_compile=True),
         )
         tokenizer = object()
         model_loader = Mock(return_value=(raw_model, tokenizer))
@@ -479,7 +481,7 @@ def test_single_loader_binds_each_immutable_precision_preset():
         assert loaded_tokenizer is tokenizer
         assert model_loader.call_count == 1
         call_kwargs = model_loader.call_args.kwargs
-        assert call_kwargs["generation_compile"] is True
+        assert call_kwargs["generation_compile"] is False
         assert call_kwargs["precision"] == precision
         assert call_kwargs["attn_implementation"] == "sdpa"
         assert call_kwargs["use_server"] is False
@@ -489,6 +491,27 @@ def test_single_loader_binds_each_immutable_precision_preset():
             ]
             == precision
         )
+
+
+@pytest.mark.parametrize("disable_compile", (False, None, 1))
+def test_single_loader_rejects_loader_that_ignores_compile_disable(
+    disable_compile,
+):
+    raw_model = SimpleNamespace(
+        generation_config=SimpleNamespace(disable_compile=disable_compile),
+    )
+    model_loader = Mock(return_value=(raw_model, object()))
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"requires generation_config\.disable_compile to be boolean True",
+    ):
+        load_optimized_single_engine(
+            model_loader=model_loader,
+            loader_kwargs=_loader_kwargs(),
+        )
+
+    assert model_loader.call_args.kwargs["generation_compile"] is False
 
 
 @pytest.mark.parametrize("precision", (None, "bf16"))
@@ -503,7 +526,7 @@ def test_single_loader_rejects_unregistered_precision(precision):
 @pytest.mark.parametrize("precision", ("fp32", "fp16"))
 def test_inference_loader_injects_raw_loader_and_returns_binding(precision):
     raw_model = SimpleNamespace(
-        generation_config=SimpleNamespace(disable_compile=False),
+        generation_config=SimpleNamespace(disable_compile=True),
     )
     tokenizer = object()
     with patch.object(
@@ -523,14 +546,14 @@ def test_inference_loader_injects_raw_loader_and_returns_binding(precision):
     assert binding.raw_model is raw_model
     assert loaded_tokenizer is tokenizer
     assert raw_loader.call_count == 1
-    assert raw_loader.call_args.kwargs["generation_compile"] is True
+    assert raw_loader.call_args.kwargs["generation_compile"] is False
     assert raw_loader.call_args.kwargs["precision"] == precision
     assert binding.runtime.preset is OPTIMIZED_PRESETS[precision]
 
 
 def test_optimized_public_loader_defaults_to_fp32_preset():
     raw_model = SimpleNamespace(
-        generation_config=SimpleNamespace(disable_compile=False),
+        generation_config=SimpleNamespace(disable_compile=True),
     )
     with patch.object(
         inference,
@@ -546,6 +569,61 @@ def test_optimized_public_loader_defaults_to_fp32_preset():
 
     assert raw_loader.call_args.kwargs["precision"] == "fp32"
     assert binding.runtime.preset is OPTIMIZED_PRESETS["fp32"]
+
+
+def test_generate_window_preserves_custom_generate_dispatch(monkeypatch):
+    captured = {}
+
+    class FakeModel:
+        dtype = torch.float32
+        device = torch.device("cpu")
+
+        def generate(self, **kwargs):
+            captured.update(kwargs)
+            return torch.tensor([[1, 2]], dtype=torch.long)
+
+    class FakeContextState:
+        def cache_for_window(self, model, **kwargs):
+            return object()
+
+        def active_prefix_decode_kwargs(self):
+            return {}
+
+    monkeypatch.setattr(
+        engine_module,
+        "_build_logits_processor_list",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "eos_token_ids",
+        lambda *args, **kwargs: [2],
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "build_generation_stats",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "generation_profile_context",
+        lambda **kwargs: nullcontext(),
+    )
+
+    result, stats = engine_module._generate_window(
+        FakeModel(),
+        object(),
+        {"inputs": torch.tensor([[1]], dtype=torch.long)},
+        {"precision": "fp32"},
+        context_state=FakeContextState(),
+        preset=OPTIMIZED_PRESETS["fp32"],
+    )
+
+    assert torch.equal(result, torch.tensor([[1, 2]], dtype=torch.long))
+    assert stats["torch_compile_enabled"] is False
+    custom_generate = captured["custom_generate"]
+    assert isinstance(custom_generate, partial)
+    assert custom_generate.func is engine_module.active_prefix_decode_generate
 
 
 def test_shared_calculation_helpers_preserve_legacy_server_results():

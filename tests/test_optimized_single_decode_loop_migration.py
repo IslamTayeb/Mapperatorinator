@@ -5,19 +5,20 @@ from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
+from transformers import StoppingCriteriaList
 from transformers.modeling_outputs import BaseModelOutput
-from transformers.generation.stopping_criteria import StoppingCriteriaList
 
 from osuT5.osuT5.inference.optimized.single.decode_loop import (
-    active_prefix_decode_generate,
     _bucketed_prefix_length,
     _clone_static_graph_inputs,
     _copy_static_graph_inputs,
     _cuda_graph_signature,
     _stable_encoder_outputs,
+    active_prefix_decode_generate,
 )
 
 
@@ -100,6 +101,86 @@ def test_graph_signature_preserves_shape_dtype_device_and_object_identity():
     assert signature[0] == 128
     assert ("token", (1, 1), "torch.int64", "cpu") in signature
     assert ("owner", "object", id(owner)) in signature
+
+
+def test_eager_decode_never_consults_hugging_face_compile_selection():
+    class StopAtLength:
+        def __call__(self, input_ids, scores):
+            return torch.tensor(
+                [input_ids.shape[1] >= 3],
+                dtype=torch.bool,
+                device=input_ids.device,
+            )
+
+    class FakeModel:
+        def __init__(self):
+            self.config = SimpleNamespace(is_encoder_decoder=False)
+            self._valid_auto_compile_criteria = Mock(
+                side_effect=AssertionError("compile selection must not run")
+            )
+            self.get_compiled_call = Mock(
+                side_effect=AssertionError("compiled call must not be requested")
+            )
+            self.forward_calls = 0
+
+        def _get_initial_cache_position(self, cur_len, device, model_kwargs):
+            return model_kwargs
+
+        def _has_unfinished_sequences(
+            self,
+            this_peer_finished,
+            synced_gpus,
+            device,
+        ):
+            return not bool(this_peer_finished)
+
+        def prepare_inputs_for_generation(self, input_ids, **model_kwargs):
+            return {"input_ids": input_ids}
+
+        def __call__(self, input_ids, return_dict):
+            self.forward_calls += 1
+            logits = torch.zeros(
+                (input_ids.shape[0], input_ids.shape[1], 4),
+                dtype=torch.float32,
+                device=input_ids.device,
+            )
+            logits[..., 2] = 1
+            return SimpleNamespace(logits=logits)
+
+        def _update_model_kwargs_for_generation(
+            self,
+            outputs,
+            model_kwargs,
+            is_encoder_decoder,
+        ):
+            return model_kwargs
+
+    model = FakeModel()
+    generation_config = SimpleNamespace(
+        return_dict_in_generate=False,
+        output_attentions=False,
+        output_hidden_states=False,
+        output_scores=False,
+        output_logits=False,
+        prefill_chunk_size=None,
+        _pad_token_tensor=torch.tensor(0, dtype=torch.long),
+        max_length=3,
+        do_sample=False,
+    )
+
+    output = active_prefix_decode_generate(
+        model,
+        torch.tensor([[1]], dtype=torch.long),
+        logits_processor=lambda input_ids, logits: logits,
+        stopping_criteria=StoppingCriteriaList([StopAtLength()]),
+        generation_config=generation_config,
+        cuda_graph_forward=False,
+    )
+
+    assert torch.equal(output, torch.tensor([[1, 2, 2]], dtype=torch.long))
+    assert model.forward_calls == 2
+    model._valid_auto_compile_criteria.assert_not_called()
+    model.get_compiled_call.assert_not_called()
 
 
 def test_fresh_server_import_does_not_load_optimized_decode_loop():
