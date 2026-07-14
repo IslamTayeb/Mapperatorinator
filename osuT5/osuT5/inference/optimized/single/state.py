@@ -114,3 +114,32 @@ class ProductionDecodeSession:
             int(entry.get("decode_replays", 0) or 0)
             for entry in self.graph_cache.values()
         )
+
+    def graph_profile_summary(self) -> dict[str, Any]:
+        """Return address-free CUDA-graph evidence suitable for profiles."""
+        buckets: dict[str, dict[str, int | float]] = {}
+        for entry in self.graph_cache.values():
+            prefix = int(entry.get("active_prefix_length", -1))
+            if prefix < 0:
+                raise RuntimeError("optimized graph entry is missing active_prefix_length")
+            bucket = buckets.setdefault(
+                str(prefix),
+                {"graph_count": 0, "decode_replays": 0, "capture_seconds": 0.0},
+            )
+            bucket["graph_count"] = int(bucket["graph_count"]) + 1
+            bucket["decode_replays"] = int(bucket["decode_replays"]) + int(
+                entry.get("decode_replays", 0)
+            )
+            bucket["capture_seconds"] = float(bucket["capture_seconds"]) + float(
+                entry.get("capture_seconds", 0.0)
+            )
+        return {
+            "graph_count": self.graph_count,
+            "decode_replays": sum(
+                int(bucket["decode_replays"]) for bucket in buckets.values()
+            ),
+            "capture_seconds": sum(
+                float(bucket["capture_seconds"]) for bucket in buckets.values()
+            ),
+            "buckets": dict(sorted(buckets.items(), key=lambda item: int(item[0]))),
+        }

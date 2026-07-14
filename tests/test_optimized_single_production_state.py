@@ -68,7 +68,11 @@ def test_production_session_exposes_graph_and_encoder_state_by_identity(monkeypa
     cache = _FakeCache()
     monkeypatch.setattr(state_module, "get_cache", lambda *args, **kwargs: cache)
     session = ProductionDecodeSession()
-    graph_entry = {"decode_replays": 3}
+    graph_entry = {
+        "active_prefix_length": 128,
+        "capture_seconds": 0.25,
+        "decode_replays": 3,
+    }
     session.graph_cache[(128,)] = graph_entry
     session.cache_for_window(_model(), batch_size=1, num_beams=1, cfg_scale=1.0)
     encoder_output = object()
@@ -82,7 +86,20 @@ def test_production_session_exposes_graph_and_encoder_state_by_identity(monkeypa
     assert kwargs["shared_graph_cache"][(128,)] is graph_entry
     assert kwargs["stable_encoder_holder"]["encoder_outputs"] is encoder_output
     assert session.graph_count == 1
+    assert session.graph_capture_seconds == 0.25
     assert session.graph_decode_replays == 3
+    assert session.graph_profile_summary() == {
+        "graph_count": 1,
+        "decode_replays": 3,
+        "capture_seconds": 0.25,
+        "buckets": {
+            "128": {
+                "graph_count": 1,
+                "decode_replays": 3,
+                "capture_seconds": 0.25,
+            }
+        },
+    }
 
 
 def test_production_sessions_do_not_share_mutable_state():

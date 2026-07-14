@@ -76,6 +76,9 @@ class InferenceConfig:
     use_server: bool = True  # Use server for optimized multiprocess inference
     max_batch_size: int = 16  # Maximum batch size for inference (only used for parallel sampling or super timing)
     profile_inference: bool = False  # Write stage and generation timing profile JSON
+    profile_detail_ranges: bool = False  # Emit opt-in external-profiler ranges
+    profile_cuda_capture: bool = False  # Gate an external profiler with cudaProfilerStart/Stop
+    profile_pass_kind: str = "unspecified"  # Explicit authority/trace classification
     resnap_events: bool = True  # Resnap notes to the timing after generation
     snap_near_perfect_overlaps: bool = True  # Snap nearly overlapping positions to each other
 

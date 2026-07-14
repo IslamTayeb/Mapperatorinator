@@ -5,6 +5,7 @@ import torch
 from torch import nn
 from transformers.modeling_outputs import BaseModelOutput
 
+from ....runtime_profiling import profile_range
 from .runtime_context import active_prefix_self_attention_context
 
 
@@ -220,7 +221,8 @@ def active_prefix_decode_generate(
     ):
         model_inputs = model.prepare_inputs_for_generation(input_ids, **model_kwargs)
         if is_prefill:
-            outputs = model(**model_inputs, return_dict=True)
+            with profile_range("generation.encoder_prefill"):
+                outputs = model(**model_inputs, return_dict=True)
             is_prefill = False
         else:
             decode_steps += 1
@@ -241,12 +243,13 @@ def active_prefix_decode_generate(
                 graph_entry = graph_cache.get(graph_key)
                 if graph_entry is None:
                     static_inputs = _clone_static_graph_inputs(model_inputs)
-                    graph, outputs, capture_seconds = _capture_decode_cuda_graph(
-                        model,
-                        static_inputs,
-                        active_prefix_length=prefix_length,
-                        warmup=cuda_graph_warmup,
-                    )
+                    with profile_range("generation.decode_graph_capture_setup"):
+                        graph, outputs, capture_seconds = _capture_decode_cuda_graph(
+                            model,
+                            static_inputs,
+                            active_prefix_length=prefix_length,
+                            warmup=cuda_graph_warmup,
+                        )
                     graph_entry = {
                         "graph": graph,
                         "outputs": outputs,
@@ -261,51 +264,56 @@ def active_prefix_decode_generate(
                         graph_entry["static_inputs"],
                         model_inputs,
                     )
-                    graph_entry["graph"].replay()
+                    with profile_range("generation.decode_graph_replay"):
+                        graph_entry["graph"].replay()
                 graph_entry["decode_replays"] += 1
                 outputs = graph_entry["outputs"]
             else:
                 with active_prefix_self_attention_context(prefix_length):
                     outputs = model(**model_inputs, return_dict=True)
 
-        model_kwargs = model._update_model_kwargs_for_generation(
-            outputs,
-            model_kwargs,
-            is_encoder_decoder=model.config.is_encoder_decoder,
-        )
-        if stable_encoder_holder is not None:
-            encoder_outputs = model_kwargs.get("encoder_outputs")
-            if encoder_outputs is not None:
-                model_kwargs["encoder_outputs"] = _stable_encoder_outputs(
-                    stable_encoder_holder,
-                    encoder_outputs,
-                )
-
-        next_logits = outputs.logits[:, -1, :].to(
-            copy=True,
-            dtype=torch.float32,
-            device=input_ids.device,
-        )
-        next_scores = logits_processor(input_ids, next_logits)
-        if generation_config.do_sample:
-            probabilities = nn.functional.softmax(next_scores, dim=-1)
-            next_tokens = torch.multinomial(probabilities, num_samples=1).squeeze(1)
-        else:
-            next_tokens = torch.argmax(next_scores, dim=-1)
-
-        if has_eos:
-            next_tokens = next_tokens * unfinished + pad_token_id * (1 - unfinished)
-        input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
-        stopped = stopping_criteria(input_ids, scores)
-        if not isinstance(stopped, torch.Tensor) or tuple(stopped.shape) != (
-            batch_size,
-        ):
-            raise RuntimeError(
-                "batched stopping criteria must return one value per row"
+        with profile_range("generation.cache_update"):
+            model_kwargs = model._update_model_kwargs_for_generation(
+                outputs,
+                model_kwargs,
+                is_encoder_decoder=model.config.is_encoder_decoder,
             )
-        unfinished = unfinished & ~stopped.to(dtype=torch.bool)
-        this_peer_finished = unfinished.max() == 0
-        cur_len += 1
+            if stable_encoder_holder is not None:
+                encoder_outputs = model_kwargs.get("encoder_outputs")
+                if encoder_outputs is not None:
+                    model_kwargs["encoder_outputs"] = _stable_encoder_outputs(
+                        stable_encoder_holder,
+                        encoder_outputs,
+                    )
+
+        with profile_range("generation.logits_processors"):
+            next_logits = outputs.logits[:, -1, :].to(
+                copy=True,
+                dtype=torch.float32,
+                device=input_ids.device,
+            )
+            next_scores = logits_processor(input_ids, next_logits)
+        with profile_range("generation.sampling"):
+            if generation_config.do_sample:
+                probabilities = nn.functional.softmax(next_scores, dim=-1)
+                next_tokens = torch.multinomial(probabilities, num_samples=1).squeeze(1)
+            else:
+                next_tokens = torch.argmax(next_scores, dim=-1)
+
+        with profile_range("generation.token_append_and_stopping"):
+            if has_eos:
+                next_tokens = next_tokens * unfinished + pad_token_id * (1 - unfinished)
+            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            stopped = stopping_criteria(input_ids, scores)
+            if not isinstance(stopped, torch.Tensor) or tuple(stopped.shape) != (
+                batch_size,
+            ):
+                raise RuntimeError(
+                    "batched stopping criteria must return one value per row"
+                )
+            unfinished = unfinished & ~stopped.to(dtype=torch.bool)
+            this_peer_finished = unfinished.max() == 0
+            cur_len += 1
         del outputs
 
     return input_ids

@@ -276,6 +276,15 @@ def test_ordinary_generate_window_installs_shared_specialized_dispatch(monkeypat
         def active_prefix_decode_kwargs():
             return {}
 
+        @staticmethod
+        def graph_profile_summary():
+            return {
+                "graph_count": 0,
+                "decode_replays": 0,
+                "capture_seconds": 0.0,
+                "buckets": {},
+            }
+
     model = SimpleNamespace(
         device=torch.device("cpu"),
         dtype=torch.float16,

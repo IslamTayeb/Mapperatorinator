@@ -11,7 +11,7 @@ from typing import Any
 import torch
 
 from ....event import ContextType
-from ....runtime_profiling import generation_profile_context
+from ....runtime_profiling import generation_profile_context, profile_range
 from ...engine_binding import InferenceEngineBinding
 from ...generation_utils import (
     build_generation_stats,
@@ -332,7 +332,8 @@ def _generate_window(
             sync_cuda_for_model(model)
         elapsed_seconds = time.perf_counter() - start_time
 
-    result = result.cpu()
+    with profile_range("generation.final_device_to_host"):
+        result = result.cpu()
     stats = build_generation_stats(
         result,
         model_kwargs,
@@ -417,6 +418,7 @@ def _generate_window(
             int(getattr(context_state, "graph_decode_replays", 0))
             - graph_decode_replays_before
         ),
+        "optimized_cuda_graphs": context_state.graph_profile_summary(),
     })
     return result, stats
 

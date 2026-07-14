@@ -620,6 +620,8 @@ def generate(
     timing_model = model if timing_model is None else timing_model
     timing_tokenizer = tokenizer if timing_tokenizer is None else timing_tokenizer
 
+    profiler.start_generation_capture()
+
     # Auto generate timing if not provided in in_context and required for the model and this output_type
     timing_events, timing_times, timing = None, None, None
     if args.super_timing and (len(args.in_context) == 0 or ContextType.NONE in args.in_context):
@@ -683,6 +685,8 @@ def generate(
                 events = postprocessor.resnap_events(events, timing)
     else:
         events = timing_events
+
+    profiler.stop_generation_capture()
 
     # Generate positions with diffusion
     if args.generate_positions and args.gamemode in [0, 2] and ContextType.MAP in output_type:

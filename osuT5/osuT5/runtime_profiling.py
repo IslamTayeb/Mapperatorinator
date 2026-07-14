@@ -27,6 +27,23 @@ def detail_ranges_enabled() -> bool:
 
 
 @contextmanager
+def detail_ranges_context(enabled: bool) -> Iterator[None]:
+    """Temporarily enable fine-grained profiler ranges.
+
+    This remains a no-op for normal inference because callers must opt in.
+    Nested contexts preserve an already-enabled outer profiling stage.
+    """
+    global _DETAIL_RANGES_ENABLED
+
+    previous = _DETAIL_RANGES_ENABLED
+    _DETAIL_RANGES_ENABLED = previous or bool(enabled)
+    try:
+        yield
+    finally:
+        _DETAIL_RANGES_ENABLED = previous
+
+
+@contextmanager
 def generation_profile_context(
         *,
         detail_ranges: bool = False,
@@ -42,9 +59,7 @@ def generation_profile_context(
     """Temporarily enable opt-in generation profiling controls."""
     global _DETAIL_RANGES_ENABLED
 
-    previous_detail_ranges = _DETAIL_RANGES_ENABLED
-    _DETAIL_RANGES_ENABLED = bool(detail_ranges)
-    try:
+    with detail_ranges_context(detail_ranges):
         from osuT5.osuT5.inference.runtime_dispatch import (
             AttentionRuntimeHooks,
             DecoderLayerRuntimeHooks,
@@ -106,8 +121,6 @@ def generation_profile_context(
             sdpa_backend_context(sdpa_backend),
         ):
             yield
-    finally:
-        _DETAIL_RANGES_ENABLED = previous_detail_ranges
 
 
 @contextmanager
