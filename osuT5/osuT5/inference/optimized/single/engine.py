@@ -20,6 +20,7 @@ from ...generation_utils import (
 )
 from .decode_loop import active_prefix_decode_generate
 from .exactness import cache_write_signature, rng_progression_signature
+from .budget import UntracedBudgetRecorder, budget_region
 from .logits import build_single_logits_processor_list
 from .state import ProductionDecodeSession
 
@@ -225,6 +226,16 @@ def _generate_window(
     collect_strict_exactness = bool(
         generate_kwargs.pop("collect_strict_exactness", False)
     )
+    profile_pass_kind = str(generate_kwargs.pop("profile_pass_kind", "unspecified"))
+    untraced_budget_recorder = (
+        UntracedBudgetRecorder()
+        if profile_pass_kind == "untraced_budget"
+        else None
+    )
+    if untraced_budget_recorder is not None and not sync_model_timing:
+        raise RuntimeError(
+            "untraced budget profiling requires synchronized model timing"
+        )
     if context_type is not None:
         context_type = ContextType(context_type)
     if precision != preset.precision or cfg_scale != 1.0:
@@ -294,6 +305,7 @@ def _generate_window(
         cuda_graph_forward=True,
         cuda_graph_warmup=0,
         cuda_graph_min_decode_steps=1,
+        untraced_budget_recorder=untraced_budget_recorder,
         **context_state.active_prefix_decode_kwargs(),
     )
     graph_count_before = int(getattr(context_state, "graph_count", 0))
@@ -345,7 +357,8 @@ def _generate_window(
             custom_generate=custom_generate,
         )
         if sync_model_timing:
-            sync_cuda_for_model(model)
+            with budget_region(untraced_budget_recorder, "sync"):
+                sync_cuda_for_model(model)
         elapsed_seconds = time.perf_counter() - start_time
 
     strict_exactness = None
@@ -376,6 +389,14 @@ def _generate_window(
         model_kwargs,
         pad_token_id,
         elapsed_seconds,
+    )
+    untraced_budget = (
+        untraced_budget_recorder.finish(
+            model_elapsed_seconds=elapsed_seconds,
+            generated_tokens=int(stats["generated_tokens"]),
+        )
+        if untraced_budget_recorder is not None
+        else None
     )
     stats.update({
         "precision": precision,
@@ -459,6 +480,8 @@ def _generate_window(
     })
     if strict_exactness is not None:
         stats["strict_exactness"] = strict_exactness
+    if untraced_budget is not None:
+        stats["untraced_budget"] = untraced_budget
     return result, stats
 
 
