@@ -17,7 +17,8 @@ WORK=${MAPPERATORINATOR_WORK:-/work/imt11/Mapperatorinator}
 REPO=${MAPPERATORINATOR_REPO:?Set MAPPERATORINATOR_REPO}
 COMMIT=${MAPPERATORINATOR_COMMIT:?Set MAPPERATORINATOR_COMMIT}
 BRANCH=${MAPPERATORINATOR_BRANCH:?Set MAPPERATORINATOR_BRANCH}
-REMOTE=${MAPPERATORINATOR_REMOTE:-islamtayeb}
+REMOTE=${MAPPERATORINATOR_REMOTE:-origin}
+REMOTE_BRANCH=${MAPPERATORINATOR_REMOTE_BRANCH:?Set MAPPERATORINATOR_REMOTE_BRANCH}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_ROOT="$WORK/runs/k4-mask-reuse-reciprocal-${SLURM_JOB_ID:-manual}"
 EXTENSIONS="$WORK/torch_extensions/k4-mask-reuse-$COMMIT"
@@ -39,7 +40,7 @@ if [[ "$(git -C "$REPO" branch --show-current)" != "$BRANCH" ]]; then
   echo "scout worktree differs from MAPPERATORINATOR_BRANCH" >&2
   exit 2
 fi
-REMOTE_REF="refs/remotes/$REMOTE/$BRANCH"
+REMOTE_REF="refs/remotes/$REMOTE/$REMOTE_BRANCH"
 if ! git -C "$REPO" show-ref --verify --quiet "$REMOTE_REF"; then
   echo "missing fetched remote ref $REMOTE_REF" >&2
   exit 2
@@ -82,6 +83,7 @@ echo "repo=$REPO"
 echo "commit=$COMMIT"
 echo "branch=$BRANCH"
 echo "remote_ref=$REMOTE_REF"
+echo "remote_branch=$REMOTE_BRANCH"
 echo "audio=$AUDIO"
 echo "run_root=$RUN_ROOT"
 nvidia-smi -L

@@ -31,6 +31,8 @@ def test_wrapper_pins_clean_pushed_commit_and_real_2080ti():
     assert '[[ -n "$(git -C "$REPO" status --porcelain)" ]]' in source
     assert '"$(git -C "$REPO" rev-parse HEAD)" != "$COMMIT"' in source
     assert '"$(git -C "$REPO" rev-parse "$REMOTE_REF")" != "$COMMIT"' in source
+    assert "MAPPERATORINATOR_REMOTE_BRANCH" in source
+    assert 'REMOTE_REF="refs/remotes/$REMOTE/$REMOTE_BRANCH"' in source
     assert '"$GPU_NAME" != "NVIDIA GeForce RTX 2080 Ti"' in source
     assert "profile_pass_kind=untraced_control" in source
     assert "analysis.exit-code.txt" in source
