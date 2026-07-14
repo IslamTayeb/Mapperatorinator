@@ -33,6 +33,7 @@ REQUIRE_INT8_MLP_INCREMENTAL=${REQUIRE_INT8_MLP_INCREMENTAL:-false}
 REQUIRE_CROSS_INCREMENTAL=${REQUIRE_CROSS_INCREMENTAL:-false}
 REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL=${REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL:-false}
 REQUIRE_SHARED_ARENA_INCREMENTAL=${REQUIRE_SHARED_ARENA_INCREMENTAL:-false}
+REQUIRE_PROMPT_CONTEXT_INCREMENTAL=${REQUIRE_PROMPT_CONTEXT_INCREMENTAL:-false}
 CROSS_CANDIDATE_MODE=${CROSS_CANDIDATE_MODE:-accepted}
 FIXED_TIMING_TOKENS=${FIXED_TIMING_TOKENS:-821}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
@@ -44,6 +45,7 @@ BASELINE_EXTENSION_KEY_OVERRIDE=${BASELINE_EXTENSION_KEY_OVERRIDE:-}
 CANDIDATE_EXTENSION_KEY_OVERRIDE=${CANDIDATE_EXTENSION_KEY_OVERRIDE:-}
 INT8_K1_COMPOSITION=false
 CROSS_K1_INT8_COMPOSITION=false
+PROMPT_CONTEXT_COMPOSITION=false
 
 if [[ "$BASELINE_COMMIT" != "$CANDIDATE_COMMIT" ]]; then
   echo "split+weight reciprocal requires one shared baseline/candidate commit" >&2
@@ -124,6 +126,11 @@ if [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" != true \
   echo "REQUIRE_SHARED_ARENA_INCREMENTAL must be true or false" >&2
   exit 2
 fi
+if [[ "$REQUIRE_PROMPT_CONTEXT_INCREMENTAL" != true \
+  && "$REQUIRE_PROMPT_CONTEXT_INCREMENTAL" != false ]]; then
+  echo "REQUIRE_PROMPT_CONTEXT_INCREMENTAL must be true or false" >&2
+  exit 2
+fi
 enabled_incremental_modes=0
 for enabled in \
   "$REQUIRE_SHARED_ROPE_INCREMENTAL" \
@@ -131,16 +138,33 @@ for enabled in \
   "$REQUIRE_INT8_MLP_INCREMENTAL" \
   "$REQUIRE_CROSS_INCREMENTAL" \
   "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" \
-  "$REQUIRE_SHARED_ARENA_INCREMENTAL"; do
+  "$REQUIRE_SHARED_ARENA_INCREMENTAL" \
+  "$REQUIRE_PROMPT_CONTEXT_INCREMENTAL"; do
   if [[ "$enabled" == true ]]; then
     enabled_incremental_modes=$((enabled_incremental_modes + 1))
   fi
 done
 if (( enabled_incremental_modes > 1 )); then
-  echo "shared-RoPE, K1-remainder, INT8 MLP, cross, timing-native-self, and shared-arena gates are mutually exclusive" >&2
+  echo "shared-RoPE, K1-remainder, INT8 MLP, cross, timing-native-self, shared-arena, and prompt-context gates are mutually exclusive" >&2
   exit 2
 fi
-if [[ "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_PROMPT_CONTEXT_INCREMENTAL" == true ]]; then
+  if [[ "$REQUIRE_K4_CANDIDATE" != true || "$REQUIRE_EXACT_TIMING" != true ]]; then
+    echo "prompt-context gate requires K4 and exact timing" >&2
+    exit 2
+  fi
+  if [[ "$BASELINE_RUNNER" != utils/run_k4_shared_rope_fp16_cross.py \
+    || "$CANDIDATE_RUNNER" \
+      != utils/run_k1_int8_fp16_cross_prompt_context.py ]]; then
+    echo "prompt-context gate requires the selected FP16-cross control" >&2
+    exit 2
+  fi
+  if [[ "$CROSS_CANDIDATE_MODE" != fp16_packed_projections ]]; then
+    echo "prompt-context gate requires FP16-packed cross projections" >&2
+    exit 2
+  fi
+  PROMPT_CONTEXT_COMPOSITION=true
+elif [[ "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" == true ]]; then
   if [[ "$REQUIRE_K4_CANDIDATE" != true || "$REQUIRE_EXACT_TIMING" != false ]]; then
     echo "timing-native-self gate requires K4 with declared dispatch delta" >&2
     exit 2
@@ -428,6 +452,7 @@ echo "require_cross_incremental=$REQUIRE_CROSS_INCREMENTAL"
 echo "require_timing_native_self_incremental=$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL"
 echo "fixed_timing_tokens=$FIXED_TIMING_TOKENS"
 echo "require_shared_arena_incremental=$REQUIRE_SHARED_ARENA_INCREMENTAL"
+echo "require_prompt_context_incremental=$REQUIRE_PROMPT_CONTEXT_INCREMENTAL"
 echo "cross_candidate_mode=$CROSS_CANDIDATE_MODE"
 echo "cross_k1_int8_composition=$CROSS_K1_INT8_COMPOSITION"
 echo "audio=$AUDIO"
@@ -619,7 +644,9 @@ run_profile() {
     validation_role=candidate
   fi
   local validation_cross_mode=accepted
-  if [[ "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" == true ]]; then
+  if [[ "$REQUIRE_PROMPT_CONTEXT_INCREMENTAL" == true ]]; then
+    validation_cross_mode=$CROSS_CANDIDATE_MODE
+  elif [[ "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" == true ]]; then
     validation_cross_mode=$CROSS_CANDIDATE_MODE
   elif [[ "$REQUIRE_CROSS_INCREMENTAL" == true && "$candidate" == 1 ]]; then
     validation_cross_mode=$CROSS_CANDIDATE_MODE
@@ -656,11 +683,13 @@ run_profile() {
   fi
   if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true \
     || "$CROSS_K1_INT8_COMPOSITION" == true \
-    || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+    || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true \
+    || "$PROMPT_CONTEXT_COMPOSITION" == true ]]; then
     local int8_validation_role=baseline
     if [[ "$candidate" == 1 \
       || "$CROSS_K1_INT8_COMPOSITION" == true \
-      || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+      || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true \
+      || "$PROMPT_CONTEXT_COMPOSITION" == true ]]; then
       int8_validation_role=candidate
     fi
     (
@@ -686,12 +715,14 @@ run_profile() {
   if [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true \
     || "$INT8_K1_COMPOSITION" == true \
     || "$CROSS_K1_INT8_COMPOSITION" == true \
-    || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+    || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true \
+    || "$PROMPT_CONTEXT_COMPOSITION" == true ]]; then
     local remainder_role=control
     if [[ "$candidate" == 1 \
       || "$INT8_K1_COMPOSITION" == true \
       || "$CROSS_K1_INT8_COMPOSITION" == true \
-      || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+      || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true \
+      || "$PROMPT_CONTEXT_COMPOSITION" == true ]]; then
       remainder_role=candidate
     fi
     (
@@ -817,7 +848,8 @@ if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
   || "$REQUIRE_INT8_MLP_INCREMENTAL" == true \
   || "$REQUIRE_CROSS_INCREMENTAL" == true \
   || "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" == true \
-  || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+  || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true \
+  || "$REQUIRE_PROMPT_CONTEXT_INCREMENTAL" == true ]]; then
   INITIALIZATION_ROLES=baseline_first,candidate_first,candidate_second,baseline_second
 fi
 "$PYTHON" - "$RUN_ROOT" "$INITIALIZATION_ROLES" \
@@ -827,7 +859,8 @@ fi
   "$INT8_K1_COMPOSITION" \
   "$REQUIRE_CROSS_INCREMENTAL" \
   "$CROSS_CANDIDATE_MODE" \
-  "$CROSS_K1_INT8_COMPOSITION" <<'PY'
+  "$CROSS_K1_INT8_COMPOSITION" \
+  "$REQUIRE_PROMPT_CONTEXT_INCREMENTAL" <<'PY'
 import json
 import math
 import statistics
@@ -843,11 +876,13 @@ int8_k1_composition = sys.argv[6] == "true"
 require_cross = sys.argv[7] == "true"
 cross_mode = sys.argv[8]
 cross_k1_int8_composition = sys.argv[9] == "true"
+require_prompt_context = sys.argv[10] == "true"
 shared_rope_both_arms = (
     require_k1_remainder
     or require_int8_mlp
     or cross_k1_int8_composition
 )
+shared_rope_both_arms = shared_rope_both_arms or require_prompt_context
 runs = {}
 required_numbers = (
     "initialization_wall_seconds",
@@ -981,6 +1016,54 @@ if require_cross:
         elif runtime is not None:
             raise SystemExit(f"{role}: control unexpectedly contains cross runtime")
 
+if require_prompt_context:
+    selected_runtime = (
+        "k4-split-kv-mixed-weight-shared-rope-k1-remainder-int8-mlp-"
+        f"{cross_mode}-v1"
+    )
+    prompt_runtime = (
+        "k4-split-kv-mixed-weight-shared-rope-k1-remainder-int8-mlp-"
+        f"{cross_mode}-exact-prompt-context-v1"
+    )
+    for role in roles:
+        overlay = runs[role].get("int8_mlp_overlay")
+        if not isinstance(overlay, dict):
+            raise SystemExit(f"{role}: missing INT8 MLP composition evidence")
+        cross = runs[role].get("cross_candidate")
+        runtime = runs[role].get("cross_runtime")
+        if not isinstance(cross, dict) or cross.get("mode") != cross_mode:
+            raise SystemExit(f"{role}: selected cross mode is wrong")
+        if not isinstance(runtime, dict) or runtime.get("mode") != cross_mode:
+            raise SystemExit(f"{role}: selected cross runtime evidence is missing")
+        prompt = runs[role].get("prompt_context_preparation")
+        if role.startswith("candidate"):
+            if runs[role].get("combined_runtime") != prompt_runtime:
+                raise SystemExit(f"{role}: prompt composition identity is wrong")
+            if runs[role].get("prompt_context_incremental_control") \
+                != selected_runtime:
+                raise SystemExit(f"{role}: prompt incremental control is wrong")
+            if not isinstance(prompt, dict):
+                raise SystemExit(f"{role}: prompt-context evidence is missing")
+            for key in (
+                "exactness_required",
+                "binary_search_ranges",
+                "reused_cpu_prompt_buffer",
+            ):
+                if prompt.get(key) is not True:
+                    raise SystemExit(f"{role}: prompt-context {key} is not true")
+            if prompt.get("scope") != "main_generation_only":
+                raise SystemExit(f"{role}: prompt-context scope is wrong")
+            if prompt.get("main_generate_calls") != 1:
+                raise SystemExit(f"{role}: prompt-context main call count is wrong")
+            if prompt.get("prompt_calls", 0) <= 0 \
+                or prompt.get("range_queries", 0) <= 0:
+                raise SystemExit(f"{role}: prompt-context candidate did not execute")
+        else:
+            if runs[role].get("combined_runtime") != selected_runtime:
+                raise SystemExit(f"{role}: selected control identity is wrong")
+            if prompt is not None or "prompt_context_incremental_control" in runs[role]:
+                raise SystemExit(f"{role}: control unexpectedly enabled prompt context")
+
 summary = {
     "schema_version": 1,
     "result_class": "documented-drift",
@@ -1021,7 +1104,15 @@ ANALYSIS_DISPATCH_ARGS=(
   --allow-optional-dispatch-delta
     'records.main_generation[[]*].optimized_cuda_graphs.*'
 )
-if [[ "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_PROMPT_CONTEXT_INCREMENTAL" == true ]]; then
+  ANALYSIS_EXACT_ARGS=(
+    --require-exact-label timing_context
+    --require-exact-label main_generation
+    --require-exact-dispatch-label timing_context
+    --require-exact-dispatch-label main_generation
+  )
+  ANALYSIS_DISPATCH_ARGS=()
+elif [[ "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" == true ]]; then
   ANALYSIS_EXACT_ARGS=(
     --require-exact-label timing_context
     --require-exact-label main_generation
@@ -1143,8 +1234,20 @@ fi
     --text-output "$RUN_ROOT/reciprocal-analysis.txt"
 )
 
+if [[ "$REQUIRE_PROMPT_CONTEXT_INCREMENTAL" == true ]]; then
+  (
+    cd "$CANDIDATE_REPO"
+    "$PYTHON" utils/validate_prompt_context_reciprocal.py \
+      --run-root "$RUN_ROOT" \
+      --output "$RUN_ROOT/prompt-context-reciprocal.json"
+  )
+fi
+
 SHARED_ARENA_STATUS=0
-if [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_PROMPT_CONTEXT_INCREMENTAL" == true ]]; then
+  EXPECTED_EXACT_LABELS=timing_context,main_generation
+  EXPECTED_EXACT_DISPATCH_LABELS=$EXPECTED_EXACT_LABELS
+elif [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
   set +e
   (
     cd "$CANDIDATE_REPO"
@@ -1198,7 +1301,8 @@ done
 if [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true \
   || "$INT8_K1_COMPOSITION" == true \
   || "$CROSS_K1_INT8_COMPOSITION" == true \
-  || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+  || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true \
+  || "$PROMPT_CONTEXT_COMPOSITION" == true ]]; then
   for role in baseline_first candidate_first candidate_second baseline_second; do
     artifact="$RUN_ROOT/$role.k1-remainder-validation.json"
     if [[ ! -s "$artifact" ]]; then
@@ -1209,7 +1313,8 @@ if [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true \
 fi
 if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true \
   || "$CROSS_K1_INT8_COMPOSITION" == true \
-  || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+  || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true \
+  || "$PROMPT_CONTEXT_COMPOSITION" == true ]]; then
   for role in baseline_first candidate_first candidate_second baseline_second; do
     artifact="$RUN_ROOT/$role.int8-mlp-validation.json"
     if [[ ! -s "$artifact" ]]; then
@@ -1231,7 +1336,8 @@ if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
   || "$REQUIRE_INT8_MLP_INCREMENTAL" == true \
   || "$REQUIRE_CROSS_INCREMENTAL" == true \
   || "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" == true \
-  || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+  || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true \
+  || "$REQUIRE_PROMPT_CONTEXT_INCREMENTAL" == true ]]; then
   for artifact in \
     "$RUN_ROOT/candidate-initialization/baseline_first.json" \
     "$RUN_ROOT/candidate-initialization/baseline_second.json"; do
@@ -1246,6 +1352,11 @@ if [[ "$REQUIRE_CROSS_INCREMENTAL" == true \
   echo "missing required FP16 cross reciprocal manifest" >&2
   exit 2
 fi
+if [[ "$REQUIRE_PROMPT_CONTEXT_INCREMENTAL" == true \
+  && ! -s "$RUN_ROOT/prompt-context-reciprocal.json" ]]; then
+  echo "missing required prompt-context reciprocal result" >&2
+  exit 2
+fi
 
 grep -q "^mode=$ANALYSIS_MODE$" "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q "^parity.claim=$ANALYSIS_CLAIM$" "$RUN_ROOT/reciprocal-analysis.txt"
@@ -1253,7 +1364,8 @@ if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
   || "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true \
   || "$REQUIRE_CROSS_INCREMENTAL" == true \
   || "$REQUIRE_TIMING_NATIVE_SELF_INCREMENTAL" == true \
-  || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+  || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true \
+  || "$REQUIRE_PROMPT_CONTEXT_INCREMENTAL" == true ]]; then
   grep -q '^parity.cross_candidate_exact=true$' \
     "$RUN_ROOT/reciprocal-analysis.txt"
 fi

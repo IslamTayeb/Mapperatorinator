@@ -32,6 +32,9 @@ FP16_CROSS_WRAPPER = (
 TIMING_NATIVE_SELF_WRAPPER = (
     ROOT / "scripts/dcc/verify_selected_timing_native_self_reciprocal.sbatch"
 )
+PROMPT_CONTEXT_WRAPPER = (
+    ROOT / "scripts/dcc/verify_prompt_context_reciprocal.sbatch"
+)
 def test_weight_only_full_song_wrapper_has_valid_bash_syntax() -> None:
     for wrapper in (
         WRAPPER,
@@ -41,6 +44,7 @@ def test_weight_only_full_song_wrapper_has_valid_bash_syntax() -> None:
         K1_INT8_MLP_WRAPPER,
         FP16_CROSS_WRAPPER,
         TIMING_NATIVE_SELF_WRAPPER,
+        PROMPT_CONTEXT_WRAPPER,
     ):
         subprocess.run(["bash", "-n", str(wrapper)], check=True)
 
@@ -553,3 +557,22 @@ def test_initialization_evidence_rejects_component_walls_larger_than_total(
             },
             object(),
         )
+
+
+def test_prompt_context_wrapper_uses_selected_control_and_exact_outer_gate() -> None:
+    source = PROMPT_CONTEXT_WRAPPER.read_text(encoding="utf-8")
+
+    assert "BASELINE_RUNNER=utils/run_k4_shared_rope_fp16_cross.py" in source
+    assert (
+        "CANDIDATE_RUNNER=utils/run_k1_int8_fp16_cross_prompt_context.py"
+        in source
+    )
+    assert "REQUIRE_PROMPT_CONTEXT_INCREMENTAL=true" in source
+    assert "REQUIRE_EXACT_TIMING=true" in source
+    assert "CROSS_CANDIDATE_MODE=fp16_packed_projections" in source
+
+    general = WRAPPER.read_text(encoding="utf-8")
+    assert "utils/validate_prompt_context_reciprocal.py" in general
+    assert "--require-exact-label main_generation" in general
+    assert "--require-exact-dispatch-label main_generation" in general
+    assert "prompt-context gate requires the selected FP16-cross control" in general
