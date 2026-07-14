@@ -223,6 +223,16 @@ def test_k8_never_crosses_bucket_or_max_length(cur_len, max_length, expected):
     assert _k8_eligible(cur_len, max_length, 64) is expected
 
 
+@pytest.mark.parametrize(
+    ("block_size", "cur_len", "expected"),
+    ((1, 128, True), (4, 125, True), (4, 126, False), (4, 1021, False)),
+)
+def test_parameterized_blocks_respect_bucket_and_max_length(
+    block_size, cur_len, expected
+):
+    assert _k8_eligible(cur_len, 1024, 64, block_size) is expected
+
+
 def test_static_handoff_updates_token_positions_and_causal_mask_in_place():
     inputs = {
         "decoder_input_ids": torch.tensor([[3]]),
@@ -302,7 +312,10 @@ def test_raw_child_graph_api_fails_loudly_when_torch_does_not_expose_handle():
         _ChildGraphSequence.build(object(), object())
 
 
-def test_child_graph_sequence_accepts_exact_cuda_binding_return_shapes(monkeypatch):
+@pytest.mark.parametrize(("block_size", "expected_nodes"), ((1, 2), (4, 8), (8, 16)))
+def test_child_graph_sequence_accepts_exact_cuda_binding_return_shapes(
+    monkeypatch, block_size, expected_nodes
+):
     from cuda.bindings import runtime
 
     success = runtime.cudaError_t.cudaSuccess
@@ -363,6 +376,7 @@ def test_child_graph_sequence_accepts_exact_cuda_binding_return_shapes(monkeypat
     sequence = _ChildGraphSequence.build(
         model_graph,
         tail_graph,
+        block_size=block_size,
         device=torch.device("cuda", 1),
     )
     sequence.replay()
@@ -371,7 +385,7 @@ def test_child_graph_sequence_accepts_exact_cuda_binding_return_shapes(monkeypat
 
     assert calls[0] == ("create", 0)
     add_calls = [row for row in calls if row[0] == "add"]
-    assert len(add_calls) == 16
+    assert len(add_calls) == expected_nodes
     assert add_calls[0][2:4] == (None, 0)
     assert add_calls[1][2:4] == (("node-1",), 1)
     assert ("instantiate", "parent", 0) in calls
@@ -509,9 +523,10 @@ def test_k8_lifecycle_closes_graphs_at_session_transition_and_context_exit():
     first_cache = {}
     second_cache = {}
 
-    with install_k8_candidate():
+    with install_k8_candidate(block_size=4):
         lifecycle = k8_runtime._ACTIVE_K8_LIFECYCLE
         assert isinstance(lifecycle, _K8GraphLifecycle)
+        assert k8_runtime._ACTIVE_BLOCK_SIZE == 4
         lifecycle.activate(first_cache)
         lifecycle.register(first)
         lifecycle.activate(first_cache)
@@ -523,6 +538,7 @@ def test_k8_lifecycle_closes_graphs_at_session_transition_and_context_exit():
     assert first.close_calls == 1
     assert second.close_calls == 1
     assert k8_runtime._ACTIVE_K8_LIFECYCLE is None
+    assert k8_runtime._ACTIVE_BLOCK_SIZE is None
 
 
 def test_opt_in_install_restores_default_even_on_exception(monkeypatch):
@@ -537,6 +553,20 @@ def test_opt_in_install_restores_default_even_on_exception(monkeypatch):
             )
             raise RuntimeError("boom")
     assert engine.active_prefix_decode_generate is default
+    assert k8_runtime._ACTIVE_BLOCK_SIZE is None
+
+
+@pytest.mark.parametrize("block_size", (0, 2, 3, 5, 16))
+def test_install_rejects_unsupported_block_sizes(block_size):
+    with pytest.raises(ValueError, match="block size must be one of"):
+        with install_k8_candidate(block_size=block_size):
+            pass
+
+
+def test_install_rejects_non_integer_block_size():
+    with pytest.raises(TypeError, match="block size must be an integer"):
+        with install_k8_candidate(block_size=True):
+            pass
 
 
 def test_session_reports_latest_k8_window_independent_of_graph_entries():

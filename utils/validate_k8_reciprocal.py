@@ -1,4 +1,4 @@
-"""Validate reciprocal accepted/K=8 inference profiles without hiding changed work."""
+"""Validate reciprocal accepted/counter-block profiles without hiding changed work."""
 
 from __future__ import annotations
 
@@ -201,6 +201,7 @@ def _validate_k8_profile(
     profile: Mapping[str, Any],
     *,
     name: str,
+    expected_block_size: int,
 ) -> tuple[list[str], dict[str, dict[str, Any]]]:
     failures: list[str] = []
 
@@ -281,7 +282,7 @@ def _validate_k8_profile(
                     "capture_seconds",
                 )
             }
-            if block_size != 8:
+            if block_size != expected_block_size:
                 failures.append(f"{name}.{label}[{record_index}] block_size={block_size}")
             if any(values[key] < 0 for key in integer_keys if key != "rng_request_seed"):
                 failures.append(f"{name}.{label}[{record_index}] has negative K8 counters")
@@ -343,6 +344,17 @@ def _validate_baseline(profile: Mapping[str, Any], *, name: str) -> list[str]:
     return failures
 
 
+def _percent_change(reference: float, candidate: float) -> float | None:
+    if reference <= 0:
+        return None
+    return (candidate - reference) / reference * 100.0
+
+
+def _speedup_pct(reference: float, candidate: float) -> float | None:
+    change = _percent_change(reference, candidate)
+    return None if change is None else -change
+
+
 def _performance(profile: Mapping[str, Any], label: str) -> dict[str, Any]:
     records = _records(profile, label)
     tokens = sum(int(record.get("generated_tokens", 0) or 0) for record in records)
@@ -376,6 +388,8 @@ def _pair_performance(
     signature = _same_signature(baseline, candidate, label)
     fixed_work = bool(signature["token_equal"] and signature["stopping_equal"])
     saving = baseline_perf["model_elapsed_seconds"] - candidate_perf["model_elapsed_seconds"]
+    baseline_tokens = int(baseline_perf["generated_tokens"])
+    candidate_tokens = int(candidate_perf["generated_tokens"])
     return {
         "work_comparability": "fixed_work" if fixed_work else "changed_work",
         "fixed_work": fixed_work,
@@ -392,6 +406,103 @@ def _pair_performance(
         },
         "observed_model_seconds_difference": saving,
         "fixed_work_model_seconds_saving": saving if fixed_work else None,
+        "generated_token_delta": candidate_tokens - baseline_tokens,
+        "generated_token_change_pct": _percent_change(
+            float(baseline_tokens), float(candidate_tokens)
+        ),
+        "model_elapsed_seconds_delta": (
+            candidate_perf["model_elapsed_seconds"]
+            - baseline_perf["model_elapsed_seconds"]
+        ),
+        "model_elapsed_speedup_pct": _speedup_pct(
+            baseline_perf["model_elapsed_seconds"],
+            candidate_perf["model_elapsed_seconds"],
+        ),
+        "outer_generation_wall_seconds_delta": (
+            candidate_perf["outer_generation_wall_seconds"]
+            - baseline_perf["outer_generation_wall_seconds"]
+        ),
+        "outer_generation_wall_speedup_pct": _speedup_pct(
+            baseline_perf["outer_generation_wall_seconds"],
+            candidate_perf["outer_generation_wall_seconds"],
+        ),
+        "complete_request_stage_wall_seconds_delta": (
+            candidate_perf["complete_request_stage_wall_seconds"]
+            - baseline_perf["complete_request_stage_wall_seconds"]
+        ),
+        "complete_request_stage_wall_speedup_pct": _speedup_pct(
+            baseline_perf["complete_request_stage_wall_seconds"],
+            candidate_perf["complete_request_stage_wall_seconds"],
+        ),
+    }
+
+
+def _full_decode_performance(
+    baseline: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    candidate_totals: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    baseline_labels = [_performance(baseline, label) for label in LABELS]
+    candidate_labels = [_performance(candidate, label) for label in LABELS]
+    baseline_tokens = sum(int(values["generated_tokens"]) for values in baseline_labels)
+    candidate_logical = sum(
+        int(candidate_totals[label]["logical_steps"]) for label in LABELS
+    )
+    candidate_physical = sum(
+        int(candidate_totals[label]["physical_steps"]) for label in LABELS
+    )
+    candidate_wasted = sum(
+        int(candidate_totals[label]["wasted_steps"]) for label in LABELS
+    )
+    baseline_model = sum(float(values["model_elapsed_seconds"]) for values in baseline_labels)
+    candidate_model = sum(float(values["model_elapsed_seconds"]) for values in candidate_labels)
+    baseline_outer = sum(
+        float(values["outer_generation_wall_seconds"]) for values in baseline_labels
+    )
+    candidate_outer = sum(
+        float(values["outer_generation_wall_seconds"]) for values in candidate_labels
+    )
+    baseline_stage = float(baseline_labels[0]["complete_request_stage_wall_seconds"])
+    candidate_stage = float(candidate_labels[0]["complete_request_stage_wall_seconds"])
+    return {
+        "evidence_class": "natural_work_end_to_end",
+        "fixed_work": False,
+        "baseline_generated_tokens": baseline_tokens,
+        "candidate_logical_steps": candidate_logical,
+        "candidate_physical_steps": candidate_physical,
+        "candidate_wasted_steps": candidate_wasted,
+        "generated_token_delta": candidate_logical - baseline_tokens,
+        "generated_token_change_pct": _percent_change(
+            float(baseline_tokens), float(candidate_logical)
+        ),
+        "baseline_model_elapsed_seconds": baseline_model,
+        "candidate_model_elapsed_seconds": candidate_model,
+        "model_elapsed_seconds_delta": candidate_model - baseline_model,
+        "model_elapsed_speedup_pct": _speedup_pct(baseline_model, candidate_model),
+        "baseline_logical_steps_per_model_second": (
+            baseline_tokens / baseline_model if baseline_model > 0 else 0.0
+        ),
+        "candidate_logical_steps_per_model_second": (
+            candidate_logical / candidate_model if candidate_model > 0 else 0.0
+        ),
+        "candidate_physical_steps_per_model_second": (
+            candidate_physical / candidate_model if candidate_model > 0 else 0.0
+        ),
+        "candidate_wasted_step_fraction": (
+            candidate_wasted / candidate_physical if candidate_physical > 0 else 0.0
+        ),
+        "baseline_generation_outer_wall_seconds": baseline_outer,
+        "candidate_generation_outer_wall_seconds": candidate_outer,
+        "generation_outer_wall_seconds_delta": candidate_outer - baseline_outer,
+        "generation_outer_wall_speedup_pct": _speedup_pct(
+            baseline_outer, candidate_outer
+        ),
+        "baseline_complete_request_stage_wall_seconds": baseline_stage,
+        "candidate_complete_request_stage_wall_seconds": candidate_stage,
+        "complete_request_stage_wall_seconds_delta": candidate_stage - baseline_stage,
+        "complete_request_stage_wall_speedup_pct": _speedup_pct(
+            baseline_stage, candidate_stage
+        ),
     }
 
 
@@ -428,6 +539,9 @@ def summarize(
     scope: str,
     minimum_smoke_speedup_pct: float,
     full_fixed_work_saving_seconds: float,
+    minimum_smoke_complete_wall_speedup_pct: float = 0.0,
+    candidate_block_size: int = 8,
+    baseline_block_size: int | None = None,
 ) -> dict[str, Any]:
     if set(paths) != set(RUN_NAMES):
         raise GateError(f"profile paths must be exactly {RUN_NAMES}")
@@ -455,11 +569,25 @@ def summarize(
         except GateError as exc:
             failures.append(f"{name}: {exc}")
             artifacts[name] = {"path": None, "sha256": None, "size_bytes": None, "structure": None}
+    baseline_stats: dict[str, dict[str, dict[str, Any]]] = {}
     for name in ("baseline_first", "baseline_second"):
-        failures.extend(_validate_baseline(profiles[name], name=name))
+        if baseline_block_size is None:
+            failures.extend(_validate_baseline(profiles[name], name=name))
+        else:
+            control_failures, totals = _validate_k8_profile(
+                profiles[name],
+                name=name,
+                expected_block_size=baseline_block_size,
+            )
+            failures.extend(control_failures)
+            baseline_stats[name] = totals
     candidate_stats = {}
     for name in ("candidate_first", "candidate_second"):
-        candidate_failures, totals = _validate_k8_profile(profiles[name], name=name)
+        candidate_failures, totals = _validate_k8_profile(
+            profiles[name],
+            name=name,
+            expected_block_size=candidate_block_size,
+        )
         failures.extend(candidate_failures)
         candidate_stats[name] = totals
         structure = artifacts[name]["structure"]
@@ -508,6 +636,20 @@ def summarize(
                 artifacts[candidate_name]["structure"],
             ),
         }
+        orders[order]["full_decode"] = _full_decode_performance(
+            profiles[baseline_name],
+            profiles[candidate_name],
+            candidate_stats[candidate_name],
+        )
+        full_decode_fixed = all(
+            orders[order][label]["fixed_work"] for label in LABELS
+        )
+        orders[order]["full_decode"]["fixed_work"] = full_decode_fixed
+        orders[order]["full_decode"]["evidence_class"] = (
+            "fixed_work_counter_rng"
+            if full_decode_fixed
+            else "natural_work_end_to_end"
+        )
     main_speedups = []
     for order in orders.values():
         main = order["main_generation"]
@@ -521,11 +663,30 @@ def summarize(
         main["logical_tps_speedup_pct"] = speedup
         main_speedups.append(speedup)
     reciprocal_speedup = mean(main_speedups)
-    if scope == "smoke" and reciprocal_speedup < minimum_smoke_speedup_pct:
-        failures.append(
-            "reciprocal main logical TPS speedup "
-            f"{reciprocal_speedup:.3f}% is below {minimum_smoke_speedup_pct:.3f}%"
-        )
+    complete_wall_speedups = [
+        order["full_decode"]["complete_request_stage_wall_speedup_pct"]
+        for order in orders.values()
+    ]
+    reciprocal_complete_wall_speedup = mean(
+        float(value) for value in complete_wall_speedups if value is not None
+    )
+    if scope == "smoke":
+        if baseline_block_size is None:
+            for order_name, speedup in zip(orders, complete_wall_speedups, strict=True):
+                if (
+                    speedup is None
+                    or speedup < minimum_smoke_complete_wall_speedup_pct
+                ):
+                    failures.append(
+                        f"{order_name} natural-work complete-stage wall speedup "
+                        f"{speedup} is below "
+                        f"{minimum_smoke_complete_wall_speedup_pct:.3f}%"
+                    )
+        elif reciprocal_speedup < minimum_smoke_speedup_pct:
+            failures.append(
+                "reciprocal fixed-work main logical TPS speedup "
+                f"{reciprocal_speedup:.3f}% is below {minimum_smoke_speedup_pct:.3f}%"
+            )
 
     fixed_work_savings = [
         order["main_generation"]["fixed_work_model_seconds_saving"]
@@ -580,6 +741,13 @@ def summarize(
     return {
         "schema_version": 1,
         "scope": scope,
+        "comparison_mode": (
+            "accepted_vs_counter_candidate"
+            if baseline_block_size is None
+            else "counter_control_vs_counter_candidate"
+        ),
+        "candidate_block_size": candidate_block_size,
+        "baseline_block_size": baseline_block_size,
         "profile_paths": {name: str(path) for name, path in paths.items()},
         "contract_checks": contracts,
         "artifacts": artifacts,
@@ -591,8 +759,12 @@ def summarize(
         "baseline_repeatability": baseline_repeatability,
         "candidate_repeatability": candidate_repeatability,
         "candidate_k8_totals": candidate_stats,
+        "baseline_counter_totals": baseline_stats,
         "orders": orders,
         "reciprocal_main_logical_tps_speedup_pct": reciprocal_speedup,
+        "reciprocal_complete_request_stage_wall_speedup_pct": (
+            reciprocal_complete_wall_speedup
+        ),
         "fixed_work": {
             "available": full_fixed_work_available,
             "mean_main_model_seconds_saving": full_fixed_work_saving,
@@ -608,8 +780,13 @@ def summarize(
 def _write_text(path: Path, report: Mapping[str, Any]) -> None:
     lines = [
         f"scope={report['scope']}",
+        f"comparison_mode={report['comparison_mode']}",
+        f"baseline_block_size={report['baseline_block_size']}",
+        f"candidate_block_size={report['candidate_block_size']}",
         f"feasibility_pass={report['feasibility_pass']}",
         f"reciprocal_main_logical_tps_speedup_pct={report['reciprocal_main_logical_tps_speedup_pct']:.6f}",
+        "reciprocal_complete_request_stage_wall_speedup_pct="
+        f"{report['reciprocal_complete_request_stage_wall_speedup_pct']:.6f}",
         f"fixed_work_available={report['fixed_work']['available']}",
         f"fixed_work_main_saving_seconds={report['fixed_work']['mean_main_model_seconds_saving']}",
         f"promotion_pass={report['fixed_work']['promotion_pass']}",
@@ -641,6 +818,35 @@ def _write_text(path: Path, report: Mapping[str, Any]) -> None:
                     f"{prefix}.capture_seconds={k8['capture_seconds']:.6f}",
                 )
             )
+        full = order["full_decode"]
+        full_prefix = f"{order_name}.full_decode"
+        for key in (
+            "evidence_class",
+            "fixed_work",
+            "baseline_generated_tokens",
+            "candidate_logical_steps",
+            "candidate_physical_steps",
+            "candidate_wasted_steps",
+            "generated_token_delta",
+            "generated_token_change_pct",
+            "baseline_model_elapsed_seconds",
+            "candidate_model_elapsed_seconds",
+            "model_elapsed_seconds_delta",
+            "model_elapsed_speedup_pct",
+            "baseline_logical_steps_per_model_second",
+            "candidate_logical_steps_per_model_second",
+            "candidate_physical_steps_per_model_second",
+            "candidate_wasted_step_fraction",
+            "baseline_generation_outer_wall_seconds",
+            "candidate_generation_outer_wall_seconds",
+            "generation_outer_wall_seconds_delta",
+            "generation_outer_wall_speedup_pct",
+            "baseline_complete_request_stage_wall_seconds",
+            "candidate_complete_request_stage_wall_seconds",
+            "complete_request_stage_wall_seconds_delta",
+            "complete_request_stage_wall_speedup_pct",
+        ):
+            lines.append(f"{full_prefix}.{key}={full[key]}")
         lines.append(f"{order_name}.output_artifact_equal={order['output']['artifact_equal']}")
         lines.append(f"{order_name}.output_structure_equal={order['output']['structure']['equal']}")
         for key, value in order["output"]["structure"]["numeric_deltas"].items():
@@ -659,7 +865,14 @@ def main() -> None:
     parser.add_argument("--candidate-first", type=Path, required=True)
     parser.add_argument("--baseline-second", type=Path, required=True)
     parser.add_argument("--minimum-smoke-speedup-pct", type=float, default=0.0)
+    parser.add_argument(
+        "--minimum-smoke-complete-wall-speedup-pct",
+        type=float,
+        default=0.0,
+    )
     parser.add_argument("--full-fixed-work-saving-seconds", type=float, default=5.0)
+    parser.add_argument("--candidate-block-size", choices=(1, 4, 8), type=int, default=8)
+    parser.add_argument("--baseline-block-size", choices=(1, 4, 8), type=int)
     parser.add_argument("--json-output", type=Path, required=True)
     parser.add_argument("--text-output", type=Path, required=True)
     args = parser.parse_args()
@@ -671,6 +884,11 @@ def main() -> None:
         scope=args.scope,
         minimum_smoke_speedup_pct=args.minimum_smoke_speedup_pct,
         full_fixed_work_saving_seconds=args.full_fixed_work_saving_seconds,
+        minimum_smoke_complete_wall_speedup_pct=(
+            args.minimum_smoke_complete_wall_speedup_pct
+        ),
+        candidate_block_size=args.candidate_block_size,
+        baseline_block_size=args.baseline_block_size,
     )
     args.json_output.parent.mkdir(parents=True, exist_ok=True)
     args.json_output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

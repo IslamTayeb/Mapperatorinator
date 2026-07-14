@@ -23,6 +23,7 @@ from .runtime_context import active_prefix_self_attention_context
 
 
 K8_BLOCK_SIZE = 8
+SUPPORTED_BLOCK_SIZES = (1, 4, K8_BLOCK_SIZE)
 RNG_POLICY = "counter_request_seed_window_prompt_v2"
 _GENERIC_SCORE_PROCESSORS = {
     "TopKLogitsWarper",
@@ -540,8 +541,10 @@ class _ChildGraphSequence:
         model_graph: torch.cuda.CUDAGraph,
         tail_graph: torch.cuda.CUDAGraph,
         *,
+        block_size: int = K8_BLOCK_SIZE,
         device: torch.device | None = None,
     ) -> "_ChildGraphSequence":
+        block_size = _validate_block_size(block_size)
         if not hasattr(model_graph, "raw_cuda_graph") or not hasattr(
             tail_graph, "raw_cuda_graph"
         ):
@@ -557,7 +560,7 @@ class _ChildGraphSequence:
             parent, = _cuda_check(runtime.cudaGraphCreate(0), "cudaGraphCreate")
             previous = None
             try:
-                for _ in range(K8_BLOCK_SIZE):
+                for _ in range(block_size):
                     for child in (model_graph, tail_graph):
                         dependencies = None if previous is None else (previous,)
                         node, = _cuda_check(
@@ -645,6 +648,7 @@ class _K8GraphLifecycle:
 
 
 _ACTIVE_K8_LIFECYCLE: _K8GraphLifecycle | None = None
+_ACTIVE_BLOCK_SIZE: int | None = None
 
 
 @dataclass(slots=True)
@@ -832,6 +836,7 @@ def _capture_k8_entry(
     state: K8DeviceState,
     processor: K8LogitsProcessor,
     do_sample: bool,
+    block_size: int = K8_BLOCK_SIZE,
 ) -> _K8GraphEntry:
     if not torch.cuda.is_available():
         raise RuntimeError("K8 graph capture requires CUDA")
@@ -858,6 +863,7 @@ def _capture_k8_entry(
         parent = _ChildGraphSequence.build(
             model_graph,
             tail_graph,
+            block_size=block_size,
             device=device,
         )
         try:
@@ -876,12 +882,28 @@ def _capture_k8_entry(
             raise
 
 
-def _k8_eligible(cur_len: int, max_length: int, bucket_size: int) -> bool:
-    if cur_len + K8_BLOCK_SIZE > max_length:
+def _validate_block_size(block_size: int) -> int:
+    if isinstance(block_size, bool) or not isinstance(block_size, int):
+        raise TypeError("candidate block size must be an integer")
+    if block_size not in SUPPORTED_BLOCK_SIZES:
+        raise ValueError(
+            f"candidate block size must be one of {SUPPORTED_BLOCK_SIZES}, got {block_size}"
+        )
+    return block_size
+
+
+def _k8_eligible(
+    cur_len: int,
+    max_length: int,
+    bucket_size: int,
+    block_size: int = K8_BLOCK_SIZE,
+) -> bool:
+    block_size = _validate_block_size(block_size)
+    if cur_len + block_size > max_length:
         return False
     start = _bucketed_prefix_length(cur_len, bucket_size, max_length)
     end = _bucketed_prefix_length(
-        cur_len + K8_BLOCK_SIZE - 1, bucket_size, max_length
+        cur_len + block_size - 1, bucket_size, max_length
     )
     return start == end
 
@@ -976,7 +998,8 @@ def k8_active_prefix_decode_generate(
     )):
         raise ValueError("K8 supports tensor outputs only")
     lifecycle = _ACTIVE_K8_LIFECYCLE
-    if lifecycle is None:
+    block_size = _ACTIVE_BLOCK_SIZE
+    if lifecycle is None or block_size is None:
         raise RuntimeError("K8 decode must run inside install_k8_candidate()")
     pad_token_id = int(generation_config._pad_token_tensor.reshape(-1)[0].item())
     _, cur_len = input_ids.shape
@@ -1041,7 +1064,7 @@ def k8_active_prefix_decode_generate(
     stats = {
         "k8_candidate": True,
         "window_serial": window_identity,
-        "block_size": K8_BLOCK_SIZE,
+        "block_size": block_size,
         "prefill_steps": 0,
         "eligible_steps": 0,
         "block_replays": 0,
@@ -1077,7 +1100,10 @@ def k8_active_prefix_decode_generate(
     scores = None
     while not finished:
         if is_prefill or not _k8_eligible(
-            cur_len, max_length, active_prefix_bucket_size
+            cur_len,
+            max_length,
+            active_prefix_bucket_size,
+            block_size,
         ):
             active_ids = state.sequence[:, :cur_len]
             model_inputs = model.prepare_inputs_for_generation(
@@ -1128,7 +1154,7 @@ def k8_active_prefix_decode_generate(
         model_inputs = model.prepare_inputs_for_generation(
             active_ids, **model_kwargs
         )
-        key = ("k8_candidate", id(state), prefix, do_sample, tuple(
+        key = ("k8_candidate", block_size, id(state), prefix, do_sample, tuple(
             (name, tuple(value.shape), str(value.dtype), str(value.device))
             if isinstance(value, torch.Tensor)
             else (name, type(value).__name__, id(value))
@@ -1147,6 +1173,7 @@ def k8_active_prefix_decode_generate(
                 state=state,
                 processor=processor,
                 do_sample=do_sample,
+                block_size=block_size,
             )
             try:
                 lifecycle.register(entry.parent)
@@ -1186,11 +1213,11 @@ def k8_active_prefix_decode_generate(
                 static_value.copy_(current)
                 stats["copy_calls"] += 1
                 stats["copy_bytes"] += current.numel() * current.element_size()
-        stats["eligible_steps"] += K8_BLOCK_SIZE
+        stats["eligible_steps"] += block_size
         with profile_range("generation.k8_parent_graph_replay"):
             entry.parent.replay()
         entry.block_replays += 1
-        raw_entry["decode_replays"] += K8_BLOCK_SIZE
+        raw_entry["decode_replays"] += block_size
         stats["block_replays"] += 1
         stats["status_reads"] += 1
         status = torch.stack((
@@ -1220,17 +1247,19 @@ def k8_active_prefix_decode_generate(
 
 
 @contextmanager
-def install_k8_candidate() -> Iterator[None]:
-    """Temporarily install K8 only for an explicit candidate runner."""
+def install_k8_candidate(*, block_size: int = K8_BLOCK_SIZE) -> Iterator[None]:
+    """Temporarily install a bounded block candidate for an explicit runner."""
 
-    global _ACTIVE_K8_LIFECYCLE
+    global _ACTIVE_BLOCK_SIZE, _ACTIVE_K8_LIFECYCLE
     from . import engine
 
-    if _ACTIVE_K8_LIFECYCLE is not None:
+    block_size = _validate_block_size(block_size)
+    if _ACTIVE_K8_LIFECYCLE is not None or _ACTIVE_BLOCK_SIZE is not None:
         raise RuntimeError("K8 candidate context cannot be nested")
     lifecycle = _K8GraphLifecycle()
     previous = engine.active_prefix_decode_generate
     _ACTIVE_K8_LIFECYCLE = lifecycle
+    _ACTIVE_BLOCK_SIZE = block_size
     engine.active_prefix_decode_generate = k8_active_prefix_decode_generate
     try:
         yield
@@ -1240,6 +1269,7 @@ def install_k8_candidate() -> Iterator[None]:
             lifecycle.close_all()
         finally:
             _ACTIVE_K8_LIFECYCLE = None
+            _ACTIVE_BLOCK_SIZE = None
 
 
 __all__ = [
@@ -1247,6 +1277,7 @@ __all__ = [
     "K8LogitsProcessor",
     "K8_BLOCK_SIZE",
     "RNG_POLICY",
+    "SUPPORTED_BLOCK_SIZES",
     "install_k8_candidate",
     "k8_active_prefix_decode_generate",
 ]
