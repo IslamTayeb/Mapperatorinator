@@ -73,6 +73,8 @@ def test_summary_weights_live_sentinels_and_assigns_zero_delta_elsewhere() -> No
     assert charged["timing_saving_seconds"] == pytest.approx(0.011)
     assert charged["main_saving_seconds"] == pytest.approx(0.31)
     assert charged["sizing_pass"]
+    assert charged["per_bucket"]["576"]["timing_replays"] == 0
+    assert charged["per_bucket"]["640"]["timing_replays"] == 0
 
 
 def test_summary_rejects_partial_coverage_invalid_counts_and_excess_drift() -> None:

@@ -640,7 +640,7 @@ def profile_component(args, *, output_path: Path, warmup: int, iters: int) -> di
             raise RuntimeError("component candidate mutated source cache or weights")
         bucket_reports[prefix] = {
             "main_decode_replays": main_counts[prefix],
-            "timing_decode_replays": timing_counts[prefix],
+            "timing_decode_replays": timing_counts.get(prefix, 0),
             "key_pack_setup_ms": key_pack_ms,
             "variants": variants,
         }
