@@ -97,6 +97,13 @@ def _load_manifest(path: Path) -> dict[str, Any]:
         raise RuntimeError(
             f"native extension manifest {path} must use schema {SCHEMA_VERSION}"
         )
+    source_commit = manifest.get("source_commit")
+    if (
+        not isinstance(source_commit, str)
+        or len(source_commit) != 40
+        or any(character not in "0123456789abcdef" for character in source_commit)
+    ):
+        raise RuntimeError("native extension manifest requires a full source commit")
     if manifest.get("abi") != runtime_abi():
         raise RuntimeError(
             "native extension manifest ABI mismatch: "
@@ -221,12 +228,18 @@ def write_loaded_extension_manifest(
     output_path: Path,
     *,
     expected_names: tuple[str, ...],
+    source_commit: str,
 ) -> dict[str, Any]:
     arches = requested_cuda_arches()
     if not arches:
         raise RuntimeError("building a direct-load manifest requires TORCH_CUDA_ARCH_LIST")
     if os.environ.get(MANIFEST_ENV):
         raise RuntimeError(f"unset {MANIFEST_ENV} before building a manifest")
+    if (
+        len(source_commit) != 40
+        or any(character not in "0123456789abcdef" for character in source_commit)
+    ):
+        raise RuntimeError("manifest source_commit must be a full lowercase Git hash")
     if set(_LOADED_EXTENSIONS) != set(expected_names):
         raise RuntimeError(
             "loaded native extension set mismatch: "
@@ -255,6 +268,7 @@ def write_loaded_extension_manifest(
         }
     manifest = {
         "schema_version": SCHEMA_VERSION,
+        "source_commit": source_commit,
         "abi": runtime_abi(),
         "cuda_arches": arches,
         "extensions": entries,
@@ -264,6 +278,91 @@ def write_loaded_extension_manifest(
     return manifest
 
 
+def validate_packaged_manifest(
+    manifest_path: Path,
+    *,
+    expected_source_commit: str,
+    expected_manifest_sha256: str,
+    extension_cache_root: Path,
+) -> dict[str, Any]:
+    manifest_path = manifest_path.expanduser().resolve()
+    actual_manifest_hash = _sha256_file(manifest_path)
+    if actual_manifest_hash != expected_manifest_sha256:
+        raise RuntimeError(
+            "native extension manifest hash mismatch: "
+            f"expected {expected_manifest_sha256}, got {actual_manifest_hash}"
+        )
+    manifest = _load_manifest(manifest_path)
+    if manifest["source_commit"] != expected_source_commit:
+        raise RuntimeError(
+            "native extension manifest commit mismatch: "
+            f"expected {expected_source_commit}, got {manifest['source_commit']}"
+        )
+    extensions = manifest.get("extensions")
+    if not isinstance(extensions, dict) or not extensions:
+        raise RuntimeError("native extension manifest has no extensions")
+    cache_root = extension_cache_root.expanduser().resolve()
+    if not cache_root.is_dir():
+        raise RuntimeError(f"native extension cache root is missing: {cache_root}")
+    validated: dict[str, Any] = {}
+    for name, entry in sorted(extensions.items()):
+        if not isinstance(name, str) or not isinstance(entry, dict):
+            raise RuntimeError("native extension manifest entries must be named objects")
+        relative = entry.get("library")
+        if not isinstance(relative, str):
+            raise RuntimeError(f"native extension {name} has no packaged library")
+        package_library = (manifest_path.parent / relative).resolve()
+        if not package_library.is_relative_to(manifest_path.parent.resolve()):
+            raise RuntimeError(f"native extension package library for {name} escapes root")
+        cache_library = (cache_root / name / f"{name}.so").resolve()
+        if not package_library.is_file():
+            raise RuntimeError(
+                f"native extension package library for {name} is missing: "
+                f"{package_library}"
+            )
+        if not cache_library.is_file():
+            raise RuntimeError(
+                f"native extension cached library for {name} is missing: "
+                f"{cache_library}"
+            )
+        expected_hash = entry.get("library_sha256")
+        package_hash = _sha256_file(package_library)
+        cache_hash = _sha256_file(cache_library)
+        if package_hash != expected_hash or cache_hash != expected_hash:
+            raise RuntimeError(
+                f"native extension artifact hash mismatch for {name}: "
+                f"manifest={expected_hash}, package={package_hash}, cache={cache_hash}"
+            )
+        functions = entry.get("functions")
+        source_hash = entry.get("source_sha256")
+        if not isinstance(functions, list) or not functions or not all(
+            isinstance(function, str) and function for function in functions
+        ):
+            raise RuntimeError(f"native extension {name} has invalid exported functions")
+        if (
+            not isinstance(source_hash, str)
+            or len(source_hash) != 64
+            or any(character not in "0123456789abcdef" for character in source_hash)
+        ):
+            raise RuntimeError(f"native extension {name} has invalid source hash")
+        validated[name] = {
+            "source_sha256": source_hash,
+            "library_sha256": expected_hash,
+            "functions": functions,
+            "package_library": str(package_library),
+            "cache_library": str(cache_library),
+        }
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "source_commit": manifest["source_commit"],
+        "manifest": str(manifest_path),
+        "manifest_sha256": actual_manifest_hash,
+        "extension_cache_root": str(cache_root),
+        "extensions": validated,
+        "pass": True,
+    }
+
+
 __all__ = [
     "MANIFEST_ENV",
     "extension_source_hash",
@@ -271,5 +370,6 @@ __all__ = [
     "loaded_extension_records",
     "requested_cuda_arches",
     "runtime_abi",
+    "validate_packaged_manifest",
     "write_loaded_extension_manifest",
 ]
