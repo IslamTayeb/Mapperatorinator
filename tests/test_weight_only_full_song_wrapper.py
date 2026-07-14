@@ -12,10 +12,14 @@ WRAPPER = ROOT / "scripts/dcc/verify_weight_only_full_song_reciprocal.sbatch"
 K4_WRAPPER = (
     ROOT / "scripts/dcc/verify_k4_split_weight_full_song_reciprocal.sbatch"
 )
+SHARED_ROPE_WRAPPER = (
+    ROOT
+    / "scripts/dcc/verify_k4_split_weight_shared_rope_full_song_reciprocal.sbatch"
+)
 
 
 def test_weight_only_full_song_wrapper_has_valid_bash_syntax() -> None:
-    for wrapper in (WRAPPER, K4_WRAPPER):
+    for wrapper in (WRAPPER, K4_WRAPPER, SHARED_ROPE_WRAPPER):
         subprocess.run(["bash", "-n", str(wrapper)], check=True)
 
 
@@ -35,7 +39,7 @@ def test_wrapper_uses_full_fp32_optimized_reciprocal_order_and_launchers() -> No
         "CANDIDATE_RUNNER=${CANDIDATE_RUNNER:-utils/run_approximate_weight_only.py}"
         in source
     )
-    assert '"$PYTHON" "$CANDIDATE_REPO/$CANDIDATE_RUNNER"' in source
+    assert '"$PYTHON" "$CANDIDATE_REPO/$runner"' in source
     assert source.count("run_profile baseline_first") == 1
     assert source.count("run_profile candidate_first") == 1
     assert source.count("run_profile candidate_second") == 1
@@ -95,6 +99,27 @@ def test_dedicated_k4_wrapper_pins_combined_runner_and_contract() -> None:
     assert "export REQUIRE_EXACT_TIMING=false" in source
     assert "export REQUIRE_K4_CANDIDATE=true" in source
     assert "verify_weight_only_full_song_reciprocal.sbatch" in source
+
+
+def test_shared_rope_wrapper_compares_against_exact_combined_control() -> None:
+    source = SHARED_ROPE_WRAPPER.read_text(encoding="utf-8")
+
+    assert "export BASELINE_RUNNER=utils/run_k4_approximate_weight_only.py" in source
+    assert (
+        "export CANDIDATE_RUNNER="
+        "utils/run_k4_shared_rope_approximate_weight_only.py"
+    ) in source
+    assert "export REQUIRE_EXACT_TIMING=true" in source
+    assert "export REQUIRE_K4_CANDIDATE=true" in source
+    assert "export REQUIRE_SHARED_ROPE_INCREMENTAL=true" in source
+    assert "verify_weight_only_full_song_reciprocal.sbatch" in source
+
+    general = WRAPPER.read_text(encoding="utf-8")
+    assert "ANALYSIS_MODE=exact-fp32" in general
+    assert "--require-exact-label main_generation" in general
+    assert "--require-exact-dispatch-label main_generation" in general
+    assert "shared-RoPE did not execute" in general
+    assert 'runtime_candidate=$candidate' in general
 
 
 def test_general_wrapper_requires_k4_metadata_for_every_profile() -> None:
@@ -201,10 +226,11 @@ def test_wrapper_requires_initialization_evidence_and_relaxed_analyzer_outputs()
         "initialization_cuda_memory",
     ):
         assert field in source
-    assert "--mode relaxed" in source
+    assert "ANALYSIS_MODE=relaxed" in source
+    assert '--mode "$ANALYSIS_MODE"' in source
     assert '"$RUN_ROOT/reciprocal-analysis.json"' in source
     assert '"$RUN_ROOT/reciprocal-analysis.txt"' in source
-    assert "parity.claim=relaxed-nonexact" in source
+    assert "ANALYSIS_CLAIM=relaxed-nonexact" in source
     assert "--require-exact-label timing_context" in source
     assert "--require-exact-dispatch-label timing_context" in source
     assert "--require-dispatch-declaration" in source

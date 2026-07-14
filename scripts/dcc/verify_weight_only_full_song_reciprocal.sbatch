@@ -22,9 +22,11 @@ BASELINE_BRANCH=${BASELINE_BRANCH:?Set BASELINE_BRANCH explicitly}
 CANDIDATE_BRANCH=${CANDIDATE_BRANCH:?Set CANDIDATE_BRANCH explicitly}
 CANDIDATE_REMOTE=${CANDIDATE_REMOTE:-origin}
 PROFILE_CONFIG=${PROFILE_CONFIG:-profile_salvalai}
+BASELINE_RUNNER=${BASELINE_RUNNER:-}
 CANDIDATE_RUNNER=${CANDIDATE_RUNNER:-utils/run_approximate_weight_only.py}
 REQUIRE_EXACT_TIMING=${REQUIRE_EXACT_TIMING:-true}
 REQUIRE_K4_CANDIDATE=${REQUIRE_K4_CANDIDATE:-false}
+REQUIRE_SHARED_ROPE_INCREMENTAL=${REQUIRE_SHARED_ROPE_INCREMENTAL:-false}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_LABEL=${RUN_LABEL:-split-weight-full-song-reciprocal}
 RUN_ROOT="$WORK/runs/$RUN_LABEL-${SLURM_JOB_ID:-manual}"
@@ -60,6 +62,16 @@ if [[ ! -f "$CANDIDATE_REPO/$CANDIDATE_RUNNER" ]]; then
   echo "missing candidate runner at $CANDIDATE_REPO/$CANDIDATE_RUNNER" >&2
   exit 2
 fi
+if [[ -n "$BASELINE_RUNNER" ]]; then
+  if [[ "$BASELINE_RUNNER" = /* || "$BASELINE_RUNNER" == *".."* ]]; then
+    echo "BASELINE_RUNNER must be a repository-relative path without .." >&2
+    exit 2
+  fi
+  if [[ ! -f "$BASELINE_REPO/$BASELINE_RUNNER" ]]; then
+    echo "missing baseline runner at $BASELINE_REPO/$BASELINE_RUNNER" >&2
+    exit 2
+  fi
+fi
 if [[ "$REQUIRE_EXACT_TIMING" != true && "$REQUIRE_EXACT_TIMING" != false ]]; then
   echo "REQUIRE_EXACT_TIMING must be true or false" >&2
   exit 2
@@ -68,7 +80,34 @@ if [[ "$REQUIRE_K4_CANDIDATE" != true && "$REQUIRE_K4_CANDIDATE" != false ]]; th
   echo "REQUIRE_K4_CANDIDATE must be true or false" >&2
   exit 2
 fi
-if [[ "$REQUIRE_K4_CANDIDATE" == true ]]; then
+if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" != true \
+  && "$REQUIRE_SHARED_ROPE_INCREMENTAL" != false ]]; then
+  echo "REQUIRE_SHARED_ROPE_INCREMENTAL must be true or false" >&2
+  exit 2
+fi
+if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
+  if [[ "$REQUIRE_K4_CANDIDATE" != true ]]; then
+    echo "shared-RoPE incremental gate requires K4 contract validation" >&2
+    exit 2
+  fi
+  if [[ "$REQUIRE_EXACT_TIMING" != true ]]; then
+    echo "shared-RoPE incremental gate requires exact timing parity" >&2
+    exit 2
+  fi
+  if [[ "$BASELINE_RUNNER" != utils/run_k4_approximate_weight_only.py ]]; then
+    echo "shared-RoPE incremental gate requires the exact combined control runner" >&2
+    exit 2
+  fi
+  if [[ "$CANDIDATE_RUNNER" \
+    != utils/run_k4_shared_rope_approximate_weight_only.py ]]; then
+    echo "shared-RoPE incremental gate requires the exact shared-RoPE runner" >&2
+    exit 2
+  fi
+elif [[ "$REQUIRE_K4_CANDIDATE" == true ]]; then
+  if [[ -n "$BASELINE_RUNNER" ]]; then
+    echo "ordinary K4 gate requires the accepted baseline runner" >&2
+    exit 2
+  fi
   if [[ "$CANDIDATE_RUNNER" != utils/run_k4_approximate_weight_only.py ]]; then
     echo "K4 candidate gate requires the exact combined runner" >&2
     exit 2
@@ -77,7 +116,8 @@ if [[ "$REQUIRE_K4_CANDIDATE" == true ]]; then
     echo "K4 candidate gate requires documented timing drift" >&2
     exit 2
   fi
-elif [[ "$CANDIDATE_RUNNER" != utils/run_approximate_weight_only.py ]]; then
+elif [[ -n "$BASELINE_RUNNER" \
+  || "$CANDIDATE_RUNNER" != utils/run_approximate_weight_only.py ]]; then
   echo "non-K4 gate requires the default mixed-weight runner" >&2
   exit 2
 fi
@@ -231,9 +271,11 @@ echo "candidate_branch=$CANDIDATE_BRANCH"
 echo "candidate_remote_ref=$CANDIDATE_REMOTE_REF"
 echo "same_commit_gate=true"
 echo "profile_config=$PROFILE_CONFIG"
+echo "baseline_runner=${BASELINE_RUNNER:-accepted}"
 echo "candidate_runner=$CANDIDATE_RUNNER"
 echo "require_exact_timing=$REQUIRE_EXACT_TIMING"
 echo "require_k4_candidate=$REQUIRE_K4_CANDIDATE"
+echo "require_shared_rope_incremental=$REQUIRE_SHARED_ROPE_INCREMENTAL"
 echo "audio=$AUDIO"
 echo "run_root=$RUN_ROOT"
 echo "extension_cache_mode=$EXTENSION_CACHE_MODE"
@@ -366,6 +408,12 @@ run_profile() {
   local output="$RUN_ROOT/$role"
   local compiler_cache="$RUN_ROOT/compiler-cache/$role"
   local init_json="$RUN_ROOT/candidate-initialization/$role.json"
+  local runtime_candidate=$candidate
+  local runner=$CANDIDATE_RUNNER
+  if [[ "$candidate" == 0 && -n "$BASELINE_RUNNER" ]]; then
+    runtime_candidate=1
+    runner=$BASELINE_RUNNER
+  fi
   local legacy_reset=()
   if grep -q 'inference_generation_compile:' "$repo/config.py"; then
     legacy_reset+=(inference_generation_compile=false)
@@ -382,8 +430,8 @@ run_profile() {
     export TRITON_CACHE_DIR="$compiler_cache/triton"
     export CUDA_CACHE_PATH="$compiler_cache/cuda"
     cd "$repo"
-    if [[ "$candidate" == 1 ]]; then
-      "$PYTHON" "$CANDIDATE_REPO/$CANDIDATE_RUNNER" \
+    if [[ "$runtime_candidate" == 1 ]]; then
+      "$PYTHON" "$CANDIDATE_REPO/$runner" \
         --config-name "$PROFILE_CONFIG" \
         --output-init-json "$init_json" \
         output_path="$output" \
@@ -398,11 +446,11 @@ run_profile() {
         "${legacy_reset[@]}"
     fi
   )
-  if [[ "$candidate" == 1 && ! -s "$init_json" ]]; then
+  if [[ "$runtime_candidate" == 1 && ! -s "$init_json" ]]; then
     echo "missing candidate initialization evidence for $role" >&2
     exit 2
   fi
-  if [[ "$candidate" == 0 && -e "$init_json" ]]; then
+  if [[ "$runtime_candidate" == 0 && -e "$init_json" ]]; then
     echo "baseline unexpectedly produced candidate initialization evidence" >&2
     exit 2
   fi
@@ -414,7 +462,7 @@ run_profile() {
   fi
   printf '%s\n' "$profile" > "$RUN_ROOT/$role.profile-path.txt"
   local validation_role=baseline
-  if [[ "$candidate" == 1 ]]; then
+  if [[ "$runtime_candidate" == 1 ]]; then
     validation_role=candidate
   fi
   (
@@ -425,7 +473,7 @@ run_profile() {
       > "$RUN_ROOT/$role.weight-only-validation.json"
   )
   local k4_validation_role=baseline
-  if [[ "$candidate" == 1 && "$REQUIRE_K4_CANDIDATE" == true ]]; then
+  if [[ "$runtime_candidate" == 1 && "$REQUIRE_K4_CANDIDATE" == true ]]; then
     k4_validation_role=candidate
   fi
   (
@@ -545,7 +593,12 @@ summary = {
 )
 PY
 
-"$PYTHON" - "$RUN_ROOT" <<'PY'
+INITIALIZATION_ROLES=candidate_first,candidate_second
+if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
+  INITIALIZATION_ROLES=baseline_first,candidate_first,candidate_second,baseline_second
+fi
+"$PYTHON" - "$RUN_ROOT" "$INITIALIZATION_ROLES" \
+  "$REQUIRE_SHARED_ROPE_INCREMENTAL" <<'PY'
 import json
 import math
 import statistics
@@ -553,6 +606,8 @@ import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
+roles = tuple(sys.argv[2].split(","))
+require_shared_rope = sys.argv[3] == "true"
 runs = {}
 required_numbers = (
     "initialization_wall_seconds",
@@ -566,7 +621,7 @@ required_numbers = (
     "retained_fp32_source_weight_bytes",
     "packed_weight_bytes",
 )
-for role in ("candidate_first", "candidate_second"):
+for role in roles:
     path = root / "candidate-initialization" / f"{role}.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
     if payload.get("result_class") != "documented-drift":
@@ -597,6 +652,28 @@ for role in ("candidate_first", "candidate_second"):
             raise SystemExit(f"{role}: invalid initialization memory field {key}")
     runs[role] = payload
 
+if require_shared_rope:
+    for role in ("candidate_first", "candidate_second"):
+        shared = runs[role].get("shared_rope")
+        if not isinstance(shared, dict):
+            raise SystemExit(f"{role}: missing shared-RoPE evidence")
+        if shared.get("scope") != "main-model-only":
+            raise SystemExit(f"{role}: shared-RoPE scope is wrong")
+        if shared.get("incremental_exactness_claim") is not True:
+            raise SystemExit(f"{role}: shared-RoPE exactness declaration is missing")
+        stats = shared.get("stats")
+        if not isinstance(stats, dict):
+            raise SystemExit(f"{role}: shared-RoPE stats are missing")
+        if stats.get("forwards", 0) <= 0 or stats.get("reuses", 0) <= 0:
+            raise SystemExit(f"{role}: shared-RoPE did not execute")
+        if stats.get("computes") != stats.get("expected_computes"):
+            raise SystemExit(f"{role}: shared-RoPE compute accounting failed")
+        if stats.get("reuses") != stats.get("expected_reuses"):
+            raise SystemExit(f"{role}: shared-RoPE reuse accounting failed")
+    for role in ("baseline_first", "baseline_second"):
+        if "shared_rope" in runs[role] or "combined_runtime" in runs[role]:
+            raise SystemExit(f"{role}: combined control unexpectedly enabled shared RoPE")
+
 summary = {
     "schema_version": 1,
     "result_class": "documented-drift",
@@ -613,15 +690,37 @@ summary = {
 )
 PY
 
+ANALYSIS_MODE=relaxed
+ANALYSIS_CLAIM=relaxed-nonexact
 ANALYSIS_EXACT_ARGS=()
-ANALYSIS_TIMING_DISPATCH_ARGS=()
-if [[ "$REQUIRE_EXACT_TIMING" == true ]]; then
+ANALYSIS_DISPATCH_ARGS=(
+  --allow-optional-dispatch-delta 'optimized_result_class'
+  --allow-dispatch-delta
+    'records.main_generation[[]*].optimized_dispatch_capture_hits'
+  --allow-dispatch-delta
+    'records.main_generation[[]*].optimized_dispatch_capture_hits.*'
+  --allow-dispatch-delta
+    'records.main_generation[[]*].native_cross_mlp_tail_*'
+  --allow-optional-dispatch-delta
+    'records.main_generation[[]*].optimized_cuda_graphs.*'
+)
+if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
+  ANALYSIS_MODE=exact-fp32
+  ANALYSIS_CLAIM=exact-fp32
+  ANALYSIS_EXACT_ARGS=(
+    --require-exact-label timing_context
+    --require-exact-label main_generation
+    --require-exact-dispatch-label timing_context
+    --require-exact-dispatch-label main_generation
+  )
+  ANALYSIS_DISPATCH_ARGS=()
+elif [[ "$REQUIRE_EXACT_TIMING" == true ]]; then
   ANALYSIS_EXACT_ARGS=(
     --require-exact-label timing_context
     --require-exact-dispatch-label timing_context
   )
 else
-  ANALYSIS_TIMING_DISPATCH_ARGS=(
+  ANALYSIS_DISPATCH_ARGS+=(
     --allow-dispatch-delta
       'records.timing_context[[]*].optimized_dispatch_capture_hits'
     --allow-dispatch-delta
@@ -638,19 +737,10 @@ fi
     --candidate-first-profile "$CANDIDATE_FIRST" \
     --candidate-second-profile "$CANDIDATE_SECOND" \
     --baseline-second-profile "$BASELINE_SECOND" \
-    --mode relaxed \
+    --mode "$ANALYSIS_MODE" \
     "${ANALYSIS_EXACT_ARGS[@]}" \
     --require-dispatch-declaration \
-    "${ANALYSIS_TIMING_DISPATCH_ARGS[@]}" \
-    --allow-optional-dispatch-delta 'optimized_result_class' \
-    --allow-dispatch-delta \
-      'records.main_generation[[]*].optimized_dispatch_capture_hits' \
-    --allow-dispatch-delta \
-      'records.main_generation[[]*].optimized_dispatch_capture_hits.*' \
-    --allow-dispatch-delta \
-      'records.main_generation[[]*].native_cross_mlp_tail_*' \
-    --allow-optional-dispatch-delta \
-      'records.main_generation[[]*].optimized_cuda_graphs.*' \
+    "${ANALYSIS_DISPATCH_ARGS[@]}" \
     --json-output "$RUN_ROOT/reciprocal-analysis.json" \
     --text-output "$RUN_ROOT/reciprocal-analysis.txt"
 )
@@ -677,13 +767,25 @@ for artifact in \
     exit 2
   fi
 done
+if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
+  for artifact in \
+    "$RUN_ROOT/candidate-initialization/baseline_first.json" \
+    "$RUN_ROOT/candidate-initialization/baseline_second.json"; do
+    if [[ ! -s "$artifact" ]]; then
+      echo "missing required incremental-control artifact: $artifact" >&2
+      exit 2
+    fi
+  done
+fi
 
-grep -q '^mode=relaxed$' "$RUN_ROOT/reciprocal-analysis.txt"
-grep -q '^parity.claim=relaxed-nonexact$' "$RUN_ROOT/reciprocal-analysis.txt"
+grep -q "^mode=$ANALYSIS_MODE$" "$RUN_ROOT/reciprocal-analysis.txt"
+grep -q "^parity.claim=$ANALYSIS_CLAIM$" "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^parity.baseline_repeat_stable=true$' "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^parity.candidate_repeat_stable=true$' "$RUN_ROOT/reciprocal-analysis.txt"
 EXPECTED_EXACT_LABELS=none
-if [[ "$REQUIRE_EXACT_TIMING" == true ]]; then
+if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
+  EXPECTED_EXACT_LABELS=timing_context,main_generation
+elif [[ "$REQUIRE_EXACT_TIMING" == true ]]; then
   EXPECTED_EXACT_LABELS=timing_context
 fi
 grep -q "^parity.required_exact_labels=$EXPECTED_EXACT_LABELS$" \
