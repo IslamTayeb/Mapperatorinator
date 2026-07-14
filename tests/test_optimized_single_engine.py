@@ -61,7 +61,7 @@ def _loader_kwargs(**overrides):
 def test_runtime_metadata_exposes_two_fixed_accepted_presets():
     expected_versions = {
         "fp32": "accepted-fp32-native-cross-mlp-289-v3",
-        "fp16": "accepted-fp16-all-fused-v2",
+        "fp16": "candidate-fp16-all-fused-split-kv-v3",
     }
     for precision, version in expected_versions.items():
         metadata = OptimizedSingleRuntime(
@@ -89,12 +89,10 @@ def test_runtime_metadata_exposes_two_fixed_accepted_presets():
             "native_decode_kernels": True,
             "native_q1_self_attention": True,
             "native_q1_rope_cache_self_attention": True,
-            "native_q1_rope_cache_split_kv": precision == "fp32",
-            "native_q1_rope_cache_split_kv_split_count": (
-                8 if precision == "fp32" else None
-            ),
-            "native_q1_rope_cache_split_kv_prefix_buckets": (
-                tuple(range(192, 833, 64)) if precision == "fp32" else ()
+            "native_q1_rope_cache_split_kv": True,
+            "native_q1_rope_cache_split_kv_split_count": 8,
+            "native_q1_rope_cache_split_kv_prefix_buckets": tuple(
+                range(192, 833, 64)
             ),
             "native_cross_mlp_tail": True,
         }

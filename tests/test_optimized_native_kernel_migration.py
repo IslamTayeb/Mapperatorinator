@@ -141,7 +141,16 @@ def test_q1_kernel_import_does_not_build_and_loader_is_singleton(monkeypatch):
         assert "float numer = 0.0f" in body
         assert "extern __shared__ float shared_mem[]" in body
     assert source.count('asm("trap;")') == 2
-    assert "split-KV q1 requires fp32 storage" in source
+    assert "split-KV q1 requires fp32 or fp16 storage" in source
+    assert "split_kv_prepare_rope_cache_kernel<scalar_t, block_size>" in source
+    assert "split_kv_partial_kernel<scalar_t, block_size>" in source
+    assert "split_kv_merge_kernel<scalar_t, block_size>" in source
+    assert "LAUNCH_SPLIT_KV(float, FLOAT_PTR)" in source
+    assert "LAUNCH_SPLIT_KV(__half, HALF_PTR)" in source
+    assert "auto fp32_options = qkv.options().dtype(torch::kFloat32);" in source
+    assert "Traits::load(cache_keys[" in source
+    assert "Traits::load(cache_values[" in source
+    assert "Traits::store(numerator / global_denom)" in source
     assert "constexpr int split_count = 8;" in source
     assert "properties.major == 7 && properties.minor == 5" in source
 
@@ -219,12 +228,14 @@ def test_q1_wrappers_preserve_dtype_mask_conversion_and_argument_order(
     assert all(args[index].dtype == dtype for index in range(5))
 
 
-def test_fp32_sm75_live_prefix_routes_split8_and_other_cases_fall_back(
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_supported_sm75_live_prefix_routes_split8_and_other_cases_fall_back(
     monkeypatch,
+    dtype,
 ):
     from osuT5.osuT5.inference.optimized.kernels import q1_attention
 
-    qkv = torch.zeros((1, 1, 3, 2, 4), dtype=torch.float32)
+    qkv = torch.zeros((1, 1, 3, 2, 4), dtype=dtype)
     calls = []
 
     class _Extension:
@@ -262,14 +273,11 @@ def test_fp32_sm75_live_prefix_routes_split8_and_other_cases_fall_back(
     assert calls[1][1][-1] == 128
 
 
-def test_split_kv_policy_is_fp32_sm75_and_live_prefix_only():
+def test_split_kv_policy_is_supported_dtype_sm75_and_live_prefix_only():
     from osuT5.osuT5.inference.optimized.kernels import q1_attention
 
     assert q1_attention.native_q1_rope_cache_attention_variant(
         torch.zeros((1, 1, 3, 2, 4)), 640
-    ) == "accepted"
-    assert q1_attention.native_q1_rope_cache_attention_variant(
-        torch.zeros((1, 1, 3, 2, 4), dtype=torch.float16), 640
     ) == "accepted"
     assert tuple(sorted(q1_attention._SPLIT_KV_Q1_PREFIXES)) == tuple(
         range(192, 833, 64)
@@ -281,8 +289,14 @@ def test_split_kv_policy_is_fp32_sm75_and_live_prefix_only():
         active_prefix_length=640,
         capability=(7, 5),
     )
+    assert q1_attention._split_kv_q1_eligible(
+        dtype=torch.float16,
+        device_type="cuda",
+        active_prefix_length=640,
+        capability=(7, 5),
+    )
     for overrides in (
-        {"dtype": torch.float16},
+        {"dtype": torch.bfloat16},
         {"device_type": "cpu"},
         {"active_prefix_length": 128},
         {"active_prefix_length": 896},
@@ -296,6 +310,86 @@ def test_split_kv_policy_is_fp32_sm75_and_live_prefix_only():
         }
         arguments.update(overrides)
         assert not q1_attention._split_kv_q1_eligible(**arguments)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_explicit_split_and_accepted_component_wrappers_share_validation(
+    monkeypatch,
+    dtype,
+):
+    from osuT5.osuT5.inference.optimized.kernels import q1_attention
+
+    qkv = torch.zeros((1, 1, 3, 2, 4), dtype=dtype)
+    arguments = (
+        qkv,
+        torch.zeros((1, 2, 832, 4), dtype=dtype),
+        torch.zeros((1, 2, 832, 4), dtype=dtype),
+        torch.zeros((1, 1, 4), dtype=dtype),
+        torch.zeros((1, 1, 4), dtype=dtype),
+        torch.tensor([1]),
+        None,
+        640,
+    )
+    calls = []
+
+    class _Extension:
+        def q1_rope_cache_attention(self, *args):
+            calls.append(("accepted", args))
+            return args[0]
+
+        def split_kv_q1_rope_cache_attention(self, *args):
+            calls.append(("split", args))
+            return args[0]
+
+    monkeypatch.setattr(q1_attention, "_NATIVE_Q1_ATTENTION", _Extension())
+    monkeypatch.setattr(
+        q1_attention,
+        "_validate_rope_cache_inputs",
+        lambda *args: None,
+    )
+    monkeypatch.setattr(q1_attention, "_native_mask", lambda *args, **kwargs: None)
+    monkeypatch.setattr(q1_attention, "_device_capability", lambda device: (7, 5))
+
+    accepted = q1_attention.accepted_q1_rope_cache_attention(*arguments)
+    split = q1_attention.split_kv_q1_rope_cache_attention(*arguments)
+
+    assert accepted is qkv
+    assert split is qkv
+    assert [name for name, _ in calls] == ["accepted", "split"]
+    assert calls[1][1][-1] == 640
+
+
+def test_explicit_split_wrapper_rejects_unsupported_contract_before_build(
+    monkeypatch,
+):
+    from osuT5.osuT5.inference.optimized.kernels import q1_attention
+
+    qkv = torch.zeros((1, 1, 3, 2, 4), dtype=torch.float16)
+    arguments = (
+        qkv,
+        torch.zeros((1, 2, 832, 4), dtype=torch.float16),
+        torch.zeros((1, 2, 832, 4), dtype=torch.float16),
+        torch.zeros((1, 1, 4), dtype=torch.float16),
+        torch.zeros((1, 1, 4), dtype=torch.float16),
+        torch.tensor([1]),
+        None,
+        640,
+    )
+    monkeypatch.setattr(
+        q1_attention,
+        "_validate_rope_cache_inputs",
+        lambda *args: None,
+    )
+    monkeypatch.setattr(q1_attention, "_native_mask", lambda *args, **kwargs: None)
+    monkeypatch.setattr(q1_attention, "_device_capability", lambda device: (8, 0))
+    monkeypatch.setattr(
+        q1_attention,
+        "_load_native_q1_attention",
+        lambda: (_ for _ in ()).throw(AssertionError("must not build")),
+    )
+
+    with pytest.raises(RuntimeError, match="requires FP32 or FP16 SM75"):
+        q1_attention.split_kv_q1_rope_cache_attention(*arguments)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
