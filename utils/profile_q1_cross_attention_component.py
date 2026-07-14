@@ -44,6 +44,10 @@ FIXED_WORK_500_TPS_SECONDS = FIXED_WORK_MAIN_TOKENS / 500.0
 FIXED_WORK_500_TPS_GAP_SECONDS = (
     FIXED_WORK_MAIN_SECONDS - FIXED_WORK_500_TPS_SECONDS
 )
+SESSION_PROFILE_LABELS = {
+    "timing_context": "timing_generation",
+    "main_generation": "main_generation",
+}
 
 
 @dataclass(frozen=True)
@@ -97,8 +101,9 @@ def _run_and_capture_sessions(args, *, output_path: Path) -> dict[str, Any]:
 
     def wrapped_generate(processor, *positional, **kwargs):
         result = original_generate(processor, *positional, **kwargs)
-        label = kwargs.get("profile_label")
-        if label in {"timing_generation", "main_generation"}:
+        profile_label = kwargs.get("profile_label")
+        label = SESSION_PROFILE_LABELS.get(profile_label)
+        if label is not None:
             if label in captures:
                 raise RuntimeError(f"captured more than one {label} Processor")
             if processor.decode_session_state is None:
