@@ -246,6 +246,8 @@ def test_cross_wrappers_pin_k1_int8_control_and_one_candidate_mode(
     assert "missing cross runtime evidence" in general
     assert "control unexpectedly contains cross runtime" in general
     assert "CROSS_K1_INT8_COMPOSITION=true" in general
+    assert "metric.fixed_8294_main_seconds=" in general
+    assert "metric.complete_request_wall_seconds=" in general
 
 
 def test_general_wrapper_requires_k4_metadata_for_every_profile() -> None:

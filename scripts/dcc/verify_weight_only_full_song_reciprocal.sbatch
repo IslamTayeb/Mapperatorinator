@@ -1094,6 +1094,7 @@ grep -q '^parity.required_exact_dispatch_labels_pass=true$' \
 grep -q '^dispatch.declaration_pass=true$' "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^metric.timing_model_seconds=' "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^metric.main_model_seconds=' "$RUN_ROOT/reciprocal-analysis.txt"
+grep -q '^metric.fixed_8294_main_seconds=' "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^metric.complete_request_wall_seconds=' \
   "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^metric.peak_cuda_memory_allocated_mb=' \
