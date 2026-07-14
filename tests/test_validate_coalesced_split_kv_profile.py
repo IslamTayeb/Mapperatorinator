@@ -42,7 +42,7 @@ def test_candidate_requires_all_split_dispatches_and_short_fallback() -> None:
     assert report["pass"]
     assert report["main_counts"][COALESCED] == 11
 
-    with pytest.raises(CoalescedProfileError, match="every eligible"):
+    with pytest.raises(CoalescedProfileError, match="every live eligible"):
         validate_profile(_profile(coalesced=11, split=12, generic=14), role="candidate")
     with pytest.raises(CoalescedProfileError, match="short fallback"):
         validate_profile(
