@@ -11,6 +11,7 @@
 
 set -euo pipefail
 
+SLURM_JOB_ID=${SLURM_JOB_ID:?Run this wrapper inside a Slurm allocation}
 ENV=${MAPPERATORINATOR_ENV:-/hpc/group/romerolab/imt11/envs/mapperatorinator}
 PYTHON=${MAPPERATORINATOR_PYTHON:-$ENV/bin/python}
 WORK=${MAPPERATORINATOR_WORK:-/work/imt11/Mapperatorinator}
@@ -21,7 +22,7 @@ REMOTE=${MAPPERATORINATOR_REMOTE:-origin}
 REMOTE_REF="$REMOTE/$BRANCH"
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 TORCH_EXTENSIONS_DIR=${MAPPERATORINATOR_TORCH_EXTENSIONS_DIR:-$WORK/torch_extensions}
-RUN_ROOT="$WORK/runs/dp4a-mlp-component-${SLURM_JOB_ID:-manual}"
+RUN_ROOT="$WORK/runs/dp4a-mlp-component-$SLURM_JOB_ID"
 
 export PATH="$(dirname "$PYTHON"):$PATH"
 for tool in "$PYTHON" ffmpeg ffprobe; do
@@ -63,6 +64,15 @@ fi
 mkdir -p "$WORK/logs" "$WORK/tmp" "$WORK/cache" \
   "$WORK/cache/torch_inductor" "$WORK/cache/triton" "$WORK/cache/cuda" \
   "$TORCH_EXTENSIONS_DIR" "$RUN_ROOT"
+
+squeue -h -u "${USER:?}" -t R -o '%A|%b|%j' > "$RUN_ROOT/running-jobs.txt"
+OTHER_GPU_JOBS=$(awk -F'|' -v self="$SLURM_JOB_ID" \
+  '$1 != self && tolower($2) ~ /gpu/ {print}' "$RUN_ROOT/running-jobs.txt")
+if [[ -n "$OTHER_GPU_JOBS" ]]; then
+  echo "another GPU job is already running for $USER:" >&2
+  echo "$OTHER_GPU_JOBS" >&2
+  exit 2
+fi
 export XDG_CACHE_HOME="$WORK/cache"
 export HF_HOME="$WORK/cache/huggingface"
 export TRANSFORMERS_CACHE="$WORK/cache/huggingface"
@@ -91,7 +101,7 @@ if [[ "$GPU_NAME" != "NVIDIA GeForce RTX 2080 Ti" ]]; then
 fi
 
 echo "host=$(hostname)"
-echo "job_id=${SLURM_JOB_ID:-manual}"
+echo "job_id=$SLURM_JOB_ID"
 echo "repo=$REPO"
 echo "commit=$COMMIT"
 echo "branch=$BRANCH"
@@ -102,9 +112,8 @@ echo "run_root=$RUN_ROOT"
 echo "ffmpeg=$(command -v ffmpeg)"
 echo "ffprobe=$(command -v ffprobe)"
 echo "cuda_launch_blocking=$CUDA_LAUNCH_BLOCKING"
-if [[ -n "${SLURM_JOB_ID:-}" ]]; then
-  scontrol show job -o "$SLURM_JOB_ID"
-fi
+scontrol show job -o "$SLURM_JOB_ID" > "$RUN_ROOT/slurm-job.txt"
+cat "$RUN_ROOT/slurm-job.txt"
 nvidia-smi --query-gpu=name,uuid,driver_version,memory.total --format=csv,noheader
 nvidia-smi \
   --query-gpu=timestamp,uuid,utilization.gpu,memory.used,memory.total,power.draw,clocks.sm,temperature.gpu \

@@ -27,8 +27,15 @@ def _bucket(*, baseline: float, candidate: float, count: int = 100) -> dict:
         "baseline_finite": True,
         "baseline_repeat_bitwise_equal": True,
         "baseline_memory_stable": True,
+        "selected_weight_only_self_dispatch_observed": True,
+        "selected_native_rope_cache_self_dispatch_observed": True,
+        "selected_q1_bmm_cross_dispatch_observed": True,
+        "selected_weight_only_mlp_dispatch_observed": True,
         "selected_int8_dispatch_observed": True,
         "selected_fp16_cross_dispatch_observed": True,
+        "selected_weight_only_final_projection_observed": True,
+        "rejected_native_cross_dispatch_absent": True,
+        "nonfused_native_self_fallback_absent": True,
     }
     for config in CONFIGS:
         checks.update(
@@ -87,7 +94,7 @@ def test_summary_normalizes_sentinel_mix_to_fixed_8294_and_gates_hot_saving() ->
         expected_baseline - expected_candidate
     )
     assert report["l2_hot_saving_pass"]
-    assert report["cache_cold_non_regression_pass"]
+    assert report["cache_cold_saving_pass"]
     assert report["component_pass"]
 
 
@@ -105,7 +112,7 @@ def test_summary_stops_on_subthreshold_hot_or_cold_regression_or_invariant() -> 
     }
     cold_report = summarize_component({"128": cold}, total_replays=100)
     assert cold_report["l2_hot_saving_pass"]
-    assert not cold_report["cache_cold_non_regression_pass"]
+    assert not cold_report["cache_cold_saving_pass"]
     assert not cold_report["component_pass"]
 
     bad = _bucket(baseline=0.0165, candidate=0.0125)
@@ -204,6 +211,10 @@ def test_dcc_wrapper_pins_clean_pushed_2080_ti_worktree() -> None:
     assert "MAPPERATORINATOR_BRANCH" in source
     assert 'status --porcelain' in source
     assert 'rev-parse "$REMOTE_REF"' in source
+    assert "Run this wrapper inside a Slurm allocation" in source
+    assert "running-jobs.txt" in source
+    assert "another GPU job is already running" in source
+    assert "slurm-job.txt" in source
     assert "--bucket-mode sentinel" in source
     assert "--cold-iters 100" in source
     assert "profile_inference=true" in source

@@ -48,6 +48,8 @@ def test_cuda_source_is_two_stage_signed_dp4a_with_fp32_edges() -> None:
     assert "rmsnorm_quant_dp4a_fc1_gelu_kernel" in source
     assert "quant_dp4a_fc2_residual_kernel" in source
     assert source.count("__dp4a") == 2
+    assert "static_assert(HIDDEN_DIM % 4 == 0" in source
+    assert "static_assert(INTERMEDIATE_DIM % 4 == 0" in source
     assert "int accumulator = 0" in source
     assert "int8_t quantized[HIDDEN_DIM]" in source
     assert "int8_t quantized[INTERMEDIATE_DIM]" in source

@@ -67,6 +67,10 @@ _CUDA_SOURCE = r"""
 constexpr int THREADS = 256;
 constexpr int HIDDEN_DIM = 768;
 constexpr int INTERMEDIATE_DIM = 3072;
+static_assert(HIDDEN_DIM % 4 == 0,
+    "hidden dimension must have no signed-DP4A tail");
+static_assert(INTERMEDIATE_DIM % 4 == 0,
+    "intermediate dimension must have no signed-DP4A tail");
 
 template<int ACTIVE_WARPS>
 __global__ void rmsnorm_quant_dp4a_fc1_gelu_kernel(

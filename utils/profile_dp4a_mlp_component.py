@@ -432,7 +432,10 @@ def summarize_component(
         modes["l2_hot"]["fixed_8294_saving_seconds"]
         >= FIXED_MAIN_SAVING_GATE_SECONDS
     )
-    cold_pass = modes["cache_cold"]["fixed_8294_saving_seconds"] >= 0.0
+    cold_pass = (
+        modes["cache_cold"]["fixed_8294_saving_seconds"]
+        >= FIXED_MAIN_SAVING_GATE_SECONDS
+    )
     return {
         "measured_replays": measured_replays,
         "total_replays": int(total_replays),
@@ -441,7 +444,7 @@ def summarize_component(
         "modes": modes,
         "saving_gate_seconds": FIXED_MAIN_SAVING_GATE_SECONDS,
         "l2_hot_saving_pass": hot_pass,
-        "cache_cold_non_regression_pass": cold_pass,
+        "cache_cold_saving_pass": cold_pass,
         "invariant_failures": invariant_failures,
         "invariants_pass": invariants_pass,
         "component_pass": invariants_pass and hot_pass and cold_pass,
@@ -582,12 +585,35 @@ def profile_component(
             "baseline_memory_stable": bool(
                 hot_memory["baseline"] and cold_memory["baseline"]
             ),
+            "selected_weight_only_self_dispatch_observed": (
+                dispatch_counts.get("weight_only_self_attention_block")
+                == DECODER_LAYERS
+            ),
+            "selected_native_rope_cache_self_dispatch_observed": (
+                dispatch_counts.get("native_q1_rope_cache_self_attention")
+                == DECODER_LAYERS
+            ),
+            "selected_q1_bmm_cross_dispatch_observed": (
+                dispatch_counts.get("q1_bmm_cross_attention") == DECODER_LAYERS
+            ),
+            "selected_weight_only_mlp_dispatch_observed": (
+                dispatch_counts.get("weight_only_mlp_tail") == DECODER_LAYERS
+            ),
             "selected_int8_dispatch_observed": (
                 dispatch_counts.get("int8_weight_mlp_tail") == DECODER_LAYERS
             ),
             "selected_fp16_cross_dispatch_observed": (
                 dispatch_counts.get("fp16_packed_cross_projection_candidate")
                 == DECODER_LAYERS
+            ),
+            "selected_weight_only_final_projection_observed": (
+                dispatch_counts.get("weight_only_final_projection") == 1
+            ),
+            "rejected_native_cross_dispatch_absent": (
+                dispatch_counts.get("native_cross_mlp_tail") == 0
+            ),
+            "nonfused_native_self_fallback_absent": (
+                dispatch_counts.get("native_q1_self_attention") == 0
             ),
         }
         for config, (warps, ctas) in CONFIGS.items():
@@ -726,8 +752,7 @@ def _text(report: dict[str, Any]) -> str:
         [
             f"saving_gate_seconds={summary['saving_gate_seconds']:.6f}",
             f"l2_hot_saving_pass={summary['l2_hot_saving_pass']}",
-            "cache_cold_non_regression_pass="
-            f"{summary['cache_cold_non_regression_pass']}",
+            f"cache_cold_saving_pass={summary['cache_cold_saving_pass']}",
             f"invariants_pass={summary['invariants_pass']}",
             f"component_pass={summary['component_pass']}",
             "production_wiring=False",
