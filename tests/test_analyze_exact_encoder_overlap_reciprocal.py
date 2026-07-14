@@ -1,4 +1,5 @@
 import copy
+import hashlib
 
 import pytest
 
@@ -44,6 +45,10 @@ def _profile():
 
 
 def _overlap():
+    encoder_digests = ["e" * 64, "f" * 64]
+    aggregate = hashlib.sha256()
+    for digest in encoder_digests:
+        aggregate.update(digest.encode("ascii"))
     return {
         "version": OVERLAP_VERSION,
         "production_default": False,
@@ -66,6 +71,8 @@ def _overlap():
         "pinned_input_bytes": 80,
         "device_input_copy_bytes": 80,
         "output_store_bytes": 100,
+        "encoder_output_sha256_per_window": encoder_digests,
+        "encoder_output_aggregate_sha256": aggregate.hexdigest(),
         "peak_allocated_vram_bytes": 1000,
         "peak_reserved_vram_bytes": 1200,
         "incremental_peak_allocated_vram_bytes": 200,
@@ -132,6 +139,11 @@ def test_candidate_validation_requires_complete_exact_b1_overlap():
     overlap["main_model_generate_calls"] = 3
     overlap["launch_after_timing_window"] = 2
     overlap["per_row_main_join_wait_seconds"] = [0.03, 0.03, 0.04]
+    overlap["encoder_output_sha256_per_window"] = ["e" * 64, "f" * 64, "0" * 64]
+    aggregate = hashlib.sha256()
+    for digest in overlap["encoder_output_sha256_per_window"]:
+        aggregate.update(digest.encode("ascii"))
+    overlap["encoder_output_aggregate_sha256"] = aggregate.hexdigest()
     profile = {
         "metadata": {"optimized_exact_main_encoder_overlap": copy.deepcopy(overlap)}
     }
