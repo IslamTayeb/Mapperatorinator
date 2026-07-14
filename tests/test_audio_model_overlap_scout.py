@@ -193,6 +193,30 @@ class AudioModelOverlapScoutTest(unittest.TestCase):
         self.assertEqual(completed.stdout, "")
         self.assertEqual(completed.stderr, "")
 
+    def test_default_inference_import_does_not_import_overlap_scout(self) -> None:
+        command = [
+            sys.executable,
+            "-c",
+            "\n".join(
+                [
+                    "import contextlib, io, sys",
+                    "stdout=io.StringIO()",
+                    "stderr=io.StringIO()",
+                    "with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):",
+                    "    import inference",
+                    "assert 'osuT5.osuT5.inference.optimized.audio_model_overlap_scout' not in sys.modules",
+                ]
+            ),
+        ]
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_reciprocal_gate_requires_exactness_and_half_second_cold_win(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             report = analyze_reciprocal(_reciprocal_records(Path(directory)))
