@@ -80,7 +80,7 @@ def _memory_time_summary(path: Path) -> Path:
         [
             "Time (%)",
             "Total Time (ns)",
-            "Operations",
+            "Num Calls",
             "Avg (ns)",
             "Med (ns)",
             "Min (ns)",
@@ -809,6 +809,11 @@ def test_cuda_memory_time_and_size_reports_preserve_operations_and_units(tmp_pat
             "maximum_ns": 30,
         }
     ]
+    assert time_report["column_resolution"]["canonical_fields"]["calls"] == {
+        "source_column": "Num Calls",
+        "source_unit": None,
+        "multiplier": None,
+    }
     assert size_report["total_bytes"] == 3 * (1 << 20)
     assert size_report["operations"][0]["average_bytes"] == int(1.5 * (1 << 20))
     assert size_report["column_resolution"]["canonical_fields"]["total_bytes"] == {

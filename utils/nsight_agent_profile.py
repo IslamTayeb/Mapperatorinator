@@ -530,7 +530,14 @@ _CUDA_API_ALIASES = {
 _MEMORY_TIME_ALIASES = {
     "operation": ("Operation", "Name"),
     "total_ns": ("Total Time (ns)", "Total Time (us)", "Total Time (ms)", "Total Time"),
-    "calls": ("Operations", "Num Operations", "Calls", "Instances", "Count"),
+    "calls": (
+        "Num Calls",
+        "Operations",
+        "Num Operations",
+        "Calls",
+        "Instances",
+        "Count",
+    ),
     "average_ns": ("Avg (ns)", "Average (ns)", "Avg (us)", "Average (us)", "Avg"),
     "minimum_ns": ("Min (ns)", "Minimum (ns)", "Min (us)", "Min"),
     "maximum_ns": ("Max (ns)", "Maximum (ns)", "Max (us)", "Max"),
