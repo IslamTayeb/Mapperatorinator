@@ -1,4 +1,4 @@
-"""Decide the exact reciprocal full-song K4 decoder-mask reuse gate."""
+"""Decide incremental parity for mask reuse atop relaxed K4+mixed inference."""
 
 from __future__ import annotations
 
@@ -11,7 +11,8 @@ from typing import Any, Mapping
 from utils.analyze_reciprocal_full_song_candidate import analyze
 
 
-SCHEMA_VERSION = "mapperatorinator.k4-mask-reuse-reciprocal.v1"
+SCHEMA_VERSION = "mapperatorinator.k4-mask-reuse-reciprocal.v2"
+INCREMENTAL_EXACTNESS_SCOPE = "mask-reuse-vs-relaxed-k4-mixed-control"
 WALL_METRICS = (
     "main_outer_stage_wall_seconds",
     "complete_request_wall_seconds",
@@ -23,10 +24,15 @@ def decide(
     *,
     minimum_wall_saving_seconds: float = 0.05,
     maximum_model_regression_fraction: float = 0.01,
+    maximum_timing_stage_regression_fraction: float = 0.01,
 ) -> dict[str, Any]:
     for name, value in (
         ("minimum_wall_saving_seconds", minimum_wall_saving_seconds),
         ("maximum_model_regression_fraction", maximum_model_regression_fraction),
+        (
+            "maximum_timing_stage_regression_fraction",
+            maximum_timing_stage_regression_fraction,
+        ),
     ):
         if (
             isinstance(value, bool)
@@ -35,11 +41,15 @@ def decide(
             or float(value) < 0.0
         ):
             raise ValueError(f"{name} must be finite and non-negative")
-    if analysis.get("mode") != "exact-fp32":
-        raise ValueError("mask reuse reciprocal analysis must be exact-fp32")
+    if analysis.get("mode") != "relaxed":
+        raise ValueError(
+            "mask reuse must use relaxed analysis with incremental exactness gates"
+        )
     parity = analysis.get("parity")
     if not isinstance(parity, Mapping):
         raise ValueError("analysis parity is missing")
+    if parity.get("claim") != "relaxed-nonexact":
+        raise ValueError("mask reuse analysis must retain the relaxed base claim")
     parity_pass = bool(
         parity.get("cross_candidate_exact")
         and parity.get("baseline_repeat_stable")
@@ -88,16 +98,53 @@ def decide(
             "main synchronized model time regressed by "
             f"{model_delta_fraction * 100.0:.3f}%"
         )
+    timing_stage = metrics.get("timing_outer_stage_wall_seconds")
+    if not isinstance(timing_stage, Mapping):
+        raise ValueError("analysis is missing timing_outer_stage_wall_seconds")
+    timing_stage_delta_fraction = float(
+        timing_stage["candidate_minus_baseline_fraction"]
+    )
+    timing_stage_pairs = timing_stage.get("reciprocal_pairs")
+    if not isinstance(timing_stage_pairs, list) or len(timing_stage_pairs) != 2:
+        raise ValueError(
+            "timing_outer_stage_wall_seconds must contain two reciprocal pairs"
+        )
+    timing_stage_pair_regression_fractions = [
+        max(0.0, -float(pair["improvement"])) / float(pair["baseline"])
+        for pair in timing_stage_pairs
+    ]
+    timing_stage_pairwise_pass = all(
+        value <= maximum_timing_stage_regression_fraction
+        for value in timing_stage_pair_regression_fractions
+    )
+    timing_stage_pass = (
+        timing_stage_delta_fraction <= maximum_timing_stage_regression_fraction
+        and timing_stage_pairwise_pass
+    )
+    if timing_stage_delta_fraction > maximum_timing_stage_regression_fraction:
+        failures.append(
+            "median timing outer stage regressed by "
+            f"{timing_stage_delta_fraction * 100.0:.3f}%"
+        )
+    if not timing_stage_pairwise_pass:
+        failures.append(
+            "timing outer stage exceeded the regression tolerance in a "
+            "reciprocal order"
+        )
     if not parity_pass:
         failures.append("exact token/stopping/output/dispatch parity failed")
     return {
         "schema_version": SCHEMA_VERSION,
+        "incremental_exactness_scope": INCREMENTAL_EXACTNESS_SCOPE,
         "result_class": "promotion" if not failures else "valid_negative",
         "promotion_pass": not failures,
         "parity_pass": parity_pass,
         "thresholds": {
             "minimum_wall_saving_seconds": minimum_wall_saving_seconds,
             "maximum_model_regression_fraction": maximum_model_regression_fraction,
+            "maximum_timing_stage_regression_fraction": (
+                maximum_timing_stage_regression_fraction
+            ),
         },
         "walls": walls,
         "main_model": {
@@ -105,6 +152,14 @@ def decide(
             "candidate_median": float(model["candidate_median"]),
             "candidate_minus_baseline_fraction": model_delta_fraction,
             "nonregression_pass": model_pass,
+        },
+        "timing_stage": {
+            "baseline_median": float(timing_stage["baseline_median"]),
+            "candidate_median": float(timing_stage["candidate_median"]),
+            "candidate_minus_baseline_fraction": timing_stage_delta_fraction,
+            "pair_regression_fractions": timing_stage_pair_regression_fractions,
+            "pairwise_nonregression_pass": timing_stage_pairwise_pass,
+            "nonregression_pass": timing_stage_pass,
         },
         "failures": failures,
         "analysis": analysis,
@@ -116,6 +171,7 @@ def text_report(report: Mapping[str, Any]) -> str:
         f"result_class={report['result_class']}",
         f"promotion_pass={str(report['promotion_pass']).lower()}",
         f"parity_pass={str(report['parity_pass']).lower()}",
+        f"incremental_exactness_scope={report['incremental_exactness_scope']}",
     ]
     for metric in WALL_METRICS:
         wall = report["walls"][metric]
@@ -133,6 +189,16 @@ def text_report(report: Mapping[str, Any]) -> str:
         "candidate_minus_baseline_fraction:"
         f"{report['main_model']['candidate_minus_baseline_fraction']:.9f},"
         f"nonregression:{str(report['main_model']['nonregression_pass']).lower()}"
+    )
+    lines.append(
+        "timing_outer_stage_wall_seconds="
+        f"baseline:{report['timing_stage']['baseline_median']:.9f},"
+        f"candidate:{report['timing_stage']['candidate_median']:.9f},"
+        "candidate_minus_baseline_fraction:"
+        f"{report['timing_stage']['candidate_minus_baseline_fraction']:.9f},"
+        "pairwise_nonregression:"
+        f"{str(report['timing_stage']['pairwise_nonregression_pass']).lower()},"
+        f"nonregression:{str(report['timing_stage']['nonregression_pass']).lower()}"
     )
     lines.extend(f"failure={failure}" for failure in report["failures"])
     return "\n".join(lines) + "\n"
@@ -167,7 +233,7 @@ def main() -> None:
     )
     analysis = analyze(
         paths,
-        mode="exact-fp32",
+        mode="relaxed",
         optional_allowed_dispatch_deltas=dispatch_patterns,
         required_exact_labels=("timing_context", "main_generation"),
         require_dispatch_declaration=True,
