@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import gc
 import os
 from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
+import weakref
 
 import pytest
 import torch
@@ -17,6 +19,7 @@ from osuT5.osuT5.inference.optimized.single.decode_loop import (
     _clone_static_graph_inputs,
     _copy_static_graph_inputs,
     _cuda_graph_signature,
+    _new_encoder_stabilization_stats,
     _stable_encoder_outputs,
     active_prefix_decode_generate,
 )
@@ -89,6 +92,154 @@ def test_stable_encoder_output_reuses_identity_and_storage_for_same_shape():
     assert second is first
     assert second.last_hidden_state.data_ptr() == pointer
     assert torch.equal(second.last_hidden_state, second_source.last_hidden_state)
+
+
+def test_stable_encoder_output_skips_identical_object_copy() -> None:
+    tensor = torch.randn(1, 4, 8)
+    output = BaseModelOutput(last_hidden_state=tensor)
+    holder = {"encoder_outputs": output}
+    stats = _new_encoder_stabilization_stats()
+    version = tensor._version
+
+    result = _stable_encoder_outputs(holder, output, profile_stats=stats)
+
+    assert result is output
+    assert tensor._version == version
+    assert stats == {
+        "calls": 1,
+        "executed_bytes": 0,
+        "executed_copies": 0,
+        "holder_replacements": 0,
+        "skipped_copies": 1,
+        "skipped_identity_copies": 1,
+        "skipped_shared_storage_copies": 0,
+    }
+
+
+def test_stable_encoder_output_skips_equal_storage_view_copy() -> None:
+    source = torch.randn(1, 4, 8)
+    same_view = source.as_strided(
+        source.shape,
+        source.stride(),
+        source.storage_offset(),
+    )
+    assert same_view is not source
+    assert same_view.is_set_to(source)
+    holder = {
+        "encoder_outputs": BaseModelOutput(last_hidden_state=same_view),
+    }
+    stats = _new_encoder_stabilization_stats()
+    version = source._version
+
+    result = _stable_encoder_outputs(
+        holder,
+        BaseModelOutput(last_hidden_state=source),
+        profile_stats=stats,
+    )
+
+    assert result.last_hidden_state is same_view
+    assert source._version == version
+    assert stats["calls"] == 1
+    assert stats["skipped_copies"] == 1
+    assert stats["skipped_shared_storage_copies"] == 1
+    assert stats["executed_bytes"] == 0
+
+
+def test_stable_encoder_output_copies_distinct_compatible_storage() -> None:
+    current_tensor = torch.zeros((1, 4, 8), dtype=torch.float32)
+    source = torch.randn((1, 4, 8), dtype=torch.float32)
+    current = BaseModelOutput(last_hidden_state=current_tensor)
+    holder = {"encoder_outputs": current}
+    stats = _new_encoder_stabilization_stats()
+    pointer = current_tensor.data_ptr()
+
+    result = _stable_encoder_outputs(
+        holder,
+        BaseModelOutput(last_hidden_state=source),
+        profile_stats=stats,
+    )
+
+    assert result is current
+    assert result.last_hidden_state.data_ptr() == pointer
+    assert torch.equal(result.last_hidden_state, source)
+    assert stats["calls"] == 1
+    assert stats["skipped_copies"] == 0
+    assert stats["executed_copies"] == 1
+    assert stats["executed_bytes"] == source.numel() * source.element_size()
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        torch.ones((1, 5, 8), dtype=torch.float32),
+        torch.ones((1, 4, 8), dtype=torch.float16),
+    ),
+)
+def test_stable_encoder_output_shape_and_dtype_mismatch_still_replace(source) -> None:
+    original = BaseModelOutput(
+        last_hidden_state=torch.zeros((1, 4, 8), dtype=torch.float32)
+    )
+    holder = {"encoder_outputs": original}
+    stats = _new_encoder_stabilization_stats()
+
+    result = _stable_encoder_outputs(
+        holder,
+        BaseModelOutput(last_hidden_state=source),
+        profile_stats=stats,
+    )
+
+    assert result is holder["encoder_outputs"]
+    assert result is not original
+    assert result.last_hidden_state is not source
+    assert result.last_hidden_state.shape == source.shape
+    assert result.last_hidden_state.dtype == source.dtype
+    assert torch.equal(result.last_hidden_state, source)
+    assert stats["holder_replacements"] == 1
+    assert stats["executed_copies"] == 1
+    assert stats["executed_bytes"] == source.numel() * source.element_size()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_stable_encoder_output_device_mismatch_still_replaces() -> None:
+    original = BaseModelOutput(last_hidden_state=torch.zeros((1, 4, 8)))
+    source = torch.ones((1, 4, 8), device="cuda")
+    holder = {"encoder_outputs": original}
+
+    result = _stable_encoder_outputs(
+        holder,
+        BaseModelOutput(last_hidden_state=source),
+    )
+
+    assert result is not original
+    assert result.last_hidden_state.device.type == "cuda"
+    assert torch.equal(result.last_hidden_state, source)
+
+
+def test_stable_encoder_output_clone_owns_storage_and_lifetime() -> None:
+    source = torch.randn(1, 4, 8)
+    source_reference = weakref.ref(source)
+    encoder_outputs = BaseModelOutput(last_hidden_state=source)
+    holder = {}
+
+    result = _stable_encoder_outputs(holder, encoder_outputs)
+    expected = source.clone()
+    assert result.last_hidden_state is not source
+    assert not result.last_hidden_state.is_set_to(source)
+
+    del encoder_outputs
+    del source
+    gc.collect()
+
+    assert source_reference() is None
+    assert torch.equal(holder["encoder_outputs"].last_hidden_state, expected)
+
+
+def test_stable_encoder_output_fails_loudly_on_invalid_holder_and_stats() -> None:
+    source = BaseModelOutput(last_hidden_state=torch.ones(1, 4, 8))
+    with pytest.raises(RuntimeError, match="non-BaseModelOutput"):
+        _stable_encoder_outputs({"encoder_outputs": object()}, source)
+    with pytest.raises(ValueError, match="invalid schema"):
+        _stable_encoder_outputs({}, source, profile_stats={"calls": 0})
 
 
 def test_graph_signature_preserves_shape_dtype_device_and_object_identity():
@@ -217,6 +368,26 @@ for name in (
 """
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_fresh_decode_loop_import_keeps_native_extensions_cold_and_quiet():
+    completed = _run_fresh_python(
+        """
+import sys
+from osuT5.osuT5.inference.optimized.single import decode_loop
+
+assert decode_loop is not None
+for name in (
+    "osuT5.osuT5.inference.optimized.kernels.q1_attention",
+    "osuT5.osuT5.inference.optimized.kernels.cross_mlp",
+    "osuT5.osuT5.inference.optimized.kernels.decoder_layer",
+    "torch.utils.cpp_extension",
+):
+    assert name not in sys.modules, name
+"""
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == ""
 
 
 class _PerRowEosCriteria:

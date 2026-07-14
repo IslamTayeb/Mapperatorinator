@@ -9,6 +9,42 @@ from ....runtime_profiling import profile_range
 from .runtime_context import active_prefix_self_attention_context
 
 
+_ENCODER_STABILIZATION_STAT_KEYS = frozenset(
+    {
+        "calls",
+        "skipped_copies",
+        "skipped_identity_copies",
+        "skipped_shared_storage_copies",
+        "executed_copies",
+        "executed_bytes",
+        "holder_replacements",
+    }
+)
+
+
+def _new_encoder_stabilization_stats() -> dict[str, int]:
+    return {key: 0 for key in sorted(_ENCODER_STABILIZATION_STAT_KEYS)}
+
+
+def _record_encoder_stabilization(
+    stats: dict[str, int] | None,
+    key: str,
+    amount: int = 1,
+) -> None:
+    if stats is None:
+        return
+    if set(stats) != _ENCODER_STABILIZATION_STAT_KEYS or any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in stats.values()
+    ):
+        raise ValueError("encoder stabilization profiling stats have invalid schema")
+    if key not in _ENCODER_STABILIZATION_STAT_KEYS:
+        raise ValueError(f"unknown encoder stabilization profiling counter {key}")
+    if isinstance(amount, bool) or not isinstance(amount, int) or amount < 0:
+        raise ValueError("encoder stabilization profiling increments must be non-negative")
+    stats[key] += amount
+
+
 def _bucketed_prefix_length(cur_len: int, bucket_size: int, max_cache_len: int) -> int:
     if bucket_size <= 0:
         raise ValueError("active-prefix decode bucket size must be positive")
@@ -68,7 +104,10 @@ def _copy_static_graph_inputs(
 def _stable_encoder_outputs(
     holder: dict[str, BaseModelOutput],
     encoder_outputs: Any,
+    *,
+    profile_stats: dict[str, int] | None = None,
 ) -> BaseModelOutput:
+    _record_encoder_stabilization(profile_stats, "calls")
     if not isinstance(encoder_outputs, BaseModelOutput):
         raise RuntimeError(
             "Expected BaseModelOutput encoder_outputs, got "
@@ -78,6 +117,12 @@ def _stable_encoder_outputs(
     if not isinstance(source, torch.Tensor):
         raise RuntimeError("encoder_outputs.last_hidden_state must be a tensor")
     current = holder.get("encoder_outputs")
+    if current is not None and not isinstance(current, BaseModelOutput):
+        raise RuntimeError("stable encoder holder contains a non-BaseModelOutput value")
+    if current is not None and not isinstance(current.last_hidden_state, torch.Tensor):
+        raise RuntimeError(
+            "stable encoder holder last_hidden_state must be a tensor"
+        )
     if (
         current is None
         or current.last_hidden_state.shape != source.shape
@@ -89,8 +134,32 @@ def _stable_encoder_outputs(
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
         )
+        _record_encoder_stabilization(profile_stats, "holder_replacements")
+        _record_encoder_stabilization(profile_stats, "executed_copies")
+        _record_encoder_stabilization(
+            profile_stats,
+            "executed_bytes",
+            source.numel() * source.element_size(),
+        )
+    elif current.last_hidden_state is source:
+        _record_encoder_stabilization(profile_stats, "skipped_copies")
+        _record_encoder_stabilization(profile_stats, "skipped_identity_copies")
+    elif current.last_hidden_state.is_set_to(source):
+        # ``is_set_to`` proves equal storage, offset, size, and stride.  Merely
+        # overlapping storage is not enough to skip the existing copy.
+        _record_encoder_stabilization(profile_stats, "skipped_copies")
+        _record_encoder_stabilization(
+            profile_stats,
+            "skipped_shared_storage_copies",
+        )
     else:
         current.last_hidden_state.copy_(source)
+        _record_encoder_stabilization(profile_stats, "executed_copies")
+        _record_encoder_stabilization(
+            profile_stats,
+            "executed_bytes",
+            source.numel() * source.element_size(),
+        )
     return holder["encoder_outputs"]
 
 
@@ -154,6 +223,7 @@ def active_prefix_decode_generate(
     cuda_graph_min_decode_steps: int = 1,
     shared_graph_cache: dict[tuple[Any, ...], dict[str, Any]] | None = None,
     stable_encoder_holder: dict[str, BaseModelOutput] | None = None,
+    stable_encoder_profile_stats: dict[str, int] | None = None,
     **model_kwargs,
 ) -> torch.LongTensor:
     """Fixed-batch HF loop with persistent active-prefix CUDA graphs."""
@@ -284,6 +354,7 @@ def active_prefix_decode_generate(
                     model_kwargs["encoder_outputs"] = _stable_encoder_outputs(
                         stable_encoder_holder,
                         encoder_outputs,
+                        profile_stats=stable_encoder_profile_stats,
                     )
 
         with profile_range("generation.logits_processors"):

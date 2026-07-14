@@ -1586,6 +1586,7 @@ class Processor(object):
             "decode_graph_capture_seconds_delta",
             "decode_graph_replays_delta",
             "optimized_cuda_graphs",
+            "encoder_stabilization",
         ):
             if stats.get(key) is not None:
                 record[key] = stats[key]

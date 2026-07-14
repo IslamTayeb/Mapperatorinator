@@ -187,3 +187,35 @@ def test_processor_records_specialized_dispatch_capture_hits():
     )
 
     assert processor.profiler.generation[0]["optimized_dispatch_capture_hits"] == hits
+
+
+def test_processor_records_opt_in_encoder_stabilization_counters():
+    processor = Processor.__new__(Processor)
+    processor.profiler = InferenceProfiler(enabled=True, detail_ranges=True)
+    processor.precision = "fp32"
+    processor.model = object()
+    processor.parallel = False
+    counters = {
+        "calls": 100,
+        "skipped_copies": 99,
+        "skipped_identity_copies": 99,
+        "skipped_shared_storage_copies": 0,
+        "executed_copies": 1,
+        "executed_bytes": 4096,
+        "holder_replacements": 1,
+    }
+
+    processor._record_generation_profile(
+        profile_label="main_generation",
+        mode="main",
+        context_type="MAP",
+        wall_seconds=1.0,
+        stats={
+            "generated_tokens": 4,
+            "elapsed_seconds": 0.5,
+            "tokens_per_second": 8.0,
+            "encoder_stabilization": counters,
+        },
+    )
+
+    assert processor.profiler.generation[0]["encoder_stabilization"] == counters

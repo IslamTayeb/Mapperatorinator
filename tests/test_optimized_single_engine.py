@@ -628,6 +628,77 @@ def test_generate_window_preserves_custom_generate_dispatch(monkeypatch):
     custom_generate = captured["custom_generate"]
     assert isinstance(custom_generate, partial)
     assert custom_generate.func is engine_module.active_prefix_decode_generate
+    assert custom_generate.keywords["stable_encoder_profile_stats"] is None
+    assert "encoder_stabilization" not in stats
+
+
+def test_generate_window_exposes_encoder_copy_counters_only_for_detail_profile(
+    monkeypatch,
+):
+    captured = {}
+
+    class FakeModel:
+        dtype = torch.float32
+        device = torch.device("cpu")
+
+        def generate(self, **kwargs):
+            captured.update(kwargs)
+            return torch.tensor([[1, 2]], dtype=torch.long)
+
+    class FakeContextState:
+        @staticmethod
+        def cache_for_window(model, **kwargs):
+            del model, kwargs
+            return object()
+
+        @staticmethod
+        def active_prefix_decode_kwargs():
+            return {}
+
+        @staticmethod
+        def graph_profile_summary():
+            return {"graphs": []}
+
+    monkeypatch.setattr(
+        engine_module,
+        "_build_logits_processor_list",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(engine_module, "eos_token_ids", lambda *args, **kwargs: [2])
+    monkeypatch.setattr(
+        engine_module,
+        "build_generation_stats",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "generation_profile_context",
+        lambda **kwargs: nullcontext(),
+    )
+    monkeypatch.setattr(engine_module, "detail_ranges_enabled", lambda: True)
+
+    _, stats = engine_module._generate_window(
+        FakeModel(),
+        object(),
+        {"inputs": torch.tensor([[1]], dtype=torch.long)},
+        {"precision": "fp32"},
+        context_state=FakeContextState(),
+        preset=OPTIMIZED_PRESETS["fp32"],
+    )
+
+    counters = captured["custom_generate"].keywords[
+        "stable_encoder_profile_stats"
+    ]
+    assert counters == stats["encoder_stabilization"]
+    assert counters == {
+        "calls": 0,
+        "executed_bytes": 0,
+        "executed_copies": 0,
+        "holder_replacements": 0,
+        "skipped_copies": 0,
+        "skipped_identity_copies": 0,
+        "skipped_shared_storage_copies": 0,
+    }
 
 
 def test_shared_calculation_helpers_preserve_legacy_server_results():

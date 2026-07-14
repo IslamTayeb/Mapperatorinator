@@ -11,14 +11,21 @@ from typing import Any
 import torch
 
 from ....event import ContextType
-from ....runtime_profiling import generation_profile_context, profile_range
+from ....runtime_profiling import (
+    detail_ranges_enabled,
+    generation_profile_context,
+    profile_range,
+)
 from ...engine_binding import InferenceEngineBinding
 from ...generation_utils import (
     build_generation_stats,
     eos_token_ids,
     sync_cuda_for_model,
 )
-from .decode_loop import active_prefix_decode_generate
+from .decode_loop import (
+    _new_encoder_stabilization_stats,
+    active_prefix_decode_generate,
+)
 from .logits import build_single_logits_processor_list
 from .state import ProductionDecodeSession
 
@@ -277,12 +284,18 @@ def _generate_window(
         "pad_token_id",
         getattr(tokenizer, "pad_id", None),
     )
+    encoder_stabilization_stats = (
+        _new_encoder_stabilization_stats()
+        if detail_ranges_enabled()
+        else None
+    )
     custom_generate = partial(
         active_prefix_decode_generate,
         active_prefix_bucket_size=ACTIVE_PREFIX_BUCKET_SIZE,
         cuda_graph_forward=True,
         cuda_graph_warmup=0,
         cuda_graph_min_decode_steps=1,
+        stable_encoder_profile_stats=encoder_stabilization_stats,
         **context_state.active_prefix_decode_kwargs(),
     )
     graph_count_before = int(getattr(context_state, "graph_count", 0))
@@ -420,6 +433,8 @@ def _generate_window(
         ),
         "optimized_cuda_graphs": context_state.graph_profile_summary(),
     })
+    if encoder_stabilization_stats is not None:
+        stats["encoder_stabilization"] = dict(encoder_stabilization_stats)
     return result, stats
 
 
