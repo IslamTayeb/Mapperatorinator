@@ -34,6 +34,15 @@ def test_import_is_cold_and_preload_is_singleton(monkeypatch) -> None:
         "cross_attention_one_pass",
         "cross_attention_split",
     ]
+    assert calls[0]["cpp_sources"] == cross_attention._CPP_SOURCE
+
+
+def test_cpp_source_declares_every_generated_binding() -> None:
+    source = cross_attention._CPP_SOURCE
+
+    assert "torch::Tensor cross_attention_one_pass(" in source
+    assert "torch::Tensor cross_attention_split(" in source
+    assert "int64_t splits" in source
 
 
 def test_source_has_genuine_split_grid_and_online_softmax_merge() -> None:
