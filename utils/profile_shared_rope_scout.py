@@ -25,8 +25,8 @@ from osuT5.osuT5.inference.optimized.scout.shared_rope import (  # noqa: E402
     shared_decoder_rope_context,
 )
 from utils.profile_native_prefix_dtype_scout import (  # noqa: E402
+    ALL_BUCKETS,
     CapturedGraph,
-    SENTINEL_BUCKETS,
     _accepted_main_session_run,
     _all_cache_snapshots,
     _assert_scout_args,
@@ -193,9 +193,9 @@ def summarize_shared_rope(
     install_setup_seconds: float,
 ) -> dict[str, Any]:
     measured = tuple(sorted(int(prefix) for prefix in buckets))
-    if measured != tuple(SENTINEL_BUCKETS):
+    if measured != tuple(ALL_BUCKETS):
         raise ValueError(
-            f"shared RoPE requires sentinel buckets {SENTINEL_BUCKETS}, got {measured}"
+            f"shared RoPE requires every live bucket {ALL_BUCKETS}, got {measured}"
         )
     if any(prefix not in live_counts or live_counts[prefix] <= 0 for prefix in measured):
         raise ValueError("live counts must contain positive sentinel replay counts")
@@ -248,11 +248,11 @@ def _validate_report(report: dict[str, Any]) -> None:
     summary = report.get("summary")
     if not all(isinstance(value, dict) for value in (metadata, buckets, summary)):
         raise TypeError("shared-RoPE metadata, buckets, and summary must be objects")
-    if tuple(metadata.get("measured_buckets", ())) != SENTINEL_BUCKETS:
-        raise ValueError("shared-RoPE report must cover exact sentinel buckets")
-    if set(buckets) != {str(prefix) for prefix in SENTINEL_BUCKETS}:
+    if tuple(metadata.get("measured_buckets", ())) != ALL_BUCKETS:
+        raise ValueError("shared-RoPE report must cover every live bucket")
+    if set(buckets) != {str(prefix) for prefix in ALL_BUCKETS}:
         raise ValueError("shared-RoPE bucket payload does not match metadata")
-    for prefix in SENTINEL_BUCKETS:
+    for prefix in ALL_BUCKETS:
         bucket = buckets[str(prefix)]
         timing = bucket.get("timing")
         if not isinstance(timing, dict):
@@ -294,7 +294,7 @@ def profile_shared_rope_scout(
     model.eval()
     plan = build_shared_rope_plan(model)
     accepted_entries = validate_accepted_graph_cache(run["session"].graph_cache)
-    selected = {prefix: accepted_entries[prefix] for prefix in SENTINEL_BUCKETS}
+    selected = {prefix: accepted_entries[prefix] for prefix in ALL_BUCKETS}
     live_counts = {
         prefix: int(entry["decode_replays"])
         for prefix, entry in accepted_entries.items()
@@ -306,7 +306,7 @@ def profile_shared_rope_scout(
             "q1_bmm_cross_attention": 0,
             "native_cross_mlp_tail": 0,
         }
-        for prefix in SENTINEL_BUCKETS
+        for prefix in ALL_BUCKETS
     }
     captured_candidates: dict[int, CapturedGraph] = {}
     capture_stats_by_prefix: dict[int, dict[str, Any]] = {}
@@ -441,7 +441,7 @@ def profile_shared_rope_scout(
         install_setup_seconds=install_setup_seconds,
     )
     total_replays = sum(live_counts.values())
-    measured_replays = sum(live_counts[prefix] for prefix in SENTINEL_BUCKETS)
+    measured_replays = sum(live_counts[prefix] for prefix in ALL_BUCKETS)
     report = {
         "schema_version": SCHEMA_VERSION,
         "metadata": {
@@ -450,7 +450,7 @@ def profile_shared_rope_scout(
             "original_decoder_layer": True,
             "original_specialized_dispatch": True,
             "precision": "fp32",
-            "measured_buckets": list(SENTINEL_BUCKETS),
+            "measured_buckets": list(ALL_BUCKETS),
             "accepted_bucket_replay_counts": {
                 str(prefix): count for prefix, count in live_counts.items()
             },
@@ -497,7 +497,7 @@ def _text_report(report: dict[str, Any]) -> str:
         f"promotion_pass={str(summary['promotion_pass']).lower()}",
         f"follow_up={summary['follow_up_if_below_threshold']}",
     ]
-    for prefix in SENTINEL_BUCKETS:
+    for prefix in ALL_BUCKETS:
         bucket = report["buckets"][str(prefix)]
         lines.append(
             f"prefix_{prefix}=accepted_ms:{bucket['timing']['accepted_ms_per_call']:.9f},"
