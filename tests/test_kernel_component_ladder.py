@@ -16,7 +16,7 @@ class KernelComponentLadderTest(unittest.TestCase):
         for commit in (
             "1c8417d313ce9237f7648aca434f42b6796f2a7d",
             "5fafbaf59b0a0e64bc12da83d5f340dd32aa7b79",
-            "7b26d7fed1c0f15120c8b8f53dc638c949415ef8",
+            "e3279d3836d1ff6cc4f5b32f67f45afec8755902",
             "907652706d402a90723724cd52f2d2ca721b635f",
             "f13e55e1bf1ad32629f2981738acb65aab09a45f",
         ):
