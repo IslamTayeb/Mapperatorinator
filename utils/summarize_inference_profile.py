@@ -239,7 +239,11 @@ def _performance(
         )
     )
     return {
-        "pass": bool(baseline_records) and record_shape_match and metrics["tokens_per_second"]["pass"] and metrics["model_elapsed_seconds"]["pass"],
+        "pass": (
+            bool(baseline_records)
+            and record_shape_match
+            and all(metric["pass"] for metric in metrics.values())
+        ),
         "metrics": metrics,
         "records_match": record_shape_match,
         "generated_tokens_match": baseline_total["generated_tokens"] == candidate_total["generated_tokens"],

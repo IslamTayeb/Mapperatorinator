@@ -12,6 +12,7 @@ def _profile(
     timing_tokens: list[int] | None = None,
     model_scale: float = 1.0,
     wall_scale: float = 1.0,
+    stage_scale: float | None = None,
     output_hash: str = "same-output",
     seed: int = 12345,
 ) -> dict:
@@ -45,9 +46,10 @@ def _profile(
                 "wall_seconds": wall_seconds,
             }
         )
+    stage_scale = wall_scale if stage_scale is None else stage_scale
     return {
         "metadata": metadata,
-        "stages": [{"name": "inference", "wall_seconds": 2.0 * wall_scale}],
+        "stages": [{"name": "inference", "wall_seconds": 2.0 * stage_scale}],
         "generation": generation,
     }
 
@@ -119,7 +121,7 @@ def test_five_percent_boundary_is_inclusive(tmp_path):
     baseline = _write(tmp_path / "baseline.json", _profile())
     candidate = _write(
         tmp_path / "candidate.json",
-        _profile(model_scale=1.05, wall_scale=2.0),
+        _profile(model_scale=1.05, wall_scale=1.05),
     )
 
     report = profiles.compare_profiles(
@@ -130,8 +132,73 @@ def test_five_percent_boundary_is_inclusive(tmp_path):
     )
 
     assert report["performance"]["metrics"]["model_elapsed_seconds"]["pass"]
-    assert not report["performance"]["metrics"]["outer_wall_seconds"]["pass"]
+    assert report["performance"]["metrics"]["outer_wall_seconds"]["pass"]
+    assert report["performance"]["metrics"]["total_stage_wall_seconds"]["pass"]
     assert report["performance"]["pass"]
+
+
+def test_outer_wall_regression_blocks_performance_pass(tmp_path):
+    baseline_first = _write(tmp_path / "baseline-first.json", _profile())
+    baseline_second = _write(tmp_path / "baseline-second.json", _profile())
+    candidate_second = _write(
+        tmp_path / "candidate-second.json",
+        _profile(wall_scale=1.011, stage_scale=1.0),
+    )
+    candidate_first = _write(
+        tmp_path / "candidate-first.json",
+        _profile(wall_scale=1.011, stage_scale=1.0),
+    )
+
+    report = profiles.compare_reciprocal_profiles(
+        baseline_first,
+        candidate_second,
+        candidate_first,
+        baseline_second,
+        labels=list(profiles.DEFAULT_LABELS),
+        regression_tolerance_pct=1.0,
+    )
+
+    metrics = report["orders"]["baseline_first"]["reports"]["main_generation"][
+        "performance"
+    ]["metrics"]
+    assert metrics["tokens_per_second"]["pass"]
+    assert metrics["model_elapsed_seconds"]["pass"]
+    assert not metrics["outer_wall_seconds"]["pass"]
+    assert metrics["total_stage_wall_seconds"]["pass"]
+    assert not report["performance_pass"]
+    assert not profiles._passed(report)
+
+
+def test_total_stage_wall_regression_blocks_performance_pass(tmp_path):
+    baseline_first = _write(tmp_path / "baseline-first.json", _profile())
+    baseline_second = _write(tmp_path / "baseline-second.json", _profile())
+    candidate_second = _write(
+        tmp_path / "candidate-second.json",
+        _profile(stage_scale=1.011),
+    )
+    candidate_first = _write(
+        tmp_path / "candidate-first.json",
+        _profile(stage_scale=1.011),
+    )
+
+    report = profiles.compare_reciprocal_profiles(
+        baseline_first,
+        candidate_second,
+        candidate_first,
+        baseline_second,
+        labels=list(profiles.DEFAULT_LABELS),
+        regression_tolerance_pct=1.0,
+    )
+
+    metrics = report["orders"]["baseline_first"]["reports"]["main_generation"][
+        "performance"
+    ]["metrics"]
+    assert metrics["tokens_per_second"]["pass"]
+    assert metrics["model_elapsed_seconds"]["pass"]
+    assert metrics["outer_wall_seconds"]["pass"]
+    assert not metrics["total_stage_wall_seconds"]["pass"]
+    assert not report["performance_pass"]
+    assert not profiles._passed(report)
 
 
 def test_record_shape_and_counts_must_match(tmp_path):
