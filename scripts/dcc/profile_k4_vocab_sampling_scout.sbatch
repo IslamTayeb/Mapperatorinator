@@ -118,5 +118,11 @@ cd "$REPO"
 
 test -s "$RUN_ROOT/scout.json"
 test -s "$RUN_ROOT/initialization.json"
+PROFILE_COUNT=$(find "$RUN_ROOT/output" -type f -name '*.profile.json' | wc -l)
+OSU_COUNT=$(find "$RUN_ROOT/output" -type f -name '*.osu' | wc -l)
+if [[ "$PROFILE_COUNT" -ne 1 || "$OSU_COUNT" -ne 1 ]]; then
+  echo "expected one inference profile and one final .osu; got profiles=$PROFILE_COUNT osu=$OSU_COUNT" >&2
+  exit 2
+fi
 find "$RUN_ROOT" -type f ! -name sha256sums.txt -print0 \
   | sort -z | xargs -0 sha256sum > "$RUN_ROOT/sha256sums.txt"
