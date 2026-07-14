@@ -52,6 +52,57 @@ OPTIMIZED_PRESETS = MappingProxyType(
     }
 )
 
+VALIDATED_SUPER_TIMING_ACTUAL_BATCH_SIZES = MappingProxyType(
+    {
+        "fp32": (1, 2, 3, 4, 8, 10, 11),
+        "fp16": (10, 11),
+    }
+)
+SUPER_TIMING_MIN_CONFIGURED_BATCH_SIZE = MappingProxyType(
+    {
+        "fp32": 1,
+        "fp16": 16,
+    }
+)
+
+
+def _exact_batch_partition(
+    total: int,
+    *,
+    allowed_shapes: tuple[int, ...],
+) -> tuple[int, ...] | None:
+    """Return the fewest deterministic chunks, preferring larger shapes."""
+
+    if isinstance(total, bool) or not isinstance(total, int):
+        raise TypeError("super-timing sample count must be an integer")
+    if total <= 0:
+        raise ValueError("super-timing sample count must be positive")
+    if (
+        not allowed_shapes
+        or any(
+            isinstance(shape, bool) or not isinstance(shape, int) or shape <= 0
+            for shape in allowed_shapes
+        )
+        or tuple(sorted(set(allowed_shapes))) != allowed_shapes
+    ):
+        raise ValueError(
+            "super-timing allowed shapes must be unique positive ascending integers"
+        )
+
+    plans: list[tuple[int, ...] | None] = [()] + [None] * total
+    for count in range(1, total + 1):
+        candidates = [
+            (shape,) + tail
+            for shape in reversed(allowed_shapes)
+            if shape <= count and (tail := plans[count - shape]) is not None
+        ]
+        if candidates:
+            plans[count] = min(
+                candidates,
+                key=lambda plan: (len(plan), tuple(-shape for shape in plan)),
+            )
+    return plans[total]
+
 
 def _optimized_config_metadata(preset: OptimizedPreset) -> dict[str, Any]:
     """Describe one immutable accepted engine preset for profiles."""
@@ -187,6 +238,13 @@ def _generate_window(
         batch_size == 1
         and specialized_dispatch_batch_size in {None, 1}
     )
+    batched_policy_disabled_reason = (
+        "batch_gt_1"
+        if batch_size > 1
+        else "nominal_batched_policy"
+        if not specialized_batch
+        else None
+    )
     q1_bmm_cross_attention = specialized_batch
     native_q1_self_attention = (
         specialized_batch and context_type != ContextType.TIMING
@@ -287,7 +345,7 @@ def _generate_window(
         "decoder_loop_backend": "active_prefix_cuda_graph",
         "torch_compile_enabled": False,
         "optimized_effective_config_version": preset.version,
-        "experimental_batched_super_timing": allow_batched_decode,
+        "optimized_batched_super_timing": allow_batched_decode,
         "optimized_dispatch_mode": (
             "accepted_batch1" if specialized_batch else "framework_batch"
         ),
@@ -296,7 +354,9 @@ def _generate_window(
                 "requested": specialized_batch,
                 "enabled": q1_bmm_cross_attention,
                 "disabled_reason": (
-                    None if q1_bmm_cross_attention else "batch_gt_1"
+                    None
+                    if q1_bmm_cross_attention
+                    else batched_policy_disabled_reason
                 ),
             },
             "native_q1_self_attention": {
@@ -305,7 +365,7 @@ def _generate_window(
                 "disabled_reason": (
                     None
                     if native_q1_self_attention
-                    else "batch_gt_1"
+                    else batched_policy_disabled_reason
                     if not specialized_batch
                     else "timing_context"
                 ),
@@ -316,7 +376,7 @@ def _generate_window(
                 "disabled_reason": (
                     None
                     if native_q1_rope_cache_self_attention
-                    else "batch_gt_1"
+                    else batched_policy_disabled_reason
                     if not specialized_batch
                     else "timing_context"
                 ),
@@ -327,7 +387,7 @@ def _generate_window(
                 "disabled_reason": (
                     None
                     if native_cross_mlp_tail
-                    else "batch_gt_1"
+                    else batched_policy_disabled_reason
                     if not specialized_batch
                     else "timing_context"
                 ),
@@ -336,7 +396,7 @@ def _generate_window(
         "native_cross_mlp_tail_requested": specialized_batch,
         "native_cross_mlp_tail_enabled": native_cross_mlp_tail,
         "native_cross_mlp_tail_disabled_reason": (
-            "batch_gt_1"
+            batched_policy_disabled_reason
             if not specialized_batch
             else "timing_context"
             if not native_cross_mlp_tail
@@ -379,6 +439,27 @@ class OptimizedSingleRuntime:
     def new_context_state(self) -> ProductionDecodeSession:
         return ProductionDecodeSession()
 
+    def for_super_timing(
+        self,
+        *,
+        max_batch_size: int,
+    ) -> "OptimizedSuperTimingRuntime":
+        if isinstance(max_batch_size, bool) or not isinstance(max_batch_size, int):
+            raise TypeError("optimized super timing max_batch_size must be an integer")
+        if max_batch_size <= 0:
+            raise ValueError("optimized super timing max_batch_size must be positive")
+        minimum = SUPER_TIMING_MIN_CONFIGURED_BATCH_SIZE[self.preset.precision]
+        if max_batch_size < minimum:
+            raise ValueError(
+                f"optimized {self.preset.precision} super timing requires "
+                f"max_batch_size>={minimum}"
+            )
+        return OptimizedSuperTimingRuntime(
+            self.preset,
+            configured_max_batch_size=max_batch_size,
+            public_wiring=True,
+        )
+
     def generate_window(
         self,
         *,
@@ -412,12 +493,13 @@ class OptimizedSingleRuntime:
         }
 
 
-@dataclass(slots=True)
-class ExperimentalBatchedSuperTimingRuntime:
-    """Private profiling runtime; never selected by public inference config."""
+@dataclass(frozen=True, slots=True)
+class OptimizedSuperTimingRuntime:
+    """Request-local fixed-batch runtime for optimized super timing."""
 
     preset: OptimizedPreset
-    nominal_batch_size: int
+    configured_max_batch_size: int
+    public_wiring: bool
     _session: ProductionDecodeSession = field(
         default_factory=ProductionDecodeSession,
         init=False,
@@ -430,13 +512,73 @@ class ExperimentalBatchedSuperTimingRuntime:
             for candidate in OPTIMIZED_PRESETS.values()
         ):
             raise ValueError(
-                "experimental batched runtime requires a registered preset"
+                "optimized super-timing runtime requires a registered preset"
             )
-        if self.nominal_batch_size <= 0:
-            raise ValueError("experimental nominal batch size must be positive")
+        if (
+            isinstance(self.configured_max_batch_size, bool)
+            or not isinstance(self.configured_max_batch_size, int)
+        ):
+            raise TypeError(
+                "optimized super-timing configured max batch size must be an integer"
+            )
+        if self.configured_max_batch_size <= 0:
+            raise ValueError(
+                "optimized super-timing configured max batch size must be positive"
+            )
+        if not isinstance(self.public_wiring, bool):
+            raise TypeError("optimized super-timing public_wiring must be boolean")
+        minimum = SUPER_TIMING_MIN_CONFIGURED_BATCH_SIZE[self.preset.precision]
+        if self.public_wiring and self.configured_max_batch_size < minimum:
+            raise ValueError(
+                f"optimized {self.preset.precision} super timing requires "
+                f"configured max batch size >= {minimum}"
+            )
+
+    @property
+    def is_super_timing_runtime(self) -> bool:
+        return True
 
     def new_context_state(self) -> ProductionDecodeSession:
         return self._session
+
+    def plan_batches(
+        self,
+        *,
+        num_samples: int,
+        max_batch_size: int,
+    ) -> tuple[int, ...]:
+        if max_batch_size != self.configured_max_batch_size:
+            raise RuntimeError(
+                "optimized super-timing Processor batch limit changed after setup"
+            )
+        if self.public_wiring:
+            allowed = tuple(
+                shape
+                for shape in VALIDATED_SUPER_TIMING_ACTUAL_BATCH_SIZES[
+                    self.preset.precision
+                ]
+                if shape <= max_batch_size
+            )
+            plan = _exact_batch_partition(
+                num_samples,
+                allowed_shapes=allowed,
+            )
+            if plan is None:
+                raise ValueError(
+                    f"optimized {self.preset.precision} super timing cannot "
+                    f"partition {num_samples} windows into validated actual "
+                    f"graph shapes {list(allowed)}"
+                )
+            return plan
+
+        if isinstance(num_samples, bool) or not isinstance(num_samples, int):
+            raise TypeError("profiling super-timing sample count must be an integer")
+        if num_samples <= 0:
+            raise ValueError("profiling super-timing sample count must be positive")
+        return tuple(
+            min(max_batch_size, num_samples - start)
+            for start in range(0, num_samples, max_batch_size)
+        )
 
     def generate_window(
         self,
@@ -449,7 +591,7 @@ class ExperimentalBatchedSuperTimingRuntime:
     ):
         if context_state is not self._session:
             raise RuntimeError(
-                "experimental batched runtime requires its persistent session"
+                "optimized super-timing runtime requires its persistent session"
             )
         return _generate_window(
             model,
@@ -459,41 +601,71 @@ class ExperimentalBatchedSuperTimingRuntime:
             context_state=context_state,
             preset=self.preset,
             allow_batched_decode=True,
-            specialized_dispatch_batch_size=self.nominal_batch_size,
+            specialized_dispatch_batch_size=self.configured_max_batch_size,
         )
 
-    def profile_metadata(self) -> dict[str, Any]:
+    def super_timing_profile_metadata(self) -> dict[str, Any]:
+        actual_shapes = (
+            list(
+                shape
+                for shape in VALIDATED_SUPER_TIMING_ACTUAL_BATCH_SIZES[
+                    self.preset.precision
+                ]
+                if shape <= self.configured_max_batch_size
+            )
+            if self.public_wiring
+            else None
+        )
         return {
-            "optimized_effective_config_version": self.preset.version,
-            "optimized_effective_config": {
-                **_optimized_config_metadata(self.preset),
-                "batch_size": "profile_selected",
-                "nominal_batch_size": self.nominal_batch_size,
-                "specialized_dispatch_batch_size": 1,
+            "optimized_super_timing_enabled": True,
+            "optimized_super_timing_public_wiring": self.public_wiring,
+            "optimized_super_timing_config": {
+                "precision": self.preset.precision,
+                "configured_max_batch_size": self.configured_max_batch_size,
+                "validated_actual_batch_sizes": actual_shapes,
+                "batch_planner": (
+                    "validated_exact_partition"
+                    if self.public_wiring
+                    else "profiling_fixed_chunks_with_arbitrary_tail"
+                ),
                 "framework_dispatch_batch_gt_1": True,
+                "framework_dispatch_batch1_under_batched_policy": (
+                    self.configured_max_batch_size > 1
+                ),
+                "accepted_specialized_dispatch_batch1": (
+                    self.configured_max_batch_size == 1
+                ),
+                "native_q1_self_attention_batch_gt_1": False,
+                "native_q1_rope_cache_self_attention_batch_gt_1": False,
+                "q1_bmm_cross_attention_batch_gt_1": False,
+                "native_cross_mlp_tail_batch_gt_1": False,
             },
-            "optimized_runtime_owner": (
+            "optimized_super_timing_runtime_owner": (
                 "osuT5.osuT5.inference.optimized.single.engine"
             ),
-            "optimized_result_class": "component-scout",
-            "public_wiring": False,
+            "optimized_super_timing_result_class": (
+                self.preset.result_class
+                if self.public_wiring
+                else "component-scout"
+            ),
         }
 
 
-def build_experimental_batched_super_timing_runtime(
+def build_profiling_batched_super_timing_runtime(
     precision: str,
     *,
     nominal_batch_size: int,
-) -> ExperimentalBatchedSuperTimingRuntime:
+) -> OptimizedSuperTimingRuntime:
     try:
         preset = OPTIMIZED_PRESETS[precision]
     except (KeyError, TypeError) as exc:
         raise ValueError(
             "batched super-timing runtime requires precision in: fp16, fp32"
         ) from exc
-    return ExperimentalBatchedSuperTimingRuntime(
+    return OptimizedSuperTimingRuntime(
         preset,
-        nominal_batch_size=nominal_batch_size,
+        configured_max_batch_size=nominal_batch_size,
+        public_wiring=False,
     )
 
 

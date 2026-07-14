@@ -401,8 +401,16 @@ def validate_reserved_runtime_flags(args: InferenceConfig):
             raise ValueError("inference_engine=optimized currently requires cfg_scale=1.0.")
         if args.num_beams != 1:
             raise ValueError("inference_engine=optimized currently requires num_beams=1.")
-        if args.super_timing:
-            raise ValueError("inference_engine=optimized does not support super_timing.")
+        if args.super_timing and args.timer_num_beams != 1:
+            raise ValueError(
+                "inference_engine=optimized super_timing requires "
+                "timer_num_beams=1."
+            )
+        if args.super_timing and args.timer_cfg_scale != 1.0:
+            raise ValueError(
+                "inference_engine=optimized super_timing requires "
+                "timer_cfg_scale=1.0."
+            )
 
     def effective_generation_batch_size() -> int:
         batch_multiplier = args.num_beams * (2 if args.cfg_scale > 1.0 else 1)

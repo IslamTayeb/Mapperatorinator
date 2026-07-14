@@ -421,10 +421,10 @@ def profile(args, *, mode: str, batch_size: int, seed: int) -> dict[str, Any]:
     bound_model = model
     if mode == "graph":
         from osuT5.osuT5.inference.optimized.single.engine import (
-            build_experimental_batched_super_timing_runtime,
+            build_profiling_batched_super_timing_runtime,
         )
 
-        runtime = build_experimental_batched_super_timing_runtime(
+        runtime = build_profiling_batched_super_timing_runtime(
             args.precision,
             nominal_batch_size=batch_size,
         )

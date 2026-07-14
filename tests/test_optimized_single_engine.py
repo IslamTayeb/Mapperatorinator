@@ -17,11 +17,20 @@ from osuT5.osuT5.inference.generation_utils import (
 )
 from osuT5.osuT5.inference.optimized.single import engine as engine_module
 from osuT5.osuT5.inference.optimized.single.engine import (
-    ExperimentalBatchedSuperTimingRuntime,
     OPTIMIZED_PRESETS,
+    SUPER_TIMING_MIN_CONFIGURED_BATCH_SIZE,
+    VALIDATED_SUPER_TIMING_ACTUAL_BATCH_SIZES,
     OptimizedPreset,
     OptimizedSingleRuntime,
+    OptimizedSuperTimingRuntime,
+    _exact_batch_partition,
+    build_profiling_batched_super_timing_runtime,
     load_optimized_single_engine,
+)
+from osuT5.osuT5.inference.processor import Processor
+from osuT5.osuT5.inference.profiler import InferenceProfiler
+from osuT5.osuT5.inference.super_timing_generator import (
+    _configure_optimized_super_timing_runtime,
 )
 from osuT5.osuT5.inference.optimized.single.state import ProductionDecodeSession
 from osuT5.osuT5.inference import server
@@ -82,18 +91,319 @@ def test_runtime_metadata_exposes_two_fixed_accepted_presets():
         }
 
 
-def test_experimental_batched_runtime_persists_one_private_session():
-    runtime = ExperimentalBatchedSuperTimingRuntime(
-        OPTIMIZED_PRESETS["fp32"],
+def test_profiling_batched_runtime_persists_one_private_session():
+    runtime = build_profiling_batched_super_timing_runtime(
+        "fp32",
         nominal_batch_size=4,
     )
+    assert isinstance(runtime, OptimizedSuperTimingRuntime)
+    assert runtime.preset is OPTIMIZED_PRESETS["fp32"]
     first = runtime.new_context_state()
     second = runtime.new_context_state()
     assert first is second
-    assert runtime.profile_metadata()["public_wiring"] is False
-    assert runtime.profile_metadata()["optimized_effective_config"][
+    metadata = runtime.super_timing_profile_metadata()
+    assert metadata["optimized_super_timing_public_wiring"] is False
+    assert metadata["optimized_super_timing_config"][
         "framework_dispatch_batch_gt_1"
     ] is True
+    assert metadata["optimized_super_timing_config"][
+        "validated_actual_batch_sizes"
+    ] is None
+    assert runtime.plan_batches(num_samples=11, max_batch_size=4) == (4, 4, 3)
+
+
+@pytest.mark.parametrize(
+    ("precision", "maximum"),
+    (
+        ("fp32", 1),
+        ("fp32", 3),
+        ("fp32", 15),
+        ("fp32", 32),
+        ("fp16", 16),
+        ("fp16", 32),
+    ),
+)
+def test_single_runtime_preserves_configured_super_timing_maximum(
+    precision,
+    maximum,
+):
+    original = OptimizedSingleRuntime(OPTIMIZED_PRESETS[precision])
+    timing = original.for_super_timing(max_batch_size=maximum)
+
+    assert isinstance(timing, OptimizedSuperTimingRuntime)
+    assert timing is not original
+    assert timing.configured_max_batch_size == maximum
+    assert timing.public_wiring is True
+    assert timing.new_context_state() is timing.new_context_state()
+    assert original.new_context_state() is not original.new_context_state()
+    with pytest.raises(FrozenInstanceError):
+        timing.configured_max_batch_size = 1
+
+
+def test_super_timing_validated_batches_are_immutable_and_precision_specific():
+    assert VALIDATED_SUPER_TIMING_ACTUAL_BATCH_SIZES == {
+        "fp32": (1, 2, 3, 4, 8, 10, 11),
+        "fp16": (10, 11),
+    }
+    assert SUPER_TIMING_MIN_CONFIGURED_BATCH_SIZE == {"fp32": 1, "fp16": 16}
+    with pytest.raises(TypeError):
+        VALIDATED_SUPER_TIMING_ACTUAL_BATCH_SIZES["fp32"] = (32,)
+    with pytest.raises(ValueError, match="max_batch_size>=16"):
+        OptimizedSingleRuntime(OPTIMIZED_PRESETS["fp16"]).for_super_timing(
+            max_batch_size=15
+        )
+
+
+@pytest.mark.parametrize(
+    ("total", "allowed", "expected"),
+    (
+        (1, (1, 2, 3, 4, 8, 10, 11), (1,)),
+        (5, (1, 2, 3, 4, 8, 10, 11), (4, 1)),
+        (12, (1, 2, 3, 4, 8, 10, 11), (11, 1)),
+        (19, (1, 2, 3, 4, 8, 10, 11), (11, 8)),
+        (11, (1, 2, 3, 4), (4, 4, 3)),
+        (20, (10, 11), (10, 10)),
+        (21, (10, 11), (11, 10)),
+        (22, (10, 11), (11, 11)),
+        (19, (10, 11), None),
+    ),
+)
+def test_exact_batch_partition_uses_only_actual_validated_shapes(
+    total,
+    allowed,
+    expected,
+):
+    assert _exact_batch_partition(total, allowed_shapes=allowed) == expected
+
+
+def test_public_runtime_plans_only_validated_actual_graph_shapes():
+    fp32 = OptimizedSingleRuntime(OPTIMIZED_PRESETS["fp32"]).for_super_timing(
+        max_batch_size=16
+    )
+    assert fp32.plan_batches(num_samples=19, max_batch_size=16) == (11, 8)
+
+    fp32_small = OptimizedSingleRuntime(
+        OPTIMIZED_PRESETS["fp32"]
+    ).for_super_timing(max_batch_size=4)
+    assert fp32_small.plan_batches(num_samples=11, max_batch_size=4) == (4, 4, 3)
+
+    fp16 = OptimizedSingleRuntime(OPTIMIZED_PRESETS["fp16"]).for_super_timing(
+        max_batch_size=16
+    )
+    assert fp16.plan_batches(num_samples=21, max_batch_size=16) == (11, 10)
+    with pytest.raises(ValueError, match="cannot partition 19 windows"):
+        fp16.plan_batches(num_samples=19, max_batch_size=16)
+
+
+def test_generator_configures_request_local_runtime_without_mutating_original():
+    original = OptimizedSingleRuntime(OPTIMIZED_PRESETS["fp32"])
+    profiler = InferenceProfiler(enabled=True)
+    profiler.set_metadata(
+        optimized_effective_config={"ordinary": "unchanged"},
+        optimized_runtime_owner="ordinary-runtime",
+    )
+    processor = SimpleNamespace(
+        inference_runtime=original,
+        do_sample=False,
+        num_beams=1,
+        cfg_scale=1.0,
+        decode_session_state=object(),
+        max_batch_size=99,
+        profiler=profiler,
+    )
+
+    timing = _configure_optimized_super_timing_runtime(
+        processor,
+        max_batch_size=12,
+    )
+
+    assert isinstance(timing, OptimizedSuperTimingRuntime)
+    assert timing.configured_max_batch_size == 12
+    assert processor.inference_runtime is timing
+    assert processor.inference_runtime is not original
+    assert processor.decode_session_state is None
+    assert processor.max_batch_size == 12
+    assert profiler.metadata["optimized_super_timing_public_wiring"] is True
+    assert profiler.metadata["optimized_super_timing_config"][
+        "validated_actual_batch_sizes"
+    ] == [1, 2, 3, 4, 8, 10, 11]
+    assert profiler.metadata["optimized_effective_config"] == {
+        "ordinary": "unchanged"
+    }
+    assert profiler.metadata["optimized_runtime_owner"] == "ordinary-runtime"
+    assert original.new_context_state() is not original.new_context_state()
+
+
+def test_generator_leaves_v32_runtime_and_legacy_timer_policy_untouched():
+    processor = SimpleNamespace(
+        inference_runtime=None,
+        do_sample=False,
+        num_beams=2,
+        cfg_scale=1.5,
+    )
+
+    assert (
+        _configure_optimized_super_timing_runtime(
+            processor,
+            max_batch_size=8,
+        )
+        is None
+    )
+    assert processor.inference_runtime is None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"do_sample": True},
+        {"num_beams": 2},
+        {"cfg_scale": 1.1},
+    ),
+)
+def test_generator_rejects_non_greedy_optimized_super_timing(overrides):
+    values = {
+        "inference_runtime": OptimizedSingleRuntime(OPTIMIZED_PRESETS["fp32"]),
+        "do_sample": False,
+        "num_beams": 1,
+        "cfg_scale": 1.0,
+    }
+    values.update(overrides)
+    with pytest.raises(ValueError, match="greedy decoding"):
+        _configure_optimized_super_timing_runtime(
+            SimpleNamespace(**values),
+            max_batch_size=16,
+        )
+
+
+def test_production_super_timing_runtime_rejects_unvalidated_batch():
+    with pytest.raises(ValueError, match="configured max batch size >= 16"):
+        OptimizedSuperTimingRuntime(
+            OPTIMIZED_PRESETS["fp16"],
+            configured_max_batch_size=4,
+            public_wiring=True,
+        )
+
+    with pytest.raises(TypeError, match="configured max batch size must be an integer"):
+        OptimizedSuperTimingRuntime(
+            OPTIMIZED_PRESETS["fp32"],
+            configured_max_batch_size=True,
+            public_wiring=False,
+        )
+
+
+def test_existing_profiling_runtime_is_not_replaced_by_generator():
+    runtime = OptimizedSuperTimingRuntime(
+        OPTIMIZED_PRESETS["fp32"],
+        configured_max_batch_size=4,
+        public_wiring=False,
+    )
+    processor = SimpleNamespace(
+        inference_runtime=runtime,
+        do_sample=False,
+        num_beams=1,
+        cfg_scale=1.0,
+        decode_session_state=object(),
+        max_batch_size=16,
+        profiler=InferenceProfiler(enabled=False),
+    )
+
+    configured = _configure_optimized_super_timing_runtime(
+        processor,
+        max_batch_size=16,
+    )
+
+    assert configured is runtime
+    assert processor.inference_runtime is runtime
+    assert processor.max_batch_size == 4
+    assert runtime.super_timing_profile_metadata()[
+        "optimized_super_timing_config"
+    ]["batch_planner"] == "profiling_fixed_chunks_with_arbitrary_tail"
+
+
+def test_generator_rejects_reusing_already_public_super_timing_runtime():
+    runtime = OptimizedSingleRuntime(OPTIMIZED_PRESETS["fp32"]).for_super_timing(
+        max_batch_size=16
+    )
+    processor = SimpleNamespace(
+        inference_runtime=runtime,
+        do_sample=False,
+        num_beams=1,
+        cfg_scale=1.0,
+    )
+
+    with pytest.raises(RuntimeError, match="must not reuse an already-public"):
+        _configure_optimized_super_timing_runtime(
+            processor,
+            max_batch_size=16,
+        )
+
+
+def test_processor_batch_plan_uses_runtime_planner_and_fails_loudly():
+    planner = Mock(return_value=(4, 3))
+    processor = object.__new__(Processor)
+    processor.inference_runtime = SimpleNamespace(plan_batches=planner)
+
+    assert processor._generation_batch_plan(
+        num_samples=7,
+        max_batch_size=4,
+    ) == (4, 3)
+    planner.assert_called_once_with(num_samples=7, max_batch_size=4)
+
+    processor.inference_runtime.plan_batches = Mock(return_value=(4, 4))
+    with pytest.raises(ValueError, match="does not cover every input"):
+        processor._generation_batch_plan(num_samples=7, max_batch_size=4)
+
+    processor.inference_runtime.plan_batches = Mock(return_value=(5, 2))
+    with pytest.raises(ValueError, match="invalid actual batch size"):
+        processor._generation_batch_plan(num_samples=7, max_batch_size=4)
+
+
+def test_processor_legacy_batch_plan_remains_fixed_chunks_with_tail():
+    processor = object.__new__(Processor)
+    processor.inference_runtime = None
+
+    assert processor._generation_batch_plan(
+        num_samples=11,
+        max_batch_size=4,
+    ) == (4, 4, 3)
+
+
+def test_batched_inference_executes_the_runtime_actual_shape_plan():
+    processor = object.__new__(Processor)
+    processor.inference_runtime = OptimizedSingleRuntime(
+        OPTIMIZED_PRESETS["fp32"]
+    ).for_super_timing(max_batch_size=16)
+    processor.max_batch_size = 16
+    processor.num_beams = 1
+    processor.cfg_scale = 1.0
+    processor.tokenizer = SimpleNamespace(pad_id=0)
+    processor.profiler = InferenceProfiler(enabled=False)
+    processor.last_generation_stats = None
+    processor.super_timing_iteration = 0
+    processor.stack_prompts = lambda cond, uncond: (
+        torch.arange(19, dtype=torch.long).reshape(19, 1) + 1,
+        None,
+        1,
+    )
+    actual_batches = []
+
+    def generate_func(kwargs):
+        actual_batches.append(int(kwargs["inputs"].shape[0]))
+        return kwargs["decoder_input_ids"]
+
+    results = list(
+        processor._batched_inference(
+            generate_func,
+            [torch.ones((1, 1), dtype=torch.long)] * 19,
+            [torch.ones((1, 1), dtype=torch.long)] * 19,
+            torch.ones((19, 2)),
+            [{"feature": torch.ones((1, 1))} for _ in range(19)],
+            verbose=False,
+        )
+    )
+
+    assert actual_batches == [11, 8]
+    assert [int(result.shape[0]) for result, _ in results] == [11, 8]
 
 
 def test_precision_presets_and_bound_runtime_are_immutable():

@@ -765,6 +765,42 @@ class Processor(object):
 
         return cond_prompts, uncond_prompts, model_kwargses
 
+    def _generation_batch_plan(
+            self,
+            *,
+            num_samples: int,
+            max_batch_size: int,
+    ) -> tuple[int, ...]:
+        planner = getattr(self.inference_runtime, "plan_batches", None)
+        if callable(planner):
+            plan = planner(
+                num_samples=num_samples,
+                max_batch_size=max_batch_size,
+            )
+        else:
+            plan = tuple(
+                min(max_batch_size, num_samples - start)
+                for start in range(0, num_samples, max_batch_size)
+            )
+
+        if not isinstance(plan, tuple):
+            raise TypeError("generation batch planner must return a tuple")
+        if any(
+            isinstance(batch_size, bool)
+            or not isinstance(batch_size, int)
+            or batch_size <= 0
+            or batch_size > max_batch_size
+            for batch_size in plan
+        ):
+            raise ValueError(
+                "generation batch plan contains an invalid actual batch size"
+            )
+        if sum(plan) != num_samples:
+            raise ValueError(
+                "generation batch plan does not cover every input exactly once"
+            )
+        return plan
+
     def _batched_inference(
             self,
             generate_func,
@@ -784,15 +820,25 @@ class Processor(object):
         max_batch_size = max(1, self.max_batch_size // self.num_beams // (2 if self.cfg_scale > 1 else 1))
         num_samples = cond_prompt.size(0)
         model_kwarg_keys = list(model_kwargses[0].keys())
+        batch_plan = self._generation_batch_plan(
+            num_samples=num_samples,
+            max_batch_size=max_batch_size,
+        )
+        batch_slices = []
+        batch_start = 0
+        for actual_batch_size in batch_plan:
+            batch_slices.append((batch_start, actual_batch_size))
+            batch_start += actual_batch_size
 
         # Process each batch
         tokens_per_second_meter = self._create_tokens_per_second_meter()
-        iterator = tqdm(list(range(0, num_samples, max_batch_size)), dynamic_ncols=True) if verbose else range(0, num_samples, max_batch_size)
-        for i in iterator:
-            frames_batch = frames[i:i + max_batch_size]
-            cond_prompt_batch = cond_prompt[i:i + max_batch_size]
-            uncond_prompt_batch = uncond_prompt[i:i + max_batch_size] if uncond_prompt is not None else None
-            kwargses_batch = model_kwargses[i:i + max_batch_size]
+        iterator = tqdm(batch_slices, dynamic_ncols=True) if verbose else batch_slices
+        for i, actual_batch_size in iterator:
+            batch_end = i + actual_batch_size
+            frames_batch = frames[i:batch_end]
+            cond_prompt_batch = cond_prompt[i:batch_end]
+            uncond_prompt_batch = uncond_prompt[i:batch_end] if uncond_prompt is not None else None
+            kwargses_batch = model_kwargses[i:batch_end]
             model_kwargs_batch = {k: torch.cat([kwargs[k] for kwargs in kwargses_batch], dim=0) for k in
                                   model_kwarg_keys}
 
@@ -1527,7 +1573,7 @@ class Processor(object):
         if stats.get("torch_compile_enabled") is not None:
             record["torch_compile_enabled"] = stats["torch_compile_enabled"]
         for key in (
-            "experimental_batched_super_timing",
+            "optimized_batched_super_timing",
             "optimized_dispatch_mode",
             "optimized_dispatch_policy",
             "native_cross_mlp_tail_requested",

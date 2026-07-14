@@ -56,6 +56,49 @@ def test_optimized_engine_accepts_only_the_two_frozen_precision_presets():
     )
 
 
+def test_optimized_super_timing_accepts_only_greedy_beam1_cfg1():
+    base = dict(
+        inference_engine="optimized",
+        precision="fp32",
+        use_server=False,
+        parallel=False,
+        device="cuda",
+        attn_implementation="sdpa",
+        cfg_scale=1.0,
+        num_beams=1,
+        super_timing=True,
+        timer_num_beams=1,
+        timer_cfg_scale=1.0,
+    )
+    validate_reserved_runtime_flags(InferenceConfig(**base))
+
+    _assert_raises(
+        ValueError,
+        "timer_num_beams=1",
+        lambda: validate_reserved_runtime_flags(
+            InferenceConfig(**{**base, "timer_num_beams": 2})
+        ),
+    )
+    _assert_raises(
+        ValueError,
+        "timer_cfg_scale=1.0",
+        lambda: validate_reserved_runtime_flags(
+            InferenceConfig(**{**base, "timer_cfg_scale": 1.1})
+        ),
+    )
+
+
+def test_v32_super_timing_keeps_legacy_timer_beams_and_cfg():
+    validate_reserved_runtime_flags(
+        InferenceConfig(
+            inference_engine="v32",
+            super_timing=True,
+            timer_num_beams=2,
+            timer_cfg_scale=1.5,
+        )
+    )
+
+
 def test_v32_loader_never_imports_or_dispatches_to_optimized_adapter():
     with patch.object(inference, "load_model_with_server", return_value=("model", "tokenizer")) as legacy_loader:
         with patch.object(inference.importlib, "import_module") as optimized_import:

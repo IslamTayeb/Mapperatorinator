@@ -330,7 +330,7 @@ def test_ordinary_generate_window_installs_shared_specialized_dispatch(monkeypat
     assert timing_dispatch_counts == timing_stats["optimized_dispatch_capture_hits"]
 
 
-def test_experimental_batched_window_deliberately_disables_all_native_dispatch(
+def test_batched_super_timing_window_deliberately_disables_all_native_dispatch(
     monkeypatch,
 ) -> None:
     captured: list[dict[str, object]] = []
@@ -392,6 +392,7 @@ def test_experimental_batched_window_deliberately_disables_all_native_dispatch(
         "native_cross_mlp_tail": 0,
     }
     assert stats["optimized_dispatch_mode"] == "framework_batch"
+    assert stats["optimized_batched_super_timing"] is True
     assert {
         row["disabled_reason"]
         for row in stats["optimized_dispatch_policy"].values()
@@ -441,6 +442,14 @@ def test_nominal_batched_policy_keeps_a_one_row_tail_on_framework(monkeypatch):
     assert all(value is False for value in captured[0].values() if isinstance(value, bool))
     assert all(value == 0 for value in dispatch_counts.values())
     assert stats["optimized_dispatch_mode"] == "framework_batch"
+    assert {
+        row["disabled_reason"]
+        for row in stats["optimized_dispatch_policy"].values()
+    } == {"nominal_batched_policy"}
+    assert (
+        stats["native_cross_mlp_tail_disabled_reason"]
+        == "nominal_batched_policy"
+    )
 
 
 @pytest.mark.parametrize(

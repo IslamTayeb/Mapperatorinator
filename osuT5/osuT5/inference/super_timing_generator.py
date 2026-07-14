@@ -28,6 +28,66 @@ def _array_profile(value: npt.ArrayLike) -> dict[str, object]:
     }
 
 
+def _configure_optimized_super_timing_runtime(
+        processor: Processor,
+        *,
+        max_batch_size: int,
+) -> object | None:
+    runtime = processor.inference_runtime
+    if runtime is None:
+        return None
+    if processor.do_sample or processor.num_beams != 1 or processor.cfg_scale != 1.0:
+        raise ValueError(
+            "optimized super timing requires greedy decoding, num_beams=1, "
+            "and timer_cfg_scale=1"
+        )
+
+    if getattr(runtime, "is_super_timing_runtime", False):
+        if getattr(runtime, "public_wiring", None) is not False:
+            raise RuntimeError(
+                "super-timing generator must not reuse an already-public "
+                "optimized super-timing runtime"
+            )
+        timing_runtime = runtime
+    else:
+        factory = getattr(runtime, "for_super_timing", None)
+        if not callable(factory):
+            raise TypeError(
+                "bound optimized runtime does not support super timing"
+            )
+        timing_runtime = factory(max_batch_size=max_batch_size)
+        if timing_runtime is runtime:
+            raise RuntimeError(
+                "optimized super timing must use a generator-local runtime"
+            )
+
+    configured_max_batch_size = getattr(
+        timing_runtime,
+        "configured_max_batch_size",
+        None,
+    )
+    if (
+        isinstance(configured_max_batch_size, bool)
+        or not isinstance(configured_max_batch_size, int)
+        or configured_max_batch_size <= 0
+        or configured_max_batch_size > max_batch_size
+    ):
+        raise RuntimeError(
+            "optimized super timing selected an invalid configured max batch size"
+        )
+    processor.inference_runtime = timing_runtime
+    processor.decode_session_state = None
+    processor.max_batch_size = configured_max_batch_size
+    profile_metadata = getattr(
+        timing_runtime,
+        "super_timing_profile_metadata",
+        None,
+    )
+    if callable(profile_metadata):
+        processor.profiler.set_metadata(**profile_metadata())
+    return timing_runtime
+
+
 class SuperTimingGenerator:
     def __init__(
             self,
@@ -46,6 +106,10 @@ class SuperTimingGenerator:
         self.processor.top_p = 1
         self.processor.top_k = 50
         self.processor.add_to_beatmap = False
+        _configure_optimized_super_timing_runtime(
+            self.processor,
+            max_batch_size=args.max_batch_size,
+        )
         self.bpm_change_threshold = args.timer_bpm_threshold
         self.types_first = args.train.data.types_first
         self.iterations = args.timer_iterations
