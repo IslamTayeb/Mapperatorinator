@@ -39,7 +39,7 @@ torch::Tensor weight_only_mlp_residual(
     torch::Tensor input, torch::Tensor norm_weight, torch::Tensor fc1_weight,
     c10::optional<torch::Tensor> fc1_bias, torch::Tensor fc2_weight,
     c10::optional<torch::Tensor> fc2_bias, double eps,
-    int64_t outputs_per_block);
+    int64_t fc1_outputs_per_block, int64_t fc2_outputs_per_block);
 """
 
 
@@ -331,9 +331,11 @@ torch::Tensor weight_only_mlp_residual(
         torch::Tensor input, torch::Tensor norm_weight,
         torch::Tensor fc1_weight, c10::optional<torch::Tensor> fc1_bias,
         torch::Tensor fc2_weight, c10::optional<torch::Tensor> fc2_bias,
-        double eps, int64_t outputs_per_block) {
+        double eps, int64_t fc1_outputs_per_block,
+        int64_t fc2_outputs_per_block) {
     check_common(input, fc1_weight);
-    check_outputs_per_block(outputs_per_block);
+    check_outputs_per_block(fc1_outputs_per_block);
+    check_outputs_per_block(fc2_outputs_per_block);
     TORCH_CHECK(fc2_weight.is_cuda() && fc2_weight.device() == input.device(),
         "fc2 weight must use the input CUDA device");
     TORCH_CHECK(fc2_weight.scalar_type() == torch::kFloat16
@@ -360,41 +362,47 @@ torch::Tensor weight_only_mlp_residual(
         norm_weight.data_ptr<float>(), normalized.data_ptr<float>(), hidden_dim,
         static_cast<float>(eps));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    const int threads = static_cast<int>(outputs_per_block) * 32;
+    const int fc1_threads = static_cast<int>(fc1_outputs_per_block) * 32;
+    const int fc2_threads = static_cast<int>(fc2_outputs_per_block) * 32;
     const int fc1_blocks = (intermediate_dim
-        + static_cast<int>(outputs_per_block) - 1)
-        / static_cast<int>(outputs_per_block);
-    const int fc2_blocks = (hidden_dim + static_cast<int>(outputs_per_block) - 1)
-        / static_cast<int>(outputs_per_block);
-    if (outputs_per_block == 2) {
-        weight_only_linear_kernel<2, false, true><<<fc1_blocks, threads, 0, stream>>>(
+        + static_cast<int>(fc1_outputs_per_block) - 1)
+        / static_cast<int>(fc1_outputs_per_block);
+    const int fc2_blocks = (hidden_dim
+        + static_cast<int>(fc2_outputs_per_block) - 1)
+        / static_cast<int>(fc2_outputs_per_block);
+    if (fc1_outputs_per_block == 2) {
+        weight_only_linear_kernel<2, false, true><<<fc1_blocks, fc1_threads, 0, stream>>>(
             normalized.data_ptr<float>(),
             reinterpret_cast<const __half*>(fc1_weight.data_ptr<at::Half>()),
             fc1_bias_ptr, nullptr, activated.data_ptr<float>(), hidden_dim,
             intermediate_dim, fc1_bias_ptr != nullptr);
-        weight_only_linear_kernel<2, true, false><<<fc2_blocks, threads, 0, stream>>>(
+    } else if (fc1_outputs_per_block == 4) {
+        weight_only_linear_kernel<4, false, true><<<fc1_blocks, fc1_threads, 0, stream>>>(
+            normalized.data_ptr<float>(),
+            reinterpret_cast<const __half*>(fc1_weight.data_ptr<at::Half>()),
+            fc1_bias_ptr, nullptr, activated.data_ptr<float>(), hidden_dim,
+            intermediate_dim, fc1_bias_ptr != nullptr);
+    } else {
+        weight_only_linear_kernel<8, false, true><<<fc1_blocks, fc1_threads, 0, stream>>>(
+            normalized.data_ptr<float>(),
+            reinterpret_cast<const __half*>(fc1_weight.data_ptr<at::Half>()),
+            fc1_bias_ptr, nullptr, activated.data_ptr<float>(), hidden_dim,
+            intermediate_dim, fc1_bias_ptr != nullptr);
+    }
+    if (fc2_outputs_per_block == 2) {
+        weight_only_linear_kernel<2, true, false><<<fc2_blocks, fc2_threads, 0, stream>>>(
             activated.data_ptr<float>(),
             reinterpret_cast<const __half*>(fc2_weight.data_ptr<at::Half>()),
             fc2_bias_ptr, input.data_ptr<float>(), output.data_ptr<float>(),
             intermediate_dim, hidden_dim, fc2_bias_ptr != nullptr);
-    } else if (outputs_per_block == 4) {
-        weight_only_linear_kernel<4, false, true><<<fc1_blocks, threads, 0, stream>>>(
-            normalized.data_ptr<float>(),
-            reinterpret_cast<const __half*>(fc1_weight.data_ptr<at::Half>()),
-            fc1_bias_ptr, nullptr, activated.data_ptr<float>(), hidden_dim,
-            intermediate_dim, fc1_bias_ptr != nullptr);
-        weight_only_linear_kernel<4, true, false><<<fc2_blocks, threads, 0, stream>>>(
+    } else if (fc2_outputs_per_block == 4) {
+        weight_only_linear_kernel<4, true, false><<<fc2_blocks, fc2_threads, 0, stream>>>(
             activated.data_ptr<float>(),
             reinterpret_cast<const __half*>(fc2_weight.data_ptr<at::Half>()),
             fc2_bias_ptr, input.data_ptr<float>(), output.data_ptr<float>(),
             intermediate_dim, hidden_dim, fc2_bias_ptr != nullptr);
     } else {
-        weight_only_linear_kernel<8, false, true><<<fc1_blocks, threads, 0, stream>>>(
-            normalized.data_ptr<float>(),
-            reinterpret_cast<const __half*>(fc1_weight.data_ptr<at::Half>()),
-            fc1_bias_ptr, nullptr, activated.data_ptr<float>(), hidden_dim,
-            intermediate_dim, fc1_bias_ptr != nullptr);
-        weight_only_linear_kernel<8, true, false><<<fc2_blocks, threads, 0, stream>>>(
+        weight_only_linear_kernel<8, true, false><<<fc2_blocks, fc2_threads, 0, stream>>>(
             activated.data_ptr<float>(),
             reinterpret_cast<const __half*>(fc2_weight.data_ptr<at::Half>()),
             fc2_bias_ptr, input.data_ptr<float>(), output.data_ptr<float>(),
@@ -581,7 +589,8 @@ def weight_only_mlp_residual(
     fc2: PackedLinear,
     *,
     eps: float,
-    outputs_per_block: int = 8,
+    fc1_outputs_per_block: int = 8,
+    fc2_outputs_per_block: int = 8,
 ) -> torch.Tensor:
     _require_fp32_activation(input, name="input")
     _require_fp32_activation(norm_weight, name="norm weight")
@@ -595,7 +604,8 @@ def weight_only_mlp_residual(
         fc2.weight,
         fc2.bias,
         float(eps),
-        int(outputs_per_block),
+        int(fc1_outputs_per_block),
+        int(fc2_outputs_per_block),
     )
 
 
@@ -714,7 +724,8 @@ def weight_only_prefix(
         pack.fc1,
         pack.fc2,
         eps=norm_eps(module.final_layer_norm),
-        outputs_per_block=outputs_per_block,
+        fc1_outputs_per_block=outputs_per_block,
+        fc2_outputs_per_block=outputs_per_block,
     )
 
 

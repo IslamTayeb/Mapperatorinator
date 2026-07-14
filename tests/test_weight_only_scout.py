@@ -78,6 +78,10 @@ def test_cuda_source_keeps_fp32_state_and_uses_vectorized_fp16_weight_reads() ->
     assert "bias must retain FP32 storage" in source
     assert "norm weight must remain contiguous FP32" in source
     assert "half2 weight loads" in source
+    assert "fc1_outputs_per_block" in source
+    assert "fc2_outputs_per_block" in source
+    assert "fc1_threads" in source
+    assert "fc2_threads" in source
     assert "wmma" not in source.lower()
     assert "c10::cuda::CUDAGuard" in source
 
@@ -205,8 +209,55 @@ def test_wrappers_preserve_argument_order_and_fp32_output(monkeypatch) -> None:
             second.bias,
             1e-5,
             8,
+            8,
         ),
     )
+
+
+def test_mlp_wrapper_allows_independent_fc1_fc2_launch_shapes(monkeypatch) -> None:
+    calls = []
+
+    class Extension:
+        @staticmethod
+        def weight_only_mlp_residual(*args):
+            calls.append(args)
+            return args[0]
+
+    monkeypatch.setattr(weight_only, "_WEIGHT_ONLY_EXTENSION", Extension())
+    monkeypatch.setattr(
+        weight_only,
+        "_require_fp32_activation",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        weight_only,
+        "_require_fp16_weight",
+        lambda *args, **kwargs: None,
+    )
+    hidden = torch.zeros((1, 1, 4), dtype=torch.float32)
+    norm = torch.ones(4, dtype=torch.float32)
+    first = weight_only.PackedLinear(
+        weight=torch.ones((8, 4), dtype=torch.float16),
+        bias=None,
+        source_weight_bytes=64,
+    )
+    second = weight_only.PackedLinear(
+        weight=torch.ones((4, 8), dtype=torch.float16),
+        bias=None,
+        source_weight_bytes=64,
+    )
+
+    weight_only.weight_only_mlp_residual(
+        hidden,
+        norm,
+        first,
+        second,
+        eps=1e-5,
+        fc1_outputs_per_block=2,
+        fc2_outputs_per_block=8,
+    )
+
+    assert calls[0][-2:] == (2, 8)
 
 
 def test_decoder_pack_reports_replacement_and_scout_memory_separately() -> None:

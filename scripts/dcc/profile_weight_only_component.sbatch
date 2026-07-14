@@ -98,7 +98,7 @@ cd "$REPO"
   --config-name profile_salvalai \
   --report-path "$RUN_ROOT/component.json" \
   --output-path "$RUN_ROOT/baseline-capture" \
-  --bucket-mode sentinel \
+  --bucket-mode all \
   --warmup 100 \
   --iters 1000 \
   audio_path="$AUDIO" \
