@@ -36,6 +36,7 @@ HEADS = 12
 KV_LENGTH = 1024
 HEAD_DIM = 64
 SENTINEL_PREFIXES = (128, 576, 640)
+SESSION_LABELS = ("timing_context", "main_generation")
 FIXED_WORK_MAIN_TOKENS = 8_294
 SELECTED_MAIN_SECONDS = 17.597493572930155
 TARGET_500_SECONDS = FIXED_WORK_MAIN_TOKENS / 500.0
@@ -117,7 +118,7 @@ def _run_and_capture_sessions(args, *, output_path: Path) -> dict[str, Any]:
     def wrapped_generate(processor, *positional, **kwargs):
         result = original_generate(processor, *positional, **kwargs)
         label = kwargs.get("profile_label")
-        if label in {"timing_generation", "main_generation"}:
+        if label in SESSION_LABELS:
             if label in sessions or processor.decode_session_state is None:
                 raise RuntimeError(f"invalid decode-session capture for {label}")
             sessions[label] = {
@@ -141,12 +142,12 @@ def _run_and_capture_sessions(args, *, output_path: Path) -> dict[str, Any]:
         )
     finally:
         Processor.generate = original_generate
-    missing = {"timing_generation", "main_generation"} - set(sessions)
+    missing = set(SESSION_LABELS) - set(sessions)
     if missing:
         raise RuntimeError(f"full run missed decode sessions: {sorted(missing)}")
     return {
         "model": sessions["main_generation"]["processor"].model,
-        "timing_session": sessions["timing_generation"]["session"],
+        "timing_session": sessions["timing_context"]["session"],
         "main_session": sessions["main_generation"]["session"],
         "generated": generated,
         "result_path": str(result_path),

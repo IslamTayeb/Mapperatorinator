@@ -15,12 +15,17 @@ from utils.profile_q1_cross_attention_component import (
     RELAXED_MAX_ABS_DRIFT,
     SELECTED_MAIN_SECONDS,
     SENTINEL_PREFIXES,
+    SESSION_LABELS,
     summarize_hybrid_component,
 )
 
 
 CURRENT = "selected_packed_wq_wo_fp32_kv"
 HYBRID = "hybrid_packed_wq_fp16_k_fp32_v_fp32_wo"
+
+
+def test_live_decode_session_labels_match_processor_profile_contract() -> None:
+    assert SESSION_LABELS == ("timing_context", "main_generation")
 
 
 def _buckets(*, current_ms: float = 0.5, hybrid_ms: float = 0.4, drift: float = 0.001):
