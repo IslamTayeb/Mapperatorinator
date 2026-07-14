@@ -22,6 +22,7 @@ BASELINE_BRANCH=${BASELINE_BRANCH:?Set BASELINE_BRANCH explicitly}
 CANDIDATE_BRANCH=${CANDIDATE_BRANCH:?Set CANDIDATE_BRANCH explicitly}
 CANDIDATE_REMOTE=${CANDIDATE_REMOTE:-origin}
 PROFILE_CONFIG=${PROFILE_CONFIG:-profile_salvalai}
+CANDIDATE_RUNNER=${CANDIDATE_RUNNER:-utils/run_approximate_weight_only.py}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_LABEL=${RUN_LABEL:-split-weight-full-song-reciprocal}
 RUN_ROOT="$WORK/runs/$RUN_LABEL-${SLURM_JOB_ID:-manual}"
@@ -47,6 +48,14 @@ fi
 
 if [[ "$PROFILE_CONFIG" != profile_salvalai ]]; then
   echo "full-song reciprocal requires PROFILE_CONFIG=profile_salvalai" >&2
+  exit 2
+fi
+if [[ "$CANDIDATE_RUNNER" = /* || "$CANDIDATE_RUNNER" == *".."* ]]; then
+  echo "CANDIDATE_RUNNER must be a repository-relative path without .." >&2
+  exit 2
+fi
+if [[ ! -f "$CANDIDATE_REPO/$CANDIDATE_RUNNER" ]]; then
+  echo "missing candidate runner at $CANDIDATE_REPO/$CANDIDATE_RUNNER" >&2
   exit 2
 fi
 
@@ -195,6 +204,7 @@ echo "candidate_branch=$CANDIDATE_BRANCH"
 echo "candidate_remote_ref=$CANDIDATE_REMOTE_REF"
 echo "same_commit_gate=true"
 echo "profile_config=$PROFILE_CONFIG"
+echo "candidate_runner=$CANDIDATE_RUNNER"
 echo "audio=$AUDIO"
 echo "run_root=$RUN_ROOT"
 echo "extension_cache_mode=$EXTENSION_CACHE_MODE"
@@ -344,7 +354,7 @@ run_profile() {
     export CUDA_CACHE_PATH="$compiler_cache/cuda"
     cd "$repo"
     if [[ "$candidate" == 1 ]]; then
-      "$PYTHON" utils/run_approximate_weight_only.py \
+      "$PYTHON" "$CANDIDATE_REPO/$CANDIDATE_RUNNER" \
         --config-name "$PROFILE_CONFIG" \
         --output-init-json "$init_json" \
         output_path="$output" \

@@ -27,7 +27,11 @@ def test_wrapper_uses_full_fp32_optimized_reciprocal_order_and_launchers() -> No
     assert "profile_pass_kind=untraced_control" in source
     assert '"$PYTHON" "$CANDIDATE_REPO/utils/run_fixed_seed_inference.py"' in source
     assert '--target-repo "$BASELINE_REPO"' in source
-    assert '"$PYTHON" utils/run_approximate_weight_only.py' in source
+    assert (
+        "CANDIDATE_RUNNER=${CANDIDATE_RUNNER:-utils/run_approximate_weight_only.py}"
+        in source
+    )
+    assert '"$PYTHON" "$CANDIDATE_REPO/$CANDIDATE_RUNNER"' in source
     assert source.count("run_profile baseline_first") == 1
     assert source.count("run_profile candidate_first") == 1
     assert source.count("run_profile candidate_second") == 1
@@ -52,6 +56,14 @@ def test_wrapper_requires_one_pushed_combined_commit_and_worktree() -> None:
     assert 'CANDIDATE_REPO_RESOLVED=$(realpath -e "$CANDIDATE_REPO")' in source
     assert '[[ "$BASELINE_REPO_RESOLVED" != "$CANDIDATE_REPO_RESOLVED" ]]' in source
     assert 'echo "same_commit_gate=true"' in source
+
+
+def test_wrapper_validates_opt_in_candidate_runner_inside_candidate_repo() -> None:
+    source = WRAPPER.read_text(encoding="utf-8")
+
+    assert '[[ "$CANDIDATE_RUNNER" = /* || "$CANDIDATE_RUNNER" == *".."* ]]' in source
+    assert '[[ ! -f "$CANDIDATE_REPO/$CANDIDATE_RUNNER" ]]' in source
+    assert 'echo "candidate_runner=$CANDIDATE_RUNNER"' in source
 
 
 def test_wrapper_isolates_native_extensions_and_keeps_compiler_caches_per_run() -> None:
