@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import subprocess
 import sys
+import weakref
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -27,7 +28,7 @@ def _state(owner) -> weight_only_runtime.ApproximateWeightOnlyState:
         packed_weight_bytes=64,
     )
     return weight_only_runtime.ApproximateWeightOnlyState(
-        owner_ref=lambda: owner,
+        owner_ref=weakref.ref(owner),
         layer_packs={},
         final_norm=norm,
         final_projection=projection,
@@ -58,6 +59,16 @@ def test_weight_only_context_installs_all_narrow_hooks_and_restores() -> None:
     assert runtime_dispatch.decoder_layer_runtime_hooks() is before
 
 
+def test_no_initialization_leaves_default_decoder_hooks_neutral() -> None:
+    hooks = runtime_dispatch.decoder_layer_runtime_hooks()
+
+    assert hooks == runtime_dispatch.DecoderLayerRuntimeHooks()
+    assert hooks.self_attention_block_forward is None
+    assert hooks.cross_mlp_tail_forward is None
+    assert hooks.decoder_final_norm_forward is None
+    assert hooks.output_projection_forward is None
+
+
 def test_original_decoder_forward_remains_installed() -> None:
     forward = VarWhisperDecoderLayer.forward
     source = inspect.getsource(forward)
@@ -80,6 +91,19 @@ def test_state_owner_and_metadata_fail_loudly() -> None:
     assert metadata["result_class"] == "documented-drift"
     assert metadata["exactness_claim"] is False
     assert metadata["fp32_activations_caches_reductions_logits"] is True
+    assert metadata["version"] == "approximate-fp16-weights-fp32-state-v2"
+    assert metadata["fp16_weight_regions"] == [
+        "self_qkv",
+        "self_output",
+        "mlp_fc1",
+        "mlp_fc2",
+        "final_logits",
+    ]
+    assert metadata["fp32_selected_decode_matrix_regions"] == [
+        "cross_query",
+        "cross_output",
+    ]
+    assert "fp32_weight_regions" not in metadata
     assert metadata["outputs_per_block"] == {
         "self_qkv": 4,
         "self_output": 4,
@@ -112,6 +136,35 @@ def test_runtime_initialization_is_idempotent_and_model_owned(monkeypatch) -> No
     assert calls == [owner]
     with pytest.raises(RuntimeError, match="different model"):
         runtime.initialize_approximate_weight_only(torch.nn.Module())
+
+
+def test_repeated_initialize_and_context_teardown_reuse_one_owned_state(
+    monkeypatch,
+) -> None:
+    owner = torch.nn.Module()
+    state = _state(owner)
+    calls = []
+    monkeypatch.setattr(
+        weight_only_runtime.ApproximateWeightOnlyState,
+        "initialize",
+        classmethod(lambda cls, model: calls.append(model) or state),
+    )
+    runtime = engine.OptimizedSingleRuntime(engine.OPTIMIZED_PRESETS["fp32"])
+    default_hooks = runtime_dispatch.decoder_layer_runtime_hooks()
+    pack_identity = id(state.final_projection_pack)
+
+    for _ in range(3):
+        assert runtime.initialize_approximate_weight_only(owner) == state.metadata()
+        assert runtime._approximate_weight_only_state is state
+        assert id(state.final_projection_pack) == pack_identity
+        with weight_only_runtime.approximate_weight_only_runtime_context(state):
+            installed = runtime_dispatch.decoder_layer_runtime_hooks()
+            assert installed is not default_hooks
+            assert installed.self_attention_block_forward.keywords["state"] is state
+            assert installed.cross_mlp_tail_forward.keywords["state"] is state
+        assert runtime_dispatch.decoder_layer_runtime_hooks() is default_hooks
+
+    assert calls == [owner]
 
 
 def test_fp16_runtime_rejects_weight_only_initialization() -> None:
@@ -282,7 +335,10 @@ def test_explicit_candidate_replaces_only_main_specialized_hooks(monkeypatch) ->
         def graph_profile_summary():
             return {}
 
-    model = SimpleNamespace(
+    class FakeModel(SimpleNamespace):
+        pass
+
+    model = FakeModel(
         device=torch.device("cpu"),
         dtype=torch.float32,
         generate=lambda **kwargs: torch.tensor([[1, 2]]),
