@@ -332,7 +332,8 @@ run_profile() {
         "${COMMON_OVERRIDES[@]}" \
         "${legacy_reset[@]}"
     else
-      "$PYTHON" inference.py --config-name "$PROFILE_CONFIG" \
+      "$PYTHON" utils/run_fixed_seed_inference.py \
+        --config-name "$PROFILE_CONFIG" \
         output_path="$output" \
         "${COMMON_OVERRIDES[@]}" \
         "${legacy_reset[@]}"
