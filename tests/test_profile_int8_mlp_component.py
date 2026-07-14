@@ -1,8 +1,15 @@
 from __future__ import annotations
 
-import pytest
+from types import SimpleNamespace
 
-from utils.profile_int8_mlp_component import DECODER_LAYERS, summarize_component
+import pytest
+import torch
+
+from utils.profile_int8_mlp_component import (
+    DECODER_LAYERS,
+    _rms_norm_eps,
+    summarize_component,
+)
 
 
 def _entry(*, fp16: float, int8: float, fp32: float = 0.3, count: int = 100):
@@ -26,6 +33,19 @@ def _entry(*, fp16: float, int8: float, fp32: float = 0.3, count: int = 100):
             "output_shape_preserved": True,
         },
     }
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.float64])
+def test_rms_norm_eps_uses_storage_dtype_default_when_module_eps_is_none(dtype) -> None:
+    module = SimpleNamespace(eps=None)
+
+    assert _rms_norm_eps(module, dtype) == torch.finfo(dtype).eps
+
+
+def test_rms_norm_eps_preserves_explicit_module_epsilon() -> None:
+    module = SimpleNamespace(eps=1e-5)
+
+    assert _rms_norm_eps(module, torch.float32) == pytest.approx(1e-5)
 
 
 def test_summary_weights_live_counts_and_requires_1p4x_local_speedup() -> None:

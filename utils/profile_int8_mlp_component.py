@@ -44,6 +44,13 @@ class MlpCapture:
     hidden_states: torch.Tensor
 
 
+def _rms_norm_eps(module: torch.nn.Module, dtype: torch.dtype) -> float:
+    """Match ``torch.nn.RMSNorm`` when its epsilon is dtype-derived."""
+
+    eps = getattr(module, "eps", None)
+    return float(torch.finfo(dtype).eps if eps is None else eps)
+
+
 def _accepted_context(prefix: int):
     return generation_profile_context(
         active_prefix_self_attention_length=prefix,
@@ -241,7 +248,7 @@ def profile_int8_mlp_component(
         capture = _capture_real_mlp_input(model, inputs, prefix=prefix)
         _restore_all_cache(cache, snapshots)
         layer = capture.module
-        eps = float(getattr(layer.final_layer_norm, "eps", torch.finfo(torch.float32).eps))
+        eps = _rms_norm_eps(layer.final_layer_norm, capture.hidden_states.dtype)
 
         torch.cuda.synchronize()
         allocated_before = int(torch.cuda.memory_allocated())
