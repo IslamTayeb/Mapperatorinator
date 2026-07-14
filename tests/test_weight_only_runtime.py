@@ -41,6 +41,8 @@ def _state(owner) -> weight_only_runtime.ApproximateWeightOnlyState:
         reserved_bytes_delta=128,
         retained_fp32_source_weight_bytes=256,
         packed_weight_bytes=128,
+        cross_mode=weight_only_runtime.CROSS_ACCEPTED,
+        cross_packs=None,
     )
 
 
@@ -103,6 +105,15 @@ def test_state_owner_and_metadata_fail_loudly() -> None:
         "cross_query",
         "cross_output",
     ]
+    assert metadata["cross_candidate"] == {
+        "mode": "accepted",
+        "scope": "main-model-only",
+        "attention_accumulation": "fp32",
+        "production_selector_unchanged": True,
+        "result_class": "control",
+        "exactness_claim": False,
+        "accepted_q1_bmm": True,
+    }
     assert "fp32_weight_regions" not in metadata
     assert metadata["outputs_per_block"] == {
         "self_qkv": 4,
@@ -206,6 +217,41 @@ def test_fp16_runtime_rejects_weight_only_initialization() -> None:
     runtime = engine.OptimizedSingleRuntime(engine.OPTIMIZED_PRESETS["fp16"])
     with pytest.raises(TypeError, match="requires the FP32 preset"):
         runtime.initialize_approximate_weight_only(torch.nn.Module())
+
+
+def test_cross_candidate_initialization_is_explicit_mode_owned(monkeypatch) -> None:
+    owner = torch.nn.Module()
+    state = _state(owner)
+    object.__setattr__(state, "cross_mode", weight_only_runtime.CROSS_FP16_PACKED)
+    calls = []
+
+    def initialize(cls, model, *, cross_mode="accepted"):
+        calls.append((model, cross_mode))
+        return state
+
+    monkeypatch.setattr(
+        weight_only_runtime.ApproximateWeightOnlyState,
+        "initialize",
+        classmethod(initialize),
+    )
+    runtime = engine.OptimizedSingleRuntime(engine.OPTIMIZED_PRESETS["fp32"])
+
+    metadata = runtime.initialize_approximate_weight_only_cross(
+        owner,
+        mode=weight_only_runtime.CROSS_FP16_PACKED,
+    )
+
+    assert metadata["cross_candidate"]["mode"] == "fp16_packed_projections"
+    assert calls == [(owner, "fp16_packed_projections")]
+    with pytest.raises(RuntimeError, match="different mixed-weight cross mode"):
+        runtime.initialize_approximate_weight_only_cross(
+            owner,
+            mode=weight_only_runtime.CROSS_SPLIT8,
+        )
+    with pytest.raises(ValueError, match="must be fp16_packed"):
+        engine.OptimizedSingleRuntime(
+            engine.OPTIMIZED_PRESETS["fp32"]
+        ).initialize_approximate_weight_only_cross(owner, mode="accepted")
 
 
 def test_profile_metadata_is_unchanged_until_explicit_initialization(monkeypatch) -> None:

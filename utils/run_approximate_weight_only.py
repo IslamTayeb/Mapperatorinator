@@ -90,7 +90,14 @@ def _initialize_with_evidence(initializer, model) -> dict:
     }
 
 
-def run(config_name: str, overrides: list[str], output_init_json: Path) -> None:
+def run_with_initializer(
+    config_name: str,
+    overrides: list[str],
+    output_init_json: Path,
+    *,
+    initializer_name: str,
+    initializer_kwargs: dict | None = None,
+) -> None:
     import inference
 
     args = _load_args(config_name, overrides)
@@ -116,17 +123,14 @@ def run(config_name: str, overrides: list[str], output_init_json: Path) -> None:
         nonlocal initialized, init_metadata
         binding, tokenizer = original_loader(*loader_args, **loader_kwargs)
         if not initialized:
-            initializer = getattr(
-                binding.runtime,
-                "initialize_approximate_weight_only",
-                None,
-            )
+            initializer = getattr(binding.runtime, initializer_name, None)
             if initializer is None:
                 raise RuntimeError(
-                    "loaded runtime does not expose weight-only initialization"
+                    f"loaded runtime does not expose {initializer_name}"
                 )
+            kwargs = {} if initializer_kwargs is None else dict(initializer_kwargs)
             init_metadata = _initialize_with_evidence(
-                initializer,
+                lambda model: initializer(model, **kwargs),
                 binding.raw_model,
             )
             output_init_json.parent.mkdir(parents=True, exist_ok=True)
@@ -145,6 +149,15 @@ def run(config_name: str, overrides: list[str], output_init_json: Path) -> None:
         inference.load_model_with_engine = original_loader
     if not initialized or init_metadata is None:
         raise RuntimeError("weight-only candidate model was never initialized")
+
+
+def run(config_name: str, overrides: list[str], output_init_json: Path) -> None:
+    run_with_initializer(
+        config_name,
+        overrides,
+        output_init_json,
+        initializer_name="initialize_approximate_weight_only",
+    )
 
 
 def main() -> None:
