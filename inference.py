@@ -30,6 +30,7 @@ from osuT5.osuT5.config import TrainConfig
 from osuT5.osuT5.dataset.data_utils import events_of_type, TIMING_TYPES, merge_events
 from osuT5.osuT5.inference import Preprocessor, Processor, Postprocessor, BeatmapConfig, GenerationConfig, \
     generation_config_from_beatmap, beatmap_config_from_beatmap, background_line
+from osuT5.osuT5.inference.audio_preparation import audio_array_metadata, resolve_audio_samples
 from osuT5.osuT5.inference.profiler import InferenceProfiler
 from osuT5.osuT5.inference.server import InferenceClient
 from osuT5.osuT5.inference.super_timing_generator import SuperTimingGenerator
@@ -539,6 +540,7 @@ def generate(
         verbose=True,
         logger=None,
         profiler: InferenceProfiler | None = None,
+        preloaded_audio=None,
 ):
     audio_path = args.audio_path if audio_path is None else audio_path
     beatmap_path = args.beatmap_path if beatmap_path is None else beatmap_path
@@ -604,17 +606,21 @@ def generate(
         processor = Processor(args, model, tokenizer, profiler=profiler)
         postprocessor = Postprocessor(args, logger=logger)
 
-    with profiler.stage("audio_load"):
-        audio = preprocessor.load(audio_path)
+    audio_source = "preloaded" if preloaded_audio is not None else "file"
+    with profiler.stage("audio_load", source=audio_source):
+        audio = resolve_audio_samples(preprocessor, audio_path, preloaded_audio)
     with profiler.stage("audio_segment"):
         sequences = preprocessor.segment(audio)
     profiler.set_metadata(
+        audio_source=audio_source,
         audio_samples=len(audio),
         song_length_ms=sequences[2],
         sequence_count=len(sequences[0]),
         milliseconds_per_sequence=preprocessor.miliseconds_per_sequence,
         milliseconds_per_stride=preprocessor.miliseconds_per_stride,
     )
+    if profiler.enabled:
+        profiler.set_metadata(**audio_array_metadata(audio))
     extra_in_context = {}
     output_type = args.output_type.copy()
     timing_model = model if timing_model is None else timing_model
