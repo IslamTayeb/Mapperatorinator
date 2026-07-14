@@ -134,6 +134,8 @@ def _mutable_tensor_templates(root: Any) -> list[tuple[torch.Tensor, torch.Tenso
 @dataclass(slots=True)
 class TailAnchor:
     prefix: int
+    window_index: int
+    block_ordinal: int
     input_ids: torch.Tensor
     raw_logits_steps: list[torch.Tensor]
     rng_state: tuple[torch.Tensor, list[torch.Tensor] | None]
@@ -160,8 +162,8 @@ class CapturedTailGraph:
     static_model_inputs: dict[str, torch.Tensor]
     mutable_templates: list[tuple[torch.Tensor, torch.Tensor]]
     state_templates: dict[str, torch.Tensor]
-    setup_seconds: float
-    peak_vram_bytes: int
+    tail_only_capture_setup_seconds: float
+    absolute_peak_vram_bytes: int
 
     def reset(self) -> None:
         self.state.sequence.copy_(self.state_templates["sequence"])
@@ -175,13 +177,87 @@ class CapturedTailGraph:
                 tensor.copy_(template)
 
 
+class _BoundedAnchorSampler:
+    """Retain first, deterministic interior, and latest complete blocks."""
+
+    def __init__(self, *, prefix: int, block_size: int, limit: int) -> None:
+        if limit < 3:
+            raise ValueError("samples-per-prefix must be at least three")
+        self.prefix = prefix
+        self.block_size = block_size
+        self.limit = limit
+        self.completed_blocks = 0
+        self.first: TailAnchor | None = None
+        self.latest: TailAnchor | None = None
+        self._interior: list[tuple[int, TailAnchor]] = []
+
+    def _priority(self, anchor: TailAnchor) -> int:
+        # SplitMix64 gives a stable reservoir priority without Python's
+        # process-randomized hash.  Ordinal and window provenance are retained
+        # separately in the report.
+        value = (
+            anchor.block_ordinal
+            ^ (anchor.window_index << 32)
+            ^ (self.prefix << 16)
+            ^ self.block_size
+        ) & ((1 << 64) - 1)
+        value = (value + 0x9E3779B97F4A7C15) & ((1 << 64) - 1)
+        value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & (
+            (1 << 64) - 1
+        )
+        value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & (
+            (1 << 64) - 1
+        )
+        return value ^ (value >> 31)
+
+    def _consider_interior(self, anchor: TailAnchor) -> None:
+        self._interior.append((self._priority(anchor), anchor))
+        self._interior.sort(key=lambda item: (item[0], item[1].block_ordinal))
+        del self._interior[self.limit - 2 :]
+
+    def consider(self, anchor: TailAnchor) -> None:
+        if anchor.prefix != self.prefix:
+            raise ValueError("anchor prefix differs from bounded sampler")
+        anchor.block_ordinal = self.completed_blocks
+        self.completed_blocks += 1
+        if self.first is None:
+            self.first = anchor
+            return
+        if self.latest is not None:
+            # The prior latest is now known to be an interior block.  This
+            # ensures the final block never competes for an interior slot.
+            self._consider_interior(self.latest)
+        self.latest = anchor
+
+    def selected(self) -> list[tuple[str, TailAnchor]]:
+        if self.first is None:
+            return []
+        selected: list[tuple[str, TailAnchor]] = [("first", self.first)]
+        selected.extend(
+            ("deterministic_interior", anchor)
+            for _, anchor in sorted(
+                self._interior,
+                key=lambda item: item[1].block_ordinal,
+            )
+        )
+        if self.latest is not None:
+            selected.append(("latest", self.latest))
+        return selected
+
+    @property
+    def retained_payloads(self) -> int:
+        return int(self.first is not None) + len(self._interior) + int(
+            self.latest is not None
+        )
+
+
 class _RawTailCapture(LogitsProcessor):
     """Transparent main-only processor that retains complete scheduled blocks."""
 
     def __init__(
         self,
         *,
-        anchors: dict[int, dict[int, list[TailAnchor]]],
+        anchors: dict[int, dict[int, _BoundedAnchorSampler]],
         processors: Any,
         stopping_criteria: Any,
         generation_config: Any,
@@ -197,8 +273,8 @@ class _RawTailCapture(LogitsProcessor):
             raise ValueError("tail capture block sizes must be positive")
         self.block_sizes = tuple(sorted(set(block_sizes)))
         self.window_index = window_index
-        if samples_per_prefix < 1:
-            raise ValueError("samples-per-prefix must be positive")
+        if samples_per_prefix < 3:
+            raise ValueError("samples-per-prefix must be at least three")
         self.samples_per_prefix = samples_per_prefix
         self.generated_steps = 0
         self.decode_prefixes: list[int] = []
@@ -227,6 +303,8 @@ class _RawTailCapture(LogitsProcessor):
             raise RuntimeError("tail capture requires tensor EOS ids")
         return TailAnchor(
             prefix=prefix,
+            window_index=self.window_index,
+            block_ordinal=-1,
             input_ids=input_ids.detach().clone(),
             raw_logits_steps=[scores.detach().clone()],
             rng_state=_rng_state(),
@@ -259,20 +337,21 @@ class _RawTailCapture(LogitsProcessor):
                 else:
                     active.raw_logits_steps.append(scores.detach().clone())
                     if len(active.raw_logits_steps) == block_size:
-                        self.anchors.setdefault(block_size, {}).setdefault(
+                        sampler = self.anchors.setdefault(block_size, {}).setdefault(
                             prefix,
-                            [],
-                        ).append(active)
+                            _BoundedAnchorSampler(
+                                prefix=prefix,
+                                block_size=block_size,
+                                limit=self.samples_per_prefix,
+                            ),
+                        )
+                        sampler.consider(active)
                         active = None
                     self.active[block_size] = active
                     continue
             if (
                 prefix - cur_len + 1 >= block_size
                 and max_length - cur_len >= block_size
-                and len(
-                    self.anchors.setdefault(block_size, {}).get(prefix, [])
-                )
-                < self.samples_per_prefix
             ):
                 active = self._start(input_ids, scores, prefix)
             self.active[block_size] = active
@@ -293,9 +372,21 @@ def _eager_dynamic_tail(
     processors,
     stopping_criteria,
     read_status_each_step: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     input_ids = anchor.input_ids.detach().clone()
     unfinished = torch.ones((1,), dtype=torch.bool, device=input_ids.device)
+    logical_length = torch.full(
+        (1,),
+        max(anchor.max_length, input_ids.shape[1] + block_size + 1),
+        dtype=torch.long,
+        device=input_ids.device,
+    )
     generated = []
     continues = []
     pad = torch.tensor(
@@ -316,6 +407,12 @@ def _eager_dynamic_tail(
         next_tokens = torch.where(unfinished, next_tokens, pad)
         input_ids = torch.cat((input_ids, next_tokens[:, None]), dim=-1)
         stopped = stopping_criteria(input_ids, None).to(dtype=torch.bool)
+        just_stopped = unfinished & stopped
+        logical_length = torch.where(
+            just_stopped,
+            torch.full_like(logical_length, input_ids.shape[1]),
+            logical_length,
+        )
         unfinished = unfinished & ~stopped
         if read_status_each_step:
             # Match the production loop's scalar host decision.  The value is
@@ -328,6 +425,7 @@ def _eager_dynamic_tail(
         torch.stack(generated),
         unfinished,
         torch.stack(continues),
+        logical_length,
     )
 
 
@@ -394,7 +492,7 @@ def _capture_candidate_graph(
     with torch.cuda.graph(graph):
         outputs = run()
     torch.cuda.synchronize()
-    setup_seconds = time.perf_counter() - setup_started
+    tail_only_capture_setup_seconds = time.perf_counter() - setup_started
     captured = CapturedTailGraph(
         graph=graph,
         state=state,
@@ -402,8 +500,8 @@ def _capture_candidate_graph(
         static_model_inputs=static_model_inputs,
         mutable_templates=mutable_templates,
         state_templates=template,
-        setup_seconds=setup_seconds,
-        peak_vram_bytes=int(torch.cuda.max_memory_allocated()),
+        tail_only_capture_setup_seconds=tail_only_capture_setup_seconds,
+        absolute_peak_vram_bytes=int(torch.cuda.max_memory_allocated()),
     )
     captured.reset()
     torch.cuda.synchronize()
@@ -447,7 +545,7 @@ def _measure_eager_once(
 def _measure_graph_once(
     captured: CapturedTailGraph,
     anchor: TailAnchor,
-) -> dict[str, float]:
+) -> dict[str, float | bool]:
     _set_rng_state(anchor.rng_state)
     captured.reset()
     torch.cuda.synchronize()
@@ -459,12 +557,13 @@ def _measure_graph_once(
     end_event.record()
     # One explicit device-to-host completion decision per block.  It replaces
     # the production loop's one scalar read per token.
-    bool(captured.state.unfinished.item())
+    returned_post_block_unfinished = bool(captured.state.unfinished.item())
     wall_ms = (time.perf_counter() - started) * 1_000.0
     event_ms = _event_ms(start_event, end_event)
     return {
         "wall_ms": wall_ms,
         "cuda_ms": event_ms,
+        "returned_post_block_unfinished": returned_post_block_unfinished,
     }
 
 
@@ -476,7 +575,7 @@ def _time_reciprocal(
     warmup: int,
     iterations: int,
 ) -> dict[str, Any]:
-    by_order: dict[str, dict[str, list[dict[str, float]]]] = {
+    by_order: dict[str, dict[str, list[dict[str, float | bool]]]] = {
         "eager_first": {"eager": [], "device_graph": []},
         "graph_first": {"eager": [], "device_graph": []},
     }
@@ -518,17 +617,48 @@ def _time_reciprocal(
     conservative = min(
         report["saved_wall_ms_per_block"] for report in order_reports.values()
     )
+    returned_statuses = [
+        bool(sample["returned_post_block_unfinished"])
+        for order in by_order.values()
+        for sample in order["device_graph"]
+    ]
+    if not returned_statuses:
+        raise RuntimeError("graph timing produced no post-block status")
     return {
         "orders": order_reports,
         "conservative_saved_wall_ms_per_block": conservative,
         "post_block_status_reads": 1,
+        "returned_post_block_unfinished": returned_statuses[0],
+        "returned_post_block_status_consistent": len(set(returned_statuses)) == 1,
         "static_model_input_handoff": True,
+    }
+
+
+def _post_block_status_report(
+    *,
+    expected_unfinished: bool,
+    timing: dict[str, Any],
+) -> dict[str, Any]:
+    returned = timing.get("returned_post_block_unfinished")
+    consistent = timing.get("returned_post_block_status_consistent")
+    reads = timing.get("post_block_status_reads")
+    if not isinstance(returned, bool) or not isinstance(consistent, bool):
+        raise TypeError("post-block timing must expose boolean returned status")
+    if reads != 1:
+        raise ValueError("device-tail graph must read post-block status exactly once")
+    return {
+        "expected_unfinished": expected_unfinished,
+        "returned_unfinished": returned,
+        "reads_per_block": reads,
+        "consistent_across_timing_samples": consistent,
+        "parity": bool(consistent and returned == expected_unfinished),
     }
 
 
 def _profile_anchor(
     anchor: TailAnchor,
     *,
+    sample_role: str,
     block_size: int,
     warmup: int,
     iterations: int,
@@ -563,6 +693,9 @@ def _profile_anchor(
         "sequence_exact": bool(torch.equal(eager[0], graph_sequence)),
         "unfinished_exact": bool(torch.equal(eager[2], captured.state.unfinished)),
         "continue_values_exact": bool(torch.equal(eager[3], graph_continues)),
+        "logical_length_exact": bool(
+            torch.equal(eager[4], captured.state.logical_length)
+        ),
         "rng_exact": _rng_equal(eager_rng, graph_rng),
         "handoff_token_exact": bool(
             torch.equal(
@@ -601,9 +734,18 @@ def _profile_anchor(
         warmup=warmup,
         iterations=iterations,
     )
+    expected_post_block_unfinished = bool(eager[2].item())
+    post_block_status = _post_block_status_report(
+        expected_unfinished=expected_post_block_unfinished,
+        timing=timing,
+    )
+    checks["returned_post_block_status_exact"] = post_block_status["parity"]
     saved_wall_ms = timing["conservative_saved_wall_ms_per_block"]
     return {
         "prefix": anchor.prefix,
+        "sample_role": sample_role,
+        "window_index": anchor.window_index,
+        "block_ordinal": anchor.block_ordinal,
         "block_size": block_size,
         "start_length": int(start_len),
         "vocab_size": int(anchor.raw_logits_steps[0].shape[-1]),
@@ -616,8 +758,13 @@ def _profile_anchor(
         "checks": checks,
         "pass": all(checks.values()),
         "reciprocal_timing": timing,
-        "capture_setup_seconds": captured.setup_seconds,
-        "peak_vram_bytes": captured.peak_vram_bytes,
+        "post_block_status": post_block_status,
+        "tail_only_capture_setup_seconds": (
+            captured.tail_only_capture_setup_seconds
+        ),
+        "absolute_peak_vram_bytes": captured.absolute_peak_vram_bytes,
+        "capture_vram_delta_available": False,
+        "capture_vram_delta_bytes": None,
         "saved_wall_ms_per_block": saved_wall_ms,
         "saved_wall_us_per_token": saved_wall_ms * 1_000.0 / block_size,
     }
@@ -730,27 +877,15 @@ def _aggregate_anchor_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "conservative_saved_wall_us_per_token": min(
             float(sample["saved_wall_us_per_token"]) for sample in samples
         ),
-        "capture_setup_seconds": sum(
-            float(sample["capture_setup_seconds"]) for sample in samples
+        "tail_only_capture_setup_seconds_sample_sum": sum(
+            float(sample["tail_only_capture_setup_seconds"]) for sample in samples
         ),
-        "peak_vram_bytes": max(int(sample["peak_vram_bytes"]) for sample in samples),
+        "absolute_peak_vram_bytes_max": max(
+            int(sample["absolute_peak_vram_bytes"]) for sample in samples
+        ),
+        "capture_vram_delta_available": False,
+        "capture_vram_delta_bytes": None,
     }
-
-
-def _representative_anchors(
-    anchors: list[TailAnchor],
-    *,
-    limit: int,
-) -> list[TailAnchor]:
-    if limit < 1:
-        raise ValueError("samples-per-prefix must be positive")
-    if len(anchors) <= limit:
-        return list(anchors)
-    indices = {
-        round(index * (len(anchors) - 1) / (limit - 1))
-        for index in range(limit)
-    } if limit > 1 else {len(anchors) // 2}
-    return [anchors[index] for index in sorted(indices)]
 
 
 def summarize(
@@ -810,7 +945,8 @@ def summarize(
             "full_runtime_blockers": [
                 "untraced_transition_budget_not_combined",
                 "full_forward_graph_not_measured",
-                "capture_setup_and_memory_not_projectable_to_full_runtime",
+                "tail_only_capture_setup_not_projectable_to_full_runtime",
+                "absolute_peak_vram_has_no_candidate_delta",
             ],
             "unmeasured_prefixes_assumed_saving_seconds": 0.0,
         }
@@ -830,14 +966,14 @@ def profile_device_resident_tail(
         raise RuntimeError("device-resident tail profiler requires CUDA")
     if warmup < 1 or iterations < 2:
         raise ValueError("warmup must be positive and reciprocal iterations >= 2")
-    if samples_per_prefix < 1:
-        raise ValueError("samples-per-prefix must be positive")
+    if samples_per_prefix < 3:
+        raise ValueError("samples-per-prefix must be at least three")
     _assert_scout_args(args)
     from osuT5.osuT5.inference import Processor
     from osuT5.osuT5.inference.optimized.single import engine
     from osuT5.osuT5.inference.runtime_dispatch import attention_runtime_hooks
 
-    anchors: dict[int, dict[int, list[TailAnchor]]] = {
+    anchors: dict[int, dict[int, _BoundedAnchorSampler]] = {
         block_size: {} for block_size in BLOCK_SIZES
     }
     schedules: list[WindowSchedule] = []
@@ -933,7 +1069,14 @@ def profile_device_resident_tail(
         for prefix, prefix_schedule in scheduled_prefixes.items():
             prefix_int = int(prefix)
             expected_blocks = int(prefix_schedule["full_blocks"])
-            captured = anchors[block_size].get(prefix_int, [])
+            sampler = anchors[block_size].get(prefix_int)
+            completed_blocks = 0 if sampler is None else sampler.completed_blocks
+            if completed_blocks != expected_blocks:
+                raise RuntimeError(
+                    f"K{block_size} prefix {prefix} observed {completed_blocks} blocks, "
+                    f"expected {expected_blocks} from the full-song schedule"
+                )
+            captured = [] if sampler is None else sampler.selected()
             expected_samples = min(expected_blocks, samples_per_prefix)
             if len(captured) != expected_samples:
                 raise RuntimeError(
@@ -942,21 +1085,20 @@ def profile_device_resident_tail(
                 )
             if not captured:
                 continue
-            representative = _representative_anchors(
-                captured,
-                limit=samples_per_prefix,
-            )
             samples = [
                 _profile_anchor(
                     anchor,
+                    sample_role=sample_role,
                     block_size=block_size,
                     warmup=warmup,
                     iterations=iterations,
                 )
-                for anchor in representative
+                for sample_role, anchor in captured
             ]
             measured.setdefault(prefix, {})[str(block_size)] = {
                 **_aggregate_anchor_samples(samples),
+                "observed_full_blocks": completed_blocks,
+                "retained_anchor_payloads": sampler.retained_payloads,
                 "scheduled_full_blocks": expected_blocks,
                 "scheduled_eligible_replays": int(
                     prefix_schedule["eligible_replays"]
@@ -985,7 +1127,14 @@ def profile_device_resident_tail(
             "warmup": warmup,
             "iterations": iterations,
             "samples_per_prefix": samples_per_prefix,
-            "sample_selection": "first_scheduled_blocks_per_prefix",
+            "sample_selection": "bounded_first_deterministic_interior_latest",
+            "sampling_observes_every_complete_scheduled_block": True,
+            "maximum_retained_anchor_payloads_per_prefix": samples_per_prefix,
+            "capture_accounting": {
+                "setup_scope": "tail_graph_capture_only",
+                "vram_metric": "absolute_process_peak",
+                "vram_delta_available": False,
+            },
             "accepted_bucket_replay_counts": {
                 str(prefix): count for prefix, count in live_counts.items()
             },

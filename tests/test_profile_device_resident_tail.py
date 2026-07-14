@@ -8,11 +8,15 @@ from transformers import LogitsProcessor, LogitsProcessorList
 
 from utils.profile_device_resident_tail import (
     PROMOTION_SAVING_SECONDS,
+    TailAnchor,
+    _aggregate_anchor_samples,
+    _BoundedAnchorSampler,
     _RawTailCapture,
     _bucketed_prefix,
+    _eager_dynamic_tail,
     _is_main_capture_label,
     _mutable_tensor_templates,
-    _representative_anchors,
+    _post_block_status_report,
     WindowSchedule,
     schedule_block_manifest,
     summarize,
@@ -54,10 +58,50 @@ def test_capture_provenance_accepts_only_main_generation() -> None:
     assert not _is_main_capture_label(None)
 
 
-def test_representative_anchor_selection_spans_first_middle_last() -> None:
-    anchors = [object() for _ in range(9)]
-    selected = _representative_anchors(anchors, limit=3)
-    assert selected == [anchors[0], anchors[4], anchors[8]]
+def _minimal_anchor(
+    *,
+    window_index: int,
+    token: int = 1,
+    eos: int = 9,
+) -> TailAnchor:
+    scores = torch.full((1, 11), -100.0)
+    scores[:, token] = 100.0
+    return TailAnchor(
+        prefix=64,
+        window_index=window_index,
+        block_ordinal=-1,
+        input_ids=torch.tensor([[3, 4]]),
+        raw_logits_steps=[scores],
+        rng_state=(torch.random.get_rng_state(), None),
+        logits_processors=LogitsProcessorList(),
+        stopping_criteria=[_NeverStop()],
+        do_sample=False,
+        pad_token_id=0,
+        eos_token_ids=torch.tensor([eos]),
+        max_length=128,
+    )
+
+
+def test_bounded_sampler_observes_whole_stream_and_retains_first_interior_last() -> None:
+    def sample_ordinals():
+        sampler = _BoundedAnchorSampler(prefix=64, block_size=8, limit=3)
+        for ordinal in range(100):
+            sampler.consider(_minimal_anchor(window_index=ordinal // 9))
+        selected = sampler.selected()
+        assert sampler.completed_blocks == 100
+        assert sampler.retained_payloads == 3
+        assert [role for role, _ in selected] == [
+            "first",
+            "deterministic_interior",
+            "latest",
+        ]
+        assert selected[0][1].block_ordinal == 0
+        assert 0 < selected[1][1].block_ordinal < 99
+        assert selected[-1][1].block_ordinal == 99
+        assert selected[-1][1].window_index == 11
+        return [anchor.block_ordinal for _, anchor in selected]
+
+    assert sample_ordinals() == sample_ordinals()
 
 
 def test_raw_capture_is_transparent_and_retains_one_contiguous_block() -> None:
@@ -88,7 +132,13 @@ def test_raw_capture_is_transparent_and_retains_one_contiguous_block() -> None:
 
     assert set(anchors) == {4}
     assert set(anchors[4]) == {64}
-    anchor = anchors[4][64][0]
+    sampler = anchors[4][64]
+    assert sampler.completed_blocks == 1
+    assert sampler.retained_payloads == 1
+    [(role, anchor)] = sampler.selected()
+    assert role == "first"
+    assert anchor.block_ordinal == 0
+    assert anchor.window_index == 7
     assert anchor.input_ids.shape == (1, 49)
     assert len(anchor.raw_logits_steps) == 4
     assert [item.__class__.__name__ for item in anchor.logits_processors] == [
@@ -100,6 +150,79 @@ def test_raw_capture_is_transparent_and_retains_one_contiguous_block() -> None:
         generated_steps=5,
         decode_prefixes=[64, 64, 64, 64],
     )
+
+
+def test_eager_control_records_first_logical_stop_length() -> None:
+    class _EosStop:
+        def __call__(self, input_ids, scores):
+            del scores
+            return input_ids[:, -1] == 9
+
+    anchor = _minimal_anchor(window_index=0, token=9)
+    second = torch.full((1, 11), -100.0)
+    second[:, 7] = 100.0
+    anchor.raw_logits_steps.append(second)
+    anchor.stopping_criteria = [_EosStop()]
+
+    eager = _eager_dynamic_tail(
+        anchor,
+        block_size=2,
+        processors=LogitsProcessorList(),
+        stopping_criteria=_EosStop(),
+    )
+
+    assert eager[0].tolist() == [[3, 4, 9, 0]]
+    assert eager[2].tolist() == [False]
+    assert eager[4].tolist() == [3]
+
+
+def test_post_block_status_report_requires_one_consistent_matching_read() -> None:
+    matching = _post_block_status_report(
+        expected_unfinished=False,
+        timing={
+            "returned_post_block_unfinished": False,
+            "returned_post_block_status_consistent": True,
+            "post_block_status_reads": 1,
+        },
+    )
+    mismatching = _post_block_status_report(
+        expected_unfinished=True,
+        timing={
+            "returned_post_block_unfinished": False,
+            "returned_post_block_status_consistent": True,
+            "post_block_status_reads": 1,
+        },
+    )
+
+    assert matching["parity"] is True
+    assert matching["reads_per_block"] == 1
+    assert mismatching["parity"] is False
+
+
+def test_capture_accounting_is_tail_only_and_never_claims_a_vram_delta() -> None:
+    aggregate = _aggregate_anchor_samples(
+        [
+            {
+                "pass": True,
+                "saved_wall_us_per_token": 8.0,
+                "tail_only_capture_setup_seconds": 0.2,
+                "absolute_peak_vram_bytes": 100,
+            },
+            {
+                "pass": True,
+                "saved_wall_us_per_token": 7.0,
+                "tail_only_capture_setup_seconds": 0.3,
+                "absolute_peak_vram_bytes": 120,
+            },
+        ]
+    )
+
+    assert aggregate["tail_only_capture_setup_seconds_sample_sum"] == pytest.approx(
+        0.5
+    )
+    assert aggregate["absolute_peak_vram_bytes_max"] == 120
+    assert aggregate["capture_vram_delta_available"] is False
+    assert aggregate["capture_vram_delta_bytes"] is None
 
 
 def test_mutable_tensor_templates_cover_nested_state_and_restore_in_place() -> None:
