@@ -5,6 +5,7 @@ REPO=${MAPPERATORINATOR_REPO:?Set MAPPERATORINATOR_REPO to the clean DCC worktre
 COMMIT=${MAPPERATORINATOR_COMMIT:?Set MAPPERATORINATOR_COMMIT to the pushed commit}
 BRANCH=${MAPPERATORINATOR_BRANCH:?Set MAPPERATORINATOR_BRANCH to the pushed branch}
 REMOTE=${MAPPERATORINATOR_REMOTE:-origin}
+VERIFY_SCRIPT=${MAPPERATORINATOR_VERIFY_SCRIPT:-scripts/dcc/verify_k8_reciprocal.sbatch}
 
 fail() {
   echo "$*" >&2
@@ -26,7 +27,10 @@ sinfo -h -p gpu-common -o '%P %G' | grep -q 'gpu-common' \
 REMOTE_REF="refs/remotes/$REMOTE/$BRANCH"
 git -C "$REPO" show-ref --verify --quiet "$REMOTE_REF" || fail "missing fetched remote ref $REMOTE_REF"
 [[ "$(git -C "$REPO" rev-parse "$REMOTE_REF")" == "$COMMIT" ]] || fail "remote ref differs from COMMIT"
+[[ "$VERIFY_SCRIPT" != /* && "$VERIFY_SCRIPT" != *".."* ]] \
+  || fail "MAPPERATORINATOR_VERIFY_SCRIPT must be a repository-relative path"
+[[ -f "$REPO/$VERIFY_SCRIPT" ]] || fail "missing verify script $VERIFY_SCRIPT"
 
 exec sbatch \
   --export=ALL,MAPPERATORINATOR_REPO="$REPO",MAPPERATORINATOR_COMMIT="$COMMIT",MAPPERATORINATOR_BRANCH="$BRANCH",MAPPERATORINATOR_REMOTE="$REMOTE" \
-  "$REPO/scripts/dcc/verify_k8_reciprocal.sbatch"
+  "$REPO/$VERIFY_SCRIPT"
