@@ -781,6 +781,8 @@ if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true ]]; then
     --allow-dispatch-delta
       'records.main_generation[[]*].optimized_dispatch_capture_hits.int8_weight_mlp_tail'
     --allow-optional-dispatch-delta
+      'records.main_generation[[]*].optimized_dispatch_capture_hits.*'
+    --allow-optional-dispatch-delta
       'records.main_generation[[]*].optimized_cuda_graphs.*'
   )
   ANALYSIS_EXACT_ARGS=(

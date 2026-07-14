@@ -159,6 +159,11 @@ def test_int8_mlp_wrapper_uses_exact_combined_control_and_incremental_gate() -> 
         "records.main_generation[[]*].optimized_dispatch_capture_hits.int8_weight_mlp_tail"
         in int8_analysis
     )
+    assert (
+        "--allow-optional-dispatch-delta\n"
+        "      'records.main_generation[[]*].optimized_dispatch_capture_hits.*'"
+        in int8_analysis
+    )
     assert "native_cross_mlp_tail_*" not in int8_analysis
     assert "--require-exact-label timing_context" in int8_analysis
     assert "--require-exact-dispatch-label timing_context" in int8_analysis
