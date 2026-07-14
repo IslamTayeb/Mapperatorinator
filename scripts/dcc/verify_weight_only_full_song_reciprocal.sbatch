@@ -11,6 +11,7 @@
 
 set -euo pipefail
 
+SLURM_JOB_ID=${SLURM_JOB_ID:?Run this wrapper inside a Slurm allocation}
 ENV=${MAPPERATORINATOR_ENV:-/hpc/group/romerolab/imt11/envs/mapperatorinator}
 PYTHON=${MAPPERATORINATOR_PYTHON:-$ENV/bin/python}
 WORK=${MAPPERATORINATOR_WORK:-/work/imt11/Mapperatorinator}
@@ -34,8 +35,8 @@ REQUIRE_SHARED_ARENA_INCREMENTAL=${REQUIRE_SHARED_ARENA_INCREMENTAL:-false}
 CROSS_CANDIDATE_MODE=${CROSS_CANDIDATE_MODE:-accepted}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_LABEL=${RUN_LABEL:-split-weight-full-song-reciprocal}
-RUN_ROOT="$WORK/runs/$RUN_LABEL-${SLURM_JOB_ID:-manual}"
-EXTENSION_JOB_KEY=${SLURM_JOB_ID:-manual}
+RUN_ROOT="$WORK/runs/$RUN_LABEL-$SLURM_JOB_ID"
+EXTENSION_JOB_KEY=$SLURM_JOB_ID
 EXTENSION_CACHE_ROOT_OVERRIDE=${EXTENSION_CACHE_ROOT_OVERRIDE:-}
 BASELINE_EXTENSION_KEY_OVERRIDE=${BASELINE_EXTENSION_KEY_OVERRIDE:-}
 CANDIDATE_EXTENSION_KEY_OVERRIDE=${CANDIDATE_EXTENSION_KEY_OVERRIDE:-}
@@ -361,6 +362,15 @@ done
 mkdir -p "$WORK/logs" "$WORK/tmp" "$WORK/cache" \
   "$BASELINE_TORCH_EXTENSIONS_DIR" "$CANDIDATE_TORCH_EXTENSIONS_DIR" \
   "$RUN_ROOT/candidate-initialization" "$RUN_ROOT/baseline-extension-setup"
+
+squeue -h -u "${USER:?}" -t R -o '%A|%b|%j' > "$RUN_ROOT/running-jobs.txt"
+OTHER_GPU_JOBS=$(awk -F'|' -v self="$SLURM_JOB_ID" \
+  '$1 != self && tolower($2) ~ /gpu/ {print}' "$RUN_ROOT/running-jobs.txt")
+if [[ -n "$OTHER_GPU_JOBS" ]]; then
+  echo "another GPU job is already running for $USER:" >&2
+  echo "$OTHER_GPU_JOBS" >&2
+  exit 2
+fi
 export XDG_CACHE_HOME="$WORK/cache"
 export HF_HOME="$WORK/cache/huggingface"
 export TRANSFORMERS_CACHE="$WORK/cache/huggingface"
@@ -371,7 +381,7 @@ export TOKENIZERS_PARALLELISM=false
 export PYTHONHASHSEED=0
 
 echo "host=$(hostname)"
-echo "job_id=${SLURM_JOB_ID:-manual}"
+echo "job_id=$SLURM_JOB_ID"
 echo "baseline_commit=$BASELINE_COMMIT"
 echo "candidate_commit=$CANDIDATE_COMMIT"
 echo "baseline_branch=$BASELINE_BRANCH"
@@ -398,9 +408,8 @@ echo "baseline_torch_extensions_dir=$BASELINE_TORCH_EXTENSIONS_DIR"
 echo "candidate_torch_extensions_dir=$CANDIDATE_TORCH_EXTENSIONS_DIR"
 echo "ffmpeg=$(command -v ffmpeg)"
 echo "ffprobe=$(command -v ffprobe)"
-if [[ -n "${SLURM_JOB_ID:-}" ]]; then
-  scontrol show job -o "$SLURM_JOB_ID"
-fi
+scontrol show job -o "$SLURM_JOB_ID" > "$RUN_ROOT/slurm-job.txt"
+cat "$RUN_ROOT/slurm-job.txt"
 GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1)
 if [[ "$GPU_NAME" != "NVIDIA GeForce RTX 2080 Ti" ]]; then
   echo "weight-only reciprocal requires RTX 2080 Ti, got $GPU_NAME" >&2
@@ -966,7 +975,20 @@ if [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
     --require-exact-label main_generation
   )
   ANALYSIS_DISPATCH_ARGS=(
-    --allow-dispatch-delta 'records.*[[]*].optimized_cuda_graphs.*'
+    --allow-dispatch-delta
+      'records.*[[]*].optimized_cuda_graphs.k8_candidate.copy_calls'
+    --allow-dispatch-delta
+      'records.*[[]*].optimized_cuda_graphs.k8_candidate.copy_bytes'
+    --allow-dispatch-delta
+      'records.*[[]*].optimized_cuda_graphs.k8_candidate.shared_static_input_arena'
+    --allow-dispatch-delta
+      'records.*[[]*].optimized_cuda_graphs.k8_candidate.static_input_arena_refreshes'
+    --allow-dispatch-delta
+      'records.*[[]*].optimized_cuda_graphs.k8_candidate.static_input_arena_refresh_copy_calls'
+    --allow-dispatch-delta
+      'records.*[[]*].optimized_cuda_graphs.k8_candidate.static_input_arena_refresh_copy_bytes'
+    --allow-dispatch-delta
+      'records.*[[]*].optimized_cuda_graphs.k8_candidate.static_input_arena_graph_entries'
   )
 elif [[ "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
   ANALYSIS_EXACT_ARGS=(

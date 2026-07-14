@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import pytest
 
-from utils.analyze_shared_static_input_arena import analyze
+from utils.analyze_shared_static_input_arena import (
+    EXPECTED_DISPATCH_DELTA_PATTERNS,
+    analyze,
+)
 
 
 STAGES = (
@@ -28,6 +31,7 @@ def _runtime(*, candidate: bool) -> dict:
         "static_input_arena_refreshes": 1 if candidate else 0,
         "static_input_arena_refresh_copy_calls": 4 if candidate else 0,
         "static_input_arena_refresh_copy_bytes": 256 if candidate else 0,
+        "static_input_arena_graph_entries": 2 if candidate else 0,
         "copy_calls": 4 if candidate else 120,
         "transition_timing": {
             "schema_version": 1,
@@ -56,6 +60,26 @@ def _profile(*, candidate: bool) -> dict:
         "generation": [
             {
                 "profile_label": label,
+                "optimized_dispatch_mode": "approximate_weight_only_batch1",
+                "optimized_dispatch_policy": {
+                    "effective_native_q1_rope_cache_self_attention": {
+                        "enabled": label == "main_generation",
+                    },
+                },
+                "optimized_dispatch_capture_hits": {
+                    "native_q1_rope_cache_self_attention": (
+                        24 if label == "main_generation" else 0
+                    ),
+                    "q1_bmm_cross_attention": (
+                        24 if label == "main_generation" else 0
+                    ),
+                    "int8_weight_mlp_tail": (
+                        24 if label == "main_generation" else 0
+                    ),
+                    "fp16_packed_cross_projection_candidate": (
+                        24 if label == "main_generation" else 0
+                    ),
+                },
                 "optimized_cuda_graphs": {
                     "graph_count": 2,
                     "decode_replays": 100,
@@ -92,6 +116,10 @@ def _reciprocal(*, saving: float = 0.35) -> dict:
             "cross_candidate_exact": True,
             "required_exact_labels": ["timing_context", "main_generation"],
             "required_exact_labels_pass": True,
+            "dispatch_cache_topology": {
+                "pass": True,
+                "declared_patterns": list(EXPECTED_DISPATCH_DELTA_PATTERNS),
+            },
             "output_divergence": {"final_map_equal": True},
         },
         "metrics": {
@@ -123,6 +151,7 @@ def test_shared_arena_gate_requires_exact_parity_and_point_three_seconds():
         "baseline_median": 120.0,
         "candidate_median": 4.0,
     }
+    assert report["dispatch_metadata_exact"] is True
 
 
 def test_shared_arena_gate_stops_below_declared_saving():
@@ -172,3 +201,29 @@ def test_shared_arena_gate_rejects_token_or_final_map_drift():
     reciprocal["parity"]["output_divergence"]["final_map_equal"] = False
     with pytest.raises(ValueError, match="not byte-identical"):
         analyze(reciprocal, _profiles())
+
+
+def test_shared_arena_gate_rejects_broad_delta_or_dispatch_drift():
+    reciprocal = _reciprocal()
+    reciprocal["parity"]["dispatch_cache_topology"]["declared_patterns"] = [
+        "records.*[[]*].optimized_cuda_graphs.*"
+    ]
+    with pytest.raises(ValueError, match="too broad"):
+        analyze(reciprocal, _profiles())
+
+    profiles = _profiles()
+    profiles["candidate_first"]["generation"][1][
+        "optimized_dispatch_capture_hits"
+    ]["q1_bmm_cross_attention"] -= 1
+    with pytest.raises(ValueError, match="dispatch metadata"):
+        analyze(_reciprocal(), profiles)
+
+
+def test_shared_arena_gate_requires_arena_graph_capture_evidence():
+    profiles = _profiles()
+    for record in profiles["candidate_first"]["generation"]:
+        record["optimized_cuda_graphs"]["k8_candidate"][
+            "static_input_arena_graph_entries"
+        ] = 0
+    with pytest.raises(ValueError, match="captured no shared-arena graph"):
+        analyze(_reciprocal(), profiles)

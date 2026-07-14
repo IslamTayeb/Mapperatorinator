@@ -19,6 +19,15 @@ ROLES = (
     "candidate_second",
     "baseline_second",
 )
+EXPECTED_DISPATCH_DELTA_PATTERNS = (
+    "records.*[[]*].optimized_cuda_graphs.k8_candidate.copy_calls",
+    "records.*[[]*].optimized_cuda_graphs.k8_candidate.copy_bytes",
+    "records.*[[]*].optimized_cuda_graphs.k8_candidate.shared_static_input_arena",
+    "records.*[[]*].optimized_cuda_graphs.k8_candidate.static_input_arena_refreshes",
+    "records.*[[]*].optimized_cuda_graphs.k8_candidate.static_input_arena_refresh_copy_calls",
+    "records.*[[]*].optimized_cuda_graphs.k8_candidate.static_input_arena_refresh_copy_bytes",
+    "records.*[[]*].optimized_cuda_graphs.k8_candidate.static_input_arena_graph_entries",
+)
 
 
 def _object(value: Any, *, name: str) -> dict[str, Any]:
@@ -118,6 +127,39 @@ def _cache_topology(profile: dict[str, Any], *, role: str) -> dict[str, list[dic
     return result
 
 
+def _dispatch_metadata(
+    profile: dict[str, Any], *, role: str
+) -> dict[str, list[dict[str, Any]]]:
+    generation = profile.get("generation")
+    if not isinstance(generation, list):
+        raise ValueError(f"{role}.generation must be a list")
+    result = {label: [] for label in LABELS}
+    for index, raw in enumerate(generation):
+        record = _object(raw, name=f"{role}.generation[{index}]")
+        label = record.get("profile_label")
+        if label not in result:
+            continue
+        mode = record.get("optimized_dispatch_mode")
+        if not isinstance(mode, str) or not mode:
+            raise ValueError(f"{role}.{label}[{index}] dispatch mode is missing")
+        policy = _object(
+            record.get("optimized_dispatch_policy"),
+            name=f"{role}.{label}[{index}].optimized_dispatch_policy",
+        )
+        hits = _object(
+            record.get("optimized_dispatch_capture_hits"),
+            name=f"{role}.{label}[{index}].optimized_dispatch_capture_hits",
+        )
+        result[str(label)].append({
+            "mode": mode,
+            "policy": policy,
+            "capture_hits": hits,
+        })
+    if any(not values for values in result.values()):
+        raise ValueError(f"{role} is missing timing or main dispatch metadata")
+    return result
+
+
 def _transition_summary(
     records: dict[str, list[dict[str, Any]]],
     *,
@@ -135,6 +177,7 @@ def _transition_summary(
         refreshes = 0
         refresh_copy_calls = 0
         refresh_copy_bytes = 0
+        graph_entries = 0
         ordinary_copy_calls = 0
         for index, runtime in enumerate(values):
             if runtime.get("shared_static_input_arena") is not candidate:
@@ -144,9 +187,15 @@ def _transition_summary(
             refresh = runtime.get("static_input_arena_refreshes", 0)
             refresh_calls = runtime.get("static_input_arena_refresh_copy_calls", 0)
             refresh_bytes = runtime.get("static_input_arena_refresh_copy_bytes", 0)
+            current_graph_entries = runtime.get("static_input_arena_graph_entries", 0)
             if any(
                 isinstance(item, bool) or not isinstance(item, int) or item < 0
-                for item in (refresh, refresh_calls, refresh_bytes)
+                for item in (
+                    refresh,
+                    refresh_calls,
+                    refresh_bytes,
+                    current_graph_entries,
+                )
             ):
                 raise ValueError(f"{role}.{label}[{index}] has invalid arena counters")
             if candidate and (refresh != 1 or refresh_calls != 4 or refresh_bytes <= 0):
@@ -155,9 +204,12 @@ def _transition_summary(
                 )
             if not candidate and any((refresh, refresh_calls, refresh_bytes)):
                 raise ValueError(f"{role}.{label}[{index}] baseline used an arena")
+            if not candidate and current_graph_entries:
+                raise ValueError(f"{role}.{label}[{index}] baseline captured arena graphs")
             refreshes += refresh
             refresh_copy_calls += refresh_calls
             refresh_copy_bytes += refresh_bytes
+            graph_entries += current_graph_entries
             copy_calls = runtime.get("copy_calls")
             if isinstance(copy_calls, bool) or not isinstance(copy_calls, int):
                 raise ValueError(f"{role}.{label}[{index}] copy_calls is invalid")
@@ -261,6 +313,8 @@ def _transition_summary(
                 total["seconds"] = float(total["seconds"]) + seconds
         if measured_records <= 0 or model_wall <= 0.0:
             raise ValueError(f"{role}.{label} contains no steady-state transition timing")
+        if candidate and graph_entries <= 0:
+            raise ValueError(f"{role}.{label} captured no shared-arena graph entries")
         labels[label] = {
             "records": len(values),
             "measured_records": measured_records,
@@ -271,6 +325,7 @@ def _transition_summary(
             "static_input_arena_refreshes": refreshes,
             "static_input_arena_refresh_copy_calls": refresh_copy_calls,
             "static_input_arena_refresh_copy_bytes": refresh_copy_bytes,
+            "static_input_arena_graph_entries": graph_entries,
             "copy_calls": ordinary_copy_calls,
             "stages": stage_totals,
             "device": device_totals,
@@ -291,6 +346,14 @@ def analyze(
         raise ValueError("shared arena did not require exact timing and main labels")
     if parity.get("required_exact_labels_pass") is not True:
         raise ValueError("shared arena exact label gate failed")
+    declaration = _object(
+        parity.get("dispatch_cache_topology"),
+        name="reciprocal.parity.dispatch_cache_topology",
+    )
+    if declaration.get("pass") is not True:
+        raise ValueError("shared arena dispatch/cache delta declaration failed")
+    if declaration.get("declared_patterns") != list(EXPECTED_DISPATCH_DELTA_PATTERNS):
+        raise ValueError("shared arena dispatch/cache delta declaration is too broad")
     output = _object(parity.get("output_divergence"), name="output_divergence")
     if output.get("final_map_equal") is not True:
         raise ValueError("shared arena final osu is not byte-identical")
@@ -316,12 +379,21 @@ def analyze(
     cache_topologies = {
         role: _cache_topology(profiles[role], role=role) for role in ROLES
     }
+    dispatch_metadata = {
+        role: _dispatch_metadata(profiles[role], role=role) for role in ROLES
+    }
     if cache_topologies["baseline_first"] != cache_topologies["baseline_second"]:
         raise ValueError("baseline cache topology is not reciprocal-repeat stable")
     if cache_topologies["candidate_first"] != cache_topologies["candidate_second"]:
         raise ValueError("candidate cache topology is not reciprocal-repeat stable")
     if cache_topologies["baseline_first"] != cache_topologies["candidate_first"]:
         raise ValueError("shared arena changed graph/cache topology")
+    if dispatch_metadata["baseline_first"] != dispatch_metadata["baseline_second"]:
+        raise ValueError("baseline dispatch metadata is not reciprocal-repeat stable")
+    if dispatch_metadata["candidate_first"] != dispatch_metadata["candidate_second"]:
+        raise ValueError("candidate dispatch metadata is not reciprocal-repeat stable")
+    if dispatch_metadata["baseline_first"] != dispatch_metadata["candidate_first"]:
+        raise ValueError("shared arena changed selected dispatch metadata")
     baseline_copies = statistics.median(
         transitions[role]["main_generation"]["copy_calls"]
         for role in ("baseline_first", "baseline_second")
@@ -346,6 +418,7 @@ def analyze(
         },
         "exact_incremental_parity": True,
         "cache_topology_exact": True,
+        "dispatch_metadata_exact": True,
         "final_osu_byte_identical": True,
         "main_copy_calls": {
             "baseline_median": baseline_copies,

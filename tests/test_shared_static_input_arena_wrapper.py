@@ -27,6 +27,33 @@ def test_general_wrapper_runs_arena_analyzer_and_retains_negative_report():
     assert 'SHARED_ARENA_STATUS" -ne 0' in block
     assert 'SHARED_ARENA_STATUS" -ne 3' in block
     assert 'SHARED_ARENA_STATUS" -eq 3' in block
+    assert "Run this wrapper inside a Slurm allocation" in source
+    assert "running-jobs.txt" in source
+    assert "another GPU job is already running" in source
+    assert "slurm-job.txt" in source
+
+
+def test_shared_arena_dispatch_delta_declaration_is_narrow():
+    source = (
+        ROOT / "scripts/dcc/verify_weight_only_full_song_reciprocal.sbatch"
+    ).read_text(encoding="utf-8")
+    analysis = source[source.index("ANALYSIS_MODE=relaxed") :]
+    block = analysis[
+        analysis.index('if [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then') :
+        analysis.index('elif [[ "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then')
+    ]
+
+    assert "optimized_cuda_graphs.*" not in block
+    for field in (
+        "copy_calls",
+        "copy_bytes",
+        "shared_static_input_arena",
+        "static_input_arena_refreshes",
+        "static_input_arena_refresh_copy_calls",
+        "static_input_arena_refresh_copy_bytes",
+        "static_input_arena_graph_entries",
+    ):
+        assert f"optimized_cuda_graphs.k8_candidate.{field}" in block
 
 
 def test_shared_arena_runners_differ_only_by_arena_policy():
