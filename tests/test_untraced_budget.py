@@ -53,6 +53,12 @@ def test_recorder_is_complete_per_token_and_tracks_explicit_copy(monkeypatch):
     with recorder.region("graph_input_copies"):
         destination.copy_(source)
         recorder.record_copy(source, destination)
+    recorder.record_external_copy(
+        "model_input_to_device",
+        source,
+        destination,
+        host_wall_seconds=0.01,
+    )
     result = recorder.finish(model_elapsed_seconds=1.0, generated_tokens=4)
 
     assert tuple(result["regions"]) == BUDGET_REGION_NAMES
@@ -61,6 +67,9 @@ def test_recorder_is_complete_per_token_and_tracks_explicit_copy(monkeypatch):
     assert copy["copy_count"] == 1
     assert copy["copy_bytes"] == 32
     assert copy["copy_count_by_direction"]["h2h"] == 1
+    assert result["external_transfers"]["model_input_to_device"][
+        "host_wall_seconds"
+    ] == pytest.approx(0.01)
     assert result["per_token"]["model_elapsed_ms"] == pytest.approx(250.0)
     assert result["reconciliation_pass"] is True
 

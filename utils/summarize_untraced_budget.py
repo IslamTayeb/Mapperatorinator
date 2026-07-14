@@ -24,6 +24,11 @@ REGION_NAMES = (
     "sync",
 )
 COPY_DIRECTIONS = ("h2d", "d2h", "d2d", "h2h", "other")
+EXTERNAL_TRANSFER_NAMES = (
+    "model_input_to_device",
+    "model_input_dtype_conversion",
+    "final_device_to_host",
+)
 CUDA_EVENT_REGION_NAMES = frozenset(
     {
         "prefill",
@@ -120,6 +125,20 @@ def _parse_region(value: Any, *, name: str) -> dict[str, Any]:
     return parsed
 
 
+def _parse_external_transfer(value: Any, *, name: str) -> dict[str, Any]:
+    raw = _object(value, name=name)
+    # External transfers do not own CUDA events but otherwise share the copy
+    # accounting schema with measured model regions.
+    return _parse_region(
+        {
+            **raw,
+            "cuda_event_samples": 0,
+            "cuda_event_seconds": 0.0,
+        },
+        name=name,
+    )
+
+
 def _parse_budget(
     value: Any,
     *,
@@ -162,6 +181,21 @@ def _parse_budget(
                 f"{name}.regions.{region_name}.cuda_event_samples must be "
                 f"{expected_samples}"
             )
+    external_raw = _object(
+        raw.get("external_transfers"),
+        name=f"{name}.external_transfers",
+    )
+    if set(external_raw) != set(EXTERNAL_TRANSFER_NAMES):
+        raise ValueError(
+            f"{name}.external_transfers must contain the complete schema"
+        )
+    external_transfers = {
+        transfer_name: _parse_external_transfer(
+            external_raw[transfer_name],
+            name=f"{name}.external_transfers.{transfer_name}",
+        )
+        for transfer_name in EXTERNAL_TRANSFER_NAMES
+    }
     model_seconds = _number(
         raw.get("model_elapsed_seconds"),
         name=f"{name}.model_elapsed_seconds",
@@ -207,6 +241,7 @@ def _parse_budget(
         "generated_tokens": generated_tokens,
         "model_elapsed_seconds": model_seconds,
         "regions": regions,
+        "external_transfers": external_transfers,
         "host_unattributed_seconds": host_unattributed_seconds,
         "reconciliation_error_seconds": error_seconds,
         "reconciliation_error_fraction": error_fraction,
@@ -237,6 +272,23 @@ def _empty_aggregate() -> dict[str, Any]:
             }
             for name in REGION_NAMES
         },
+        "external_transfers": {
+            name: {
+                "calls": 0,
+                "host_wall_seconds": 0.0,
+                "cuda_event_samples": 0,
+                "cuda_event_seconds": 0.0,
+                "copy_count": 0,
+                "copy_bytes": 0,
+                "copy_count_by_direction": {
+                    direction: 0 for direction in COPY_DIRECTIONS
+                },
+                "copy_bytes_by_direction": {
+                    direction: 0 for direction in COPY_DIRECTIONS
+                },
+            }
+            for name in EXTERNAL_TRANSFER_NAMES
+        },
         "window_reconciliation_pass": True,
     }
 
@@ -254,6 +306,22 @@ def _add_budget(target: dict[str, Any], budget: dict[str, Any]) -> None:
             "host_wall_seconds",
             "cuda_event_samples",
             "cuda_event_seconds",
+            "copy_count",
+            "copy_bytes",
+        ):
+            destination[field] += source[field]
+        for direction in COPY_DIRECTIONS:
+            destination["copy_count_by_direction"][direction] += source[
+                "copy_count_by_direction"
+            ][direction]
+            destination["copy_bytes_by_direction"][direction] += source[
+                "copy_bytes_by_direction"
+            ][direction]
+    for name, source in budget["external_transfers"].items():
+        destination = target["external_transfers"][name]
+        for field in (
+            "calls",
+            "host_wall_seconds",
             "copy_count",
             "copy_bytes",
         ):
@@ -299,6 +367,10 @@ def _finish_aggregate(target: dict[str, Any]) -> dict[str, Any]:
         )
         for direction in COPY_DIRECTIONS
     }
+    external_transfer_wall_seconds = sum(
+        transfer["host_wall_seconds"]
+        for transfer in target["external_transfers"].values()
+    )
     target.update(
         {
             "measured_host_seconds": measured_host_seconds,
@@ -309,6 +381,7 @@ def _finish_aggregate(target: dict[str, Any]) -> dict[str, Any]:
             "explicit_sync_count": target["regions"]["sync"]["calls"],
             "transition_count_by_direction": transition_count_by_direction,
             "transition_bytes_by_direction": transition_bytes_by_direction,
+            "external_transfer_wall_seconds": external_transfer_wall_seconds,
             "reconciliation_error_seconds": error_seconds,
             "reconciliation_error_fraction": error_fraction,
             "reconciliation_limit_fraction": RECONCILIATION_LIMIT_FRACTION,

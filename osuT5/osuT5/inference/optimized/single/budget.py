@@ -8,6 +8,7 @@ runs do not allocate CUDA events or retain timing state.
 from __future__ import annotations
 
 import time
+import math
 from contextlib import contextmanager
 from typing import Any, Iterator
 
@@ -28,6 +29,11 @@ BUDGET_REGION_NAMES = (
     "sync",
 )
 COPY_DIRECTIONS = ("h2d", "d2h", "d2d", "h2h", "other")
+EXTERNAL_TRANSFER_NAMES = (
+    "model_input_to_device",
+    "model_input_dtype_conversion",
+    "final_device_to_host",
+)
 CUDA_EVENT_REGION_NAMES = frozenset(
     {
         "prefill",
@@ -67,6 +73,21 @@ class UntracedBudgetRecorder:
         }
         self._cuda_events: dict[str, list[tuple[Any, Any]]] = {
             name: [] for name in CUDA_EVENT_REGION_NAMES
+        }
+        self._external_transfers: dict[str, dict[str, Any]] = {
+            name: {
+                "calls": 0,
+                "host_wall_seconds": 0.0,
+                "copy_count": 0,
+                "copy_bytes": 0,
+                "copy_count_by_direction": {
+                    direction: 0 for direction in COPY_DIRECTIONS
+                },
+                "copy_bytes_by_direction": {
+                    direction: 0 for direction in COPY_DIRECTIONS
+                },
+            }
+            for name in EXTERNAL_TRANSFER_NAMES
         }
 
     @contextmanager
@@ -118,6 +139,50 @@ class UntracedBudgetRecorder:
             raise TypeError("budget copy endpoints must be tensors")
         if source.numel() != destination.numel():
             raise ValueError("budget copy endpoints must contain the same elements")
+        direction, byte_count = self._copy_shape(source, destination)
+        region = self._regions[self._active_region]
+        region["copy_count"] += 1
+        region["copy_bytes"] += byte_count
+        region["copy_count_by_direction"][direction] += 1
+        region["copy_bytes_by_direction"][direction] += byte_count
+
+    def record_external_copy(
+        self,
+        name: str,
+        source: torch.Tensor,
+        destination: torch.Tensor,
+        *,
+        host_wall_seconds: float,
+    ) -> None:
+        """Record an explicit transfer outside synchronized model time."""
+
+        if self._finished:
+            raise RuntimeError("untraced budget recorder is already finished")
+        if name not in self._external_transfers:
+            raise ValueError(f"unknown external transfer: {name}")
+        if not math.isfinite(float(host_wall_seconds)) or host_wall_seconds < 0:
+            raise ValueError("external transfer host wall must be finite and non-negative")
+        direction, byte_count = self._copy_shape(source, destination)
+        transfer = self._external_transfers[name]
+        transfer["calls"] += 1
+        transfer["host_wall_seconds"] += float(host_wall_seconds)
+        transfer["copy_count"] += 1
+        transfer["copy_bytes"] += byte_count
+        transfer["copy_count_by_direction"][direction] += 1
+        transfer["copy_bytes_by_direction"][direction] += byte_count
+
+    @staticmethod
+    def _copy_shape(
+        source: torch.Tensor,
+        destination: torch.Tensor,
+    ) -> tuple[str, int]:
+        if not isinstance(source, torch.Tensor) or not isinstance(
+            destination,
+            torch.Tensor,
+        ):
+            raise TypeError("budget copy endpoints must be tensors")
+        if source.numel() != destination.numel():
+            raise ValueError("budget copy endpoints must contain the same elements")
         source_type = source.device.type
         destination_type = destination.device.type
         if source_type == "cpu" and destination_type == "cuda":
@@ -134,12 +199,7 @@ class UntracedBudgetRecorder:
         # explicit dtype-converting ``to(copy=True)`` operations, which are
         # kernels rather than raw cudaMemcpy calls but still move one output
         # payload across the recorded transition.
-        byte_count = destination.numel() * destination.element_size()
-        region = self._regions[self._active_region]
-        region["copy_count"] += 1
-        region["copy_bytes"] += byte_count
-        region["copy_count_by_direction"][direction] += 1
-        region["copy_bytes_by_direction"][direction] += byte_count
+        return direction, destination.numel() * destination.element_size()
 
     def finish(
         self,
@@ -275,6 +335,7 @@ class UntracedBudgetRecorder:
             "explicit_sync_count": int(self._regions["sync"]["calls"]),
             "transition_count_by_direction": transition_count_by_direction,
             "transition_bytes_by_direction": transition_bytes_by_direction,
+            "external_transfers": self._external_transfers,
             "accounted_host_seconds": accounted_host_seconds,
             "reconciliation_error_seconds": reconciliation_error_seconds,
             "reconciliation_error_fraction": reconciliation_error_fraction,
