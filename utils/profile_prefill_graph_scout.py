@@ -19,6 +19,7 @@ import time
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 from types import MethodType
 from typing import Any, Iterator
@@ -428,7 +429,11 @@ def capture_main_prefills(processor: Any, records: list[PrefillRecord]) -> Itera
 
     model = processor.model
     original = model.prepare_inputs_for_generation
+    original_function = getattr(original, "__func__", None)
+    if original_function is None:
+        raise TypeError("prepare_inputs_for_generation must be a bound method")
 
+    @wraps(original_function)
     def wrapped(self, decoder_input_ids, *args, **kwargs):
         prepared = original(decoder_input_ids, *args, **kwargs)
         prepared_ids = prepared.get("decoder_input_ids")

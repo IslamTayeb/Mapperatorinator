@@ -1,4 +1,5 @@
-from types import MethodType, SimpleNamespace
+import inspect
+from types import SimpleNamespace
 from unittest.mock import call
 
 import pytest
@@ -78,18 +79,34 @@ def test_graph_input_clone_and_copy_include_nested_encoder_tensor():
 
 def test_capture_context_restores_prepare_method_and_only_keeps_prefill():
     class FakeModel:
-        def prepare_inputs_for_generation(self, decoder_input_ids, **kwargs):
+        def prepare_inputs_for_generation(
+            self,
+            decoder_input_ids,
+            past_key_values=None,
+            use_cache=None,
+            encoder_outputs=None,
+            decoder_attention_mask=None,
+            cache_position=None,
+            **kwargs,
+        ):
             return {"decoder_input_ids": decoder_input_ids}
 
     model = FakeModel()
     original = model.prepare_inputs_for_generation
+    original_signature = inspect.signature(original)
     processor = SimpleNamespace(model=model)
     records = []
     encoder = BaseModelOutput(last_hidden_state=torch.zeros((1, 7, 4)))
 
     with capture_main_prefills(processor, records):
+        assert inspect.signature(model.prepare_inputs_for_generation) == original_signature
+        assert "past_key_values" in inspect.signature(
+            model.prepare_inputs_for_generation
+        ).parameters
         model.prepare_inputs_for_generation(
             torch.ones((1, 5), dtype=torch.long),
+            past_key_values=object(),
+            use_cache=True,
             encoder_outputs=encoder,
             decoder_attention_mask=torch.ones((1, 5), dtype=torch.long),
         )
