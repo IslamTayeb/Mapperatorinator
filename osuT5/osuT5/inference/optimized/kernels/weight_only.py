@@ -18,9 +18,9 @@ _WEIGHT_ONLY_EXTENSION = None
 
 
 def _load_inline(**kwargs):
-    from torch.utils.cpp_extension import load_inline
+    from .native_extension import load_inline_or_prebuilt
 
-    return load_inline(**kwargs)
+    return load_inline_or_prebuilt(**kwargs)
 
 
 _CPP_SOURCE = r"""
