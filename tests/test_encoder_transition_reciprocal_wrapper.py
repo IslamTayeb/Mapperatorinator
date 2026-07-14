@@ -27,6 +27,13 @@ def test_transition_wrapper_uses_stage_seed_and_candidate_skip_gate() -> None:
     assert "PYTHONHASHSEED=0" in source
     assert "CUBLAS_WORKSPACE_CONFIG=:4096:8" in source
     assert "utils/run_fixed_seed_inference.py" in source
+    for invocation in (
+        'run_profile baseline_first "$BASELINE_REPO"',
+        'run_profile baseline_second "$BASELINE_REPO"',
+        'run_profile candidate_first "$CANDIDATE_REPO"',
+        'run_profile candidate_second "$CANDIDATE_REPO"',
+    ):
+        assert invocation in source
     assert 'f"reciprocal_rng_{device}_sha256_{label}"' in source
     assert "stage_seed_policy" in source
     assert "profile_label_seed_fingerprints" in source
