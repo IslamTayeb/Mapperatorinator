@@ -120,6 +120,7 @@ class VocabSamplingObserver:
         self.capture_depth = 0
         self.total_graph_observations = 0
         self.total_eager_observations = 0
+        self.wasted_graph_observations = 0
         self.dropped_observations = 0
 
     def begin_capture(self) -> None:
@@ -128,7 +129,7 @@ class VocabSamplingObserver:
         self.capture_depth = 1
         self.current = {}
 
-    def finish_capture(self, parent: Any) -> None:
+    def finish_capture(self, parent: Any, *, state: Any) -> None:
         if self.capture_depth != 1:
             raise RuntimeError("K4 tail capture observer is not active")
         self.capture_depth = 0
@@ -141,6 +142,8 @@ class VocabSamplingObserver:
         self.graph_buffers[id(parent)] = {
             **self.current,
             "processor_descriptor": self.current_descriptor,
+            "physical_length": state.physical_length,
+            "logical_length": state.logical_length,
         }
         self.current = {}
 
@@ -171,6 +174,11 @@ class VocabSamplingObserver:
         if buffers is None:
             raise RuntimeError("K4 graph replay has no registered sampling buffers")
         self.total_graph_observations += 1
+        physical = int(buffers["physical_length"].detach().cpu().item())
+        logical = int(buffers["logical_length"].detach().cpu().item())
+        if logical < physical:
+            self.wasted_graph_observations += 1
+            return
         self._record(buffers, source="k4_graph_final_step")
 
     def _record(self, buffers: dict[str, Any], *, source: str) -> None:
@@ -236,7 +244,7 @@ def install_vocab_sampling_observer(
         observer.begin_capture()
         try:
             entry = original_capture(*args, **kwargs)
-            observer.finish_capture(entry.parent)
+            observer.finish_capture(entry.parent, state=entry.state)
             return entry
         except Exception:
             observer.abort_capture()
@@ -458,9 +466,15 @@ def summarize(
             "max_samples": observer.max_samples,
             "graph_final_step_observations": observer.total_graph_observations,
             "eager_remainder_observations": observer.total_eager_observations,
+            "post_eos_graph_observations_excluded": (
+                observer.wasted_graph_observations
+            ),
             "dropped_observations": observer.dropped_observations,
             "k4_graph_sampling_stride": 4,
-            "graph_sample_semantics": "final_logical_step_per_k4_block",
+            "graph_sample_semantics": (
+                "final_physical step per K4 block, excluding blocks whose final "
+                "step is after logical EOS"
+            ),
         },
         "distribution": {
             "vocab_size": next(iter(vocab_sizes)),

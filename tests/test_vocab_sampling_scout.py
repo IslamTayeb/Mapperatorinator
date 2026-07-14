@@ -54,6 +54,8 @@ def test_observer_records_bounded_graph_and_eager_samples() -> None:
         "threshold": torch.tensor(sample.threshold),
         "token": torch.tensor([sample.selected_token]),
         "processor_descriptor": sample.processor_descriptor,
+        "physical_length": torch.tensor([8]),
+        "logical_length": torch.tensor([64]),
     }
     observer.graph_buffers[id(parent)] = buffers
 
@@ -64,6 +66,27 @@ def test_observer_records_bounded_graph_and_eager_samples() -> None:
     assert observer.total_graph_observations == 2
     assert observer.dropped_observations == 1
     assert observer.samples[0].nucleus_size == 2
+
+
+def test_observer_excludes_final_graph_score_after_logical_eos() -> None:
+    observer = VocabSamplingObserver(max_samples=1)
+    parent = object()
+    sample = _sample()
+    observer.graph_buffers[id(parent)] = {
+        "raw_logits": sample.raw_logits,
+        "pre_top_p": sample.pre_top_p,
+        "post_top_p": sample.post_top_p,
+        "threshold": torch.tensor(sample.threshold),
+        "token": torch.tensor([sample.selected_token]),
+        "processor_descriptor": sample.processor_descriptor,
+        "physical_length": torch.tensor([12]),
+        "logical_length": torch.tensor([10]),
+    }
+
+    observer.observe_graph_replay(parent)
+
+    assert observer.samples == []
+    assert observer.wasted_graph_observations == 1
 
 
 def test_patch_context_restores_all_callables() -> None:
