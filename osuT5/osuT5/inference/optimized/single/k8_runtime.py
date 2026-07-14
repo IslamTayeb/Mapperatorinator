@@ -1357,6 +1357,24 @@ def install_k8_candidate(
             _ACTIVE_GRAPH_REMAINDERS = None
 
 
+@contextmanager
+def k8_block_size_context(block_size: int) -> Iterator[None]:
+    """Temporarily select a stage-local block inside one installed candidate."""
+
+    global _ACTIVE_BLOCK_SIZE
+    block_size = _validate_block_size(block_size)
+    if _ACTIVE_K8_LIFECYCLE is None or _ACTIVE_BLOCK_SIZE is None:
+        raise RuntimeError("stage-local K8 block size requires an installed candidate")
+    previous = _ACTIVE_BLOCK_SIZE
+    _ACTIVE_BLOCK_SIZE = block_size
+    try:
+        yield
+    finally:
+        if _ACTIVE_K8_LIFECYCLE is None:
+            raise RuntimeError("K8 lifecycle ended inside stage-local block context")
+        _ACTIVE_BLOCK_SIZE = previous
+
+
 __all__ = [
     "K8DeviceState",
     "K8LogitsProcessor",
@@ -1364,5 +1382,6 @@ __all__ = [
     "RNG_POLICY",
     "SUPPORTED_BLOCK_SIZES",
     "install_k8_candidate",
+    "k8_block_size_context",
     "k8_active_prefix_decode_generate",
 ]

@@ -758,6 +758,27 @@ def test_install_rejects_non_boolean_graph_remainder_policy():
             pass
 
 
+def test_stage_local_block_size_requires_active_candidate(monkeypatch):
+    monkeypatch.setattr(k8_runtime, "_ACTIVE_K8_LIFECYCLE", None)
+    monkeypatch.setattr(k8_runtime, "_ACTIVE_BLOCK_SIZE", None)
+
+    with pytest.raises(RuntimeError, match="requires an installed candidate"):
+        with k8_runtime.k8_block_size_context(1):
+            pass
+
+
+def test_stage_local_block_size_restores_parent_selection(monkeypatch):
+    lifecycle = object()
+    monkeypatch.setattr(k8_runtime, "_ACTIVE_K8_LIFECYCLE", lifecycle)
+    monkeypatch.setattr(k8_runtime, "_ACTIVE_BLOCK_SIZE", 4)
+
+    with k8_runtime.k8_block_size_context(1):
+        assert k8_runtime._ACTIVE_BLOCK_SIZE == 1
+        assert k8_runtime._ACTIVE_K8_LIFECYCLE is lifecycle
+
+    assert k8_runtime._ACTIVE_BLOCK_SIZE == 4
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_fixed_state_counter_and_append_are_cuda_graph_capture_compatible():
     state = K8DeviceState.allocate(
