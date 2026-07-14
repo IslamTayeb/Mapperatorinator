@@ -18,7 +18,12 @@ if str(REPO_ROOT) not in sys.path:
 from osuT5.osuT5.inference.engine_binding import InferenceEngineBinding
 from osuT5.osuT5.inference.profiler import InferenceProfiler
 from utils.run_approximate_weight_only import _initialize_with_evidence, _load_args
-from utils.run_final_confirmation import ConfirmationRuntime, _sha256_file
+from utils.run_final_confirmation import (
+    ConfirmationRuntime,
+    ConfirmationState,
+    _candidate_decode_context,
+    _sha256_file,
+)
 
 
 SCHEMA_VERSION = "mapperatorinator.serial-final-confirmation.v1"
@@ -88,10 +93,28 @@ def run(
         auto_select_gamemode_model=first_args.auto_select_gamemode_model,
         inference_engine=first_args.inference_engine,
     )
+    separate_timing_model = inference.should_load_separate_timing_model(first_args)
+    timing_binding = None
+    timing_tokenizer = None
+    if separate_timing_model:
+        timing_binding, timing_tokenizer = inference.load_model_with_engine(
+            first_args.model_path,
+            first_args.train,
+            first_args.device,
+            max_batch_size=first_args.max_batch_size,
+            use_server=first_args.use_server,
+            precision=first_args.precision,
+            attn_implementation=first_args.attn_implementation,
+            gamemode=first_args.gamemode,
+            auto_select_gamemode_model=False,
+            inference_engine=first_args.inference_engine,
+        )
     torch.cuda.synchronize()
     model_load_seconds = time.perf_counter() - model_load_started
     if not isinstance(binding, InferenceEngineBinding):
         raise TypeError("serial confirmation requires an optimized engine binding")
+    if timing_binding is not None and not isinstance(timing_binding, InferenceEngineBinding):
+        raise TypeError("serial confirmation requires an optimized timing engine binding")
     initialization = None
     if candidate:
         initializer = getattr(binding.runtime, "initialize_approximate_weight_only", None)
@@ -104,8 +127,23 @@ def run(
             json.dumps(initialization, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-    runtime = ConfirmationRuntime(binding.runtime, mode="natural", manifest=None)
+    state = ConfirmationState()
+    runtime = ConfirmationRuntime(
+        binding.runtime,
+        mode="natural",
+        manifest=None,
+        state=state,
+    )
     binding = InferenceEngineBinding(binding.raw_model, runtime)
+    timing_runtime = None
+    if timing_binding is not None:
+        timing_runtime = ConfirmationRuntime(
+            timing_binding.runtime,
+            mode="natural",
+            manifest=None,
+            state=state,
+        )
+        timing_binding = InferenceEngineBinding(timing_binding.raw_model, timing_runtime)
 
     runs: list[dict[str, Any]] = []
     for index, song in enumerate(songs):
@@ -124,9 +162,9 @@ def run(
             args.model_path != first_args.model_path
             or args.precision != first_args.precision
             or args.inference_engine != first_args.inference_engine
-            or inference.should_load_separate_timing_model(args)
+            or inference.should_load_separate_timing_model(args) != separate_timing_model
         ):
-            raise RuntimeError("serial confirmation songs must share one timing/main model")
+            raise RuntimeError("serial confirmation songs changed model topology")
         with profiler.stage("build_generation_config"):
             generation_config, beatmap_config = inference.get_config(args)
         gc.collect()
@@ -135,15 +173,18 @@ def run(
         reserved_before = int(torch.cuda.memory_reserved())
         torch.cuda.reset_peak_memory_stats()
         record_start = len(runtime.records)
-        _, result_path = inference.generate(
-            args,
-            generation_config=generation_config,
-            beatmap_config=beatmap_config,
-            model=binding,
-            tokenizer=tokenizer,
-            profiler=profiler,
-            verbose=False,
-        )
+        with _candidate_decode_context(candidate):
+            _, result_path = inference.generate(
+                args,
+                generation_config=generation_config,
+                beatmap_config=beatmap_config,
+                model=binding,
+                tokenizer=tokenizer,
+                timing_model=timing_binding,
+                timing_tokenizer=timing_tokenizer,
+                profiler=profiler,
+                verbose=False,
+            )
         torch.cuda.synchronize()
         record_end = len(runtime.records)
         gc.collect()
@@ -194,6 +235,8 @@ def run(
         "candidate": candidate,
         "startup": {
             "model_load_seconds": model_load_seconds,
+            "separate_timing_model": separate_timing_model,
+            "loaded_runtime_count": 2 if timing_runtime is not None else 1,
             "candidate_initialization_seconds": (
                 float(initialization["initialization_wall_seconds"])
                 if initialization is not None

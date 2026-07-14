@@ -14,8 +14,9 @@ import sys
 import time
 import uuid
 from collections import defaultdict
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import torch
 
@@ -31,6 +32,27 @@ SCHEMA_VERSION = "mapperatorinator.final-confirmation-run.v1"
 MANIFEST_SCHEMA_VERSION = "mapperatorinator.fixed-work-manifest.v1"
 MODES = ("natural", "record-fixed-work", "replay-fixed-work")
 PROFILE_LABEL_BY_CONTEXT = {"timing": "timing_context", "map": "main_generation"}
+
+
+class ConfirmationState:
+    """Request-local accounting shared by distinct timing and main runtimes."""
+
+    def __init__(self) -> None:
+        self.indices: defaultdict[str, int] = defaultdict(int)
+        self.records: list[dict[str, Any]] = []
+
+
+@contextmanager
+def _candidate_decode_context(candidate: bool) -> Iterator[None]:
+    if not candidate:
+        yield
+        return
+    from osuT5.osuT5.inference.optimized.single.k8_runtime import (
+        install_k8_candidate,
+    )
+
+    with install_k8_candidate(block_size=4):
+        yield
 
 
 def _sha256_file(path: Path) -> str:
@@ -65,12 +87,14 @@ class ConfirmationRuntime:
         *,
         mode: str,
         manifest: dict[str, Any] | None,
+        state: ConfirmationState | None = None,
     ) -> None:
         self._runtime = runtime
         self._mode = mode
         self._manifest = manifest
-        self._indices: defaultdict[str, int] = defaultdict(int)
-        self.records: list[dict[str, Any]] = []
+        self._state = ConfirmationState() if state is None else state
+        self._indices = self._state.indices
+        self.records = self._state.records
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._runtime, name)
@@ -240,17 +264,16 @@ def run(
             )
 
     original_loader = inference.load_model_with_engine
-    wrapped_runtime: ConfirmationRuntime | None = None
+    state = ConfirmationState()
+    wrapped_runtimes: list[ConfirmationRuntime] = []
     initialization = None
 
     def loader(*loader_args: Any, **loader_kwargs: Any):
-        nonlocal wrapped_runtime, initialization
-        if wrapped_runtime is not None:
-            raise RuntimeError("final confirmation supports one shared timing/main model only")
+        nonlocal initialization
         binding, tokenizer = original_loader(*loader_args, **loader_kwargs)
         if not isinstance(binding, InferenceEngineBinding):
             raise TypeError("final confirmation requires an optimized engine binding")
-        if candidate:
+        if candidate and initialization is None:
             initializer = getattr(binding.runtime, "initialize_approximate_weight_only", None)
             if initializer is None:
                 raise RuntimeError("candidate runtime lacks approximate-weight initialization")
@@ -261,20 +284,27 @@ def run(
                 json.dumps(initialization, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
             )
-        wrapped_runtime = ConfirmationRuntime(binding.runtime, mode=mode, manifest=manifest)
-        return InferenceEngineBinding(binding.raw_model, wrapped_runtime), tokenizer
+        wrapped = ConfirmationRuntime(
+            binding.runtime,
+            mode=mode,
+            manifest=manifest,
+            state=state,
+        )
+        wrapped_runtimes.append(wrapped)
+        return InferenceEngineBinding(binding.raw_model, wrapped), tokenizer
 
     inference.load_model_with_engine = loader
     process_started = time.time_ns()
     torch.cuda.reset_peak_memory_stats()
     try:
-        _, result_path = inference.main(args)
+        with _candidate_decode_context(candidate):
+            _, result_path = inference.main(args)
     finally:
         inference.load_model_with_engine = original_loader
-    if wrapped_runtime is None:
+    if not wrapped_runtimes:
         raise RuntimeError("confirmation model was never loaded")
-    wrapped_runtime.validate_complete()
-    labels = _recorded_labels(wrapped_runtime.records)
+    wrapped_runtimes[0].validate_complete()
+    labels = _recorded_labels(state.records)
     if mode == "record-fixed-work":
         assert manifest_path is not None
         if sum(labels["main_generation"]) != expected_main_steps:
@@ -323,7 +353,8 @@ def run(
             }
             for label, counts in labels.items()
         },
-        "records": wrapped_runtime.records,
+        "records": state.records,
+        "loaded_runtime_count": len(wrapped_runtimes),
         "cuda_memory": {
             "allocated_bytes": int(torch.cuda.memory_allocated()),
             "reserved_bytes": int(torch.cuda.memory_reserved()),

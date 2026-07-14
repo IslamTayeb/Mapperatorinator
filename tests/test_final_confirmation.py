@@ -10,6 +10,7 @@ from utils.analyze_final_confirmation import _memory_stability
 from utils.run_final_confirmation import (
     MANIFEST_SCHEMA_VERSION,
     ConfirmationRuntime,
+    ConfirmationState,
     _load_manifest,
 )
 from utils.run_serial_final_confirmation import _songs
@@ -17,6 +18,8 @@ from utils.run_serial_final_confirmation import _songs
 
 ROOT = Path(__file__).resolve().parents[1]
 WRAPPER = ROOT / "scripts/dcc/verify_500tps_final_confirmation.sbatch"
+FRESH_RUNNER = ROOT / "utils/run_final_confirmation.py"
+SERIAL_RUNNER = ROOT / "utils/run_serial_final_confirmation.py"
 
 
 class _Runtime:
@@ -86,6 +89,42 @@ def test_fixed_work_runtime_fails_on_extra_or_missing_windows() -> None:
             model_kwargs={"decoder_input_ids": prompt},
             generate_kwargs={"context_type": "timing"},
         )
+
+
+def test_distinct_timing_and_main_runtimes_share_one_manifest_state() -> None:
+    state = ConfirmationState()
+    timing = ConfirmationRuntime(
+        _Runtime(),
+        mode="replay-fixed-work",
+        manifest=_manifest(),
+        state=state,
+    )
+    main = ConfirmationRuntime(
+        _Runtime(),
+        mode="replay-fixed-work",
+        manifest=_manifest(),
+        state=state,
+    )
+    prompt = torch.ones((1, 5), dtype=torch.long)
+    tokenizer = SimpleNamespace(eos_id=99, context_eos={}, pad_id=0)
+
+    timing.generate_window(
+        tokenizer=tokenizer,
+        model_kwargs={"decoder_input_ids": prompt},
+        generate_kwargs={"context_type": "timing"},
+    )
+    main.generate_window(
+        tokenizer=tokenizer,
+        model_kwargs={"decoder_input_ids": prompt},
+        generate_kwargs={"context_type": "map"},
+    )
+    timing.validate_complete()
+
+    assert timing.records is main.records
+    assert [record["profile_label"] for record in state.records] == [
+        "timing_context",
+        "main_generation",
+    ]
 
 
 def test_fixed_work_executes_target_but_returns_natural_eos_prefix() -> None:
@@ -175,3 +214,16 @@ def test_dcc_wrapper_is_one_serial_authoritative_json_text_gate() -> None:
     assert '"$RUN_ROOT/analysis.txt"' in source
     assert ".html" not in source
     assert ".md" not in source
+
+
+def test_candidate_confirmation_uses_k4_and_supports_separate_timing_model() -> None:
+    fresh = FRESH_RUNNER.read_text(encoding="utf-8")
+    serial = SERIAL_RUNNER.read_text(encoding="utf-8")
+
+    assert "install_k8_candidate(block_size=4)" in fresh
+    assert "state = ConfirmationState()" in fresh
+    assert "state = ConfirmationState()" in serial
+    assert "separate_timing_model = inference.should_load_separate_timing_model" in serial
+    assert "timing_model=timing_binding" in serial
+    assert "supports one shared timing/main model only" not in fresh
+    assert "songs must share one timing/main model" not in serial
