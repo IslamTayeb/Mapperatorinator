@@ -358,6 +358,17 @@ run_profile() {
     exit 2
   fi
   printf '%s\n' "$profile" > "$RUN_ROOT/$role.profile-path.txt"
+  local validation_role=baseline
+  if [[ "$candidate" == 1 ]]; then
+    validation_role=candidate
+  fi
+  (
+    cd "$CANDIDATE_REPO"
+    "$PYTHON" utils/validate_weight_only_full_song_profile.py \
+      --profile "$profile" \
+      --role "$validation_role" \
+      > "$RUN_ROOT/$role.weight-only-validation.json"
+  )
   (
     cd "$CANDIDATE_REPO"
     "$PYTHON" - "$profile" "$role" <<'PY'
@@ -554,6 +565,10 @@ for artifact in \
   "$RUN_ROOT/candidate-initialization/candidate_first.json" \
   "$RUN_ROOT/candidate-initialization/candidate_second.json" \
   "$RUN_ROOT/candidate-initialization-summary.json" \
+  "$RUN_ROOT/baseline_first.weight-only-validation.json" \
+  "$RUN_ROOT/candidate_first.weight-only-validation.json" \
+  "$RUN_ROOT/candidate_second.weight-only-validation.json" \
+  "$RUN_ROOT/baseline_second.weight-only-validation.json" \
   "$RUN_ROOT/reciprocal-analysis.json" \
   "$RUN_ROOT/reciprocal-analysis.txt"; do
   if [[ ! -s "$artifact" ]]; then

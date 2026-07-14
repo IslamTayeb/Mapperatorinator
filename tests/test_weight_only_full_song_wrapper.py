@@ -25,7 +25,10 @@ def test_wrapper_uses_full_fp32_optimized_reciprocal_order_and_launchers() -> No
     assert "profile_detail_ranges=false" in source
     assert "profile_cuda_capture=false" in source
     assert "profile_pass_kind=untraced_control" in source
-    assert '"$PYTHON" inference.py --config-name "$PROFILE_CONFIG"' in source
+    assert (
+        '"$PYTHON" "$CANDIDATE_REPO/utils/run_fixed_seed_inference.py"' in source
+    )
+    assert '--target-repo "$BASELINE_REPO"' in source
     assert '"$PYTHON" utils/run_approximate_weight_only.py' in source
     assert source.count("run_profile baseline_first") == 1
     assert source.count("run_profile candidate_first") == 1
@@ -127,6 +130,23 @@ def test_wrapper_requires_initialization_evidence_and_relaxed_analyzer_outputs()
     assert '"$RUN_ROOT/reciprocal-analysis.json"' in source
     assert '"$RUN_ROOT/reciprocal-analysis.txt"' in source
     assert "parity.claim=relaxed-nonexact" in source
+
+
+def test_wrapper_fails_loudly_on_weight_only_profile_dispatch_contract() -> None:
+    source = WRAPPER.read_text(encoding="utf-8")
+
+    assert 'local validation_role=baseline' in source
+    assert 'validation_role=candidate' in source
+    assert 'utils/validate_weight_only_full_song_profile.py \\' in source
+    assert '--profile "$profile"' in source
+    assert '--role "$validation_role"' in source
+    for role in (
+        "baseline_first",
+        "candidate_first",
+        "candidate_second",
+        "baseline_second",
+    ):
+        assert f'"$RUN_ROOT/{role}.weight-only-validation.json"' in source
 
 
 def test_initialization_evidence_reconciles_walls_and_memory(monkeypatch) -> None:
