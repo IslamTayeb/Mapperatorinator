@@ -37,6 +37,8 @@ def run(config_name: str, overrides: list[str], output_init_json: Path) -> None:
         raise ValueError("weight-only candidate requires precision=fp32")
     if args.use_server:
         raise ValueError("weight-only candidate requires use_server=false")
+    if not args.profile_inference:
+        raise ValueError("weight-only validation requires profile_inference=true")
 
     original_loader = inference.load_model_with_engine
     initialized = False
@@ -56,6 +58,11 @@ def run(config_name: str, overrides: list[str], output_init_json: Path) -> None:
                     "loaded runtime does not expose weight-only initialization"
                 )
             init_metadata = initializer(binding.raw_model)
+            output_init_json.parent.mkdir(parents=True, exist_ok=True)
+            output_init_json.write_text(
+                json.dumps(init_metadata, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
             initialized = True
         return binding, tokenizer
 
@@ -66,11 +73,6 @@ def run(config_name: str, overrides: list[str], output_init_json: Path) -> None:
         inference.load_model_with_engine = original_loader
     if not initialized or init_metadata is None:
         raise RuntimeError("weight-only candidate model was never initialized")
-    output_init_json.parent.mkdir(parents=True, exist_ok=True)
-    output_init_json.write_text(
-        json.dumps(init_metadata, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
 
 
 def main() -> None:
