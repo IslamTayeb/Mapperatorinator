@@ -649,6 +649,7 @@ class _K8GraphLifecycle:
 
 _ACTIVE_K8_LIFECYCLE: _K8GraphLifecycle | None = None
 _ACTIVE_BLOCK_SIZE: int | None = None
+_ACTIVE_REUSE_DECODER_ATTENTION_MASK: bool | None = None
 
 
 @dataclass(slots=True)
@@ -668,6 +669,134 @@ class _K8RuntimeSlot:
     state: K8DeviceState
     processor: K8LogitsProcessor
     signature: tuple[Any, ...]
+    decoder_attention_mask: _K8DecoderMaskStorage | None
+
+
+@dataclass(slots=True)
+class _K8DecoderMaskStorage:
+    """Request-local 2-D decoder mask storage for K-block handoffs."""
+
+    buffer: torch.Tensor
+    active_length: int
+    allocation_count: int = 1
+    reset_calls: int = 0
+    sync_calls: int = 0
+    owned_reuse_calls: int = 0
+    external_copy_calls: int = 0
+    external_copy_bytes: int = 0
+    activated_elements: int = 0
+
+    @classmethod
+    def allocate(
+        cls,
+        original: torch.Tensor,
+        *,
+        max_length: int,
+    ) -> "_K8DecoderMaskStorage":
+        cls._validate_source(original, max_length=max_length)
+        buffer = torch.empty(
+            (1, max_length),
+            dtype=original.dtype,
+            device=original.device,
+        )
+        storage = cls(buffer=buffer, active_length=0)
+        storage.reset(original)
+        return storage
+
+    @staticmethod
+    def _validate_source(
+        original: torch.Tensor,
+        *,
+        max_length: int,
+        expected_dtype: torch.dtype | None = None,
+        expected_device: torch.device | None = None,
+    ) -> None:
+        if not isinstance(original, torch.Tensor):
+            raise TypeError("K4 decoder attention mask must be a tensor")
+        if original.layout != torch.strided or original.is_complex():
+            raise TypeError("K4 decoder attention mask must use real strided storage")
+        if original.ndim != 2 or original.shape[0] != 1:
+            raise ValueError("K4 decoder attention mask must have shape [1, sequence]")
+        if original.shape[1] < 1 or original.shape[1] > max_length:
+            raise ValueError("K4 decoder attention mask length exceeds its capacity")
+        if expected_dtype is not None and original.dtype != expected_dtype:
+            raise TypeError("K4 decoder attention mask dtype changed")
+        if expected_device is not None and original.device != expected_device:
+            raise ValueError("K4 decoder attention mask device changed")
+
+    def _owns(self, original: torch.Tensor) -> bool:
+        return (
+            original.untyped_storage().data_ptr()
+            == self.buffer.untyped_storage().data_ptr()
+            and original.storage_offset() == self.buffer.storage_offset()
+        )
+
+    def reset(self, original: torch.Tensor) -> None:
+        self._validate_source(
+            original,
+            max_length=self.buffer.shape[1],
+            expected_dtype=self.buffer.dtype,
+            expected_device=self.buffer.device,
+        )
+        if self._owns(original):
+            raise RuntimeError(
+                "K4 decoder attention mask reset requires external request storage"
+            )
+        self.buffer.fill_(1)
+        self.buffer[:, : original.shape[1]].copy_(original)
+        self.active_length = int(original.shape[1])
+        self.reset_calls += 1
+        self.sync_calls = 0
+        self.owned_reuse_calls = 0
+        self.external_copy_calls = 0
+        self.external_copy_bytes = 0
+        self.activated_elements = 0
+
+    def sync(self, original: torch.Tensor, *, cur_len: int) -> torch.Tensor:
+        self._validate_source(
+            original,
+            max_length=self.buffer.shape[1],
+            expected_dtype=self.buffer.dtype,
+            expected_device=self.buffer.device,
+        )
+        if isinstance(cur_len, bool) or not isinstance(cur_len, int):
+            raise TypeError("K4 decoder attention mask cur_len must be an integer")
+        original_length = int(original.shape[1])
+        if cur_len < original_length or cur_len > self.buffer.shape[1]:
+            raise ValueError("K4 decoder attention mask cur_len is out of range")
+        if self._owns(original):
+            if original_length != self.active_length:
+                raise RuntimeError(
+                    "K4 owned decoder attention mask length changed outside storage"
+                )
+            self.owned_reuse_calls += 1
+        else:
+            self.buffer[:, :original_length].copy_(original)
+            self.external_copy_calls += 1
+            self.external_copy_bytes += original.numel() * original.element_size()
+        if cur_len > original_length:
+            self.activated_elements += cur_len - original_length
+        self.active_length = cur_len
+        self.sync_calls += 1
+        return self.buffer[:, :cur_len]
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "enabled": True,
+            "allocation_count": self.allocation_count,
+            "buffer_capacity_elements": self.buffer.numel(),
+            "buffer_bytes": self.buffer.numel() * self.buffer.element_size(),
+            "buffer_dtype": str(self.buffer.dtype),
+            "buffer_device": str(self.buffer.device),
+            "active_length": self.active_length,
+            "reset_calls": self.reset_calls,
+            "sync_calls": self.sync_calls,
+            "owned_reuse_calls": self.owned_reuse_calls,
+            "external_copy_calls": self.external_copy_calls,
+            "external_copy_bytes": self.external_copy_bytes,
+            "tail_fill_calls": 0,
+            "activated_elements": self.activated_elements,
+        }
 
 
 def _freeze_processor_value(
@@ -754,12 +883,31 @@ def _runtime_slot(
     vocab_size: int,
     rng_seed: int,
     do_sample: bool,
+    decoder_attention_mask: torch.Tensor | None = None,
+    reuse_decoder_attention_mask: bool = False,
 ) -> _K8RuntimeSlot:
+    if not isinstance(reuse_decoder_attention_mask, bool):
+        raise TypeError("reuse_decoder_attention_mask must be a bool")
+    if reuse_decoder_attention_mask and decoder_attention_mask is None:
+        raise ValueError(
+            "K4 decoder mask reuse requires decoder_attention_mask"
+        )
+    if decoder_attention_mask is None:
+        mask_signature = None
+    elif isinstance(decoder_attention_mask, torch.Tensor):
+        mask_signature = (
+            str(decoder_attention_mask.dtype),
+            str(decoder_attention_mask.device),
+        )
+    else:
+        raise TypeError("decoder_attention_mask must be a tensor when present")
     signature = (
         max_length,
         tuple(int(value) for value in eos_token_ids.detach().cpu().tolist()),
         processor_signature,
         str(input_ids.device),
+        reuse_decoder_attention_mask,
+        mask_signature,
         bool(do_sample),
     )
     slots = holder.setdefault("__k8_runtime_slots__", {})
@@ -778,7 +926,15 @@ def _runtime_slot(
             vocab_size=vocab_size,
             prompt_length=input_ids.shape[1],
         )
-        slot = _K8RuntimeSlot(state, processor, signature)
+        mask_storage = (
+            _K8DecoderMaskStorage.allocate(
+                decoder_attention_mask,
+                max_length=max_length,
+            )
+            if reuse_decoder_attention_mask
+            else None
+        )
+        slot = _K8RuntimeSlot(state, processor, signature, mask_storage)
         slots[signature] = slot
     else:
         slot.state.reset(
@@ -788,6 +944,12 @@ def _runtime_slot(
             rng_seed=rng_seed,
         )
         slot.processor.reset(prompt_length=input_ids.shape[1])
+        if reuse_decoder_attention_mask:
+            if slot.decoder_attention_mask is None:
+                raise RuntimeError("K4 decoder mask storage disappeared")
+            slot.decoder_attention_mask.reset(decoder_attention_mask)
+        elif slot.decoder_attention_mask is not None:
+            raise RuntimeError("ordinary K4 slot unexpectedly owns mask storage")
     return slot
 
 
@@ -946,6 +1108,7 @@ def _sync_model_kwargs_after_k8(
     entry: _K8GraphEntry,
     *,
     cur_len: int,
+    mask_storage: _K8DecoderMaskStorage | None = None,
 ) -> None:
     model_kwargs["cache_position"] = entry.static_inputs["cache_position"]
     if "decoder_attention_mask" in model_kwargs:
@@ -957,11 +1120,19 @@ def _sync_model_kwargs_after_k8(
             or original.shape[1] > cur_len
         ):
             raise ValueError("K8 decoder attention mask must be [1, <=cur_len]")
-        extended = torch.ones(
-            (1, cur_len), dtype=original.dtype, device=original.device
-        )
-        extended[:, : original.shape[1]].copy_(original)
-        model_kwargs["decoder_attention_mask"] = extended
+        if mask_storage is None:
+            extended = torch.ones(
+                (1, cur_len), dtype=original.dtype, device=original.device
+            )
+            extended[:, : original.shape[1]].copy_(original)
+            model_kwargs["decoder_attention_mask"] = extended
+        else:
+            model_kwargs["decoder_attention_mask"] = mask_storage.sync(
+                original,
+                cur_len=cur_len,
+            )
+    elif mask_storage is not None:
+        raise RuntimeError("K4 decoder mask storage has no model kwargs owner")
 
 
 def k8_active_prefix_decode_generate(
@@ -999,7 +1170,12 @@ def k8_active_prefix_decode_generate(
         raise ValueError("K8 supports tensor outputs only")
     lifecycle = _ACTIVE_K8_LIFECYCLE
     block_size = _ACTIVE_BLOCK_SIZE
-    if lifecycle is None or block_size is None:
+    reuse_decoder_attention_mask = _ACTIVE_REUSE_DECODER_ATTENTION_MASK
+    if (
+        lifecycle is None
+        or block_size is None
+        or reuse_decoder_attention_mask is None
+    ):
         raise RuntimeError("K8 decode must run inside install_k8_candidate()")
     pad_token_id = int(generation_config._pad_token_tensor.reshape(-1)[0].item())
     _, cur_len = input_ids.shape
@@ -1057,6 +1233,8 @@ def k8_active_prefix_decode_generate(
         vocab_size=int(model.config.vocab_size),
         rng_seed=rng_seed,
         do_sample=do_sample,
+        decoder_attention_mask=model_kwargs.get("decoder_attention_mask"),
+        reuse_decoder_attention_mask=reuse_decoder_attention_mask,
     )
     state = slot.state
     processor = slot.processor
@@ -1092,6 +1270,7 @@ def k8_active_prefix_decode_generate(
         "processor_signature_setup_seconds": processor_signature_seconds,
         "parent_backend": "cuda_python_child_graphs",
         "capture_state_restore_synchronized": True,
+        "decoder_attention_mask_reuse_requested": reuse_decoder_attention_mask,
     }
     stable_encoder_holder["__k8_latest_stats__"] = stats
 
@@ -1229,7 +1408,12 @@ def k8_active_prefix_decode_generate(
         unfinished = bool(status[2])
         stats["wasted_steps"] += max(0, physical_length - logical_length)
         cur_len = physical_length if unfinished else logical_length
-        _sync_model_kwargs_after_k8(model_kwargs, entry, cur_len=cur_len)
+        _sync_model_kwargs_after_k8(
+            model_kwargs,
+            entry,
+            cur_len=cur_len,
+            mask_storage=slot.decoder_attention_mask,
+        )
         finished = not unfinished
 
     stats["logical_steps"] = cur_len - prompt_length
@@ -1243,23 +1427,40 @@ def k8_active_prefix_decode_generate(
     )
     if stats["physical_steps"] != accounted_steps:
         raise RuntimeError("K8 prefill/eligible/remainder work accounting diverged")
+    stats["decoder_attention_mask_reuse"] = (
+        slot.decoder_attention_mask.summary()
+        if slot.decoder_attention_mask is not None
+        else {"enabled": False}
+    )
     return state.sequence[:, :cur_len]
 
 
 @contextmanager
-def install_k8_candidate(*, block_size: int = K8_BLOCK_SIZE) -> Iterator[None]:
+def install_k8_candidate(
+    *,
+    block_size: int = K8_BLOCK_SIZE,
+    reuse_decoder_attention_mask: bool = False,
+) -> Iterator[None]:
     """Temporarily install a bounded block candidate for an explicit runner."""
 
     global _ACTIVE_BLOCK_SIZE, _ACTIVE_K8_LIFECYCLE
+    global _ACTIVE_REUSE_DECODER_ATTENTION_MASK
     from . import engine
 
     block_size = _validate_block_size(block_size)
-    if _ACTIVE_K8_LIFECYCLE is not None or _ACTIVE_BLOCK_SIZE is not None:
+    if not isinstance(reuse_decoder_attention_mask, bool):
+        raise TypeError("reuse_decoder_attention_mask must be a bool")
+    if (
+        _ACTIVE_K8_LIFECYCLE is not None
+        or _ACTIVE_BLOCK_SIZE is not None
+        or _ACTIVE_REUSE_DECODER_ATTENTION_MASK is not None
+    ):
         raise RuntimeError("K8 candidate context cannot be nested")
     lifecycle = _K8GraphLifecycle()
     previous = engine.active_prefix_decode_generate
     _ACTIVE_K8_LIFECYCLE = lifecycle
     _ACTIVE_BLOCK_SIZE = block_size
+    _ACTIVE_REUSE_DECODER_ATTENTION_MASK = reuse_decoder_attention_mask
     engine.active_prefix_decode_generate = k8_active_prefix_decode_generate
     try:
         yield
@@ -1270,6 +1471,7 @@ def install_k8_candidate(*, block_size: int = K8_BLOCK_SIZE) -> Iterator[None]:
         finally:
             _ACTIVE_K8_LIFECYCLE = None
             _ACTIVE_BLOCK_SIZE = None
+            _ACTIVE_REUSE_DECODER_ATTENTION_MASK = None
 
 
 __all__ = [

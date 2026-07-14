@@ -196,4 +196,37 @@ class ProductionDecodeSession:
                     latest.get("capture_state_restore_synchronized", False)
                 ),
             }
+            mask_reuse = latest.get("decoder_attention_mask_reuse")
+            if isinstance(mask_reuse, dict):
+                result["k8_candidate"]["decoder_attention_mask_reuse_requested"] = bool(
+                    latest.get("decoder_attention_mask_reuse_requested", False)
+                )
+                result["k8_candidate"]["decoder_attention_mask_reuse"] = {
+                    "enabled": bool(mask_reuse.get("enabled", False)),
+                    "allocation_count": int(mask_reuse.get("allocation_count", 0)),
+                    "buffer_capacity_elements": int(
+                        mask_reuse.get("buffer_capacity_elements", 0)
+                    ),
+                    "buffer_bytes": int(mask_reuse.get("buffer_bytes", 0)),
+                    "buffer_dtype": mask_reuse.get("buffer_dtype"),
+                    "buffer_device": mask_reuse.get("buffer_device"),
+                    "active_length": int(mask_reuse.get("active_length", 0)),
+                    "reset_calls": int(mask_reuse.get("reset_calls", 0)),
+                    "sync_calls": int(mask_reuse.get("sync_calls", 0)),
+                    "owned_reuse_calls": int(
+                        mask_reuse.get("owned_reuse_calls", 0)
+                    ),
+                    "external_copy_calls": int(
+                        mask_reuse.get("external_copy_calls", 0)
+                    ),
+                    "external_copy_bytes": int(
+                        mask_reuse.get("external_copy_bytes", 0)
+                    ),
+                    "tail_fill_calls": int(
+                        mask_reuse.get("tail_fill_calls", 0)
+                    ),
+                    "activated_elements": int(
+                        mask_reuse.get("activated_elements", 0)
+                    ),
+                }
         return result
