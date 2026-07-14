@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=q1-cross-component
+#SBATCH --job-name=hybrid-qk-cross-component
 #SBATCH --partition=gpu-common
 #SBATCH --account=romerolab
 #SBATCH --cpus-per-task=8
@@ -19,7 +19,7 @@ COMMIT=${MAPPERATORINATOR_COMMIT:?Set MAPPERATORINATOR_COMMIT to the pushed scou
 BRANCH=${MAPPERATORINATOR_BRANCH:?Set MAPPERATORINATOR_BRANCH to the scout branch}
 REMOTE=${MAPPERATORINATOR_REMOTE:-origin}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
-RUN_ROOT="$WORK/runs/q1-cross-component-${SLURM_JOB_ID:-manual}"
+RUN_ROOT="$WORK/runs/hybrid-qk-cross-component-${SLURM_JOB_ID:-manual}"
 
 export PATH="$(dirname "$PYTHON"):$PATH"
 for tool in "$PYTHON" ffmpeg ffprobe git nvidia-smi; do
@@ -72,14 +72,14 @@ export TOKENIZERS_PARALLELISM=false
 
 GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1)
 if [[ "$GPU_NAME" != "NVIDIA GeForce RTX 2080 Ti" ]]; then
-  echo "q1 cross component requires RTX 2080 Ti, got $GPU_NAME" >&2
+  echo "hybrid qk cross component requires RTX 2080 Ti, got $GPU_NAME" >&2
   exit 2
 fi
 COMPUTE_CAPABILITY=$(
   "$PYTHON" -c 'import torch; print(".".join(map(str, torch.cuda.get_device_capability())))'
 )
 if [[ "$COMPUTE_CAPABILITY" != "7.5" ]]; then
-  echo "q1 cross component requires SM75, got compute capability $COMPUTE_CAPABILITY" >&2
+  echo "hybrid qk cross component requires SM75, got compute capability $COMPUTE_CAPABILITY" >&2
   exit 2
 fi
 
@@ -109,7 +109,6 @@ set +e
   --report-path "$RUN_ROOT/component.json" \
   --text-path "$RUN_ROOT/component.txt" \
   --output-path "$RUN_ROOT/baseline-capture" \
-  --capture-prefix 640 \
   --warmup 100 \
   --iters 1000 \
   audio_path="$AUDIO" \

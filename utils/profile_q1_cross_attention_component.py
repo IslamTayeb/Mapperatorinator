@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import subprocess
 import sys
 import time
 from typing import Any, Callable
@@ -27,7 +28,6 @@ from utils.profile_native_prefix_dtype_scout import (  # noqa: E402
     _max_abs,
     _reciprocal_graph_rounds,
     _restore_all_cache,
-    validate_accepted_graph_cache,
 )
 
 
@@ -35,21 +35,18 @@ LAYERS = 12
 HEADS = 12
 KV_LENGTH = 1024
 HEAD_DIM = 64
-DEFAULT_CAPTURE_PREFIX = 640
-MAX_FP32_DRIFT = 1e-3
-MAIN_SAVING_TARGET_SECONDS = 1.503
+SENTINEL_PREFIXES = (128, 576, 640)
 FIXED_WORK_MAIN_TOKENS = 8_294
-FIXED_WORK_MAIN_SECONDS = 30.069
-FIXED_WORK_500_TPS_SECONDS = FIXED_WORK_MAIN_TOKENS / 500.0
-FIXED_WORK_500_TPS_GAP_SECONDS = (
-    FIXED_WORK_MAIN_SECONDS - FIXED_WORK_500_TPS_SECONDS
-)
+SELECTED_MAIN_SECONDS = 17.597493572930155
+TARGET_500_SECONDS = FIXED_WORK_MAIN_TOKENS / 500.0
+TARGET_500_GAP_SECONDS = SELECTED_MAIN_SECONDS - TARGET_500_SECONDS
+COMPONENT_SAVING_GATE_SECONDS = 0.3
+RELAXED_MAX_ABS_DRIFT = 1e-2
 
 
 @dataclass(frozen=True)
 class CrossInputs:
     layer_idx: int
-    query: torch.Tensor
     keys: torch.Tensor
     values: torch.Tensor
     residual: torch.Tensor
@@ -61,9 +58,31 @@ class CrossInputs:
     output_bias: torch.Tensor | None
 
 
+class _LinearView:
+    def __init__(self, weight: torch.Tensor, bias: torch.Tensor | None):
+        self.weight = weight
+        self.bias = bias
+
+
 def _tensor_sha256(tensor: torch.Tensor) -> str:
-    payload = tensor.detach().contiguous().cpu().numpy().tobytes()
-    return hashlib.sha256(payload).hexdigest()
+    return hashlib.sha256(
+        tensor.detach().contiguous().cpu().numpy().tobytes()
+    ).hexdigest()
+
+
+def _input_hashes(captures: list[CrossInputs]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for capture in captures:
+        for name, tensor in (
+            ("keys", capture.keys),
+            ("values", capture.values),
+            ("residual", capture.residual),
+            ("norm", capture.cross_norm_weight),
+            ("wq", capture.query_weight),
+            ("wo", capture.output_weight),
+        ):
+            result[f"{capture.layer_idx}.{name}"] = _tensor_sha256(tensor)
+    return result
 
 
 def _run_and_capture_sessions(args, *, output_path: Path) -> dict[str, Any]:
@@ -92,18 +111,16 @@ def _run_and_capture_sessions(args, *, output_path: Path) -> dict[str, Any]:
         inference_engine=args.inference_engine,
     )
     generation_config, beatmap_config = get_config(args)
-    captures: dict[str, Any] = {}
+    sessions: dict[str, Any] = {}
     original_generate = Processor.generate
 
     def wrapped_generate(processor, *positional, **kwargs):
         result = original_generate(processor, *positional, **kwargs)
         label = kwargs.get("profile_label")
         if label in {"timing_generation", "main_generation"}:
-            if label in captures:
-                raise RuntimeError(f"captured more than one {label} Processor")
-            if processor.decode_session_state is None:
-                raise RuntimeError(f"{label} did not expose a decode session")
-            captures[label] = {
+            if label in sessions or processor.decode_session_state is None:
+                raise RuntimeError(f"invalid decode-session capture for {label}")
+            sessions[label] = {
                 "processor": processor,
                 "session": processor.decode_session_state,
             }
@@ -124,17 +141,46 @@ def _run_and_capture_sessions(args, *, output_path: Path) -> dict[str, Any]:
         )
     finally:
         Processor.generate = original_generate
-    missing = {"timing_generation", "main_generation"} - set(captures)
+    missing = {"timing_generation", "main_generation"} - set(sessions)
     if missing:
-        raise RuntimeError(f"full SALVALAI run missed decode sessions: {sorted(missing)}")
-    main = captures["main_generation"]
+        raise RuntimeError(f"full run missed decode sessions: {sorted(missing)}")
     return {
-        "model": main["processor"].model,
-        "timing_session": captures["timing_generation"]["session"],
-        "main_session": main["session"],
+        "model": sessions["main_generation"]["processor"].model,
+        "timing_session": sessions["timing_generation"]["session"],
+        "main_session": sessions["main_generation"]["session"],
         "generated": generated,
         "result_path": str(result_path),
     }
+
+
+def _graph_entries(
+    session: Any,
+    *,
+    required_prefixes: tuple[int, ...],
+) -> dict[int, dict[str, Any]]:
+    cache = getattr(session, "graph_cache", None)
+    if not isinstance(cache, dict):
+        raise TypeError("decode session graph_cache must be a dict")
+    entries: dict[int, dict[str, Any]] = {}
+    for entry in cache.values():
+        if not isinstance(entry, dict):
+            raise TypeError("decode graph entry must be a dict")
+        prefix = entry.get("active_prefix_length")
+        count = entry.get("decode_replays")
+        if not isinstance(prefix, int) or prefix <= 0:
+            raise ValueError(f"decode graph has invalid prefix {prefix!r}")
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise ValueError(f"decode graph prefix {prefix} has invalid replay count")
+        if prefix in entries:
+            raise RuntimeError(f"decode graph repeats prefix {prefix}")
+        for field in ("graph", "outputs", "static_inputs"):
+            if field not in entry:
+                raise RuntimeError(f"decode graph prefix {prefix} is missing {field}")
+        entries[prefix] = entry
+    missing = sorted(set(required_prefixes) - set(entries))
+    if missing:
+        raise RuntimeError(f"decode graph is missing sentinel prefixes {missing}")
+    return dict(sorted(entries.items()))
 
 
 def _capture_real_cross_inputs(
@@ -143,99 +189,76 @@ def _capture_real_cross_inputs(
     *,
     prefix: int,
 ) -> list[CrossInputs]:
-    from osuT5.osuT5.runtime_profiling import generation_profile_context
     from osuT5.osuT5.model.custom_transformers.modeling_varwhisper import (
         VarWhisperAttention,
         VarWhisperDecoderLayer,
     )
+    from osuT5.osuT5.runtime_profiling import generation_profile_context
 
     cache = _cache_from_static_inputs(static_inputs)
     cache_position = static_inputs.get("cache_position")
     if not isinstance(cache_position, torch.Tensor) or cache_position.numel() != 1:
         raise RuntimeError("representative graph has invalid cache_position")
     snapshots = _all_cache_snapshots(cache, cache_position)
-    found: dict[int, CrossInputs] = {}
-    residuals: dict[int, torch.Tensor] = {}
-    handles = []
-
-    decoder_layers = [
+    layers = [
         module for module in model.modules() if isinstance(module, VarWhisperDecoderLayer)
     ]
-    if len(decoder_layers) != LAYERS:
-        raise RuntimeError(f"expected {LAYERS} decoder layers, got {len(decoder_layers)}")
+    if len(layers) != LAYERS:
+        raise RuntimeError(f"expected {LAYERS} decoder layers, got {len(layers)}")
     norm_owner = {
         id(layer.cross_attn_layer_norm): int(layer.cross_attn.layer_idx)
-        for layer in decoder_layers
+        for layer in layers
     }
+    residuals: dict[int, torch.Tensor] = {}
+    found: dict[int, CrossInputs] = {}
+    handles = []
 
     def norm_hook(module, positional):
         layer_idx = norm_owner[id(module)]
-        if layer_idx in residuals:
-            raise RuntimeError(f"cross norm layer {layer_idx} executed twice")
-        if len(positional) != 1 or not isinstance(positional[0], torch.Tensor):
-            raise RuntimeError(f"cross norm layer {layer_idx} missed its residual input")
+        if layer_idx in residuals or len(positional) != 1:
+            raise RuntimeError(f"invalid cross norm capture for layer {layer_idx}")
         residuals[layer_idx] = positional[0].detach().clone()
 
-    def hook(module, positional, kwargs):
-        hidden_states = kwargs.get(
-            "hidden_states",
-            positional[0] if positional else None,
-        )
+    def attention_hook(module, positional, kwargs):
+        hidden_states = kwargs.get("hidden_states", positional[0] if positional else None)
         past_key_value = kwargs.get("past_key_value")
-        if not isinstance(hidden_states, torch.Tensor) or past_key_value is None:
-            raise RuntimeError("cross-attention hook missed hidden/cache inputs")
         layer_idx = int(module.layer_idx)
-        if layer_idx in found:
-            raise RuntimeError(f"cross-attention layer {layer_idx} executed twice")
+        if not isinstance(hidden_states, torch.Tensor) or past_key_value is None:
+            raise RuntimeError(f"cross layer {layer_idx} missed hidden/cache inputs")
+        if layer_idx in found or layer_idx not in residuals:
+            raise RuntimeError(f"invalid cross attention capture for layer {layer_idx}")
         cross_cache = getattr(past_key_value, "cross_attention_cache", None)
         if cross_cache is None or layer_idx >= len(cross_cache.layers):
-            raise RuntimeError(f"cross-attention layer {layer_idx} missed its cache")
+            raise RuntimeError(f"cross layer {layer_idx} missed its cache")
         cache_layer = cross_cache.layers[layer_idx]
         if not getattr(cache_layer, "is_initialized", False):
-            raise RuntimeError(f"cross-attention cache layer {layer_idx} is uninitialized")
-        query = (
-            module.Wq(hidden_states)
-            .view(1, 1, module.num_heads, module.head_dim)
-            .transpose(1, 2)
-            .contiguous()
-            .detach()
-            .clone()
-        )
-        if layer_idx not in residuals:
-            raise RuntimeError(f"cross-attention layer {layer_idx} missed residual capture")
-        decoder_layer = decoder_layers[layer_idx]
+            raise RuntimeError(f"cross cache layer {layer_idx} is uninitialized")
+        layer = layers[layer_idx]
         found[layer_idx] = CrossInputs(
             layer_idx=layer_idx,
-            query=query,
             keys=cache_layer.keys.detach(),
             values=cache_layer.values.detach(),
             residual=residuals[layer_idx],
-            cross_norm_weight=decoder_layer.cross_attn_layer_norm.weight.detach(),
+            cross_norm_weight=layer.cross_attn_layer_norm.weight.detach(),
             cross_norm_eps=float(
-                getattr(
-                    decoder_layer.cross_attn_layer_norm,
-                    "eps",
-                    torch.finfo(torch.float32).eps,
-                )
+                getattr(layer.cross_attn_layer_norm, "eps", torch.finfo(torch.float32).eps)
                 or torch.finfo(torch.float32).eps
             ),
             query_weight=module.Wq.weight.detach(),
-            query_bias=(None if module.Wq.bias is None else module.Wq.bias.detach()),
+            query_bias=None if module.Wq.bias is None else module.Wq.bias.detach(),
             output_weight=module.Wo.weight.detach(),
-            output_bias=(None if module.Wo.bias is None else module.Wo.bias.detach()),
+            output_bias=None if module.Wo.bias is None else module.Wo.bias.detach(),
         )
 
-    for layer in decoder_layers:
+    for layer in layers:
         handles.append(layer.cross_attn_layer_norm.register_forward_pre_hook(norm_hook))
     for module in model.modules():
         if isinstance(module, VarWhisperAttention) and module.is_cross_attention:
-            handles.append(module.register_forward_pre_hook(hook, with_kwargs=True))
+            handles.append(module.register_forward_pre_hook(attention_hook, with_kwargs=True))
     if len(handles) != 2 * LAYERS:
         for handle in handles:
             handle.remove()
-        raise RuntimeError(
-            f"expected {LAYERS} cross norm and attention hook pairs, got {len(handles)} hooks"
-        )
+        raise RuntimeError(f"expected {2 * LAYERS} cross hooks, got {len(handles)}")
     try:
         _restore_all_cache(cache, snapshots)
         with generation_profile_context(
@@ -253,144 +276,34 @@ def _capture_real_cross_inputs(
             handle.remove()
         _restore_all_cache(cache, snapshots)
     if set(found) != set(range(LAYERS)):
-        raise RuntimeError(
-            f"expected cross inputs for layers 0..{LAYERS - 1}, got {sorted(found)}"
-        )
-    captures = [found[layer_idx] for layer_idx in range(LAYERS)]
-    expected_query = (1, HEADS, 1, HEAD_DIM)
-    expected_kv = (1, HEADS, KV_LENGTH, HEAD_DIM)
+        raise RuntimeError(f"cross capture got layers {sorted(found)}")
+    captures = [found[index] for index in range(LAYERS)]
     for capture in captures:
-        if capture.query.dtype != torch.float32 or tuple(capture.query.shape) != expected_query:
-            raise RuntimeError(
-                f"layer {capture.layer_idx} query is not FP32 {expected_query}: "
-                f"{capture.query.dtype} {tuple(capture.query.shape)}"
-            )
-        for name, tensor in (("keys", capture.keys), ("values", capture.values)):
-            if tensor.dtype != torch.float32 or tuple(tensor.shape) != expected_kv:
-                raise RuntimeError(
-                    f"layer {capture.layer_idx} {name} is not FP32 {expected_kv}: "
-                    f"{tensor.dtype} {tuple(tensor.shape)}"
-                )
-            if not tensor.is_contiguous():
-                raise RuntimeError(f"layer {capture.layer_idx} {name} is not contiguous")
+        if tuple(capture.keys.shape) != (1, HEADS, KV_LENGTH, HEAD_DIM):
+            raise RuntimeError(f"layer {capture.layer_idx} has invalid key shape")
+        if capture.keys.dtype != torch.float32 or capture.values.dtype != torch.float32:
+            raise TypeError("source cross key/value caches must remain FP32")
+        if not capture.keys.is_contiguous() or not capture.values.is_contiguous():
+            raise ValueError("source cross key/value caches must be contiguous")
         if tuple(capture.residual.shape) != (1, 1, HEADS * HEAD_DIM):
-            raise RuntimeError(
-                f"layer {capture.layer_idx} residual has invalid shape "
-                f"{tuple(capture.residual.shape)}"
-            )
+            raise RuntimeError(f"layer {capture.layer_idx} has invalid residual shape")
     return captures
 
 
-def _accepted_callable(captures: list[CrossInputs]) -> Callable[[], tuple[torch.Tensor, ...]]:
-    def run() -> tuple[torch.Tensor, ...]:
-        from osuT5.osuT5.inference.optimized.kernels.dispatch import (
-            _q1_bmm_cross_attention,
+def _pack_linears(captures: list[CrossInputs]):
+    from osuT5.osuT5.inference.optimized.kernels.weight_only import PackedLinear
+
+    return [
+        (
+            PackedLinear.from_module(_LinearView(capture.query_weight, capture.query_bias)),
+            PackedLinear.from_module(_LinearView(capture.output_weight, capture.output_bias)),
         )
-
-        return tuple(
-            _q1_bmm_cross_attention(
-                capture.query,
-                capture.keys,
-                capture.values,
-                expected_dtype=torch.float32,
-            )
-            for capture in captures
-        )
-
-    return run
+        for capture in captures
+    ]
 
 
-def _candidate_callable(
-    captures: list[CrossInputs],
-    *,
-    splits: int | None,
-    fp16_kv: bool,
-) -> tuple[Callable[[], tuple[torch.Tensor, ...]], list[CrossInputs]]:
-    from osuT5.osuT5.inference.optimized.scout.cross_attention import (
-        cross_attention_one_pass,
-        cross_attention_split,
-    )
-
-    selected = captures
-    if fp16_kv:
-        selected = [
-            CrossInputs(
-                layer_idx=capture.layer_idx,
-                query=capture.query,
-                keys=capture.keys.half(),
-                values=capture.values.half(),
-                residual=capture.residual,
-                cross_norm_weight=capture.cross_norm_weight,
-                cross_norm_eps=capture.cross_norm_eps,
-                query_weight=capture.query_weight,
-                query_bias=capture.query_bias,
-                output_weight=capture.output_weight,
-                output_bias=capture.output_bias,
-            )
-            for capture in captures
-        ]
-
-    def run() -> tuple[torch.Tensor, ...]:
-        if splits is None:
-            return tuple(
-                cross_attention_one_pass(capture.query, capture.keys, capture.values)
-                for capture in selected
-            )
-        return tuple(
-            cross_attention_split(
-                capture.query,
-                capture.keys,
-                capture.values,
-                splits,
-            )
-            for capture in selected
-        )
-
-    return run, selected
-
-
-def _observe(
-    captured: CapturedGraph,
-    *,
-    expected_shape: tuple[int, ...] = (1, HEADS, 1, HEAD_DIM),
-) -> tuple[torch.Tensor, ...]:
-    captured.graph.replay()
-    torch.cuda.synchronize()
-    if not isinstance(captured.outputs, tuple) or len(captured.outputs) != LAYERS:
-        raise RuntimeError("cross-attention graph must return one tensor per decoder layer")
-    if any(tuple(output.shape) != expected_shape for output in captured.outputs):
-        raise RuntimeError(
-            f"cross component graph returned a shape other than {expected_shape}"
-        )
-    return tuple(output.detach().float().cpu().clone() for output in captured.outputs)
-
-
-def _input_hashes(captures: list[CrossInputs]) -> dict[str, str]:
-    result: dict[str, str] = {}
-    for capture in captures:
-        for name, tensor in (
-            ("query", capture.query),
-            ("keys", capture.keys),
-            ("values", capture.values),
-            ("residual", capture.residual),
-            ("cross_norm_weight", capture.cross_norm_weight),
-            ("query_weight", capture.query_weight),
-            ("output_weight", capture.output_weight),
-        ):
-            result[f"layer{capture.layer_idx}.{name}"] = _tensor_sha256(tensor)
-        for name, tensor in (
-            ("query_bias", capture.query_bias),
-            ("output_bias", capture.output_bias),
-        ):
-            if tensor is not None:
-                result[f"layer{capture.layer_idx}.{name}"] = _tensor_sha256(tensor)
-    return result
-
-
-def _fp32_cross_block_callable(
-    captures: list[CrossInputs],
-) -> Callable[[], tuple[torch.Tensor, ...]]:
-    def run() -> tuple[torch.Tensor, ...]:
+def _fp32_block(captures: list[CrossInputs]):
+    def run():
         from osuT5.osuT5.inference.optimized.kernels.decoder_layer import (
             native_one_token_linear_residual,
             native_one_token_rmsnorm_linear,
@@ -408,12 +321,9 @@ def _fp32_cross_block_callable(
                 capture.query_bias,
                 eps=capture.cross_norm_eps,
                 outputs_per_block=8,
-            ).view(1, 1, HEADS, HEAD_DIM).transpose(1, 2)
+            ).view(1, 1, HEADS, HEAD_DIM).transpose(1, 2).contiguous()
             attention = _q1_bmm_cross_attention(
-                query,
-                capture.keys,
-                capture.values,
-                expected_dtype=torch.float32,
+                query, capture.keys, capture.values, expected_dtype=torch.float32
             )
             outputs.append(
                 native_one_token_linear_residual(
@@ -429,47 +339,27 @@ def _fp32_cross_block_callable(
     return run
 
 
-def _packed_cross_block_callable(
-    captures: list[CrossInputs],
-) -> tuple[Callable[[], tuple[torch.Tensor, ...]], dict[str, Any]]:
-    from osuT5.osuT5.inference.optimized.kernels.weight_only import (
-        PackedLinear,
-        weight_only_linear_residual,
-        weight_only_rmsnorm_linear,
-    )
-
-    class LinearView:
-        def __init__(self, weight, bias):
-            self.weight = weight
-            self.bias = bias
-
-    packed = [
-        (
-            PackedLinear.from_module(LinearView(capture.query_weight, capture.query_bias)),
-            PackedLinear.from_module(LinearView(capture.output_weight, capture.output_bias)),
-        )
-        for capture in captures
-    ]
-
-    def run() -> tuple[torch.Tensor, ...]:
+def _selected_block(captures: list[CrossInputs], packs):
+    def run():
         from osuT5.osuT5.inference.optimized.kernels.dispatch import (
             _q1_bmm_cross_attention,
         )
+        from osuT5.osuT5.inference.optimized.kernels.weight_only import (
+            weight_only_linear_residual,
+            weight_only_rmsnorm_linear,
+        )
 
         outputs = []
-        for capture, (query_pack, output_pack) in zip(captures, packed, strict=True):
+        for capture, (query_pack, output_pack) in zip(captures, packs, strict=True):
             query = weight_only_rmsnorm_linear(
                 capture.residual,
                 capture.cross_norm_weight,
                 query_pack,
                 eps=capture.cross_norm_eps,
                 outputs_per_block=8,
-            ).view(1, 1, HEADS, HEAD_DIM).transpose(1, 2)
+            ).view(1, 1, HEADS, HEAD_DIM).transpose(1, 2).contiguous()
             attention = _q1_bmm_cross_attention(
-                query,
-                capture.keys,
-                capture.values,
-                expected_dtype=torch.float32,
+                query, capture.keys, capture.values, expected_dtype=torch.float32
             )
             outputs.append(
                 weight_only_linear_residual(
@@ -481,526 +371,335 @@ def _packed_cross_block_callable(
             )
         return tuple(outputs)
 
-    source_bytes = sum(
-        query_pack.source_weight_bytes + output_pack.source_weight_bytes
-        for query_pack, output_pack in packed
-    )
-    packed_bytes = sum(
-        query_pack.packed_weight_bytes + output_pack.packed_weight_bytes
-        for query_pack, output_pack in packed
-    )
-    return run, {
-        "fp32_source_weight_bytes": source_bytes,
-        "fp16_packed_weight_bytes": packed_bytes,
-        "resident_increment_bytes": packed_bytes,
-        "hypothetical_saving_if_sources_replaced_bytes": source_bytes - packed_bytes,
-        "layers": LAYERS,
-        "packed_regions": ["cross_query", "cross_output"],
-        "fp32_activations_bias_residual_attention_output": True,
-    }
+    return run
 
 
-def _launch_metadata(name: str) -> dict[str, Any]:
-    if name == "accepted_q1_bmm":
-        return {
-            "kernel_launches_per_layer": 4,
-            "cta_count": None,
-            "cta_note": "cuBLAS/softmax launch geometry is implementation-owned",
-            "workspace_bytes_per_layer": 0,
-        }
-    if name == "one_pass_fp32":
-        return {
-            "kernel_launches_per_layer": 1,
-            "partial_grid": [12, 1, 1],
-            "partial_block": [128, 1, 1],
-            "merge_grid": None,
-            "workspace_bytes_per_layer": 0,
-            "underfill_control": True,
-        }
-    splits = int(name.split("split", 1)[1].split("_", 1)[0])
-    workspace = (HEADS * splits * HEAD_DIM + 2 * HEADS * splits) * 4
-    return {
-        "kernel_launches_per_layer": 2,
-        "partial_grid": [HEADS * splits, 1, 1],
-        "partial_block": [128, 1, 1],
-        "merge_grid": [HEADS, 1, 1],
-        "merge_block": [64, 1, 1],
-        "workspace_bytes_per_layer": workspace,
-        "underfill_control": False,
-    }
-
-
-def summarize_component(
-    variants: dict[str, dict[str, Any]],
-    *,
-    timing_decode_replays: int,
-    main_decode_replays: int,
-) -> dict[str, Any]:
-    if "accepted_q1_bmm" not in variants:
-        raise ValueError("component report requires accepted_q1_bmm")
-    if timing_decode_replays <= 0 or main_decode_replays <= 0:
-        raise ValueError("timing/main decode replay counts must be positive")
-    accepted_ms = float(variants["accepted_q1_bmm"]["ms_per_decode_step"])
-    if not math.isfinite(accepted_ms) or accepted_ms <= 0:
-        raise ValueError("accepted timing must be finite and positive")
-    accepted_main_seconds = main_decode_replays * accepted_ms / 1000.0
-    accepted_timing_seconds = timing_decode_replays * accepted_ms / 1000.0
-    candidates: dict[str, Any] = {}
-    for name, entry in variants.items():
-        if name == "accepted_q1_bmm":
-            continue
-        candidate_ms = float(entry["ms_per_decode_step"])
-        if not math.isfinite(candidate_ms) or candidate_ms <= 0:
-            raise ValueError(f"{name} timing must be finite and positive")
-        delta_ms = accepted_ms - candidate_ms
-        main_saving = main_decode_replays * delta_ms / 1000.0
-        timing_saving = timing_decode_replays * delta_ms / 1000.0
-        fp32_candidate = entry["kv_storage_dtype"] == "torch.float32"
-        promotion_eligible = fp32_candidate and name.startswith("split")
-        correctness_pass = bool(entry["checks_pass"]) and (
-            not fp32_candidate or float(entry["max_abs_drift"]) <= MAX_FP32_DRIFT
+def _hybrid_block(captures: list[CrossInputs], packs, packed_keys):
+    def run():
+        from osuT5.osuT5.inference.optimized.kernels.decoder_layer import (
+            native_one_token_linear_residual,
         )
-        projected_seconds = FIXED_WORK_MAIN_SECONDS - main_saving
-        candidates[name] = {
-            "local_speedup": accepted_ms / candidate_ms,
-            "main_saving_seconds": main_saving,
-            "timing_saving_seconds": timing_saving,
-            "timing_plus_main_saving_seconds": main_saving + timing_saving,
-            "main_saving_target_seconds": MAIN_SAVING_TARGET_SECONDS,
-            "sizing_pass": main_saving >= MAIN_SAVING_TARGET_SECONDS,
-            "correctness_pass": correctness_pass,
-            "promotion_eligible": promotion_eligible,
-            "promotion_pass": (
-                promotion_eligible
-                and correctness_pass
-                and main_saving >= MAIN_SAVING_TARGET_SECONDS
-            ),
-            "projected_fixed_work_main_seconds": projected_seconds,
-            "projected_fixed_work_main_tps": (
-                FIXED_WORK_MAIN_TOKENS / projected_seconds
-                if projected_seconds > 0
-                else math.inf
-            ),
-            "fraction_of_500_tps_gap_closed": (
-                main_saving / FIXED_WORK_500_TPS_GAP_SECONDS
-            ),
-        }
-    best_fp32 = max(
-        (
-            (name, report)
-            for name, report in candidates.items()
-            if report["promotion_eligible"] and report["correctness_pass"]
-        ),
-        key=lambda item: item[1]["main_saving_seconds"],
-        default=None,
-    )
-    ideal_seconds = FIXED_WORK_MAIN_SECONDS - accepted_main_seconds
-    return {
-        "timing_decode_replays": timing_decode_replays,
-        "main_decode_replays": main_decode_replays,
-        "accepted_timing_seconds": accepted_timing_seconds,
-        "accepted_main_seconds": accepted_main_seconds,
-        "perfect_cross_removal_main_ceiling_seconds": accepted_main_seconds,
-        "perfect_cross_removal_projected_fixed_work_tps": (
-            FIXED_WORK_MAIN_TOKENS / ideal_seconds if ideal_seconds > 0 else math.inf
-        ),
-        "perfect_cross_removal_fraction_of_500_gap": (
-            accepted_main_seconds / FIXED_WORK_500_TPS_GAP_SECONDS
-        ),
-        "fixed_work_reference": {
-            "tokens": FIXED_WORK_MAIN_TOKENS,
-            "seconds": FIXED_WORK_MAIN_SECONDS,
-            "tps": FIXED_WORK_MAIN_TOKENS / FIXED_WORK_MAIN_SECONDS,
-            "target_tps": 500.0,
-            "target_seconds": FIXED_WORK_500_TPS_SECONDS,
-            "gap_seconds": FIXED_WORK_500_TPS_GAP_SECONDS,
-            "evidence_class": "calibrated_current-main_fixed-work_reference",
-        },
-        "candidates": candidates,
-        "best_correct_fp32_candidate": None if best_fp32 is None else best_fp32[0],
-        "any_fp32_promotion_pass": any(
-            report["promotion_pass"] for report in candidates.values()
-        ),
-    }
+        from osuT5.osuT5.inference.optimized.kernels.weight_only import (
+            weight_only_rmsnorm_linear,
+        )
+        from osuT5.osuT5.inference.optimized.scout.hybrid_qk_cross import (
+            hybrid_qk_fp32_value_attention,
+        )
+
+        outputs = []
+        for capture, (query_pack, _), key in zip(
+            captures, packs, packed_keys, strict=True
+        ):
+            query = weight_only_rmsnorm_linear(
+                capture.residual,
+                capture.cross_norm_weight,
+                query_pack,
+                eps=capture.cross_norm_eps,
+                outputs_per_block=8,
+            ).view(1, 1, HEADS, HEAD_DIM).transpose(1, 2).contiguous()
+            attention = hybrid_qk_fp32_value_attention(query, key, capture.values)
+            outputs.append(
+                native_one_token_linear_residual(
+                    attention.transpose(1, 2).contiguous().view(1, 1, HEADS * HEAD_DIM),
+                    capture.residual,
+                    capture.output_weight,
+                    capture.output_bias,
+                    outputs_per_block=8,
+                )
+            )
+        return tuple(outputs)
+
+    return run
 
 
-def summarize_projection_component(
+def _observe(graph: CapturedGraph) -> tuple[torch.Tensor, ...]:
+    graph.graph.replay()
+    torch.cuda.synchronize()
+    outputs = graph.outputs
+    if not isinstance(outputs, tuple) or len(outputs) != LAYERS:
+        raise RuntimeError("cross block graph must return one tensor per decoder layer")
+    copied = tuple(value.detach().float().cpu().clone() for value in outputs)
+    if any(tuple(value.shape) != (1, 1, HEADS * HEAD_DIM) for value in copied):
+        raise RuntimeError("cross block graph returned an invalid output shape")
+    return copied
+
+
+def summarize_hybrid_component(
+    buckets: dict[int, dict[str, Any]],
     *,
-    baseline_ms: float,
-    candidate_ms: float,
-    max_abs_drift: float,
-    checks_pass: bool,
-    timing_decode_replays: int,
-    main_decode_replays: int,
+    main_counts: dict[int, int],
+    timing_counts: dict[int, int],
+    main_key_pack_setup_seconds: float = 0.0,
 ) -> dict[str, Any]:
-    if min(baseline_ms, candidate_ms) <= 0 or not all(
-        math.isfinite(value) for value in (baseline_ms, candidate_ms, max_abs_drift)
-    ):
-        raise ValueError("projection component timings/drift must be finite and valid")
-    delta_ms = baseline_ms - candidate_ms
-    main_saving = main_decode_replays * delta_ms / 1000.0
-    timing_saving = timing_decode_replays * delta_ms / 1000.0
-    projected_seconds = FIXED_WORK_MAIN_SECONDS - main_saving
+    if set(buckets) != set(SENTINEL_PREFIXES):
+        raise ValueError(f"bucket evidence must be sentinel prefixes {SENTINEL_PREFIXES}")
+    if not set(SENTINEL_PREFIXES).issubset(main_counts):
+        raise ValueError("main counts are missing sentinel prefixes")
+    for label, counts in (("main", main_counts), ("timing", timing_counts)):
+        if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in counts.values()):
+            raise ValueError(f"{label} counts must be positive integers")
+    if not timing_counts:
+        raise ValueError("timing counts must be non-empty")
+    if not math.isfinite(main_key_pack_setup_seconds) or main_key_pack_setup_seconds < 0:
+        raise ValueError("main key-pack setup must be finite and non-negative")
+
+    main_saving = 0.0
+    timing_saving = 0.0
+    checks_pass = True
+    worst_selected_drift = 0.0
+    worst_fp32_drift = 0.0
+    per_bucket: dict[str, Any] = {}
+    for prefix in SENTINEL_PREFIXES:
+        entry = buckets[prefix]
+        variants = entry.get("variants")
+        if not isinstance(variants, dict):
+            raise ValueError(f"bucket {prefix} is missing variants")
+        current = variants["selected_packed_wq_wo_fp32_kv"]
+        hybrid = variants["hybrid_packed_wq_fp16_k_fp32_v_fp32_wo"]
+        current_ms = float(current["ms_per_decode_step"])
+        hybrid_ms = float(hybrid["ms_per_decode_step"])
+        selected_drift = float(hybrid["max_abs_drift_vs_selected"])
+        fp32_drift = float(hybrid["max_abs_drift_vs_fp32"])
+        numeric = (current_ms, hybrid_ms, selected_drift, fp32_drift)
+        if not all(math.isfinite(value) for value in numeric) or min(current_ms, hybrid_ms) <= 0:
+            raise ValueError(f"bucket {prefix} has invalid timing/drift")
+        delta_ms = current_ms - hybrid_ms
+        bucket_main = main_counts[prefix] * delta_ms / 1000.0
+        bucket_timing = timing_counts.get(prefix, 0) * delta_ms / 1000.0
+        main_saving += bucket_main
+        timing_saving += bucket_timing
+        worst_selected_drift = max(worst_selected_drift, selected_drift)
+        worst_fp32_drift = max(worst_fp32_drift, fp32_drift)
+        bucket_checks = bool(hybrid.get("checks_pass")) and selected_drift <= RELAXED_MAX_ABS_DRIFT
+        checks_pass &= bucket_checks
+        per_bucket[str(prefix)] = {
+            "current_ms_per_decode_step": current_ms,
+            "hybrid_ms_per_decode_step": hybrid_ms,
+            "local_speedup": current_ms / hybrid_ms,
+            "main_replays": main_counts[prefix],
+            "timing_replays": timing_counts.get(prefix, 0),
+            "main_saving_seconds": bucket_main,
+            "timing_saving_seconds": bucket_timing,
+            "checks_pass": bucket_checks,
+        }
+    raw_main_saving = main_saving
+    main_saving -= main_key_pack_setup_seconds
+    projected_seconds = SELECTED_MAIN_SECONDS - main_saving
     return {
-        "baseline_ms_per_decode_step": baseline_ms,
-        "candidate_ms_per_decode_step": candidate_ms,
-        "local_speedup": baseline_ms / candidate_ms,
-        "max_abs_drift": max_abs_drift,
-        "checks_pass": bool(checks_pass),
-        "result_class": "documented_drift_fp16_weights_fp32_state",
+        "candidate": "hybrid_packed_wq_fp16_k_fp32_v_fp32_wo",
+        "selected_control": "selected_packed_wq_wo_fp32_kv",
+        "measured_buckets": list(SENTINEL_PREFIXES),
+        "unmeasured_main_buckets": sorted(set(main_counts) - set(SENTINEL_PREFIXES)),
+        "unmeasured_bucket_delta_policy": "zero_delta",
+        "raw_main_replay_saving_seconds": raw_main_saving,
+        "main_key_pack_setup_seconds": main_key_pack_setup_seconds,
         "main_saving_seconds": main_saving,
         "timing_saving_seconds": timing_saving,
         "timing_plus_main_saving_seconds": main_saving + timing_saving,
-        "main_saving_target_seconds": MAIN_SAVING_TARGET_SECONDS,
-        "sizing_pass": main_saving >= MAIN_SAVING_TARGET_SECONDS,
-        "projected_fixed_work_main_tps": (
-            FIXED_WORK_MAIN_TOKENS / projected_seconds
-            if projected_seconds > 0
-            else math.inf
-        ),
-        "fraction_of_500_tps_gap_closed": (
-            main_saving / FIXED_WORK_500_TPS_GAP_SECONDS
-        ),
-        "component_retention_pass": bool(checks_pass) and main_saving > 0,
+        "saving_gate_seconds": COMPONENT_SAVING_GATE_SECONDS,
+        "sizing_pass": main_saving >= COMPONENT_SAVING_GATE_SECONDS,
+        "checks_pass": checks_pass,
+        "worst_max_abs_drift_vs_selected": worst_selected_drift,
+        "worst_max_abs_drift_vs_fp32": worst_fp32_drift,
+        "relaxed_max_abs_drift": RELAXED_MAX_ABS_DRIFT,
+        "selected_fixed_work_seconds": SELECTED_MAIN_SECONDS,
+        "selected_fixed_work_tps": FIXED_WORK_MAIN_TOKENS / SELECTED_MAIN_SECONDS,
+        "projected_fixed_work_seconds": projected_seconds,
+        "projected_fixed_work_tps": FIXED_WORK_MAIN_TOKENS / projected_seconds,
+        "fraction_of_remaining_500_gap": main_saving / TARGET_500_GAP_SECONDS,
+        "component_retention_pass": checks_pass and main_saving >= COMPONENT_SAVING_GATE_SECONDS,
         "production_promotion_pass": False,
+        "per_bucket": per_bucket,
     }
 
 
-def _write_text_report(path: Path, result: dict[str, Any]) -> None:
+def _write_text(path: Path, result: dict[str, Any]) -> None:
     summary = result["summary"]
     lines = [
-        "q1 cross-attention fixed-shape component scout",
+        "hybrid qk cross-attention real-tensor sentinel component scout",
         f"commit={result['metadata']['commit']}",
-        f"timing_decode_replays={summary['timing_decode_replays']}",
-        f"main_decode_replays={summary['main_decode_replays']}",
-        f"accepted_timing_seconds={summary['accepted_timing_seconds']:.9f}",
-        f"accepted_main_seconds={summary['accepted_main_seconds']:.9f}",
-        (
-            "perfect_cross_removal_projected_fixed_work_tps="
-            f"{summary['perfect_cross_removal_projected_fixed_work_tps']:.6f}"
-        ),
-        (
-            "perfect_cross_removal_fraction_of_500_gap="
-            f"{summary['perfect_cross_removal_fraction_of_500_gap']:.6f}"
-        ),
+        f"candidate={summary['candidate']}",
+        f"main_saving_seconds={summary['main_saving_seconds']:.9f}",
+        f"timing_saving_seconds={summary['timing_saving_seconds']:.9f}",
+        f"projected_fixed_work_seconds={summary['projected_fixed_work_seconds']:.9f}",
+        f"projected_fixed_work_tps={summary['projected_fixed_work_tps']:.6f}",
+        f"worst_max_abs_drift_vs_selected={summary['worst_max_abs_drift_vs_selected']:.9g}",
+        f"component_retention_pass={str(summary['component_retention_pass']).lower()}",
+        "production_promotion_pass=false",
     ]
-    for name, report in summary["candidates"].items():
-        raw = result["variants"][name]
-        lines.extend(
-            (
-                f"candidate={name}",
-                f"candidate_ms_per_decode_step={raw['ms_per_decode_step']:.9f}",
-                f"candidate_max_abs_drift={raw['max_abs_drift']:.9g}",
-                f"candidate_local_speedup={report['local_speedup']:.6f}",
-                f"candidate_main_saving_seconds={report['main_saving_seconds']:.9f}",
-                f"candidate_timing_saving_seconds={report['timing_saving_seconds']:.9f}",
-                f"candidate_projected_fixed_work_tps={report['projected_fixed_work_main_tps']:.6f}",
-                f"candidate_fraction_of_500_gap_closed={report['fraction_of_500_tps_gap_closed']:.6f}",
-                f"candidate_promotion_pass={str(report['promotion_pass']).lower()}",
-            )
+    for prefix, entry in summary["per_bucket"].items():
+        lines.append(
+            f"bucket={prefix} current_ms={entry['current_ms_per_decode_step']:.9f} "
+            f"hybrid_ms={entry['hybrid_ms_per_decode_step']:.9f} "
+            f"main_saving_seconds={entry['main_saving_seconds']:.9f}"
         )
-    lines.append(
-        f"best_correct_fp32_candidate={summary['best_correct_fp32_candidate']}"
-    )
-    lines.append(
-        f"any_fp32_promotion_pass={str(summary['any_fp32_promotion_pass']).lower()}"
-    )
-    projection = result["cross_projection_weight_scout"]["summary"]
-    lines.extend(
-        (
-            "cross_projection_candidate=fp16_packed_wq_wo_accepted_bmm",
-            (
-                "cross_projection_baseline_ms_per_decode_step="
-                f"{projection['baseline_ms_per_decode_step']:.9f}"
-            ),
-            (
-                "cross_projection_candidate_ms_per_decode_step="
-                f"{projection['candidate_ms_per_decode_step']:.9f}"
-            ),
-            f"cross_projection_max_abs_drift={projection['max_abs_drift']:.9g}",
-            f"cross_projection_main_saving_seconds={projection['main_saving_seconds']:.9f}",
-            f"cross_projection_timing_saving_seconds={projection['timing_saving_seconds']:.9f}",
-            (
-                "cross_projection_projected_fixed_work_tps="
-                f"{projection['projected_fixed_work_main_tps']:.6f}"
-            ),
-            (
-                "cross_projection_component_retention_pass="
-                f"{str(projection['component_retention_pass']).lower()}"
-            ),
-            "cross_projection_production_promotion_pass=false",
-        )
-    )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 @torch.no_grad()
-def profile_component(
-    args,
-    *,
-    output_path: Path,
-    capture_prefix: int,
-    warmup: int,
-    iters: int,
-) -> dict[str, Any]:
+def profile_component(args, *, output_path: Path, warmup: int, iters: int) -> dict[str, Any]:
     if not torch.cuda.is_available():
-        raise RuntimeError("q1 cross-attention component scout requires CUDA")
+        raise RuntimeError("hybrid qk cross component scout requires CUDA")
     if warmup < 1 or iters < 1:
         raise ValueError("warmup and iters must be positive")
     _assert_scout_args(args)
     output_path.mkdir(parents=True, exist_ok=True)
     run = _run_and_capture_sessions(args, output_path=output_path)
-    timing_summary = run["timing_session"].graph_profile_summary()
-    main_summary = run["main_session"].graph_profile_summary()
-    entries = validate_accepted_graph_cache(run["main_session"].graph_cache)
-    matching = [
-        entry
-        for entry in entries.values()
-        if int(entry["active_prefix_length"]) == capture_prefix
-    ]
-    if len(matching) != 1:
-        raise RuntimeError(
-            f"expected one main graph for prefix {capture_prefix}, got {len(matching)}"
-        )
-    static_inputs = matching[0]["static_inputs"]
-    captures = _capture_real_cross_inputs(
-        run["model"],
-        static_inputs,
-        prefix=capture_prefix,
+    main_entries = _graph_entries(
+        run["main_session"], required_prefixes=SENTINEL_PREFIXES
     )
-    original_hashes = _input_hashes(captures)
+    timing_entries = _graph_entries(run["timing_session"], required_prefixes=(128,))
+    main_counts = {prefix: int(entry["decode_replays"]) for prefix, entry in main_entries.items()}
+    timing_counts = {prefix: int(entry["decode_replays"]) for prefix, entry in timing_entries.items()}
 
-    from osuT5.osuT5.inference.optimized.scout.cross_attention import (
-        preload_cross_attention_scout,
-    )
-    from osuT5.osuT5.inference.optimized.kernels.decoder_layer import (
-        preload_native_decoder_layer,
-    )
-    from osuT5.osuT5.inference.optimized.kernels.weight_only import (
-        preload_weight_only_extension,
-    )
+    from osuT5.osuT5.inference.optimized.kernels.decoder_layer import preload_native_decoder_layer
+    from osuT5.osuT5.inference.optimized.kernels.weight_only import preload_weight_only_extension
 
     torch.cuda.synchronize()
-    extension_started = time.perf_counter()
-    preload_cross_attention_scout()
+    preload_started = time.perf_counter()
     preload_native_decoder_layer()
     preload_weight_only_extension()
     torch.cuda.synchronize()
-    extension_preload_seconds = time.perf_counter() - extension_started
+    preload_seconds = time.perf_counter() - preload_started
 
-    callables: dict[str, Callable[[], tuple[torch.Tensor, ...]]] = {
-        "accepted_q1_bmm": _accepted_callable(captures),
-    }
-    variant_inputs: dict[str, list[CrossInputs]] = {
-        "accepted_q1_bmm": captures,
-    }
-    for name, splits, fp16_kv in (
-        ("one_pass_fp32", None, False),
-        ("split2_fp32", 2, False),
-        ("split4_fp32", 4, False),
-        ("split8_fp32", 8, False),
-        ("split8_fp16_kv", 8, True),
-    ):
-        candidate, selected_inputs = _candidate_callable(
-            captures,
-            splits=splits,
-            fp16_kv=fp16_kv,
+    bucket_reports: dict[int, dict[str, Any]] = {}
+    total_key_pack_bytes = 0
+    total_query_pack_bytes = 0
+    total_selected_output_pack_bytes = 0
+    for prefix in SENTINEL_PREFIXES:
+        captures = _capture_real_cross_inputs(
+            run["model"], main_entries[prefix]["static_inputs"], prefix=prefix
         )
-        callables[name] = candidate
-        variant_inputs[name] = selected_inputs
+        source_hashes = _input_hashes(captures)
+        packs = _pack_linears(captures)
+        key_pack_start = torch.cuda.Event(enable_timing=True)
+        key_pack_end = torch.cuda.Event(enable_timing=True)
+        key_pack_start.record()
+        packed_keys = [capture.keys.to(dtype=torch.float16).contiguous() for capture in captures]
+        key_pack_end.record()
+        torch.cuda.synchronize()
+        key_pack_ms = float(key_pack_start.elapsed_time(key_pack_end))
+        if any(key.dtype != torch.float16 or not key.is_contiguous() for key in packed_keys):
+            raise RuntimeError("hybrid key packing did not produce contiguous FP16 storage")
 
-    graphs: dict[str, CapturedGraph] = {}
-    for name, callable_ in callables.items():
-        graphs[name] = _capture_cuda_graph(
-            callable_,
-            context=nullcontext,
-            warmup=0,
-        )
-    timings, rounds, memory_stable = _reciprocal_graph_rounds(
-        {name: captured.graph for name, captured in graphs.items()},
-        restore=lambda: None,
-        warmup=warmup,
-        iters=iters,
-    )
-    reference_first = _observe(graphs["accepted_q1_bmm"])
-    reference_second = _observe(graphs["accepted_q1_bmm"])
-    if not all(
-        torch.equal(first, second)
-        for first, second in zip(reference_first, reference_second, strict=True)
-    ):
-        raise RuntimeError("accepted q1 BMM graph was not deterministic")
-
-    variants: dict[str, dict[str, Any]] = {}
-    for name, captured in graphs.items():
-        first = _observe(captured)
-        second = _observe(captured)
-        repeat_exact = all(
-            torch.equal(left, right)
-            for left, right in zip(first, second, strict=True)
-        )
-        finite = all(torch.isfinite(output).all().item() for output in first)
-        shapes_valid = all(
-            tuple(output.shape) == (1, HEADS, 1, HEAD_DIM)
-            for output in first
-        )
-        max_drift = max(
-            _max_abs(reference, candidate)
-            for reference, candidate in zip(reference_first, first, strict=True)
-        )
-        inputs_unchanged = _input_hashes(captures) == original_hashes
-        kv_dtype = variant_inputs[name][0].keys.dtype
-        checks = {
-            "finite_outputs": bool(finite),
-            "output_shapes_valid": bool(shapes_valid),
-            "repeat_deterministic": bool(repeat_exact),
-            "source_cross_cache_unchanged": bool(inputs_unchanged),
-            "memory_stable": bool(memory_stable[name]),
+        callables: dict[str, Callable[[], tuple[torch.Tensor, ...]]] = {
+            "fp32_wq_wo_fp32_kv": _fp32_block(captures),
+            "selected_packed_wq_wo_fp32_kv": _selected_block(captures, packs),
+            "hybrid_packed_wq_fp16_k_fp32_v_fp32_wo": _hybrid_block(
+                captures, packs, packed_keys
+            ),
         }
-        variants[name] = {
-            "ms_per_decode_step": float(timings[name]),
-            "ms_per_layer": float(timings[name]) / LAYERS,
-            "max_abs_drift": max_drift,
-            "checks": checks,
-            "checks_pass": all(checks.values()),
-            "kv_storage_dtype": str(kv_dtype),
-            "capture_setup_seconds": captured.setup_seconds,
-            "capture_peak_vram_bytes": captured.peak_vram_bytes,
-            "launch": _launch_metadata(name),
-            "rounds": [row for row in rounds if row["variant"] == name],
+        graphs = {
+            name: _capture_cuda_graph(callable_, context=nullcontext, warmup=0)
+            for name, callable_ in callables.items()
         }
-    summary = summarize_component(
-        variants,
-        timing_decode_replays=int(timing_summary["decode_replays"]),
-        main_decode_replays=int(main_summary["decode_replays"]),
-    )
-    fp32_cross_block = _capture_cuda_graph(
-        _fp32_cross_block_callable(captures),
-        context=nullcontext,
-        warmup=0,
-    )
-    packed_callable, packed_memory = _packed_cross_block_callable(captures)
-    packed_cross_block = _capture_cuda_graph(
-        packed_callable,
-        context=nullcontext,
-        warmup=0,
-    )
-    projection_graphs = {
-        "fp32_wq_wo_accepted_bmm": fp32_cross_block,
-        "fp16_packed_wq_wo_accepted_bmm": packed_cross_block,
-    }
-    projection_timings, projection_rounds, projection_memory_stable = (
-        _reciprocal_graph_rounds(
-            {name: graph.graph for name, graph in projection_graphs.items()},
+        timings, rounds, stable = _reciprocal_graph_rounds(
+            {name: graph.graph for name, graph in graphs.items()},
             restore=lambda: None,
             warmup=warmup,
             iters=iters,
         )
+        observations = {name: _observe(graph) for name, graph in graphs.items()}
+        variants: dict[str, Any] = {}
+        for name, graph in graphs.items():
+            first = observations[name]
+            second = _observe(graph)
+            repeat = all(torch.equal(left, right) for left, right in zip(first, second, strict=True))
+            finite = all(torch.isfinite(value).all().item() for value in first)
+            drift_selected = max(
+                _max_abs(reference, candidate)
+                for reference, candidate in zip(
+                    observations["selected_packed_wq_wo_fp32_kv"], first, strict=True
+                )
+            )
+            drift_fp32 = max(
+                _max_abs(reference, candidate)
+                for reference, candidate in zip(
+                    observations["fp32_wq_wo_fp32_kv"], first, strict=True
+                )
+            )
+            checks = {
+                "finite_outputs": bool(finite),
+                "repeat_deterministic": bool(repeat),
+                "memory_stable": bool(stable[name]),
+                "source_fp32_cache_weights_unchanged": _input_hashes(captures) == source_hashes,
+            }
+            variants[name] = {
+                "ms_per_decode_step": float(timings[name]),
+                "ms_per_layer": float(timings[name]) / LAYERS,
+                "max_abs_drift_vs_selected": float(drift_selected),
+                "max_abs_drift_vs_fp32": float(drift_fp32),
+                "checks": checks,
+                "checks_pass": all(checks.values()),
+                "capture_setup_seconds": graph.setup_seconds,
+                "capture_peak_vram_bytes": graph.peak_vram_bytes,
+                "rounds": [row for row in rounds if row["variant"] == name],
+            }
+        if _input_hashes(captures) != source_hashes:
+            raise RuntimeError("component candidate mutated source cache or weights")
+        bucket_reports[prefix] = {
+            "main_decode_replays": main_counts[prefix],
+            "timing_decode_replays": timing_counts[prefix],
+            "key_pack_setup_ms": key_pack_ms,
+            "variants": variants,
+        }
+        total_key_pack_bytes += sum(key.numel() * key.element_size() for key in packed_keys)
+        total_query_pack_bytes += sum(query.packed_weight_bytes for query, _ in packs)
+        total_selected_output_pack_bytes += sum(output.packed_weight_bytes for _, output in packs)
+
+    state_holders = getattr(run["main_session"], "stable_encoder_holders", None)
+    if not isinstance(state_holders, dict) or not state_holders:
+        raise RuntimeError("main decode session has no stable encoder-state manifest")
+    main_state_count = len(state_holders)
+    worst_key_pack_ms = max(
+        float(report["key_pack_setup_ms"]) for report in bucket_reports.values()
     )
-    fp32_projection_first = _observe(
-        fp32_cross_block,
-        expected_shape=(1, 1, HEADS * HEAD_DIM),
-    )
-    fp32_projection_second = _observe(
-        fp32_cross_block,
-        expected_shape=(1, 1, HEADS * HEAD_DIM),
-    )
-    packed_projection_first = _observe(
-        packed_cross_block,
-        expected_shape=(1, 1, HEADS * HEAD_DIM),
-    )
-    packed_projection_second = _observe(
-        packed_cross_block,
-        expected_shape=(1, 1, HEADS * HEAD_DIM),
-    )
-    projection_repeat = all(
-        torch.equal(first, second)
-        for first, second in zip(
-            packed_projection_first,
-            packed_projection_second,
-            strict=True,
-        )
-    )
-    fp32_projection_repeat = all(
-        torch.equal(first, second)
-        for first, second in zip(
-            fp32_projection_first,
-            fp32_projection_second,
-            strict=True,
-        )
-    )
-    projection_drift = max(
-        _max_abs(reference, candidate)
-        for reference, candidate in zip(
-            fp32_projection_first,
-            packed_projection_first,
-            strict=True,
-        )
-    )
-    projection_checks = {
-        "fp32_baseline_repeat_deterministic": fp32_projection_repeat,
-        "candidate_repeat_deterministic": projection_repeat,
-        "candidate_finite": all(
-            torch.isfinite(value).all().item() for value in packed_projection_first
-        ),
-        "source_cross_cache_and_weights_unchanged": (
-            _input_hashes(captures) == original_hashes
-        ),
-        "fp32_baseline_memory_stable": projection_memory_stable[
-            "fp32_wq_wo_accepted_bmm"
-        ],
-        "candidate_memory_stable": projection_memory_stable[
-            "fp16_packed_wq_wo_accepted_bmm"
-        ],
-    }
-    projection_summary = summarize_projection_component(
-        baseline_ms=projection_timings["fp32_wq_wo_accepted_bmm"],
-        candidate_ms=projection_timings["fp16_packed_wq_wo_accepted_bmm"],
-        max_abs_drift=projection_drift,
-        checks_pass=all(projection_checks.values()),
-        timing_decode_replays=int(timing_summary["decode_replays"]),
-        main_decode_replays=int(main_summary["decode_replays"]),
+    charged_key_pack_seconds = main_state_count * worst_key_pack_ms / 1000.0
+    summary = summarize_hybrid_component(
+        bucket_reports,
+        main_counts=main_counts,
+        timing_counts=timing_counts,
+        main_key_pack_setup_seconds=charged_key_pack_seconds,
     )
     return {
         "schema_version": 1,
         "metadata": {
-            "commit": __import__("subprocess").check_output(
-                ["git", "rev-parse", "HEAD"],
-                cwd=REPO_ROOT,
-                text=True,
+            "commit": subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True
             ).strip(),
             "candidate_scope": "component_only_no_production_wiring",
-            "precision": "fp32_query_output_and_accumulation",
-            "shape": [1, HEADS, 1, HEAD_DIM],
-            "cross_kv_shape": [1, HEADS, KV_LENGTH, HEAD_DIM],
-            "capture_prefix": capture_prefix,
-            "layers": LAYERS,
+            "selected_topology_base": "k4_shared_rope_k1_remainder_int8_mlp_fp16_packed_cross",
+            "candidate_storage": {
+                "query_weight": "fp16_packed",
+                "query_activation_for_qk": "fp16",
+                "key_cache": "fp16_packed",
+                "score_accumulation": "fp32",
+                "softmax": "fp32",
+                "value_cache_and_reduction": "fp32",
+                "output_projection_weight_and_activation": "fp32",
+            },
+            "sentinel_prefixes": list(SENTINEL_PREFIXES),
             "warmup": warmup,
             "iters": iters,
-            "extension_preload_seconds": extension_preload_seconds,
-            "one_pass_is_rejected_12_cta_underfill_control": True,
-            "split_variants_fix_underfill_with_head_times_split_grid": True,
+            "extension_preload_seconds": preload_seconds,
         },
         "workload": {
-            "timing_graph_profile": timing_summary,
-            "main_graph_profile": main_summary,
+            "main_counts": {str(key): value for key, value in main_counts.items()},
+            "timing_counts": {str(key): value for key, value in timing_counts.items()},
+            "main_graph_profile": run["main_session"].graph_profile_summary(),
+            "timing_graph_profile": run["timing_session"].graph_profile_summary(),
         },
+        "memory": {
+            "sentinel_key_pack_bytes": total_key_pack_bytes,
+            "sentinel_query_weight_pack_bytes": total_query_pack_bytes,
+            "selected_output_weight_pack_bytes_not_retained_by_hybrid": total_selected_output_pack_bytes,
+            "main_encoder_state_count": main_state_count,
+            "worst_sentinel_key_pack_ms_per_state": worst_key_pack_ms,
+            "charged_main_key_pack_seconds": charged_key_pack_seconds,
+            "key_pack_setup_is_recorded_not_hidden": True,
+        },
+        "buckets": {str(prefix): report for prefix, report in bucket_reports.items()},
         "summary": summary,
-        "variants": variants,
-        "cross_projection_weight_scout": {
-            "summary": projection_summary,
-            "checks": projection_checks,
-            "packed_memory": packed_memory,
-            "capture": {
-                "fp32_peak_vram_bytes": fp32_cross_block.peak_vram_bytes,
-                "candidate_peak_vram_bytes": packed_cross_block.peak_vram_bytes,
-                "fp32_setup_seconds": fp32_cross_block.setup_seconds,
-                "candidate_setup_seconds": packed_cross_block.setup_seconds,
-            },
-            "rounds": projection_rounds,
-            "scope": (
-                "component_only; current mixed runtime keeps cross Wq/Wo FP32"
-            ),
-        },
     }
 
 
@@ -1010,7 +709,6 @@ def main() -> None:
     parser.add_argument("--report-path", type=Path, required=True)
     parser.add_argument("--text-path", type=Path, required=True)
     parser.add_argument("--output-path", type=Path, required=True)
-    parser.add_argument("--capture-prefix", type=int, default=DEFAULT_CAPTURE_PREFIX)
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--iters", type=int, default=1000)
     parser.add_argument("overrides", nargs="*")
@@ -1020,30 +718,16 @@ def main() -> None:
         overrides.append(f"output_path={cli.output_path}")
     args = _load_args(cli.config_name, overrides)
     result = profile_component(
-        args,
-        output_path=cli.output_path,
-        capture_prefix=cli.capture_prefix,
-        warmup=cli.warmup,
-        iters=cli.iters,
+        args, output_path=cli.output_path, warmup=cli.warmup, iters=cli.iters
     )
     cli.report_path.parent.mkdir(parents=True, exist_ok=True)
     cli.text_path.parent.mkdir(parents=True, exist_ok=True)
     cli.report_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
-    _write_text_report(cli.text_path, result)
+    _write_text(cli.text_path, result)
     print(json.dumps(result["summary"], indent=2))
-    if any(
-        not entry["checks_pass"]
-        for entry in result["variants"].values()
-        if entry["kv_storage_dtype"] == "torch.float32"
-    ):
+    if not result["summary"]["checks_pass"]:
         raise SystemExit(1)
-    if not result["cross_projection_weight_scout"]["summary"][
-        "component_retention_pass"
-    ]:
-        # This independent documented-drift subvariant may lose without making
-        # the FP32 attention kernel evidence invalid. Its decision is recorded.
-        pass
-    if not result["summary"]["any_fp32_promotion_pass"]:
+    if not result["summary"]["component_retention_pass"]:
         raise SystemExit(3)
 
 
