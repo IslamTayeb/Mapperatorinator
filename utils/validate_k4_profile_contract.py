@@ -24,12 +24,26 @@ def _nonnegative_int(value: Any, *, name: str) -> int:
     return value
 
 
-def validate(payload: Any, *, role: str, block_size: int) -> dict[str, Any]:
+def validate(
+    payload: Any,
+    *,
+    role: str,
+    block_size: int,
+    timing_block_size: int | None = None,
+) -> dict[str, Any]:
     root = _object(payload, name="profile")
     if role not in {"baseline", "candidate"}:
         raise ValueError("role must be baseline or candidate")
     if isinstance(block_size, bool) or block_size <= 1:
         raise ValueError("block_size must be an integer greater than one")
+    if timing_block_size is None:
+        timing_block_size = block_size
+    if (
+        isinstance(timing_block_size, bool)
+        or not isinstance(timing_block_size, int)
+        or timing_block_size <= 0
+    ):
+        raise ValueError("timing_block_size must be a positive integer")
     generation = root.get("generation")
     if not isinstance(generation, list) or not generation:
         raise ValueError("profile.generation must be a non-empty list")
@@ -58,7 +72,10 @@ def validate(payload: Any, *, role: str, block_size: int) -> dict[str, Any]:
             candidate,
             name=f"generation[{index}].optimized_cuda_graphs.k8_candidate",
         )
-        if candidate.get("block_size") != block_size:
+        expected_block_size = (
+            timing_block_size if label == "timing_context" else block_size
+        )
+        if candidate.get("block_size") != expected_block_size:
             raise ValueError(f"candidate generation[{index}] has wrong block_size")
         if candidate.get("rng_policy") != RNG_POLICY:
             raise ValueError(f"candidate generation[{index}] has wrong RNG policy")
@@ -88,7 +105,9 @@ def validate(payload: Any, *, role: str, block_size: int) -> dict[str, Any]:
                 "wasted_steps",
             )
         }
-        if values["eligible_steps"] != values["block_replays"] * block_size:
+        if values["eligible_steps"] != (
+            values["block_replays"] * expected_block_size
+        ):
             raise ValueError(f"candidate generation[{index}] block accounting diverged")
         if values["physical_steps"] != (
             values["logical_steps"] + values["wasted_steps"]
@@ -117,6 +136,8 @@ def validate(payload: Any, *, role: str, block_size: int) -> dict[str, Any]:
         "schema_version": 1,
         "role": role,
         "block_size": block_size,
+        "timing_block_size": timing_block_size,
+        "main_block_size": block_size,
         "rng_policy": RNG_POLICY if role == "candidate" else None,
         "labels": totals,
         "pass": True,
@@ -128,11 +149,13 @@ def main() -> None:
     parser.add_argument("--profile", type=Path, required=True)
     parser.add_argument("--role", choices=("baseline", "candidate"), required=True)
     parser.add_argument("--block-size", type=int, default=4)
+    parser.add_argument("--timing-block-size", type=int)
     parsed = parser.parse_args()
     report = validate(
         json.loads(parsed.profile.read_text(encoding="utf-8")),
         role=parsed.role,
         block_size=parsed.block_size,
+        timing_block_size=parsed.timing_block_size,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
 
