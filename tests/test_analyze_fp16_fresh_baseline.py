@@ -43,6 +43,7 @@ def _profile(*, audit=False):
                 "native_q1_self_attention": True,
                 "native_q1_rope_cache_self_attention": True,
                 "native_cross_mlp_tail": True,
+                "device_conditional_temperature": False,
             },
         },
         "generation": [
@@ -94,7 +95,7 @@ def test_runtime_rejects_fp32_so_fp16_cannot_mask_fp32_controls():
 def test_text_reports_fixed_work_tps_and_complete_song_wall():
     aggregate = {"median": 1.0, "minimum": 1.0, "maximum": 1.0, "range": 0.0}
     result = {
-        "accepted_preset_version": EXPECTED_PRESET_VERSION,
+        "preset_version": EXPECTED_PRESET_VERSION,
         "fixed_work": {"timing_tokens": 821, "main_tokens": 7809},
         "aggregates": {
             "timing_synchronized_model_seconds": aggregate,
@@ -151,6 +152,7 @@ def test_full_analyzer_reuses_current_profiler_contract_without_fp32_mutation(
         "native_q1_self_attention": True,
         "native_q1_rope_cache_self_attention": True,
         "native_cross_mlp_tail": True,
+        "device_conditional_temperature": False,
     }
     for path in root.glob("*/output/*.profile.json"):
         profile = json.loads(path.read_text(encoding="utf-8"))
@@ -169,3 +171,102 @@ def test_full_analyzer_reuses_current_profiler_contract_without_fp32_mutation(
     assert result["fixed_work"] == {"timing_tokens": 2, "main_tokens": 3}
     assert result["checks"]["audit_rng_cache_repeat"]
     assert len(result["exactness_audits"]) == 2
+
+
+def test_candidate_runtime_requires_fp16_device_hits():
+    profile = _profile()
+    profile["metadata"]["optimized_effective_config"][
+        "device_conditional_temperature"
+    ] = True
+    for row in profile["generation"]:
+        row.update(
+            {
+                "optimized_device_conditional_temperature_requested": True,
+                "optimized_device_conditional_temperature_condition_count": 2,
+                "optimized_device_conditional_temperature_specialized_calls": 5,
+                "optimized_device_conditional_temperature_v32_fallback_calls": 0,
+            }
+        )
+    _runtime_contract(
+        profile,
+        expected_commit=COMMIT,
+        expected_branch=BRANCH,
+        expected_preset_version=EXPECTED_PRESET_VERSION,
+        expected_device_conditional_temperature=True,
+        audit=False,
+    )
+
+    profile["generation"][0][
+        "optimized_device_conditional_temperature_specialized_calls"
+    ] = 0
+    profile["generation"][1][
+        "optimized_device_conditional_temperature_specialized_calls"
+    ] = 0
+    with pytest.raises(FP16BaselineError, match="hit counters"):
+        _runtime_contract(
+            profile,
+            expected_commit=COMMIT,
+            expected_branch=BRANCH,
+            expected_preset_version=EXPECTED_PRESET_VERSION,
+            expected_device_conditional_temperature=True,
+            audit=False,
+        )
+
+
+def test_full_candidate_analyzer_accepts_one_fresh_run_with_two_audits(tmp_path):
+    fixture_path = (
+        Path(__file__).resolve().parent / "test_analyze_fp32_fresh_baseline.py"
+    )
+    spec = importlib.util.spec_from_file_location("fp32_candidate_fixture", fixture_path)
+    assert spec is not None and spec.loader is not None
+    fixture = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixture)
+    root = tmp_path / "fp16-candidate"
+    fixture._run(root, "run-01")
+    fixture._run(root, "exactness-audit-01", exactness=True)
+    fixture._run(root, "exactness-audit-02", exactness=True)
+
+    version = "candidate-shared-fp16-device-temperature-v1"
+    required_config = {
+        "version": version,
+        "precision": "fp16",
+        "attn_implementation": "sdpa",
+        "decoder_loop_backend": "active_prefix_cuda_graph",
+        "batch_size": 1,
+        "q1_bmm_cross_attention": True,
+        "native_q1_self_attention": True,
+        "native_q1_rope_cache_self_attention": True,
+        "native_cross_mlp_tail": True,
+        "device_conditional_temperature": True,
+    }
+    for path in root.glob("*/output/*.profile.json"):
+        profile = json.loads(path.read_text(encoding="utf-8"))
+        metadata = profile["metadata"]
+        metadata["precision"] = "fp16"
+        metadata["git_branch"] = BRANCH
+        metadata["optimized_effective_config"] = required_config
+        for record in profile["generation"]:
+            record["precision"] = "fp16"
+            record.update(
+                {
+                    "optimized_device_conditional_temperature_requested": True,
+                    "optimized_device_conditional_temperature_condition_count": 2,
+                    "optimized_device_conditional_temperature_specialized_calls": 5,
+                    "optimized_device_conditional_temperature_v32_fallback_calls": 0,
+                }
+            )
+        path.write_text(json.dumps(profile), encoding="utf-8")
+
+    result = analyze(
+        root,
+        expected_commit=COMMIT,
+        expected_branch=BRANCH,
+        expected_preset_version=version,
+        expected_device_conditional_temperature=True,
+        run_count=1,
+    )
+
+    assert result["status"] == "PASS"
+    assert result["run_count"] == 1
+    assert result["preset_version"] == version
+    assert result["device_conditional_temperature"] is True

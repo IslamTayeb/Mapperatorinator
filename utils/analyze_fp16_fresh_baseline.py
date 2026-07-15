@@ -15,7 +15,6 @@ from utils import nsight_agent_profile as nsight
 
 
 SCHEMA_VERSION = "mapperatorinator.fp16-fresh-baseline.v1"
-RUN_NAMES = tuple(f"run-{index:02d}" for index in range(1, 6))
 LABELS = ("timing_context", "main_generation")
 EXPECTED_PRESET_VERSION = "accepted-fp16-all-fused-v2"
 
@@ -59,6 +58,8 @@ def _runtime_contract(
     *,
     expected_commit: str,
     expected_branch: str,
+    expected_preset_version: str = EXPECTED_PRESET_VERSION,
+    expected_device_conditional_temperature: bool = False,
     audit: bool,
 ) -> None:
     metadata = profile.get("metadata")
@@ -66,6 +67,10 @@ def _runtime_contract(
         raise FP16BaselineError("profile metadata is missing")
     expected = {
         "precision": "fp16",
+        "runtime_identity": {
+            "commit": expected_commit,
+            "branch": expected_branch,
+        },
         "inference_engine": "optimized",
         "attn_implementation": "sdpa",
         "profile_pass_kind": "exactness_audit" if audit else "untraced_control",
@@ -90,7 +95,7 @@ def _runtime_contract(
     if not isinstance(effective, dict):
         raise FP16BaselineError("optimized effective config is missing")
     required_config = {
-        "version": EXPECTED_PRESET_VERSION,
+        "version": expected_preset_version,
         "precision": "fp16",
         "attn_implementation": "sdpa",
         "decoder_loop_backend": "active_prefix_cuda_graph",
@@ -99,6 +104,7 @@ def _runtime_contract(
         "native_q1_self_attention": True,
         "native_q1_rope_cache_self_attention": True,
         "native_cross_mlp_tail": True,
+        "device_conditional_temperature": expected_device_conditional_temperature,
     }
     config_failures = {
         key: {"expected": value, "actual": effective.get(key)}
@@ -116,6 +122,39 @@ def _runtime_contract(
     }
     if precisions != {"fp16"}:
         raise FP16BaselineError(f"generation precision changed: {precisions}")
+    if expected_device_conditional_temperature:
+        records = [
+            row
+            for row in profile.get("generation", [])
+            if isinstance(row, dict) and row.get("profile_label") in LABELS
+        ]
+        if not records:
+            raise FP16BaselineError("device conditional-temperature records are missing")
+        condition_count = sum(
+            int(row.get("optimized_device_conditional_temperature_condition_count", 0))
+            for row in records
+        )
+        specialized_calls = sum(
+            int(row.get("optimized_device_conditional_temperature_specialized_calls", 0))
+            for row in records
+        )
+        fallback_calls = sum(
+            int(row.get("optimized_device_conditional_temperature_v32_fallback_calls", 0))
+            for row in records
+        )
+        if not all(
+            row.get("optimized_device_conditional_temperature_requested") is True
+            for row in records
+        ):
+            raise FP16BaselineError(
+                "device conditional-temperature specialization was not requested"
+            )
+        if condition_count <= 0 or specialized_calls <= 0 or fallback_calls != 0:
+            raise FP16BaselineError(
+                "device conditional-temperature hit counters are invalid: "
+                f"conditions={condition_count}, specialized={specialized_calls}, "
+                f"fallback={fallback_calls}"
+            )
 
 
 def _profile_and_result(run_dir: Path) -> tuple[dict[str, Any], Path]:
@@ -142,9 +181,11 @@ def _metrics(profile: Mapping[str, Any], label: str) -> dict[str, Any]:
         raise FP16BaselineError(str(exc)) from exc
 
 
-def _aggregate(values: Sequence[float]) -> dict[str, float]:
-    if len(values) != len(RUN_NAMES):
-        raise FP16BaselineError("aggregate requires five fresh values")
+def _aggregate(values: Sequence[float], *, expected_count: int) -> dict[str, float]:
+    if len(values) != expected_count:
+        raise FP16BaselineError(
+            f"aggregate requires {expected_count} fresh values"
+        )
     return {
         "median": float(statistics.median(values)),
         "minimum": float(min(values)),
@@ -172,9 +213,15 @@ def analyze(
     *,
     expected_commit: str,
     expected_branch: str,
+    expected_preset_version: str = EXPECTED_PRESET_VERSION,
+    expected_device_conditional_temperature: bool = False,
+    run_count: int = 5,
 ) -> dict[str, Any]:
     if len(expected_commit) != 40:
         raise FP16BaselineError("expected commit must be a full SHA")
+    if run_count not in {1, 5}:
+        raise FP16BaselineError("run_count must be one initial or five confirmation runs")
+    run_names = tuple(f"run-{index:02d}" for index in range(1, run_count + 1))
     runs: list[dict[str, Any]] = []
     profiles: list[dict[str, Any]] = []
     results: list[Path] = []
@@ -186,13 +233,17 @@ def analyze(
     output_hashes: list[str] = []
     token_counts: dict[str, list[int]] = {label: [] for label in LABELS}
 
-    for run_name in RUN_NAMES:
+    for run_name in run_names:
         run_dir = run_root / run_name
         profile, result = _profile_and_result(run_dir)
         _runtime_contract(
             profile,
             expected_commit=expected_commit,
             expected_branch=expected_branch,
+            expected_preset_version=expected_preset_version,
+            expected_device_conditional_temperature=(
+                expected_device_conditional_temperature
+            ),
             audit=False,
         )
         profile_hash = profile["metadata"].get("result_file_sha256")
@@ -261,6 +312,10 @@ def analyze(
             audit_profile,
             expected_commit=expected_commit,
             expected_branch=expected_branch,
+            expected_preset_version=expected_preset_version,
+            expected_device_conditional_temperature=(
+                expected_device_conditional_temperature
+            ),
             audit=True,
         )
         try:
@@ -335,13 +390,16 @@ def analyze(
 
     aggregates = {
         "process_wall_seconds": _aggregate(
-            [run["process_wall_seconds"] for run in runs]
+            [run["process_wall_seconds"] for run in runs],
+            expected_count=run_count,
         ),
         "request_to_final_osu_wall_seconds": _aggregate(
-            [run["request_to_final_osu_wall_seconds"] for run in runs]
+            [run["request_to_final_osu_wall_seconds"] for run in runs],
+            expected_count=run_count,
         ),
         "peak_cuda_memory_mb": _aggregate(
-            [run["peak_cuda_memory_mb"] for run in runs]
+            [run["peak_cuda_memory_mb"] for run in runs],
+            expected_count=run_count,
         ),
     }
     for label in LABELS:
@@ -350,13 +408,16 @@ def analyze(
             [
                 run["generation"][label]["synchronized_model_seconds"]
                 for run in runs
-            ]
+            ],
+            expected_count=run_count,
         )
         aggregates[f"{prefix}_outer_wall_seconds"] = _aggregate(
-            [run["generation"][label]["outer_wall_seconds"] for run in runs]
+            [run["generation"][label]["outer_wall_seconds"] for run in runs],
+            expected_count=run_count,
         )
         aggregates[f"{prefix}_tokens_per_second"] = _aggregate(
-            [run["generation"][label]["tokens_per_second"] for run in runs]
+            [run["generation"][label]["tokens_per_second"] for run in runs],
+            expected_count=run_count,
         )
     return {
         "schema_version": SCHEMA_VERSION,
@@ -365,7 +426,8 @@ def analyze(
         "fresh_processes": True,
         "run_count": len(runs),
         "authoritative_performance": True,
-        "accepted_preset_version": EXPECTED_PRESET_VERSION,
+        "preset_version": expected_preset_version,
+        "device_conditional_temperature": expected_device_conditional_temperature,
         "fixed_work": {
             "timing_tokens": token_counts["timing_context"][0],
             "main_tokens": token_counts["main_generation"][0],
@@ -392,7 +454,7 @@ def _text(result: Mapping[str, Any]) -> str:
         (
             "status=PASS",
             "precision=fp16",
-            f"preset={result['accepted_preset_version']}",
+            f"preset={result['preset_version']}",
             f"fixed_work_timing_tokens={result['fixed_work']['timing_tokens']}",
             f"fixed_work_main_tokens={result['fixed_work']['main_tokens']}",
             f"timing_model_seconds_median={aggregates['timing_synchronized_model_seconds']['median']:.6f}",
@@ -410,6 +472,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--expected-branch", required=True)
+    parser.add_argument(
+        "--expected-preset-version",
+        default=EXPECTED_PRESET_VERSION,
+    )
+    parser.add_argument(
+        "--expected-device-conditional-temperature",
+        action="store_true",
+    )
+    parser.add_argument("--run-count", type=int, choices=(1, 5), default=5)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--text-output", type=Path, required=True)
     args = parser.parse_args(argv)
@@ -417,6 +488,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.run_root,
         expected_commit=args.expected_commit,
         expected_branch=args.expected_branch,
+        expected_preset_version=args.expected_preset_version,
+        expected_device_conditional_temperature=(
+            args.expected_device_conditional_temperature
+        ),
+        run_count=args.run_count,
     )
     args.output.write_text(
         json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"
