@@ -2,8 +2,8 @@
 
 The input order is fixed to baseline, candidate, candidate, baseline so drift
 from process order is visible.  Performance is accepted only from untraced,
-authoritative profiles.  Exact FP32 mode is deliberately a hard gate; relaxed
-mode reports precision/output divergence without calling it exact.
+authoritative profiles.  Exact modes are deliberately hard gates; relaxed mode
+reports precision/output divergence without calling it exact.
 """
 
 from __future__ import annotations
@@ -91,7 +91,7 @@ RUN_ORDER = (
 )
 BASELINE_ROLES = ("baseline_first", "baseline_second")
 CANDIDATE_ROLES = ("candidate_first", "candidate_second")
-MODES = ("exact-fp32", "relaxed")
+MODES = ("exact-fp32", "exact-same-precision", "relaxed")
 TIMING_GENERATION_STAGES = frozenset(
     {"timing_context_generation", "super_timing_generation"}
 )
@@ -602,8 +602,13 @@ def _validate_workloads(runs: Mapping[str, ParsedRun], *, mode: str) -> dict[str
         raise CandidateAnalysisError(
             f"baseline/candidate workload differs outside precision: {undeclared}"
         )
-    if mode == "exact-fp32" and any(run.precision != "fp32" for run in runs.values()):
+    precisions = {run.precision for run in runs.values()}
+    if mode == "exact-fp32" and precisions != {"fp32"}:
         raise CandidateAnalysisError("exact-fp32 mode requires all four profiles to be fp32")
+    if mode == "exact-same-precision" and len(precisions) != 1:
+        raise CandidateAnalysisError(
+            "exact-same-precision mode requires all four profiles to use one precision"
+        )
     return {
         "baseline_sha256": _sha256_json(runs["baseline_first"].workload),
         "candidate_sha256": _sha256_json(runs["candidate_first"].workload),
@@ -795,7 +800,8 @@ def _parity_and_divergence(
     dispatch_declaration = _validate_allowed_differences(
         graph_differences, allowed_dispatch_deltas
     )
-    if mode == "exact-fp32" and not dispatch_declaration["pass"]:
+    exact_mode = mode in {"exact-fp32", "exact-same-precision"}
+    if exact_mode and not dispatch_declaration["pass"]:
         raise CandidateAnalysisError(
             "dispatch/cache metadata contains undeclared or unused expected deltas: "
             f"undeclared={dispatch_declaration['undeclared_paths']}, "
@@ -815,12 +821,12 @@ def _parity_and_divergence(
         divergence["token_stream_equal"] and divergence["stopping_equal"]
         for divergence in token_divergence.values()
     ) and output_divergence["final_map_equal"]
-    if mode == "exact-fp32" and not exact_cross_candidate:
+    if exact_mode and not exact_cross_candidate:
         raise CandidateAnalysisError(
-            "exact-fp32 candidate differs in tokens, stopping, or final OSU bytes"
+            f"{mode} candidate differs in tokens, stopping, or final OSU bytes"
         )
     return {
-        "claim": "exact-fp32" if mode == "exact-fp32" else "relaxed-nonexact",
+        "claim": mode if exact_mode else "relaxed-nonexact",
         "baseline_repeat_stable": True,
         "candidate_repeat_stable": True,
         "cross_candidate_exact": exact_cross_candidate,
