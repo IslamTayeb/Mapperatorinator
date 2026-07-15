@@ -16,6 +16,7 @@ def test_wrapper_is_one_reciprocal_four_arm_full_song_gate() -> None:
     assert "run_arm exact_second exact_fp32_native_self" in source
     assert "run_arm control_second control" in source
     assert "--fixed-timing-tokens 821" in source
+    assert "--allow-mixed-stage-precision" in source
     assert "fixed_main_tokens=8294" in source
     assert "analysis.json" in source
 

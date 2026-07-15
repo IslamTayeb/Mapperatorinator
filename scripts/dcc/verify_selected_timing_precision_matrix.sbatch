@@ -265,11 +265,13 @@ analyze_arm exact_fp32_native_self \
 
 analyze_arm full_fp16 \
   "$(<"$RUN_ROOT/full_fp16_first.profile-path.txt")" \
-  "$(<"$RUN_ROOT/full_fp16_second.profile-path.txt")"
+  "$(<"$RUN_ROOT/full_fp16_second.profile-path.txt")" \
+  --allow-mixed-stage-precision
 
 analyze_arm fp16_weights_fp32_state \
   "$(<"$RUN_ROOT/fp16_weights_first.profile-path.txt")" \
-  "$(<"$RUN_ROOT/fp16_weights_second.profile-path.txt")"
+  "$(<"$RUN_ROOT/fp16_weights_second.profile-path.txt")" \
+  --allow-mixed-stage-precision
 
 (
   cd "$REPO"

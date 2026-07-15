@@ -301,6 +301,35 @@ def test_fixed_timing_work_is_normalized_from_authoritative_tps(tmp_path: Path) 
         analyze(_four_runs(tmp_path / "bad"), fixed_timing_tokens=0)
 
 
+def test_mixed_stage_precision_is_explicit_and_label_consistent(tmp_path: Path) -> None:
+    profiles = _four_runs(tmp_path)
+    for role in ("candidate_first", "candidate_second"):
+        path = profiles[role]
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        for record in payload["generation"]:
+            if record.get("profile_label") == "timing_context":
+                record["precision"] = "fp16"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(CandidateAnalysisError, match="one consistent precision"):
+        analyze(profiles, mode="relaxed")
+
+    report = analyze(
+        profiles,
+        mode="relaxed",
+        allow_mixed_stage_precision=True,
+    )
+    assert report["workload"]["baseline_stage_precisions"] == {
+        "timing_context": "fp32",
+        "main_generation": "fp32",
+    }
+    assert report["workload"]["candidate_stage_precisions"] == {
+        "timing_context": "fp16",
+        "main_generation": "fp32",
+    }
+    assert report["measurement_scope"]["mixed_stage_precision_allowed"] is True
+
+
 def test_exact_dispatch_delta_requires_a_used_explicit_pattern(tmp_path: Path) -> None:
     profiles = _four_runs(tmp_path, split_kv=True)
     with pytest.raises(CandidateAnalysisError, match="undeclared"):

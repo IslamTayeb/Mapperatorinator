@@ -117,6 +117,9 @@ DECLARABLE_DISPATCH_RECORD_KEYS = (
     "optimized_dispatch_mode",
     "optimized_dispatch_policy",
     "optimized_timing_native_self",
+    "optimized_specialized_timing_dispatch",
+    "optimized_timing_weight_only_dispatch",
+    "optimized_timing_precision_matrix",
 )
 
 
@@ -141,6 +144,7 @@ class ParsedRun:
     profile: dict[str, Any]
     metadata: dict[str, Any]
     precision: str
+    stage_precisions: dict[str, str]
     stages: tuple[Stage, ...]
     stage_sequence: tuple[str, ...]
     label_signatures: dict[str, dict[str, Any]]
@@ -387,6 +391,8 @@ def _parse_run(
     role: str,
     profile_path: Path,
     osu_override: Path | None,
+    *,
+    allow_mixed_stage_precision: bool,
 ) -> ParsedRun:
     profile_path = profile_path.expanduser().resolve()
     profile = _load_profile(profile_path, role=role)
@@ -398,10 +404,32 @@ def _parse_run(
     if metadata.get("authoritative_performance") is not True:
         raise CandidateAnalysisError(f"{role} must set authoritative_performance=true")
     _validate_invariants(metadata, role=role)
-    try:
-        precision = _profile_precision(profile, path=profile_path)
-    except Exception as exc:
-        raise CandidateAnalysisError(str(exc)) from exc
+    if allow_mixed_stage_precision:
+        precision = metadata.get("precision")
+        if not isinstance(precision, str) or not precision:
+            raise CandidateAnalysisError(f"{role}.metadata.precision is missing")
+        stage_precisions: dict[str, str] = {}
+        for label in PROFILE_LABELS:
+            values = {
+                record.get("precision")
+                for record in profile["generation"]
+                if isinstance(record, dict)
+                and record.get("profile_label") == label
+            }
+            if len(values) != 1 or not all(
+                isinstance(value, str) and value for value in values
+            ):
+                raise CandidateAnalysisError(
+                    f"{role}.{label} must expose one consistent stage precision, "
+                    f"got {sorted(str(value) for value in values)}"
+                )
+            stage_precisions[label] = next(iter(values))
+    else:
+        try:
+            precision = _profile_precision(profile, path=profile_path)
+        except Exception as exc:
+            raise CandidateAnalysisError(str(exc)) from exc
+        stage_precisions = {label: precision for label in PROFILE_LABELS}
     stages = _parse_stages(profile, role=role)
     osu_path = _resolve_osu_path(profile_path, metadata, osu_override, role=role)
     structure = summarize_osu_structure(osu_path)
@@ -513,6 +541,7 @@ def _parse_run(
         profile=profile,
         metadata=metadata,
         precision=precision,
+        stage_precisions=stage_precisions,
         stages=stages,
         stage_sequence=tuple(stage.name for stage in stages),
         label_signatures=signatures,
@@ -646,11 +675,33 @@ def _validate_workloads(runs: Mapping[str, ParsedRun], *, mode: str) -> dict[str
         raise CandidateAnalysisError(
             "exact-fp32 mode requires all four profiles to be fp32"
         )
+    baseline_stage_precisions = {
+        role: runs[role].stage_precisions for role in BASELINE_ROLES
+    }
+    candidate_stage_precisions = {
+        role: runs[role].stage_precisions for role in CANDIDATE_ROLES
+    }
+    _require_equal(baseline_stage_precisions, name="baseline stage precision")
+    _require_equal(candidate_stage_precisions, name="candidate stage precision")
+    if mode == "exact-fp32" and any(
+        precision != "fp32"
+        for run in runs.values()
+        for precision in run.stage_precisions.values()
+    ):
+        raise CandidateAnalysisError(
+            "exact-fp32 mode requires every generation stage to be fp32"
+        )
     return {
         "baseline_sha256": _sha256_json(runs["baseline_first"].workload),
         "candidate_sha256": _sha256_json(runs["candidate_first"].workload),
         "cross_differences": cross_differences,
         "precision_change_only": not undeclared,
+        "baseline_stage_precisions": runs["baseline_first"].stage_precisions,
+        "candidate_stage_precisions": runs["candidate_first"].stage_precisions,
+        "stage_precision_changes": _material_differences(
+            runs["baseline_first"].stage_precisions,
+            runs["candidate_first"].stage_precisions,
+        ),
     }
 
 
@@ -971,6 +1022,7 @@ def analyze(
     required_exact_dispatch_labels: Sequence[str] = (),
     require_dispatch_declaration: bool = False,
     fixed_timing_tokens: int | None = None,
+    allow_mixed_stage_precision: bool = False,
 ) -> dict[str, Any]:
     if mode not in MODES:
         raise CandidateAnalysisError(f"mode must be one of {MODES}")
@@ -978,7 +1030,12 @@ def analyze(
         raise CandidateAnalysisError(f"profile roles must be exactly {list(RUN_ORDER)}")
     overrides = osu_overrides or {}
     runs = {
-        role: _parse_run(role, profile_paths[role], overrides.get(role))
+        role: _parse_run(
+            role,
+            profile_paths[role],
+            overrides.get(role),
+            allow_mixed_stage_precision=allow_mixed_stage_precision,
+        )
         for role in RUN_ORDER
     }
     if fixed_timing_tokens is not None:
@@ -1029,6 +1086,7 @@ def analyze(
                 "main synchronized model time scaled to exactly 8294 generated steps"
             ),
             "fixed_timing_tokens": fixed_timing_tokens,
+            "mixed_stage_precision_allowed": allow_mixed_stage_precision,
         },
         "workload": workload,
         "parity": parity,
@@ -1037,6 +1095,7 @@ def analyze(
                 "profile_path": str(run.profile_path),
                 "osu_path": str(run.osu_path),
                 "precision": run.precision,
+                "stage_precisions": run.stage_precisions,
                 "profile_sha256": _sha256_file(run.profile_path),
                 "osu_sha256": run.osu_sha256,
                 "osu_size_bytes": run.osu_size_bytes,
@@ -1145,6 +1204,14 @@ def _arguments() -> argparse.Namespace:
         action="store_true",
         help="fail relaxed mode on undeclared or unused dispatch/cache deltas",
     )
+    parser.add_argument(
+        "--allow-mixed-stage-precision",
+        action="store_true",
+        help=(
+            "accept one consistent precision per generation label while retaining "
+            "the public request precision"
+        ),
+    )
     parser.add_argument("--fixed-timing-tokens", type=int)
     parser.add_argument("--json-output", type=Path, required=True)
     parser.add_argument("--text-output", type=Path, required=True)
@@ -1165,6 +1232,7 @@ def main() -> None:
         required_exact_dispatch_labels=args.require_exact_dispatch_label,
         require_dispatch_declaration=args.require_dispatch_declaration,
         fixed_timing_tokens=args.fixed_timing_tokens,
+        allow_mixed_stage_precision=args.allow_mixed_stage_precision,
     )
     args.json_output.parent.mkdir(parents=True, exist_ok=True)
     args.text_output.parent.mkdir(parents=True, exist_ok=True)
