@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 import pickle
 import random
+import runpy
 import sys
 
 import numpy as np
@@ -65,18 +66,18 @@ def main() -> None:
 
     _ensure_repo_import_path()
 
-    import inference as inference_module
+    from accelerate import utils as accelerate_utils
     from osuT5.osuT5.inference.optimized.scout.device_sequence_state import (
         DeviceSequenceStateActivation,
         device_sequence_state_candidate_context,
     )
 
     after_seed: dict[str, object] | None = None
-    original_setup = inference_module.setup_inference_environment
+    original_set_seed = accelerate_utils.set_seed
 
-    def recorded_setup(seed: int) -> None:
+    def recorded_set_seed(*args, **kwargs) -> None:
         nonlocal after_seed
-        original_setup(seed)
+        original_set_seed(*args, **kwargs)
         after_seed = _rng_fingerprint()
 
     activation = DeviceSequenceStateActivation()
@@ -86,14 +87,14 @@ def main() -> None:
         else nullcontext(activation)
     )
     inference_script = REPO_ROOT / "inference.py"
-    inference_module.setup_inference_environment = recorded_setup
+    accelerate_utils.set_seed = recorded_set_seed
     try:
         with context as activation:
             sys.argv = [str(inference_script), *inference_args]
-            inference_module.main()
+            runpy.run_path(str(inference_script), run_name="__main__")
         after_inference = _rng_fingerprint()
     finally:
-        inference_module.setup_inference_environment = original_setup
+        accelerate_utils.set_seed = original_set_seed
 
     if after_seed is None:
         raise RuntimeError("inference never initialized the RNG environment")
