@@ -67,10 +67,6 @@ def _runtime_contract(
         raise FP16BaselineError("profile metadata is missing")
     expected = {
         "precision": "fp16",
-        "runtime_identity": {
-            "commit": expected_commit,
-            "branch": expected_branch,
-        },
         "inference_engine": "optimized",
         "attn_implementation": "sdpa",
         "profile_pass_kind": "exactness_audit" if audit else "untraced_control",
@@ -423,6 +419,10 @@ def analyze(
         "schema_version": SCHEMA_VERSION,
         "status": "PASS",
         "precision": "fp16",
+        "runtime_identity": {
+            "commit": expected_commit,
+            "branch": expected_branch,
+        },
         "fresh_processes": True,
         "run_count": len(runs),
         "authoritative_performance": True,

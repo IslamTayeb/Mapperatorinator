@@ -37,7 +37,11 @@ class ConditionalTemperatureLogitsWarper(
         if value is None:
             value = torch.tensor(
                 temperature,
-                dtype=scores.dtype,
+                # A zero-dimensional FP32 scalar preserves PyTorch's Python
+                # float division semantics for FP16 scores. Storing this as
+                # FP16 would round the temperature before division and break
+                # same-precision V32 parity.
+                dtype=torch.float32,
                 device=scores.device,
             )
             self._temperatures_by_device[key] = value
