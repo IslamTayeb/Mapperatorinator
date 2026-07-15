@@ -1,4 +1,5 @@
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -65,6 +66,118 @@ def _copy_static_graph_inputs(
         static_value.copy_(value)
 
 
+def _static_graph_input_signature(
+    model_inputs: dict[str, Any],
+) -> tuple[Any, ...]:
+    return tuple(
+        (
+            key,
+            tuple(value.shape),
+            str(value.dtype),
+            str(value.device),
+        )
+        if isinstance(value, torch.Tensor)
+        else (key, type(value).__name__, id(value))
+        for key, value in sorted(model_inputs.items())
+    )
+
+
+def _tensor_copy_size(model_inputs: dict[str, Any]) -> tuple[int, int]:
+    tensors = [
+        value for value in model_inputs.values() if isinstance(value, torch.Tensor)
+    ]
+    return (
+        len(tensors),
+        sum(value.numel() * value.element_size() for value in tensors),
+    )
+
+
+@dataclass(slots=True)
+class _SharedStaticInputArena:
+    """One address-stable input owner shared by compatible K1 CUDA graphs."""
+
+    static_inputs: dict[str, Any]
+    signature: tuple[Any, ...]
+    tensor_addresses: tuple[tuple[str, int], ...]
+    owned_tensor_bytes: int
+    refreshes: int = 0
+    refresh_copy_calls: int = 0
+    refresh_copy_bytes: int = 0
+    graph_entries: int = 0
+
+    @staticmethod
+    def _tensor_addresses(
+        values: dict[str, Any],
+    ) -> tuple[tuple[str, int], ...]:
+        return tuple(
+            (name, value.data_ptr())
+            for name, value in sorted(values.items())
+            if isinstance(value, torch.Tensor)
+        )
+
+    @classmethod
+    def create(cls, model_inputs: dict[str, Any]) -> "_SharedStaticInputArena":
+        static_inputs = _clone_static_graph_inputs(model_inputs)
+        _, owned_tensor_bytes = _tensor_copy_size(static_inputs)
+        return cls(
+            static_inputs=static_inputs,
+            signature=_static_graph_input_signature(model_inputs),
+            tensor_addresses=cls._tensor_addresses(static_inputs),
+            owned_tensor_bytes=owned_tensor_bytes,
+        )
+
+    def validate_tensor_addresses(self) -> None:
+        if self._tensor_addresses(self.static_inputs) != self.tensor_addresses:
+            raise RuntimeError("shared static-input arena tensor address changed")
+
+    def refresh(self, model_inputs: dict[str, Any]) -> None:
+        self.validate_tensor_addresses()
+        if _static_graph_input_signature(model_inputs) != self.signature:
+            raise RuntimeError("shared static-input arena signature changed")
+        copy_calls, copy_bytes = _tensor_copy_size(model_inputs)
+        _copy_static_graph_inputs(self.static_inputs, model_inputs)
+        self.validate_tensor_addresses()
+        self.refreshes += 1
+        self.refresh_copy_calls += copy_calls
+        self.refresh_copy_bytes += copy_bytes
+
+    def register_graph(self) -> None:
+        self.validate_tensor_addresses()
+        self.graph_entries += 1
+
+    def profile_summary(self) -> dict[str, int | bool]:
+        avoided_storage = self.owned_tensor_bytes * max(0, self.graph_entries - 1)
+        return {
+            "enabled": True,
+            "graph_entries": self.graph_entries,
+            "refreshes": self.refreshes,
+            "refresh_copy_calls": self.refresh_copy_calls,
+            "refresh_copy_bytes": self.refresh_copy_bytes,
+            "owned_tensor_bytes": self.owned_tensor_bytes,
+            "avoided_duplicate_graph_input_bytes": avoided_storage,
+        }
+
+
+def _resolve_shared_static_input_arena(
+    graph_cache: dict[tuple[Any, ...], dict[str, Any]],
+    signature: tuple[Any, ...],
+) -> _SharedStaticInputArena | None:
+    matches: dict[int, _SharedStaticInputArena] = {}
+    for entry in graph_cache.values():
+        arena = entry.get("_shared_static_input_arena")
+        if arena is None:
+            continue
+        if not isinstance(arena, _SharedStaticInputArena):
+            raise RuntimeError("graph cache contains an invalid static-input arena")
+        if arena.signature == signature:
+            matches[id(arena)] = arena
+    if len(matches) > 1:
+        raise RuntimeError(
+            "graph cache contains multiple shared static-input arena owners"
+        )
+    return next(iter(matches.values()), None)
+
+
 def _stable_encoder_outputs(
     holder: dict[str, BaseModelOutput],
     encoder_outputs: Any,
@@ -127,16 +240,7 @@ def _cuda_graph_signature(
     active_prefix_length: int,
     model_inputs: dict[str, Any],
 ) -> tuple[Any, ...]:
-    signature: list[Any] = [active_prefix_length]
-    for key in sorted(model_inputs):
-        value = model_inputs[key]
-        if isinstance(value, torch.Tensor):
-            signature.append(
-                (key, tuple(value.shape), str(value.dtype), str(value.device))
-            )
-        else:
-            signature.append((key, type(value).__name__, id(value)))
-    return tuple(signature)
+    return (active_prefix_length, *_static_graph_input_signature(model_inputs))
 
 
 def active_prefix_decode_generate(
@@ -154,6 +258,7 @@ def active_prefix_decode_generate(
     cuda_graph_min_decode_steps: int = 1,
     shared_graph_cache: dict[tuple[Any, ...], dict[str, Any]] | None = None,
     stable_encoder_holder: dict[str, BaseModelOutput] | None = None,
+    shared_static_input_arena: bool = False,
     **model_kwargs,
 ) -> torch.LongTensor:
     """Fixed-batch HF loop with persistent active-prefix CUDA graphs."""
@@ -199,6 +304,12 @@ def active_prefix_decode_generate(
         raise RuntimeError("active-prefix CUDA graph decode requires CUDA inputs")
     if cuda_graph_min_decode_steps <= 0:
         raise ValueError("cuda_graph_min_decode_steps must be positive")
+    if not isinstance(shared_static_input_arena, bool):
+        raise TypeError("shared_static_input_arena must be a bool")
+    if shared_static_input_arena and not cuda_graph_forward:
+        raise ValueError(
+            "shared static-input arena requires CUDA graph forward"
+        )
 
     model_kwargs = model._get_initial_cache_position(
         cur_len,
@@ -211,6 +322,7 @@ def active_prefix_decode_generate(
     scores = None
     decode_steps = 0
     graph_cache = shared_graph_cache if shared_graph_cache is not None else {}
+    static_input_arena: _SharedStaticInputArena | None = None
     this_peer_finished = False
     unfinished = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
 
@@ -239,10 +351,34 @@ def active_prefix_decode_generate(
                 with active_prefix_self_attention_context(prefix_length):
                     outputs = model(**model_inputs, return_dict=True)
             elif use_graph:
-                graph_key = _cuda_graph_signature(prefix_length, model_inputs)
+                graph_inputs = model_inputs
+                if shared_static_input_arena:
+                    input_signature = _static_graph_input_signature(model_inputs)
+                    if static_input_arena is None:
+                        static_input_arena = _resolve_shared_static_input_arena(
+                            graph_cache,
+                            input_signature,
+                        )
+                    if static_input_arena is None:
+                        static_input_arena = _SharedStaticInputArena.create(
+                            model_inputs
+                        )
+                    else:
+                        static_input_arena.refresh(model_inputs)
+                    graph_inputs = static_input_arena.static_inputs
+                    graph_key = (
+                        "shared_static_input_arena",
+                        *_cuda_graph_signature(prefix_length, model_inputs),
+                    )
+                else:
+                    graph_key = _cuda_graph_signature(prefix_length, model_inputs)
                 graph_entry = graph_cache.get(graph_key)
                 if graph_entry is None:
-                    static_inputs = _clone_static_graph_inputs(model_inputs)
+                    static_inputs = (
+                        graph_inputs
+                        if shared_static_input_arena
+                        else _clone_static_graph_inputs(model_inputs)
+                    )
                     with profile_range("generation.decode_graph_capture_setup"):
                         graph, outputs, capture_seconds = _capture_decode_cuda_graph(
                             model,
@@ -258,12 +394,31 @@ def active_prefix_decode_generate(
                         "capture_seconds": capture_seconds,
                         "decode_replays": 0,
                     }
+                    if shared_static_input_arena:
+                        if static_input_arena is None:
+                            raise RuntimeError(
+                                "shared static-input arena disappeared during capture"
+                            )
+                        static_input_arena.register_graph()
+                        graph_entry["_shared_static_input_arena"] = static_input_arena
                     graph_cache[graph_key] = graph_entry
                 else:
-                    _copy_static_graph_inputs(
-                        graph_entry["static_inputs"],
-                        model_inputs,
-                    )
+                    if shared_static_input_arena:
+                        entry_arena = graph_entry.get("_shared_static_input_arena")
+                        if entry_arena is not static_input_arena:
+                            raise RuntimeError(
+                                "CUDA graph resolved the wrong shared input arena"
+                            )
+                        if graph_entry["static_inputs"] is not graph_inputs:
+                            raise RuntimeError(
+                                "CUDA graph did not retain the shared input arena"
+                            )
+                        static_input_arena.validate_tensor_addresses()
+                    else:
+                        _copy_static_graph_inputs(
+                            graph_entry["static_inputs"],
+                            model_inputs,
+                        )
                     with profile_range("generation.decode_graph_replay"):
                         graph_entry["graph"].replay()
                 graph_entry["decode_replays"] += 1

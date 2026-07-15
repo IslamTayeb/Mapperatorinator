@@ -118,6 +118,7 @@ class ProductionDecodeSession:
     def graph_profile_summary(self) -> dict[str, Any]:
         """Return address-free CUDA-graph evidence suitable for profiles."""
         buckets: dict[str, dict[str, int | float]] = {}
+        shared_arenas: dict[int, Any] = {}
         for entry in self.graph_cache.values():
             prefix = int(entry.get("active_prefix_length", -1))
             if prefix < 0:
@@ -133,7 +134,15 @@ class ProductionDecodeSession:
             bucket["capture_seconds"] = float(bucket["capture_seconds"]) + float(
                 entry.get("capture_seconds", 0.0)
             )
-        return {
+            arena = entry.get("_shared_static_input_arena")
+            if arena is not None:
+                profile_summary = getattr(arena, "profile_summary", None)
+                if not callable(profile_summary):
+                    raise RuntimeError(
+                        "optimized graph entry contains an invalid shared input arena"
+                    )
+                shared_arenas[id(arena)] = arena
+        result = {
             "graph_count": self.graph_count,
             "decode_replays": sum(
                 int(bucket["decode_replays"]) for bucket in buckets.values()
@@ -143,3 +152,31 @@ class ProductionDecodeSession:
             ),
             "buckets": dict(sorted(buckets.items(), key=lambda item: int(item[0]))),
         }
+        if shared_arenas:
+            summaries = [
+                arena.profile_summary() for arena in shared_arenas.values()
+            ]
+            result["shared_static_input_arena"] = {
+                "enabled": True,
+                "arena_count": len(summaries),
+                "graph_entries": sum(
+                    int(summary["graph_entries"]) for summary in summaries
+                ),
+                "refreshes": sum(
+                    int(summary["refreshes"]) for summary in summaries
+                ),
+                "refresh_copy_calls": sum(
+                    int(summary["refresh_copy_calls"]) for summary in summaries
+                ),
+                "refresh_copy_bytes": sum(
+                    int(summary["refresh_copy_bytes"]) for summary in summaries
+                ),
+                "owned_tensor_bytes": sum(
+                    int(summary["owned_tensor_bytes"]) for summary in summaries
+                ),
+                "avoided_duplicate_graph_input_bytes": sum(
+                    int(summary["avoided_duplicate_graph_input_bytes"])
+                    for summary in summaries
+                ),
+            }
+        return result
