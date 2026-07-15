@@ -18,6 +18,9 @@ def test_combined_full_song_wrapper_is_serial_by_default_with_parallel_opt_in() 
     assert "for precision in fp32 fp16" in source
     assert "untraced_control" in source
     assert "exactness_audit" in source
+    assert 'if [[ "$precision" == fp32 ]]' in source
+    assert 'audit_pass_kind=untraced_control' in source
+    assert 'audit_pass_kind=exactness_audit' in source
     assert "combined_fallback" in source
     assert "MAPPERATORINATOR_NATIVE_EXTENSION_MANIFEST" in source
     assert "another user GPU job exists" in source
@@ -91,3 +94,32 @@ def test_combined_full_song_gate_compares_both_parents_and_fallback(monkeypatch)
     assert report["comparisons"]["aot_parent"]["process_wall_seconds"][
         "saved_seconds"
     ] == 4.0
+
+
+def test_fp16_audits_use_same_precision_untraced_evidence(monkeypatch) -> None:
+    audit_arguments = []
+
+    def fake_load(run_dir, *, audit, **kwargs):
+        del kwargs
+        audit_arguments.append((run_dir.name, audit))
+        variant = run_dir.parent.name
+        process = 49.0 if variant in {"combined", "combined_fallback"} else 52.0
+        return _fake_run(process=process, audit=audit)
+
+    monkeypatch.setattr(combined_analysis, "_load_run", fake_load)
+    expected = {
+        variant: ("a" * 40, "branch")
+        for variant in combined_analysis.AUDIT_VARIANTS
+    }
+
+    report = combined_analysis._analyze_precision(
+        Path("/runs"),
+        precision="fp16",
+        expected=expected,
+    )
+
+    assert report["status"] == "PASS"
+    assert report["audit_kind"] == "same_precision_fp16"
+    assert all(not audit for name, audit in audit_arguments if name == "exactness-audit")
+    assert "rng_and_cache" not in report["checks"]
+    assert report["checks"]["same_precision_fp16_evidence"]

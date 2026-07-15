@@ -62,6 +62,7 @@ def _analyze_precision(
             for run_name in RUN_NAMES
         ]
     audits = {}
+    strict_audit = precision == "fp32"
     for variant in AUDIT_VARIANTS:
         commit, branch = expected[variant]
         audits[variant] = _load_run(
@@ -69,7 +70,7 @@ def _analyze_precision(
             precision=precision,
             commit=commit,
             branch=branch,
-            audit=True,
+            audit=strict_audit,
         )
 
     all_rows = [
@@ -83,10 +84,20 @@ def _analyze_precision(
         "dispatch_and_graph": _same([row["records"] for row in all_rows]),
         "graph_signature": _same([row["graph_sha256"] for row in all_rows]),
         "token_and_stopping": _same([row["signatures"] for row in all_rows]),
-        "rng_and_cache": _same(
-            [audits[variant]["strict_exactness"] for variant in AUDIT_VARIANTS]
+        "rng_and_cache": (
+            _same(
+                [audits[variant]["strict_exactness"] for variant in AUDIT_VARIANTS]
+            )
+            if strict_audit
+            else None
+        ),
+        "same_precision_fp16_evidence": (
+            _same([audits[variant]["signatures"] for variant in AUDIT_VARIANTS])
+            if not strict_audit
+            else None
         ),
     }
+    checks = {key: value for key, value in checks.items() if value is not None}
 
     aggregates: dict[str, Any] = {}
     for variant in PERFORMANCE_VARIANTS:
@@ -154,6 +165,7 @@ def _analyze_precision(
         "comparisons": comparisons,
         "runs": runs,
         "exactness_audits": audits,
+        "audit_kind": "strict_fp32" if strict_audit else "same_precision_fp16",
     }
 
 

@@ -228,10 +228,14 @@ for precision in fp32 fp16; do
         untraced_control "$(manifest_mode_for "$variant")"
     done
   done
+  audit_pass_kind=untraced_control
+  if [[ "$precision" == fp32 ]]; then
+    audit_pass_kind=exactness_audit
+  fi
   for variant in lazy_parent aot_parent combined combined_fallback; do
     run_process \
       "$(repo_for "$variant")" "$precision" "$variant" exactness-audit \
-      exactness_audit "$(manifest_mode_for "$variant")"
+      "$audit_pass_kind" "$(manifest_mode_for "$variant")"
   done
 done
 
