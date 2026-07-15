@@ -16,8 +16,8 @@ from pathlib import Path
 import random
 
 import hydra
-import numpy as np
 import torch
+from accelerate.utils import set_seed
 from omegaconf import OmegaConf, DictConfig
 from slider import Beatmap
 from transformers.utils import cached_file, is_flash_attn_2_available
@@ -133,10 +133,7 @@ def setup_inference_environment(seed: int, *, strict_fp32: bool = False):
         torch.backends.cudnn.allow_tf32 = False
     else:
         torch.set_float32_matmul_precision("high")
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    set_seed(seed)
 
 
 def compile_device_and_seed(args: InferenceConfig, verbose=True):
