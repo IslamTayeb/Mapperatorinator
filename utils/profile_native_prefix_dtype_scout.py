@@ -876,7 +876,12 @@ def _accepted_main_session_run(args, *, output_path: Path):
     from osuT5.osuT5.inference import Processor
 
     compile_args(args, verbose=False)
-    setup_inference_environment(args.seed)
+    setup_inference_environment(
+        args.seed,
+        strict_fp32=(
+            args.inference_engine == "optimized" and args.precision == "fp32"
+        ),
+    )
     binding, tokenizer = load_model_with_engine(
         args.model_path,
         args.train,

@@ -7,6 +7,7 @@ import pytest
 from utils.profile_shared_rope_scout import (
     REQUIRED_MAIN_SAVING_SECONDS,
     SCHEMA_VERSION,
+    _strict_fp32_environment,
     _validate_live_accepted_graph_cache,
     _validate_report,
     decision_exit_code,
@@ -91,6 +92,33 @@ def test_short_loop_source_caps_replays_at_fixed_prefix_boundary():
 
     assert "safe_steps = min(steps, active_prefix_length - cache_position)" in source
     assert '"executed_steps": len(accepted_tokens)' in source
+
+
+def test_component_profiler_requires_strict_fp32_environment(monkeypatch):
+    import torch
+
+    monkeypatch.setenv("NVIDIA_TF32_OVERRIDE", "0")
+    torch.set_float32_matmul_precision("highest")
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+
+    assert _strict_fp32_environment() == {
+        "float32_matmul_precision": "highest",
+        "cuda_matmul_allow_tf32": False,
+        "cudnn_allow_tf32": False,
+        "nvidia_tf32_override": "0",
+    }
+
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", True)
+    with pytest.raises(RuntimeError, match="strict FP32 environment"):
+        _strict_fp32_environment()
+
+
+def test_accepted_capture_requests_strict_fp32_setup():
+    source = (ROOT / "utils/profile_native_prefix_dtype_scout.py").read_text()
+
+    assert 'strict_fp32=(' in source
+    assert 'args.inference_engine == "optimized" and args.precision == "fp32"' in source
 
 
 def test_live_graph_manifest_requires_exact_current_bucket_topology():
@@ -204,6 +232,7 @@ def test_dcc_wrapper_is_exact_clean_opt_in_and_retains_negative_report():
     assert 'git -C "$REPO" branch --show-current' in source
     assert 'git -C "$REPO" rev-parse "${REMOTE_REF}^{commit}"' in source
     assert "utils/profile_shared_rope_scout.py" in source
+    assert "export NVIDIA_TF32_OVERRIDE=0" in source
     assert "--warmup 100" in source
     assert "--iters 1000" in source
     assert 'PROFILE_EXIT" -ne 0 && "$PROFILE_EXIT" -ne 3' in source

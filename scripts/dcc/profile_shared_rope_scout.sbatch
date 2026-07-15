@@ -69,6 +69,7 @@ export CUDA_CACHE_PATH="$WORK/cache/cuda"
 export TORCH_EXTENSIONS_DIR="$WORK/torch_extensions"
 export TMPDIR="$WORK/tmp"
 export TOKENIZERS_PARALLELISM=false
+export NVIDIA_TF32_OVERRIDE=0
 export PATH="$(dirname "$PYTHON"):$PATH"
 
 for tool in ffmpeg ffprobe; do
