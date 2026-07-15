@@ -10,6 +10,17 @@ import runpy
 import sys
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _ensure_repo_import_path() -> Path:
+    """Make direct file execution resolve the repository's Python packages."""
+    root = str(REPO_ROOT)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    return REPO_ROOT
+
+
 def _parse_runner_args(argv: list[str]) -> tuple[Path, list[str]]:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--activation-manifest", type=Path, required=True)
@@ -26,11 +37,13 @@ def main() -> None:
     if manifest_path.exists():
         raise FileExistsError(f"refusing to overwrite {manifest_path}")
 
+    _ensure_repo_import_path()
+
     from osuT5.osuT5.inference.optimized.scout.device_sequence_state import (
         device_sequence_state_candidate_context,
     )
 
-    inference_script = Path(__file__).resolve().parents[1] / "inference.py"
+    inference_script = REPO_ROOT / "inference.py"
     with device_sequence_state_candidate_context() as activation:
         sys.argv = [str(inference_script), *inference_args]
         runpy.run_path(str(inference_script), run_name="__main__")

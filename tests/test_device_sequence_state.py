@@ -23,7 +23,11 @@ from osuT5.osuT5.inference.optimized.scout.device_sequence_state import (
 from osuT5.osuT5.inference.optimized.single.decode_loop import (
     active_prefix_decode_generate,
 )
-from utils.run_device_sequence_state_candidate import _parse_runner_args
+from utils.run_device_sequence_state_candidate import (
+    REPO_ROOT as RUNNER_REPO_ROOT,
+    _ensure_repo_import_path,
+    _parse_runner_args,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -242,6 +246,14 @@ def test_candidate_runner_preserves_hydra_arguments() -> None:
         "profile_salvalai",
         "precision=fp16",
     ]
+
+
+def test_candidate_runner_adds_repo_root_for_direct_file_execution(monkeypatch) -> None:
+    filtered = [entry for entry in sys.path if entry != str(RUNNER_REPO_ROOT)]
+    monkeypatch.setattr(sys, "path", filtered)
+
+    assert _ensure_repo_import_path() == RUNNER_REPO_ROOT
+    assert sys.path[0] == str(RUNNER_REPO_ROOT)
 
 
 def test_reciprocal_wrapper_is_serial_by_default_with_explicit_parallel_opt_in() -> None:
