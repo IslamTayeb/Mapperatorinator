@@ -5,9 +5,94 @@ from __future__ import annotations
 import torch
 
 from ...logit_processors import (
+    ConditionalTemperatureLogitsWarper as _V32ConditionalTemperatureLogitsWarper,
     MonotonicTimeShiftLogitsProcessor as _V32MonotonicTimeShiftLogitsProcessor,
     build_logits_processor_list,
 )
+
+
+class ConditionalTemperatureLogitsWarper(
+    _V32ConditionalTemperatureLogitsWarper
+):
+    """Device-only batch-1 specialization with V32 batched fallback."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._condition_tokens_by_device: dict[
+            tuple[int, torch.device, torch.dtype], torch.Tensor
+        ] = {}
+        self._temperatures_by_device: dict[
+            tuple[float, torch.device, torch.dtype], torch.Tensor
+        ] = {}
+
+    def _temperature_tensor(
+        self,
+        temperature: float,
+        scores: torch.Tensor,
+    ) -> torch.Tensor:
+        key = (float(temperature), scores.device, scores.dtype)
+        value = self._temperatures_by_device.get(key)
+        if value is None:
+            value = torch.tensor(
+                temperature,
+                dtype=scores.dtype,
+                device=scores.device,
+            )
+            self._temperatures_by_device[key] = value
+        return value
+
+    def _condition_tokens(
+        self,
+        index: int,
+        tokens: tuple[int, ...],
+        input_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        key = (index, input_ids.device, input_ids.dtype)
+        value = self._condition_tokens_by_device.get(key)
+        if value is None:
+            value = torch.tensor(
+                tokens,
+                dtype=input_ids.dtype,
+                device=input_ids.device,
+            )
+            self._condition_tokens_by_device[key] = value
+        return value
+
+    def __call__(
+        self,
+        input_ids: torch.LongTensor,
+        scores: torch.FloatTensor,
+    ) -> torch.Tensor:
+        if not self.conditionals or input_ids.shape[0] != 1:
+            return super().__call__(input_ids, scores)
+        if scores.shape[0] != 1:
+            raise ValueError(
+                "optimized conditional temperature requires matching batch-1 scores"
+            )
+        if input_ids.device != scores.device:
+            raise ValueError(
+                "optimized conditional temperature requires tokens and scores "
+                "on one device"
+            )
+
+        selected = self._temperature_tensor(self.temperature, scores)
+        # Reverse traversal preserves the V32 first-match precedence without a
+        # data-dependent host branch: earlier conditions overwrite later ones.
+        for index in range(len(self.conditionals) - 1, -1, -1):
+            temperature, tokens, offset = self.conditionals[index]
+            if input_ids.shape[1] < offset:
+                continue
+            condition_tokens = self._condition_tokens(index, tokens, input_ids)
+            matches = torch.eq(
+                input_ids[0, -offset],
+                condition_tokens,
+            ).any()
+            selected = torch.where(
+                matches,
+                self._temperature_tensor(temperature, scores),
+                selected,
+            )
+        return scores / selected
 
 
 class MonotonicTimeShiftLogitsProcessor(_V32MonotonicTimeShiftLogitsProcessor):
@@ -126,11 +211,17 @@ def build_single_logits_processor_list(
     lookback_time: float = 0.0,
     device=None,
     stateful_monotonic: bool = True,
+    device_conditional_temperature: bool = True,
 ):
     monotonic_factory = (
         MonotonicTimeShiftLogitsProcessor
         if stateful_monotonic
         else _V32MonotonicTimeShiftLogitsProcessor
+    )
+    conditional_temperature_factory = (
+        ConditionalTemperatureLogitsWarper
+        if device_conditional_temperature
+        else _V32ConditionalTemperatureLogitsWarper
     )
     return build_logits_processor_list(
         tokenizer,
@@ -144,4 +235,5 @@ def build_single_logits_processor_list(
         lookback_time=lookback_time,
         device=device,
         monotonic_processor_factory=monotonic_factory,
+        conditional_temperature_factory=conditional_temperature_factory,
     )

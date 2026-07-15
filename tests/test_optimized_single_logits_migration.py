@@ -5,9 +5,11 @@ import torch
 
 from osuT5.osuT5.event import EventType
 from osuT5.osuT5.inference.logit_processors import (
+    ConditionalTemperatureLogitsWarper as V32ConditionalTemperatureLogitsWarper,
     MonotonicTimeShiftLogitsProcessor as V32MonotonicTimeShiftLogitsProcessor,
 )
 from osuT5.osuT5.inference.optimized.single.logits import (
+    ConditionalTemperatureLogitsWarper as OptimizedConditionalTemperatureLogitsWarper,
     MonotonicTimeShiftLogitsProcessor as OptimizedMonotonicTimeShiftLogitsProcessor,
 )
 
@@ -76,3 +78,69 @@ def test_optimized_monotonic_matches_v32_full_scan_for_random_inputs(batch_size)
             _apply(full_scan, input_ids, scores),
             _apply(candidate, input_ids, scores),
         )
+
+
+def _conditional_temperature(cls):
+    return cls(
+        temperature=0.9,
+        timing_temperature=0.1,
+        mania_column_temperature=0.8,
+        taiko_hit_temperature=0.7,
+        types_first=True,
+        beat_type_tokens=(10, 11),
+        mania_type_tokens=(20, 21),
+        scroll_speed_tokens=(30, 31),
+    )
+
+
+@pytest.mark.parametrize(
+    "tokens",
+    [
+        [0],
+        [0, 10],
+        [20, 0, 0],
+        [20, 0, 10],
+        [30, 0, 11],
+        [0, 0, 0, 0],
+    ],
+)
+def test_device_conditional_temperature_matches_v32_batch1_exactly(tokens):
+    baseline = _conditional_temperature(V32ConditionalTemperatureLogitsWarper)
+    candidate = _conditional_temperature(
+        OptimizedConditionalTemperatureLogitsWarper
+    )
+    input_ids = torch.tensor([tokens], dtype=torch.long)
+    scores = torch.tensor(
+        [[-3.25, -0.0, 0.1, 1.0, 19.75]],
+        dtype=torch.float32,
+    )
+
+    assert torch.equal(
+        _apply(baseline, input_ids, scores),
+        _apply(candidate, input_ids, scores),
+    )
+
+
+def test_device_conditional_temperature_matches_v32_batched_fallback():
+    baseline = _conditional_temperature(V32ConditionalTemperatureLogitsWarper)
+    candidate = _conditional_temperature(
+        OptimizedConditionalTemperatureLogitsWarper
+    )
+    input_ids = torch.tensor(
+        [[20, 0, 10], [20, 0, 0], [0, 0, 30]],
+        dtype=torch.long,
+    )
+    scores = torch.arange(15, dtype=torch.float32).reshape(3, 5) - 7
+
+    assert torch.equal(
+        _apply(baseline, input_ids, scores),
+        _apply(candidate, input_ids, scores),
+    )
+
+
+def test_device_conditional_temperature_rejects_mismatched_batch1_devices():
+    candidate = _conditional_temperature(
+        OptimizedConditionalTemperatureLogitsWarper
+    )
+    with pytest.raises(ValueError, match="matching batch-1 scores"):
+        candidate(torch.tensor([[10]]), torch.zeros((2, 4)))

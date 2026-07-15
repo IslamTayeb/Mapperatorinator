@@ -39,7 +39,7 @@ class OptimizedPreset:
 OPTIMIZED_PRESETS = MappingProxyType(
     {
         "fp32": OptimizedPreset(
-            version="accepted-fp32-native-cross-mlp-289-v3",
+            version="candidate-strict-fp32-device-temperature-v1",
             result_class="documented-drift",
             precision="fp32",
             torch_dtype=torch.float32,
@@ -131,6 +131,7 @@ def _optimized_config_metadata(preset: OptimizedPreset) -> dict[str, Any]:
         "native_q1_self_attention": True,
         "native_q1_rope_cache_self_attention": True,
         "native_cross_mlp_tail": True,
+        "device_conditional_temperature": preset.precision == "fp32",
     }
 
 
@@ -277,6 +278,7 @@ def _generate_window(
         lookback_time=lookback_time,
         device=model.device,
         stateful_monotonic=specialized_batch,
+        device_conditional_temperature=preset.precision == "fp32",
     )
     cache = context_state.cache_for_window(
         model,

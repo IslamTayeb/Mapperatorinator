@@ -58,9 +58,9 @@ def _loader_kwargs(**overrides):
     return values
 
 
-def test_runtime_metadata_exposes_two_fixed_accepted_presets():
+def test_runtime_metadata_exposes_strict_fp32_candidate_and_accepted_fp16():
     expected_versions = {
-        "fp32": "accepted-fp32-native-cross-mlp-289-v3",
+        "fp32": "candidate-strict-fp32-device-temperature-v1",
         "fp16": "accepted-fp16-all-fused-v2",
     }
     for precision, version in expected_versions.items():
@@ -90,6 +90,7 @@ def test_runtime_metadata_exposes_two_fixed_accepted_presets():
             "native_q1_self_attention": True,
             "native_q1_rope_cache_self_attention": True,
             "native_cross_mlp_tail": True,
+            "device_conditional_temperature": precision == "fp32",
         }
 
 
@@ -573,6 +574,7 @@ def test_optimized_public_loader_defaults_to_fp32_preset():
 
 def test_generate_window_preserves_custom_generate_dispatch(monkeypatch):
     captured = {}
+    processor_kwargs = {}
 
     class FakeModel:
         dtype = torch.float32
@@ -592,10 +594,14 @@ def test_generate_window_preserves_custom_generate_dispatch(monkeypatch):
         def graph_profile_summary(self):
             return {"graphs": []}
 
+    def fake_processors(*args, **kwargs):
+        processor_kwargs.update(kwargs)
+        return object()
+
     monkeypatch.setattr(
         engine_module,
         "_build_logits_processor_list",
-        lambda *args, **kwargs: object(),
+        fake_processors,
     )
     monkeypatch.setattr(
         engine_module,
@@ -628,6 +634,7 @@ def test_generate_window_preserves_custom_generate_dispatch(monkeypatch):
     custom_generate = captured["custom_generate"]
     assert isinstance(custom_generate, partial)
     assert custom_generate.func is engine_module.active_prefix_decode_generate
+    assert processor_kwargs["device_conditional_temperature"] is True
 
 
 def test_shared_calculation_helpers_preserve_legacy_server_results():

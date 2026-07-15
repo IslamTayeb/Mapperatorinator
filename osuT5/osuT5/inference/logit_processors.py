@@ -250,8 +250,9 @@ def build_logits_processor_list(
     lookback_time: float = 0.0,
     device=None,
     monotonic_processor_factory=MonotonicTimeShiftLogitsProcessor,
+    conditional_temperature_factory=ConditionalTemperatureLogitsWarper,
 ):
-    """Build the shared processor chain with a runtime-owned monotonic policy."""
+    """Build the shared processor chain with runtime-owned processor policies."""
 
     from transformers import (
         ClassifierFreeGuidanceLogitsProcessor,
@@ -282,7 +283,7 @@ def build_logits_processor_list(
         )
     if types_first:
         processors.append(
-            ConditionalTemperatureLogitsWarper(
+            conditional_temperature_factory(
                 temperature,
                 timing_temperature,
                 mania_column_temperature,
