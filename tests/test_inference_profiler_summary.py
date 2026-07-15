@@ -91,9 +91,13 @@ def test_detail_ranges_require_profile_and_restore_after_stage(monkeypatch):
 
 def test_only_untraced_control_is_authoritative():
     control = InferenceProfiler(enabled=True, pass_kind="untraced_control")
+    exactness = InferenceProfiler(enabled=True, pass_kind="exactness_audit")
     traced = InferenceProfiler(enabled=True, pass_kind="nsys_graph")
 
     assert control.metadata["authoritative_performance"] is True
+    assert control.metadata["strict_exactness_evidence"] is False
+    assert exactness.metadata["authoritative_performance"] is False
+    assert exactness.metadata["strict_exactness_evidence"] is True
     assert traced.metadata["authoritative_performance"] is False
     with pytest.raises(ValueError, match="profile_pass_kind"):
         InferenceProfiler(enabled=True, pass_kind="traced-but-unclassified")

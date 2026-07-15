@@ -19,6 +19,7 @@ from ...generation_utils import (
     sync_cuda_for_model,
 )
 from .decode_loop import active_prefix_decode_generate
+from .exactness import cache_write_signature, rng_progression_signature
 from .logits import build_single_logits_processor_list
 from .state import ProductionDecodeSession
 
@@ -221,6 +222,9 @@ def _generate_window(
     lookahead_time = generate_kwargs.pop("lookahead_time", 0.0)
     context_type = generate_kwargs.pop("context_type", None)
     sync_model_timing = bool(generate_kwargs.pop("sync_model_timing", False))
+    collect_strict_exactness = bool(
+        generate_kwargs.pop("collect_strict_exactness", False)
+    )
     if context_type is not None:
         context_type = ContextType(context_type)
     if precision != preset.precision or cfg_scale != 1.0:
@@ -229,6 +233,13 @@ def _generate_window(
         raise ValueError("optimized single runtime requires batch_size=1.")
     if int(generate_kwargs.get("num_beams", 1)) != 1:
         raise ValueError("optimized single runtime requires num_beams=1.")
+    if collect_strict_exactness:
+        if precision != "fp32":
+            raise ValueError("strict exactness evidence requires FP32 inference")
+        if not sync_model_timing:
+            raise ValueError(
+                "strict exactness evidence requires synchronized profiling"
+            )
 
     if specialized_dispatch_batch_size is not None and (
         specialized_dispatch_batch_size <= 0
@@ -299,6 +310,11 @@ def _generate_window(
         "native_cross_mlp_tail": 0,
     }
 
+    rng_before = (
+        rng_progression_signature(model.device)
+        if collect_strict_exactness
+        else None
+    )
     with torch.autocast(
         device_type=model.device.type,
         dtype=torch.bfloat16,
@@ -331,6 +347,27 @@ def _generate_window(
         if sync_model_timing:
             sync_cuda_for_model(model)
         elapsed_seconds = time.perf_counter() - start_time
+
+    strict_exactness = None
+    if collect_strict_exactness:
+        with profile_range("generation.strict_exactness_evidence"):
+            rng_after = rng_progression_signature(model.device)
+            # The loop forwards the full prompt, then appends one sampled token
+            # after each forward. It exits immediately after appending the final
+            # stopped token, so that last token has not been forwarded or cached.
+            self_sequence_length = int(result.shape[-1]) - 1
+            strict_exactness = {
+                "schema_version": 1,
+                "timing_class": "non_authoritative_outside_model_elapsed",
+                "rng_before": rng_before,
+                "rng_after": rng_after,
+                "cache_writes": cache_write_signature(
+                    cache,
+                    self_sequence_length=self_sequence_length,
+                    expected_dtype=expected_dtype,
+                    expected_device=model.device,
+                ),
+            }
 
     with profile_range("generation.final_device_to_host"):
         result = result.cpu()
@@ -420,6 +457,8 @@ def _generate_window(
         ),
         "optimized_cuda_graphs": context_state.graph_profile_summary(),
     })
+    if strict_exactness is not None:
+        stats["strict_exactness"] = strict_exactness
     return result, stats
 
 

@@ -190,6 +190,11 @@ class Processor(object):
             sync_model_timing=self.profiler.enabled,
         )
         if self.inference_runtime is not None:
+            generate_kwargs2["collect_strict_exactness"] = (
+                self.profiler.enabled
+                and self.profiler.pass_kind == "exactness_audit"
+            )
+        if self.inference_runtime is not None:
             if self.decode_session_state is None:
                 self.decode_session_state = self._new_decode_session_state()
             return self.inference_runtime.generate_window(
@@ -1586,6 +1591,7 @@ class Processor(object):
             "decode_graph_capture_seconds_delta",
             "decode_graph_replays_delta",
             "optimized_cuda_graphs",
+            "strict_exactness",
         ):
             if stats.get(key) is not None:
                 record[key] = stats[key]
