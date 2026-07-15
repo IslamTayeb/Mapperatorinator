@@ -26,6 +26,7 @@ WORK=${MAPPERATORINATOR_WORK:-/work/imt11/Mapperatorinator}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 EXPECTED_GPU=${MAPPERATORINATOR_EXPECTED_GPU:-2080 Ti}
 EXPECTED_MAIN_TOKENS=${MAPPERATORINATOR_EXPECTED_MAIN_TOKENS:-8294}
+EXPECTED_TIMING_TOKENS=${MAPPERATORINATOR_EXPECTED_TIMING_TOKENS:-821}
 RUN_LABEL=${RUN_LABEL:-strict-fp32-untraced-budget}
 RUN_ROOT="$WORK/runs/${RUN_LABEL}-${SLURM_JOB_ID}"
 MIN_AVAILABLE_KIB=$((20 * 1024 * 1024))
@@ -173,14 +174,20 @@ BUDGET_PROFILE=$(<"$RUN_ROOT/untraced_budget/profile-path.txt")
   --output "$RUN_ROOT/budget-summary.json" \
   --text-output "$RUN_ROOT/budget-summary.txt"
 [[ -s "$RUN_ROOT/budget-summary.json" ]] || die "missing budget summary"
+[[ -s "$RUN_ROOT/budget-summary.txt" ]] || die "missing budget text summary"
 
-"$PYTHON" - "$RUN_ROOT/budget-summary.json" "$RUN_ROOT/transparency.json" "$EXPECTED_MAIN_TOKENS" <<'PY'
+"$PYTHON" - \
+  "$RUN_ROOT/budget-summary.json" \
+  "$RUN_ROOT/transparency.json" \
+  "$EXPECTED_MAIN_TOKENS" \
+  "$EXPECTED_TIMING_TOKENS" <<'PY'
 import json
 import sys
 
 summary = json.load(open(sys.argv[1], encoding="utf-8"))
 transparency = json.load(open(sys.argv[2], encoding="utf-8"))
 expected_tokens = int(sys.argv[3])
+expected_timing_tokens = int(sys.argv[4])
 if not summary.get("pass"):
     raise SystemExit("budget reconciliation failed")
 if not transparency.get("pass"):
@@ -195,6 +202,16 @@ if int(main.get("generated_tokens", -1)) != expected_tokens:
     )
 if float(main.get("reconciliation_error_fraction", 1.0)) > 0.02:
     raise SystemExit("main-generation budget did not reconcile within 2%")
+timing = summary.get("by_label", {}).get("timing_context")
+if not isinstance(timing, dict):
+    raise SystemExit("budget summary is missing timing_context")
+if int(timing.get("generated_tokens", -1)) != expected_timing_tokens:
+    raise SystemExit(
+        f"expected {expected_timing_tokens} fixed-work timing tokens, "
+        f"got {timing.get('generated_tokens')}"
+    )
+if float(timing.get("reconciliation_error_fraction", 1.0)) > 0.02:
+    raise SystemExit("timing-generation budget did not reconcile within 2%")
 PY
 
 echo "PASS_UNTRACED_BUDGET run_root=$RUN_ROOT"

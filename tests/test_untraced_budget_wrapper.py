@@ -34,6 +34,9 @@ def test_wrapper_is_serial_strict_fp32_and_pins_pushed_worktree() -> None:
     assert "transparency" in source
     assert "summarize_untraced_budget.py" in source
     assert "reconcile within 2%" in source
+    assert "EXPECTED_MAIN_TOKENS" in source and "8294" in source
+    assert "EXPECTED_TIMING_TOKENS" in source and "821" in source
+    assert "missing budget text summary" in source
     assert "sha256sums.txt" in source
 
 

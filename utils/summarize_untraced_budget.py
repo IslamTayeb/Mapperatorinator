@@ -617,6 +617,19 @@ def _text_report(report: dict[str, Any]) -> str:
             f"cuda_s:{region['cuda_event_seconds']:.9f},"
             f"copies:{region['copy_count']},bytes:{region['copy_bytes']}"
         )
+    for name in EXTERNAL_TRANSFER_NAMES:
+        transfer = overall["external_transfers"][name]
+        lines.append(
+            f"external_transfer.{name}=calls:{transfer['calls']},"
+            f"host_s:{transfer['host_wall_seconds']:.9f},"
+            f"copies:{transfer['copy_count']},bytes:{transfer['copy_bytes']}"
+        )
+    for direction in COPY_DIRECTIONS:
+        lines.append(
+            f"transition.{direction}=count:"
+            f"{overall['transition_count_by_direction'][direction]},bytes:"
+            f"{overall['transition_bytes_by_direction'][direction]}"
+        )
     paired = report.get("paired_control")
     if isinstance(paired, dict) and isinstance(paired.get("overall"), dict):
         comparison = paired["overall"]
