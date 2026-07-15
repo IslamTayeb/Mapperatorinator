@@ -72,12 +72,13 @@ def test_validate_batch_sizes_fails_loudly_above_configured_cap():
         validate_batch_sizes((1, 2, 4, 8, 16), max_batch_size=8)
 
 
-def test_accepted_args_rejects_non_fp32_or_nonaccepted_runtime():
+def test_accepted_args_accepts_shared_fp32_fp16_and_rejects_other_runtime():
     _assert_accepted_args(_accepted_args())
+    _assert_accepted_args(_accepted_args(precision="fp16"))
 
-    with pytest.raises(ValueError, match="accepted FP32 runtime"):
-        _assert_accepted_args(_accepted_args(precision="fp16"))
-    with pytest.raises(ValueError, match="accepted FP32 runtime"):
+    with pytest.raises(ValueError, match="fp32 or fp16"):
+        _assert_accepted_args(_accepted_args(precision="bf16"))
+    with pytest.raises(ValueError, match="accepted runtime"):
         _assert_accepted_args(_accepted_args(inference_engine="v32"))
 
 
