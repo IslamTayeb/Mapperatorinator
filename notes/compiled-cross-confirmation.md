@@ -11,3 +11,4 @@
   and job-local torch_extensions / TORCHINDUCTOR cache under the run root.
 - Do not compose DP4A (49908852 DROP). Do not claim cold one-off win (AOT/setup ~13s).
 - Mode: AOT/persistent compile path; `max-autotune-no-cudagraphs` (scout 49906034).
+- Graduation detail: `notes/compiled-cross-graduation.md` (independence + non-additive TPS caveat).
