@@ -11,6 +11,7 @@
 
 set -euo pipefail
 
+SLURM_JOB_ID=${SLURM_JOB_ID:?Submit this wrapper through Slurm}
 ENV=${MAPPERATORINATOR_ENV:-/hpc/group/romerolab/imt11/envs/mapperatorinator}
 PYTHON=${MAPPERATORINATOR_PYTHON:-$ENV/bin/python}
 WORK=${MAPPERATORINATOR_WORK:-/work/imt11/Mapperatorinator}
@@ -22,7 +23,7 @@ AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_ROOT="$WORK/runs/fp16-split-kv-q1-component-${SLURM_JOB_ID:-manual}"
 
 export PATH="$(dirname "$PYTHON"):$PATH"
-for tool in "$PYTHON" ffmpeg ffprobe nvidia-smi; do
+for tool in "$PYTHON" ffmpeg ffprobe nvidia-smi scontrol squeue; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "missing required tool: $tool" >&2
     exit 2
@@ -75,17 +76,25 @@ if [[ "$GPU_NAME" != "NVIDIA GeForce RTX 2080 Ti" || "$GPU_CAPABILITY" != "75" ]
   echo "FP16 split-KV component requires RTX 2080 Ti SM75, got $GPU_NAME sm_$GPU_CAPABILITY" >&2
   exit 2
 fi
+mapfile -t OTHER_GPU_JOBS < <(
+  squeue -h -u "$USER" -t RUNNING,PENDING -o '%A|%b|%j' \
+    | awk -F'|' -v current="$SLURM_JOB_ID" \
+        '$1 != current && tolower($2) ~ /gpu/ { print }'
+)
+if [[ ${#OTHER_GPU_JOBS[@]} -ne 0 ]]; then
+  printf '%s\n' "${OTHER_GPU_JOBS[@]}" >&2
+  echo "another GPU job is running or pending" >&2
+  exit 2
+fi
 
 echo "host=$(hostname)"
-echo "job_id=${SLURM_JOB_ID:-manual}"
+echo "job_id=$SLURM_JOB_ID"
 echo "commit=$COMMIT"
 echo "branch=$BRANCH"
 echo "repo=$REPO"
 echo "python=$PYTHON"
 echo "run_root=$RUN_ROOT"
-if [[ -n "${SLURM_JOB_ID:-}" ]]; then
-  scontrol show job -o "$SLURM_JOB_ID"
-fi
+scontrol show job -o "$SLURM_JOB_ID"
 nvidia-smi --query-gpu=name,uuid,driver_version,memory.total --format=csv,noheader
 
 cd "$REPO"
