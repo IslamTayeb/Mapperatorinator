@@ -303,6 +303,7 @@ def _inference_profile(
     dispatch_hits: int = 4,
     graph_capture_seconds: float = 0.5,
     graph_decode_replays: int = 12,
+    pass_kind: str = "untraced_control",
 ) -> Path:
     main_tokens = [1, 2, 3] if main_tokens is None else main_tokens
     metadata = {
@@ -341,6 +342,12 @@ def _inference_profile(
         },
         "optimized_runtime_owner": "optimized.single.engine",
         "optimized_result_class": "documented-drift",
+        "profile_pass_kind": pass_kind,
+        "authoritative_performance": pass_kind == "untraced_control",
+        "float32_matmul_precision": "highest",
+        "cuda_matmul_allow_tf32": False,
+        "cudnn_allow_tf32": False,
+        "nvidia_tf32_override": "0",
         "result_file_sha256": "osu-hash",
         "result_file_size_bytes": 500,
     }
@@ -383,6 +390,67 @@ def _inference_profile(
         encoding="utf-8",
     )
     return path
+
+
+def test_strict_fp32_profile_contract_accepts_control_and_traced_passes(
+    tmp_path: Path,
+) -> None:
+    control = _inference_profile(tmp_path / "control.json")
+    traced = _inference_profile(
+        tmp_path / "traced.json",
+        pass_kind="nsys_graph",
+    )
+
+    control_report = nsight.validate_strict_fp32_profile(control)
+    traced_report = nsight.validate_strict_fp32_profile(traced)
+
+    assert control_report["status"] == "PASS"
+    assert control_report["authoritative_performance"] is True
+    assert traced_report["status"] == "PASS"
+    assert traced_report["authoritative_performance"] is False
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("precision", "fp16"),
+        ("float32_matmul_precision", "high"),
+        ("cuda_matmul_allow_tf32", True),
+        ("cudnn_allow_tf32", True),
+        ("nvidia_tf32_override", None),
+    ],
+)
+def test_strict_fp32_profile_contract_rejects_precision_or_tf32_drift(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    path = _inference_profile(tmp_path / f"{field}.json")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["metadata"][field] = value
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(nsight.NsightProfileError, match="strict FP32 profile contract"):
+        nsight.validate_strict_fp32_profile(path)
+
+
+def test_text_summary_separates_model_outer_trace_and_profiler_overhead(
+    tmp_path: Path,
+) -> None:
+    control = _run("control", pass_kind="untraced_control")
+    traced = _run(
+        "traced",
+        pass_kind="nsys_node",
+        paired_control="control",
+    )
+    manifest = _manifest(tmp_path / "manifest.json", [control, traced])
+
+    text = nsight.render_text_summary(nsight.analyze_manifest(manifest))
+
+    assert "main_generation: tokens=8 model_s=" in text
+    assert "outer_s=" in text
+    assert "traced_tps_authoritative=false" in text
+    assert "overhead traced vs control main_generation:" in text
 
 
 def test_native_kernel_csv_preserves_exact_identity_and_classifies_family(tmp_path):

@@ -104,6 +104,15 @@ PROFILE_PRESET_KEYS = (
     "optimized_runtime_owner",
     "optimized_result_class",
 )
+STRICT_FP32_METADATA = {
+    "precision": "fp32",
+    "inference_engine": "optimized",
+    "attn_implementation": "sdpa",
+    "float32_matmul_precision": "highest",
+    "cuda_matmul_allow_tf32": False,
+    "cudnn_allow_tf32": False,
+    "nvidia_tf32_override": "0",
+}
 PROFILE_GRAPH_CACHE_RECORD_KEYS = (
     "decoder_loop_backend",
     "torch_compile_enabled",
@@ -2234,6 +2243,62 @@ def _load_inference_profile(path: Path) -> dict[str, Any]:
     return payload
 
 
+def validate_strict_fp32_profile(path: Path) -> dict[str, Any]:
+    """Fail unless an inference profile proves strict FP32 with TF32 disabled."""
+
+    path = path.resolve()
+    profile = _load_inference_profile(path)
+    metadata = profile["metadata"]
+    failures = {
+        key: {"expected": expected, "actual": metadata.get(key)}
+        for key, expected in STRICT_FP32_METADATA.items()
+        if metadata.get(key) != expected
+    }
+    pass_kind = metadata.get("profile_pass_kind")
+    if pass_kind not in PASS_KINDS:
+        failures["profile_pass_kind"] = {
+            "expected": sorted(PASS_KINDS),
+            "actual": pass_kind,
+        }
+    expected_authoritative = pass_kind == "untraced_control"
+    if metadata.get("authoritative_performance") is not expected_authoritative:
+        failures["authoritative_performance"] = {
+            "expected": expected_authoritative,
+            "actual": metadata.get("authoritative_performance"),
+        }
+    effective = metadata.get("optimized_effective_config")
+    effective_precision = (
+        effective.get("precision") if isinstance(effective, dict) else None
+    )
+    if effective_precision != "fp32":
+        failures["optimized_effective_config.precision"] = {
+            "expected": "fp32",
+            "actual": effective_precision,
+        }
+    generation_precisions = sorted(
+        {
+            str(record.get("precision"))
+            for record in profile["generation"]
+            if isinstance(record, dict) and record.get("precision") is not None
+        }
+    )
+    if generation_precisions != ["fp32"]:
+        failures["generation.precision"] = {
+            "expected": ["fp32"],
+            "actual": generation_precisions,
+        }
+    if failures:
+        raise NsightProfileError(f"strict FP32 profile contract failed: {failures}")
+    return {
+        "status": "PASS",
+        "profile": str(path),
+        "profile_pass_kind": pass_kind,
+        "authoritative_performance": expected_authoritative,
+        "runtime": dict(STRICT_FP32_METADATA),
+        "generation_precisions": generation_precisions,
+    }
+
+
 def _profile_precision(profile: Mapping[str, Any], *, path: Path) -> str:
     values = {str(profile["metadata"].get("precision", ""))}
     values.update(
@@ -2944,10 +3009,21 @@ def render_text_summary(summary: Mapping[str, Any]) -> str:
             perf = stage["performance"]
             tps = perf["tps"]
             authority = "authoritative" if tps["authoritative"] else "diagnostic"
+            model_ns = perf["synchronized_model_ns"]
+            outer_ns = perf["outer_wall_ns"]
             lines.append(
                 f"{run_id} {stage_name}: tokens={perf['generated_tokens']} "
+                f"model_s={model_ns / 1_000_000_000 if model_ns is not None else None} "
+                f"outer_s={outer_ns / 1_000_000_000 if outer_ns is not None else None} "
                 f"tps={tps['value']} ({authority})"
             )
+            trace = stage["trace_window"]
+            if trace.get("status") == "available":
+                lines.append(
+                    f"  gpu trace: busy_union_ns={trace['gpu_busy_union_ns']} "
+                    f"kernel_accumulated_ns={trace['kernel_accumulated_ns']} "
+                    f"window_ns={trace['wall_ns']}"
+                )
             for kernel in stage["top_kernels"][:5]:
                 lines.append(
                     f"  kernel {kernel['raw_name']}: total_ns={kernel['total_ns']} "
@@ -2965,6 +3041,18 @@ def render_text_summary(summary: Mapping[str, Any]) -> str:
             lines.append(
                 f"{run_id} postprocessing: timing_ns={timing_post['total_ns']} "
                 f"main_ns={main_post['total_ns']}"
+            )
+    for comparison in summary["comparisons"]:
+        if comparison.get("comparison_type") != "profiler_transparency":
+            continue
+        for stage_name, stage in comparison["stages"].items():
+            overhead = stage["profiler_overhead"]
+            lines.append(
+                f"overhead {comparison['traced_run_id']} vs "
+                f"{comparison['control_run_id']} {stage_name}: "
+                f"model_pct={overhead['model_delta_percent']} "
+                f"outer_pct={overhead['outer_delta_percent']} "
+                "traced_tps_authoritative=false"
             )
     lines.append(f"ncu: {summary['ncu']['status']}")
     return "\n".join(lines) + "\n"
@@ -2989,6 +3077,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=",".join(PROFILE_LABELS),
         help="comma-separated profile labels (default: timing_context,main_generation)",
     )
+    strict_fp32 = subparsers.add_parser(
+        "strict-fp32",
+        help="gate an inference profile on strict FP32 and TF32-off metadata",
+    )
+    strict_fp32.add_argument("--profile", type=Path, required=True)
+    strict_fp32.add_argument("--output", type=Path, required=True)
     extract = subparsers.add_parser(
         "extract-sqlite",
         help="extract exact stage-scoped CSV reports from an nsys SQLite export",
@@ -3032,6 +3126,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 encoding="utf-8",
             )
             return 0 if report["pass"] else 1
+        if args.command == "strict-fp32":
+            report = validate_strict_fp32_profile(args.profile)
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(
+                json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n",
+                encoding="utf-8",
+            )
+            return 0
         if args.command == "extract-sqlite":
             extract_sqlite_reports(
                 args.sqlite,

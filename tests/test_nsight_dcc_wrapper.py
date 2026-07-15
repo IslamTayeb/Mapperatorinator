@@ -42,12 +42,13 @@ def test_help_capability_probes_accept_nonzero_only_with_captured_output() -> No
     ) in source
 
 
-def test_wrapper_collects_fp32_first_and_isolates_all_passes() -> None:
+def test_wrapper_collects_only_strict_fp32_and_isolates_all_passes() -> None:
     source = _source()
 
-    fp32 = source.index("run_precision fp32")
-    fp16 = source.index("run_precision fp16")
-    assert fp32 < fp16
+    assert source.count("run_precision fp32") == 1
+    assert "run_precision fp16" not in source
+    assert '"precision_order": ["fp32"]' in source
+    assert '"comparisons": []' in source
     assert "full_control" in source
     assert "full_graph" in source
     assert "smoke_control" in source
@@ -56,6 +57,17 @@ def test_wrapper_collects_fp32_first_and_isolates_all_passes() -> None:
     assert "untraced_control" in source
     assert "nsys_graph" in source
     assert "nsys_node" in source
+
+
+def test_wrapper_disables_tf32_before_every_python_or_cuda_process() -> None:
+    source = _source()
+
+    override = source.index("export NVIDIA_TF32_OVERRIDE=0")
+    first_python = source.index('"$PYTHON"', override)
+    assert override < first_python
+    assert "utils/nsight_agent_profile.py strict-fp32" in source
+    assert 'artifact(directory / "strict-fp32.json", "strict_fp32_gate")' in source
+    assert "validate_strict_fp32_profile(profile_path)" in source
 
 
 def test_graph_and_node_collection_use_bounded_low_overhead_options() -> None:
@@ -86,10 +98,10 @@ def test_parameterized_nsys_report_names_are_detected() -> None:
     assert "cuda_gpu_kern_gb_sum" in source
 
 
-def test_wrapper_gates_transparency_before_next_precision() -> None:
+def test_wrapper_gates_transparency_for_both_fp32_trace_levels() -> None:
     source = _source()
 
-    body = source[source.index("run_precision()") : source.index("# FP32 must complete")]
+    body = source[source.index("run_precision()") : source.index("# Strict FP32")]
     assert body.index('run_control "$precision" full') < body.index(
         'transparency_gate "$precision" full graph'
     )

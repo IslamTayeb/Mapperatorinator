@@ -49,7 +49,7 @@ REMOTE_REF=${MAPPERATORINATOR_REMOTE_REF:?Set MAPPERATORINATOR_REMOTE_REF to the
 WORK=${MAPPERATORINATOR_WORK:-/work/imt11/Mapperatorinator}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 EXPECTED_GPU=${MAPPERATORINATOR_EXPECTED_GPU:-2080 Ti}
-RUN_LABEL=${RUN_LABEL:-nsight-agent-inference}
+RUN_LABEL=${RUN_LABEL:-nsight-agent-strict-fp32}
 RUN_ROOT="$WORK/runs/${RUN_LABEL}-${SLURM_JOB_ID}"
 CAPABILITIES="$RUN_ROOT/capabilities"
 RUNS="$RUN_ROOT/runs"
@@ -70,6 +70,9 @@ mkdir -p "$WORK/logs" "$WORK/tmp" "$WORK/cache" \
   "$WORK/cache/torch_inductor" "$WORK/cache/triton" "$WORK/cache/cuda" \
   "$WORK/torch_extensions" "$CAPABILITIES" "$RUNS"
 export PATH="$(dirname "$PYTHON"):$PATH"
+# This must precede every Python/CUDA process, including profiler capability
+# imports. Runtime metadata is separately hard-gated for both PyTorch flags.
+export NVIDIA_TF32_OVERRIDE=0
 export XDG_CACHE_HOME="$WORK/cache"
 export HF_HOME="$WORK/cache/huggingface"
 export TRANSFORMERS_CACHE="$WORK/cache/huggingface"
@@ -203,6 +206,10 @@ capture_run_paths() {
   require_nonempty "$result"
   printf '%s\n' "$profile" > "$run_dir/profile-path.txt"
   printf '%s\n' "$result" > "$run_dir/result-path.txt"
+  "$PYTHON" utils/nsight_agent_profile.py strict-fp32 \
+    --profile "$profile" \
+    --output "$run_dir/strict-fp32.json"
+  require_nonempty "$run_dir/strict-fp32.json"
 }
 
 run_control() {
@@ -352,9 +359,8 @@ run_precision() {
   transparency_gate "$precision" smoke node
 }
 
-# FP32 must complete its parity gates before FP16 begins.
+# Strict FP32 is the only profiling lane. Traced TPS remains diagnostic.
 run_precision fp32
-run_precision fp16
 
 NCU_PROBE_DIR="$RUN_ROOT/ncu-permission-probe"
 mkdir -p "$NCU_PROBE_DIR"
@@ -554,6 +560,7 @@ def add_run(result, precision, directory_name, scope, pass_kind, paired=None):
     artifacts = [
         artifact(profile_path, "inference_profile"),
         artifact(result_path, "result_osu"),
+        artifact(directory / "strict-fp32.json", "strict_fp32_gate"),
         artifact(directory / "stdout.txt", "process_stdout"),
         artifact(directory / "stderr.txt", "process_stderr", allow_empty=True),
     ]
@@ -593,6 +600,7 @@ def add_run(result, precision, directory_name, scope, pass_kind, paired=None):
             )
             stages[stage]["trace_window_end_ns"] = int(extracted_stage["end_ns"])
             stages[stage]["diagnostic_counts"] = extracted_stage["counts"]
+    strict_fp32 = nsight.validate_strict_fp32_profile(profile_path)
     workload = {
         "commit": os.environ["NSIGHT_COMMIT"],
         "audio_sha256": sha(Path(os.environ["NSIGHT_AUDIO"])),
@@ -620,6 +628,7 @@ def add_run(result, precision, directory_name, scope, pass_kind, paired=None):
             "identity": {
                 "config_name": config,
                 "source_profile": relative(profile_path),
+                "strict_fp32": strict_fp32,
                 "nsys_capture_scope": "timing_and_main_generation" if pass_kind.startswith("nsys_") else None,
                 "stage_kernel_extraction": "exact NVTX wall containment" if pass_kind == "nsys_node" else None,
             },
@@ -629,21 +638,21 @@ def add_run(result, precision, directory_name, scope, pass_kind, paired=None):
     )
 
 runs = []
-for precision in ("fp32", "fp16"):
-    add_run(runs, precision, "full_control", "full", "untraced_control")
-    add_run(runs, precision, "full_graph", "full", "nsys_graph", paired="full_control")
-    add_run(runs, precision, "smoke_control", "smoke", "untraced_control")
-    add_run(runs, precision, "smoke_node", "smoke", "nsys_node", paired="smoke_control")
-    ncu_directory = runs_root / precision / "smoke_ncu"
-    if ncu_directory.exists():
-        add_run(runs, precision, "smoke_ncu", "smoke", "ncu_kernel", paired="smoke_control")
-        ncu_run = runs[-1]
-        ncu_run["artifacts"].extend(
-            [
-                artifact(ncu_directory / "ncu/hot-kernel.ncu-rep", "ncu_rep"),
-                artifact(ncu_directory / "ncu/hot-kernel.raw.csv", "ncu_raw_csv"),
-            ]
-        )
+precision = "fp32"
+add_run(runs, precision, "full_control", "full", "untraced_control")
+add_run(runs, precision, "full_graph", "full", "nsys_graph", paired="full_control")
+add_run(runs, precision, "smoke_control", "smoke", "untraced_control")
+add_run(runs, precision, "smoke_node", "smoke", "nsys_node", paired="smoke_control")
+ncu_directory = runs_root / precision / "smoke_ncu"
+if ncu_directory.exists():
+    add_run(runs, precision, "smoke_ncu", "smoke", "ncu_kernel", paired="smoke_control")
+    ncu_run = runs[-1]
+    ncu_run["artifacts"].extend(
+        [
+            artifact(ncu_directory / "ncu/hot-kernel.ncu-rep", "ncu_rep"),
+            artifact(ncu_directory / "ncu/hot-kernel.raw.csv", "ncu_raw_csv"),
+        ]
+    )
 
 targeted = json.loads(os.environ["NSIGHT_TARGETED_NCU_JSON"])
 manifest = {
@@ -655,7 +664,8 @@ manifest = {
         "remote_ref": os.environ["NSIGHT_REMOTE_REF"],
         "slurm_job_id": os.environ["SLURM_JOB_ID"],
         "gpu": os.environ.get("MAPPERATORINATOR_EXPECTED_GPU", "2080 Ti"),
-        "precision_order": ["fp32", "fp16"],
+        "precision_order": ["fp32"],
+        "strict_fp32": dict(nsight.STRICT_FP32_METADATA),
     },
     "tool_capabilities": {
         "nsys_version_path": "capabilities/nsys-version.txt",
@@ -663,13 +673,7 @@ manifest = {
         "dcgmi_version_path": "capabilities/dcgmi-version.txt",
     },
     "runs": runs,
-    "comparisons": [
-        {
-            "comparison_type": "cross_precision_divergence",
-            "left_run_id": "fp32_full_control",
-            "right_run_id": "fp16_full_control",
-        }
-    ],
+    "comparisons": [],
     "ncu_probe": {
         "attempted": True,
         "attempt_count": 1,
