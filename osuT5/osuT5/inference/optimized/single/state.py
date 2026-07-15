@@ -146,12 +146,12 @@ class ProductionDecodeSession:
         latest = None
         if self.active_state_signature is not None:
             holder = self.stable_encoder_holders.get(self.active_state_signature, {})
-            candidate = holder.get("__k8_latest_stats__")
-            if isinstance(candidate, dict) and candidate.get("k8_candidate") is True:
+            candidate = holder.get("__exact_k4_latest_stats__")
+            if isinstance(candidate, dict) and candidate.get("exact_k4_candidate") is True:
                 latest = candidate
         if latest is not None:
-            result["k8_candidate"] = {
-                "block_size": int(latest.get("block_size", 8)),
+            result["exact_k4_candidate"] = {
+                "block_size": int(latest.get("block_size", 4)),
                 "prefill_steps": int(latest.get("prefill_steps", 0)),
                 "eligible_steps": int(latest.get("eligible_steps", 0)),
                 "block_replays": int(latest.get("block_replays", 0)),
@@ -194,6 +194,15 @@ class ProductionDecodeSession:
                 "parent_backend": latest.get("parent_backend"),
                 "capture_state_restore_synchronized": bool(
                     latest.get("capture_state_restore_synchronized", False)
+                ),
+                "terminal_rollbacks": int(latest.get("terminal_rollbacks", 0)),
+                "generator_offset_corrections": int(
+                    latest.get("generator_offset_corrections", 0)
+                ),
+                "generator_offset_increment": (
+                    None
+                    if latest.get("generator_offset_increment") is None
+                    else int(latest["generator_offset_increment"])
                 ),
             }
         return result

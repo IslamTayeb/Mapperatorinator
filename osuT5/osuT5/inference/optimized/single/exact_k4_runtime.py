@@ -1,4 +1,10 @@
-"""Opt-in batch-one K=8 full-model CUDA-graph decode candidate."""
+"""Opt-in strict-FP32 exact K=4 full-model CUDA-graph decode candidate.
+
+The accepted K=1 loop remains the default.  This module is imported only by an
+explicit reciprocal runner.  Eligible blocks capture four distinct
+``model -> logits processors -> softmax -> torch.multinomial`` steps in one
+ordinary PyTorch CUDA graph registered against the default CUDA generator.
+"""
 
 from __future__ import annotations
 
@@ -14,17 +20,17 @@ from transformers.modeling_outputs import BaseModelOutput
 from ....runtime_profiling import profile_range
 from .decode_loop import (
     _bucketed_prefix_length,
-    _capture_decode_cuda_graph,
     _clone_static_graph_inputs,
+    _copy_static_graph_inputs,
     _max_cache_shape,
     _stable_encoder_outputs,
 )
 from .runtime_context import active_prefix_self_attention_context
 
 
-K8_BLOCK_SIZE = 8
-SUPPORTED_BLOCK_SIZES = (1, 4, K8_BLOCK_SIZE)
-RNG_POLICY = "counter_request_seed_window_prompt_v2"
+EXACT_K4_BLOCK_SIZE = 4
+SUPPORTED_BLOCK_SIZES = (EXACT_K4_BLOCK_SIZE,)
+RNG_POLICY = "default_cuda_generator_torch_multinomial_exact_offset_rollback"
 _GENERIC_SCORE_PROCESSORS = {
     "TopKLogitsWarper",
     "TopPLogitsWarper",
@@ -45,38 +51,19 @@ def _require_batch1_long(name: str, value: torch.Tensor) -> torch.Tensor:
     return value
 
 
-def _prompt_seed(
-    input_ids: torch.Tensor,
-    *,
-    request_seed: int,
-    window_identity: int,
-) -> int:
-    """Stable request/window stream seed; the host copy is charged as setup."""
-
-    values = input_ids.detach().cpu().reshape(-1).tolist()
-    state = 0xCBF29CE484222325
-    for value in (request_seed, window_identity):
-        state ^= int(value) & 0xFFFFFFFFFFFFFFFF
-        state = (state * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
-    for value in values:
-        state ^= int(value) & 0xFFFFFFFFFFFFFFFF
-        state = (state * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
-    state ^= len(values)
-    return state & 0x7FFFFFFFFFFFFFFF
-
-
 @dataclass(slots=True)
-class K8DeviceState:
+class ExactK4DeviceState:
     sequence: torch.Tensor
     physical_length: torch.Tensor
     logical_length: torch.Tensor
     unfinished: torch.Tensor
     pad_token: torch.Tensor
     eos_token_ids: torch.Tensor
-    rng_seed: torch.Tensor
-    rng_counter: torch.Tensor
     monotonic_has_time_shift: torch.Tensor
     monotonic_last_value: torch.Tensor
+    stop_flags: torch.Tensor
+    length_snapshots: torch.Tensor
+    unfinished_snapshots: torch.Tensor
     max_length: int
 
     @classmethod
@@ -87,8 +74,7 @@ class K8DeviceState:
         max_length: int,
         pad_token_id: int,
         eos_token_ids: torch.Tensor,
-        rng_seed: int,
-    ) -> "K8DeviceState":
+    ) -> "ExactK4DeviceState":
         input_ids = _require_batch1_long("input_ids", input_ids)
         if isinstance(max_length, bool) or not isinstance(max_length, int):
             raise TypeError("max_length must be an integer")
@@ -119,12 +105,25 @@ class K8DeviceState:
             eos_token_ids=eos_token_ids.to(
                 device=input_ids.device, dtype=torch.long
             ).contiguous(),
-            rng_seed=torch.full_like(length, int(rng_seed)),
-            rng_counter=torch.zeros_like(length),
             monotonic_has_time_shift=torch.zeros(
                 (1,), dtype=torch.bool, device=input_ids.device
             ),
             monotonic_last_value=torch.zeros_like(length),
+            stop_flags=torch.zeros(
+                (EXACT_K4_BLOCK_SIZE,),
+                dtype=torch.bool,
+                device=input_ids.device,
+            ),
+            length_snapshots=torch.zeros(
+                (EXACT_K4_BLOCK_SIZE,),
+                dtype=torch.long,
+                device=input_ids.device,
+            ),
+            unfinished_snapshots=torch.zeros(
+                (EXACT_K4_BLOCK_SIZE,),
+                dtype=torch.bool,
+                device=input_ids.device,
+            ),
             max_length=max_length,
         )
 
@@ -136,8 +135,6 @@ class K8DeviceState:
             ("logical_length", self.logical_length, torch.long),
             ("unfinished", self.unfinished, torch.bool),
             ("pad_token", self.pad_token, torch.long),
-            ("rng_seed", self.rng_seed, torch.long),
-            ("rng_counter", self.rng_counter, torch.long),
             ("monotonic_has_time_shift", self.monotonic_has_time_shift, torch.bool),
             ("monotonic_last_value", self.monotonic_last_value, torch.long),
         ):
@@ -146,6 +143,21 @@ class K8DeviceState:
             if value.shape != (1,) or value.dtype != dtype or value.device != device:
                 raise ValueError(
                     f"{name} must have shape [1], dtype {dtype}, and sequence device"
+                )
+        for name, value, dtype in (
+            ("stop_flags", self.stop_flags, torch.bool),
+            ("length_snapshots", self.length_snapshots, torch.long),
+            ("unfinished_snapshots", self.unfinished_snapshots, torch.bool),
+        ):
+            if (
+                not isinstance(value, torch.Tensor)
+                or value.shape != (EXACT_K4_BLOCK_SIZE,)
+                or value.dtype != dtype
+                or value.device != device
+            ):
+                raise ValueError(
+                    f"{name} must have shape [{EXACT_K4_BLOCK_SIZE}], dtype "
+                    f"{dtype}, and sequence device"
                 )
         if self.sequence.shape[1] != self.max_length:
             raise ValueError("sequence width must equal max_length")
@@ -156,27 +168,27 @@ class K8DeviceState:
         *,
         pad_token_id: int,
         eos_token_ids: torch.Tensor,
-        rng_seed: int,
     ) -> None:
         input_ids = _require_batch1_long("input_ids", input_ids)
         if input_ids.device != self.sequence.device:
-            raise ValueError("K8 state reset requires the original CUDA device")
+            raise ValueError("ExactK4 state reset requires the original CUDA device")
         if input_ids.shape[1] >= self.max_length:
-            raise ValueError("K8 state reset prompt exceeds sequence capacity")
+            raise ValueError("ExactK4 state reset prompt exceeds sequence capacity")
         if eos_token_ids.shape != self.eos_token_ids.shape or not torch.equal(
             eos_token_ids.to(device=self.eos_token_ids.device), self.eos_token_ids
         ):
-            raise ValueError("K8 state reset EOS policy changed")
+            raise ValueError("ExactK4 state reset EOS policy changed")
         self.sequence.fill_(int(pad_token_id))
         self.sequence[:, : input_ids.shape[1]].copy_(input_ids)
         self.physical_length.fill_(input_ids.shape[1])
         self.logical_length.fill_(self.max_length)
         self.unfinished.fill_(True)
         self.pad_token.fill_(int(pad_token_id))
-        self.rng_seed.fill_(int(rng_seed))
-        self.rng_counter.zero_()
         self.monotonic_has_time_shift.zero_()
         self.monotonic_last_value.zero_()
+        self.stop_flags.zero_()
+        self.length_snapshots.zero_()
+        self.unfinished_snapshots.zero_()
 
     def initialize_monotonic(
         self,
@@ -227,7 +239,12 @@ class K8DeviceState:
             self.monotonic_last_value,
         ))
 
-    def append(self, next_token: torch.Tensor) -> torch.Tensor:
+    def append(
+        self,
+        next_token: torch.Tensor,
+        *,
+        snapshot_index: int | None = None,
+    ) -> torch.Tensor:
         if next_token.shape != (1,) or next_token.dtype != torch.long:
             raise ValueError("next_token must be one torch.long token")
         active = torch.where(self.unfinished, next_token, self.pad_token)
@@ -243,15 +260,29 @@ class K8DeviceState:
         )
         self.unfinished.bitwise_and_(~just_stopped)
         self.physical_length.copy_(next_length)
+        if snapshot_index is not None:
+            if not 0 <= snapshot_index < EXACT_K4_BLOCK_SIZE:
+                raise ValueError("snapshot_index is outside the K4 block")
+            self.stop_flags[snapshot_index].copy_(just_stopped[0])
+            self.length_snapshots[snapshot_index].copy_(self.physical_length[0])
+            self.unfinished_snapshots[snapshot_index].copy_(self.unfinished[0])
         return active
 
-    def counter_uniform(self) -> torch.Tensor:
-        value = self.rng_seed + self.rng_counter * 2862933555777941757
-        value = torch.bitwise_xor(value, torch.bitwise_right_shift(value, 21))
-        value = torch.bitwise_xor(value, torch.bitwise_left_shift(value, 17))
-        bits = torch.bitwise_and(value, (1 << 53) - 1)
-        self.rng_counter.add_(1)
-        return (bits.to(torch.float64) + 0.5) / float(1 << 53)
+    def restore_terminal(self, *, valid_steps: int) -> None:
+        if isinstance(valid_steps, bool) or not isinstance(valid_steps, int):
+            raise TypeError("valid_steps must be an integer")
+        if not 1 <= valid_steps <= EXACT_K4_BLOCK_SIZE:
+            raise ValueError("valid_steps is outside the K4 block")
+        logical_length = int(self.length_snapshots[valid_steps - 1].item())
+        self.sequence[:, logical_length:].fill_(int(self.pad_token.item()))
+        self.physical_length.fill_(logical_length)
+        self.logical_length.fill_(logical_length)
+        self.unfinished.copy_(
+            self.unfinished_snapshots[valid_steps - 1].reshape(1)
+        )
+        self.stop_flags[valid_steps:].zero_()
+        self.length_snapshots[valid_steps:].zero_()
+        self.unfinished_snapshots[valid_steps:].zero_()
 
 
 @dataclass(slots=True)
@@ -262,31 +293,32 @@ class _LookbackState:
 
 
 @dataclass(slots=True)
-class K8LogitsProcessor:
+class ExactK4LogitsProcessor:
     processors: list[Any]
-    state: K8DeviceState
+    state: ExactK4DeviceState
     time_shift_start: int
     time_shift_end: int
     sos_ids: torch.Tensor
     offsets: torch.Tensor
     lookbacks: dict[int, _LookbackState] = field(default_factory=dict)
+    snapshots: dict[str, torch.Tensor] = field(default_factory=dict)
 
     @classmethod
     def compile(
         cls,
         processors: Any,
         *,
-        state: K8DeviceState,
+        state: ExactK4DeviceState,
         vocab_size: int,
         prompt_length: int,
-    ) -> "K8LogitsProcessor":
+    ) -> "ExactK4LogitsProcessor":
         items = list(processors)
         monotonic = [
             item for item in items
             if type(item).__name__ == "MonotonicTimeShiftLogitsProcessor"
         ]
         if len(monotonic) != 1:
-            raise ValueError("K8 requires exactly one monotonic logits processor")
+            raise ValueError("ExactK4 requires exactly one monotonic logits processor")
         owner = monotonic[0]
         time_start = int(owner.time_shift_start)
         time_end = int(owner.time_shift_end)
@@ -331,7 +363,15 @@ class K8LogitsProcessor:
                     ),
                 )
                 continue
-            raise ValueError(f"K8 does not support logits processor {name}")
+            raise ValueError(f"ExactK4 does not support logits processor {name}")
+        compiled.snapshots = {
+            name: torch.zeros(
+                (EXACT_K4_BLOCK_SIZE, *value.shape),
+                dtype=value.dtype,
+                device=value.device,
+            )
+            for name, value in compiled.mutable_tensors().items()
+        }
         return compiled
 
     def reset(self, *, prompt_length: int) -> None:
@@ -344,6 +384,8 @@ class K8LogitsProcessor:
         for lookback in self.lookbacks.values():
             lookback.last_scores.zero_()
             lookback.has_last_scores.zero_()
+        for snapshots in self.snapshots.values():
+            snapshots.zero_()
 
     def mutable_tensors(self) -> dict[str, torch.Tensor]:
         values = {
@@ -354,6 +396,22 @@ class K8LogitsProcessor:
             values[f"lookback_{index}_scores"] = lookback.last_scores
             values[f"lookback_{index}_has"] = lookback.has_last_scores
         return values
+
+    def snapshot(self, step: int) -> None:
+        if not 0 <= step < EXACT_K4_BLOCK_SIZE:
+            raise ValueError("processor snapshot step is outside the K4 block")
+        current = self.mutable_tensors()
+        if set(current) != set(self.snapshots):
+            raise RuntimeError("processor mutable-state schema changed after capture")
+        for name, value in current.items():
+            self.snapshots[name][step].copy_(value)
+
+    def restore_terminal(self, *, valid_steps: int) -> None:
+        if not 1 <= valid_steps <= EXACT_K4_BLOCK_SIZE:
+            raise ValueError("valid_steps is outside the K4 block")
+        for name, value in self.mutable_tensors().items():
+            value.copy_(self.snapshots[name][valid_steps - 1])
+            self.snapshots[name][valid_steps:].zero_()
 
     def _conditional_temperature(self, item: Any, scores: torch.Tensor) -> torch.Tensor:
         temperature = torch.full(
@@ -430,7 +488,7 @@ class K8LogitsProcessor:
             elif name in _GENERIC_SCORE_PROCESSORS:
                 scores = item(self.state.sequence, scores)
             else:
-                raise RuntimeError(f"uncompiled K8 logits processor {name}")
+                raise RuntimeError(f"uncompiled ExactK4 logits processor {name}")
         return scores
 
     def observe(self, token: torch.Tensor) -> None:
@@ -442,13 +500,9 @@ class K8LogitsProcessor:
         )
 
 
-def _sample_counter(scores: torch.Tensor, state: K8DeviceState) -> torch.Tensor:
+def _sample_exact(scores: torch.Tensor) -> torch.Tensor:
     probabilities = nn.functional.softmax(scores, dim=-1)
-    threshold = state.counter_uniform().to(dtype=probabilities.dtype)
-    cdf = probabilities.cumsum(dim=-1)
-    return torch.searchsorted(cdf[0], threshold).clamp(
-        max=probabilities.shape[-1] - 1
-    ).to(dtype=torch.long)
+    return torch.multinomial(probabilities, num_samples=1).squeeze(1)
 
 
 def _update_static_model_inputs(
@@ -463,19 +517,19 @@ def _update_static_model_inputs(
         or decoder_ids.shape != (1, 1)
         or decoder_ids.dtype != torch.long
     ):
-        raise ValueError("K8 static decoder_input_ids must be [1, 1] long")
+        raise ValueError("ExactK4 static decoder_input_ids must be [1, 1] long")
     if (
         not isinstance(cache_position, torch.Tensor)
         or cache_position.shape != (1,)
         or cache_position.dtype != torch.long
     ):
-        raise ValueError("K8 static cache_position must be [1] long")
+        raise ValueError("ExactK4 static cache_position must be [1] long")
     if (
         not isinstance(position_ids, torch.Tensor)
         or position_ids.shape != (1, 1)
         or position_ids.dtype != torch.long
     ):
-        raise ValueError("K8 static decoder_position_ids must be [1, 1] long")
+        raise ValueError("ExactK4 static decoder_position_ids must be [1, 1] long")
     decoder_ids.copy_(token.view(1, 1))
     cache_position.add_(1)
     position_ids.add_(1)
@@ -491,182 +545,47 @@ def _update_static_model_inputs(
 def _one_step_tail(
     *,
     logits: torch.Tensor,
-    processor: K8LogitsProcessor,
-    state: K8DeviceState,
+    processor: ExactK4LogitsProcessor,
+    state: ExactK4DeviceState,
     static_inputs: dict[str, Any],
     do_sample: bool,
+    snapshot_index: int | None = None,
 ) -> torch.Tensor:
     scores = processor(logits[:, -1, :])
     next_token = (
-        _sample_counter(scores, state)
+        _sample_exact(scores)
         if do_sample
         else torch.argmax(scores, dim=-1)
     )
-    active = state.append(next_token)
+    active = state.append(next_token, snapshot_index=snapshot_index)
     processor.observe(active)
+    if snapshot_index is not None:
+        processor.snapshot(snapshot_index)
     _update_static_model_inputs(static_inputs, active)
     return active
 
 
-def _cuda_check(result: tuple[Any, ...], operation: str) -> tuple[Any, ...]:
-    from cuda.bindings import runtime
-
-    if not isinstance(result, tuple) or not result:
-        raise RuntimeError(f"{operation} returned an invalid CUDA result")
-    if result[0] != runtime.cudaError_t.cudaSuccess:
-        raise RuntimeError(f"{operation} failed with {result[0]}")
-    return result[1:]
-
-
-def _cuda_status(result: tuple[Any, ...], operation: str) -> None:
-    payload = _cuda_check(result, operation)
-    if payload:
-        raise RuntimeError(f"{operation} returned unexpected payload {payload!r}")
+_EXACT_K4_INSTALLED = False
 
 
 @dataclass(slots=True)
-class _ChildGraphSequence:
-    parent_graph: Any
-    executable: Any
-    model_graph: torch.cuda.CUDAGraph
-    tail_graph: torch.cuda.CUDAGraph
-    device: torch.device
-    closed: bool = False
-    executable_closed: bool = False
-    parent_closed: bool = False
-
-    @classmethod
-    def build(
-        cls,
-        model_graph: torch.cuda.CUDAGraph,
-        tail_graph: torch.cuda.CUDAGraph,
-        *,
-        block_size: int = K8_BLOCK_SIZE,
-        device: torch.device | None = None,
-    ) -> "_ChildGraphSequence":
-        block_size = _validate_block_size(block_size)
-        if not hasattr(model_graph, "raw_cuda_graph") or not hasattr(
-            tail_graph, "raw_cuda_graph"
-        ):
-            raise RuntimeError(
-                "K8 requires CUDAGraph(keep_graph=True).raw_cuda_graph()"
-            )
-        from cuda.bindings import runtime
-
-        if device is None:
-            device = torch.device("cuda", torch.cuda.current_device())
-        device = torch.device(device)
-        with torch.cuda.device(device):
-            parent, = _cuda_check(runtime.cudaGraphCreate(0), "cudaGraphCreate")
-            previous = None
-            try:
-                for _ in range(block_size):
-                    for child in (model_graph, tail_graph):
-                        dependencies = None if previous is None else (previous,)
-                        node, = _cuda_check(
-                            runtime.cudaGraphAddChildGraphNode(
-                                parent,
-                                dependencies,
-                                0 if previous is None else 1,
-                                runtime.cudaGraph_t(child.raw_cuda_graph()),
-                            ),
-                            "cudaGraphAddChildGraphNode",
-                        )
-                        previous = node
-                executable, = _cuda_check(
-                    runtime.cudaGraphInstantiate(parent, 0),
-                    "cudaGraphInstantiate",
-                )
-            except Exception:
-                _cuda_status(runtime.cudaGraphDestroy(parent), "cudaGraphDestroy")
-                raise
-        return cls(parent, executable, model_graph, tail_graph, device)
-
-    def replay(self) -> None:
-        if self.closed:
-            raise RuntimeError("K8 parent graph is closed")
-        from cuda.bindings import runtime
-
-        with torch.cuda.device(self.device):
-            stream = runtime.cudaStream_t(torch.cuda.current_stream().cuda_stream)
-            _cuda_status(
-                runtime.cudaGraphLaunch(self.executable, stream),
-                "cudaGraphLaunch",
-            )
-
-    def close(self) -> None:
-        if self.closed:
-            return
-        from cuda.bindings import runtime
-
-        with torch.cuda.device(self.device):
-            if not self.executable_closed:
-                _cuda_status(
-                    runtime.cudaGraphExecDestroy(self.executable),
-                    "cudaGraphExecDestroy",
-                )
-                self.executable_closed = True
-            if not self.parent_closed:
-                _cuda_status(
-                    runtime.cudaGraphDestroy(self.parent_graph),
-                    "cudaGraphDestroy",
-                )
-                self.parent_closed = True
-        self.closed = self.executable_closed and self.parent_closed
-
-
-@dataclass(slots=True)
-class _K8GraphLifecycle:
-    active_cache_id: int | None = None
-    graphs: dict[int, _ChildGraphSequence] = field(default_factory=dict)
-
-    def activate(self, graph_cache: dict[Any, Any]) -> None:
-        cache_id = id(graph_cache)
-        if self.active_cache_id is not None and self.active_cache_id != cache_id:
-            self.close_all()
-        self.active_cache_id = cache_id
-
-    def register(self, graph: _ChildGraphSequence) -> None:
-        if graph.closed:
-            raise RuntimeError("cannot register a closed K8 child graph")
-        self.graphs[id(graph)] = graph
-
-    def close_all(self) -> None:
-        first_error: Exception | None = None
-        remaining: dict[int, _ChildGraphSequence] = {}
-        for identity, graph in tuple(self.graphs.items()):
-            try:
-                graph.close()
-            except Exception as exc:
-                remaining[identity] = graph
-                if first_error is None:
-                    first_error = exc
-        self.graphs = remaining
-        self.active_cache_id = None
-        if first_error is not None:
-            raise first_error
-
-
-_ACTIVE_K8_LIFECYCLE: _K8GraphLifecycle | None = None
-_ACTIVE_BLOCK_SIZE: int | None = None
-
-
-@dataclass(slots=True)
-class _K8GraphEntry:
-    parent: _ChildGraphSequence
+class _ExactK4GraphEntry:
+    graph: torch.cuda.CUDAGraph
     static_inputs: dict[str, Any]
-    state: K8DeviceState
-    processor: K8LogitsProcessor
-    outputs: Any
+    state: ExactK4DeviceState
+    processor: ExactK4LogitsProcessor
+    generator: torch.Generator
+    model_dtype: torch.dtype
+    offset_increment: int
     capture_seconds: float
     peak_vram_bytes: int
     block_replays: int = 0
 
 
 @dataclass(slots=True)
-class _K8RuntimeSlot:
-    state: K8DeviceState
-    processor: K8LogitsProcessor
+class _ExactK4RuntimeSlot:
+    state: ExactK4DeviceState
+    processor: ExactK4LogitsProcessor
     signature: tuple[Any, ...]
 
 
@@ -725,21 +644,24 @@ def _processor_signature(
     return tuple(rows)
 
 
-def _request_seed(generator: Any, device: torch.device) -> int:
-    if isinstance(generator, (list, tuple)):
-        if len(generator) != 1:
-            raise ValueError("K8 batch-one decoding accepts one generator")
-        generator = generator[0]
-    if generator is not None:
-        if not isinstance(generator, torch.Generator):
-            raise TypeError("K8 generator must be a torch.Generator")
-        return int(generator.initial_seed())
+def _default_cuda_generator(
+    explicit_generator: Any,
+    device: torch.device,
+) -> torch.Generator:
+    if explicit_generator is not None:
+        raise ValueError(
+            "ExactK4 preserves the accepted implicit default CUDA generator; "
+            "explicit generators are unsupported"
+        )
     if device.type != "cuda":
-        raise RuntimeError("K8 request seed fallback requires a CUDA device")
+        raise RuntimeError("ExactK4 requires a CUDA device")
     index = device.index
     if index is None:
         index = torch.cuda.current_device()
-    return int(torch.cuda.default_generators[index].initial_seed())
+    generator = torch.cuda.default_generators[index]
+    if not hasattr(generator, "get_offset") or not hasattr(generator, "set_offset"):
+        raise RuntimeError("ExactK4 requires CUDA generator offset APIs")
+    return generator
 
 
 def _runtime_slot(
@@ -752,9 +674,8 @@ def _runtime_slot(
     logits_processor: Any,
     processor_signature: tuple[Any, ...],
     vocab_size: int,
-    rng_seed: int,
     do_sample: bool,
-) -> _K8RuntimeSlot:
+) -> _ExactK4RuntimeSlot:
     signature = (
         max_length,
         tuple(int(value) for value in eos_token_ids.detach().cpu().tolist()),
@@ -762,53 +683,89 @@ def _runtime_slot(
         str(input_ids.device),
         bool(do_sample),
     )
-    slots = holder.setdefault("__k8_runtime_slots__", {})
+    slots = holder.setdefault("__exact_k4_runtime_slots__", {})
     slot = slots.get(signature)
     if slot is None:
-        state = K8DeviceState.allocate(
+        state = ExactK4DeviceState.allocate(
             input_ids,
             max_length=max_length,
             pad_token_id=pad_token_id,
             eos_token_ids=eos_token_ids,
-            rng_seed=rng_seed,
         )
-        processor = K8LogitsProcessor.compile(
+        processor = ExactK4LogitsProcessor.compile(
             logits_processor,
             state=state,
             vocab_size=vocab_size,
             prompt_length=input_ids.shape[1],
         )
-        slot = _K8RuntimeSlot(state, processor, signature)
+        slot = _ExactK4RuntimeSlot(state, processor, signature)
         slots[signature] = slot
     else:
         slot.state.reset(
             input_ids,
             pad_token_id=pad_token_id,
             eos_token_ids=eos_token_ids,
-            rng_seed=rng_seed,
         )
         slot.processor.reset(prompt_length=input_ids.shape[1])
     return slot
 
 
 def _snapshot_tensors(
-    state: K8DeviceState,
-    processor: K8LogitsProcessor,
+    state: ExactK4DeviceState,
+    processor: ExactK4LogitsProcessor,
     static_inputs: dict[str, Any],
+    *,
+    cache_position_start: int,
+    model_dtype: torch.dtype,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    tensors = {
-        "sequence": state.sequence,
-        "physical_length": state.physical_length,
-        "logical_length": state.logical_length,
-        "unfinished": state.unfinished,
-        "rng_counter": state.rng_counter,
+    tensors: dict[str, torch.Tensor] = {
+        name: value
+        for name in (
+            "sequence",
+            "physical_length",
+            "logical_length",
+            "unfinished",
+            "stop_flags",
+            "length_snapshots",
+            "unfinished_snapshots",
+        )
+        if isinstance((value := getattr(state, name)), torch.Tensor)
+    }
+    tensors.update({
         **processor.mutable_tensors(),
+        **{
+            f"processor_snapshot:{name}": value
+            for name, value in processor.snapshots.items()
+        },
         **{
             f"input:{name}": value
             for name, value in static_inputs.items()
             if isinstance(value, torch.Tensor)
         },
-    }
+    })
+    cache = static_inputs.get("past_key_values")
+    layers = getattr(getattr(cache, "self_attention_cache", None), "layers", None)
+    if not isinstance(layers, (list, tuple)) or not layers:
+        raise ValueError("ExactK4 requires initialized self-attention cache layers")
+    for layer_index, layer in enumerate(layers):
+        for kind in ("keys", "values"):
+            value = getattr(layer, kind, None)
+            if (
+                not isinstance(value, torch.Tensor)
+                or value.dtype != model_dtype
+                or value.device != state.sequence.device
+                or value.ndim != 4
+                or cache_position_start < 0
+                or cache_position_start + EXACT_K4_BLOCK_SIZE > value.shape[-2]
+            ):
+                raise ValueError(
+                    f"ExactK4 cache self[{layer_index}].{kind} cannot own the block"
+                )
+            tensors[f"cache:{layer_index}:{kind}"] = value[
+                ...,
+                cache_position_start : cache_position_start + EXACT_K4_BLOCK_SIZE,
+                :,
+            ]
     return [(value, value.detach().clone()) for value in tensors.values()]
 
 
@@ -817,69 +774,93 @@ def _restore_snapshot_tensors(
     *,
     device: torch.device,
 ) -> None:
-    """Order capture-time writes before restoring persistent K8 state."""
+    """Order capture-time writes before restoring persistent ExactK4 state."""
 
     # torch.cuda.graph captures on a side stream and capture_end does not make
     # the caller's stream wait for that work.  Without this synchronization,
-    # tail-capture writes to sequence/RNG/processor state can race these copies.
+    # graph-capture writes to sequence/cache/processor state can race these copies.
     torch.cuda.synchronize(device)
     for tensor, snapshot in snapshots:
         tensor.copy_(snapshot)
     torch.cuda.synchronize(device)
 
 
-def _capture_k8_entry(
+def _capture_exact_k4_entry(
     model,
     model_inputs: dict[str, Any],
     *,
     active_prefix_length: int,
-    state: K8DeviceState,
-    processor: K8LogitsProcessor,
+    state: ExactK4DeviceState,
+    processor: ExactK4LogitsProcessor,
+    generator: torch.Generator,
+    cache_position_start: int,
     do_sample: bool,
-    block_size: int = K8_BLOCK_SIZE,
-) -> _K8GraphEntry:
+    block_size: int = EXACT_K4_BLOCK_SIZE,
+) -> _ExactK4GraphEntry:
     if not torch.cuda.is_available():
-        raise RuntimeError("K8 graph capture requires CUDA")
+        raise RuntimeError("ExactK4 graph capture requires CUDA")
     started = time.perf_counter()
     device = state.sequence.device
+    block_size = _validate_block_size(block_size)
+    if not do_sample:
+        raise ValueError("ExactK4 currently requires accepted sampling mode")
     with torch.cuda.device(device):
         torch.cuda.reset_peak_memory_stats(device)
         static_inputs = _clone_static_graph_inputs(model_inputs)
-        model_graph = torch.cuda.CUDAGraph(keep_graph=True)
-        with torch.cuda.graph(model_graph):
-            with active_prefix_self_attention_context(active_prefix_length):
-                outputs = model(**static_inputs, return_dict=True)
-        snapshots = _snapshot_tensors(state, processor, static_inputs)
-        tail_graph = torch.cuda.CUDAGraph(keep_graph=True)
-        with torch.cuda.graph(tail_graph):
-            _one_step_tail(
-                logits=outputs.logits,
-                processor=processor,
-                state=state,
-                static_inputs=static_inputs,
-                do_sample=do_sample,
-            )
-        _restore_snapshot_tensors(snapshots, device=device)
-        parent = _ChildGraphSequence.build(
-            model_graph,
-            tail_graph,
-            block_size=block_size,
+        snapshots = _snapshot_tensors(
+            state,
+            processor,
+            static_inputs,
+            cache_position_start=cache_position_start,
+            model_dtype=model.dtype,
+        )
+        generator_state = generator.get_state().clone()
+        generator_offset = int(generator.get_offset())
+        probe_scores = torch.zeros(
+            (1, int(model.config.vocab_size)),
+            dtype=torch.float32,
             device=device,
         )
-        try:
-            torch.cuda.synchronize(device)
-            return _K8GraphEntry(
-                parent=parent,
-                static_inputs=static_inputs,
-                state=state,
-                processor=processor,
-                outputs=outputs,
-                capture_seconds=time.perf_counter() - started,
-                peak_vram_bytes=torch.cuda.max_memory_allocated(device),
+        _sample_exact(probe_scores)
+        torch.cuda.synchronize(device)
+        offset_increment = int(generator.get_offset()) - generator_offset
+        generator.set_state(generator_state)
+        generator.set_offset(generator_offset)
+        if offset_increment != 4:
+            raise RuntimeError(
+                "accepted FP32 [1, vocab] multinomial must advance the CUDA RNG "
+                f"offset by four, got {offset_increment}"
             )
-        except Exception:
-            parent.close()
-            raise
+
+        graph = torch.cuda.CUDAGraph()
+        graph.register_generator_state(generator)
+        with torch.cuda.graph(graph):
+            for step in range(block_size):
+                with active_prefix_self_attention_context(active_prefix_length):
+                    outputs = model(**static_inputs, return_dict=True)
+                _one_step_tail(
+                    logits=outputs.logits,
+                    processor=processor,
+                    state=state,
+                    static_inputs=static_inputs,
+                    do_sample=True,
+                    snapshot_index=step,
+                )
+        _restore_snapshot_tensors(snapshots, device=device)
+        generator.set_state(generator_state)
+        generator.set_offset(generator_offset)
+        torch.cuda.synchronize(device)
+        return _ExactK4GraphEntry(
+            graph=graph,
+            static_inputs=static_inputs,
+            state=state,
+            processor=processor,
+            generator=generator,
+            model_dtype=model.dtype,
+            offset_increment=offset_increment,
+            capture_seconds=time.perf_counter() - started,
+            peak_vram_bytes=torch.cuda.max_memory_allocated(device),
+        )
 
 
 def _validate_block_size(block_size: int) -> int:
@@ -892,11 +873,11 @@ def _validate_block_size(block_size: int) -> int:
     return block_size
 
 
-def _k8_eligible(
+def _exact_k4_eligible(
     cur_len: int,
     max_length: int,
     bucket_size: int,
-    block_size: int = K8_BLOCK_SIZE,
+    block_size: int = EXACT_K4_BLOCK_SIZE,
 ) -> bool:
     block_size = _validate_block_size(block_size)
     if cur_len + block_size > max_length:
@@ -931,19 +912,19 @@ def _eos_tensor(
     ]
     if unsupported or len(eos) != 1 or len(maximum) != 1:
         raise ValueError(
-            "K8 requires exactly EosTokenCriteria and MaxLengthCriteria; "
+            "ExactK4 requires exactly EosTokenCriteria and MaxLengthCriteria; "
             f"unsupported={unsupported}"
         )
     if not isinstance(eos[0], torch.Tensor):
-        raise TypeError("K8 EOS ids must be a tensor")
+        raise TypeError("ExactK4 EOS ids must be a tensor")
     if maximum[0] != max_length:
-        raise ValueError("K8 MaxLengthCriteria must match cache capacity")
+        raise ValueError("ExactK4 MaxLengthCriteria must match cache capacity")
     return eos[0].to(device=device, dtype=torch.long).reshape(-1).contiguous()
 
 
-def _sync_model_kwargs_after_k8(
+def _sync_model_kwargs_after_exact_k4(
     model_kwargs: dict[str, Any],
-    entry: _K8GraphEntry,
+    entry: _ExactK4GraphEntry,
     *,
     cur_len: int,
 ) -> None:
@@ -956,7 +937,7 @@ def _sync_model_kwargs_after_k8(
             or tuple(original.shape[:1]) != (1,)
             or original.shape[1] > cur_len
         ):
-            raise ValueError("K8 decoder attention mask must be [1, <=cur_len]")
+            raise ValueError("ExactK4 decoder attention mask must be [1, <=cur_len]")
         extended = torch.ones(
             (1, cur_len), dtype=original.dtype, device=original.device
         )
@@ -964,7 +945,61 @@ def _sync_model_kwargs_after_k8(
         model_kwargs["decoder_attention_mask"] = extended
 
 
-def k8_active_prefix_decode_generate(
+def _terminal_steps(stop_flags: torch.Tensor) -> int | None:
+    if (
+        not isinstance(stop_flags, torch.Tensor)
+        or stop_flags.shape != (EXACT_K4_BLOCK_SIZE,)
+        or stop_flags.dtype != torch.bool
+    ):
+        raise ValueError("ExactK4 stopping flags have an invalid schema")
+    indices = torch.nonzero(stop_flags, as_tuple=False).reshape(-1)
+    if indices.numel() == 0:
+        return None
+    return int(indices[0].item()) + 1
+
+
+def _restore_terminal_block(
+    entry: _ExactK4GraphEntry,
+    model_inputs: dict[str, Any],
+    *,
+    valid_steps: int,
+    block_cache_start: int,
+    block_sequence_start: int,
+    generator_start_offset: int,
+) -> None:
+    """Restore the exact accepted state after a terminal partial block."""
+
+    entry.state.restore_terminal(valid_steps=valid_steps)
+    entry.processor.restore_terminal(valid_steps=valid_steps)
+    _copy_static_graph_inputs(entry.static_inputs, model_inputs)
+    for step in range(valid_steps):
+        _update_static_model_inputs(
+            entry.static_inputs,
+            entry.state.sequence[:, block_sequence_start + step],
+        )
+
+    cache = model_inputs.get("past_key_values")
+    layers = getattr(getattr(cache, "self_attention_cache", None), "layers", None)
+    if not isinstance(layers, (list, tuple)) or not layers:
+        raise ValueError("ExactK4 terminal rollback lost the self-attention cache")
+    tail_start = block_cache_start + valid_steps
+    tail_end = block_cache_start + EXACT_K4_BLOCK_SIZE
+    for layer_index, layer in enumerate(layers):
+        for kind in ("keys", "values"):
+            value = getattr(layer, kind, None)
+            if not isinstance(value, torch.Tensor) or value.dtype != entry.model_dtype:
+                raise TypeError(
+                    f"ExactK4 terminal cache self[{layer_index}].{kind} has dtype "
+                    f"{getattr(value, 'dtype', None)}, expected {entry.model_dtype}"
+                )
+            value[..., tail_start:tail_end, :].zero_()
+
+    entry.generator.set_offset(
+        generator_start_offset + entry.offset_increment * valid_steps
+    )
+
+
+def exact_k4_active_prefix_decode_generate(
     model,
     input_ids: torch.LongTensor,
     logits_processor,
@@ -981,29 +1016,33 @@ def k8_active_prefix_decode_generate(
     stable_encoder_holder: dict[str, BaseModelOutput] | None = None,
     **model_kwargs,
 ) -> torch.LongTensor:
-    """Opt-in full-model+tail K8 loop; defaults never select this callable."""
+    """Opt-in full-model+tail ExactK4 loop; defaults never select this callable."""
 
     del cuda_graph_warmup, cuda_graph_min_decode_steps
     if synced_gpus or streamer is not None:
-        raise ValueError("K8 does not support synced_gpus or streamers")
+        raise ValueError("ExactK4 does not support synced_gpus or streamers")
     if input_ids.device.type != "cuda" or not cuda_graph_forward:
-        raise RuntimeError("K8 requires CUDA graph decode")
+        raise RuntimeError("ExactK4 requires CUDA graph decode")
     if input_ids.shape[0] != 1:
-        raise ValueError("K8 requires batch size one")
+        raise ValueError("ExactK4 requires batch size one")
+    if getattr(model, "dtype", None) != torch.float32 or input_ids.device.type != "cuda":
+        raise TypeError("ExactK4 requires strict FP32 model storage on CUDA")
     if generation_config.return_dict_in_generate or any((
         generation_config.output_attentions,
         generation_config.output_hidden_states,
         generation_config.output_scores,
         generation_config.output_logits,
     )):
-        raise ValueError("K8 supports tensor outputs only")
-    lifecycle = _ACTIVE_K8_LIFECYCLE
-    block_size = _ACTIVE_BLOCK_SIZE
-    if lifecycle is None or block_size is None:
-        raise RuntimeError("K8 decode must run inside install_k8_candidate()")
+        raise ValueError("ExactK4 supports tensor outputs only")
+    block_size = EXACT_K4_BLOCK_SIZE
+    if not _EXACT_K4_INSTALLED:
+        raise RuntimeError("ExactK4 decode must run inside install_exact_k4_candidate()")
     pad_token_id = int(generation_config._pad_token_tensor.reshape(-1)[0].item())
     _, cur_len = input_ids.shape
-    generator = model_kwargs.pop("generator", None)
+    generator = _default_cuda_generator(
+        model_kwargs.pop("generator", None),
+        input_ids.device,
+    )
     model_kwargs = model._get_initial_cache_position(
         cur_len, input_ids.device, model_kwargs
     )
@@ -1014,28 +1053,12 @@ def k8_active_prefix_decode_generate(
         max_length=max_length,
     )
     if stable_encoder_holder is None:
-        raise RuntimeError("K8 requires persistent request-local runtime state")
+        raise RuntimeError("ExactK4 requires persistent request-local runtime state")
     graph_cache = shared_graph_cache if shared_graph_cache is not None else {}
-    lifecycle.activate(graph_cache)
     window_identity = int(
-        stable_encoder_holder.get("__k8_window_serial__", 0)
+        stable_encoder_holder.get("__exact_k4_window_serial__", 0)
     ) + 1
-    stable_encoder_holder["__k8_window_serial__"] = window_identity
-    current_request_seed = _request_seed(generator, input_ids.device)
-    stored_request_seed = stable_encoder_holder.setdefault(
-        "__k8_request_seed__",
-        current_request_seed,
-    )
-    if int(stored_request_seed) != current_request_seed:
-        raise RuntimeError("K8 request-local generator seed changed mid-session")
-
-    prompt_seed_started = time.perf_counter()
-    rng_seed = _prompt_seed(
-        input_ids,
-        request_seed=current_request_seed,
-        window_identity=window_identity,
-    )
-    prompt_seed_seconds = time.perf_counter() - prompt_seed_started
+    stable_encoder_holder["__exact_k4_window_serial__"] = window_identity
     processor_d2h: dict[str, int] = {"calls": 0, "bytes": 0}
     processor_signature_started = time.perf_counter()
     processor_signature = _processor_signature(
@@ -1046,6 +1069,8 @@ def k8_active_prefix_decode_generate(
         time.perf_counter() - processor_signature_started
     )
     do_sample = bool(generation_config.do_sample)
+    if not do_sample:
+        raise ValueError("ExactK4 currently supports accepted sampling mode only")
     slot = _runtime_slot(
         stable_encoder_holder,
         input_ids=input_ids,
@@ -1055,14 +1080,13 @@ def k8_active_prefix_decode_generate(
         logits_processor=logits_processor,
         processor_signature=processor_signature,
         vocab_size=int(model.config.vocab_size),
-        rng_seed=rng_seed,
         do_sample=do_sample,
     )
     state = slot.state
     processor = slot.processor
     prompt_length = int(cur_len)
     stats = {
-        "k8_candidate": True,
+        "exact_k4_candidate": True,
         "window_serial": window_identity,
         "block_size": block_size,
         "prefill_steps": 0,
@@ -1078,28 +1102,31 @@ def k8_active_prefix_decode_generate(
         "logical_steps": 0,
         "wasted_steps": 0,
         "rng_policy": RNG_POLICY,
-        "rng_exact": False,
-        "rng_drift": "documented_counter_based_per_window",
-        "rng_request_seed": current_request_seed,
+        "rng_exact": True,
+        "rng_drift": None,
+        "rng_request_seed": int(generator.initial_seed()),
         "rng_window_identity": window_identity,
         "rng_early_eos_isolation": True,
-        "sampling_mode": "sample" if do_sample else "greedy",
-        "prompt_seed_d2h_copy_calls": 1,
-        "prompt_seed_d2h_copy_bytes": input_ids.numel() * input_ids.element_size(),
-        "prompt_seed_setup_seconds": prompt_seed_seconds,
+        "sampling_mode": "sample",
+        "prompt_seed_d2h_copy_calls": 0,
+        "prompt_seed_d2h_copy_bytes": 0,
+        "prompt_seed_setup_seconds": 0.0,
         "processor_signature_d2h_copy_calls": processor_d2h["calls"],
         "processor_signature_d2h_copy_bytes": processor_d2h["bytes"],
         "processor_signature_setup_seconds": processor_signature_seconds,
-        "parent_backend": "cuda_python_child_graphs",
+        "parent_backend": "ordinary_pytorch_cuda_graph_four_distinct_steps",
         "capture_state_restore_synchronized": True,
+        "terminal_rollbacks": 0,
+        "generator_offset_corrections": 0,
+        "generator_offset_increment": None,
     }
-    stable_encoder_holder["__k8_latest_stats__"] = stats
+    stable_encoder_holder["__exact_k4_latest_stats__"] = stats
 
     is_prefill = True
     finished = False
     scores = None
     while not finished:
-        if is_prefill or not _k8_eligible(
+        if is_prefill or not _exact_k4_eligible(
             cur_len,
             max_length,
             active_prefix_bucket_size,
@@ -1133,11 +1160,7 @@ def k8_active_prefix_decode_generate(
                         stable_encoder_holder, encoder_outputs
                     )
             scores_step = processor(outputs.logits[:, -1, :])
-            token = (
-                _sample_counter(scores_step, state)
-                if do_sample
-                else torch.argmax(scores_step, dim=-1)
-            )
+            token = _sample_exact(scores_step)
             active = state.append(token)
             processor.observe(active)
             stats["status_reads"] += 1
@@ -1154,7 +1177,7 @@ def k8_active_prefix_decode_generate(
         model_inputs = model.prepare_inputs_for_generation(
             active_ids, **model_kwargs
         )
-        key = ("k8_candidate", block_size, id(state), prefix, do_sample, tuple(
+        key = ("exact_k4_candidate", block_size, id(state), id(generator), prefix, tuple(
             (name, tuple(value.shape), str(value.dtype), str(value.device))
             if isinstance(value, torch.Tensor)
             else (name, type(value).__name__, id(value))
@@ -1166,118 +1189,144 @@ def k8_active_prefix_decode_generate(
                 if isinstance(value, torch.Tensor):
                     stats["copy_calls"] += 1
                     stats["copy_bytes"] += value.numel() * value.element_size()
-            entry = _capture_k8_entry(
+            entry = _capture_exact_k4_entry(
                 model,
                 model_inputs,
                 active_prefix_length=prefix,
                 state=state,
                 processor=processor,
+                generator=generator,
+                cache_position_start=cur_len - 1,
                 do_sample=do_sample,
                 block_size=block_size,
             )
-            try:
-                lifecycle.register(entry.parent)
-            except Exception:
-                entry.parent.close()
-                raise
             raw_entry = {
-                "k8_candidate": True,
+                "exact_k4_candidate": True,
                 "runtime_entry": entry,
                 "active_prefix_length": prefix,
                 "capture_seconds": entry.capture_seconds,
                 "decode_replays": 0,
-                "k8_stats": stats,
+                "exact_k4_stats": stats,
             }
             graph_cache[key] = raw_entry
             stats["capture_seconds"] += entry.capture_seconds
             stats["peak_vram_bytes"] = max(
                 stats["peak_vram_bytes"], entry.peak_vram_bytes
             )
+            stats["generator_offset_increment"] = entry.offset_increment
         else:
             entry = raw_entry["runtime_entry"]
-            raw_entry["k8_stats"] = stats
-            if entry.state is not state or entry.processor is not processor:
-                raise RuntimeError("K8 graph resolved the wrong persistent state")
+            raw_entry["exact_k4_stats"] = stats
+            stats["generator_offset_increment"] = entry.offset_increment
+            if (
+                entry.state is not state
+                or entry.processor is not processor
+                or entry.generator is not generator
+            ):
+                raise RuntimeError("ExactK4 graph resolved the wrong persistent state")
             for name, static_value in entry.static_inputs.items():
                 if not isinstance(static_value, torch.Tensor):
                     continue
                 current = model_inputs.get(name)
                 if not isinstance(current, torch.Tensor):
-                    raise RuntimeError(f"K8 model input {name} stopped being a tensor")
+                    raise RuntimeError(f"ExactK4 model input {name} stopped being a tensor")
                 if (
                     current.shape != static_value.shape
                     or current.dtype != static_value.dtype
                     or current.device != static_value.device
                 ):
-                    raise RuntimeError(f"K8 model input {name} changed signature")
+                    raise RuntimeError(f"ExactK4 model input {name} changed signature")
                 static_value.copy_(current)
                 stats["copy_calls"] += 1
                 stats["copy_bytes"] += current.numel() * current.element_size()
+        block_sequence_start = cur_len
+        block_cache_start = cur_len - 1
+        generator_start_offset = int(generator.get_offset())
         stats["eligible_steps"] += block_size
-        with profile_range("generation.k8_parent_graph_replay"):
-            entry.parent.replay()
+        with profile_range("generation.exact_k4_graph_replay"):
+            entry.graph.replay()
         entry.block_replays += 1
         raw_entry["decode_replays"] += block_size
         stats["block_replays"] += 1
         stats["status_reads"] += 1
-        status = torch.stack((
-            state.physical_length[0],
-            state.logical_length[0],
-            state.unfinished[0].to(dtype=torch.long),
-        )).cpu().tolist()
-        physical_length, logical_length = (int(status[0]), int(status[1]))
-        unfinished = bool(status[2])
-        stats["wasted_steps"] += max(0, physical_length - logical_length)
-        cur_len = physical_length if unfinished else logical_length
-        _sync_model_kwargs_after_k8(model_kwargs, entry, cur_len=cur_len)
+        status = torch.cat((
+            state.physical_length,
+            state.logical_length,
+            state.unfinished.to(dtype=torch.long),
+            state.stop_flags.to(dtype=torch.long),
+        )).cpu()
+        generator_end_offset = int(generator.get_offset())
+        expected_offset = entry.offset_increment * block_size
+        if generator_end_offset - generator_start_offset != expected_offset:
+            raise RuntimeError(
+                "ExactK4 graph RNG offset disagrees with accepted multinomial: "
+                f"expected {expected_offset}, got "
+                f"{generator_end_offset - generator_start_offset}"
+            )
+        valid_steps = _terminal_steps(status[3:].to(dtype=torch.bool))
+        if valid_steps is None:
+            physical_length = int(status[0].item())
+            logical_length = int(status[1].item())
+            unfinished = bool(status[2].item())
+            if not unfinished or physical_length != block_sequence_start + block_size:
+                raise RuntimeError("ExactK4 nonterminal block state is inconsistent")
+            cur_len = physical_length
+        else:
+            _restore_terminal_block(
+                entry,
+                model_inputs,
+                valid_steps=valid_steps,
+                block_cache_start=block_cache_start,
+                block_sequence_start=block_sequence_start,
+                generator_start_offset=generator_start_offset,
+            )
+            stats["terminal_rollbacks"] += 1
+            stats["generator_offset_corrections"] += 1
+            stats["wasted_steps"] += block_size - valid_steps
+            cur_len = block_sequence_start + valid_steps
+            unfinished = False
+        _sync_model_kwargs_after_exact_k4(model_kwargs, entry, cur_len=cur_len)
         finished = not unfinished
 
     stats["logical_steps"] = cur_len - prompt_length
     stats["physical_steps"] = stats["logical_steps"] + stats["wasted_steps"]
     if stats["physical_steps"] - stats["logical_steps"] != stats["wasted_steps"]:
-        raise RuntimeError("K8 physical/logical/wasted step accounting diverged")
+        raise RuntimeError("ExactK4 physical/logical/wasted step accounting diverged")
     accounted_steps = (
         stats["prefill_steps"]
         + stats["eligible_steps"]
         + stats["remainder_steps"]
     )
     if stats["physical_steps"] != accounted_steps:
-        raise RuntimeError("K8 prefill/eligible/remainder work accounting diverged")
+        raise RuntimeError("ExactK4 prefill/eligible/remainder work accounting diverged")
     return state.sequence[:, :cur_len]
 
 
 @contextmanager
-def install_k8_candidate(*, block_size: int = K8_BLOCK_SIZE) -> Iterator[None]:
+def install_exact_k4_candidate() -> Iterator[None]:
     """Temporarily install a bounded block candidate for an explicit runner."""
 
-    global _ACTIVE_BLOCK_SIZE, _ACTIVE_K8_LIFECYCLE
+    global _EXACT_K4_INSTALLED
     from . import engine
 
-    block_size = _validate_block_size(block_size)
-    if _ACTIVE_K8_LIFECYCLE is not None or _ACTIVE_BLOCK_SIZE is not None:
-        raise RuntimeError("K8 candidate context cannot be nested")
-    lifecycle = _K8GraphLifecycle()
+    if _EXACT_K4_INSTALLED:
+        raise RuntimeError("ExactK4 candidate context cannot be nested")
     previous = engine.active_prefix_decode_generate
-    _ACTIVE_K8_LIFECYCLE = lifecycle
-    _ACTIVE_BLOCK_SIZE = block_size
-    engine.active_prefix_decode_generate = k8_active_prefix_decode_generate
+    _EXACT_K4_INSTALLED = True
+    engine.active_prefix_decode_generate = exact_k4_active_prefix_decode_generate
     try:
         yield
     finally:
         engine.active_prefix_decode_generate = previous
-        try:
-            lifecycle.close_all()
-        finally:
-            _ACTIVE_K8_LIFECYCLE = None
-            _ACTIVE_BLOCK_SIZE = None
+        _EXACT_K4_INSTALLED = False
 
 
 __all__ = [
-    "K8DeviceState",
-    "K8LogitsProcessor",
-    "K8_BLOCK_SIZE",
+    "ExactK4DeviceState",
+    "ExactK4LogitsProcessor",
+    "EXACT_K4_BLOCK_SIZE",
     "RNG_POLICY",
     "SUPPORTED_BLOCK_SIZES",
-    "install_k8_candidate",
-    "k8_active_prefix_decode_generate",
+    "install_exact_k4_candidate",
+    "exact_k4_active_prefix_decode_generate",
 ]
