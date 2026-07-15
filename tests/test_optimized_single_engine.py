@@ -596,7 +596,7 @@ def test_generate_window_preserves_custom_generate_dispatch(monkeypatch):
 
     def fake_processors(*args, **kwargs):
         processor_kwargs.update(kwargs)
-        return object()
+        return []
 
     monkeypatch.setattr(
         engine_module,

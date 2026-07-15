@@ -18,6 +18,8 @@ class ConditionalTemperatureLogitsWarper(
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.specialized_calls = 0
+        self.v32_fallback_calls = 0
         self._condition_tokens_by_device: dict[
             tuple[int, torch.device, torch.dtype], torch.Tensor
         ] = {}
@@ -64,6 +66,7 @@ class ConditionalTemperatureLogitsWarper(
         scores: torch.FloatTensor,
     ) -> torch.Tensor:
         if not self.conditionals or input_ids.shape[0] != 1:
+            self.v32_fallback_calls += 1
             return super().__call__(input_ids, scores)
         if scores.shape[0] != 1:
             raise ValueError(
@@ -74,6 +77,8 @@ class ConditionalTemperatureLogitsWarper(
                 "optimized conditional temperature requires tokens and scores "
                 "on one device"
             )
+
+        self.specialized_calls += 1
 
         selected = self._temperature_tensor(self.temperature, scores)
         # Reverse traversal preserves the V32 first-match precedence without a
@@ -93,6 +98,15 @@ class ConditionalTemperatureLogitsWarper(
                 selected,
             )
         return scores / selected
+
+    def profile_stats(self) -> dict[str, int]:
+        """Return dispatch evidence without synchronizing device state."""
+
+        return {
+            "condition_count": len(self.conditionals),
+            "specialized_calls": int(self.specialized_calls),
+            "v32_fallback_calls": int(self.v32_fallback_calls),
+        }
 
 
 class MonotonicTimeShiftLogitsProcessor(_V32MonotonicTimeShiftLogitsProcessor):
@@ -237,3 +251,25 @@ def build_single_logits_processor_list(
         monotonic_processor_factory=monotonic_factory,
         conditional_temperature_factory=conditional_temperature_factory,
     )
+
+
+def conditional_temperature_profile_stats(processors) -> dict[str, int]:
+    """Extract one candidate processor's host-side dispatch counters."""
+
+    candidates = [
+        processor
+        for processor in processors
+        if isinstance(processor, ConditionalTemperatureLogitsWarper)
+    ]
+    if len(candidates) > 1:
+        raise RuntimeError(
+            "optimized logits chain contains multiple conditional-temperature "
+            "processors"
+        )
+    if not candidates:
+        return {
+            "condition_count": 0,
+            "specialized_calls": 0,
+            "v32_fallback_calls": 0,
+        }
+    return candidates[0].profile_stats()

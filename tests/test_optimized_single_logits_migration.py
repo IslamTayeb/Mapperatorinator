@@ -119,6 +119,11 @@ def test_device_conditional_temperature_matches_v32_batch1_exactly(tokens):
         _apply(baseline, input_ids, scores),
         _apply(candidate, input_ids, scores),
     )
+    assert candidate.profile_stats() == {
+        "condition_count": 3,
+        "specialized_calls": 1,
+        "v32_fallback_calls": 0,
+    }
 
 
 def test_device_conditional_temperature_matches_v32_batched_fallback():
@@ -136,6 +141,11 @@ def test_device_conditional_temperature_matches_v32_batched_fallback():
         _apply(baseline, input_ids, scores),
         _apply(candidate, input_ids, scores),
     )
+    assert candidate.profile_stats() == {
+        "condition_count": 3,
+        "specialized_calls": 0,
+        "v32_fallback_calls": 1,
+    }
 
 
 def test_device_conditional_temperature_rejects_mismatched_batch1_devices():

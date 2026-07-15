@@ -1,0 +1,23 @@
+{
+  "schema_version": "mapperatorinator.dispatch-delta-allowlist.v1",
+  "allowed_paths": [
+    "preset.optimized_effective_config.device_conditional_temperature",
+    "preset.optimized_effective_config.version",
+    "preset.optimized_effective_config_version",
+    "records.*.optimized_device_conditional_temperature_requested",
+    "records.*.optimized_device_conditional_temperature_condition_count",
+    "records.*.optimized_device_conditional_temperature_specialized_calls",
+    "records.*.optimized_device_conditional_temperature_v32_fallback_calls",
+    "records.*.optimized_effective_config_version"
+  ],
+  "required_paths": [
+    "preset.optimized_effective_config.device_conditional_temperature",
+    "preset.optimized_effective_config.version",
+    "preset.optimized_effective_config_version",
+    "records.*.optimized_device_conditional_temperature_requested",
+    "records.*.optimized_device_conditional_temperature_condition_count",
+    "records.*.optimized_device_conditional_temperature_specialized_calls",
+    "records.*.optimized_device_conditional_temperature_v32_fallback_calls",
+    "records.*.optimized_effective_config_version"
+  ]
+}

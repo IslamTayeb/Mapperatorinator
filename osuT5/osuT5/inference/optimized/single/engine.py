@@ -20,7 +20,10 @@ from ...generation_utils import (
 )
 from .decode_loop import active_prefix_decode_generate
 from .exactness import cache_write_signature, rng_progression_signature
-from .logits import build_single_logits_processor_list
+from .logits import (
+    build_single_logits_processor_list,
+    conditional_temperature_profile_stats,
+)
 from .state import ProductionDecodeSession
 
 
@@ -379,6 +382,18 @@ def _generate_window(
         pad_token_id,
         elapsed_seconds,
     )
+    conditional_temperature_stats = conditional_temperature_profile_stats(processors)
+    if (
+        preset.precision == "fp32"
+        and batch_size == 1
+        and types_first
+        and conditional_temperature_stats["condition_count"] > 0
+        and conditional_temperature_stats["specialized_calls"] <= 0
+    ):
+        raise RuntimeError(
+            "strict FP32 device conditional-temperature path was requested but "
+            "never dispatched"
+        )
     stats.update({
         "precision": precision,
         "context_type": context_type.value if context_type is not None else None,
@@ -443,6 +458,18 @@ def _generate_window(
             else None
         ),
         "optimized_dispatch_capture_hits": dict(dispatch_counts),
+        "optimized_device_conditional_temperature_requested": (
+            preset.precision == "fp32"
+        ),
+        "optimized_device_conditional_temperature_condition_count": (
+            conditional_temperature_stats["condition_count"]
+        ),
+        "optimized_device_conditional_temperature_specialized_calls": (
+            conditional_temperature_stats["specialized_calls"]
+        ),
+        "optimized_device_conditional_temperature_v32_fallback_calls": (
+            conditional_temperature_stats["v32_fallback_calls"]
+        ),
         "decode_graph_count_before": graph_count_before,
         "decode_graph_count_after": int(getattr(context_state, "graph_count", 0)),
         "decode_graph_count_delta": (
