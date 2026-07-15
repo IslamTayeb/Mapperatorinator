@@ -20,6 +20,7 @@ def _row(
         "native_load_seconds": native,
         "ready_seconds": imported + native,
         "optional_modules_loaded": optional or [],
+        "import_modules": ["config", "inference"],
         "extensions": {
             "extension": {
                 "library_sha256": library,
@@ -63,7 +64,7 @@ def test_combined_summary_rejects_extension_drift_and_lazy_regression() -> None:
 
     assert report["status"] == "FAIL"
     assert not report["checks"]["extension_parity"]
-    assert not report["checks"]["lazy_import_retained"]
+    assert not report["checks"]["lazy_import_no_more_than_five_percent_slower"]
 
 
 def test_combined_summary_requires_all_variants() -> None:

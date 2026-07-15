@@ -22,7 +22,7 @@ class CombinedStartupCpuWrapperTest(unittest.TestCase):
         self.assertIn('export TORCH_EXTENSIONS_DIR="$NATIVE_CACHE"', source)
         self.assertIn("export TORCH_CUDA_ARCH_LIST=7.5", source)
         self.assertIn("profile_combined_startup.py", source)
-        self.assertIn("--rounds 5", source)
+        self.assertIn("--rounds 6", source)
         self.assertIn("COMBINED_STARTUP_PASS", source)
 
 

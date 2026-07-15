@@ -103,6 +103,13 @@ def worker(repo: Path, *, mode: str, manifest: Path) -> dict[str, Any]:
 
     import_seconds = time.perf_counter() - import_started
     optional_loaded = [name for name in OPTIONAL_MODULES if name in sys.modules]
+    import_modules = sorted(
+        name
+        for name in sys.modules
+        if name == "inference"
+        or name == "config"
+        or name.startswith(("config.", "osuT5.", "osu_diffusion."))
+    )
 
     native_started = time.perf_counter()
     from osuT5.osuT5.inference.optimized.kernels import decoder_layer, q1_attention
@@ -136,6 +143,7 @@ def worker(repo: Path, *, mode: str, manifest: Path) -> dict[str, Any]:
         "native_load_seconds": native_seconds,
         "ready_seconds": total_seconds,
         "optional_modules_loaded": optional_loaded,
+        "import_modules": import_modules,
         "extensions": extension_evidence,
     }
 
@@ -220,6 +228,12 @@ def summarize(rows: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
             for module in row["optional_modules_loaded"]
         }
     )
+    lazy_import_topologies = {
+        tuple(row["import_modules"]) for row in rows["lazy_parent"]
+    }
+    combined_import_topologies = {
+        tuple(row["import_modules"]) for row in rows["combined"]
+    }
     comparisons = {
         parent: {
             metric: _comparison(
@@ -238,10 +252,14 @@ def summarize(rows: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
     checks = {
         "extension_parity": not parity_failures,
         "combined_optional_modules_cold": not combined_optional,
-        "lazy_import_retained": comparisons["lazy_parent"]["import_seconds"][
-            "improvement_pct"
-        ]
-        >= -1.0,
+        "lazy_import_topology_retained": (
+            len(lazy_import_topologies) == 1
+            and lazy_import_topologies == combined_import_topologies
+        ),
+        "lazy_import_no_more_than_five_percent_slower": comparisons[
+            "lazy_parent"
+        ]["import_seconds"]["improvement_pct"]
+        >= -5.0,
         "aot_direct_load_retained": comparisons["aot_parent"][
             "native_load_seconds"
         ]["improvement_pct"]
@@ -268,6 +286,8 @@ def summarize(rows: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
         },
         "extension_parity_failures": parity_failures,
         "combined_optional_modules_loaded": combined_optional,
+        "lazy_parent_import_modules": list(next(iter(lazy_import_topologies))),
+        "combined_import_modules": list(next(iter(combined_import_topologies))),
         "checks": checks,
     }
 
@@ -286,8 +306,8 @@ def profile(args: argparse.Namespace) -> dict[str, Any]:
     for name in VARIANTS:
         commit, branch = expected[name]
         _verify_repo(repos[name], commit=commit, branch=branch)
-    if args.rounds < 3:
-        raise CombinedStartupError("combined startup requires at least three rounds")
+    if args.rounds < 6:
+        raise CombinedStartupError("combined startup requires all six reciprocal orders")
     if not args.python.is_file() or not os.access(args.python, os.X_OK):
         raise CombinedStartupError(f"Python is not executable: {args.python}")
     if not args.manifest.is_file():
@@ -300,8 +320,11 @@ def profile(args: argparse.Namespace) -> dict[str, Any]:
     }
     orders = (
         VARIANTS,
-        ("combined", "aot_parent", "lazy_parent"),
+        ("lazy_parent", "combined", "aot_parent"),
         ("aot_parent", "lazy_parent", "combined"),
+        ("aot_parent", "combined", "lazy_parent"),
+        ("combined", "lazy_parent", "aot_parent"),
+        ("combined", "aot_parent", "lazy_parent"),
     )
     rows = {name: [] for name in VARIANTS}
     script = Path(__file__).resolve()

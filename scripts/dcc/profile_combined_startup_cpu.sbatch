@@ -111,7 +111,7 @@ cd "$COMBINED_REPO"
   --combined-repo "$COMBINED_REPO" \
   --combined-commit "$COMBINED_COMMIT" \
   --combined-branch "$COMBINED_BRANCH" \
-  --rounds 5 \
+  --rounds 6 \
   --output "$RUN_ROOT/analysis.json" \
   --text-output "$RUN_ROOT/analysis.txt"
 
