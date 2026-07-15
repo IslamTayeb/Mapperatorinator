@@ -244,7 +244,7 @@ def test_candidate_runner_preserves_hydra_arguments() -> None:
     ]
 
 
-def test_reciprocal_wrapper_is_serial_precision_generic_and_fail_loud() -> None:
+def test_reciprocal_wrapper_is_serial_by_default_with_explicit_parallel_opt_in() -> None:
     source = (
         REPO_ROOT
         / "scripts/dcc/profile_device_sequence_state_reciprocal.sbatch"
@@ -259,3 +259,6 @@ def test_reciprocal_wrapper_is_serial_precision_generic_and_fail_loud() -> None:
     assert "cross_candidate_exact\"] is True" in source
     assert "dispatch_cache_topology\"][\"pass\"] is True" in source
     assert "another GPU job is running or pending" in source
+    assert "MAPPERATORINATOR_ALLOW_PARALLEL_RECIPROCAL:-0" in source
+    assert "MAPPERATORINATOR_ALLOW_PARALLEL_RECIPROCAL must be 0 or 1" in source
+    assert "parallel_reciprocal_opt_in=$ALLOW_PARALLEL_RECIPROCAL" in source
