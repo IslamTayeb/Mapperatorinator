@@ -1,6 +1,8 @@
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -11,6 +13,19 @@ from utils.analyze_fp16_fresh_baseline import (
     _runtime_contract,
     _text,
 )
+
+
+def test_analyzer_is_directly_executable_from_repository_root() -> None:
+    completed = subprocess.run(
+        [sys.executable, "utils/analyze_fp16_fresh_baseline.py", "--help"],
+        cwd=Path(__file__).resolve().parents[1],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "--run-root" in completed.stdout
 
 
 COMMIT = "a" * 40

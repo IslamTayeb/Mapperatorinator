@@ -7,8 +7,17 @@ import hashlib
 import json
 import math
 import statistics
+import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+
+# ``python utils/analyze_fp16_fresh_baseline.py`` puts ``utils/`` rather than
+# the repository root on sys.path.  The DCC wrapper deliberately launches the
+# analyzer that way, so make the repository package importable before loading
+# its shared analysis helpers.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from utils import analyze_fp32_fresh_baseline as common
 from utils import nsight_agent_profile as nsight
