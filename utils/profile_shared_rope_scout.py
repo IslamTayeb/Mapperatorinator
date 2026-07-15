@@ -93,6 +93,24 @@ def _git_head() -> str:
     return result.stdout.strip()
 
 
+def _strict_fp32_environment() -> dict[str, Any]:
+    evidence = {
+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        "cuda_matmul_allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
+        "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
+        "nvidia_tf32_override": os.environ.get("NVIDIA_TF32_OVERRIDE"),
+    }
+    expected = {
+        "float32_matmul_precision": "highest",
+        "cuda_matmul_allow_tf32": False,
+        "cudnn_allow_tf32": False,
+        "nvidia_tf32_override": "0",
+    }
+    if evidence != expected:
+        raise RuntimeError(f"strict FP32 environment is not active: {evidence}")
+    return evidence
+
+
 def _sha256_tensor(tensor: torch.Tensor) -> str:
     value = tensor.detach().contiguous().cpu()
     try:
@@ -359,6 +377,7 @@ def profile_shared_rope_scout(
     _assert_scout_args(args)
     output_path.mkdir(parents=True, exist_ok=True)
     run = _accepted_main_session_run(args, output_path=output_path)
+    strict_fp32_environment = _strict_fp32_environment()
     model = run["model"]
     model.eval()
     plan = build_shared_rope_plan(model)
@@ -524,6 +543,7 @@ def profile_shared_rope_scout(
             "original_decoder_layer": True,
             "original_specialized_dispatch": True,
             "precision": "fp32",
+            "strict_fp32_environment": strict_fp32_environment,
             "measured_buckets": list(ALL_BUCKETS),
             "accepted_bucket_replay_counts": {
                 str(prefix): count for prefix, count in live_counts.items()
