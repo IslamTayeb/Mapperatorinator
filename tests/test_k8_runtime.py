@@ -206,6 +206,11 @@ def test_shared_static_input_arena_preserves_addresses_and_refreshes_once_per_wi
     } == pointers
     with pytest.raises(RuntimeError, match="refreshed twice"):
         arena.refresh(second, window_identity=(0, 2))
+    assert bool(arena.content_match.item()) is True
+
+    arena.static_inputs["decoder_input_ids"].fill_(99)
+    assert arena.accumulate_content_match(second) == len(arena.tensor_addresses)
+    assert bool(arena.content_match.item()) is False
 
 
 def test_shared_arena_refresh_identity_includes_persistent_request_serial():

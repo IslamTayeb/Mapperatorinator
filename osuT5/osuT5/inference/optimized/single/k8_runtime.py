@@ -725,6 +725,7 @@ class _StaticInputArena:
     signature: tuple[Any, ...]
     tensor_addresses: tuple[tuple[str, int], ...]
     refreshed_window_identity: tuple[int, int]
+    content_match: torch.Tensor
 
     @staticmethod
     def _tensor_addresses(values: dict[str, Any]) -> tuple[tuple[str, int], ...]:
@@ -746,12 +747,47 @@ class _StaticInputArena:
         window_identity: tuple[int, int],
     ) -> "_StaticInputArena":
         static_inputs = _clone_static_graph_inputs(model_inputs)
-        return cls(
+        tensor_values = [
+            value for value in static_inputs.values() if isinstance(value, torch.Tensor)
+        ]
+        if not tensor_values:
+            raise RuntimeError("shared static-input arena requires tensor inputs")
+        arena = cls(
             static_inputs=static_inputs,
             signature=_static_input_signature(model_inputs),
             tensor_addresses=cls._tensor_addresses(static_inputs),
             refreshed_window_identity=window_identity,
+            content_match=torch.ones(
+                (),
+                dtype=torch.bool,
+                device=tensor_values[0].device,
+            ),
         )
+        arena.accumulate_content_match(model_inputs)
+        return arena
+
+    def accumulate_content_match(self, model_inputs: dict[str, Any]) -> int:
+        """Asynchronously prove every copied tensor matches its live source."""
+
+        self.validate_tensor_addresses()
+        checks = 0
+        for name, static_value in self.static_inputs.items():
+            if not isinstance(static_value, torch.Tensor):
+                continue
+            current = model_inputs.get(name)
+            if not isinstance(current, torch.Tensor):
+                raise RuntimeError(f"shared arena input {name} stopped being a tensor")
+            if (
+                current.shape != static_value.shape
+                or current.dtype != static_value.dtype
+                or current.device != static_value.device
+            ):
+                raise RuntimeError(f"shared arena input {name} changed tensor signature")
+            self.content_match.logical_and_(torch.eq(static_value, current).all())
+            checks += 1
+        if checks <= 0:
+            raise RuntimeError("shared static-input arena validated no tensors")
+        return checks
 
     def refresh(
         self,
@@ -766,6 +802,7 @@ class _StaticInputArena:
         if signature != self.signature:
             raise RuntimeError("shared static-input arena signature changed")
         _copy_static_graph_inputs(self.static_inputs, model_inputs)
+        self.accumulate_content_match(model_inputs)
         self.validate_tensor_addresses()
         self.refreshed_window_identity = window_identity
 
@@ -1275,6 +1312,8 @@ def k8_active_prefix_decode_generate(
         "static_input_arena_refresh_copy_calls": 0,
         "static_input_arena_refresh_copy_bytes": 0,
         "static_input_arena_graph_entries": 0,
+        "static_input_arena_content_checks": 0,
+        "static_input_arena_content_match": True,
     }
     if transition_timing:
         stats["transition_timing"] = {
@@ -1434,10 +1473,16 @@ def k8_active_prefix_decode_generate(
                     window_identity=arena_window_identity,
                 )
                 slot.static_input_arena = arena
+                stats["static_input_arena_content_checks"] += len(
+                    arena.tensor_addresses
+                )
             else:
                 arena.refresh(
                     model_inputs,
                     window_identity=arena_window_identity,
+                )
+                stats["static_input_arena_content_checks"] += len(
+                    arena.tensor_addresses
                 )
             stats["static_input_arena_refreshes"] += 1
             stats["static_input_arena_refresh_copy_calls"] += copy_calls
@@ -1455,6 +1500,7 @@ def k8_active_prefix_decode_generate(
             "k8_candidate",
             block_size,
             graph_remainders,
+            shared_static_input_arena,
             id(state),
             prefix,
             do_sample,
@@ -1646,6 +1692,15 @@ def k8_active_prefix_decode_generate(
         stats,
         enabled=shared_static_input_arena,
     )
+    if shared_static_input_arena and stats["static_input_arena_refreshes"] > 0:
+        arena = slot.static_input_arena
+        if arena is None:
+            raise RuntimeError("shared static-input arena disappeared before validation")
+        stats["static_input_arena_content_match"] = bool(
+            arena.content_match.item()
+        )
+        if not stats["static_input_arena_content_match"]:
+            raise RuntimeError("shared static-input arena content copy diverged")
     if transition_timing:
         timing_stats = stats["transition_timing"]
         accounted = sum(

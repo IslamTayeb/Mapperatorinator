@@ -105,6 +105,28 @@ def _decode_callable_fingerprint() -> tuple[Any, ...]:
     return _callable_fingerprint(engine.active_prefix_decode_generate)
 
 
+def _k8_runtime_fingerprint() -> tuple[Any, ...]:
+    from ..single import k8_runtime
+
+    values = (
+        k8_runtime._ACTIVE_BLOCK_SIZE,
+        k8_runtime._ACTIVE_GRAPH_REMAINDERS,
+        k8_runtime._ACTIVE_SHARED_STATIC_INPUT_ARENA,
+        k8_runtime._ACTIVE_TRANSITION_TIMING,
+    )
+    if any(value is None for value in values):
+        raise RuntimeError(
+            "persistent graph workspace requires an active K8 runtime topology"
+        )
+    return (
+        "k8_runtime",
+        int(values[0]),
+        bool(values[1]),
+        bool(values[2]),
+        bool(values[3]),
+    )
+
+
 class _PersistentWorkspace:
     def __init__(self, signature: tuple[Any, ...]):
         self.signature = signature
@@ -154,6 +176,7 @@ class _PersistentWorkspace:
                             arena.refreshed_window_identity
                         ),
                         "input_signature": repr(arena.signature),
+                        "content_match": bool(arena.content_match.item()),
                         "tensor_addresses": [
                             {"name": name, "data_ptr": int(data_ptr)}
                             for name, data_ptr in arena.tensor_addresses
@@ -231,6 +254,7 @@ class PersistentGraphWorkspacePool:
         self._model_fingerprint = _model_fingerprint(model)
         self._model_topology_fingerprint = _model_topology_fingerprint(model)
         self._decode_callable_fingerprint = _decode_callable_fingerprint()
+        self._k8_runtime_fingerprint = _k8_runtime_fingerprint()
         self._packed_state_ref = packed_state
         self._packed_fingerprint = _owned_tensor_fingerprint(packed_state)
         self.topology_signature = topology_signature
@@ -259,6 +283,8 @@ class PersistentGraphWorkspacePool:
             raise RuntimeError("persistent graph model forward topology changed")
         if _decode_callable_fingerprint() != self._decode_callable_fingerprint:
             raise RuntimeError("persistent graph decode callable topology changed")
+        if _k8_runtime_fingerprint() != self._k8_runtime_fingerprint:
+            raise RuntimeError("persistent graph K8 runtime topology changed")
         if _owned_tensor_fingerprint(self._packed_state_ref) != self._packed_fingerprint:
             raise RuntimeError("persistent packed-weight tensor addresses or versions changed")
         return model

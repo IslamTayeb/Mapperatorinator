@@ -223,6 +223,8 @@ class ProductionDecodeSession:
                 "static_input_arena_refresh_copy_calls",
                 "static_input_arena_refresh_copy_bytes",
                 "static_input_arena_graph_entries",
+                "static_input_arena_content_checks",
+                "static_input_arena_content_match",
                 "transition_timing",
             ):
                 if key in latest:

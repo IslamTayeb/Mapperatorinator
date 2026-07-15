@@ -34,6 +34,8 @@ def _runtime(*, candidate: bool) -> dict:
         "static_input_arena_refresh_copy_calls": 4 if candidate else 0,
         "static_input_arena_refresh_copy_bytes": 256 if candidate else 0,
         "static_input_arena_graph_entries": 2 if candidate else 0,
+        "static_input_arena_content_checks": 4 if candidate else 0,
+        "static_input_arena_content_match": True,
         "copy_calls": 4 if candidate else 120,
         "transition_timing": {
             "schema_version": 1,
@@ -163,6 +165,8 @@ def _append_prefill_eos_window(profiles: dict) -> None:
             "static_input_arena_refresh_copy_calls": 0,
             "static_input_arena_refresh_copy_bytes": 0,
             "static_input_arena_graph_entries": 0,
+            "static_input_arena_content_checks": 0,
+            "static_input_arena_content_match": True,
             "copy_calls": 0,
         })
         timing = runtime["transition_timing"]
@@ -291,4 +295,15 @@ def test_shared_arena_gate_requires_arena_graph_capture_evidence():
             "static_input_arena_graph_entries"
         ] = 0
     with pytest.raises(ValueError, match="captured no shared-arena graph"):
+        analyze(_reciprocal(), profiles)
+
+
+def test_shared_arena_gate_rejects_content_copy_divergence():
+    profiles = _profiles()
+    runtime = profiles["candidate_first"]["generation"][0][
+        "optimized_cuda_graphs"
+    ]["k8_candidate"]
+    runtime["static_input_arena_content_match"] = False
+
+    with pytest.raises(ValueError, match="content diverged"):
         analyze(_reciprocal(), profiles)

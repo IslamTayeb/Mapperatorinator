@@ -65,6 +65,8 @@ def _arena_storage_identity(value: Any, *, name: str) -> tuple[Any, ...]:
         )
         if len(refreshed) != 2:
             raise ValueError(f"{name}[{index}] refresh identity must have two values")
+        if row.get("content_match") is not True:
+            raise ValueError(f"{name}[{index}] arena content did not match")
         for part_index, part in enumerate(refreshed):
             _integer(part, name=f"{name}[{index}].refresh[{part_index}]")
         addresses = _list(
@@ -101,6 +103,68 @@ def _arena_storage_identity(value: Any, *, name: str) -> tuple[Any, ...]:
             )
         )
     return tuple(result)
+
+
+def _arena_refresh_identities(value: Any, *, name: str) -> tuple[tuple[int, int], ...]:
+    rows = _list(value, name=name)
+    result = []
+    for index, raw in enumerate(rows):
+        row = _object(raw, name=f"{name}[{index}]")
+        refreshed = _list(
+            row.get("refreshed_window_identity"),
+            name=f"{name}[{index}].refreshed_window_identity",
+        )
+        if len(refreshed) != 2:
+            raise ValueError(f"{name}[{index}] refresh identity must have two values")
+        result.append(
+            (
+                _integer(refreshed[0], name=f"{name}[{index}].request", minimum=1),
+                _integer(refreshed[1], name=f"{name}[{index}].window", minimum=1),
+            )
+        )
+    return tuple(result)
+
+
+def _dispatch_topology_pass(
+    label: str,
+    modes: list[str],
+    policies: list[dict[str, Any]],
+) -> bool:
+    expected_mode = (
+        "fp32_timing_native_self_batch1"
+        if label == "timing_context"
+        else "approximate_weight_only_batch1"
+    )
+    if not modes or any(mode != expected_mode for mode in modes):
+        return False
+    for policy in policies:
+        q1 = policy.get("q1_bmm_cross_attention")
+        effective_self = policy.get("effective_native_q1_rope_cache_self_attention")
+        if not isinstance(q1, dict) or q1.get("enabled") is not True:
+            return False
+        if not isinstance(effective_self, dict) or effective_self.get("enabled") is not True:
+            return False
+        if effective_self.get("kernel") != "native_q1_rope_cache_attention":
+            return False
+        if label == "timing_context":
+            timing = policy.get("timing_native_self")
+            if (
+                effective_self.get("owner") != "accepted_attention_hook"
+                or not isinstance(timing, dict)
+                or timing.get("enabled") is not True
+                or timing.get("exactness_claim") is not True
+            ):
+                return False
+        else:
+            weight = policy.get("approximate_weight_only")
+            if (
+                effective_self.get("owner") != "approximate_weight_only"
+                or not isinstance(weight, dict)
+                or weight.get("enabled") is not True
+                or weight.get("exactness_claim") is not False
+            ):
+                return False
+    return True
 
 
 def _profile_metrics(path: Path) -> dict[str, Any]:
@@ -160,6 +224,7 @@ def _profile_metrics(path: Path) -> dict[str, Any]:
         stopping = []
         dispatch_modes = []
         dispatch_policies = []
+        k8_topology_checks = []
         for index, row in enumerate(rows):
             tokens = _list(
                 row.get("generated_token_ids"),
@@ -201,6 +266,25 @@ def _profile_metrics(path: Path) -> dict[str, Any]:
                     row.get("optimized_dispatch_policy"),
                     name=f"{label}[{index}].optimized_dispatch_policy",
                 )
+            )
+            graphs = _object(
+                row.get("optimized_cuda_graphs"),
+                name=f"{label}[{index}].optimized_cuda_graphs",
+            )
+            k8 = _object(
+                graphs.get("k8_candidate"),
+                name=f"{label}[{index}].k8_candidate",
+            )
+            k8_topology_checks.append(
+                k8.get("block_size") == 4
+                and k8.get("remainder_backend") == "cuda_graph"
+                and k8.get("shared_static_input_arena") is True
+                and k8.get("static_input_arena_content_match") is True
+                and _integer(
+                    k8.get("static_input_arena_content_checks"),
+                    name=f"{label}[{index}].arena_content_checks",
+                )
+                >= 0
             )
         cache_storage = _list(
             last_persistent.get("cache_storage"),
@@ -252,6 +336,16 @@ def _profile_metrics(path: Path) -> dict[str, Any]:
                 arena_storage,
                 name=f"{label}.persistent_workspace.arena_storage",
             ),
+            "arena_refresh_identities": _arena_refresh_identities(
+                arena_storage,
+                name=f"{label}.persistent_workspace.arena_storage",
+            ),
+            "dispatch_topology_pass": _dispatch_topology_pass(
+                label,
+                dispatch_modes,
+                dispatch_policies,
+            ),
+            "k8_topology_pass": all(k8_topology_checks),
             "cross_request_graph_hits": max(
                 int(
                     _object(
@@ -313,9 +407,45 @@ def analyze(manifest_path: Path) -> dict[str, Any]:
         raise ValueError("persistent graph initialization schema_version must be 1")
     if initialization.get("topology_version") != TOPOLOGY_VERSION:
         raise ValueError("persistent graph initialization topology version changed")
+    initialization_roles = {}
     for role in ("main", "timing"):
-        if not _object(initialization.get(role), name=f"initialization.{role}"):
+        initialization_roles[role] = _object(
+            initialization.get(role),
+            name=f"initialization.{role}",
+        )
+        if not initialization_roles[role]:
             raise ValueError(f"persistent graph {role} initialization is empty")
+    main_initialization = initialization_roles["main"]
+    timing_initialization = initialization_roles["timing"]
+    main_cross = _object(
+        main_initialization.get("cross_candidate"),
+        name="initialization.main.cross_candidate",
+    )
+    main_int8 = _object(
+        main_initialization.get("int8_mlp_overlay"),
+        name="initialization.main.int8_mlp_overlay",
+    )
+    initialization_topology_pass = (
+        main_initialization.get("result_class") == "documented-drift"
+        and main_initialization.get("exactness_claim") is False
+        and main_cross.get("mode") == "fp16_packed_projections"
+        and main_cross.get("accepted_q1_bmm") is True
+        and main_cross.get("incremental_exactness_required") is True
+        and main_int8.get("dispatch_counter") == "int8_weight_mlp_tail"
+        and timing_initialization.get("result_class") == "exact"
+        and timing_initialization.get("exactness_claim") is True
+        and timing_initialization.get("precision") == "fp32"
+        and timing_initialization.get("native_q1_self_attention") is True
+        and timing_initialization.get("native_q1_rope_cache_self_attention") is True
+        and timing_initialization.get("q1_bmm_cross_attention_retained") is True
+        and timing_initialization.get("original_decoder_forward_retained") is True
+    )
+    if not initialization_topology_pass:
+        raise ValueError("persistent graph initialization topology is wrong")
+    pool_initial = _object(
+        initialization.get("pool_initial"),
+        name="initialization.pool_initial",
+    )
     results = _object(manifest.get("results"), name="manifest.results")
     if set(results) != set(PASSES):
         raise ValueError(f"persistent graph results must be exactly {list(PASSES)}")
@@ -332,6 +462,12 @@ def analyze(manifest_path: Path) -> dict[str, Any]:
             result_rows[pass_name].get("process_call_wall_seconds"),
             name=f"{pass_name}.process_call_wall_seconds",
         )
+    profile_topology_pass = all(
+        metrics[pass_name]["labels"][label]["dispatch_topology_pass"]
+        and metrics[pass_name]["labels"][label]["k8_topology_pass"]
+        for pass_name in PASSES
+        for label in LABELS
+    )
     cold = metrics["cold"]
     warm2 = metrics["warm2"]
     exactness: dict[str, Any] = {"reference": "cold", "passes": {}}
@@ -403,6 +539,19 @@ def analyze(manifest_path: Path) -> dict[str, Any]:
     }
     pool_checks = {}
     for role in ("main", "timing"):
+        expected_topology = (
+            TOPOLOGY_VERSION,
+            role,
+            "block_size=4",
+            "graph_remainders=true",
+            "shared_rope=true" if role == "main" else "timing_native_self=true",
+            "shared_static_input_arena=true",
+        )
+        expected_topology_repr = repr(expected_topology)
+        initial_summary = _object(
+            pool_initial.get(role),
+            name=f"initialization.pool_initial.{role}",
+        )
         summaries = {
             pass_name: _object(
                 pools[pass_name].get(role),
@@ -443,6 +592,17 @@ def analyze(manifest_path: Path) -> dict[str, Any]:
             final_workspace.get("arena_storage"),
             name=f"final.workspace.{role}.arena_storage",
         )
+        arena_refreshes = {
+            pass_name: _arena_refresh_identities(
+                workspace_rows[pass_name].get("arena_storage"),
+                name=f"{pass_name}.workspace.{role}.arena_storage",
+            )
+            for pass_name in PASSES
+        }
+        final_arena_refreshes = _arena_refresh_identities(
+            final_workspace.get("arena_storage"),
+            name=f"final.workspace.{role}.arena_storage",
+        )
         stable_workspace_fields = (
             "signature",
             "graph_count",
@@ -452,6 +612,14 @@ def analyze(manifest_path: Path) -> dict[str, Any]:
             "cache_storage",
         )
         pool_checks[role] = {
+            "topology_signature": all(
+                item.get("topology_signature") == expected_topology_repr
+                for item in (
+                    initial_summary,
+                    *summaries.values(),
+                    summary,
+                )
+            ),
             "one_workspace": (
                 all(item.get("workspaces_created") == 1 for item in summaries.values())
                 and summary.get("workspaces_created") == 1
@@ -482,10 +650,21 @@ def analyze(manifest_path: Path) -> dict[str, Any]:
                 == arena_identities["warm1"]
                 == arena_identities["warm2"]
             ),
+            "arena_refresh_progression": all(
+                identities
+                and all(request_serial == expected_request for request_serial, _ in identities)
+                for expected_request, identities in (
+                    (1, arena_refreshes["cold"]),
+                    (2, arena_refreshes["warm1"]),
+                    (3, arena_refreshes["warm2"]),
+                )
+            ),
             "final_snapshot_matches_warm2": all(
                 workspace_rows["warm2"].get(field) == final_workspace.get(field)
                 for field in stable_workspace_fields
-            ) and arena_identities["warm2"] == final_arena_identity,
+            )
+            and arena_identities["warm2"] == final_arena_identity
+            and arena_refreshes["warm2"] == final_arena_refreshes,
             "graphs_and_storage_nonempty": (
                 int(workspace_rows["cold"].get("graph_count", 0)) > 0
                 and int(workspace_rows["cold"].get("encoder_slot_count", 0)) > 0
@@ -510,7 +689,19 @@ def analyze(manifest_path: Path) -> dict[str, Any]:
         and all(capture_seconds[name] <= 1e-9 for name in WARM_PASSES)
         and all(graph_deltas[name] == 0 for name in WARM_PASSES)
     )
-    hits_pass = all(cross_request_hits[name] > 0 for name in WARM_PASSES)
+    hits_progression_by_label = {
+        label: (
+            metrics["warm1"]["labels"][label]["cross_request_graph_hits"] > 0
+            and metrics["warm2"]["labels"][label]["cross_request_graph_hits"]
+            > metrics["warm1"]["labels"][label]["cross_request_graph_hits"]
+        )
+        for label in LABELS
+    }
+    hits_pass = (
+        cross_request_hits["warm1"] > 0
+        and cross_request_hits["warm2"] > cross_request_hits["warm1"]
+        and all(hits_progression_by_label.values())
+    )
     tolerance_mb = VRAM_GROWTH_TOLERANCE_BYTES / (1024 * 1024)
     warm1 = metrics["warm1"]
     profile_memory_checks = {
@@ -601,7 +792,10 @@ def analyze(manifest_path: Path) -> dict[str, Any]:
             "pass": capture_pass,
         },
         "cross_request_graph_hits": cross_request_hits,
+        "cross_request_hit_progression_by_label": hits_progression_by_label,
         "cross_request_hits_pass": hits_pass,
+        "initialization_topology_pass": initialization_topology_pass,
+        "profile_topology_pass": profile_topology_pass,
         "pool_checks": pool_checks,
         "pool_pass": pool_pass,
         "memory_gate": {
@@ -616,6 +810,8 @@ def analyze(manifest_path: Path) -> dict[str, Any]:
             exactness_pass
             and capture_pass
             and hits_pass
+            and initialization_topology_pass
+            and profile_topology_pass
             and pool_pass
             and memory_pass
             and close_pass
@@ -631,6 +827,9 @@ def _text(report: dict[str, Any]) -> str:
             f"pass={str(report['pass']).lower()}",
             f"exactness_pass={str(report['exactness_pass']).lower()}",
             f"capture_pass={str(report['capture_gate']['pass']).lower()}",
+            f"cross_request_hits_pass={str(report['cross_request_hits_pass']).lower()}",
+            f"initialization_topology_pass={str(report['initialization_topology_pass']).lower()}",
+            f"profile_topology_pass={str(report['profile_topology_pass']).lower()}",
             f"pool_pass={str(report['pool_pass']).lower()}",
             f"memory_pass={str(report['memory_gate']['pass']).lower()}",
             f"close_pass={str(report['close_pass']).lower()}",

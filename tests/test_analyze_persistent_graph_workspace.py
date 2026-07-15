@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import copy
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,7 @@ def _profile(
     graph_delta: int,
     cross_request_hits: int,
 ) -> Path:
+    request_serial = {"cold": 1, "warm1": 2, "warm2": 3}[label]
     result = root / f"{label}.osu"
     result.write_text("same map\n", encoding="utf-8")
     cache_storage = [
@@ -45,8 +47,9 @@ def _profile(
         {
             "state_signature": "sig",
             "slot_signature": "slot",
-            "refreshed_window_identity": [1, 44],
+            "refreshed_window_identity": [request_serial, 44],
             "input_signature": "inputs",
+            "content_match": True,
             "tensor_addresses": [
                 {"name": "decoder_input_ids", "data_ptr": 789}
             ],
@@ -54,6 +57,7 @@ def _profile(
     ]
     generation = []
     for index, profile_label in enumerate(("timing_context", "main_generation")):
+        timing = profile_label == "timing_context"
         generation.append(
             {
                 "profile_label": profile_label,
@@ -65,9 +69,46 @@ def _profile(
                 "generated_token_ids": [index, index + 1],
                 "decode_graph_capture_seconds_delta": capture_seconds / 2,
                 "decode_graph_count_delta": graph_delta,
-                "optimized_dispatch_mode": "selected",
-                "optimized_dispatch_policy": {"self": "native"},
+                "optimized_dispatch_mode": (
+                    "fp32_timing_native_self_batch1"
+                    if timing
+                    else "approximate_weight_only_batch1"
+                ),
+                "optimized_dispatch_policy": {
+                    "q1_bmm_cross_attention": {"enabled": True},
+                    "effective_native_q1_rope_cache_self_attention": {
+                        "enabled": True,
+                        "owner": (
+                            "accepted_attention_hook"
+                            if timing
+                            else "approximate_weight_only"
+                        ),
+                        "kernel": "native_q1_rope_cache_attention",
+                    },
+                    **(
+                        {
+                            "timing_native_self": {
+                                "enabled": True,
+                                "exactness_claim": True,
+                            }
+                        }
+                        if timing
+                        else {
+                            "approximate_weight_only": {
+                                "enabled": True,
+                                "exactness_claim": False,
+                            }
+                        }
+                    ),
+                },
                 "optimized_cuda_graphs": {
+                    "k8_candidate": {
+                        "block_size": 4,
+                        "remainder_backend": "cuda_graph",
+                        "shared_static_input_arena": True,
+                        "static_input_arena_content_match": True,
+                        "static_input_arena_content_checks": 4,
+                    },
                     "persistent_workspace": {
                         "cross_request_graph_hits": cross_request_hits,
                         "cache_storage": cache_storage,
@@ -157,6 +198,7 @@ def _manifest(tmp_path: Path, *, warm_capture: float = 0.0) -> Path:
                 "slot_signature": "slot",
                 "refreshed_window_identity": [1, 44],
                 "input_signature": "inputs",
+                "content_match": True,
                 "tensor_addresses": [
                     {"name": "decoder_input_ids", "data_ptr": 789}
                 ],
@@ -166,15 +208,29 @@ def _manifest(tmp_path: Path, *, warm_capture: float = 0.0) -> Path:
         "closed": False,
     }
 
-    def pool(request_count: int) -> dict:
+    def pool(request_count: int, role: str) -> dict:
+        workspace_row = copy.deepcopy(workspace)
+        workspace_row["arena_storage"][0]["refreshed_window_identity"] = [
+            request_count,
+            44,
+        ]
+        topology = (
+            "selected-k4-k1-int8-fp16-cross-shared-arena-persistent-graphs-v2",
+            role,
+            "block_size=4",
+            "graph_remainders=true",
+            "shared_rope=true" if role == "main" else "timing_native_self=true",
+            "shared_static_input_arena=true",
+        )
         return {
+            "topology_signature": repr(topology),
             "workspaces_created": 1,
             "workspaces_evicted": 0,
             "max_resident_slots": 1,
             "resident_slots": 1,
             "request_count": request_count,
             "closed": False,
-            "workspaces": [workspace],
+            "workspaces": [workspace_row],
         }
 
     initialization = tmp_path / "initialization.json"
@@ -186,8 +242,31 @@ def _manifest(tmp_path: Path, *, warm_capture: float = 0.0) -> Path:
                     "selected-k4-k1-int8-fp16-cross-shared-arena-"
                     "persistent-graphs-v2"
                 ),
-                "main": {"initialized": True},
-                "timing": {"initialized": True},
+                "main": {
+                    "result_class": "documented-drift",
+                    "exactness_claim": False,
+                    "cross_candidate": {
+                        "mode": "fp16_packed_projections",
+                        "accepted_q1_bmm": True,
+                        "incremental_exactness_required": True,
+                    },
+                    "int8_mlp_overlay": {
+                        "dispatch_counter": "int8_weight_mlp_tail"
+                    },
+                },
+                "timing": {
+                    "result_class": "exact",
+                    "exactness_claim": True,
+                    "precision": "fp32",
+                    "native_q1_self_attention": True,
+                    "native_q1_rope_cache_self_attention": True,
+                    "q1_bmm_cross_attention_retained": True,
+                    "original_decoder_forward_retained": True,
+                },
+                "pool_initial": {
+                    "main": pool(0, "main"),
+                    "timing": pool(0, "timing"),
+                },
             }
         ),
         encoding="utf-8",
@@ -207,8 +286,8 @@ def _manifest(tmp_path: Path, *, warm_capture: float = 0.0) -> Path:
                         "profile_path": str(cold),
                         "process_call_wall_seconds": 7.0,
                         "pool_summary": {
-                            "main": pool(1),
-                            "timing": pool(1),
+                            "main": pool(1, "main"),
+                            "timing": pool(1, "timing"),
                         },
                         "cuda_peak_stats_reset": True,
                         "cuda_memory": {
@@ -222,8 +301,8 @@ def _manifest(tmp_path: Path, *, warm_capture: float = 0.0) -> Path:
                         "profile_path": str(warm1),
                         "process_call_wall_seconds": 6.0,
                         "pool_summary": {
-                            "main": pool(2),
-                            "timing": pool(2),
+                            "main": pool(2, "main"),
+                            "timing": pool(2, "timing"),
                         },
                         "cuda_peak_stats_reset": True,
                         "cuda_memory": {
@@ -237,8 +316,8 @@ def _manifest(tmp_path: Path, *, warm_capture: float = 0.0) -> Path:
                         "profile_path": str(warm2),
                         "process_call_wall_seconds": 5.9,
                         "pool_summary": {
-                            "main": pool(3),
-                            "timing": pool(3),
+                            "main": pool(3, "main"),
+                            "timing": pool(3, "timing"),
                         },
                         "cuda_peak_stats_reset": True,
                         "cuda_memory": {
@@ -249,7 +328,10 @@ def _manifest(tmp_path: Path, *, warm_capture: float = 0.0) -> Path:
                         },
                     },
                 },
-                "final_pool_summary": {"main": pool(3), "timing": pool(3)},
+                "final_pool_summary": {
+                    "main": pool(3, "main"),
+                    "timing": pool(3, "timing"),
+                },
                 "close_completed": True,
             }
         ),
@@ -313,6 +395,69 @@ def test_analyzer_rejects_warm_arena_address_change(tmp_path: Path) -> None:
     report = analyze(manifest_path)
 
     assert report["pool_checks"]["main"]["stable_arena_storage"] is False
+    assert report["pool_pass"] is False
+
+
+def test_analyzer_rejects_constant_cross_request_arena_identity(tmp_path: Path) -> None:
+    manifest_path = _manifest(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for pass_name in ("warm1", "warm2"):
+        for role in ("main", "timing"):
+            manifest["results"][pass_name]["pool_summary"][role]["workspaces"][0][
+                "arena_storage"
+            ][0]["refreshed_window_identity"][0] = 1
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    report = analyze(manifest_path)
+
+    assert report["pool_checks"]["main"]["arena_refresh_progression"] is False
+    assert report["pool_pass"] is False
+
+
+def test_analyzer_rejects_nonincreasing_cross_request_hits(tmp_path: Path) -> None:
+    manifest_path = _manifest(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    warm2_path = Path(manifest["results"]["warm2"]["profile_path"])
+    warm2 = json.loads(warm2_path.read_text(encoding="utf-8"))
+    for row in warm2["generation"]:
+        row["optimized_cuda_graphs"]["persistent_workspace"][
+            "cross_request_graph_hits"
+        ] = 9
+    warm2_path.write_text(json.dumps(warm2), encoding="utf-8")
+
+    report = analyze(manifest_path)
+
+    assert report["cross_request_hits_pass"] is False
+    assert report["pass"] is False
+
+
+def test_analyzer_rejects_wrong_common_dispatch_topology(tmp_path: Path) -> None:
+    manifest_path = _manifest(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for pass_name in ("cold", "warm1", "warm2"):
+        profile_path = Path(manifest["results"][pass_name]["profile_path"])
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        for row in profile["generation"]:
+            row["optimized_dispatch_mode"] = "wrong-topology"
+        profile_path.write_text(json.dumps(profile), encoding="utf-8")
+
+    report = analyze(manifest_path)
+
+    assert report["profile_topology_pass"] is False
+    assert report["pass"] is False
+
+
+def test_analyzer_rejects_wrong_pool_topology_signature(tmp_path: Path) -> None:
+    manifest_path = _manifest(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["results"]["warm2"]["pool_summary"]["main"][
+        "topology_signature"
+    ] = "wrong"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    report = analyze(manifest_path)
+
+    assert report["pool_checks"]["main"]["topology_signature"] is False
     assert report["pool_pass"] is False
 
 

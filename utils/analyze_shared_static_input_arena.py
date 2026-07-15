@@ -27,6 +27,8 @@ EXPECTED_DISPATCH_DELTA_PATTERNS = (
     "records.*[[]*].optimized_cuda_graphs.k8_candidate.static_input_arena_refresh_copy_calls",
     "records.*[[]*].optimized_cuda_graphs.k8_candidate.static_input_arena_refresh_copy_bytes",
     "records.*[[]*].optimized_cuda_graphs.k8_candidate.static_input_arena_graph_entries",
+    "records.*[[]*].optimized_cuda_graphs.k8_candidate.static_input_arena_content_checks",
+    "records.*[[]*].optimized_cuda_graphs.k8_candidate.static_input_arena_content_match",
 )
 
 
@@ -178,6 +180,7 @@ def _transition_summary(
         refresh_copy_calls = 0
         refresh_copy_bytes = 0
         graph_entries = 0
+        content_checks = 0
         ordinary_copy_calls = 0
         for index, runtime in enumerate(values):
             if runtime.get("shared_static_input_arena") is not candidate:
@@ -188,6 +191,11 @@ def _transition_summary(
             refresh_calls = runtime.get("static_input_arena_refresh_copy_calls", 0)
             refresh_bytes = runtime.get("static_input_arena_refresh_copy_bytes", 0)
             current_graph_entries = runtime.get("static_input_arena_graph_entries", 0)
+            current_content_checks = runtime.get(
+                "static_input_arena_content_checks",
+                0,
+            )
+            content_match = runtime.get("static_input_arena_content_match")
             replay_counts = {
                 name: runtime.get(name)
                 for name in ("block_replays", "remainder_graph_replays")
@@ -205,25 +213,39 @@ def _transition_summary(
                     refresh_calls,
                     refresh_bytes,
                     current_graph_entries,
+                    current_content_checks,
                 )
             ):
                 raise ValueError(f"{role}.{label}[{index}] has invalid arena counters")
+            if content_match is not True:
+                raise ValueError(f"{role}.{label}[{index}] arena content diverged")
             if candidate:
                 if expected_refreshes == 1 and (
-                    refresh != 1 or refresh_calls != 4 or refresh_bytes <= 0
+                    refresh != 1
+                    or refresh_calls != 4
+                    or refresh_bytes <= 0
+                    or current_content_checks != refresh_calls
                 ):
                     raise ValueError(
                         f"{role}.{label}[{index}] graph-using window must refresh "
                         "exactly four tensors once"
                     )
                 if expected_refreshes == 0 and any(
-                    (refresh, refresh_calls, refresh_bytes, current_graph_entries)
+                    (
+                        refresh,
+                        refresh_calls,
+                        refresh_bytes,
+                        current_graph_entries,
+                        current_content_checks,
+                    )
                 ):
                     raise ValueError(
                         f"{role}.{label}[{index}] zero graph replays require zero "
                         "arena refreshes and captures"
                     )
-            if not candidate and any((refresh, refresh_calls, refresh_bytes)):
+            if not candidate and any(
+                (refresh, refresh_calls, refresh_bytes, current_content_checks)
+            ):
                 raise ValueError(f"{role}.{label}[{index}] baseline used an arena")
             if not candidate and current_graph_entries:
                 raise ValueError(f"{role}.{label}[{index}] baseline captured arena graphs")
@@ -231,6 +253,7 @@ def _transition_summary(
             refresh_copy_calls += refresh_calls
             refresh_copy_bytes += refresh_bytes
             graph_entries += current_graph_entries
+            content_checks += current_content_checks
             copy_calls = runtime.get("copy_calls")
             if isinstance(copy_calls, bool) or not isinstance(copy_calls, int):
                 raise ValueError(f"{role}.{label}[{index}] copy_calls is invalid")
@@ -347,6 +370,7 @@ def _transition_summary(
             "static_input_arena_refresh_copy_calls": refresh_copy_calls,
             "static_input_arena_refresh_copy_bytes": refresh_copy_bytes,
             "static_input_arena_graph_entries": graph_entries,
+            "static_input_arena_content_checks": content_checks,
             "copy_calls": ordinary_copy_calls,
             "stages": stage_totals,
             "device": device_totals,

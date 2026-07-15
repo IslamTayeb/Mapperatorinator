@@ -1061,6 +1061,10 @@ elif [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
       'records.*[[]*].optimized_cuda_graphs.k8_candidate.static_input_arena_refresh_copy_bytes'
     --allow-dispatch-delta
       'records.*[[]*].optimized_cuda_graphs.k8_candidate.static_input_arena_graph_entries'
+    --allow-dispatch-delta
+      'records.*[[]*].optimized_cuda_graphs.k8_candidate.static_input_arena_content_checks'
+    --allow-dispatch-delta
+      'records.*[[]*].optimized_cuda_graphs.k8_candidate.static_input_arena_content_match'
   )
 elif [[ "$REQUIRE_CROSS_INCREMENTAL" == true ]]; then
   ANALYSIS_EXACT_ARGS=(

@@ -90,10 +90,11 @@ def test_runner_reuses_two_bindings_and_closes_pools(monkeypatch, tmp_path: Path
         lambda *args, **kwargs: nullcontext(),
     )
     install_calls = []
+    original_install = runner.install_k8_candidate
 
     def fake_install(**kwargs):
         install_calls.append(kwargs)
-        return nullcontext()
+        return original_install(**kwargs)
 
     monkeypatch.setattr(runner, "install_k8_candidate", fake_install)
     cuda_calls = []

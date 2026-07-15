@@ -10,6 +10,7 @@ from osuT5.osuT5.inference.optimized.scout.persistent_graph_workspace import (
     PersistentGraphWorkspacePool,
 )
 from osuT5.osuT5.inference.optimized.single import state as state_module
+from osuT5.osuT5.inference.optimized.single import k8_runtime
 from osuT5.osuT5.inference.optimized.single.decode_loop import (
     _stable_encoder_outputs,
 )
@@ -43,6 +44,14 @@ class _Cache:
         self.self_attention_cache = _Resettable()
         self.cross_attention_cache = _Resettable()
         self.is_updated = {0: True, 1: True}
+
+
+@pytest.fixture(autouse=True)
+def _active_k8_topology(monkeypatch):
+    monkeypatch.setattr(k8_runtime, "_ACTIVE_BLOCK_SIZE", 4)
+    monkeypatch.setattr(k8_runtime, "_ACTIVE_GRAPH_REMAINDERS", True)
+    monkeypatch.setattr(k8_runtime, "_ACTIVE_SHARED_STATIC_INPUT_ARENA", True)
+    monkeypatch.setattr(k8_runtime, "_ACTIVE_TRANSITION_TIMING", False)
 
 
 def _pool(model: _Model, *, max_slots: int = 2):
@@ -105,6 +114,7 @@ def test_a1_a2_reuse_one_workspace_and_reset_cross_cache(monkeypatch):
     arena = summary["workspaces"][0]["arena_storage"]
     assert len(arena) == 1
     assert arena[0]["refreshed_window_identity"] == [1, 1]
+    assert arena[0]["content_match"] is True
     assert arena[0]["tensor_addresses"][0]["name"] == "decoder_input_ids"
 
 
@@ -280,6 +290,16 @@ def test_model_forward_topology_change_invalidates_pool():
 
     model.forward = MethodType(replacement, model)
     with pytest.raises(RuntimeError, match="forward topology changed"):
+        pool.new_request()
+
+
+def test_k8_runtime_topology_change_invalidates_pool(monkeypatch):
+    model = _Model()
+    pool = _pool(model)
+
+    monkeypatch.setattr(k8_runtime, "_ACTIVE_SHARED_STATIC_INPUT_ARENA", False)
+
+    with pytest.raises(RuntimeError, match="K8 runtime topology changed"):
         pool.new_request()
 
 
