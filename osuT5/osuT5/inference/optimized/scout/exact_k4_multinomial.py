@@ -306,7 +306,11 @@ def _decode_step(
     was_unfinished = state.unfinished[0].clone()
     token = sampled_scalar * was_unfinished + PAD_TOKEN_ID * (1 - was_unfinished)
     state.tokens[step + 1].copy_(token)
-    stopped = eos_mask[sampled_scalar].logical_and(
+    # Tensor-indexing by a device scalar takes a capture-unsupported path in
+    # this PyTorch/CUDA build.  ``gather`` keeps the exact device lookup inside
+    # the ordinary graph without a host scalar conversion.
+    sampled_is_eos = torch.gather(eos_mask, 0, sampled_scalar.reshape(1))[0]
+    stopped = sampled_is_eos.logical_and(
         was_unfinished.to(dtype=torch.bool)
     )
     state.stop_flags[step].copy_(stopped)

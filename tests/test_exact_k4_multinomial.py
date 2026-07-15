@@ -94,6 +94,8 @@ def test_probe_is_opt_in_and_uses_one_ordinary_graph_with_distinct_steps() -> No
     assert "graph.register_generator_state(generator)" in source
     assert "for step in range(BLOCK_SIZE):" in source
     assert "torch.multinomial(probabilities, num_samples=1).squeeze(1)" in source
+    assert "torch.gather(eos_mask, 0, sampled_scalar.reshape(1))[0]" in source
+    assert "eos_mask[sampled_scalar]" not in source
     assert "raw_cuda_graph" not in source
     assert "cudaGraphAddChildGraphNode" not in source
     assert "generator.set_offset(corrected_offset)" in source
