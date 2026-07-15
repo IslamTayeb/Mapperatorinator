@@ -32,6 +32,7 @@ REQUIRE_K1_REMAINDER_INCREMENTAL=${REQUIRE_K1_REMAINDER_INCREMENTAL:-false}
 REQUIRE_INT8_MLP_INCREMENTAL=${REQUIRE_INT8_MLP_INCREMENTAL:-false}
 REQUIRE_CROSS_INCREMENTAL=${REQUIRE_CROSS_INCREMENTAL:-false}
 REQUIRE_SHARED_ARENA_INCREMENTAL=${REQUIRE_SHARED_ARENA_INCREMENTAL:-false}
+REQUIRE_DP4A_INCREMENTAL=${REQUIRE_DP4A_INCREMENTAL:-false}
 CROSS_CANDIDATE_MODE=${CROSS_CANDIDATE_MODE:-accepted}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_LABEL=${RUN_LABEL:-split-weight-full-song-reciprocal}
@@ -113,13 +114,19 @@ if [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" != true \
   echo "REQUIRE_SHARED_ARENA_INCREMENTAL must be true or false" >&2
   exit 2
 fi
+if [[ "$REQUIRE_DP4A_INCREMENTAL" != true \
+  && "$REQUIRE_DP4A_INCREMENTAL" != false ]]; then
+  echo "REQUIRE_DP4A_INCREMENTAL must be true or false" >&2
+  exit 2
+fi
 enabled_incremental_modes=0
 for enabled in \
   "$REQUIRE_SHARED_ROPE_INCREMENTAL" \
   "$REQUIRE_K1_REMAINDER_INCREMENTAL" \
   "$REQUIRE_INT8_MLP_INCREMENTAL" \
   "$REQUIRE_CROSS_INCREMENTAL" \
-  "$REQUIRE_SHARED_ARENA_INCREMENTAL"; do
+  "$REQUIRE_SHARED_ARENA_INCREMENTAL" \
+  "$REQUIRE_DP4A_INCREMENTAL"; do
   if [[ "$enabled" == true ]]; then
     enabled_incremental_modes=$((enabled_incremental_modes + 1))
   fi
@@ -128,7 +135,24 @@ if (( enabled_incremental_modes > 1 )); then
   echo "shared-RoPE, K1-remainder, INT8 MLP, cross, and shared-arena gates are mutually exclusive" >&2
   exit 2
 fi
-if [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_DP4A_INCREMENTAL" == true ]]; then
+  if [[ "$REQUIRE_K4_CANDIDATE" != true || "$REQUIRE_EXACT_TIMING" != true ]]; then
+    echo "DP4A gate requires K4 and exact timing" >&2
+    exit 2
+  fi
+  if [[ "$BASELINE_RUNNER" \
+      != utils/run_k4_shared_rope_fp16_cross_shared_arena.py \
+    || "$CANDIDATE_RUNNER" \
+      != utils/run_k4_shared_rope_fp16_cross_dp4a.py ]]; then
+    echo "DP4A gate requires the selected shared-arena control and DP4A runner" >&2
+    exit 2
+  fi
+  if [[ "$CROSS_CANDIDATE_MODE" != fp16_packed_projections ]]; then
+    echo "DP4A gate requires selected FP16 packed cross projections" >&2
+    exit 2
+  fi
+  CROSS_K1_INT8_COMPOSITION=true
+elif [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
   if [[ "$REQUIRE_K4_CANDIDATE" != true || "$REQUIRE_EXACT_TIMING" != true ]]; then
     echo "shared-arena gate requires K4 and exact timing" >&2
     exit 2
@@ -359,7 +383,8 @@ for tool in ffmpeg ffprobe; do
   fi
 done
 
-mkdir -p "$WORK/logs" "$WORK/tmp" "$WORK/cache" \
+JOB_TMPDIR="$WORK/tmp/reciprocal-$SLURM_JOB_ID"
+mkdir -p "$WORK/logs" "$JOB_TMPDIR" "$WORK/cache" \
   "$BASELINE_TORCH_EXTENSIONS_DIR" "$CANDIDATE_TORCH_EXTENSIONS_DIR" \
   "$RUN_ROOT/candidate-initialization" "$RUN_ROOT/baseline-extension-setup"
 
@@ -376,7 +401,7 @@ export HF_HOME="$WORK/cache/huggingface"
 export TRANSFORMERS_CACHE="$WORK/cache/huggingface"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
-export TMPDIR="$WORK/tmp"
+export TMPDIR="$JOB_TMPDIR"
 export TOKENIZERS_PARALLELISM=false
 export PYTHONHASHSEED=0
 
@@ -399,10 +424,12 @@ echo "require_int8_mlp_incremental=$REQUIRE_INT8_MLP_INCREMENTAL"
 echo "int8_k1_composition=$INT8_K1_COMPOSITION"
 echo "require_cross_incremental=$REQUIRE_CROSS_INCREMENTAL"
 echo "require_shared_arena_incremental=$REQUIRE_SHARED_ARENA_INCREMENTAL"
+echo "require_dp4a_incremental=$REQUIRE_DP4A_INCREMENTAL"
 echo "cross_candidate_mode=$CROSS_CANDIDATE_MODE"
 echo "cross_k1_int8_composition=$CROSS_K1_INT8_COMPOSITION"
 echo "audio=$AUDIO"
 echo "run_root=$RUN_ROOT"
+echo "tmpdir=$TMPDIR"
 echo "extension_cache_mode=$EXTENSION_CACHE_MODE"
 echo "baseline_torch_extensions_dir=$BASELINE_TORCH_EXTENSIONS_DIR"
 echo "candidate_torch_extensions_dir=$CANDIDATE_TORCH_EXTENSIONS_DIR"
@@ -590,7 +617,9 @@ run_profile() {
     validation_role=candidate
   fi
   local validation_cross_mode=accepted
-  if [[ "$REQUIRE_CROSS_INCREMENTAL" == true && "$candidate" == 1 ]]; then
+  if [[ "$REQUIRE_DP4A_INCREMENTAL" == true ]]; then
+    validation_cross_mode=$CROSS_CANDIDATE_MODE
+  elif [[ "$REQUIRE_CROSS_INCREMENTAL" == true && "$candidate" == 1 ]]; then
     validation_cross_mode=$CROSS_CANDIDATE_MODE
   elif [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
     validation_cross_mode=$CROSS_CANDIDATE_MODE
@@ -605,11 +634,13 @@ run_profile() {
   )
   if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true \
     || "$CROSS_K1_INT8_COMPOSITION" == true \
-    || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+    || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true \
+    || "$REQUIRE_DP4A_INCREMENTAL" == true ]]; then
     local int8_validation_role=baseline
     if [[ "$candidate" == 1 \
       || "$CROSS_K1_INT8_COMPOSITION" == true \
-      || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+      || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true \
+      || "$REQUIRE_DP4A_INCREMENTAL" == true ]]; then
       int8_validation_role=candidate
     fi
     (
@@ -635,12 +666,14 @@ run_profile() {
   if [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true \
     || "$INT8_K1_COMPOSITION" == true \
     || "$CROSS_K1_INT8_COMPOSITION" == true \
-    || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+    || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true \
+    || "$REQUIRE_DP4A_INCREMENTAL" == true ]]; then
     local remainder_role=control
     if [[ "$candidate" == 1 \
       || "$INT8_K1_COMPOSITION" == true \
       || "$CROSS_K1_INT8_COMPOSITION" == true \
-      || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+      || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true \
+      || "$REQUIRE_DP4A_INCREMENTAL" == true ]]; then
       remainder_role=candidate
     fi
     (
@@ -765,7 +798,8 @@ if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
   || "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true \
   || "$REQUIRE_INT8_MLP_INCREMENTAL" == true \
   || "$REQUIRE_CROSS_INCREMENTAL" == true \
-  || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+  || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true \
+  || "$REQUIRE_DP4A_INCREMENTAL" == true ]]; then
   INITIALIZATION_ROLES=baseline_first,candidate_first,candidate_second,baseline_second
 fi
 "$PYTHON" - "$RUN_ROOT" "$INITIALIZATION_ROLES" \
@@ -775,7 +809,8 @@ fi
   "$INT8_K1_COMPOSITION" \
   "$REQUIRE_CROSS_INCREMENTAL" \
   "$CROSS_CANDIDATE_MODE" \
-  "$CROSS_K1_INT8_COMPOSITION" <<'PY'
+  "$CROSS_K1_INT8_COMPOSITION" \
+  "$REQUIRE_DP4A_INCREMENTAL" <<'PY'
 import json
 import math
 import statistics
@@ -791,6 +826,7 @@ int8_k1_composition = sys.argv[6] == "true"
 require_cross = sys.argv[7] == "true"
 cross_mode = sys.argv[8]
 cross_k1_int8_composition = sys.argv[9] == "true"
+require_dp4a = sys.argv[10] == "true"
 shared_rope_both_arms = (
     require_k1_remainder
     or require_int8_mlp
@@ -929,6 +965,27 @@ if require_cross:
         elif runtime is not None:
             raise SystemExit(f"{role}: control unexpectedly contains cross runtime")
 
+if require_dp4a:
+    for role in roles:
+        cross = runs[role].get("cross_candidate")
+        if not isinstance(cross, dict) or cross.get("mode") != cross_mode:
+            raise SystemExit(f"{role}: selected FP16 cross mode is missing")
+        if not isinstance(runs[role].get("int8_mlp_overlay"), dict):
+            raise SystemExit(f"{role}: selected INT8 MLP overlay is missing")
+        overlay = runs[role].get("dp4a_self_qkv_overlay")
+        runtime = runs[role].get("dp4a_runtime")
+        if role.startswith("candidate"):
+            if not isinstance(overlay, dict):
+                raise SystemExit(f"{role}: DP4A self-QKV overlay is missing")
+            if overlay.get("dispatch_counter") != "dp4a_self_qkv_projection":
+                raise SystemExit(f"{role}: DP4A dispatch identity is wrong")
+            if not isinstance(runtime, dict) or runtime.get(
+                "full_graph_measurement_required"
+            ) is not True:
+                raise SystemExit(f"{role}: DP4A full-graph declaration is missing")
+        elif overlay is not None or runtime is not None:
+            raise SystemExit(f"{role}: selected control unexpectedly enabled DP4A")
+
 summary = {
     "schema_version": 1,
     "result_class": "documented-drift",
@@ -969,7 +1026,19 @@ ANALYSIS_DISPATCH_ARGS=(
   --allow-optional-dispatch-delta
     'records.main_generation[[]*].optimized_cuda_graphs.*'
 )
-if [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_DP4A_INCREMENTAL" == true ]]; then
+  ANALYSIS_EXACT_ARGS=(
+    --require-exact-label timing_context
+    --require-exact-dispatch-label timing_context
+  )
+  ANALYSIS_DISPATCH_ARGS=(
+    --allow-optional-dispatch-delta 'optimized_result_class'
+    --allow-dispatch-delta
+      'records.main_generation[[]*].optimized_dispatch_capture_hits.dp4a_self_qkv_projection'
+    --allow-optional-dispatch-delta
+      'records.main_generation[[]*].optimized_cuda_graphs.*'
+  )
+elif [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
   ANALYSIS_EXACT_ARGS=(
     --require-exact-label timing_context
     --require-exact-label main_generation

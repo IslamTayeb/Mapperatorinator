@@ -92,6 +92,17 @@ def test_wrapper_validates_opt_in_candidate_runner_inside_candidate_repo() -> No
     assert 'echo "candidate_runner=$CANDIDATE_RUNNER"' in source
 
 
+def test_wrapper_has_isolated_dp4a_incremental_gate() -> None:
+    source = WRAPPER.read_text(encoding="utf-8")
+
+    assert "REQUIRE_DP4A_INCREMENTAL=${REQUIRE_DP4A_INCREMENTAL:-false}" in source
+    assert "utils/run_k4_shared_rope_fp16_cross_shared_arena.py" in source
+    assert "utils/run_k4_shared_rope_fp16_cross_dp4a.py" in source
+    assert 'JOB_TMPDIR="$WORK/tmp/reciprocal-$SLURM_JOB_ID"' in source
+    assert 'export TMPDIR="$JOB_TMPDIR"' in source
+    assert "dp4a_self_qkv_projection" in source
+
+
 def test_wrapper_allows_declared_timing_drift_for_k4_composition() -> None:
     source = WRAPPER.read_text(encoding="utf-8")
 

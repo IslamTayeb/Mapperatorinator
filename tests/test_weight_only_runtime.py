@@ -22,6 +22,7 @@ def _state(
     owner,
     *,
     int8_mlp: bool = False,
+    dp4a_self_qkv: bool = False,
     cross_mode: str = weight_only_runtime.CROSS_ACCEPTED,
 ) -> weight_only_runtime.ApproximateWeightOnlyState:
     projection = torch.nn.Linear(4, 8, bias=False)
@@ -52,6 +53,10 @@ def _state(
         int8_mlp_extension_init_seconds=1.5 if int8_mlp else 0.0,
         int8_mlp_pack_seconds=0.25 if int8_mlp else 0.0,
         int8_mlp_packed_weight_bytes=48 if int8_mlp else 0,
+        dp4a_self_qkv_packs={} if dp4a_self_qkv else None,
+        dp4a_extension_init_seconds=2.5 if dp4a_self_qkv else 0.0,
+        dp4a_pack_seconds=0.125 if dp4a_self_qkv else 0.0,
+        dp4a_packed_weight_bytes=96 if dp4a_self_qkv else 0,
     )
 
 
@@ -354,6 +359,62 @@ def test_cross_int8_composition_initialization_is_owned_and_idempotent(
         ).initialize_approximate_int8_mlp_weight_only_cross(
             owner,
             mode="split8_attention",
+        )
+
+
+def test_dp4a_self_qkv_composition_initialization_is_owned_and_declared(
+    monkeypatch,
+) -> None:
+    owner = torch.nn.Module()
+    state = _state(
+        owner,
+        int8_mlp=True,
+        dp4a_self_qkv=True,
+        cross_mode=weight_only_runtime.CROSS_FP16_PACKED,
+    )
+    calls = []
+
+    def initialize(
+        cls,
+        model,
+        *,
+        cross_mode="accepted",
+        int8_mlp=False,
+        dp4a_self_qkv=False,
+    ):
+        calls.append((model, cross_mode, int8_mlp, dp4a_self_qkv))
+        return state
+
+    monkeypatch.setattr(
+        weight_only_runtime.ApproximateWeightOnlyState,
+        "initialize",
+        classmethod(initialize),
+    )
+    runtime = engine.OptimizedSingleRuntime(engine.OPTIMIZED_PRESETS["fp32"])
+
+    first = runtime.initialize_approximate_int8_mlp_weight_only_cross_dp4a_self_qkv(
+        owner,
+        mode=weight_only_runtime.CROSS_FP16_PACKED,
+    )
+    second = runtime.initialize_approximate_int8_mlp_weight_only_cross_dp4a_self_qkv(
+        owner,
+        mode=weight_only_runtime.CROSS_FP16_PACKED,
+    )
+
+    assert first == second == state.metadata()
+    assert calls == [
+        (owner, weight_only_runtime.CROSS_FP16_PACKED, True, True)
+    ]
+    overlay = first["dp4a_self_qkv_overlay"]
+    assert overlay["dispatch_counter"] == "dp4a_self_qkv_projection"
+    assert overlay["persistent_ctas"] == 68
+    assert overlay["packed_weight_bytes"] == 96
+    with pytest.raises(ValueError, match="requires fp16_packed"):
+        engine.OptimizedSingleRuntime(
+            engine.OPTIMIZED_PRESETS["fp32"]
+        ).initialize_approximate_int8_mlp_weight_only_cross_dp4a_self_qkv(
+            owner,
+            mode="accepted",
         )
 
 

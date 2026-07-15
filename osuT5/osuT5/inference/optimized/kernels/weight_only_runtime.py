@@ -148,6 +148,10 @@ class ApproximateWeightOnlyState:
     int8_mlp_extension_init_seconds: float = 0.0
     int8_mlp_pack_seconds: float = 0.0
     int8_mlp_packed_weight_bytes: int = 0
+    dp4a_self_qkv_packs: dict[int, Any] | None = None
+    dp4a_extension_init_seconds: float = 0.0
+    dp4a_pack_seconds: float = 0.0
+    dp4a_packed_weight_bytes: int = 0
 
     @classmethod
     def initialize(
@@ -156,6 +160,7 @@ class ApproximateWeightOnlyState:
         *,
         cross_mode: str = CROSS_ACCEPTED,
         int8_mlp: bool = False,
+        dp4a_self_qkv: bool = False,
     ) -> "ApproximateWeightOnlyState":
         if not isinstance(model, torch.nn.Module):
             raise TypeError("weight-only candidate owner must be a torch module")
@@ -218,6 +223,14 @@ class ApproximateWeightOnlyState:
             preload_int8_mlp_extension()
             torch.cuda.synchronize()
             int8_extension_seconds = time.perf_counter() - int8_extension_start
+        dp4a_extension_seconds = 0.0
+        if dp4a_self_qkv:
+            from ..scout.int8_dp4a_projection import preload_dp4a_projection_extension
+
+            dp4a_extension_start = time.perf_counter()
+            preload_dp4a_projection_extension()
+            torch.cuda.synchronize()
+            dp4a_extension_seconds = time.perf_counter() - dp4a_extension_start
         torch.cuda.synchronize()
         extension_seconds = time.perf_counter() - extension_start
         extension_allocated_after = torch.cuda.memory_allocated(device)
@@ -252,6 +265,22 @@ class ApproximateWeightOnlyState:
             int8_packed_bytes = sum(
                 pack.memory_report()["packed_weight_bytes"]
                 for pack in int8_packs.values()
+            )
+        dp4a_packs = None
+        dp4a_pack_seconds = 0.0
+        dp4a_packed_bytes = 0
+        if dp4a_self_qkv:
+            from ..scout.int8_mlp import Int8PackedLinear
+
+            dp4a_pack_start = time.perf_counter()
+            dp4a_packs = {
+                id(layer): Int8PackedLinear.from_module(layer.self_attn.Wqkv)
+                for layer in layers
+            }
+            torch.cuda.synchronize(device)
+            dp4a_pack_seconds = time.perf_counter() - dp4a_pack_start
+            dp4a_packed_bytes = sum(
+                pack.packed_weight_bytes for pack in dp4a_packs.values()
             )
         torch.cuda.synchronize(device)
         pack_seconds = time.perf_counter() - pack_start
@@ -289,13 +318,19 @@ class ApproximateWeightOnlyState:
             allocated_bytes_delta=allocated_after - allocated_before,
             reserved_bytes_delta=reserved_after - reserved_before,
             retained_fp32_source_weight_bytes=source_bytes,
-            packed_weight_bytes=packed_bytes + int8_packed_bytes,
+            packed_weight_bytes=(
+                packed_bytes + int8_packed_bytes + dp4a_packed_bytes
+            ),
             cross_mode=cross_mode,
             cross_packs=cross_packs,
             int8_mlp_packs=int8_packs,
             int8_mlp_extension_init_seconds=int8_extension_seconds,
             int8_mlp_pack_seconds=int8_pack_seconds,
             int8_mlp_packed_weight_bytes=int8_packed_bytes,
+            dp4a_self_qkv_packs=dp4a_packs,
+            dp4a_extension_init_seconds=dp4a_extension_seconds,
+            dp4a_pack_seconds=dp4a_pack_seconds,
+            dp4a_packed_weight_bytes=dp4a_packed_bytes,
         )
 
     def validate_owner(self, model: torch.nn.Module) -> None:
@@ -332,6 +367,20 @@ class ApproximateWeightOnlyState:
             return self.int8_mlp_packs[id(layer)]
         except KeyError as exc:
             raise RuntimeError("INT8 MLP overlay received an unowned decoder layer") from exc
+
+    @property
+    def dp4a_self_qkv_enabled(self) -> bool:
+        return self.dp4a_self_qkv_packs is not None
+
+    def dp4a_self_qkv_pack_for_layer(self, layer: torch.nn.Module) -> Any:
+        if self.dp4a_self_qkv_packs is None:
+            raise RuntimeError("DP4A self-QKV overlay was not initialized")
+        try:
+            return self.dp4a_self_qkv_packs[id(layer)]
+        except KeyError as exc:
+            raise RuntimeError(
+                "DP4A self-QKV overlay received an unowned decoder layer"
+            ) from exc
 
     def metadata(self) -> dict[str, Any]:
         fp16_regions = [
@@ -411,6 +460,25 @@ class ApproximateWeightOnlyState:
                 "weight_pack_seconds": self.int8_mlp_pack_seconds,
                 "packed_weight_bytes": self.int8_mlp_packed_weight_bytes,
             }
+        if self.dp4a_self_qkv_enabled:
+            metadata["dp4a_self_qkv_overlay"] = {
+                "version": "sm75-dynamic-activation-int8-dp4a-self-qkv-v1",
+                "result_class": "documented-drift",
+                "exactness_claim": False,
+                "scope": "main-model-decoder-self-qkv-only",
+                "replaces_effective_regions": ["self_qkv"],
+                "retained_unused_fp16_regions": ["self_qkv"],
+                "activation_quantization": "dynamic-per-token-symmetric-int8",
+                "weight_quantization": "symmetric-per-output-row-int8",
+                "accumulation": "signed-dp4a-int32",
+                "output_storage": "fp32",
+                "active_warps": 8,
+                "persistent_ctas": 68,
+                "dispatch_counter": "dp4a_self_qkv_projection",
+                "extension_init_seconds": self.dp4a_extension_init_seconds,
+                "weight_pack_seconds": self.dp4a_pack_seconds,
+                "packed_weight_bytes": self.dp4a_packed_weight_bytes,
+            }
         return metadata
 
 
@@ -457,13 +525,28 @@ def _self_attention_block_forward(
     values = _require_fp32_cuda(getattr(cache_layer, "values", None), name="self cache values")
 
     with profile_range(f"{layer_name}.weight_only.self_qkv"):
-        qkv = weight_only_rmsnorm_linear(
-            hidden_states,
-            module.self_attn_layer_norm.weight,
-            pack.self_qkv,
-            eps=_norm_eps(module.self_attn_layer_norm),
-            outputs_per_block=SELF_QKV_OUTPUTS_PER_BLOCK,
-        ).view(1, 1, 3, module.self_attn.num_heads, module.self_attn.head_dim)
+        if state.dp4a_self_qkv_enabled:
+            from ..scout.int8_dp4a_projection import dp4a_rmsnorm_linear
+
+            qkv_projection = dp4a_rmsnorm_linear(
+                hidden_states,
+                module.self_attn_layer_norm.weight,
+                state.dp4a_self_qkv_pack_for_layer(module),
+                eps=_norm_eps(module.self_attn_layer_norm),
+                active_warps=8,
+                persistent_ctas=68,
+            )
+        else:
+            qkv_projection = weight_only_rmsnorm_linear(
+                hidden_states,
+                module.self_attn_layer_norm.weight,
+                pack.self_qkv,
+                eps=_norm_eps(module.self_attn_layer_norm),
+                outputs_per_block=SELF_QKV_OUTPUTS_PER_BLOCK,
+            )
+        qkv = qkv_projection.view(
+            1, 1, 3, module.self_attn.num_heads, module.self_attn.head_dim
+        )
     cos, sin = module.self_attn.rotary_emb(qkv, position_ids=position_ids)
     native_mask = attention_mask
     if isinstance(native_mask, torch.Tensor):
@@ -497,6 +580,10 @@ def _self_attention_block_forward(
         variant=native_q1_variant,
         prefix_length=int(prefix_length),
     )
+    if state.dp4a_self_qkv_enabled and dispatch_counts is not None:
+        dispatch_counts["dp4a_self_qkv_projection"] = (
+            dispatch_counts.get("dp4a_self_qkv_projection", 0) + 1
+        )
     return output, (self_output, self_cache)
 
 

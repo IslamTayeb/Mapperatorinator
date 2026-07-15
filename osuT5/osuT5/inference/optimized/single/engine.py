@@ -672,6 +672,47 @@ class OptimizedSingleRuntime:
         object.__setattr__(self, "_approximate_weight_only_state", state)
         return state.metadata()
 
+    def initialize_approximate_int8_mlp_weight_only_cross_dp4a_self_qkv(
+        self,
+        model: torch.nn.Module,
+        *,
+        mode: str,
+    ) -> dict[str, Any]:
+        """Compose the selected runtime with the measured SM75 DP4A self-QKV delta."""
+
+        if self.preset.precision != "fp32":
+            raise TypeError("DP4A composition requires the FP32 optimized preset")
+        from ..kernels.weight_only_runtime import (
+            ApproximateWeightOnlyState,
+            CROSS_FP16_PACKED,
+        )
+
+        if mode != CROSS_FP16_PACKED:
+            raise ValueError(
+                "DP4A composition requires fp16_packed_projections cross mode"
+            )
+        existing = self._approximate_weight_only_state
+        if existing is not None:
+            existing.validate_owner(model)
+            if (
+                not existing.int8_mlp_enabled
+                or not existing.dp4a_self_qkv_enabled
+                or existing.cross_mode != mode
+            ):
+                raise RuntimeError(
+                    "optimized runtime already owns a different mixed-weight "
+                    "INT8/cross/DP4A composition"
+                )
+            return existing.metadata()
+        state = ApproximateWeightOnlyState.initialize(
+            model,
+            cross_mode=mode,
+            int8_mlp=True,
+            dp4a_self_qkv=True,
+        )
+        object.__setattr__(self, "_approximate_weight_only_state", state)
+        return state.metadata()
+
     def for_super_timing(
         self,
         *,

@@ -28,6 +28,7 @@ def _enrich_evidence(
     *,
     mode: str,
     composition_version: str,
+    dp4a_self_qkv: bool = False,
 ) -> None:
     try:
         payload = json.loads(output_init_json.read_text(encoding="utf-8"))
@@ -42,6 +43,14 @@ def _enrich_evidence(
         raise RuntimeError("cross candidate composition identity was not recorded")
     if not isinstance(payload.get("shared_rope"), dict):
         raise RuntimeError("cross candidate shared-RoPE evidence is missing")
+    dp4a = payload.get("dp4a_self_qkv_overlay")
+    if dp4a_self_qkv:
+        if not isinstance(dp4a, dict):
+            raise RuntimeError("DP4A self-QKV initialization evidence is missing")
+        if dp4a.get("dispatch_counter") != "dp4a_self_qkv_projection":
+            raise RuntimeError("DP4A self-QKV dispatch identity was not recorded")
+    elif dp4a is not None:
+        raise RuntimeError("ordinary cross candidate unexpectedly enabled DP4A")
     if "cross_runtime" in payload:
         raise RuntimeError("cross candidate evidence already contains cross wiring")
     payload["cross_runtime"] = {
@@ -54,6 +63,15 @@ def _enrich_evidence(
         "accepted_q1_bmm_required": True,
         "original_decoder_forward_required": True,
     }
+    if dp4a_self_qkv:
+        payload["dp4a_runtime"] = {
+            **dp4a,
+            "incremental_control": (
+                "k4-split-kv-mixed-weight-shared-rope-k1-remainder-int8-mlp-"
+                "fp16_packed_projections-v1"
+            ),
+            "full_graph_measurement_required": True,
+        }
     output_init_json.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -68,6 +86,7 @@ def run(
     mode: str,
     shared_static_input_arena: bool = False,
     transition_timing: bool = False,
+    dp4a_self_qkv: bool = False,
 ) -> None:
     if mode not in CROSS_CANDIDATE_MODES:
         raise ValueError(
@@ -75,7 +94,7 @@ def run(
         )
     composition_version = (
         "k4-split-kv-mixed-weight-shared-rope-k1-remainder-int8-mlp-"
-        f"{mode}-v1"
+        f"{mode}{'-dp4a-self-qkv' if dp4a_self_qkv else ''}-v1"
     )
 
     def weight_runner(
@@ -87,7 +106,11 @@ def run(
             nested_config_name,
             nested_overrides,
             nested_output_init_json,
-            initializer_name="initialize_approximate_int8_mlp_weight_only_cross",
+            initializer_name=(
+                "initialize_approximate_int8_mlp_weight_only_cross_dp4a_self_qkv"
+                if dp4a_self_qkv
+                else "initialize_approximate_int8_mlp_weight_only_cross"
+            ),
             initializer_kwargs={"mode": mode},
         )
 
@@ -105,6 +128,7 @@ def run(
         output_init_json,
         mode=mode,
         composition_version=composition_version,
+        dp4a_self_qkv=dp4a_self_qkv,
     )
 
 
