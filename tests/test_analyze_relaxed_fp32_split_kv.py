@@ -132,6 +132,7 @@ def test_relaxed_gate_rejects_rng_or_cross_cache_drift(
     "script",
     (
         "utils/analyze_relaxed_fp32_split_kv.py",
+        "utils/analyze_fp16_fresh_baseline.py",
         "utils/analyze_fp16_split_kv_reciprocal.py",
     ),
 )
