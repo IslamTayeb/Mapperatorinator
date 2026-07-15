@@ -295,15 +295,20 @@ def _decode_step(
 ) -> None:
     previous = state.tokens[step].to(dtype=torch.float32)
     state.cache[step].copy_(logits[step].nan_to_num(neginf=-100.0) + previous)
-    scores = logits[step].clone()
+    # Keep the accepted batch-one sampling shape and call sequence exactly:
+    # [1, vocabulary] FP32 scores -> softmax -> multinomial -> squeeze(1).
+    scores = logits[step].clone().unsqueeze(0)
     first = 2 + 2 * step
-    scores[first].add_(state.processor_state[0] * 0.001)
+    scores[0, first].add_(state.processor_state[0] * 0.001)
     probabilities = torch.softmax(scores, dim=-1)
-    sampled = torch.multinomial(probabilities, num_samples=1).reshape(())
+    sampled = torch.multinomial(probabilities, num_samples=1).squeeze(1)
+    sampled_scalar = sampled[0]
     was_unfinished = state.unfinished[0].clone()
-    token = sampled * was_unfinished + PAD_TOKEN_ID * (1 - was_unfinished)
+    token = sampled_scalar * was_unfinished + PAD_TOKEN_ID * (1 - was_unfinished)
     state.tokens[step + 1].copy_(token)
-    stopped = eos_mask[sampled].logical_and(was_unfinished.to(dtype=torch.bool))
+    stopped = eos_mask[sampled_scalar].logical_and(
+        was_unfinished.to(dtype=torch.bool)
+    )
     state.stop_flags[step].copy_(stopped)
     state.unfinished.mul_((~stopped).to(dtype=torch.long))
     state.processor_state.add_(token.to(dtype=torch.float32))
