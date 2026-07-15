@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=runtime-nsight-fixed7149
+#SBATCH --job-name=arena-runtime-nsight
 #SBATCH --partition=gpu-common
 #SBATCH --account=romerolab
 #SBATCH --cpus-per-task=8
@@ -10,6 +10,16 @@
 #SBATCH --error=/work/imt11/Mapperatorinator/logs/%x-%j.err
 
 set -euo pipefail
+
+# The selected K4/K1 runtime owns its cache capacity and natural stopping.
+# Profiling therefore compares identical fixed-seed natural selected runs
+# instead of rewriting MaxLengthCriteria through the generic fixed-work gate.
+export RUN_LABEL=selected-arena-runtime-nsight
+export MAPPERATORINATOR_SELECTED_RUNNER=utils/run_k4_shared_rope_fp16_cross_shared_arena_transition_timing.py
+source "${MAPPERATORINATOR_REPO:?Set MAPPERATORINATOR_REPO to the clean profiler worktree}/scripts/dcc/profile_nsight_inference.sbatch"
+exit 0
+
+: <<'LEGACY_FIXED_WORK_HARNESS'
 
 die() {
   echo "runtime-nsight-fixed7149: $*" >&2
@@ -328,3 +338,4 @@ find "$RUN_ROOT" -type f ! -name sha256sums.txt -print0 \
   | sort -z | xargs -0 sha256sum > "$RUN_ROOT/sha256sums.txt"
 require_nonempty "$RUN_ROOT/sha256sums.txt"
 cat "$RUN_ROOT/analysis.txt"
+LEGACY_FIXED_WORK_HARNESS

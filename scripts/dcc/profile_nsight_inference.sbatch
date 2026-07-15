@@ -50,6 +50,12 @@ WORK=${MAPPERATORINATOR_WORK:-/work/imt11/Mapperatorinator}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 EXPECTED_GPU=${MAPPERATORINATOR_EXPECTED_GPU:-2080 Ti}
 RUN_LABEL=${RUN_LABEL:-nsight-agent-inference}
+SELECTED_RUNNER=${MAPPERATORINATOR_SELECTED_RUNNER:-}
+SELECTED_MODE=false
+if [[ -n "$SELECTED_RUNNER" ]]; then
+  [[ -f "$REPO/$SELECTED_RUNNER" ]] || die "missing selected runtime runner: $SELECTED_RUNNER"
+  SELECTED_MODE=true
+fi
 RUN_ROOT="$WORK/runs/${RUN_LABEL}-${SLURM_JOB_ID}"
 CAPABILITIES="$RUN_ROOT/capabilities"
 RUNS="$RUN_ROOT/runs"
@@ -173,8 +179,18 @@ build_inference_command() {
   local detail_ranges=$4
   local cuda_capture=$5
   local output_dir=$6
-  INFERENCE_COMMAND=(
-    "$PYTHON" inference.py --config-name "$config_name"
+  local runner_dir
+  runner_dir=$(dirname "$output_dir")
+  if [[ "$SELECTED_MODE" == true ]]; then
+    INFERENCE_COMMAND=(
+      "$PYTHON" "$SELECTED_RUNNER"
+      --config-name "$config_name"
+      --output-init-json "$runner_dir/runtime-evidence.json"
+    )
+  else
+    INFERENCE_COMMAND=("$PYTHON" inference.py --config-name "$config_name")
+  fi
+  INFERENCE_COMMAND+=(
     audio_path="$AUDIO"
     output_path="$output_dir"
     device=cuda
@@ -347,14 +363,24 @@ run_precision() {
   run_control "$precision" full profile_salvalai
   run_nsys "$precision" full profile_salvalai graph nsys_graph
   transparency_gate "$precision" full graph
+  if [[ "$SELECTED_MODE" == true ]]; then
+    run_nsys "$precision" full profile_salvalai node nsys_node
+    transparency_gate "$precision" full node
+    return
+  fi
   run_control "$precision" smoke profile_salvalai_smoke15
   run_nsys "$precision" smoke profile_salvalai_smoke15 node nsys_node
   transparency_gate "$precision" smoke node
 }
 
-# FP32 must complete its parity gates before FP16 begins.
+# FP32 must complete its parity gates before FP16 begins. A selected-runtime
+# profile is intentionally FP32-only and runs the full workload at both graph
+# and node trace levels so child-kernel rankings are not inferred from graph
+# replay shells.
 run_precision fp32
-run_precision fp16
+if [[ "$SELECTED_MODE" == false ]]; then
+  run_precision fp16
+fi
 
 NCU_PROBE_DIR="$RUN_ROOT/ncu-permission-probe"
 mkdir -p "$NCU_PROBE_DIR"
@@ -386,6 +412,10 @@ elif [[ $NCU_PROBE_EXIT -ne 0 ]]; then
   NCU_FATAL=1
 else
   echo "ncu_status=available" | tee "$NCU_PROBE_DIR/status.txt"
+  if [[ "$SELECTED_MODE" == true ]]; then
+    echo "ncu_target_status=skipped_selected_runtime_profile" \
+      | tee -a "$NCU_PROBE_DIR/status.txt"
+  else
   # FP32 is the authoritative optimization target.  Select exactly one kernel
   # from its fresh node-level trace and collect one bounded NCU profile.
   precision=fp32
@@ -466,6 +496,7 @@ PY
     --traced "$(<"$ncu_dir/profile-path.txt")" \
     --output "$ncu_dir/transparency.json"
   TARGETED_NCU+=("$precision:$(basename "$ncu_dir/ncu/hot-kernel.ncu-rep")")
+  fi
 fi
 
 TARGETED_NCU_JSON=$(printf '%s\n' "${TARGETED_NCU[@]:-}" | "$PYTHON" -c 'import json,sys; print(json.dumps([line.strip() for line in sys.stdin if line.strip()]))')
@@ -477,6 +508,8 @@ export NSIGHT_REMOTE_REF="$REMOTE_REF"
 export NSIGHT_AUDIO="$AUDIO"
 export NSIGHT_NCU_PROBE_EXIT="$NCU_PROBE_EXIT"
 export NSIGHT_TARGETED_NCU_JSON="$TARGETED_NCU_JSON"
+export NSIGHT_SELECTED_MODE="$SELECTED_MODE"
+export NSIGHT_SELECTED_RUNNER="$SELECTED_RUNNER"
 "$PYTHON" - <<'PY'
 import hashlib
 import json
@@ -557,6 +590,9 @@ def add_run(result, precision, directory_name, scope, pass_kind, paired=None):
         artifact(directory / "stdout.txt", "process_stdout"),
         artifact(directory / "stderr.txt", "process_stderr", allow_empty=True),
     ]
+    runtime_evidence_path = directory / "runtime-evidence.json"
+    if runtime_evidence_path.is_file():
+        artifacts.append(artifact(runtime_evidence_path, "runtime_initialization_evidence"))
     if pass_kind in {"nsys_graph", "nsys_node"}:
         artifacts.extend(
             [
@@ -605,9 +641,17 @@ def add_run(result, precision, directory_name, scope, pass_kind, paired=None):
     result.append(
         {
             "run_id": run_id,
-            "run_group_id": f"{precision}:accepted:{scope}",
+            "run_group_id": (
+                f"{precision}:selected-shared-arena:{scope}"
+                if os.environ["NSIGHT_SELECTED_MODE"] == "true"
+                else f"{precision}:accepted:{scope}"
+            ),
             "precision": precision,
-            "engine_variant": "accepted",
+            "engine_variant": (
+                "selected-shared-static-input-arena"
+                if os.environ["NSIGHT_SELECTED_MODE"] == "true"
+                else "accepted"
+            ),
             "engine_preset_version": metadata.get("optimized_effective_config_version"),
             "pass_kind": pass_kind,
             "authoritative_performance": pass_kind == "untraced_control",
@@ -629,9 +673,13 @@ def add_run(result, precision, directory_name, scope, pass_kind, paired=None):
     )
 
 runs = []
-for precision in ("fp32", "fp16"):
+precisions = ("fp32",) if os.environ["NSIGHT_SELECTED_MODE"] == "true" else ("fp32", "fp16")
+for precision in precisions:
     add_run(runs, precision, "full_control", "full", "untraced_control")
     add_run(runs, precision, "full_graph", "full", "nsys_graph", paired="full_control")
+    if os.environ["NSIGHT_SELECTED_MODE"] == "true":
+        add_run(runs, precision, "full_node", "full", "nsys_node", paired="full_control")
+        continue
     add_run(runs, precision, "smoke_control", "smoke", "untraced_control")
     add_run(runs, precision, "smoke_node", "smoke", "nsys_node", paired="smoke_control")
     ncu_directory = runs_root / precision / "smoke_ncu"
@@ -663,7 +711,7 @@ manifest = {
         "dcgmi_version_path": "capabilities/dcgmi-version.txt",
     },
     "runs": runs,
-    "comparisons": [
+    "comparisons": [] if os.environ["NSIGHT_SELECTED_MODE"] == "true" else [
         {
             "comparison_type": "cross_precision_divergence",
             "left_run_id": "fp32_full_control",
