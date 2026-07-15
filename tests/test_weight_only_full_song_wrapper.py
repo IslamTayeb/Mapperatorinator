@@ -104,6 +104,31 @@ def test_wrapper_has_isolated_dp4a_incremental_gate() -> None:
     assert 'export TMPDIR="$JOB_TMPDIR"' in source
     assert "dp4a_self_qkv_projection" in source
 
+    dp4a_analysis = source.split(
+        'if [[ "$REQUIRE_DP4A_INCREMENTAL" == true ]]; then\n'
+        "  # Selected-stack control already owns",
+        1,
+    )[1].split(
+        'elif [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then',
+        1,
+    )[0]
+    assert (
+        "records.main_generation[[]*].optimized_dispatch_capture_hits.dp4a_self_qkv_projection"
+        in dp4a_analysis
+    )
+    assert (
+        "'records.main_generation[[]*].optimized_dispatch_capture_hits'"
+        in dp4a_analysis
+    )
+    assert (
+        "--allow-optional-dispatch-delta\n"
+        "      'records.main_generation[[]*].optimized_dispatch_capture_hits.*'"
+        in dp4a_analysis
+    )
+    assert "--require-exact-label timing_context" in dp4a_analysis
+    assert "--require-exact-dispatch-label timing_context" in dp4a_analysis
+    assert "--require-exact-label main_generation" not in dp4a_analysis
+
 
 def test_wrapper_allows_declared_timing_drift_for_k4_composition() -> None:
     source = WRAPPER.read_text(encoding="utf-8")

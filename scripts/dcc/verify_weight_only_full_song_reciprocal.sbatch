@@ -1029,6 +1029,9 @@ ANALYSIS_DISPATCH_ARGS=(
     'records.main_generation[[]*].optimized_cuda_graphs.*'
 )
 if [[ "$REQUIRE_DP4A_INCREMENTAL" == true ]]; then
+  # Selected-stack control already owns packed cross, INT8 MLP, split-KV, and
+  # weight-only hits. DP4A only adds self-QKV, but token-dependent secondary hit
+  # counts may still differ in main generation under documented drift.
   ANALYSIS_EXACT_ARGS=(
     --require-exact-label timing_context
     --require-exact-dispatch-label timing_context
@@ -1036,7 +1039,11 @@ if [[ "$REQUIRE_DP4A_INCREMENTAL" == true ]]; then
   ANALYSIS_DISPATCH_ARGS=(
     --allow-optional-dispatch-delta 'optimized_result_class'
     --allow-dispatch-delta
+      'records.main_generation[[]*].optimized_dispatch_capture_hits'
+    --allow-dispatch-delta
       'records.main_generation[[]*].optimized_dispatch_capture_hits.dp4a_self_qkv_projection'
+    --allow-optional-dispatch-delta
+      'records.main_generation[[]*].optimized_dispatch_capture_hits.*'
     --allow-optional-dispatch-delta
       'records.main_generation[[]*].optimized_cuda_graphs.*'
   )
