@@ -37,6 +37,7 @@ COMBINED_BRANCH=${MAPPERATORINATOR_COMBINED_BRANCH:?Set the combined branch}
 COMBINED_REMOTE_REF=${MAPPERATORINATOR_COMBINED_REMOTE_REF:?Set the pushed combined ref}
 MANIFEST=${MAPPERATORINATOR_NATIVE_EXTENSION_MANIFEST:?Set the validated AOT manifest}
 NATIVE_CACHE=${MAPPERATORINATOR_NATIVE_EXTENSION_CACHE:?Set the populated native-extension cache}
+ALLOW_PARALLEL_RECIPROCAL=${MAPPERATORINATOR_ALLOW_PARALLEL_RECIPROCAL:-0}
 RUN_LABEL=${RUN_LABEL:-combined-start-full-song}
 RUN_ROOT="$WORK/runs/${RUN_LABEL}-${SLURM_JOB_ID}"
 
@@ -46,6 +47,8 @@ export NVIDIA_TF32_OVERRIDE=0
 [[ -f "$AUDIO" ]] || die "missing audio: $AUDIO"
 [[ -s "$MANIFEST" ]] || die "missing native-extension manifest: $MANIFEST"
 [[ -d "$NATIVE_CACHE" ]] || die "missing native-extension cache: $NATIVE_CACHE"
+[[ "$ALLOW_PARALLEL_RECIPROCAL" == 0 || "$ALLOW_PARALLEL_RECIPROCAL" == 1 ]] \
+  || die "MAPPERATORINATOR_ALLOW_PARALLEL_RECIPROCAL must be 0 or 1"
 [[ ! -e "$RUN_ROOT" ]] || die "refusing to overwrite $RUN_ROOT"
 
 verify_repo() {
@@ -96,10 +99,14 @@ mapfile -t OTHER_GPU_JOBS < <(
     | awk -F'|' -v current="$SLURM_JOB_ID" \
         '$1 != current && tolower($2) ~ /gpu/ { print }'
 )
-[[ ${#OTHER_GPU_JOBS[@]} -eq 0 ]] || {
+[[ ${#OTHER_GPU_JOBS[@]} -eq 0 || "$ALLOW_PARALLEL_RECIPROCAL" == 1 ]] || {
   printf '%s\n' "${OTHER_GPU_JOBS[@]}" >&2
   die "another user GPU job exists"
 }
+if [[ ${#OTHER_GPU_JOBS[@]} -ne 0 ]]; then
+  printf '%s\n' "${OTHER_GPU_JOBS[@]}" >&2
+  echo "parallel_reciprocal_opt_in=1" >&2
+fi
 
 {
   echo "host=$(hostname)"
@@ -118,6 +125,7 @@ mapfile -t OTHER_GPU_JOBS < <(
   echo "audio=$AUDIO"
   echo "audio_sha256=$(sha256sum "$AUDIO" | awk '{print $1}')"
   echo "run_root=$RUN_ROOT"
+  echo "parallel_reciprocal_opt_in=$ALLOW_PARALLEL_RECIPROCAL"
   "$PYTHON" -c 'import torch, transformers; print(f"torch={torch.__version__}"); print(f"torch_cuda={torch.version.cuda}"); print(f"transformers={transformers.__version__}")'
   nvidia-smi --query-gpu=name,uuid,driver_version,memory.total,compute_cap --format=csv,noheader
   scontrol show job -o "$SLURM_JOB_ID"

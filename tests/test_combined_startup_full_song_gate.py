@@ -11,7 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 WRAPPER = REPO_ROOT / "scripts" / "dcc" / "profile_combined_startup_full_song.sbatch"
 
 
-def test_combined_full_song_wrapper_is_serial_exact_and_not_submitted() -> None:
+def test_combined_full_song_wrapper_is_serial_by_default_with_parallel_opt_in() -> None:
     subprocess.run(["bash", "-n", str(WRAPPER)], check=True)
     source = WRAPPER.read_text()
     assert "#SBATCH --gres=gpu:2080:1" in source
@@ -21,6 +21,8 @@ def test_combined_full_song_wrapper_is_serial_exact_and_not_submitted() -> None:
     assert "combined_fallback" in source
     assert "MAPPERATORINATOR_NATIVE_EXTENSION_MANIFEST" in source
     assert "another user GPU job exists" in source
+    assert "MAPPERATORINATOR_ALLOW_PARALLEL_RECIPROCAL:-0" in source
+    assert "parallel_reciprocal_opt_in=$ALLOW_PARALLEL_RECIPROCAL" in source
     assert "NVIDIA_TF32_OVERRIDE=0" in source
     assert "profile_cuda_capture=false" in source
     assert "analyze_combined_startup_full_song.py" in source
