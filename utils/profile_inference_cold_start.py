@@ -13,7 +13,8 @@ from typing import Any
 
 OPTIONAL_MODULES = (
     "diffusion_pipeline",
-    "osu_diffusion",
+    "osu_diffusion.utils.models",
+    "osu_diffusion.utils.diffusion",
     "osuT5.osuT5.inference.super_timing_generator",
     "osuT5.osuT5.utils.train_utils",
     "datasets",

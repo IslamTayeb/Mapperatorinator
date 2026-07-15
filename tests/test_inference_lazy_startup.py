@@ -30,7 +30,8 @@ import inference
 
 for name in (
     "diffusion_pipeline",
-    "osu_diffusion",
+    "osu_diffusion.utils.models",
+    "osu_diffusion.utils.diffusion",
     "osuT5.osuT5.inference.super_timing_generator",
     "osuT5.osuT5.utils.train_utils",
     "datasets",
@@ -72,6 +73,20 @@ except AttributeError as exc:
     assert "not_a_real_export" in str(exc)
 else:
     raise AssertionError("unknown lazy export did not fail")
+"""
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_diffusion_public_exports_are_lazy() -> None:
+    completed = _run_fresh_python(
+        """
+import sys
+import osu_diffusion
+
+assert "osu_diffusion.utils.models" not in sys.modules
+assert isinstance(osu_diffusion.DiT_models, dict)
+assert "osu_diffusion.utils.models" in sys.modules
 """
     )
     assert completed.returncode == 0, completed.stderr
