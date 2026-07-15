@@ -36,7 +36,7 @@ RUN_ROOT="$WORK/runs/${RUN_LABEL}-${SLURM_JOB_ID}"
 
 case "$PRECISION" in
   fp32) ANALYSIS_MODE=exact-fp32 ;;
-  fp16) ANALYSIS_MODE=relaxed ;;
+  fp16) ANALYSIS_MODE=exact-same-precision ;;
   *) die "MAPPERATORINATOR_PRECISION must be fp32 or fp16" ;;
 esac
 
@@ -143,23 +143,19 @@ COMMON_ARGS=(
 
 declare -A PROFILE_PATHS
 declare -A OSU_PATHS
+declare -A EVIDENCE_PATHS
 run_role() {
   local role=$1
   local kind=$2
   local run_dir="$RUN_ROOT/$role"
   mkdir -p "$run_dir/output"
-  local command
-  if [[ "$kind" == candidate ]]; then
-    command=(
-      "$PYTHON" utils/run_device_sequence_state_candidate.py
-      --activation-manifest "$run_dir/activation.json"
-      -- "${COMMON_ARGS[@]}" output_path="$run_dir/output"
-    )
-  else
-    command=(
-      "$PYTHON" inference.py "${COMMON_ARGS[@]}" output_path="$run_dir/output"
-    )
-  fi
+  local evidence="$run_dir/evidence.json"
+  local command=(
+    "$PYTHON" utils/run_device_sequence_state_candidate.py
+    --mode "$kind"
+    --evidence-manifest "$evidence"
+    -- "${COMMON_ARGS[@]}" output_path="$run_dir/output"
+  )
   printf '%q ' "${command[@]}" > "$run_dir/command.txt"
   printf '\n' >> "$run_dir/command.txt"
   "${command[@]}" > "$run_dir/stdout.txt" 2> "$run_dir/stderr.txt"
@@ -169,27 +165,45 @@ run_role() {
   local osu=${profile%.profile.json}
   require_nonempty "$profile"
   require_nonempty "$osu"
-  if [[ "$kind" == candidate ]]; then
-    require_nonempty "$run_dir/activation.json"
-    "$PYTHON" - "$run_dir/activation.json" <<'PY'
+  require_nonempty "$evidence"
+  "$PYTHON" - "$evidence" "$kind" <<'PY'
 import json
 import pathlib
 import sys
 
 payload = json.loads(pathlib.Path(sys.argv[1]).read_text())
+role = sys.argv[2]
 assert payload == {
     "accepted_dispatch_replaced": False,
     "candidate": "preallocated_batch1_device_sequence_state",
     "decode_loop_calls": payload["decode_loop_calls"],
     "decoder_layer_replaced": False,
-    "enabled": True,
+    "enabled": role == "candidate",
+    "rng_after_inference": payload["rng_after_inference"],
+    "rng_after_seed": payload["rng_after_seed"],
+    "role": role,
     "schema_version": 1,
 }
-assert isinstance(payload["decode_loop_calls"], int) and payload["decode_loop_calls"] > 0
+calls = payload["decode_loop_calls"]
+assert isinstance(calls, int) and calls >= 0
+assert (calls > 0) == (role == "candidate")
+for key in ("rng_after_seed", "rng_after_inference"):
+    rng = payload[key]
+    assert set(rng) == {
+        "numpy_sha256",
+        "python_sha256",
+        "torch_cpu_sha256",
+        "torch_cuda_sha256",
+    }
+    assert all(isinstance(rng[name], str) and len(rng[name]) == 64 for name in (
+        "numpy_sha256", "python_sha256", "torch_cpu_sha256"
+    ))
+    assert isinstance(rng["torch_cuda_sha256"], list) and rng["torch_cuda_sha256"]
+    assert all(isinstance(value, str) and len(value) == 64 for value in rng["torch_cuda_sha256"])
 PY
-  fi
   PROFILE_PATHS[$role]=$profile
   OSU_PATHS[$role]=$osu
+  EVIDENCE_PATHS[$role]=$evidence
 }
 
 run_role baseline_first baseline
@@ -224,6 +238,21 @@ assert report["parity"]["dispatch_cache_topology"]["pass"] is True
 assert not report["parity"]["dispatch_cache_topology"]["differences"]
 assert {run["precision"] for run in report["runs"].values()} == {precision}
 assert report["metrics"]["main_tokens"]["candidate_minus_baseline"] == 0.0
+PY
+
+"$PYTHON" - \
+  "${EVIDENCE_PATHS[baseline_first]}" \
+  "${EVIDENCE_PATHS[candidate_first]}" \
+  "${EVIDENCE_PATHS[candidate_second]}" \
+  "${EVIDENCE_PATHS[baseline_second]}" <<'PY'
+import json
+import pathlib
+import sys
+
+evidence = [json.loads(pathlib.Path(path).read_text()) for path in sys.argv[1:]]
+for key in ("rng_after_seed", "rng_after_inference"):
+    reference = evidence[0][key]
+    assert all(payload[key] == reference for payload in evidence[1:]), key
 PY
 
 echo "device_sequence_state_reciprocal=PASS"

@@ -27,6 +27,7 @@ from utils.run_device_sequence_state_candidate import (
     REPO_ROOT as RUNNER_REPO_ROOT,
     _ensure_repo_import_path,
     _parse_runner_args,
+    _rng_fingerprint,
 )
 
 
@@ -100,9 +101,12 @@ def test_stopping_policy_fails_loudly(criteria, error) -> None:
 
 
 class _SampleModel:
-    def __init__(self) -> None:
+    def __init__(self, dtype: torch.dtype = torch.float32) -> None:
         self.config = SimpleNamespace(is_encoder_decoder=False)
+        self.dtype = dtype
         self.prepared_storage = []
+        self.cache_marker = object()
+        self.cache_observations = []
 
     def _get_initial_cache_position(self, cur_len, device, model_kwargs):
         del cur_len, device
@@ -113,8 +117,8 @@ class _SampleModel:
         return not bool(finished)
 
     def prepare_inputs_for_generation(self, input_ids, **model_kwargs):
-        del model_kwargs
         self.prepared_storage.append(input_ids.untyped_storage().data_ptr())
+        self.cache_observations.append(model_kwargs.get("cache_marker") is self.cache_marker)
         return {"input_ids": input_ids[:, -1:]}
 
     def __call__(self, input_ids, return_dict):
@@ -122,6 +126,7 @@ class _SampleModel:
         logits = torch.tensor(
             [[[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, -100.0, -100.0]]],
             device=input_ids.device,
+            dtype=self.dtype,
         )
         return SimpleNamespace(logits=logits)
 
@@ -132,6 +137,7 @@ class _SampleModel:
         is_encoder_decoder,
     ):
         del outputs, is_encoder_decoder
+        self.cache_observations.append(model_kwargs.get("cache_marker") is self.cache_marker)
         return model_kwargs
 
 
@@ -149,8 +155,8 @@ def _generation_config(max_length: int = 7):
     )
 
 
-def _run_sample(*, candidate: bool):
-    model = _SampleModel()
+def _run_sample(*, candidate: bool, dtype: torch.dtype = torch.float32):
+    model = _SampleModel(dtype)
     torch.manual_seed(12345)
     result = active_prefix_decode_generate(
         model,
@@ -159,16 +165,31 @@ def _run_sample(*, candidate: bool):
         stopping_criteria=_criteria(eos=(7,), max_length=7),
         generation_config=_generation_config(),
         preallocated_batch1_state=candidate,
+        cache_marker=model.cache_marker,
     )
-    return result, torch.random.get_rng_state().clone(), model.prepared_storage
+    return (
+        result,
+        torch.random.get_rng_state().clone(),
+        model.prepared_storage,
+        model.cache_observations,
+    )
 
 
-def test_candidate_matches_default_tokens_rng_and_uses_one_storage() -> None:
-    baseline, baseline_rng, baseline_storage = _run_sample(candidate=False)
-    candidate, candidate_rng, candidate_storage = _run_sample(candidate=True)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_candidate_matches_default_tokens_rng_cache_and_uses_one_storage(dtype) -> None:
+    baseline, baseline_rng, baseline_storage, baseline_cache = _run_sample(
+        candidate=False,
+        dtype=dtype,
+    )
+    candidate, candidate_rng, candidate_storage, candidate_cache = _run_sample(
+        candidate=True,
+        dtype=dtype,
+    )
 
     assert torch.equal(candidate, baseline)
     assert torch.equal(candidate_rng, baseline_rng)
+    assert candidate_cache == baseline_cache
+    assert all(candidate_cache)
     assert len(set(candidate_storage)) == 1
     assert len(set(baseline_storage)) > 1
 
@@ -179,7 +200,7 @@ def test_candidate_does_not_call_torch_cat_for_token_append(monkeypatch) -> None
         raise AssertionError("candidate token append must not call torch.cat")
 
     monkeypatch.setattr(torch, "cat", reject_cat)
-    result, _, _ = _run_sample(candidate=True)
+    result, _, _, _ = _run_sample(candidate=True)
     assert result.shape == (1, 7)
 
 
@@ -230,17 +251,20 @@ def test_candidate_context_restores_engine_binding() -> None:
 
 
 def test_candidate_runner_preserves_hydra_arguments() -> None:
-    manifest, remaining = _parse_runner_args(
+    mode, manifest, remaining = _parse_runner_args(
         [
-            "--activation-manifest",
-            "/tmp/activation.json",
+            "--mode",
+            "candidate",
+            "--evidence-manifest",
+            "/tmp/evidence.json",
             "--",
             "--config-name",
             "profile_salvalai",
             "precision=fp16",
         ]
     )
-    assert manifest == Path("/tmp/activation.json")
+    assert mode == "candidate"
+    assert manifest == Path("/tmp/evidence.json")
     assert remaining == [
         "--config-name",
         "profile_salvalai",
@@ -256,6 +280,22 @@ def test_candidate_runner_adds_repo_root_for_direct_file_execution(monkeypatch) 
     assert sys.path[0] == str(RUNNER_REPO_ROOT)
 
 
+def test_rng_fingerprint_tracks_all_seeded_generators() -> None:
+    import random
+    import numpy as np
+
+    random.seed(12345)
+    np.random.seed(12345)
+    torch.manual_seed(12345)
+    first = _rng_fingerprint()
+    random.seed(12345)
+    np.random.seed(12345)
+    torch.manual_seed(12345)
+    assert _rng_fingerprint() == first
+    torch.rand(1)
+    assert _rng_fingerprint()["torch_cpu_sha256"] != first["torch_cpu_sha256"]
+
+
 def test_reciprocal_wrapper_is_serial_by_default_with_explicit_parallel_opt_in() -> None:
     source = (
         REPO_ROOT
@@ -267,10 +307,13 @@ def test_reciprocal_wrapper_is_serial_by_default_with_explicit_parallel_opt_in()
     assert "run_role baseline_second baseline" in source
     assert "MAPPERATORINATOR_PRECISION:-fp32" in source
     assert "fp32) ANALYSIS_MODE=exact-fp32" in source
-    assert "fp16) ANALYSIS_MODE=relaxed" in source
+    assert "fp16) ANALYSIS_MODE=exact-same-precision" in source
     assert "cross_candidate_exact\"] is True" in source
     assert "dispatch_cache_topology\"][\"pass\"] is True" in source
     assert "another GPU job is running or pending" in source
     assert "MAPPERATORINATOR_ALLOW_PARALLEL_RECIPROCAL:-0" in source
     assert "MAPPERATORINATOR_ALLOW_PARALLEL_RECIPROCAL must be 0 or 1" in source
     assert "parallel_reciprocal_opt_in=$ALLOW_PARALLEL_RECIPROCAL" in source
+    assert "--mode \"$kind\"" in source
+    assert "rng_after_seed" in source
+    assert "rng_after_inference" in source
