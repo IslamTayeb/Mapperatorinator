@@ -7,6 +7,12 @@ SCRIPT = (
     / "dcc"
     / "verify_batched_encoder_store_full_song_reciprocal.sbatch"
 )
+CEILING_SCRIPT = (
+    Path(__file__).resolve().parents[1]
+    / "scripts"
+    / "dcc"
+    / "profile_batched_encoder_precompute_ceiling.sbatch"
+)
 
 
 def test_wrapper_pins_clean_pushed_same_precision_2080ti_worktree():
@@ -45,3 +51,17 @@ def test_wrapper_measures_all_batches_both_passes_and_two_encoder_stages():
     assert '"$PYTHON" utils/' not in source
     assert ".md" not in source
     assert ".html" not in source
+
+
+def test_standalone_ceiling_wrapper_is_shared_precision_and_module_safe():
+    source = CEILING_SCRIPT.read_text(encoding="utf-8")
+    for fragment in (
+        'PRECISION=${MAPPERATORINATOR_PRECISION:?',
+        'fp32|fp16)',
+        'export NVIDIA_TF32_OVERRIDE=0',
+        '"$PYTHON" -m utils.profile_batched_encoder_precompute_ceiling',
+        'precision="$PRECISION"',
+        '--batch-sizes 1,2,4,8,16',
+    ):
+        assert fragment in source
+    assert '"$PYTHON" utils/' not in source

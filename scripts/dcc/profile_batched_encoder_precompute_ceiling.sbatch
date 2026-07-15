@@ -15,10 +15,22 @@ PYTHON=${MAPPERATORINATOR_PYTHON:-/hpc/group/romerolab/imt11/envs/mapperatorinat
 REPO=${MAPPERATORINATOR_REPO:?Set MAPPERATORINATOR_REPO to the clean ceiling worktree}
 COMMIT=${MAPPERATORINATOR_COMMIT:?Set MAPPERATORINATOR_COMMIT to the pushed ceiling commit}
 BRANCH=${MAPPERATORINATOR_BRANCH:?Set MAPPERATORINATOR_BRANCH to the ceiling branch}
+PRECISION=${MAPPERATORINATOR_PRECISION:?Set MAPPERATORINATOR_PRECISION to fp32 or fp16}
 WORK=${MAPPERATORINATOR_WORK:-/work/imt11/Mapperatorinator}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_LABEL=${RUN_LABEL:-encoder-batch-ceiling}
 RUN_ROOT="$WORK/runs/${RUN_LABEL}-${SLURM_JOB_ID:-manual}"
+
+case "$PRECISION" in
+  fp32|fp16) ;;
+  *)
+    echo "MAPPERATORINATOR_PRECISION must be fp32 or fp16" >&2
+    exit 2
+    ;;
+esac
+
+# Must precede every Python process and CUDA context.
+export NVIDIA_TF32_OVERRIDE=0
 
 if [[ ! -x "$PYTHON" ]]; then
   echo "missing executable Python at $PYTHON" >&2
@@ -74,6 +86,7 @@ done
   echo "job_id=${SLURM_JOB_ID:-manual}"
   echo "commit=$COMMIT"
   echo "branch=$BRANCH"
+  echo "precision=$PRECISION"
   echo "repo=$REPO"
   echo "python=$PYTHON"
   echo "audio=$AUDIO"
@@ -103,7 +116,7 @@ SMI_PID=$!
 trap 'kill "$SMI_PID" 2>/dev/null || true' EXIT
 
 cd "$REPO"
-"$PYTHON" utils/profile_batched_encoder_precompute_ceiling.py \
+"$PYTHON" -m utils.profile_batched_encoder_precompute_ceiling \
   --config-name profile_salvalai \
   --report-path "$RUN_ROOT/encoder-precompute-ceiling.json" \
   --batch-sizes 1,2,4,8,16 \
@@ -111,7 +124,7 @@ cd "$REPO"
   audio_path="$AUDIO" \
   output_path="$RUN_ROOT/unused-output" \
   device=cuda \
-  precision=fp32 \
+  precision="$PRECISION" \
   attn_implementation=sdpa \
   inference_engine=optimized \
   use_server=false \
