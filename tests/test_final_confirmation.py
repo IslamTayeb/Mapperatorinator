@@ -352,6 +352,10 @@ def test_dcc_wrapper_is_one_serial_authoritative_json_text_gate() -> None:
     assert "validate_direct_manifest" in source
     assert "MAPPERATORINATOR_NATIVE_EXTENSION_MANIFEST" in source
     assert 'export TORCH_CUDA_ARCH_LIST=7.5' in source
+    assert 'FINAL_TMPDIR="$WORK/tmp/final-$COMMIT-$JOB_SCOPE"' in source
+    assert 'FINAL_TORCH_EXTENSIONS_DIR="$WORK/torch_extensions/final-$COMMIT-fp32-sm75"' in source
+    assert 'export TMPDIR="$FINAL_TMPDIR"' in source
+    assert 'export TORCH_EXTENSIONS_DIR="$FINAL_TORCH_EXTENSIONS_DIR"' in source
     assert "MAPPERATORINATOR_REMOTE_BRANCH" in source
     assert "another user GPU job exists" in source
     assert 'tee "$RUN_ROOT/preflight.txt"' in source

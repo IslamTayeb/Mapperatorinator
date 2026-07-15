@@ -116,7 +116,14 @@ if [[ ${#OTHER_GPU_JOBS[@]} -ne 0 ]]; then
   exit 2
 fi
 
-mkdir -p "$WORK/logs" "$WORK/cache" "$WORK/tmp" "$WORK/torch_extensions/final-$COMMIT"
+JOB_SCOPE=${SLURM_JOB_ID:-manual-$$}
+FINAL_TMPDIR="$WORK/tmp/final-$COMMIT-$JOB_SCOPE"
+FINAL_TORCH_EXTENSIONS_DIR="$WORK/torch_extensions/final-$COMMIT-fp32-sm75"
+mkdir -p \
+  "$WORK/logs" \
+  "$WORK/cache" \
+  "$FINAL_TMPDIR" \
+  "$FINAL_TORCH_EXTENSIONS_DIR"
 mkdir "$RUN_ROOT"
 export XDG_CACHE_HOME="$WORK/cache"
 export HF_HOME="$WORK/cache/huggingface"
@@ -125,8 +132,8 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
 export PYTHONHASHSEED=0
-export TMPDIR="$WORK/tmp"
-export TORCH_EXTENSIONS_DIR="$WORK/torch_extensions/final-$COMMIT"
+export TMPDIR="$FINAL_TMPDIR"
+export TORCH_EXTENSIONS_DIR="$FINAL_TORCH_EXTENSIONS_DIR"
 export TORCH_CUDA_ARCH_LIST=7.5
 
 if [[ "$REQUIRE_DIRECT_AOT" == 1 ]]; then
@@ -171,6 +178,8 @@ fi
   echo "remote_branch=$REMOTE_BRANCH"
   echo "repo=$REPO"
   echo "run_root=$RUN_ROOT"
+  echo "tmpdir=$TMPDIR"
+  echo "torch_extensions_dir=$TORCH_EXTENSIONS_DIR"
   echo "gpu=$GPU_NAME"
   echo "native_extension_mode=$([[ "$REQUIRE_DIRECT_AOT" == 1 ]] && echo direct || echo load_inline)"
   echo "runtime_spec=$CANDIDATE_RUNTIME_SPEC_SOURCE"
