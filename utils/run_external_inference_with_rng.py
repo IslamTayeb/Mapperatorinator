@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import pickle
 import random
@@ -90,6 +91,7 @@ def main() -> None:
         raise FileExistsError(f"refusing to overwrite {evidence_path}")
     inference_script = _validate_repo(repo, expected_commit)
     sys.path.insert(0, str(repo))
+    os.chdir(repo)
 
     from accelerate import utils as accelerate_utils
 
