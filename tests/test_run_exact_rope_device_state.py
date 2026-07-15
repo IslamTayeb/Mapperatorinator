@@ -1,6 +1,10 @@
 import pytest
 
-from utils.run_exact_rope_device_state import _activation_payload, _parse_args
+from utils.run_exact_rope_device_state import (
+    _activation_payload,
+    _parse_args,
+    _run_setup_and_fingerprint,
+)
 
 
 def test_combined_activation_payload_preserves_decoder_and_dispatch() -> None:
@@ -72,3 +76,18 @@ def test_combined_runner_requires_both_evidence_paths() -> None:
     assert str(parsed.evidence_manifest) == "/tmp/state.json"
     assert parsed.mode == "candidate"
     assert parsed.overrides == ["precision=fp32"]
+
+
+def test_setup_observer_preserves_precision_policy_arguments(monkeypatch) -> None:
+    calls = []
+    expected = {"python_sha256": "a", "torch_cuda_sha256": ["b"]}
+    monkeypatch.setattr(
+        "utils.run_device_sequence_state_candidate._rng_fingerprint",
+        lambda: expected,
+    )
+
+    def setup(seed, *, strict_fp32):
+        calls.append((seed, strict_fp32))
+
+    assert _run_setup_and_fingerprint(setup, 12345, strict_fp32=False) is expected
+    assert calls == [(12345, False)]

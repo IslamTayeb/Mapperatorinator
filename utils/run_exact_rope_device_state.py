@@ -54,6 +54,19 @@ def _activation_payload(
     }
 
 
+def _run_setup_and_fingerprint(
+    setup: Any,
+    seed: int,
+    *args: Any,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Preserve the full inference-environment call surface while observing RNG."""
+    from utils.run_device_sequence_state_candidate import _rng_fingerprint
+
+    setup(seed, *args, **kwargs)
+    return _rng_fingerprint()
+
+
 def run(
     *,
     mode: str,
@@ -79,10 +92,14 @@ def run(
     rng_after_seed: dict[str, Any] | None = None
     original_setup = inference_module.setup_inference_environment
 
-    def recorded_setup(seed: int) -> None:
+    def recorded_setup(seed: int, *args: Any, **kwargs: Any) -> None:
         nonlocal rng_after_seed
-        original_setup(seed)
-        rng_after_seed = _rng_fingerprint()
+        rng_after_seed = _run_setup_and_fingerprint(
+            original_setup,
+            seed,
+            *args,
+            **kwargs,
+        )
 
     activation = DeviceSequenceStateActivation()
     context = (
