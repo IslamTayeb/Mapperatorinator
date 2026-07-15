@@ -38,13 +38,13 @@ class OptimizedPreset:
 OPTIMIZED_PRESETS = MappingProxyType(
     {
         "fp32": OptimizedPreset(
-            version="accepted-fp32-native-cross-mlp-289-v3",
+            version="accepted-fp32-shared-rope-device-state-v4",
             result_class="documented-drift",
             precision="fp32",
             torch_dtype=torch.float32,
         ),
         "fp16": OptimizedPreset(
-            version="accepted-fp16-all-fused-v2",
+            version="accepted-fp16-shared-rope-device-state-v3",
             result_class="documented-drift",
             precision="fp16",
             torch_dtype=torch.float16,
@@ -129,6 +129,8 @@ def _optimized_config_metadata(preset: OptimizedPreset) -> dict[str, Any]:
         "native_decode_kernels": True,
         "native_q1_self_attention": True,
         "native_q1_rope_cache_self_attention": True,
+        "shared_decoder_rope": True,
+        "preallocated_batch1_sequence_state": True,
         "native_cross_mlp_tail": True,
     }
 
@@ -250,6 +252,8 @@ def _generate_window(
         specialized_batch and context_type != ContextType.TIMING
     )
     native_q1_rope_cache_self_attention = native_q1_self_attention
+    shared_decoder_rope = native_q1_rope_cache_self_attention
+    preallocated_batch1_state = specialized_batch
     native_cross_mlp_tail = (
         specialized_batch
         and _native_cross_mlp_tail_enabled(context_type=context_type)
@@ -273,6 +277,11 @@ def _generate_window(
         num_beams=generate_kwargs.get("num_beams", 1),
         cfg_scale=cfg_scale,
     )
+    shared_rope_plan = (
+        context_state.shared_rope_plan_for_window(model)
+        if shared_decoder_rope
+        else None
+    )
     pad_token_id = generate_kwargs.get(
         "pad_token_id",
         getattr(tokenizer, "pad_id", None),
@@ -283,6 +292,8 @@ def _generate_window(
         cuda_graph_forward=True,
         cuda_graph_warmup=0,
         cuda_graph_min_decode_steps=1,
+        preallocated_batch1_state=preallocated_batch1_state,
+        shared_rope_plan=shared_rope_plan,
         **context_state.active_prefix_decode_kwargs(),
     )
     graph_count_before = int(getattr(context_state, "graph_count", 0))
@@ -297,6 +308,8 @@ def _generate_window(
         "native_q1_self_attention": 0,
         "q1_bmm_cross_attention": 0,
         "native_cross_mlp_tail": 0,
+        "shared_decoder_rope_compute": 0,
+        "shared_decoder_rope_reuse": 0,
     }
 
     with torch.autocast(
@@ -307,6 +320,7 @@ def _generate_window(
         q1_bmm_cross_attention=q1_bmm_cross_attention,
         native_q1_self_attention=native_q1_self_attention,
         native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
+        share_decoder_rope=shared_decoder_rope,
         native_cross_mlp_tail=native_cross_mlp_tail,
         optimized_expected_dtype=expected_dtype,
         optimized_dispatch_counts=dispatch_counts,
@@ -382,6 +396,26 @@ def _generate_window(
                     else "timing_context"
                 ),
             },
+            "shared_decoder_rope": {
+                "requested": specialized_batch,
+                "enabled": shared_decoder_rope,
+                "disabled_reason": (
+                    None
+                    if shared_decoder_rope
+                    else batched_policy_disabled_reason
+                    if not specialized_batch
+                    else "timing_context"
+                ),
+            },
+            "preallocated_batch1_sequence_state": {
+                "requested": specialized_batch,
+                "enabled": preallocated_batch1_state,
+                "disabled_reason": (
+                    None
+                    if preallocated_batch1_state
+                    else batched_policy_disabled_reason
+                ),
+            },
             "native_cross_mlp_tail": {
                 "requested": specialized_batch,
                 "enabled": native_cross_mlp_tail,
@@ -404,6 +438,11 @@ def _generate_window(
             else None
         ),
         "optimized_dispatch_capture_hits": dict(dispatch_counts),
+        "shared_decoder_rope_plan": (
+            shared_rope_plan.summary()
+            if shared_rope_plan is not None
+            else None
+        ),
         "decode_graph_count_before": graph_count_before,
         "decode_graph_count_after": int(getattr(context_state, "graph_count", 0)),
         "decode_graph_count_delta": (

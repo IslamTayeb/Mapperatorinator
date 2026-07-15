@@ -187,6 +187,7 @@ def q1_rope_cache_self_attention_forward(
     attention_mask: torch.Tensor | None,
     sliding_window_mask: torch.Tensor | None,
     native_q1_rope_cache_attention: Callable[..., torch.Tensor] | None,
+    share_decoder_rope: bool = False,
     expected_dtype: torch.dtype = torch.float32,
     dispatch_counts: dict[str, int] | None = None,
 ) -> tuple[torch.Tensor] | None:
@@ -225,11 +226,22 @@ def q1_rope_cache_self_attention_forward(
             module.head_dim,
         )
 
+    if share_decoder_rope:
+        from ..single.shared_rope import shared_decoder_rope
+
+        rope_forward = lambda: shared_decoder_rope(
+            module.rotary_emb,
+            qkv,
+            position_ids,
+            dispatch_counts=dispatch_counts,
+        )
+    else:
+        rope_forward = lambda: module.rotary_emb(qkv, position_ids=position_ids)
     if profile_ranges:
         with profile_range(f"{range_prefix}.rope"):
-            cos, sin = module.rotary_emb(qkv, position_ids=position_ids)
+            cos, sin = rope_forward()
     else:
-        cos, sin = module.rotary_emb(qkv, position_ids=position_ids)
+        cos, sin = rope_forward()
 
     cache_layer = past_key_value.layers[module.layer_idx]
     if not getattr(cache_layer, "is_initialized", False):

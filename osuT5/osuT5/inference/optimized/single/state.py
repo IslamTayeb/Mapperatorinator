@@ -26,6 +26,7 @@ class ProductionDecodeSession:
         tuple[Any, ...],
         dict[str, BaseModelOutput],
     ] = field(default_factory=dict)
+    shared_rope_plans: dict[tuple[Any, ...], Any] = field(default_factory=dict)
     active_state_signature: tuple[Any, ...] | None = None
 
     @staticmethod
@@ -96,6 +97,21 @@ class ProductionDecodeSession:
                 self.active_state_signature
             ],
         }
+
+    def shared_rope_plan_for_window(self, model):
+        if self.active_state_signature is None:
+            raise RuntimeError(
+                "decode cache must be selected before requesting shared RoPE state"
+            )
+        if self.active_state_signature[0] != id(model):
+            raise RuntimeError("shared RoPE model does not own the active decode cache")
+        plan = self.shared_rope_plans.get(self.active_state_signature)
+        if plan is None:
+            from .shared_rope import build_shared_decoder_rope_plan
+
+            plan = build_shared_decoder_rope_plan(model)
+            self.shared_rope_plans[self.active_state_signature] = plan
+        return plan
 
     @property
     def graph_count(self) -> int:

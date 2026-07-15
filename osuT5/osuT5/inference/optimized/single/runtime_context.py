@@ -58,11 +58,16 @@ def attention_runtime_context(
     q1_bmm_cross_attention: bool = False,
     native_q1_self_attention: bool = False,
     native_q1_rope_cache_self_attention: bool = False,
+    share_decoder_rope: bool = False,
     expected_dtype: torch.dtype = torch.float32,
     dispatch_counts: dict[str, int] | None = None,
 ) -> Iterator[None]:
     if expected_dtype not in {torch.float32, torch.float16}:
         raise TypeError("optimized attention supports only float32 or float16")
+    if share_decoder_rope and not native_q1_rope_cache_self_attention:
+        raise ValueError(
+            "shared decoder RoPE requires fused native self-attention"
+        )
     from ..kernels.dispatch import (
         q1_rope_cache_self_attention_forward,
         sdpa_q1_attention_forward,
@@ -95,6 +100,7 @@ def attention_runtime_context(
             native_q1_rope_cache_attention=(
                 native_q1_rope_cache_attention
             ),
+            share_decoder_rope=share_decoder_rope,
             expected_dtype=expected_dtype,
             dispatch_counts=dispatch_counts,
         )

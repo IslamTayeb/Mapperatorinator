@@ -60,8 +60,8 @@ def _loader_kwargs(**overrides):
 
 def test_runtime_metadata_exposes_two_fixed_accepted_presets():
     expected_versions = {
-        "fp32": "accepted-fp32-native-cross-mlp-289-v3",
-        "fp16": "accepted-fp16-all-fused-v2",
+        "fp32": "accepted-fp32-shared-rope-device-state-v4",
+        "fp16": "accepted-fp16-shared-rope-device-state-v3",
     }
     for precision, version in expected_versions.items():
         metadata = OptimizedSingleRuntime(
@@ -89,6 +89,8 @@ def test_runtime_metadata_exposes_two_fixed_accepted_presets():
             "native_decode_kernels": True,
             "native_q1_self_attention": True,
             "native_q1_rope_cache_self_attention": True,
+            "shared_decoder_rope": True,
+            "preallocated_batch1_sequence_state": True,
             "native_cross_mlp_tail": True,
         }
 
@@ -571,12 +573,22 @@ def test_optimized_public_loader_defaults_to_fp32_preset():
     assert binding.runtime.preset is OPTIMIZED_PRESETS["fp32"]
 
 
-def test_generate_window_preserves_custom_generate_dispatch(monkeypatch):
+@pytest.mark.parametrize(
+    ("precision", "dtype"),
+    (("fp32", torch.float32), ("fp16", torch.float16)),
+)
+def test_generate_window_preserves_custom_generate_dispatch(
+    monkeypatch,
+    precision,
+    dtype,
+):
     captured = {}
 
     class FakeModel:
-        dtype = torch.float32
         device = torch.device("cpu")
+
+        def __init__(self):
+            self.dtype = dtype
 
         def generate(self, **kwargs):
             captured.update(kwargs)
@@ -588,6 +600,10 @@ def test_generate_window_preserves_custom_generate_dispatch(monkeypatch):
 
         def active_prefix_decode_kwargs(self):
             return {}
+
+        def shared_rope_plan_for_window(self, model):
+            del model
+            return SimpleNamespace(summary=lambda: {"validated": True})
 
         def graph_profile_summary(self):
             return {"graphs": []}
@@ -617,9 +633,9 @@ def test_generate_window_preserves_custom_generate_dispatch(monkeypatch):
         FakeModel(),
         object(),
         {"inputs": torch.tensor([[1]], dtype=torch.long)},
-        {"precision": "fp32"},
+        {"precision": precision},
         context_state=FakeContextState(),
-        preset=OPTIMIZED_PRESETS["fp32"],
+        preset=OPTIMIZED_PRESETS[precision],
     )
 
     assert torch.equal(result, torch.tensor([[1, 2]], dtype=torch.long))
@@ -628,6 +644,14 @@ def test_generate_window_preserves_custom_generate_dispatch(monkeypatch):
     custom_generate = captured["custom_generate"]
     assert isinstance(custom_generate, partial)
     assert custom_generate.func is engine_module.active_prefix_decode_generate
+    assert custom_generate.keywords["preallocated_batch1_state"] is True
+    assert custom_generate.keywords["shared_rope_plan"].summary() == {
+        "validated": True
+    }
+    assert stats["optimized_dispatch_policy"]["shared_decoder_rope"]["enabled"]
+    assert stats["optimized_dispatch_policy"][
+        "preallocated_batch1_sequence_state"
+    ]["enabled"]
 
 
 def test_shared_calculation_helpers_preserve_legacy_server_results():

@@ -221,6 +221,7 @@ def test_session_type_does_not_own_rng_or_per_window_processing_state():
         "caches",
         "graph_cache",
         "stable_encoder_holders",
+        "shared_rope_plans",
         "active_state_signature",
     }
     assert not fields.intersection(
