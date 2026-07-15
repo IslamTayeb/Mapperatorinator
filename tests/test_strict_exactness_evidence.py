@@ -111,10 +111,19 @@ def test_rng_signature_does_not_advance_cpu_rng_and_detects_progression():
 
 
 @pytest.mark.parametrize(
-    ("pass_kind", "expected"),
-    (("untraced_control", False), ("exactness_audit", True)),
+    ("precision", "pass_kind", "expected"),
+    (
+        ("fp32", "untraced_control", False),
+        ("fp32", "exactness_audit", True),
+        ("fp16", "untraced_control", False),
+        ("fp16", "exactness_audit", True),
+    ),
 )
-def test_processor_enables_evidence_only_for_exactness_audit(pass_kind, expected):
+def test_processor_enables_same_precision_evidence_only_for_exactness_audit(
+    precision,
+    pass_kind,
+    expected,
+):
     captured = {}
 
     class Runtime:
@@ -126,7 +135,7 @@ def test_processor_enables_evidence_only_for_exactness_audit(pass_kind, expected
             return "result"
 
     processor = object.__new__(Processor)
-    processor.precision = "fp32"
+    processor.precision = precision
     processor.do_sample = True
     processor.num_beams = 1
     processor.top_p = 0.9
