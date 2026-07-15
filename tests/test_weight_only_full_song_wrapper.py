@@ -90,6 +90,8 @@ def test_wrapper_validates_opt_in_candidate_runner_inside_candidate_repo() -> No
     assert '[[ "$CANDIDATE_RUNNER" = /* || "$CANDIDATE_RUNNER" == *".."* ]]' in source
     assert '[[ ! -f "$CANDIDATE_REPO/$CANDIDATE_RUNNER" ]]' in source
     assert 'echo "candidate_runner=$CANDIDATE_RUNNER"' in source
+    assert "CANDIDATE_REMOTE_BRANCH=${CANDIDATE_REMOTE_BRANCH:-$CANDIDATE_BRANCH}" in source
+    assert 'refs/remotes/$CANDIDATE_REMOTE/$CANDIDATE_REMOTE_BRANCH' in source
 
 
 def test_wrapper_has_isolated_dp4a_incremental_gate() -> None:

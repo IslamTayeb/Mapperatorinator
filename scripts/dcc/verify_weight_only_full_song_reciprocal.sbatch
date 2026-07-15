@@ -22,6 +22,7 @@ CANDIDATE_COMMIT=${CANDIDATE_COMMIT:?Set CANDIDATE_COMMIT}
 BASELINE_BRANCH=${BASELINE_BRANCH:?Set BASELINE_BRANCH explicitly}
 CANDIDATE_BRANCH=${CANDIDATE_BRANCH:?Set CANDIDATE_BRANCH explicitly}
 CANDIDATE_REMOTE=${CANDIDATE_REMOTE:-origin}
+CANDIDATE_REMOTE_BRANCH=${CANDIDATE_REMOTE_BRANCH:-$CANDIDATE_BRANCH}
 PROFILE_CONFIG=${PROFILE_CONFIG:-profile_salvalai}
 BASELINE_RUNNER=${BASELINE_RUNNER:-}
 CANDIDATE_RUNNER=${CANDIDATE_RUNNER:-utils/run_approximate_weight_only.py}
@@ -358,7 +359,7 @@ validate_repo() {
 
 validate_repo "$BASELINE_REPO" "$BASELINE_COMMIT" "$BASELINE_BRANCH"
 validate_repo "$CANDIDATE_REPO" "$CANDIDATE_COMMIT" "$CANDIDATE_BRANCH"
-CANDIDATE_REMOTE_REF="refs/remotes/$CANDIDATE_REMOTE/$CANDIDATE_BRANCH"
+CANDIDATE_REMOTE_REF="refs/remotes/$CANDIDATE_REMOTE/$CANDIDATE_REMOTE_BRANCH"
 if ! git -C "$CANDIDATE_REPO" show-ref --verify --quiet "$CANDIDATE_REMOTE_REF"; then
   echo "missing fetched candidate remote ref $CANDIDATE_REMOTE_REF" >&2
   exit 2
@@ -411,6 +412,7 @@ echo "baseline_commit=$BASELINE_COMMIT"
 echo "candidate_commit=$CANDIDATE_COMMIT"
 echo "baseline_branch=$BASELINE_BRANCH"
 echo "candidate_branch=$CANDIDATE_BRANCH"
+echo "candidate_remote_branch=$CANDIDATE_REMOTE_BRANCH"
 echo "candidate_remote_ref=$CANDIDATE_REMOTE_REF"
 echo "same_commit_gate=true"
 echo "profile_config=$PROFILE_CONFIG"
