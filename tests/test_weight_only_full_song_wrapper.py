@@ -41,16 +41,16 @@ def test_wrapper_uses_fp32_reciprocal_then_deterministic_fp16_controls() -> None
         "run_profile candidate_first"
     )
     assert source.index("run_profile candidate_first") < source.index(
-        "run_profile candidate_second"
-    )
-    assert source.index("run_profile candidate_second") < source.index(
-        "run_profile baseline_second"
-    )
-    assert source.index("run_profile baseline_second") < source.index(
         "run_profile accepted_fp16_first"
     )
     assert source.index("run_profile accepted_fp16_first") < source.index(
         "run_profile accepted_fp16_second"
+    )
+    assert source.index("run_profile accepted_fp16_second") < source.index(
+        "run_profile candidate_second"
+    )
+    assert source.index("run_profile candidate_second") < source.index(
+        "run_profile baseline_second"
     )
     assert '0 fp16' in source
 

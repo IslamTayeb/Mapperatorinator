@@ -408,11 +408,11 @@ PY
 preload_baseline_extensions baseline_first
 run_profile baseline_first "$BASELINE_REPO" "$BASELINE_TORCH_EXTENSIONS_DIR" 0
 run_profile candidate_first "$CANDIDATE_REPO" "$CANDIDATE_TORCH_EXTENSIONS_DIR" 1
+run_profile accepted_fp16_first "$BASELINE_REPO" "$BASELINE_TORCH_EXTENSIONS_DIR" 0 fp16
+run_profile accepted_fp16_second "$BASELINE_REPO" "$BASELINE_TORCH_EXTENSIONS_DIR" 0 fp16
 run_profile candidate_second "$CANDIDATE_REPO" "$CANDIDATE_TORCH_EXTENSIONS_DIR" 1
 preload_baseline_extensions baseline_second
 run_profile baseline_second "$BASELINE_REPO" "$BASELINE_TORCH_EXTENSIONS_DIR" 0
-run_profile accepted_fp16_first "$BASELINE_REPO" "$BASELINE_TORCH_EXTENSIONS_DIR" 0 fp16
-run_profile accepted_fp16_second "$BASELINE_REPO" "$BASELINE_TORCH_EXTENSIONS_DIR" 0 fp16
 
 BASELINE_FIRST=$(<"$RUN_ROOT/baseline_first.profile-path.txt")
 CANDIDATE_FIRST=$(<"$RUN_ROOT/candidate_first.profile-path.txt")

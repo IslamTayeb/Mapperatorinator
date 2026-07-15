@@ -161,6 +161,45 @@ def _reciprocal_group_metrics(report: Mapping[str, Any], name: str) -> dict[str,
     return result
 
 
+def _mixed_vs_fp16_reciprocal(runs: Mapping[str, ParsedRun]) -> dict[str, Any]:
+    pair_roles = (
+        ("mixed_then_fp16", "candidate_first", "accepted_fp16_first"),
+        ("fp16_then_mixed", "candidate_second", "accepted_fp16_second"),
+    )
+    pairs = []
+    for order, mixed_role, fp16_role in pair_roles:
+        mixed = runs[mixed_role].metrics
+        fp16 = runs[fp16_role].metrics
+        mixed_fixed = FIXED_WORK_TOKENS / mixed["main_tps"]
+        fp16_fixed = FIXED_WORK_TOKENS / fp16["main_tps"]
+        pairs.append(
+            {
+                "order": order,
+                "mixed_weight_role": mixed_role,
+                "accepted_fp16_role": fp16_role,
+                "mixed_weight_main_tps": mixed["main_tps"],
+                "accepted_fp16_main_tps": fp16["main_tps"],
+                "mixed_weight_minus_fp16_tps": mixed["main_tps"] - fp16["main_tps"],
+                "mixed_weight_fixed_work_main_seconds": mixed_fixed,
+                "accepted_fp16_fixed_work_main_seconds": fp16_fixed,
+                "mixed_weight_fixed_work_saving_vs_fp16_seconds": (
+                    fp16_fixed - mixed_fixed
+                ),
+            }
+        )
+    savings = [
+        pair["mixed_weight_fixed_work_saving_vs_fp16_seconds"] for pair in pairs
+    ]
+    return {
+        "comparison_scope": (
+            "reciprocal fixed-work normalization; cross-design token streams may differ"
+        ),
+        "pairs": pairs,
+        "fixed_work_saving_median_seconds": float(statistics.median(savings)),
+        "fixed_work_saving_range_seconds": max(savings) - min(savings),
+    }
+
+
 def analyze(
     profile_paths: Mapping[str, Path],
     reciprocal_report: Mapping[str, Any] | Path,
@@ -214,15 +253,37 @@ def analyze(
         "mixed_weight": _reciprocal_group_metrics(reciprocal, "mixed_weight"),
         "accepted_fp16": _median_metrics(runs, FP16_ROLES),
     }
+    mixed_from_profiles = _median_metrics(runs, CANDIDATE_ROLES)
+    for key in ("main_model_seconds", "main_tokens", "main_tps"):
+        if not math.isclose(
+            groups["mixed_weight"][key],
+            mixed_from_profiles[key],
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise CandidateAnalysisError(
+                f"mixed-weight reciprocal report disagrees with profiles for {key}"
+            )
     fp32_fixed = groups["fp32_reference"]["fixed_work_main_seconds"]
     mixed_fixed = groups["mixed_weight"]["fixed_work_main_seconds"]
     fixed_saving = fp32_fixed - mixed_fixed
     performance = {
         "comparison_policy": (
-            "FP32 reference versus mixed-weight uses reciprocal medians; accepted FP16 "
-            "is descriptive because its two repetitions run after the reciprocal ladder"
+            "six-run order is FP32,mixed,FP16,FP16,mixed,FP32; fixed-work "
+            "comparisons use reciprocal pairs and traced work is never authoritative"
         ),
+        "run_order": [
+            "baseline_first",
+            "candidate_first",
+            "accepted_fp16_first",
+            "accepted_fp16_second",
+            "candidate_second",
+            "baseline_second",
+        ],
         "groups": groups,
+        "mixed_weight_vs_accepted_fp16_reciprocal": _mixed_vs_fp16_reciprocal(
+            runs
+        ),
         "mixed_weight_fixed_work_saving_vs_fp32_seconds": fixed_saving,
         "mixed_weight_fixed_work_saving_target_seconds": FULL_SONG_SAVING_TARGET_SECONDS,
         "mixed_weight_meets_full_song_saving_target": (
@@ -285,6 +346,11 @@ def text_report(report: Mapping[str, Any]) -> str:
     lines.append(
         "mixed_weight.meets_3_5s_target="
         f"{str(performance['mixed_weight_meets_full_song_saving_target']).lower()}"
+    )
+    fp16_reciprocal = performance["mixed_weight_vs_accepted_fp16_reciprocal"]
+    lines.append(
+        "mixed_weight.fixed_work_saving_vs_fp16_median_seconds="
+        f"{fp16_reciprocal['fixed_work_saving_median_seconds']:.9f}"
     )
     divergence = report["mixed_weight_vs_accepted_fp16"]
     for label, values in divergence["token_and_stopping_divergence"].items():

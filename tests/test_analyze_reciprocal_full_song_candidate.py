@@ -413,6 +413,19 @@ def test_weight_only_precision_matrix_requires_exact_fp16_self_repeat(
         "fixed_work_main_seconds"
     ] == pytest.approx(8_294 / ((4 / 10.0 + 4 / 10.4) / 2))
     assert report["performance"]["groups"]["accepted_fp16"]["main_tps"] > 0
+    assert report["performance"]["run_order"] == [
+        "baseline_first",
+        "candidate_first",
+        "accepted_fp16_first",
+        "accepted_fp16_second",
+        "candidate_second",
+        "baseline_second",
+    ]
+    assert len(
+        report["performance"]["mixed_weight_vs_accepted_fp16_reciprocal"][
+            "pairs"
+        ]
+    ) == 2
     assert report["mixed_weight_vs_accepted_fp16"][
         "token_and_stopping_divergence"
     ]["main_generation"]["token_stream_equal"] is False
