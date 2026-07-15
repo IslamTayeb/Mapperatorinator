@@ -15,9 +15,9 @@ from utils import nsight_agent_profile as nsight
 
 
 SCHEMA_VERSION = "mapperatorinator.fp16-fresh-baseline.v1"
-RUN_NAMES = tuple(f"run-{index:02d}" for index in range(1, 6))
 LABELS = ("timing_context", "main_generation")
 EXPECTED_PRESET_VERSION = "accepted-fp16-all-fused-v2"
+SPLIT_KV_PREFIXES = tuple(range(192, 833, 64))
 
 
 class FP16BaselineError(RuntimeError):
@@ -59,6 +59,8 @@ def _runtime_contract(
     *,
     expected_commit: str,
     expected_branch: str,
+    expected_preset_version: str = EXPECTED_PRESET_VERSION,
+    expected_split_kv: bool = False,
     audit: bool,
 ) -> None:
     metadata = profile.get("metadata")
@@ -90,7 +92,7 @@ def _runtime_contract(
     if not isinstance(effective, dict):
         raise FP16BaselineError("optimized effective config is missing")
     required_config = {
-        "version": EXPECTED_PRESET_VERSION,
+        "version": expected_preset_version,
         "precision": "fp16",
         "attn_implementation": "sdpa",
         "decoder_loop_backend": "active_prefix_cuda_graph",
@@ -109,6 +111,23 @@ def _runtime_contract(
         raise FP16BaselineError(
             f"accepted shared-specialized FP16 preset changed: {config_failures}"
         )
+    if expected_split_kv:
+        expected_split_config = {
+            "native_q1_rope_cache_split_kv": True,
+            "native_q1_rope_cache_split_kv_split_count": 8,
+            "native_q1_rope_cache_split_kv_prefix_buckets": list(
+                SPLIT_KV_PREFIXES
+            ),
+        }
+        split_failures = {
+            key: {"expected": value, "actual": effective.get(key)}
+            for key, value in expected_split_config.items()
+            if effective.get(key) != value
+        }
+        if split_failures:
+            raise FP16BaselineError(
+                f"FP16 split-KV config changed: {split_failures}"
+            )
     precisions = {
         row.get("precision")
         for row in profile.get("generation", [])
@@ -116,6 +135,36 @@ def _runtime_contract(
     }
     if precisions != {"fp16"}:
         raise FP16BaselineError(f"generation precision changed: {precisions}")
+    if expected_split_kv:
+        records = [
+            row
+            for row in profile.get("generation", [])
+            if isinstance(row, dict) and row.get("profile_label") in LABELS
+        ]
+        hit_maps = [
+            row.get("optimized_dispatch_capture_hits")
+            for row in records
+            if isinstance(row.get("optimized_dispatch_capture_hits"), dict)
+        ]
+        aggregate_key = "native_q1_rope_cache_self_attention_split_kv_8"
+        aggregate_hits = sum(int(value.get(aggregate_key, 0)) for value in hit_maps)
+        prefix_hits = {
+            prefix: sum(
+                int(
+                    value.get(
+                        f"{aggregate_key}_prefix_{prefix}",
+                        0,
+                    )
+                )
+                for value in hit_maps
+            )
+            for prefix in SPLIT_KV_PREFIXES
+        }
+        if aggregate_hits <= 0 or sum(prefix_hits.values()) != aggregate_hits:
+            raise FP16BaselineError(
+                "FP16 split-KV hit metadata is missing or inconsistent: "
+                f"aggregate={aggregate_hits}, prefixes={prefix_hits}"
+            )
 
 
 def _profile_and_result(run_dir: Path) -> tuple[dict[str, Any], Path]:
@@ -135,6 +184,20 @@ def _signature(profile: Mapping[str, Any], label: str) -> dict[str, Any]:
     return value
 
 
+def _token_groups(profile: Mapping[str, Any], label: str) -> list[list[list[int]]]:
+    material: list[list[list[int]]] = []
+    for index, record in enumerate(profile.get("generation", [])):
+        if not isinstance(record, dict) or record.get("profile_label") != label:
+            continue
+        groups = nsight._record_token_groups(record)
+        if groups is None:
+            raise FP16BaselineError(f"{label} record {index} has no token IDs")
+        material.append(groups)
+    if not material:
+        raise FP16BaselineError(f"{label} token material is empty")
+    return material
+
+
 def _metrics(profile: Mapping[str, Any], label: str) -> dict[str, Any]:
     try:
         return common._label_metrics(profile, label)
@@ -142,9 +205,11 @@ def _metrics(profile: Mapping[str, Any], label: str) -> dict[str, Any]:
         raise FP16BaselineError(str(exc)) from exc
 
 
-def _aggregate(values: Sequence[float]) -> dict[str, float]:
-    if len(values) != len(RUN_NAMES):
-        raise FP16BaselineError("aggregate requires five fresh values")
+def _aggregate(values: Sequence[float], *, expected_count: int) -> dict[str, float]:
+    if len(values) != expected_count:
+        raise FP16BaselineError(
+            f"aggregate requires {expected_count} fresh values"
+        )
     return {
         "median": float(statistics.median(values)),
         "minimum": float(min(values)),
@@ -172,9 +237,15 @@ def analyze(
     *,
     expected_commit: str,
     expected_branch: str,
+    expected_preset_version: str = EXPECTED_PRESET_VERSION,
+    expected_split_kv: bool = False,
+    run_count: int = 5,
 ) -> dict[str, Any]:
     if len(expected_commit) != 40:
         raise FP16BaselineError("expected commit must be a full SHA")
+    if run_count not in {1, 5}:
+        raise FP16BaselineError("run_count must be one initial or five confirmation runs")
+    run_names = tuple(f"run-{index:02d}" for index in range(1, run_count + 1))
     runs: list[dict[str, Any]] = []
     profiles: list[dict[str, Any]] = []
     results: list[Path] = []
@@ -186,13 +257,15 @@ def analyze(
     output_hashes: list[str] = []
     token_counts: dict[str, list[int]] = {label: [] for label in LABELS}
 
-    for run_name in RUN_NAMES:
+    for run_name in run_names:
         run_dir = run_root / run_name
         profile, result = _profile_and_result(run_dir)
         _runtime_contract(
             profile,
             expected_commit=expected_commit,
             expected_branch=expected_branch,
+            expected_preset_version=expected_preset_version,
+            expected_split_kv=expected_split_kv,
             audit=False,
         )
         profile_hash = profile["metadata"].get("result_file_sha256")
@@ -247,6 +320,7 @@ def analyze(
                         "stopping_sha256": label_signatures[label][
                             "stopping_sha256"
                         ],
+                        "token_groups_by_record": _token_groups(profile, label),
                     }
                     for label in LABELS
                 },
@@ -261,6 +335,8 @@ def analyze(
             audit_profile,
             expected_commit=expected_commit,
             expected_branch=expected_branch,
+            expected_preset_version=expected_preset_version,
+            expected_split_kv=expected_split_kv,
             audit=True,
         )
         try:
@@ -276,7 +352,14 @@ def analyze(
                 "output_sha256": _file_hash(audit_result),
                 "structure": nsight.summarize_osu_structure(audit_result),
                 "signatures": {
-                    label: _signature(audit_profile, label) for label in LABELS
+                    label: {
+                        **_signature(audit_profile, label),
+                        "token_groups_by_record": _token_groups(
+                            audit_profile,
+                            label,
+                        ),
+                    }
+                    for label in LABELS
                 },
                 "strict_exactness": exactness,
                 "record_contract": record,
@@ -335,13 +418,16 @@ def analyze(
 
     aggregates = {
         "process_wall_seconds": _aggregate(
-            [run["process_wall_seconds"] for run in runs]
+            [run["process_wall_seconds"] for run in runs],
+            expected_count=run_count,
         ),
         "request_to_final_osu_wall_seconds": _aggregate(
-            [run["request_to_final_osu_wall_seconds"] for run in runs]
+            [run["request_to_final_osu_wall_seconds"] for run in runs],
+            expected_count=run_count,
         ),
         "peak_cuda_memory_mb": _aggregate(
-            [run["peak_cuda_memory_mb"] for run in runs]
+            [run["peak_cuda_memory_mb"] for run in runs],
+            expected_count=run_count,
         ),
     }
     for label in LABELS:
@@ -350,22 +436,30 @@ def analyze(
             [
                 run["generation"][label]["synchronized_model_seconds"]
                 for run in runs
-            ]
+            ],
+            expected_count=run_count,
         )
         aggregates[f"{prefix}_outer_wall_seconds"] = _aggregate(
-            [run["generation"][label]["outer_wall_seconds"] for run in runs]
+            [run["generation"][label]["outer_wall_seconds"] for run in runs],
+            expected_count=run_count,
         )
         aggregates[f"{prefix}_tokens_per_second"] = _aggregate(
-            [run["generation"][label]["tokens_per_second"] for run in runs]
+            [run["generation"][label]["tokens_per_second"] for run in runs],
+            expected_count=run_count,
         )
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "PASS",
         "precision": "fp16",
+        "runtime_identity": {
+            "commit": expected_commit,
+            "branch": expected_branch,
+        },
         "fresh_processes": True,
         "run_count": len(runs),
         "authoritative_performance": True,
-        "accepted_preset_version": EXPECTED_PRESET_VERSION,
+        "preset_version": expected_preset_version,
+        "split_kv": expected_split_kv,
         "fixed_work": {
             "timing_tokens": token_counts["timing_context"][0],
             "main_tokens": token_counts["main_generation"][0],
@@ -380,6 +474,23 @@ def analyze(
                 "process_wall_seconds": _process_wall(audit["run_dir"]),
                 "output_sha256": audit["output_sha256"],
                 "strict_exactness": audit["strict_exactness"],
+                "token_signatures": {
+                    label: {
+                        "generated_tokens": audit["signatures"][label][
+                            "generated_tokens"
+                        ],
+                        "token_stream_sha256": audit["signatures"][label][
+                            "token_stream_sha256"
+                        ],
+                        "stopping_sha256": audit["signatures"][label][
+                            "stopping_sha256"
+                        ],
+                        "token_groups_by_record": audit["signatures"][label][
+                            "token_groups_by_record"
+                        ],
+                    }
+                    for label in LABELS
+                },
             }
             for audit in audits
         ],
@@ -392,7 +503,7 @@ def _text(result: Mapping[str, Any]) -> str:
         (
             "status=PASS",
             "precision=fp16",
-            f"preset={result['accepted_preset_version']}",
+            f"preset={result['preset_version']}",
             f"fixed_work_timing_tokens={result['fixed_work']['timing_tokens']}",
             f"fixed_work_main_tokens={result['fixed_work']['main_tokens']}",
             f"timing_model_seconds_median={aggregates['timing_synchronized_model_seconds']['median']:.6f}",
@@ -410,6 +521,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--expected-branch", required=True)
+    parser.add_argument(
+        "--expected-preset-version",
+        default=EXPECTED_PRESET_VERSION,
+    )
+    parser.add_argument("--expected-split-kv", action="store_true")
+    parser.add_argument("--run-count", type=int, choices=(1, 5), default=5)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--text-output", type=Path, required=True)
     args = parser.parse_args(argv)
@@ -417,6 +534,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.run_root,
         expected_commit=args.expected_commit,
         expected_branch=args.expected_branch,
+        expected_preset_version=args.expected_preset_version,
+        expected_split_kv=args.expected_split_kv,
+        run_count=args.run_count,
     )
     args.output.write_text(
         json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"

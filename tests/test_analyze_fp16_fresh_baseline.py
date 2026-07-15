@@ -94,7 +94,7 @@ def test_runtime_rejects_fp32_so_fp16_cannot_mask_fp32_controls():
 def test_text_reports_fixed_work_tps_and_complete_song_wall():
     aggregate = {"median": 1.0, "minimum": 1.0, "maximum": 1.0, "range": 0.0}
     result = {
-        "accepted_preset_version": EXPECTED_PRESET_VERSION,
+        "preset_version": EXPECTED_PRESET_VERSION,
         "fixed_work": {"timing_tokens": 821, "main_tokens": 7809},
         "aggregates": {
             "timing_synchronized_model_seconds": aggregate,
@@ -169,3 +169,106 @@ def test_full_analyzer_reuses_current_profiler_contract_without_fp32_mutation(
     assert result["fixed_work"] == {"timing_tokens": 2, "main_tokens": 3}
     assert result["checks"]["audit_rng_cache_repeat"]
     assert len(result["exactness_audits"]) == 2
+
+
+def test_candidate_runtime_requires_consistent_fp16_split_kv_hits():
+    profile = _profile()
+    version = "candidate-fp16-all-fused-split-kv-v3"
+    profile["metadata"]["optimized_effective_config"].update(
+        {
+            "version": version,
+            "native_q1_rope_cache_split_kv": True,
+            "native_q1_rope_cache_split_kv_split_count": 8,
+            "native_q1_rope_cache_split_kv_prefix_buckets": list(
+                range(192, 833, 64)
+            ),
+        }
+    )
+    aggregate = "native_q1_rope_cache_self_attention_split_kv_8"
+    profile["generation"][1]["optimized_dispatch_capture_hits"] = {
+        aggregate: 12,
+        f"{aggregate}_prefix_640": 12,
+    }
+    _runtime_contract(
+        profile,
+        expected_commit=COMMIT,
+        expected_branch=BRANCH,
+        expected_preset_version=version,
+        expected_split_kv=True,
+        audit=False,
+    )
+
+    profile["generation"][1]["optimized_dispatch_capture_hits"][aggregate] = 13
+    with pytest.raises(FP16BaselineError, match="hit metadata"):
+        _runtime_contract(
+            profile,
+            expected_commit=COMMIT,
+            expected_branch=BRANCH,
+            expected_preset_version=version,
+            expected_split_kv=True,
+            audit=False,
+        )
+
+
+def test_full_split_kv_candidate_accepts_one_run_and_two_audits(tmp_path):
+    fixture_path = (
+        Path(__file__).resolve().parent / "test_analyze_fp32_fresh_baseline.py"
+    )
+    spec = importlib.util.spec_from_file_location("fp32_split_fixture", fixture_path)
+    assert spec is not None and spec.loader is not None
+    fixture = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixture)
+    root = tmp_path / "fp16-split-candidate"
+    fixture._run(root, "run-01")
+    fixture._run(root, "exactness-audit-01", exactness=True)
+    fixture._run(root, "exactness-audit-02", exactness=True)
+
+    version = "candidate-fp16-all-fused-split-kv-v3"
+    required_config = {
+        "version": version,
+        "precision": "fp16",
+        "attn_implementation": "sdpa",
+        "decoder_loop_backend": "active_prefix_cuda_graph",
+        "batch_size": 1,
+        "q1_bmm_cross_attention": True,
+        "native_q1_self_attention": True,
+        "native_q1_rope_cache_self_attention": True,
+        "native_cross_mlp_tail": True,
+        "native_q1_rope_cache_split_kv": True,
+        "native_q1_rope_cache_split_kv_split_count": 8,
+        "native_q1_rope_cache_split_kv_prefix_buckets": list(
+            range(192, 833, 64)
+        ),
+    }
+    aggregate = "native_q1_rope_cache_self_attention_split_kv_8"
+    for path in root.glob("*/output/*.profile.json"):
+        profile = json.loads(path.read_text(encoding="utf-8"))
+        metadata = profile["metadata"]
+        metadata["precision"] = "fp16"
+        metadata["git_branch"] = BRANCH
+        metadata["optimized_effective_config"] = required_config
+        for record in profile["generation"]:
+            record["precision"] = "fp16"
+            if record["profile_label"] == "main_generation":
+                record["optimized_dispatch_capture_hits"] = {
+                    aggregate: 12,
+                    f"{aggregate}_prefix_640": 12,
+                }
+        path.write_text(json.dumps(profile), encoding="utf-8")
+
+    result = analyze(
+        root,
+        expected_commit=COMMIT,
+        expected_branch=BRANCH,
+        expected_preset_version=version,
+        expected_split_kv=True,
+        run_count=1,
+    )
+
+    assert result["status"] == "PASS"
+    assert result["run_count"] == 1
+    assert result["preset_version"] == version
+    assert result["split_kv"] is True
+    assert result["runs"][0]["token_signatures"]["main_generation"][
+        "token_groups_by_record"
+    ]
