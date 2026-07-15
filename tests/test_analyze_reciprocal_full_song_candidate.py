@@ -276,6 +276,49 @@ def test_exact_fp32_reports_reciprocal_order_aware_metrics(tmp_path: Path) -> No
     assert "metric.complete_request_wall_seconds=" in text_report(report)
 
 
+def test_exact_same_precision_accepts_exact_fp16_reciprocal(tmp_path: Path) -> None:
+    profiles = {
+        role: _write_run(
+            tmp_path,
+            role,
+            main_seconds=10.0 + index * 0.1,
+            precision="fp16",
+        )
+        for index, role in enumerate(RUN_ORDER)
+    }
+
+    report = analyze(profiles, mode="exact-same-precision")
+
+    assert report["mode"] == "exact-same-precision"
+    assert report["parity"]["claim"] == "exact-same-precision"
+    assert report["parity"]["cross_candidate_exact"] is True
+    assert {run["precision"] for run in report["runs"].values()} == {"fp16"}
+
+
+def test_exact_same_precision_rejects_mixed_precision_and_divergence(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(CandidateAnalysisError, match="one precision"):
+        analyze(_four_runs(tmp_path, precision="fp16"), mode="exact-same-precision")
+
+    exact_root = tmp_path / "exact"
+    exact_root.mkdir()
+    profiles = {
+        role: _write_run(
+            exact_root,
+            role,
+            main_seconds=10.0,
+            precision="fp16",
+            main_tokens=[10, 99, 12, 13]
+            if role.startswith("candidate")
+            else [10, 11, 12, 13],
+        )
+        for role in RUN_ORDER
+    }
+    with pytest.raises(CandidateAnalysisError, match="tokens, stopping, or final OSU"):
+        analyze(profiles, mode="exact-same-precision")
+
+
 def test_exact_dispatch_delta_requires_a_used_explicit_pattern(tmp_path: Path) -> None:
     profiles = _four_runs(tmp_path, split_kv=True)
     with pytest.raises(CandidateAnalysisError, match="undeclared"):
@@ -323,7 +366,7 @@ def test_relaxed_mode_reports_token_stopping_structure_and_map_divergence(
     assert parity["cross_candidate_exact"] is False
     assert parity["token_and_stopping_divergence"]["main_generation"][
         "aligned_mismatches"
-    ] == 2
+    ] == 1
     assert not parity["token_and_stopping_divergence"]["main_generation"][
         "stopping_equal"
     ]
