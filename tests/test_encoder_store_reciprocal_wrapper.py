@@ -18,6 +18,8 @@ def test_wrapper_pins_clean_pushed_2080ti_worktree_and_full_song():
         'git -C "$REPO" status --porcelain',
         'git -C "$REPO" rev-parse "$REMOTE_REF"',
         'NVIDIA GeForce RTX 2080 Ti',
+        "preload_weight_only_extension",
+        "preload_int8_mlp_extension",
         'profile_pass_kind=untraced_control',
         'run_profile baseline_first baseline',
         'run_profile candidate_second candidate',
@@ -33,6 +35,7 @@ def test_wrapper_charges_two_model_audits_and_writes_json_text_only():
     assert "auto_select_gamemode_model=false" in source
     assert '--main-audit "$RUN_ROOT/drift-audit/main/encoder-precompute.json"' in source
     assert '--timing-audit "$RUN_ROOT/drift-audit/timing/encoder-precompute.json"' in source
+    assert "--minimum-complete-request-saving-seconds 0.3" in source
     assert '--json-output "$RUN_ROOT/analysis.json"' in source
     assert '--text-output "$RUN_ROOT/analysis.txt"' in source
     assert ".md" not in source

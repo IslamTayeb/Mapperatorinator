@@ -141,9 +141,17 @@ from osuT5.osuT5.inference.optimized.kernels.decoder_layer import (
 from osuT5.osuT5.inference.optimized.kernels.q1_attention import (
     preload_native_q1_attention,
 )
+from osuT5.osuT5.inference.optimized.scout.int8_mlp import (
+    preload_int8_mlp_extension,
+)
+from osuT5.osuT5.inference.optimized.scout.weight_only import (
+    preload_weight_only_extension,
+)
 
 preload_native_q1_attention()
 preload_native_decoder_layer()
+preload_weight_only_extension()
+preload_int8_mlp_extension()
 torch.cuda.synchronize()
 path.write_text(
     json.dumps(
@@ -242,6 +250,7 @@ set +e
   --timing-audit "$RUN_ROOT/drift-audit/timing/encoder-precompute.json" \
   --batch-size "$ENCODER_BATCH_SIZE" \
   --base-seed 12345 \
+  --minimum-complete-request-saving-seconds 0.3 \
   --json-output "$RUN_ROOT/analysis.json" \
   --text-output "$RUN_ROOT/analysis.txt"
 ANALYSIS_STATUS=$?

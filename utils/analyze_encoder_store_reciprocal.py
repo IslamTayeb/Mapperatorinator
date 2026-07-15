@@ -13,7 +13,30 @@ from osuT5.osuT5.inference.optimized.scout.encoder_store import (
     SUPPORTED_LABELS,
 )
 from utils.fixed_seed_inference import SEED_POLICY_VERSION, stage_seed
+from utils.run_batched_encoder_store_full_song import SELECTED_STACK_VERSION
 from utils.summarize_inference_profile import compare_reciprocal_profiles
+
+
+MIN_COMPLETE_REQUEST_SAVING_SECONDS = 0.3
+MAX_ABS_ENCODER_DRIFT = 1e-3
+RTX_2080_TI_TOTAL_BYTES = 11_264 * 1024 * 1024
+STORE_ACCOUNTING_TOLERANCE_SECONDS = 0.02
+STORE_TIME_FIELDS = (
+    "batch_setup_seconds",
+    "input_copy_seconds",
+    "encoder_synchronized_seconds",
+    "storage_allocation_seconds",
+    "output_store_copy_seconds",
+)
+STORE_MEMORY_FIELDS = (
+    "baseline_allocated_vram_bytes",
+    "baseline_reserved_vram_bytes",
+    "peak_allocated_vram_bytes",
+    "peak_reserved_vram_bytes",
+    "incremental_peak_allocated_vram_bytes",
+    "incremental_peak_reserved_vram_bytes",
+    "output_store_bytes",
+)
 
 
 def _load(path: Path, *, name: str) -> dict[str, Any]:
@@ -33,6 +56,23 @@ def _number(value: Any, *, name: str, positive: bool = False) -> float:
     if not math.isfinite(result) or result < 0 or (positive and result <= 0):
         raise ValueError(f"{name} must be finite and non-negative")
     return result
+
+
+def _signed_number(value: Any, *, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be numeric")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be finite")
+    return result
+
+
+def _integer(value: Any, *, name: str, positive: bool = False) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer")
+    if value < 0 or (positive and value <= 0):
+        raise ValueError(f"{name} must be non-negative")
+    return value
 
 
 def _records(profile: dict[str, Any], label: str) -> list[dict[str, Any]]:
@@ -114,6 +154,16 @@ def _complete_wall(profile: dict[str, Any]) -> float:
     return finished - started
 
 
+def _runner_complete_wall(evidence: dict[str, Any], *, role: str) -> float:
+    """Return the outer cold-request wall recorded by the isolated runner."""
+
+    return _number(
+        evidence.get("run_wall_seconds"),
+        name=f"{role}.run_wall_seconds",
+        positive=True,
+    )
+
+
 def _label_metrics(profile: dict[str, Any], label: str) -> dict[str, Any]:
     rows = _records(profile, label)
     tokens = sum(int(row.get("generated_tokens", 0) or 0) for row in rows)
@@ -142,12 +192,30 @@ def _label_metrics(profile: dict[str, Any], label: str) -> dict[str, Any]:
 
 
 def _profile_metrics(profile: dict[str, Any]) -> dict[str, Any]:
+    memory_rows = [
+        row
+        for key in ("stages", "generation")
+        for row in profile.get(key, [])
+        if isinstance(row, dict) and "cuda_max_memory_allocated_mb" in row
+    ]
+    if not memory_rows:
+        raise ValueError("profile lacks CUDA peak-memory evidence")
+    peak_allocated_mb = max(
+        _number(
+            row["cuda_max_memory_allocated_mb"],
+            name="cuda_max_memory_allocated_mb",
+        )
+        for row in memory_rows
+    )
     return {
         "timing": _label_metrics(profile, "timing_context"),
         "main": _label_metrics(profile, "main_generation"),
         "timing_stage_seconds": _stage(profile, "timing_context_generation"),
         "main_stage_seconds": _stage(profile, "main_generation"),
         "complete_request_seconds": _complete_wall(profile),
+        "peak_cuda_memory_allocated_bytes": int(
+            peak_allocated_mb * 1024 * 1024
+        ),
     }
 
 
@@ -160,6 +228,112 @@ def _validate_seed_metadata(profile: dict[str, Any], *, base_seed: int) -> None:
     for label in SUPPORTED_LABELS:
         if metadata.get(f"reciprocal_seed_{label}") != stage_seed(base_seed, label):
             raise ValueError(f"profile reciprocal seed changed for {label}")
+
+
+def _validate_store_charges(store: dict[str, Any]) -> dict[str, Any]:
+    entries = store.get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("candidate encoder-store entries are missing")
+    charged_entries = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ValueError(f"candidate encoder-store entry {index} is invalid")
+        complete = _number(
+            entry.get("complete_precompute_seconds"),
+            name=f"entry[{index}].complete_precompute_seconds",
+            positive=True,
+        )
+        times = {
+            field: _number(
+                entry.get(field),
+                name=f"entry[{index}].{field}",
+            )
+            for field in STORE_TIME_FIELDS
+        }
+        accounted = sum(times.values())
+        if accounted > complete + STORE_ACCOUNTING_TOLERANCE_SECONDS:
+            raise ValueError(
+                f"candidate encoder-store entry {index} component time exceeds "
+                "complete precompute wall"
+            )
+        memory = {
+            field: _integer(
+                entry.get(field),
+                name=f"entry[{index}].{field}",
+                positive=field == "output_store_bytes",
+            )
+            for field in STORE_MEMORY_FIELDS
+        }
+        if (
+            memory["peak_allocated_vram_bytes"]
+            - memory["baseline_allocated_vram_bytes"]
+            != memory["incremental_peak_allocated_vram_bytes"]
+        ):
+            raise ValueError(
+                f"candidate encoder-store entry {index} allocated VRAM delta changed"
+            )
+        if (
+            memory["peak_reserved_vram_bytes"]
+            - memory["baseline_reserved_vram_bytes"]
+            != memory["incremental_peak_reserved_vram_bytes"]
+        ):
+            raise ValueError(
+                f"candidate encoder-store entry {index} reserved VRAM delta changed"
+            )
+        if (
+            memory["incremental_peak_allocated_vram_bytes"]
+            < memory["output_store_bytes"]
+        ):
+            raise ValueError(
+                f"candidate encoder-store entry {index} peak allocation does not "
+                "charge output storage"
+            )
+        charged_entries.append(
+            {
+                "entry_index": index,
+                "complete_precompute_seconds": complete,
+                "accounted_precompute_seconds": accounted,
+                "unattributed_precompute_seconds": max(0.0, complete - accounted),
+                **times,
+                **memory,
+            }
+        )
+    total_complete = sum(
+        entry["complete_precompute_seconds"] for entry in charged_entries
+    )
+    total_store = sum(entry["output_store_bytes"] for entry in charged_entries)
+    if not math.isclose(
+        _number(
+            store.get("total_complete_precompute_seconds"),
+            name="total_complete_precompute_seconds",
+        ),
+        total_complete,
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        raise ValueError("candidate total precompute wall does not match entries")
+    if _integer(
+        store.get("total_output_store_bytes"),
+        name="total_output_store_bytes",
+        positive=True,
+    ) != total_store:
+        raise ValueError("candidate total output storage does not match entries")
+    return {
+        "entries": charged_entries,
+        "total_complete_precompute_seconds": total_complete,
+        "total_accounted_precompute_seconds": sum(
+            entry["accounted_precompute_seconds"] for entry in charged_entries
+        ),
+        "total_output_store_bytes": total_store,
+        "total_incremental_peak_allocated_vram_bytes": sum(
+            entry["incremental_peak_allocated_vram_bytes"]
+            for entry in charged_entries
+        ),
+        "total_incremental_peak_reserved_vram_bytes": sum(
+            entry["incremental_peak_reserved_vram_bytes"]
+            for entry in charged_entries
+        ),
+    }
 
 
 def _validate_candidate_store(
@@ -218,6 +392,8 @@ def _validate_candidate_store(
             "output_store_bytes",
             "conditioning_sha256",
             "complete_precompute_seconds",
+            *STORE_TIME_FIELDS,
+            *STORE_MEMORY_FIELDS,
         ):
             if profile_entry.get(key) != external_entry.get(key):
                 raise ValueError(
@@ -231,8 +407,13 @@ def _validate_candidate_store(
             row = uses.get(label)
             if not isinstance(row, dict) or row.get("rows_reused", 0) <= 0:
                 raise ValueError(f"candidate did not reuse encoder rows for {label}")
+            if row.get("per_window_device_copy") is not False:
+                raise ValueError(
+                    f"candidate unexpectedly copied encoder rows for {label}"
+                )
     if sorted(labels_seen) != sorted(SUPPORTED_LABELS):
         raise ValueError(f"candidate store labels changed: {labels_seen}")
+    _validate_store_charges(external)
     return external
 
 
@@ -268,7 +449,15 @@ def analyze(
     *,
     batch_size: int,
     base_seed: int,
+    minimum_complete_request_saving_seconds: float = (
+        MIN_COMPLETE_REQUEST_SAVING_SECONDS
+    ),
 ) -> dict[str, Any]:
+    minimum_complete_request_saving_seconds = _number(
+        minimum_complete_request_saving_seconds,
+        name="minimum_complete_request_saving_seconds",
+        positive=True,
+    )
     profiles = {
         role: _load(path, name=f"{role} profile")
         for role, path in profile_paths.items()
@@ -277,6 +466,18 @@ def analyze(
         role: _load(path, name=f"{role} evidence")
         for role, path in evidence_paths.items()
     }
+    selected_topologies = {}
+    for role, payload in evidence.items():
+        if payload.get("schema_version") != 2:
+            raise ValueError(f"{role} evidence schema changed")
+        topology = payload.get("selected_topology")
+        if not isinstance(topology, dict):
+            raise ValueError(f"{role} evidence lacks selected topology")
+        if topology.get("version") != SELECTED_STACK_VERSION:
+            raise ValueError(f"{role} selected topology version changed")
+        if not isinstance(payload.get("selected_initialization"), dict):
+            raise ValueError(f"{role} selected initialization is missing")
+        selected_topologies[role] = topology
     for profile in profiles.values():
         _validate_seed_metadata(profile, base_seed=base_seed)
     for role in ("baseline_first", "baseline_second"):
@@ -290,6 +491,9 @@ def analyze(
             batch_size=batch_size,
         )
         for role in ("candidate_second", "candidate_first")
+    }
+    store_charges = {
+        role: _validate_store_charges(store) for role, store in stores.items()
     }
 
     audits = {
@@ -307,25 +511,47 @@ def analyze(
             raise ValueError(f"{role} drift audit lacks B1 comparison")
         audit_window_counts.add(audit.get("metadata", {}).get("live_window_count"))
         audit_rows[role] = {
-            "b1_complete_precompute_seconds": audit["variants"]["1"][
-                "complete_precompute_seconds"
-            ],
-            "candidate_complete_precompute_seconds": audit_variant[
-                "complete_precompute_seconds"
-            ],
-            "complete_seconds_saved_vs_b1": audit_variant[
-                "complete_seconds_saved_vs_b1"
-            ],
-            "max_abs_encoder_drift": drift.get("max_abs"),
-            "mean_window_max_abs_encoder_drift": drift.get(
-                "mean_window_max_abs"
+            "b1_complete_precompute_seconds": _number(
+                audit["variants"]["1"]["complete_precompute_seconds"],
+                name=f"{role}.b1_complete_precompute_seconds",
+                positive=True,
             ),
-            "exact_window_count": drift.get("exact_window_count"),
-            "window_count": drift.get("window_count"),
-            "incremental_peak_vram_bytes": audit_variant.get(
-                "incremental_peak_vram_bytes"
+            "candidate_complete_precompute_seconds": _number(
+                audit_variant["complete_precompute_seconds"],
+                name=f"{role}.candidate_complete_precompute_seconds",
+                positive=True,
             ),
-            "output_store_bytes": audit_variant.get("output_store_bytes"),
+            "complete_seconds_saved_vs_b1": _signed_number(
+                audit_variant["complete_seconds_saved_vs_b1"],
+                name=f"{role}.complete_seconds_saved_vs_b1",
+            ),
+            "max_abs_encoder_drift": _number(
+                drift.get("max_abs"),
+                name=f"{role}.max_abs_encoder_drift",
+            ),
+            "mean_window_max_abs_encoder_drift": _number(
+                drift.get("mean_window_max_abs"),
+                name=f"{role}.mean_window_max_abs_encoder_drift",
+            ),
+            "exact_window_count": _integer(
+                drift.get("exact_window_count"),
+                name=f"{role}.exact_window_count",
+            ),
+            "window_count": _integer(
+                drift.get("window_count"),
+                name=f"{role}.window_count",
+                positive=True,
+            ),
+            "incremental_peak_vram_bytes": _integer(
+                audit_variant.get("incremental_peak_vram_bytes"),
+                name=f"{role}.incremental_peak_vram_bytes",
+                positive=True,
+            ),
+            "output_store_bytes": _integer(
+                audit_variant.get("output_store_bytes"),
+                name=f"{role}.output_store_bytes",
+                positive=True,
+            ),
         }
     if len(audit_window_counts) != 1:
         raise ValueError("main and timing drift audits have different window counts")
@@ -346,6 +572,11 @@ def analyze(
         regression_tolerance_pct=100.0,
     )
     metrics = {role: _profile_metrics(profile) for role, profile in profiles.items()}
+    for role, role_metrics in metrics.items():
+        role_metrics["runner_complete_wall_seconds"] = _runner_complete_wall(
+            evidence[role],
+            role=role,
+        )
     order_pairs = (
         ("baseline_first", "candidate_second"),
         ("baseline_second", "candidate_first"),
@@ -355,16 +586,24 @@ def analyze(
         baseline = metrics[baseline_role]
         candidate = metrics[candidate_role]
         request_saved = (
-            baseline["complete_request_seconds"]
-            - candidate["complete_request_seconds"]
+            baseline["runner_complete_wall_seconds"]
+            - candidate["runner_complete_wall_seconds"]
         )
         orders.append(
             {
                 "baseline": baseline_role,
                 "candidate": candidate_role,
+                "baseline_complete_request_seconds": baseline[
+                    "runner_complete_wall_seconds"
+                ],
+                "candidate_complete_request_seconds": candidate[
+                    "runner_complete_wall_seconds"
+                ],
                 "complete_request_seconds_saved": request_saved,
                 "complete_request_speedup_pct": (
-                    request_saved / baseline["complete_request_seconds"] * 100.0
+                    request_saved
+                    / baseline["runner_complete_wall_seconds"]
+                    * 100.0
                 ),
                 "timing_stage_seconds_saved": (
                     baseline["timing_stage_seconds"]
@@ -404,21 +643,62 @@ def analyze(
         for role in ("baseline_first", "baseline_second")
     ]
     repeatability_pass = all(row["exact"] for row in repeatability.values())
-    request_nonregression = all(
-        order["complete_request_seconds_saved"] >= 0.0 for order in orders
+    complete_wall_saving_pass = all(
+        order["complete_request_seconds_saved"]
+        >= minimum_complete_request_saving_seconds
+        for order in orders
+    )
+    drift_pass = all(
+        row["max_abs_encoder_drift"] <= MAX_ABS_ENCODER_DRIFT
+        for row in audit_rows.values()
+    )
+    candidate_vram_pass = all(
+        metrics[role]["peak_cuda_memory_allocated_bytes"]
+        <= RTX_2080_TI_TOTAL_BYTES
+        for role in ("candidate_first", "candidate_second")
+    ) and all(
+        entry["peak_allocated_vram_bytes"] <= RTX_2080_TI_TOTAL_BYTES
+        for charges in store_charges.values()
+        for entry in charges["entries"]
+    )
+    storage_pass = all(
+        charges["total_output_store_bytes"] > 0
+        and charges["total_incremental_peak_allocated_vram_bytes"]
+        >= charges["total_output_store_bytes"]
+        for charges in store_charges.values()
+    )
+    baseline_output_repeat = (
+        profiles["baseline_first"]["metadata"].get("result_file_sha256")
+        == profiles["baseline_second"]["metadata"].get("result_file_sha256")
+    )
+    candidate_output_repeat = (
+        profiles["candidate_first"]["metadata"].get("result_file_sha256")
+        == profiles["candidate_second"]["metadata"].get("result_file_sha256")
+    )
+    output_repeatability_pass = baseline_output_repeat and candidate_output_repeat
+    pass_gate = (
+        repeatability_pass
+        and output_repeatability_pass
+        and complete_wall_saving_pass
+        and drift_pass
+        and candidate_vram_pass
+        and storage_pass
     )
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "decision": (
-            "PASS_FULL_SONG_GATE"
-            if repeatability_pass and request_nonregression
-            else "STOP_ENCODER_STORE"
+            "PASS_FULL_SONG_GATE" if pass_gate else "STOP_ENCODER_STORE"
         ),
         "batch_size": batch_size,
+        "minimum_complete_request_saving_seconds": (
+            minimum_complete_request_saving_seconds
+        ),
         "profiles": {key: str(value) for key, value in profile_paths.items()},
         "evidence": {key: str(value) for key, value in evidence_paths.items()},
+        "selected_topologies": selected_topologies,
         "audit_paths": {key: str(value) for key, value in audit_paths.items()},
         "audits": audit_rows,
+        "store_charges": store_charges,
         "metrics": metrics,
         "orders": orders,
         "mean_complete_request_seconds_saved": sum(
@@ -427,19 +707,19 @@ def analyze(
         / len(orders),
         "repeatability": repeatability,
         "repeatability_pass": repeatability_pass,
-        "request_nonregression_pass": request_nonregression,
+        "complete_wall_saving_pass": complete_wall_saving_pass,
+        "max_abs_encoder_drift": MAX_ABS_ENCODER_DRIFT,
+        "drift_pass": drift_pass,
+        "rtx_2080_ti_total_bytes": RTX_2080_TI_TOTAL_BYTES,
+        "candidate_vram_pass": candidate_vram_pass,
+        "storage_pass": storage_pass,
+        "output_repeatability_pass": output_repeatability_pass,
         "baseline_output_repeat": {
-            "sha256_equal": profiles["baseline_first"]["metadata"].get(
-                "result_file_sha256"
-            )
-            == profiles["baseline_second"]["metadata"].get("result_file_sha256"),
+            "sha256_equal": baseline_output_repeat,
             "structure": [_osu_structure(path) for path in baseline_artifacts],
         },
         "candidate_output_repeat": {
-            "sha256_equal": profiles["candidate_first"]["metadata"].get(
-                "result_file_sha256"
-            )
-            == profiles["candidate_second"]["metadata"].get("result_file_sha256"),
+            "sha256_equal": candidate_output_repeat,
             "structure": [_osu_structure(path) for path in candidate_artifacts],
         },
         "reciprocal_exactness": reciprocal,
@@ -451,13 +731,18 @@ def _text(report: dict[str, Any]) -> str:
     lines = [
         f"decision={report['decision']}",
         f"batch_size={report['batch_size']}",
+        f"minimum_complete_request_saving_seconds={report['minimum_complete_request_saving_seconds']:.6f}",
         f"mean_complete_request_seconds_saved={report['mean_complete_request_seconds_saved']:.6f}",
         f"main_encoder_max_abs_drift={report['audits']['main']['max_abs_encoder_drift']}",
         f"timing_encoder_max_abs_drift={report['audits']['timing']['max_abs_encoder_drift']}",
         f"main_encoder_precompute_seconds_saved={report['audits']['main']['complete_seconds_saved_vs_b1']}",
         f"timing_encoder_precompute_seconds_saved={report['audits']['timing']['complete_seconds_saved_vs_b1']}",
         f"repeatability_pass={str(report['repeatability_pass']).lower()}",
-        f"request_nonregression_pass={str(report['request_nonregression_pass']).lower()}",
+        f"output_repeatability_pass={str(report['output_repeatability_pass']).lower()}",
+        f"complete_wall_saving_pass={str(report['complete_wall_saving_pass']).lower()}",
+        f"drift_pass={str(report['drift_pass']).lower()}",
+        f"storage_pass={str(report['storage_pass']).lower()}",
+        f"candidate_vram_pass={str(report['candidate_vram_pass']).lower()}",
     ]
     for index, order in enumerate(report["orders"]):
         lines.append(
@@ -484,6 +769,11 @@ def main() -> None:
     parser.add_argument("--timing-audit", type=Path, required=True)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--base-seed", type=int, default=12345)
+    parser.add_argument(
+        "--minimum-complete-request-saving-seconds",
+        type=float,
+        default=MIN_COMPLETE_REQUEST_SAVING_SECONDS,
+    )
     parser.add_argument("--json-output", type=Path, required=True)
     parser.add_argument("--text-output", type=Path, required=True)
     args = parser.parse_args()
@@ -505,6 +795,9 @@ def main() -> None:
         {"main": args.main_audit, "timing": args.timing_audit},
         batch_size=args.batch_size,
         base_seed=args.base_seed,
+        minimum_complete_request_saving_seconds=(
+            args.minimum_complete_request_saving_seconds
+        ),
     )
     args.json_output.parent.mkdir(parents=True, exist_ok=True)
     args.json_output.write_text(
