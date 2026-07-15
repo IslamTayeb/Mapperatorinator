@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from functools import partial
@@ -170,6 +171,63 @@ def _native_cross_mlp_tail_enabled(
     return context_type != ContextType.TIMING
 
 
+STRICT_FP32_TIMING_NATIVE_SELF_VERSION = "strict-fp32-timing-native-self-v1"
+
+
+def _strict_fp32_timing_native_self_metadata() -> dict[str, Any]:
+    """Describe the opt-in timing-only dispatch delta.
+
+    This policy deliberately reuses the accepted decoder forward and accepted
+    native self-attention hooks.  It owns no weights, tensors, kernels, caches,
+    or sampler state.
+    """
+
+    return {
+        "version": STRICT_FP32_TIMING_NATIVE_SELF_VERSION,
+        "scope": "standalone-timing-model-batch1-only",
+        "precision": "fp32",
+        "torch_dtype": "torch.float32",
+        "tf32_disabled_required": True,
+        "result_class": "exact-incremental-candidate",
+        "exactness_claim": True,
+        "native_q1_self_attention": True,
+        "native_q1_rope_cache_self_attention": True,
+        "q1_bmm_cross_attention_retained": True,
+        "native_cross_mlp_tail_retained_disabled": True,
+        "original_decoder_forward_retained": True,
+        "accepted_kernel_implementation_reused": True,
+        "owns_model_weights": False,
+        "reduced_precision_weights": False,
+        "reduced_precision_activations": False,
+        "counter_rng": False,
+        "production_selector_unchanged": True,
+    }
+
+
+def _require_strict_fp32_timing_native_self_environment() -> None:
+    actual = {
+        "NVIDIA_TF32_OVERRIDE": os.environ.get("NVIDIA_TF32_OVERRIDE"),
+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        "cuda_matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+        "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
+    }
+    expected = {
+        "NVIDIA_TF32_OVERRIDE": "0",
+        "float32_matmul_precision": "highest",
+        "cuda_matmul_allow_tf32": False,
+        "cudnn_allow_tf32": False,
+    }
+    failures = {
+        key: {"expected": value, "actual": actual[key]}
+        for key, value in expected.items()
+        if actual[key] != value
+    }
+    if failures:
+        raise RuntimeError(
+            f"strict FP32 timing-native-self environment mismatch: {failures}"
+        )
+
+
 @torch.no_grad()
 def _generate_window(
     model,
@@ -181,6 +239,7 @@ def _generate_window(
     preset: OptimizedPreset,
     allow_batched_decode: bool = False,
     specialized_dispatch_batch_size: int | None = None,
+    strict_fp32_timing_native_self_owner: torch.nn.Module | None = None,
 ):
     expected_dtype = preset.torch_dtype
     if model.dtype != expected_dtype:
@@ -249,6 +308,24 @@ def _generate_window(
         batch_size == 1
         and specialized_dispatch_batch_size in {None, 1}
     )
+    if strict_fp32_timing_native_self_owner is not None:
+        _require_strict_fp32_timing_native_self_environment()
+        if strict_fp32_timing_native_self_owner is not model:
+            raise RuntimeError(
+                "strict FP32 timing-native-self policy is bound to a different model"
+            )
+        if preset.precision != "fp32" or model.dtype != torch.float32:
+            raise TypeError(
+                "strict FP32 timing-native-self policy requires FP32 model storage"
+            )
+        if batch_size != 1:
+            raise ValueError(
+                "strict FP32 timing-native-self policy requires actual batch size 1"
+            )
+        if context_type != ContextType.TIMING:
+            raise RuntimeError(
+                "strict FP32 timing-native-self policy may execute only timing context"
+            )
     batched_policy_disabled_reason = (
         "batch_gt_1"
         if batch_size > 1
@@ -257,8 +334,18 @@ def _generate_window(
         else None
     )
     q1_bmm_cross_attention = specialized_batch
+    strict_fp32_timing_native_self_enabled = (
+        strict_fp32_timing_native_self_owner is not None
+        and specialized_batch
+        and batch_size == 1
+        and context_type == ContextType.TIMING
+    )
     native_q1_self_attention = (
-        specialized_batch and context_type != ContextType.TIMING
+        specialized_batch
+        and (
+            context_type != ContextType.TIMING
+            or strict_fp32_timing_native_self_enabled
+        )
     )
     native_q1_rope_cache_self_attention = native_q1_self_attention
     native_cross_mlp_tail = (
@@ -385,7 +472,11 @@ def _generate_window(
         "optimized_effective_config_version": preset.version,
         "optimized_batched_super_timing": allow_batched_decode,
         "optimized_dispatch_mode": (
-            "accepted_batch1" if specialized_batch else "framework_batch"
+            "strict_fp32_timing_native_self_batch1"
+            if strict_fp32_timing_native_self_enabled
+            else "accepted_batch1"
+            if specialized_batch
+            else "framework_batch"
         ),
         "optimized_dispatch_policy": {
             "q1_bmm_cross_attention": {
@@ -457,6 +548,23 @@ def _generate_window(
         ),
         "optimized_cuda_graphs": context_state.graph_profile_summary(),
     })
+    if strict_fp32_timing_native_self_owner is not None:
+        stats["optimized_dispatch_policy"][
+            "strict_fp32_timing_native_self"
+        ] = {
+            "requested": True,
+            "enabled": strict_fp32_timing_native_self_enabled,
+            "disabled_reason": (
+                None
+                if strict_fp32_timing_native_self_enabled
+                else batched_policy_disabled_reason
+            ),
+            "result_class": "exact-incremental-candidate",
+            "exactness_claim": True,
+        }
+        stats["optimized_strict_fp32_timing_native_self"] = (
+            _strict_fp32_timing_native_self_metadata()
+        )
     if strict_exactness is not None:
         stats["strict_exactness"] = strict_exactness
     return result, stats
@@ -465,6 +573,12 @@ def _generate_window(
 @dataclass(frozen=True, slots=True)
 class OptimizedSingleRuntime:
     preset: OptimizedPreset
+    _strict_fp32_timing_native_self_owner: torch.nn.Module | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self):
         if not isinstance(self.preset, OptimizedPreset):
@@ -479,6 +593,38 @@ class OptimizedSingleRuntime:
 
     def new_context_state(self) -> ProductionDecodeSession:
         return ProductionDecodeSession()
+
+    def initialize_strict_fp32_timing_native_self(
+        self,
+        model: torch.nn.Module,
+    ) -> dict[str, Any]:
+        """Opt one standalone FP32 timing model into accepted self kernels."""
+
+        if self.preset.precision != "fp32":
+            raise TypeError(
+                "strict FP32 timing-native-self policy requires the FP32 preset"
+            )
+        if not isinstance(model, torch.nn.Module):
+            raise TypeError(
+                "strict FP32 timing-native-self policy requires a torch module"
+            )
+        if model.dtype != torch.float32:
+            raise TypeError(
+                "strict FP32 timing-native-self policy requires FP32 model storage"
+            )
+        _require_strict_fp32_timing_native_self_environment()
+        existing = self._strict_fp32_timing_native_self_owner
+        if existing is not None and existing is not model:
+            raise RuntimeError(
+                "strict FP32 timing-native-self policy is already bound to a "
+                "different model"
+            )
+        object.__setattr__(
+            self,
+            "_strict_fp32_timing_native_self_owner",
+            model,
+        )
+        return _strict_fp32_timing_native_self_metadata()
 
     def for_super_timing(
         self,
@@ -521,10 +667,13 @@ class OptimizedSingleRuntime:
             dict(generate_kwargs),
             context_state=context_state,
             preset=self.preset,
+            strict_fp32_timing_native_self_owner=(
+                self._strict_fp32_timing_native_self_owner
+            ),
         )
 
     def profile_metadata(self) -> dict[str, Any]:
-        return {
+        metadata = {
             "optimized_effective_config_version": self.preset.version,
             "optimized_effective_config": _optimized_config_metadata(self.preset),
             "optimized_runtime_owner": (
@@ -532,6 +681,11 @@ class OptimizedSingleRuntime:
             ),
             "optimized_result_class": self.preset.result_class,
         }
+        if self._strict_fp32_timing_native_self_owner is not None:
+            metadata["optimized_strict_fp32_timing_native_self"] = (
+                _strict_fp32_timing_native_self_metadata()
+            )
+        return metadata
 
 
 @dataclass(frozen=True, slots=True)
