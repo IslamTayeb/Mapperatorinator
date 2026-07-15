@@ -30,6 +30,7 @@ WORK=${MAPPERATORINATOR_WORK:-/work/imt11/Mapperatorinator}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 EXPECTED_GPU=${MAPPERATORINATOR_EXPECTED_GPU:-2080 Ti}
 PRECISION=${MAPPERATORINATOR_PRECISION:?Set MAPPERATORINATOR_PRECISION to fp32 or fp16}
+ALLOW_PARALLEL_RECIPROCAL=${MAPPERATORINATOR_ALLOW_PARALLEL_RECIPROCAL:-0}
 RUN_LABEL=${RUN_LABEL:-shared-rope-full-song-$PRECISION}
 RUN_ROOT="$WORK/runs/${RUN_LABEL}-${SLURM_JOB_ID}"
 
@@ -38,6 +39,8 @@ export NVIDIA_TF32_OVERRIDE=0
 [[ -x "$PYTHON" ]] || die "missing Python: $PYTHON"
 [[ "$PRECISION" == fp32 || "$PRECISION" == fp16 ]] \
   || die "MAPPERATORINATOR_PRECISION must be fp32 or fp16"
+[[ "$ALLOW_PARALLEL_RECIPROCAL" == 0 || "$ALLOW_PARALLEL_RECIPROCAL" == 1 ]] \
+  || die "MAPPERATORINATOR_ALLOW_PARALLEL_RECIPROCAL must be 0 or 1"
 [[ -f "$AUDIO" ]] || die "missing audio: $AUDIO"
 [[ ! -e "$RUN_ROOT" ]] || die "refusing to overwrite $RUN_ROOT"
 [[ -d "$REPO/.git" || -f "$REPO/.git" ]] || die "missing worktree: $REPO"
@@ -79,10 +82,14 @@ mapfile -t OTHER_GPU_JOBS < <(
     | awk -F'|' -v current="$SLURM_JOB_ID" \
         '$1 != current && tolower($2) ~ /gpu/ { print }'
 )
-[[ ${#OTHER_GPU_JOBS[@]} -eq 0 ]] || {
+[[ ${#OTHER_GPU_JOBS[@]} -eq 0 || "$ALLOW_PARALLEL_RECIPROCAL" == 1 ]] || {
   printf '%s\n' "${OTHER_GPU_JOBS[@]}" >&2
   die "another user GPU job exists"
 }
+if [[ ${#OTHER_GPU_JOBS[@]} -ne 0 ]]; then
+  printf '%s\n' "${OTHER_GPU_JOBS[@]}" >&2
+  echo "parallel_reciprocal_opt_in=1" >&2
+fi
 
 {
   echo "host=$(hostname)"
@@ -95,6 +102,7 @@ mapfile -t OTHER_GPU_JOBS < <(
   echo "audio_sha256=$(sha256sum "$AUDIO" | awk '{print $1}')"
   echo "run_root=$RUN_ROOT"
   echo "precision=$PRECISION"
+  echo "parallel_reciprocal_opt_in=$ALLOW_PARALLEL_RECIPROCAL"
   echo "NVIDIA_TF32_OVERRIDE=$NVIDIA_TF32_OVERRIDE"
   "$PYTHON" -c 'import torch, transformers; print(f"torch={torch.__version__}"); print(f"torch_cuda={torch.version.cuda}"); print(f"transformers={transformers.__version__}")'
   nvidia-smi --query-gpu=name,uuid,driver_version,memory.total,compute_cap --format=csv,noheader

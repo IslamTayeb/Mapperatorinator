@@ -16,11 +16,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 WRAPPER = REPO_ROOT / "scripts" / "dcc" / "profile_shared_rope_full_song.sbatch"
 
 
-def test_full_song_wrapper_is_valid_and_serial() -> None:
+def test_full_song_wrapper_is_serial_by_default_with_explicit_parallel_opt_in() -> None:
     subprocess.run(["bash", "-n", str(WRAPPER)], check=True)
     source = WRAPPER.read_text()
     assert "#SBATCH --gres=gpu:2080:1" in source
     assert 'MAPPERATORINATOR_PRECISION:?Set MAPPERATORINATOR_PRECISION' in source
+    assert "MAPPERATORINATOR_ALLOW_PARALLEL_RECIPROCAL:-0" in source
+    assert "parallel_reciprocal_opt_in=$ALLOW_PARALLEL_RECIPROCAL" in source
     assert 'for precision in "$PRECISION"' in source
     assert "for index in 01 02 03" in source
     assert "exactness_audit" in source
