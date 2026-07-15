@@ -384,6 +384,8 @@ def test_dcc_wrapper_is_fp16_sentinel_only_and_fail_loud() -> None:
         "MAPPERATORINATOR_BRANCH:?",
         'rev-parse "$REMOTE/$BRANCH"',
         "MAPPERATORINATOR_REMOTE:-origin",
+        "MAPPERATORINATOR_ALLOW_PARALLEL_COMPONENT:-0",
+        "non_authoritative_parallel_component",
         "another GPU job is running or pending",
         "NVIDIA GeForce RTX 2080 Ti",
         "precision=fp16",
