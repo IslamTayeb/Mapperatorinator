@@ -1,3 +1,5 @@
+import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -5,6 +7,7 @@ import pytest
 from utils.analyze_fp16_fresh_baseline import (
     EXPECTED_PRESET_VERSION,
     FP16BaselineError,
+    analyze,
     _runtime_contract,
     _text,
 )
@@ -120,3 +123,49 @@ def test_wrapper_runs_five_controls_and_two_non_authoritative_audits():
     assert "accepted-fp16" not in script
     assert ".md" not in script
     assert ".html" not in script
+
+
+def test_full_analyzer_reuses_current_profiler_contract_without_fp32_mutation(
+    tmp_path,
+):
+    fixture_path = (
+        Path(__file__).resolve().parent / "test_analyze_fp32_fresh_baseline.py"
+    )
+    spec = importlib.util.spec_from_file_location("fp32_fixture", fixture_path)
+    assert spec is not None and spec.loader is not None
+    fixture = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixture)
+    root = tmp_path / "fp16-root"
+    for name in ("run-01", "run-02", "run-03", "run-04", "run-05"):
+        fixture._run(root, name)
+    fixture._run(root, "exactness-audit-01", exactness=True)
+    fixture._run(root, "exactness-audit-02", exactness=True)
+
+    required_config = {
+        "version": EXPECTED_PRESET_VERSION,
+        "precision": "fp16",
+        "attn_implementation": "sdpa",
+        "decoder_loop_backend": "active_prefix_cuda_graph",
+        "batch_size": 1,
+        "q1_bmm_cross_attention": True,
+        "native_q1_self_attention": True,
+        "native_q1_rope_cache_self_attention": True,
+        "native_cross_mlp_tail": True,
+    }
+    for path in root.glob("*/output/*.profile.json"):
+        profile = json.loads(path.read_text(encoding="utf-8"))
+        metadata = profile["metadata"]
+        metadata["precision"] = "fp16"
+        metadata["git_branch"] = BRANCH
+        metadata["optimized_effective_config"] = required_config
+        for record in profile["generation"]:
+            record["precision"] = "fp16"
+        path.write_text(json.dumps(profile), encoding="utf-8")
+
+    result = analyze(root, expected_commit=COMMIT, expected_branch=BRANCH)
+
+    assert result["status"] == "PASS"
+    assert result["run_count"] == 5
+    assert result["fixed_work"] == {"timing_tokens": 2, "main_tokens": 3}
+    assert result["checks"]["audit_rng_cache_repeat"]
+    assert len(result["exactness_audits"]) == 2
