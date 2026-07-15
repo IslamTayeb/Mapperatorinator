@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -126,3 +129,28 @@ def test_wrapper_runs_candidate_and_two_audits_without_docs():
     assert "--expected-device-conditional-temperature" in script
     assert ".md" not in script
     assert ".html" not in script
+
+
+@pytest.mark.parametrize(
+    "script_name",
+    (
+        "analyze_fp16_fresh_baseline.py",
+        "analyze_fp16_reciprocal_candidate.py",
+    ),
+)
+def test_analyzers_support_direct_script_launch_without_repo_pythonpath(script_name):
+    root = Path(__file__).resolve().parents[1]
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+
+    completed = subprocess.run(
+        [sys.executable, str(root / "utils" / script_name), "--help"],
+        cwd=root,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "usage:" in completed.stdout

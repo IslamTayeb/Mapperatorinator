@@ -10,8 +10,12 @@ import statistics
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from utils import analyze_fp32_fresh_baseline as common
-from utils import nsight_agent_profile as nsight
+try:
+    from . import analyze_fp32_fresh_baseline as common
+    from . import nsight_agent_profile as nsight
+except ImportError:  # Direct ``python utils/...py`` execution.
+    import analyze_fp32_fresh_baseline as common
+    import nsight_agent_profile as nsight
 
 
 SCHEMA_VERSION = "mapperatorinator.fp16-fresh-baseline.v1"

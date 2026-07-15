@@ -10,10 +10,16 @@ import statistics
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from utils.analyze_fp16_fresh_baseline import (
-    EXPECTED_PRESET_VERSION,
-    SCHEMA_VERSION as FP16_RUN_SCHEMA_VERSION,
-)
+try:
+    from .analyze_fp16_fresh_baseline import (
+        EXPECTED_PRESET_VERSION,
+        SCHEMA_VERSION as FP16_RUN_SCHEMA_VERSION,
+    )
+except ImportError:  # Direct ``python utils/...py`` execution.
+    from analyze_fp16_fresh_baseline import (  # type: ignore[no-redef]
+        EXPECTED_PRESET_VERSION,
+        SCHEMA_VERSION as FP16_RUN_SCHEMA_VERSION,
+    )
 
 
 SCHEMA_VERSION = "mapperatorinator.fp16-reciprocal-candidate.v1"
