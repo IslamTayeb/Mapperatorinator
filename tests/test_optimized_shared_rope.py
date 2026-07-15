@@ -210,6 +210,22 @@ def test_shared_rope_rejects_unsupported_state_before_execution() -> None:
                 torch.tensor([[3]]),
             )
 
+    with pytest.raises(TypeError, match="position_ids must use torch.long"):
+        with shared_decoder_rope_forward_context(plan):
+            shared_decoder_rope(
+                model.layers[0].self_attn.rotary_emb,
+                torch.ones(1, 1, 4),
+                torch.tensor([[3]], dtype=torch.int32),
+            )
+
+    with pytest.raises(ValueError, match="tensors must use one device"):
+        with shared_decoder_rope_forward_context(plan):
+            shared_decoder_rope(
+                model.layers[0].self_attn.rotary_emb,
+                torch.ones(1, 1, 4, device="meta"),
+                torch.tensor([[3]], device="meta"),
+            )
+
 
 def test_context_allows_the_existing_nonfused_self_attention_fallback() -> None:
     model = _Model()
@@ -231,3 +247,28 @@ def test_context_allows_the_existing_nonfused_self_attention_fallback() -> None:
         model.layers[1].self_attn.rotary_emb.forward.__func__
         is original_fallback.__func__
     )
+
+
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float16))
+def test_shared_rope_runtime_hook_restores_cleanly(monkeypatch, dtype) -> None:
+    from osuT5.osuT5.inference import runtime_dispatch
+    from osuT5.osuT5.inference.optimized.kernels import q1_attention
+    from osuT5.osuT5.inference.optimized.single.runtime_context import (
+        attention_runtime_context,
+    )
+
+    monkeypatch.setattr(q1_attention, "preload_native_q1_attention", lambda: None)
+    original = runtime_dispatch.attention_runtime_hooks()
+    with attention_runtime_context(
+        q1_bmm_cross_attention=True,
+        native_q1_self_attention=True,
+        native_q1_rope_cache_self_attention=True,
+        share_decoder_rope=True,
+        expected_dtype=dtype,
+    ):
+        hook = runtime_dispatch.attention_runtime_hooks().q1_rope_cache_self_attention_forward
+        assert hook is not None
+        assert hook.keywords["share_decoder_rope"] is True
+        assert hook.keywords["expected_dtype"] == dtype
+
+    assert runtime_dispatch.attention_runtime_hooks() == original

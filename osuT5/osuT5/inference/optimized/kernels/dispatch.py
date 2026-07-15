@@ -229,14 +229,16 @@ def q1_rope_cache_self_attention_forward(
     if share_decoder_rope:
         from ..single.shared_rope import shared_decoder_rope
 
-        rope_forward = lambda: shared_decoder_rope(
-            module.rotary_emb,
-            qkv,
-            position_ids,
-            dispatch_counts=dispatch_counts,
-        )
+        def rope_forward():
+            return shared_decoder_rope(
+                module.rotary_emb,
+                qkv,
+                position_ids,
+                dispatch_counts=dispatch_counts,
+            )
     else:
-        rope_forward = lambda: module.rotary_emb(qkv, position_ids=position_ids)
+        def rope_forward():
+            return module.rotary_emb(qkv, position_ids=position_ids)
     if profile_ranges:
         with profile_range(f"{range_prefix}.rope"):
             cos, sin = rope_forward()

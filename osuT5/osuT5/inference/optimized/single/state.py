@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from transformers.modeling_outputs import BaseModelOutput
 
 from ...cache_utils import MapperatorinatorCache, get_cache
+
+if TYPE_CHECKING:
+    from .shared_rope import SharedDecoderRopePlan
 
 
 @dataclass
@@ -26,7 +29,9 @@ class ProductionDecodeSession:
         tuple[Any, ...],
         dict[str, BaseModelOutput],
     ] = field(default_factory=dict)
-    shared_rope_plans: dict[tuple[Any, ...], Any] = field(default_factory=dict)
+    shared_rope_plans: dict[tuple[Any, ...], SharedDecoderRopePlan] = field(
+        default_factory=dict
+    )
     active_state_signature: tuple[Any, ...] | None = None
 
     @staticmethod
@@ -98,7 +103,7 @@ class ProductionDecodeSession:
             ],
         }
 
-    def shared_rope_plan_for_window(self, model):
+    def shared_rope_plan_for_window(self, model) -> SharedDecoderRopePlan:
         if self.active_state_signature is None:
             raise RuntimeError(
                 "decode cache must be selected before requesting shared RoPE state"
