@@ -46,6 +46,7 @@ def test_wrapper_has_independent_smoke_and_full_scopes_and_non_docs_artifacts():
     source = WRAPPER.read_text(encoding="utf-8")
 
     assert "EXACT_K4_SCOPE=${EXACT_K4_SCOPE:-smoke}" in source
+    assert "FULL_SAVING_SECONDS=${FULL_SAVING_SECONDS:-5.0}" in source
     assert "PROFILE_CONFIG=profile_salvalai_smoke15" in source
     assert "PROFILE_CONFIG=profile_salvalai" in source
     assert "strict-exact-k4-${EXACT_K4_SCOPE}-${SLURM_JOB_ID}" in source

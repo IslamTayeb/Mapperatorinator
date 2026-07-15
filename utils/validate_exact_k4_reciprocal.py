@@ -529,7 +529,7 @@ def main() -> None:
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--expected-branch", required=True)
     parser.add_argument("--minimum-speedup-pct", type=float, default=0.0)
-    parser.add_argument("--full-saving-seconds", type=float, default=1.412)
+    parser.add_argument("--full-saving-seconds", type=float, default=5.0)
     parser.add_argument("--json-output", type=Path, required=True)
     parser.add_argument("--text-output", type=Path, required=True)
     args = parser.parse_args()
