@@ -63,6 +63,10 @@ def get_profile_runtime_metadata() -> dict:
         "transformers_cache": os.environ.get("TRANSFORMERS_CACHE"),
         "xdg_cache_home": os.environ.get("XDG_CACHE_HOME"),
         "tmpdir": os.environ.get("TMPDIR"),
+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        "cuda_matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+        "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
+        "nvidia_tf32_override": os.environ.get("NVIDIA_TF32_OVERRIDE"),
     }
     if torch.cuda.is_available():
         metadata["cuda_device_name"] = torch.cuda.get_device_name()
@@ -121,11 +125,16 @@ def assert_package_versions():
     assert_package_version("transformers", "4.57.3")
 
 
-def setup_inference_environment(seed: int):
+def setup_inference_environment(seed: int, *, strict_fp32: bool = False):
     assert_package_versions()
     multiprocessing.set_start_method('spawn', force=True)
     torch.set_grad_enabled(False)
-    torch.set_float32_matmul_precision('high')
+    if strict_fp32:
+        torch.set_float32_matmul_precision("highest")
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    else:
+        torch.set_float32_matmul_precision("high")
     set_seed(seed)
 
 
@@ -893,7 +902,12 @@ def main(args: InferenceConfig):
     with profiler.stage("compile_args"):
         compile_args(args)
     with profiler.stage("setup_inference_environment"):
-        setup_inference_environment(args.seed)
+        setup_inference_environment(
+            args.seed,
+            strict_fp32=(
+                args.inference_engine == "optimized" and args.precision == "fp32"
+            ),
+        )
 
     with profiler.stage("load_main_model"):
         model, tokenizer = load_model_with_engine(args.model_path, args.train, args.device,
