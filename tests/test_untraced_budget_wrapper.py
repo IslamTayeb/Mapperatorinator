@@ -22,9 +22,11 @@ def test_wrapper_is_serial_strict_fp32_and_pins_pushed_worktree() -> None:
     assert "max_batch_size=1" not in source
     assert "run_profile untraced_control" in source
     assert "run_profile untraced_budget" in source
-    assert source.index("run_profile untraced_control") < source.index(
-        "run_profile untraced_budget"
-    )
+    assert "MAPPERATORINATOR_BUDGET_ORDER" in source
+    assert "control_first|budget_first" in source
+    assert 'if [[ "$BUDGET_ORDER" == control_first ]]' in source
+    assert source.count("run_profile untraced_control") == 2
+    assert source.count("run_profile untraced_budget") == 2
     assert 'git -C "$REPO" status --porcelain' in source
     assert 'git -C "$REPO" branch --show-current' in source
     assert 'git -C "$REPO" show-ref --verify --quiet "$REMOTE_REF"' in source

@@ -27,6 +27,7 @@ AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 EXPECTED_GPU=${MAPPERATORINATOR_EXPECTED_GPU:-2080 Ti}
 EXPECTED_MAIN_TOKENS=${MAPPERATORINATOR_EXPECTED_MAIN_TOKENS:-8294}
 EXPECTED_TIMING_TOKENS=${MAPPERATORINATOR_EXPECTED_TIMING_TOKENS:-821}
+BUDGET_ORDER=${MAPPERATORINATOR_BUDGET_ORDER:-control_first}
 RUN_LABEL=${RUN_LABEL:-strict-fp32-untraced-budget}
 RUN_ROOT="$WORK/runs/${RUN_LABEL}-${SLURM_JOB_ID}"
 MIN_AVAILABLE_KIB=$((20 * 1024 * 1024))
@@ -37,6 +38,10 @@ export NVIDIA_TF32_OVERRIDE=0
 [[ -x "$PYTHON" ]] || die "missing Python: $PYTHON"
 [[ -d "$REPO/.git" || -f "$REPO/.git" ]] || die "missing worktree: $REPO"
 [[ -f "$AUDIO" ]] || die "missing audio: $AUDIO"
+case "$BUDGET_ORDER" in
+  control_first|budget_first) ;;
+  *) die "MAPPERATORINATOR_BUDGET_ORDER must be control_first or budget_first" ;;
+esac
 [[ ! -e "$RUN_ROOT" ]] || die "refusing to overwrite $RUN_ROOT"
 [[ -z "$(git -C "$REPO" status --porcelain)" ]] || die "worktree is dirty"
 [[ "$(git -C "$REPO" rev-parse HEAD)" == "$COMMIT" ]] || die "HEAD does not match commit"
@@ -101,6 +106,7 @@ trap finalize EXIT
   echo "audio=$AUDIO"
   echo "audio_sha256=$(sha256sum "$AUDIO" | awk '{print $1}')"
   echo "run_root=$RUN_ROOT"
+  echo "budget_order=$BUDGET_ORDER"
   echo "run_root_available_kib=$AVAILABLE_KIB"
   echo "NVIDIA_TF32_OVERRIDE=$NVIDIA_TF32_OVERRIDE"
   git -C "$REPO" status --short --branch
@@ -157,8 +163,13 @@ run_profile() {
   printf '%s\n' "$result" > "$run_dir/result-path.txt"
 }
 
-run_profile untraced_control
-run_profile untraced_budget
+if [[ "$BUDGET_ORDER" == control_first ]]; then
+  run_profile untraced_control
+  run_profile untraced_budget
+else
+  run_profile untraced_budget
+  run_profile untraced_control
+fi
 
 CONTROL_PROFILE=$(<"$RUN_ROOT/untraced_control/profile-path.txt")
 BUDGET_PROFILE=$(<"$RUN_ROOT/untraced_budget/profile-path.txt")
