@@ -65,6 +65,8 @@ def _analysis(*, candidate: bool, run_count: int, model_seconds: float) -> dict:
             CANDIDATE_PRESET_VERSION if candidate else EXPECTED_PRESET_VERSION
         ),
         "device_conditional_temperature": candidate,
+        "device_conditional_temperature_applicable": candidate,
+        "device_conditional_temperature_specialized_calls": 5 if candidate else 0,
         "fixed_work": {"timing_tokens": 3, "main_tokens": 3},
         "checks": {"all": True},
         "runs": [dict(run) for _ in range(run_count)],
@@ -115,6 +117,26 @@ def test_gate_fails_on_same_precision_token_drift(tmp_path):
 
     with pytest.raises(FP16ReciprocalError, match="parity failed"):
         analyze(baseline, candidate, mode="initial")
+
+
+def test_gate_reports_no_applicable_work_without_promoting_timing_noise(tmp_path):
+    baseline = _write(
+        tmp_path / "baseline.json",
+        _analysis(candidate=False, run_count=5, model_seconds=10.0),
+    )
+    candidate_payload = _analysis(
+        candidate=True, run_count=1, model_seconds=9.0
+    )
+    candidate_payload["device_conditional_temperature_applicable"] = False
+    candidate_payload["device_conditional_temperature_specialized_calls"] = 0
+    candidate = _write(tmp_path / "candidate.json", candidate_payload)
+
+    result = analyze(baseline, candidate, mode="initial")
+
+    assert result["status"] == "STOP_NO_APPLICABLE_WORK"
+    assert result["exact_same_precision_parity"] is True
+    assert result["positive_timing_signal"] is True
+    assert result["promotion_eligible"] is False
 
 
 def test_wrapper_runs_candidate_and_two_audits_without_docs():

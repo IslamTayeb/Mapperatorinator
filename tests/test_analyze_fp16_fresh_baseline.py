@@ -96,6 +96,8 @@ def test_text_reports_fixed_work_tps_and_complete_song_wall():
     aggregate = {"median": 1.0, "minimum": 1.0, "maximum": 1.0, "range": 0.0}
     result = {
         "preset_version": EXPECTED_PRESET_VERSION,
+        "device_conditional_temperature_applicable": False,
+        "device_conditional_temperature_specialized_calls": 0,
         "fixed_work": {"timing_tokens": 821, "main_tokens": 7809},
         "aggregates": {
             "timing_synchronized_model_seconds": aggregate,
@@ -202,7 +204,7 @@ def test_candidate_runtime_requires_fp16_device_hits():
     profile["generation"][1][
         "optimized_device_conditional_temperature_specialized_calls"
     ] = 0
-    with pytest.raises(FP16BaselineError, match="hit counters"):
+    with pytest.raises(FP16BaselineError, match="never dispatched"):
         _runtime_contract(
             profile,
             expected_commit=COMMIT,
@@ -211,6 +213,39 @@ def test_candidate_runtime_requires_fp16_device_hits():
             expected_device_conditional_temperature=True,
             audit=False,
         )
+
+
+def test_candidate_runtime_accepts_requested_but_inapplicable_workload():
+    profile = _profile()
+    profile["metadata"]["optimized_effective_config"][
+        "device_conditional_temperature"
+    ] = True
+    for row in profile["generation"]:
+        row.update(
+            {
+                "optimized_device_conditional_temperature_requested": True,
+                "optimized_device_conditional_temperature_condition_count": 0,
+                "optimized_device_conditional_temperature_specialized_calls": 0,
+                "optimized_device_conditional_temperature_v32_fallback_calls": 0,
+            }
+        )
+
+    stats = _runtime_contract(
+        profile,
+        expected_commit=COMMIT,
+        expected_branch=BRANCH,
+        expected_preset_version=EXPECTED_PRESET_VERSION,
+        expected_device_conditional_temperature=True,
+        audit=False,
+    )
+
+    assert stats == {
+        "requested": True,
+        "applicable": False,
+        "condition_count": 0,
+        "specialized_calls": 0,
+        "v32_fallback_calls": 0,
+    }
 
 
 def test_full_candidate_analyzer_accepts_one_fresh_run_with_two_audits(tmp_path):

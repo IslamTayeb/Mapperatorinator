@@ -65,7 +65,7 @@ def _runtime_contract(
     expected_preset_version: str = EXPECTED_PRESET_VERSION,
     expected_device_conditional_temperature: bool = False,
     audit: bool,
-) -> None:
+) -> dict[str, Any]:
     metadata = profile.get("metadata")
     if not isinstance(metadata, dict):
         raise FP16BaselineError("profile metadata is missing")
@@ -122,39 +122,65 @@ def _runtime_contract(
     }
     if precisions != {"fp16"}:
         raise FP16BaselineError(f"generation precision changed: {precisions}")
-    if expected_device_conditional_temperature:
-        records = [
-            row
-            for row in profile.get("generation", [])
-            if isinstance(row, dict) and row.get("profile_label") in LABELS
-        ]
-        if not records:
-            raise FP16BaselineError("device conditional-temperature records are missing")
-        condition_count = sum(
-            int(row.get("optimized_device_conditional_temperature_condition_count", 0))
-            for row in records
+    records = [
+        row
+        for row in profile.get("generation", [])
+        if isinstance(row, dict) and row.get("profile_label") in LABELS
+    ]
+    if not records:
+        raise FP16BaselineError("device conditional-temperature records are missing")
+    if expected_device_conditional_temperature and not all(
+        row.get("optimized_device_conditional_temperature_requested") is True
+        for row in records
+    ):
+        raise FP16BaselineError(
+            "device conditional-temperature specialization was not requested"
         )
-        specialized_calls = sum(
-            int(row.get("optimized_device_conditional_temperature_specialized_calls", 0))
-            for row in records
-        )
-        fallback_calls = sum(
-            int(row.get("optimized_device_conditional_temperature_v32_fallback_calls", 0))
-            for row in records
-        )
-        if not all(
-            row.get("optimized_device_conditional_temperature_requested") is True
-            for row in records
+    counters: dict[str, int] = {}
+    for result_key, record_key in (
+        (
+            "condition_count",
+            "optimized_device_conditional_temperature_condition_count",
+        ),
+        (
+            "specialized_calls",
+            "optimized_device_conditional_temperature_specialized_calls",
+        ),
+        (
+            "v32_fallback_calls",
+            "optimized_device_conditional_temperature_v32_fallback_calls",
+        ),
+    ):
+        values = [row.get(record_key, 0) for row in records]
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in values
         ):
             raise FP16BaselineError(
-                "device conditional-temperature specialization was not requested"
+                f"device conditional-temperature {result_key} must be "
+                "non-negative integers"
             )
-        if condition_count <= 0 or specialized_calls <= 0 or fallback_calls != 0:
+        counters[result_key] = sum(values)
+    applicable = counters["condition_count"] > 0
+    if expected_device_conditional_temperature:
+        if counters["v32_fallback_calls"] != 0:
             raise FP16BaselineError(
-                "device conditional-temperature hit counters are invalid: "
-                f"conditions={condition_count}, specialized={specialized_calls}, "
-                f"fallback={fallback_calls}"
+                "device conditional-temperature unexpectedly used V32 fallback"
             )
+        if applicable and counters["specialized_calls"] <= 0:
+            raise FP16BaselineError(
+                "device conditional-temperature had applicable conditions but "
+                "never dispatched"
+            )
+        if not applicable and counters["specialized_calls"] != 0:
+            raise FP16BaselineError(
+                "device conditional-temperature dispatched without conditions"
+            )
+    return {
+        "requested": expected_device_conditional_temperature,
+        "applicable": applicable,
+        **counters,
+    }
 
 
 def _profile_and_result(run_dir: Path) -> tuple[dict[str, Any], Path]:
@@ -232,11 +258,12 @@ def analyze(
     structures: list[dict[str, Any]] = []
     output_hashes: list[str] = []
     token_counts: dict[str, list[int]] = {label: [] for label in LABELS}
+    dispatch_stats: list[dict[str, Any]] = []
 
     for run_name in run_names:
         run_dir = run_root / run_name
         profile, result = _profile_and_result(run_dir)
-        _runtime_contract(
+        run_dispatch_stats = _runtime_contract(
             profile,
             expected_commit=expected_commit,
             expected_branch=expected_branch,
@@ -246,6 +273,7 @@ def analyze(
             ),
             audit=False,
         )
+        dispatch_stats.append(run_dispatch_stats)
         profile_hash = profile["metadata"].get("result_file_sha256")
         output_hash = _file_hash(result)
         if profile_hash != output_hash:
@@ -284,6 +312,7 @@ def analyze(
                 "request_to_final_osu_wall_seconds": _request_wall(profile),
                 "generation": label_metrics,
                 "peak_cuda_memory_mb": peak_memory,
+                "device_conditional_temperature": run_dispatch_stats,
                 "output_sha256": output_hash,
                 "output_structure": structure,
                 "dispatch_and_graph_contract_sha256": _hash(record),
@@ -308,7 +337,7 @@ def analyze(
     for audit_index in (1, 2):
         audit_dir = run_root / f"exactness-audit-{audit_index:02d}"
         audit_profile, audit_result = _profile_and_result(audit_dir)
-        _runtime_contract(
+        audit_dispatch_stats = _runtime_contract(
             audit_profile,
             expected_commit=expected_commit,
             expected_branch=expected_branch,
@@ -335,6 +364,7 @@ def analyze(
                 },
                 "strict_exactness": exactness,
                 "record_contract": record,
+                "device_conditional_temperature": audit_dispatch_stats,
             }
         )
 
@@ -365,6 +395,21 @@ def analyze(
         ),
         "audit_rng_cache_repeat": (
             audits[0]["strict_exactness"] == audits[1]["strict_exactness"]
+        ),
+        "device_conditional_temperature_dispatch": all(
+            stats["v32_fallback_calls"] == 0
+            and (
+                not stats["applicable"] or stats["specialized_calls"] > 0
+            )
+            for stats in dispatch_stats
+        ),
+        "audit_device_conditional_temperature_dispatch": all(
+            audit["device_conditional_temperature"]["v32_fallback_calls"] == 0
+            and (
+                not audit["device_conditional_temperature"]["applicable"]
+                or audit["device_conditional_temperature"]["specialized_calls"] > 0
+            )
+            for audit in audits
         ),
     }
     for label in LABELS:
@@ -432,6 +477,12 @@ def analyze(
         "authoritative_performance": True,
         "preset_version": expected_preset_version,
         "device_conditional_temperature": expected_device_conditional_temperature,
+        "device_conditional_temperature_applicable": any(
+            stats["applicable"] for stats in dispatch_stats
+        ),
+        "device_conditional_temperature_specialized_calls": sum(
+            stats["specialized_calls"] for stats in dispatch_stats
+        ),
         "fixed_work": {
             "timing_tokens": token_counts["timing_context"][0],
             "main_tokens": token_counts["main_generation"][0],
@@ -446,6 +497,9 @@ def analyze(
                 "process_wall_seconds": _process_wall(audit["run_dir"]),
                 "output_sha256": audit["output_sha256"],
                 "strict_exactness": audit["strict_exactness"],
+                "device_conditional_temperature": audit[
+                    "device_conditional_temperature"
+                ],
             }
             for audit in audits
         ],
@@ -459,6 +513,10 @@ def _text(result: Mapping[str, Any]) -> str:
             "status=PASS",
             "precision=fp16",
             f"preset={result['preset_version']}",
+            "device_conditional_temperature_applicable="
+            f"{str(result['device_conditional_temperature_applicable']).lower()}",
+            "device_conditional_temperature_specialized_calls="
+            f"{result['device_conditional_temperature_specialized_calls']}",
             f"fixed_work_timing_tokens={result['fixed_work']['timing_tokens']}",
             f"fixed_work_main_tokens={result['fixed_work']['main_tokens']}",
             f"timing_model_seconds_median={aggregates['timing_synchronized_model_seconds']['median']:.6f}",

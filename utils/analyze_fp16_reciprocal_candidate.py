@@ -207,6 +207,24 @@ def analyze(
         raise FP16ReciprocalError("candidate FP16 preset changed")
     if candidate.get("device_conditional_temperature") is not True:
         raise FP16ReciprocalError("candidate device specialization was not verified")
+    candidate_applicable = candidate.get(
+        "device_conditional_temperature_applicable"
+    )
+    candidate_specialized_calls = candidate.get(
+        "device_conditional_temperature_specialized_calls"
+    )
+    if not isinstance(candidate_applicable, bool):
+        raise FP16ReciprocalError("candidate applicability evidence is missing")
+    if (
+        isinstance(candidate_specialized_calls, bool)
+        or not isinstance(candidate_specialized_calls, int)
+        or candidate_specialized_calls < 0
+    ):
+        raise FP16ReciprocalError("candidate specialized-call evidence is invalid")
+    if candidate_applicable != (candidate_specialized_calls > 0):
+        raise FP16ReciprocalError(
+            "candidate applicability and specialized calls disagree"
+        )
 
     baseline_runs = baseline["runs"]
     candidate_runs = candidate["runs"]
@@ -249,20 +267,26 @@ def analyze(
         key: _delta(baseline_metrics[key], candidate_metrics[key])
         for key in baseline_metrics
     }
-    promotion_eligible = (
+    positive_timing_signal = (
         deltas["combined_synchronized_model_seconds"]["saved_seconds"] > 0
         or deltas["request_to_final_osu_wall_seconds"]["saved_seconds"] > 0
     )
+    promotion_eligible = candidate_applicable and positive_timing_signal
+    if not candidate_applicable:
+        status = "STOP_NO_APPLICABLE_WORK"
+    elif promotion_eligible:
+        status = "PASS_INITIAL" if mode == "initial" else "PASS_CONFIRMED"
+    else:
+        status = "STOP_NO_GAIN"
     result: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
-        "status": (
-            ("PASS_INITIAL" if mode == "initial" else "PASS_CONFIRMED")
-            if promotion_eligible
-            else "STOP_NO_GAIN"
-        ),
+        "status": status,
         "mode": mode,
         "promotion_eligible": promotion_eligible,
         "exact_same_precision_parity": True,
+        "candidate_device_specialization_applicable": candidate_applicable,
+        "candidate_device_specialized_calls": candidate_specialized_calls,
+        "positive_timing_signal": positive_timing_signal,
         "baseline_analysis": str(baseline_path.resolve()),
         "candidate_analysis": str(candidate_path.resolve()),
         "candidate_runtime_identity": candidate.get("runtime_identity"),
@@ -280,6 +304,10 @@ def _text(value: Mapping[str, Any]) -> str:
         f"promotion_eligible={str(value['promotion_eligible']).lower()}",
         "precision=fp16",
         "exact_same_precision_parity=true",
+        "candidate_device_specialization_applicable="
+        f"{str(value['candidate_device_specialization_applicable']).lower()}",
+        "candidate_device_specialized_calls="
+        f"{value['candidate_device_specialized_calls']}",
     ]
     for key, delta in value["deltas"].items():
         lines.extend(
