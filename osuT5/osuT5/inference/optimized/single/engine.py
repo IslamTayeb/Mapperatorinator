@@ -18,9 +18,12 @@ from ...generation_utils import (
     eos_token_ids,
     sync_cuda_for_model,
 )
-from .decode_loop import active_prefix_decode_generate
+from .decode_loop import (
+    active_prefix_decode_generate,
+    untraced_budget_decode_generate,
+)
 from .exactness import cache_write_signature, rng_progression_signature
-from .budget import UntracedBudgetRecorder, budget_region
+from .budget import UntracedBudgetRecorder
 from .logits import build_single_logits_processor_list
 from .state import ProductionDecodeSession
 
@@ -203,44 +206,63 @@ def _generate_window(
         raise RuntimeError(
             "untraced budget profiling requires synchronized model timing"
         )
-    device_model_kwargs: dict[str, Any] = {}
-    for key, value in model_kwargs.items():
-        if not isinstance(value, torch.Tensor):
-            device_model_kwargs[key] = value
-            continue
-        started = time.perf_counter()
-        destination = value.to(model.device)
-        transfer_wall = time.perf_counter() - started
-        if untraced_budget_recorder is not None and destination is not value:
-            untraced_budget_recorder.record_external_copy(
-                "model_input_to_device",
-                value,
-                destination,
-                host_wall_seconds=transfer_wall,
+    if untraced_budget_recorder is None:
+        # This is intentionally the accepted current-main preparation path.
+        # The authoritative control must not pay profiler clocks or recorder
+        # dispatch on every input tensor.
+        model_kwargs = {
+            key: value.to(model.device) if isinstance(value, torch.Tensor) else value
+            for key, value in model_kwargs.items()
+        }
+        model_kwargs = {
+            key: (
+                value.to(model.dtype)
+                if key != "inputs"
+                and isinstance(value, torch.Tensor)
+                and value.dtype == torch.float32
+                else value
             )
-        device_model_kwargs[key] = destination
-    model_kwargs = device_model_kwargs
-    dtype_model_kwargs: dict[str, Any] = {}
-    for key, value in model_kwargs.items():
-        if (
-            key == "inputs"
-            or not isinstance(value, torch.Tensor)
-            or value.dtype != torch.float32
-        ):
-            dtype_model_kwargs[key] = value
-            continue
-        started = time.perf_counter()
-        destination = value.to(model.dtype)
-        transfer_wall = time.perf_counter() - started
-        if untraced_budget_recorder is not None and destination is not value:
-            untraced_budget_recorder.record_external_copy(
-                "model_input_dtype_conversion",
-                value,
-                destination,
-                host_wall_seconds=transfer_wall,
-            )
-        dtype_model_kwargs[key] = destination
-    model_kwargs = dtype_model_kwargs
+            for key, value in model_kwargs.items()
+        }
+    else:
+        device_model_kwargs: dict[str, Any] = {}
+        for key, value in model_kwargs.items():
+            if not isinstance(value, torch.Tensor):
+                device_model_kwargs[key] = value
+                continue
+            started = time.perf_counter()
+            destination = value.to(model.device)
+            transfer_wall = time.perf_counter() - started
+            if destination is not value:
+                untraced_budget_recorder.record_external_copy(
+                    "model_input_to_device",
+                    value,
+                    destination,
+                    host_wall_seconds=transfer_wall,
+                )
+            device_model_kwargs[key] = destination
+        model_kwargs = device_model_kwargs
+        dtype_model_kwargs: dict[str, Any] = {}
+        for key, value in model_kwargs.items():
+            if (
+                key == "inputs"
+                or not isinstance(value, torch.Tensor)
+                or value.dtype != torch.float32
+            ):
+                dtype_model_kwargs[key] = value
+                continue
+            started = time.perf_counter()
+            destination = value.to(model.dtype)
+            transfer_wall = time.perf_counter() - started
+            if destination is not value:
+                untraced_budget_recorder.record_external_copy(
+                    "model_input_dtype_conversion",
+                    value,
+                    destination,
+                    host_wall_seconds=transfer_wall,
+                )
+            dtype_model_kwargs[key] = destination
+        model_kwargs = dtype_model_kwargs
     batch_size = model_kwargs["inputs"].shape[0]
 
     precision = generate_kwargs.pop("precision", preset.precision)
@@ -323,15 +345,26 @@ def _generate_window(
         "pad_token_id",
         getattr(tokenizer, "pad_id", None),
     )
-    custom_generate = partial(
-        active_prefix_decode_generate,
-        active_prefix_bucket_size=ACTIVE_PREFIX_BUCKET_SIZE,
-        cuda_graph_forward=True,
-        cuda_graph_warmup=0,
-        cuda_graph_min_decode_steps=1,
-        untraced_budget_recorder=untraced_budget_recorder,
-        **context_state.active_prefix_decode_kwargs(),
-    )
+    active_prefix_kwargs = context_state.active_prefix_decode_kwargs()
+    if untraced_budget_recorder is None:
+        custom_generate = partial(
+            active_prefix_decode_generate,
+            active_prefix_bucket_size=ACTIVE_PREFIX_BUCKET_SIZE,
+            cuda_graph_forward=True,
+            cuda_graph_warmup=0,
+            cuda_graph_min_decode_steps=1,
+            **active_prefix_kwargs,
+        )
+    else:
+        custom_generate = partial(
+            untraced_budget_decode_generate,
+            active_prefix_bucket_size=ACTIVE_PREFIX_BUCKET_SIZE,
+            cuda_graph_forward=True,
+            cuda_graph_warmup=0,
+            cuda_graph_min_decode_steps=1,
+            untraced_budget_recorder=untraced_budget_recorder,
+            **active_prefix_kwargs,
+        )
     graph_count_before = int(getattr(context_state, "graph_count", 0))
     graph_capture_seconds_before = float(
         getattr(context_state, "graph_capture_seconds", 0.0)
@@ -380,9 +413,11 @@ def _generate_window(
             ),
             custom_generate=custom_generate,
         )
-        if sync_model_timing:
-            with budget_region(untraced_budget_recorder, "sync"):
+        if sync_model_timing and untraced_budget_recorder is not None:
+            with untraced_budget_recorder.region("sync"):
                 sync_cuda_for_model(model)
+        elif sync_model_timing:
+            sync_cuda_for_model(model)
         elapsed_seconds = time.perf_counter() - start_time
 
     strict_exactness = None
@@ -407,17 +442,20 @@ def _generate_window(
             }
 
     with profile_range("generation.final_device_to_host"):
-        device_result = result
-        transfer_started = time.perf_counter()
-        result = result.cpu()
-        transfer_wall = time.perf_counter() - transfer_started
-        if untraced_budget_recorder is not None and result is not device_result:
-            untraced_budget_recorder.record_external_copy(
-                "final_device_to_host",
-                device_result,
-                result,
-                host_wall_seconds=transfer_wall,
-            )
+        if untraced_budget_recorder is None:
+            result = result.cpu()
+        else:
+            device_result = result
+            transfer_started = time.perf_counter()
+            result = result.cpu()
+            transfer_wall = time.perf_counter() - transfer_started
+            if result is not device_result:
+                untraced_budget_recorder.record_external_copy(
+                    "final_device_to_host",
+                    device_result,
+                    result,
+                    host_wall_seconds=transfer_wall,
+                )
     stats = build_generation_stats(
         result,
         model_kwargs,

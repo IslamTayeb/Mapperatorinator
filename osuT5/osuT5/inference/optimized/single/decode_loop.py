@@ -140,7 +140,7 @@ def _cuda_graph_signature(
     return tuple(signature)
 
 
-def active_prefix_decode_generate(
+def untraced_budget_decode_generate(
     model,
     input_ids: torch.LongTensor,
     logits_processor,
@@ -155,10 +155,13 @@ def active_prefix_decode_generate(
     cuda_graph_min_decode_steps: int = 1,
     shared_graph_cache: dict[tuple[Any, ...], dict[str, Any]] | None = None,
     stable_encoder_holder: dict[str, BaseModelOutput] | None = None,
-    untraced_budget_recorder: UntracedBudgetRecorder | None = None,
+    untraced_budget_recorder: UntracedBudgetRecorder,
     **model_kwargs,
 ) -> torch.LongTensor:
-    """Fixed-batch HF loop with persistent active-prefix CUDA graphs."""
+    """Instrumented decode loop used only by ``untraced_budget`` passes."""
+
+    if untraced_budget_recorder is None:
+        raise ValueError("untraced budget decode requires a recorder")
 
     if synced_gpus:
         raise ValueError("active_prefix_decode_generate does not support synced_gpus")
@@ -368,6 +371,186 @@ def active_prefix_decode_generate(
             # explicitly instead of disappearing into the unattributed gap.
             with untraced_budget_recorder.region("sync"):
                 this_peer_finished = bool((unfinished.max() == 0).item())
+        del outputs
+
+    return input_ids
+
+
+def active_prefix_decode_generate(
+    model,
+    input_ids: torch.LongTensor,
+    logits_processor,
+    stopping_criteria,
+    generation_config,
+    synced_gpus: bool = False,
+    streamer=None,
+    *,
+    active_prefix_bucket_size: int = 128,
+    cuda_graph_forward: bool = False,
+    cuda_graph_warmup: int = 0,
+    cuda_graph_min_decode_steps: int = 1,
+    shared_graph_cache: dict[tuple[Any, ...], dict[str, Any]] | None = None,
+    stable_encoder_holder: dict[str, BaseModelOutput] | None = None,
+    **model_kwargs,
+) -> torch.LongTensor:
+    """Accepted fixed-batch loop, unchanged for controls and production."""
+
+    if synced_gpus:
+        raise ValueError("active_prefix_decode_generate does not support synced_gpus")
+    if streamer is not None:
+        raise ValueError("active_prefix_decode_generate does not support streamers")
+    if generation_config.return_dict_in_generate:
+        raise ValueError("active_prefix_decode_generate supports tensor outputs only")
+    if (
+        generation_config.output_attentions
+        or generation_config.output_hidden_states
+        or generation_config.output_scores
+        or generation_config.output_logits
+    ):
+        raise ValueError(
+            "active_prefix_decode_generate does not support auxiliary outputs"
+        )
+    if generation_config.prefill_chunk_size is not None:
+        raise ValueError(
+            "active_prefix_decode_generate does not support prefill_chunk_size"
+        )
+
+    pad_token_id = generation_config._pad_token_tensor
+    has_eos = any(
+        hasattr(criteria, "eos_token_id") for criteria in stopping_criteria
+    )
+    batch_size, cur_len = input_ids.shape[:2]
+    if batch_size > 1:
+        decoder_attention_mask = model_kwargs.get("decoder_attention_mask")
+        if not isinstance(decoder_attention_mask, torch.Tensor):
+            raise ValueError(
+                "batched active-prefix decode requires decoder_attention_mask"
+            )
+        if decoder_attention_mask.ndim != 2 or tuple(
+            decoder_attention_mask.shape
+        ) != (batch_size, cur_len):
+            raise ValueError(
+                "batched decoder_attention_mask must match input_ids shape"
+            )
+    if cuda_graph_forward and input_ids.device.type != "cuda":
+        raise RuntimeError("active-prefix CUDA graph decode requires CUDA inputs")
+    if cuda_graph_min_decode_steps <= 0:
+        raise ValueError("cuda_graph_min_decode_steps must be positive")
+
+    model_kwargs = model._get_initial_cache_position(
+        cur_len,
+        input_ids.device,
+        model_kwargs,
+    )
+    max_cache_len = _max_cache_shape(model_kwargs, generation_config)
+
+    is_prefill = True
+    scores = None
+    decode_steps = 0
+    graph_cache = shared_graph_cache if shared_graph_cache is not None else {}
+    this_peer_finished = False
+    unfinished = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
+
+    while model._has_unfinished_sequences(
+        this_peer_finished,
+        synced_gpus,
+        device=input_ids.device,
+    ):
+        model_inputs = model.prepare_inputs_for_generation(input_ids, **model_kwargs)
+        if is_prefill:
+            with profile_range("generation.encoder_prefill"):
+                outputs = model(**model_inputs, return_dict=True)
+            is_prefill = False
+        else:
+            decode_steps += 1
+            prefix_length = _bucketed_prefix_length(
+                cur_len,
+                active_prefix_bucket_size,
+                max_cache_len,
+            )
+            use_graph = (
+                cuda_graph_forward
+                and decode_steps >= cuda_graph_min_decode_steps
+            )
+            if cuda_graph_forward and not use_graph:
+                with active_prefix_self_attention_context(prefix_length):
+                    outputs = model(**model_inputs, return_dict=True)
+            elif use_graph:
+                graph_key = _cuda_graph_signature(prefix_length, model_inputs)
+                graph_entry = graph_cache.get(graph_key)
+                if graph_entry is None:
+                    static_inputs = _clone_static_graph_inputs(model_inputs)
+                    with profile_range("generation.decode_graph_capture_setup"):
+                        graph, outputs, capture_seconds = _capture_decode_cuda_graph(
+                            model,
+                            static_inputs,
+                            active_prefix_length=prefix_length,
+                            warmup=cuda_graph_warmup,
+                        )
+                    graph_entry = {
+                        "graph": graph,
+                        "outputs": outputs,
+                        "static_inputs": static_inputs,
+                        "active_prefix_length": prefix_length,
+                        "capture_seconds": capture_seconds,
+                        "decode_replays": 0,
+                    }
+                    graph_cache[graph_key] = graph_entry
+                else:
+                    _copy_static_graph_inputs(
+                        graph_entry["static_inputs"],
+                        model_inputs,
+                    )
+                    with profile_range("generation.decode_graph_replay"):
+                        graph_entry["graph"].replay()
+                graph_entry["decode_replays"] += 1
+                outputs = graph_entry["outputs"]
+            else:
+                with active_prefix_self_attention_context(prefix_length):
+                    outputs = model(**model_inputs, return_dict=True)
+
+        with profile_range("generation.cache_update"):
+            model_kwargs = model._update_model_kwargs_for_generation(
+                outputs,
+                model_kwargs,
+                is_encoder_decoder=model.config.is_encoder_decoder,
+            )
+            if stable_encoder_holder is not None:
+                encoder_outputs = model_kwargs.get("encoder_outputs")
+                if encoder_outputs is not None:
+                    model_kwargs["encoder_outputs"] = _stable_encoder_outputs(
+                        stable_encoder_holder,
+                        encoder_outputs,
+                    )
+
+        with profile_range("generation.logits_processors"):
+            next_logits = outputs.logits[:, -1, :].to(
+                copy=True,
+                dtype=torch.float32,
+                device=input_ids.device,
+            )
+            next_scores = logits_processor(input_ids, next_logits)
+        with profile_range("generation.sampling"):
+            if generation_config.do_sample:
+                probabilities = nn.functional.softmax(next_scores, dim=-1)
+                next_tokens = torch.multinomial(probabilities, num_samples=1).squeeze(1)
+            else:
+                next_tokens = torch.argmax(next_scores, dim=-1)
+
+        with profile_range("generation.token_append_and_stopping"):
+            if has_eos:
+                next_tokens = next_tokens * unfinished + pad_token_id * (1 - unfinished)
+            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            stopped = stopping_criteria(input_ids, scores)
+            if not isinstance(stopped, torch.Tensor) or tuple(stopped.shape) != (
+                batch_size,
+            ):
+                raise RuntimeError(
+                    "batched stopping criteria must return one value per row"
+                )
+            unfinished = unfinished & ~stopped.to(dtype=torch.bool)
+            this_peer_finished = unfinished.max() == 0
+            cur_len += 1
         del outputs
 
     return input_ids
