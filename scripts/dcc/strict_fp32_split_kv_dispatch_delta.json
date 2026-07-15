@@ -1,0 +1,37 @@
+{
+  "schema_version": "mapperatorinator.dispatch-delta-allowlist.v1",
+  "allowed_paths": [
+    "preset.optimized_effective_config.native_q1_rope_cache_split_kv",
+    "preset.optimized_effective_config.native_q1_rope_cache_split_kv_prefix_buckets",
+    "preset.optimized_effective_config.native_q1_rope_cache_split_kv_split_count",
+    "records.*.optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8",
+    "records.*.optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8_prefix_192",
+    "records.*.optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8_prefix_256",
+    "records.*.optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8_prefix_320",
+    "records.*.optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8_prefix_384",
+    "records.*.optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8_prefix_448",
+    "records.*.optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8_prefix_512",
+    "records.*.optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8_prefix_576",
+    "records.*.optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8_prefix_640",
+    "records.*.optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8_prefix_704",
+    "records.*.optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8_prefix_768",
+    "records.*.optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8_prefix_832"
+  ],
+  "required_paths": [
+    "preset.optimized_effective_config.native_q1_rope_cache_split_kv",
+    "preset.optimized_effective_config.native_q1_rope_cache_split_kv_prefix_buckets",
+    "preset.optimized_effective_config.native_q1_rope_cache_split_kv_split_count",
+    "records.*.optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8",
+    "records.*.optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8_prefix_192",
+    "records.*.optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8_prefix_256",
+    "records.*.optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8_prefix_320",
+    "records.*.optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8_prefix_384",
+    "records.*.optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8_prefix_448",
+    "records.*.optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8_prefix_512",
+    "records.*.optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8_prefix_576",
+    "records.*.optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8_prefix_640",
+    "records.*.optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8_prefix_704",
+    "records.*.optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8_prefix_768",
+    "records.*.optimized_dispatch_capture_hits.native_q1_rope_cache_self_attention_split_kv_8_prefix_832"
+  ]
+}

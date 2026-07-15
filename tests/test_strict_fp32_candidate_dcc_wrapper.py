@@ -41,6 +41,14 @@ def test_wrapper_pins_candidate_baseline_hardware_queue_and_storage() -> None:
     assert "MAPPERATORINATOR_BASELINE_ANALYSIS" in source
     assert "MAPPERATORINATOR_INITIAL_ANALYSIS" in source
     assert "MAPPERATORINATOR_DISPATCH_DELTA_SPEC" in source
+    assert (
+        'DEFAULT_DISPATCH_DELTA_SPEC="$REPO/scripts/dcc/'
+        'strict_fp32_split_kv_dispatch_delta.json"'
+    ) in source
+    assert (
+        "MAPPERATORINATOR_DISPATCH_DELTA_SPEC:-$DEFAULT_DISPATCH_DELTA_SPEC"
+        in source
+    )
     assert "dispatch-delta-spec.json" in source
     assert "--dispatch-delta-spec" in source
     assert "dispatch delta spec must be tracked inside the candidate worktree" in source
