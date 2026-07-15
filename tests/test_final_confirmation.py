@@ -80,6 +80,42 @@ def test_fixed_work_runtime_replays_exact_per_window_lengths() -> None:
     assert all(record["target_steps"] == record["logical_steps"] for record in wrapped.records)
 
 
+def test_device_resident_fixed_work_keeps_cache_capacity_and_uses_scoped_target() -> None:
+    class DeviceResidentRuntime(_Runtime):
+        def generate_window(self, **kwargs):
+            from osuT5.osuT5.inference.optimized.single.k8_runtime import (
+                active_fixed_work_target_steps,
+            )
+
+            target = active_fixed_work_target_steps()
+            assert target is not None
+            prompt = kwargs["model_kwargs"]["decoder_input_ids"]
+            self.calls.append((dict(kwargs["generate_kwargs"]), target))
+            return (
+                torch.zeros((1, prompt.shape[1] + target), dtype=torch.long),
+                {"generated_tokens": target, "elapsed_seconds": 1.0},
+            )
+
+    runtime = DeviceResidentRuntime()
+    wrapped = ConfirmationRuntime(
+        runtime,
+        mode="replay-fixed-work",
+        manifest=_manifest(),
+        device_resident_fixed_work=True,
+    )
+    prompt = torch.ones((1, 5), dtype=torch.long)
+    tokenizer = SimpleNamespace(eos_id=99, context_eos={}, pad_id=0)
+
+    result, _ = wrapped.generate_window(
+        tokenizer=tokenizer,
+        model_kwargs={"decoder_input_ids": prompt},
+        generate_kwargs={"context_type": "map", "max_length": 1024},
+    )
+
+    assert result.shape[1] == 9
+    assert runtime.calls == [({"context_type": "map", "max_length": 1024}, 4)]
+
+
 def test_fixed_work_runtime_fails_on_extra_or_missing_windows() -> None:
     prompt = torch.ones((1, 5), dtype=torch.long)
     tokenizer = SimpleNamespace(eos_id=99, context_eos={}, pad_id=0)

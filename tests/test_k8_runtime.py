@@ -25,6 +25,8 @@ from osuT5.osuT5.inference.optimized.single.k8_runtime import (
     _sync_model_kwargs_after_k8,
     _update_static_model_inputs,
     _validate_static_input_arena_refreshes,
+    active_fixed_work_target_steps,
+    fixed_work_target_steps,
     install_k8_candidate,
 )
 from osuT5.osuT5.inference.optimized.single.state import ProductionDecodeSession
@@ -106,6 +108,29 @@ def test_state_reset_preserves_every_fixed_address_and_prompt_seed():
     assert state.physical_length.tolist() == [3]
     assert state.unfinished.tolist() == [True]
     assert not torch.equal(state.rng_seed, first_seed)
+
+
+def test_fixed_stop_length_preserves_capacity_and_stops_at_target():
+    state = _state(max_length=12)
+    pointer = state.sequence.data_ptr()
+    state.reset(
+        torch.tensor([[1, 5]]),
+        pad_token_id=0,
+        eos_token_ids=torch.tensor([9]),
+        rng_seed=456,
+        stop_length=5,
+    )
+
+    state.append(torch.tensor([7]))
+    state.append(torch.tensor([8]))
+    state.append(torch.tensor([6]))
+
+    assert state.max_length == state.sequence.shape[1] == 12
+    assert state.sequence.data_ptr() == pointer
+    assert state.physical_length.tolist() == [5]
+    assert state.logical_length.tolist() == [5]
+    assert state.stop_length.tolist() == [5]
+    assert state.unfinished.tolist() == [False]
 
 
 def test_prompt_stream_seed_owns_request_seed_window_and_prompt_identity():
@@ -334,6 +359,23 @@ def test_parameterized_blocks_respect_bucket_and_max_length(
     block_size, cur_len, expected
 ):
     assert _k8_eligible(cur_len, 1024, 64, block_size) is expected
+
+
+def test_blocks_respect_logical_stop_without_shrinking_cache_capacity():
+    assert _k8_eligible(120, 1024, 64, 4, stop_length=124)
+    assert not _k8_eligible(121, 1024, 64, 4, stop_length=124)
+    with pytest.raises(ValueError, match="cannot exceed cache capacity"):
+        _k8_eligible(120, 1024, 64, 4, stop_length=1025)
+
+
+def test_fixed_work_target_context_is_scoped_and_fails_loudly():
+    assert active_fixed_work_target_steps() is None
+    with fixed_work_target_steps(17):
+        assert active_fixed_work_target_steps() == 17
+    assert active_fixed_work_target_steps() is None
+    with pytest.raises(ValueError, match="positive integer"):
+        with fixed_work_target_steps(0):
+            pass
 
 
 def test_static_handoff_updates_token_positions_and_causal_mask_in_place():

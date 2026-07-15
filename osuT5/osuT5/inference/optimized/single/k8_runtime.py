@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 import time
 from typing import Any, Iterator
@@ -78,6 +79,7 @@ class K8DeviceState:
     rng_counter: torch.Tensor
     monotonic_has_time_shift: torch.Tensor
     monotonic_last_value: torch.Tensor
+    stop_length: torch.Tensor
     max_length: int
 
     @classmethod
@@ -126,6 +128,7 @@ class K8DeviceState:
                 (1,), dtype=torch.bool, device=input_ids.device
             ),
             monotonic_last_value=torch.zeros_like(length),
+            stop_length=torch.full_like(length, max_length),
             max_length=max_length,
         )
 
@@ -141,6 +144,7 @@ class K8DeviceState:
             ("rng_counter", self.rng_counter, torch.long),
             ("monotonic_has_time_shift", self.monotonic_has_time_shift, torch.bool),
             ("monotonic_last_value", self.monotonic_last_value, torch.long),
+            ("stop_length", self.stop_length, torch.long),
         ):
             if not isinstance(value, torch.Tensor):
                 raise TypeError(f"{name} must be a tensor")
@@ -158,12 +162,24 @@ class K8DeviceState:
         pad_token_id: int,
         eos_token_ids: torch.Tensor,
         rng_seed: int,
+        stop_length: int | None = None,
     ) -> None:
         input_ids = _require_batch1_long("input_ids", input_ids)
         if input_ids.device != self.sequence.device:
             raise ValueError("K8 state reset requires the original CUDA device")
         if input_ids.shape[1] >= self.max_length:
             raise ValueError("K8 state reset prompt exceeds sequence capacity")
+        if stop_length is None:
+            stop_length = self.max_length
+        if (
+            isinstance(stop_length, bool)
+            or not isinstance(stop_length, int)
+            or stop_length <= input_ids.shape[1]
+            or stop_length > self.max_length
+        ):
+            raise ValueError(
+                "K8 stop length must exceed the prompt and fit sequence capacity"
+            )
         if eos_token_ids.shape != self.eos_token_ids.shape or not torch.equal(
             eos_token_ids.to(device=self.eos_token_ids.device), self.eos_token_ids
         ):
@@ -178,6 +194,7 @@ class K8DeviceState:
         self.rng_counter.zero_()
         self.monotonic_has_time_shift.zero_()
         self.monotonic_last_value.zero_()
+        self.stop_length.fill_(stop_length)
 
     def initialize_monotonic(
         self,
@@ -237,7 +254,7 @@ class K8DeviceState:
         )
         next_length = self.physical_length + 1
         eos = (active[:, None] == self.eos_token_ids[None, :]).any(dim=1)
-        stopped = eos | (next_length >= self.max_length)
+        stopped = eos | (next_length >= self.stop_length)
         just_stopped = self.unfinished & stopped
         self.logical_length.copy_(
             torch.where(just_stopped, next_length, self.logical_length)
@@ -653,6 +670,10 @@ _ACTIVE_BLOCK_SIZE: int | None = None
 _ACTIVE_GRAPH_REMAINDERS: bool | None = None
 _ACTIVE_SHARED_STATIC_INPUT_ARENA: bool | None = None
 _ACTIVE_TRANSITION_TIMING: bool | None = None
+_FIXED_WORK_TARGET_STEPS: ContextVar[int | None] = ContextVar(
+    "mapperatorinator_k8_fixed_work_target_steps",
+    default=None,
+)
 
 
 _TRANSITION_STAGES = (
@@ -875,7 +896,12 @@ def _runtime_slot(
     vocab_size: int,
     rng_seed: int,
     do_sample: bool,
+    stop_length: int | None = None,
 ) -> _K8RuntimeSlot:
+    if stop_length is None:
+        stop_length = max_length
+    if stop_length <= input_ids.shape[1] or stop_length > max_length:
+        raise ValueError("K8 runtime stop length must fit the sequence capacity")
     signature = (
         max_length,
         tuple(int(value) for value in eos_token_ids.detach().cpu().tolist()),
@@ -901,12 +927,14 @@ def _runtime_slot(
         )
         slot = _K8RuntimeSlot(state, processor, signature)
         slots[signature] = slot
+        state.stop_length.fill_(stop_length)
     else:
         slot.state.reset(
             input_ids,
             pad_token_id=pad_token_id,
             eos_token_ids=eos_token_ids,
             rng_seed=rng_seed,
+            stop_length=stop_length,
         )
         slot.processor.reset(prompt_length=input_ids.shape[1])
     return slot
@@ -921,6 +949,7 @@ def _snapshot_tensors(
         "sequence": state.sequence,
         "physical_length": state.physical_length,
         "logical_length": state.logical_length,
+        "stop_length": state.stop_length,
         "unfinished": state.unfinished,
         "rng_counter": state.rng_counter,
         **processor.mutable_tensors(),
@@ -1037,9 +1066,15 @@ def _k8_eligible(
     max_length: int,
     bucket_size: int,
     block_size: int = K8_BLOCK_SIZE,
+    *,
+    stop_length: int | None = None,
 ) -> bool:
     block_size = _validate_block_size(block_size)
-    if cur_len + block_size > max_length:
+    if stop_length is None:
+        stop_length = max_length
+    if stop_length > max_length:
+        raise ValueError("K8 stop length cannot exceed cache capacity")
+    if cur_len + block_size > stop_length:
         return False
     start = _bucketed_prefix_length(cur_len, bucket_size, max_length)
     end = _bucketed_prefix_length(
@@ -1157,6 +1192,16 @@ def k8_active_prefix_decode_generate(
         cur_len, input_ids.device, model_kwargs
     )
     max_length = _max_cache_shape(model_kwargs, generation_config)
+    fixed_work_target_steps = _FIXED_WORK_TARGET_STEPS.get()
+    stop_length = max_length
+    if fixed_work_target_steps is not None:
+        stop_length = cur_len + fixed_work_target_steps
+        if stop_length > max_length:
+            raise ValueError(
+                "fixed-work target exceeds K8 cache capacity: "
+                f"prompt={cur_len}, steps={fixed_work_target_steps}, "
+                f"capacity={max_length}"
+            )
     eos_ids = _eos_tensor(
         stopping_criteria,
         input_ids.device,
@@ -1206,6 +1251,7 @@ def k8_active_prefix_decode_generate(
         vocab_size=int(model.config.vocab_size),
         rng_seed=rng_seed,
         do_sample=do_sample,
+        stop_length=stop_length,
     )
     state = slot.state
     processor = slot.processor
@@ -1249,6 +1295,9 @@ def k8_active_prefix_decode_generate(
         "static_input_arena_refresh_copy_calls": 0,
         "static_input_arena_refresh_copy_bytes": 0,
         "static_input_arena_graph_entries": 0,
+        "fixed_work_target_steps": fixed_work_target_steps,
+        "stop_length": stop_length,
+        "cache_capacity": max_length,
     }
     if transition_timing:
         stats["transition_timing"] = {
@@ -1323,6 +1372,7 @@ def k8_active_prefix_decode_generate(
             max_length,
             active_prefix_bucket_size,
             block_size,
+            stop_length=stop_length,
         )
         if not block_eligible and not graph_remainders:
             active_ids = state.sequence[:, :cur_len]
@@ -1675,12 +1725,35 @@ def install_k8_candidate(
             _ACTIVE_TRANSITION_TIMING = None
 
 
+@contextmanager
+def fixed_work_target_steps(target_steps: int) -> Iterator[None]:
+    """Set a harness-only logical stop without changing K8 cache capacity."""
+
+    if (
+        isinstance(target_steps, bool)
+        or not isinstance(target_steps, int)
+        or target_steps <= 0
+    ):
+        raise ValueError("fixed-work target steps must be a positive integer")
+    token = _FIXED_WORK_TARGET_STEPS.set(target_steps)
+    try:
+        yield
+    finally:
+        _FIXED_WORK_TARGET_STEPS.reset(token)
+
+
+def active_fixed_work_target_steps() -> int | None:
+    return _FIXED_WORK_TARGET_STEPS.get()
+
+
 __all__ = [
     "K8DeviceState",
     "K8LogitsProcessor",
     "K8_BLOCK_SIZE",
     "RNG_POLICY",
     "SUPPORTED_BLOCK_SIZES",
+    "active_fixed_work_target_steps",
+    "fixed_work_target_steps",
     "install_k8_candidate",
     "k8_active_prefix_decode_generate",
 ]

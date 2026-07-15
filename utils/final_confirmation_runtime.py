@@ -100,6 +100,7 @@ class AcceptedRuntimePlugin:
     """No-op accepted production runtime control."""
 
     name = "accepted-optimized"
+    device_resident_fixed_work = False
 
     def __init__(self) -> None:
         self._bindings = 0
@@ -137,6 +138,8 @@ class AcceptedRuntimePlugin:
 
 class KBlockSharedRopeWeightPlugin:
     """Compose block decoding, exact shared RoPE, and a runtime initializer."""
+
+    device_resident_fixed_work = True
 
     def __init__(
         self,

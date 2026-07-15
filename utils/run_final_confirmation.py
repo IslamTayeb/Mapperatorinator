@@ -14,6 +14,7 @@ import sys
 import time
 import uuid
 from collections import defaultdict
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -72,12 +73,16 @@ class ConfirmationRuntime:
         manifest: dict[str, Any] | None,
         indices: defaultdict[str, int] | None = None,
         records: list[dict[str, Any]] | None = None,
+        device_resident_fixed_work: bool = False,
     ) -> None:
         self._runtime = runtime
         self._mode = mode
         self._manifest = manifest
         self._indices = indices if indices is not None else defaultdict(int)
         self.records = records if records is not None else []
+        if not isinstance(device_resident_fixed_work, bool):
+            raise TypeError("device_resident_fixed_work must be boolean")
+        self._device_resident_fixed_work = device_resident_fixed_work
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._runtime, name)
@@ -92,6 +97,7 @@ class ConfirmationRuntime:
                     if self._manifest is not None
                     else None
                 ),
+                "device_resident_fixed_work": self._device_resident_fixed_work,
             }
         )
         return metadata
@@ -121,7 +127,8 @@ class ConfirmationRuntime:
             if index >= len(counts):
                 raise RuntimeError(f"fixed-work replay has too many {label} windows")
             target_steps = int(counts[index])
-            generate_kwargs["max_length"] = prompt_width + target_steps
+            if not self._device_resident_fixed_work:
+                generate_kwargs["max_length"] = prompt_width + target_steps
             from osuT5.osuT5.inference.optimized.single import engine as engine_module
             from osuT5.osuT5.event import ContextType
 
@@ -132,11 +139,22 @@ class ConfirmationRuntime:
                 lookahead_time=float(generate_kwargs.get("lookahead_time", 0.0)),
                 context_type=ContextType(str(context_type)),
             )
-            engine_module.eos_token_ids = lambda *args, **kwargs: []
+            # Keep one impossible EOS id so K8 retains a valid EosTokenCriteria
+            # while executing the fixed logical target. Natural EOS ids are
+            # recorded above and used to trim the consumer-facing result.
+            engine_module.eos_token_ids = lambda *args, **kwargs: [-1]
         call_kwargs = dict(kwargs)
         call_kwargs["generate_kwargs"] = generate_kwargs
+        fixed_target_context = nullcontext()
+        if target_steps is not None and self._device_resident_fixed_work:
+            from osuT5.osuT5.inference.optimized.single.k8_runtime import (
+                fixed_work_target_steps,
+            )
+
+            fixed_target_context = fixed_work_target_steps(target_steps)
         try:
-            result, stats = self._runtime.generate_window(**call_kwargs)
+            with fixed_target_context:
+                result, stats = self._runtime.generate_window(**call_kwargs)
         finally:
             if engine_module is not None and original_eos is not None:
                 engine_module.eos_token_ids = original_eos
@@ -266,6 +284,9 @@ def run(
             manifest=manifest,
             indices=shared_indices,
             records=shared_records,
+            device_resident_fixed_work=bool(
+                getattr(plugin, "device_resident_fixed_work", False)
+            ),
         )
         wrapped_runtimes.append(wrapped_runtime)
         return InferenceEngineBinding(binding.raw_model, wrapped_runtime), tokenizer
