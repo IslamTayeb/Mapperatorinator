@@ -48,6 +48,7 @@ except ImportError:
 RUN_NAMES = ("run-01", "run-02", "run-03")
 PRECISIONS = ("fp32", "fp16")
 SIDES = ("baseline", "candidate")
+CANDIDATE_VERSION = "strict-shared-rope-dtype-generic-v2"
 
 
 class FullSongGateError(RuntimeError):
@@ -105,6 +106,46 @@ def _runtime_contract(
         raise FullSongGateError(f"generation precision changed: {generated}")
 
 
+def _candidate_evidence_contract(
+    candidate_evidence: Any,
+    *,
+    precision: str,
+) -> dict[str, Any]:
+    if not isinstance(candidate_evidence, dict):
+        raise FullSongGateError("candidate evidence must be an object")
+    payload = candidate_evidence.get("candidate")
+    if not isinstance(payload, dict):
+        raise FullSongGateError("candidate evidence is missing candidate data")
+    required = {
+        "version": CANDIDATE_VERSION,
+        "precision": precision,
+        "dtype_generic": True,
+        "original_decoder_forward_required": True,
+        "production_wiring": False,
+        "full_song_exactness_claim": False,
+    }
+    failures = {
+        key: {"expected": value, "actual": payload.get(key)}
+        for key, value in required.items()
+        if payload.get(key) != value
+    }
+    retained = payload.get("retained_specialized_dispatch")
+    if retained != {
+        "q1_bmm_cross_attention": True,
+        "native_q1_rope_cache_self_attention": True,
+        "native_q1_self_attention": True,
+    }:
+        failures["retained_specialized_dispatch"] = retained
+    stats = payload.get("stats")
+    if not isinstance(stats, dict) or int(stats.get("reuses", 0)) <= 0:
+        failures["stats.reuses"] = (
+            None if not isinstance(stats, dict) else stats.get("reuses")
+        )
+    if failures:
+        raise FullSongGateError(f"candidate evidence mismatch: {failures}")
+    return payload
+
+
 def _load_run(
     run_dir: Path,
     *,
@@ -112,6 +153,7 @@ def _load_run(
     commit: str,
     branch: str,
     audit: bool,
+    candidate: bool,
 ) -> dict[str, Any]:
     for name, allow_empty in (
         ("command.txt", False),
@@ -151,6 +193,14 @@ def _load_run(
     graph = nsight._profile_graph_cache_signature(profile, LABELS)
     if graph["status"] != "available":
         raise FullSongGateError(f"graph signature unavailable: {run_dir}")
+    candidate_evidence = None
+    if candidate:
+        evidence_path = _required_file(
+            run_dir / "candidate-evidence.json",
+            allow_empty=False,
+        )
+        candidate_evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        _candidate_evidence_contract(candidate_evidence, precision=precision)
     return {
         "profile_path": str(profile_path),
         "result_path": str(result_path),
@@ -173,6 +223,7 @@ def _load_run(
             for label, signature in signatures.items()
         },
         "strict_exactness": _strict_exactness_contract(profile) if audit else None,
+        "candidate_evidence": candidate_evidence,
     }
 
 
@@ -225,6 +276,7 @@ def _analyze_precision(
                 commit=commit,
                 branch=branch,
                 audit=False,
+                candidate=side == "candidate",
             )
             for run_name in RUN_NAMES
         ]
@@ -234,6 +286,7 @@ def _analyze_precision(
             commit=commit,
             branch=branch,
             audit=True,
+            candidate=side == "candidate",
         )
 
     combined = runs["baseline"] + runs["candidate"] + list(audits.values())
@@ -247,6 +300,12 @@ def _analyze_precision(
         "token_and_stopping": _same([row["signatures"] for row in combined]),
         "rng_and_cache": _same(
             [audits[side]["strict_exactness"] for side in SIDES]
+        ),
+        "candidate_evidence_consistent": _same(
+            [
+                row["candidate_evidence"]["candidate"]
+                for row in runs["candidate"] + [audits["candidate"]]
+            ]
         ),
     }
     aggregates: dict[str, Any] = {}
@@ -292,10 +351,10 @@ def _analyze_precision(
     }
     checks.update(
         {
-            "fresh_process_saves_at_least_one_second": comparisons[
+            "process_wall_no_more_than_one_percent_slower": comparisons[
                 "process_wall_seconds"
-            ]["saved_seconds"]
-            >= 1.0,
+            ]["candidate_delta_pct"]
+            <= 1.0,
             "request_wall_no_more_than_one_percent_slower": comparisons[
                 "request_wall_seconds"
             ]["candidate_delta_pct"]
@@ -315,60 +374,69 @@ def _analyze_precision(
         "checks": checks,
         "aggregates": aggregates,
         "comparisons": comparisons,
+        "same_precision_drift": {
+            "byte_identical_output": checks["output_bytes"],
+            "identical_tokens_and_stopping": checks["token_and_stopping"],
+            "identical_rng_and_cache": checks["rng_and_cache"],
+            "identical_dispatch_and_graph": (
+                checks["dispatch_and_graph"] and checks["graph_signature"]
+            ),
+        },
         "runs": runs,
         "exactness_audits": audits,
     }
 
 
 def analyze(args: argparse.Namespace) -> dict[str, Any]:
-    results = {
-        precision: _analyze_precision(
-            args.run_root,
-            precision=precision,
-            baseline_commit=args.baseline_commit,
-            baseline_branch=args.baseline_branch,
-            candidate_commit=args.candidate_commit,
-            candidate_branch=args.candidate_branch,
-        )
-        for precision in PRECISIONS
-    }
+    if args.precision not in PRECISIONS:
+        raise FullSongGateError("precision must be fp16 or fp32")
+    result = _analyze_precision(
+        args.run_root,
+        precision=args.precision,
+        baseline_commit=args.baseline_commit,
+        baseline_branch=args.baseline_branch,
+        candidate_commit=args.candidate_commit,
+        candidate_branch=args.candidate_branch,
+    )
     return {
         "schema_version": 1,
-        "status": "PASS"
-        if all(result["status"] == "PASS" for result in results.values())
-        else "FAIL",
-        "precision_results": results,
+        "precision": args.precision,
+        "status": result["status"],
+        "result": result,
     }
 
 
 def _text(report: dict[str, Any]) -> str:
     rows = [f"status={report['status']}"]
-    for precision in PRECISIONS:
-        result = report["precision_results"][precision]
-        rows.append(f"{precision}.status={result['status']}")
-        for name, comparison in result["comparisons"].items():
-            rows.append(
-                f"{precision}.{name}.baseline_seconds="
-                f"{comparison['baseline_seconds']:.6f}"
-            )
-            rows.append(
-                f"{precision}.{name}.candidate_seconds="
-                f"{comparison['candidate_seconds']:.6f}"
-            )
-            rows.append(
-                f"{precision}.{name}.saved_seconds="
-                f"{comparison['saved_seconds']:.6f}"
-            )
-            rows.append(
-                f"{precision}.{name}.candidate_delta_pct="
-                f"{comparison['candidate_delta_pct']:.3f}"
-            )
+    precision = report["precision"]
+    result = report["result"]
+    rows.append(f"precision={precision}")
+    for check, passed in result["checks"].items():
+        rows.append(f"check.{check}={str(passed).lower()}")
+    for name, comparison in result["comparisons"].items():
+        rows.append(
+            f"{precision}.{name}.baseline_seconds="
+            f"{comparison['baseline_seconds']:.6f}"
+        )
+        rows.append(
+            f"{precision}.{name}.candidate_seconds="
+            f"{comparison['candidate_seconds']:.6f}"
+        )
+        rows.append(
+            f"{precision}.{name}.saved_seconds="
+            f"{comparison['saved_seconds']:.6f}"
+        )
+        rows.append(
+            f"{precision}.{name}.candidate_delta_pct="
+            f"{comparison['candidate_delta_pct']:.3f}"
+        )
     return "\n".join(rows) + "\n"
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-root", type=Path, required=True)
+    parser.add_argument("--precision", choices=PRECISIONS, required=True)
     parser.add_argument("--baseline-commit", required=True)
     parser.add_argument("--baseline-branch", required=True)
     parser.add_argument("--candidate-commit", required=True)

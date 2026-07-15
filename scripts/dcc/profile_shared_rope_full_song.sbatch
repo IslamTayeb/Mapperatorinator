@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=lazy-start-full-song
+#SBATCH --job-name=shared-rope-full-song
 #SBATCH --partition=gpu-common
 #SBATCH --account=romerolab
 #SBATCH --cpus-per-task=8
@@ -12,7 +12,7 @@
 set -euo pipefail
 
 die() {
-  echo "lazy-start-full-song: $*" >&2
+  echo "shared-rope-full-song: $*" >&2
   exit 2
 }
 
@@ -22,39 +22,33 @@ require_nonempty() {
 
 SLURM_JOB_ID=${SLURM_JOB_ID:?Run this wrapper inside Slurm}
 PYTHON=${MAPPERATORINATOR_PYTHON:-/hpc/group/romerolab/imt11/envs/mapperatorinator/bin/python}
-BASELINE_REPO=${MAPPERATORINATOR_BASELINE_REPO:?Set the clean baseline worktree}
-BASELINE_COMMIT=${MAPPERATORINATOR_BASELINE_COMMIT:?Set the baseline commit}
-BASELINE_BRANCH=${MAPPERATORINATOR_BASELINE_BRANCH:?Set the baseline branch}
-CANDIDATE_REPO=${MAPPERATORINATOR_CANDIDATE_REPO:?Set the clean candidate worktree}
-CANDIDATE_COMMIT=${MAPPERATORINATOR_CANDIDATE_COMMIT:?Set the candidate commit}
-CANDIDATE_BRANCH=${MAPPERATORINATOR_CANDIDATE_BRANCH:?Set the candidate branch}
-CANDIDATE_REMOTE_REF=${MAPPERATORINATOR_CANDIDATE_REMOTE_REF:?Set the pushed candidate ref}
+REPO=${MAPPERATORINATOR_REPO:?Set the clean pushed candidate worktree}
+COMMIT=${MAPPERATORINATOR_COMMIT:?Set the candidate commit}
+BRANCH=${MAPPERATORINATOR_BRANCH:?Set the candidate branch}
+REMOTE_REF=${MAPPERATORINATOR_REMOTE_REF:?Set the pushed candidate ref}
 WORK=${MAPPERATORINATOR_WORK:-/work/imt11/Mapperatorinator}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 EXPECTED_GPU=${MAPPERATORINATOR_EXPECTED_GPU:-2080 Ti}
-RUN_LABEL=${RUN_LABEL:-lazy-start-full-song}
+PRECISION=${MAPPERATORINATOR_PRECISION:?Set MAPPERATORINATOR_PRECISION to fp32 or fp16}
+RUN_LABEL=${RUN_LABEL:-shared-rope-full-song-$PRECISION}
 RUN_ROOT="$WORK/runs/${RUN_LABEL}-${SLURM_JOB_ID}"
 
 export NVIDIA_TF32_OVERRIDE=0
 
 [[ -x "$PYTHON" ]] || die "missing Python: $PYTHON"
+[[ "$PRECISION" == fp32 || "$PRECISION" == fp16 ]] \
+  || die "MAPPERATORINATOR_PRECISION must be fp32 or fp16"
 [[ -f "$AUDIO" ]] || die "missing audio: $AUDIO"
 [[ ! -e "$RUN_ROOT" ]] || die "refusing to overwrite $RUN_ROOT"
-for repo in "$BASELINE_REPO" "$CANDIDATE_REPO"; do
-  [[ -d "$repo/.git" || -f "$repo/.git" ]] || die "missing worktree: $repo"
-  [[ -z "$(git -C "$repo" status --porcelain)" ]] || die "dirty worktree: $repo"
-done
-[[ "$(git -C "$BASELINE_REPO" rev-parse HEAD)" == "$BASELINE_COMMIT" ]] \
-  || die "baseline commit mismatch"
-[[ "$(git -C "$BASELINE_REPO" branch --show-current)" == "$BASELINE_BRANCH" ]] \
-  || die "baseline branch mismatch"
-[[ "$(git -C "$CANDIDATE_REPO" rev-parse HEAD)" == "$CANDIDATE_COMMIT" ]] \
+[[ -d "$REPO/.git" || -f "$REPO/.git" ]] || die "missing worktree: $REPO"
+[[ -z "$(git -C "$REPO" status --porcelain)" ]] || die "dirty worktree: $REPO"
+[[ "$(git -C "$REPO" rev-parse HEAD)" == "$COMMIT" ]] \
   || die "candidate commit mismatch"
-[[ "$(git -C "$CANDIDATE_REPO" branch --show-current)" == "$CANDIDATE_BRANCH" ]] \
+[[ "$(git -C "$REPO" branch --show-current)" == "$BRANCH" ]] \
   || die "candidate branch mismatch"
-git -C "$CANDIDATE_REPO" show-ref --verify --quiet "$CANDIDATE_REMOTE_REF" \
+git -C "$REPO" show-ref --verify --quiet "$REMOTE_REF" \
   || die "missing pushed candidate ref"
-[[ "$(git -C "$CANDIDATE_REPO" rev-parse "$CANDIDATE_REMOTE_REF")" == "$CANDIDATE_COMMIT" ]] \
+[[ "$(git -C "$REPO" rev-parse "$REMOTE_REF")" == "$COMMIT" ]] \
   || die "pushed candidate ref mismatch"
 
 mkdir -p "$WORK/logs" "$WORK/tmp" "$WORK/cache" \
@@ -93,15 +87,14 @@ mapfile -t OTHER_GPU_JOBS < <(
 {
   echo "host=$(hostname)"
   echo "job_id=$SLURM_JOB_ID"
-  echo "baseline_commit=$BASELINE_COMMIT"
-  echo "baseline_branch=$BASELINE_BRANCH"
-  echo "candidate_commit=$CANDIDATE_COMMIT"
-  echo "candidate_branch=$CANDIDATE_BRANCH"
-  echo "candidate_remote_ref=$CANDIDATE_REMOTE_REF"
+  echo "commit=$COMMIT"
+  echo "branch=$BRANCH"
+  echo "remote_ref=$REMOTE_REF"
   echo "python=$PYTHON"
   echo "audio=$AUDIO"
   echo "audio_sha256=$(sha256sum "$AUDIO" | awk '{print $1}')"
   echo "run_root=$RUN_ROOT"
+  echo "precision=$PRECISION"
   echo "NVIDIA_TF32_OVERRIDE=$NVIDIA_TF32_OVERRIDE"
   "$PYTHON" -c 'import torch, transformers; print(f"torch={torch.__version__}"); print(f"torch_cuda={torch.version.cuda}"); print(f"transformers={transformers.__version__}")'
   nvidia-smi --query-gpu=name,uuid,driver_version,memory.total,compute_cap --format=csv,noheader
@@ -130,8 +123,16 @@ run_process() {
   local pass_kind=$5
   local run_dir="$RUN_ROOT/$precision/$side/$name"
   mkdir -p "$run_dir/output"
+  local entrypoint=(inference.py --config-name profile_salvalai)
+  if [[ "$side" == candidate ]]; then
+    entrypoint=(
+      utils/run_strict_shared_rope.py
+      --config-name profile_salvalai
+      --evidence-path "$run_dir/candidate-evidence.json"
+    )
+  fi
   local command=(
-    "$PYTHON" inference.py --config-name profile_salvalai
+    "$PYTHON" "${entrypoint[@]}"
     audio_path="$AUDIO"
     output_path="$run_dir/output"
     device=cuda
@@ -163,7 +164,7 @@ run_process() {
   capture_paths "$run_dir"
 }
 
-for precision in fp32 fp16; do
+for precision in "$PRECISION"; do
   for index in 01 02 03; do
     if (( 10#$index % 2 == 1 )); then
       order=(baseline candidate)
@@ -171,25 +172,21 @@ for precision in fp32 fp16; do
       order=(candidate baseline)
     fi
     for side in "${order[@]}"; do
-      if [[ "$side" == baseline ]]; then
-        repo=$BASELINE_REPO
-      else
-        repo=$CANDIDATE_REPO
-      fi
-      run_process "$repo" "$precision" "$side" "run-$index" untraced_control
+      run_process "$REPO" "$precision" "$side" "run-$index" untraced_control
     done
   done
-  run_process "$BASELINE_REPO" "$precision" baseline exactness-audit exactness_audit
-  run_process "$CANDIDATE_REPO" "$precision" candidate exactness-audit exactness_audit
+  run_process "$REPO" "$precision" baseline exactness-audit exactness_audit
+  run_process "$REPO" "$precision" candidate exactness-audit exactness_audit
 done
 
-cd "$CANDIDATE_REPO"
-"$PYTHON" utils/analyze_lazy_startup_full_song.py \
+cd "$REPO"
+"$PYTHON" utils/analyze_shared_rope_full_song.py \
   --run-root "$RUN_ROOT" \
-  --baseline-commit "$BASELINE_COMMIT" \
-  --baseline-branch "$BASELINE_BRANCH" \
-  --candidate-commit "$CANDIDATE_COMMIT" \
-  --candidate-branch "$CANDIDATE_BRANCH" \
+  --precision "$PRECISION" \
+  --baseline-commit "$COMMIT" \
+  --baseline-branch "$BRANCH" \
+  --candidate-commit "$COMMIT" \
+  --candidate-branch "$BRANCH" \
   --output "$RUN_ROOT/analysis.json" \
   --text-output "$RUN_ROOT/analysis.txt"
 
@@ -197,4 +194,4 @@ require_nonempty "$RUN_ROOT/analysis.json"
 require_nonempty "$RUN_ROOT/analysis.txt"
 find "$RUN_ROOT" -type f ! -name sha256sums.txt -print0 \
   | sort -z | xargs -0 sha256sum > "$RUN_ROOT/sha256sums.txt"
-echo "lazy_start_full_song=PASS"
+echo "shared_rope_full_song_$PRECISION=PASS"

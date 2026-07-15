@@ -48,11 +48,16 @@ def _cache(*, dtype: torch.dtype = torch.float32):
     )
 
 
-def _signature(cache, *, self_sequence_length: int = 3):
+def _signature(
+    cache,
+    *,
+    self_sequence_length: int = 3,
+    dtype: torch.dtype = torch.float32,
+):
     return cache_write_signature(
         cache,
         self_sequence_length=self_sequence_length,
-        expected_dtype=torch.float32,
+        expected_dtype=dtype,
         expected_device="cpu",
     )
 
@@ -94,6 +99,16 @@ def test_cache_signature_fails_loudly_on_invalid_contracts():
     stale_cross.cross_attention_cache.layers[0].keys[..., 5, :].fill_(1)
     with pytest.raises(RuntimeError, match="beyond written length"):
         _signature(stale_cross)
+
+
+def test_cache_signature_supports_same_precision_fp16_audits():
+    cache = _cache(dtype=torch.float16)
+    baseline = _signature(cache, dtype=torch.float16)
+
+    cache.self_attention_cache.layers[1].values[..., 1, :].add_(1)
+    changed = _signature(cache, dtype=torch.float16)
+
+    assert baseline["aggregate_sha256"] != changed["aggregate_sha256"]
 
 
 def test_rng_signature_does_not_advance_cpu_rng_and_detects_progression():

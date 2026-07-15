@@ -234,8 +234,6 @@ def _generate_window(
     if int(generate_kwargs.get("num_beams", 1)) != 1:
         raise ValueError("optimized single runtime requires num_beams=1.")
     if collect_strict_exactness:
-        if precision != "fp32":
-            raise ValueError("strict exactness evidence requires FP32 inference")
         if not sync_model_timing:
             raise ValueError(
                 "strict exactness evidence requires synchronized profiling"

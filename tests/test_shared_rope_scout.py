@@ -106,11 +106,12 @@ def _calls(model):
     return [layer.self_attn.rotary_emb.calls for layer in model.layers]
 
 
-def test_shared_rope_is_exact_and_computes_once_per_group_per_forward():
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float16))
+def test_shared_rope_is_exact_and_computes_once_per_group_per_forward(dtype):
     baseline = _Model()
     candidate = _Model()
     candidate.load_state_dict(baseline.state_dict())
-    x = torch.tensor([[[0.25, -0.5, 0.75, 1.0]]])
+    x = torch.tensor([[[0.25, -0.5, 0.75, 1.0]]], dtype=dtype)
     position_ids = torch.tensor([[7]])
 
     expected = baseline(x, position_ids)
