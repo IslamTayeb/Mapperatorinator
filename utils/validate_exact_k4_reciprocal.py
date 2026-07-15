@@ -6,8 +6,17 @@ import argparse
 import json
 import math
 import statistics
+import sys
 from pathlib import Path
 from typing import Any, Mapping
+
+# The DCC wrapper launches this file directly.  In that mode Python adds the
+# ``utils`` directory, not the repository root, to sys.path, so sibling
+# ``utils.*`` modules are otherwise unavailable unless a test runner happened
+# to inject the checkout through PYTHONPATH.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from utils import analyze_fp32_fresh_baseline as strict
 from utils import nsight_agent_profile as nsight

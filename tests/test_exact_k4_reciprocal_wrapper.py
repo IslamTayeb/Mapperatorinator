@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -65,9 +66,12 @@ def test_candidate_runner_installs_only_exact_k4_context():
 
 
 def test_validator_cli_is_importable():
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
     result = subprocess.run(
         [sys.executable, "utils/validate_exact_k4_reciprocal.py", "--help"],
         cwd=ROOT,
+        env=env,
         capture_output=True,
         text=True,
         check=False,
