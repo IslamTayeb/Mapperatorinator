@@ -9,6 +9,12 @@ from utils.analyze_reciprocal_full_song_candidate import (
     analyze,
     text_report,
 )
+from utils.analyze_weight_only_precision_matrix import (
+    ALL_ROLES as PRECISION_MATRIX_ROLES,
+    analyze as analyze_precision_matrix,
+    text_report as precision_matrix_text_report,
+)
+from utils.fixed_seed_inference import SEED_POLICY_VERSION
 
 
 STAGE_NAMES = (
@@ -191,6 +197,11 @@ def _profile(
             "optimized_runtime_owner": "osuT5.osuT5.inference.optimized.single.engine",
             "optimized_result_class": "documented-drift",
             "result_file_path": str(result_path),
+            "reciprocal_seed_policy": SEED_POLICY_VERSION,
+            "reciprocal_rng_cpu_sha256_timing_context": "1" * 64,
+            "reciprocal_rng_cuda_sha256_timing_context": "2" * 64,
+            "reciprocal_rng_cpu_sha256_main_generation": "3" * 64,
+            "reciprocal_rng_cuda_sha256_main_generation": "4" * 64,
         },
         "stages": _stages(
             timing_wall=timing_model_seconds + 0.4,
@@ -368,3 +379,71 @@ def test_stage_schema_must_match_across_all_four_runs(tmp_path: Path) -> None:
 
     with pytest.raises(CandidateAnalysisError, match="stage sequence"):
         analyze(profiles)
+
+
+def test_weight_only_precision_matrix_requires_exact_fp16_self_repeat(
+    tmp_path: Path,
+) -> None:
+    reciprocal_profiles = _four_runs(tmp_path)
+    reciprocal = analyze(reciprocal_profiles, mode="relaxed")
+    matrix_profiles = {
+        "candidate_first": reciprocal_profiles["candidate_first"],
+        "candidate_second": reciprocal_profiles["candidate_second"],
+        "accepted_fp16_first": _write_run(
+            tmp_path,
+            "accepted_fp16_first",
+            main_seconds=7.0,
+            precision="fp16",
+            main_tokens=[20, 21, 22],
+        ),
+        "accepted_fp16_second": _write_run(
+            tmp_path,
+            "accepted_fp16_second",
+            main_seconds=7.2,
+            precision="fp16",
+            main_tokens=[20, 21, 22],
+        ),
+    }
+
+    report = analyze_precision_matrix(matrix_profiles, reciprocal)
+
+    assert set(matrix_profiles) == set(PRECISION_MATRIX_ROLES)
+    assert report["repeatability"]["accepted_fp16"]["final_osu_equal"] is True
+    assert report["performance"]["groups"]["fp32_reference"][
+        "fixed_work_main_seconds"
+    ] == pytest.approx(8_294 / ((4 / 10.0 + 4 / 10.4) / 2))
+    assert report["performance"]["groups"]["accepted_fp16"]["main_tps"] > 0
+    assert report["mixed_weight_vs_accepted_fp16"][
+        "token_and_stopping_divergence"
+    ]["main_generation"]["token_stream_equal"] is False
+    assert "mixed_weight_vs_fp16.main_generation=" in precision_matrix_text_report(
+        report
+    )
+
+
+def test_weight_only_precision_matrix_rejects_fp16_token_instability(
+    tmp_path: Path,
+) -> None:
+    reciprocal_profiles = _four_runs(tmp_path)
+    reciprocal = analyze(reciprocal_profiles, mode="relaxed")
+    matrix_profiles = {
+        "candidate_first": reciprocal_profiles["candidate_first"],
+        "candidate_second": reciprocal_profiles["candidate_second"],
+        "accepted_fp16_first": _write_run(
+            tmp_path,
+            "accepted_fp16_first",
+            main_seconds=7.0,
+            precision="fp16",
+            main_tokens=[20, 21, 22],
+        ),
+        "accepted_fp16_second": _write_run(
+            tmp_path,
+            "accepted_fp16_second",
+            main_seconds=7.2,
+            precision="fp16",
+            main_tokens=[20, 99, 22],
+        ),
+    }
+
+    with pytest.raises(CandidateAnalysisError, match="FP16 token stream"):
+        analyze_precision_matrix(matrix_profiles, reciprocal)

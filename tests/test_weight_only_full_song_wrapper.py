@@ -15,12 +15,13 @@ def test_weight_only_full_song_wrapper_has_valid_bash_syntax() -> None:
     subprocess.run(["bash", "-n", str(WRAPPER)], check=True)
 
 
-def test_wrapper_uses_full_fp32_optimized_reciprocal_order_and_launchers() -> None:
+def test_wrapper_uses_fp32_reciprocal_then_deterministic_fp16_controls() -> None:
     source = WRAPPER.read_text(encoding="utf-8")
 
     assert "PROFILE_CONFIG=${PROFILE_CONFIG:-profile_salvalai}" in source
     assert '[[ "$PROFILE_CONFIG" != profile_salvalai ]]' in source
-    assert "precision=fp32" in source
+    assert 'local precision=${5:-fp32}' in source
+    assert 'precision="$precision"' in source
     assert "inference_engine=optimized" in source
     assert "profile_detail_ranges=false" in source
     assert "profile_cuda_capture=false" in source
@@ -34,6 +35,8 @@ def test_wrapper_uses_full_fp32_optimized_reciprocal_order_and_launchers() -> No
     assert source.count("run_profile candidate_first") == 1
     assert source.count("run_profile candidate_second") == 1
     assert source.count("run_profile baseline_second") == 1
+    assert source.count("run_profile accepted_fp16_first") == 1
+    assert source.count("run_profile accepted_fp16_second") == 1
     assert source.index("run_profile baseline_first") < source.index(
         "run_profile candidate_first"
     )
@@ -43,6 +46,13 @@ def test_wrapper_uses_full_fp32_optimized_reciprocal_order_and_launchers() -> No
     assert source.index("run_profile candidate_second") < source.index(
         "run_profile baseline_second"
     )
+    assert source.index("run_profile baseline_second") < source.index(
+        "run_profile accepted_fp16_first"
+    )
+    assert source.index("run_profile accepted_fp16_first") < source.index(
+        "run_profile accepted_fp16_second"
+    )
+    assert '0 fp16' in source
 
 
 def test_wrapper_isolates_native_extensions_and_keeps_compiler_caches_per_run() -> None:
@@ -130,6 +140,10 @@ def test_wrapper_requires_initialization_evidence_and_relaxed_analyzer_outputs()
     assert '"$RUN_ROOT/reciprocal-analysis.json"' in source
     assert '"$RUN_ROOT/reciprocal-analysis.txt"' in source
     assert "parity.claim=relaxed-nonexact" in source
+    assert "utils/analyze_weight_only_precision_matrix.py" in source
+    assert '"$RUN_ROOT/precision-matrix-analysis.json"' in source
+    assert '"$RUN_ROOT/precision-matrix-analysis.txt"' in source
+    assert "exactness_claim=false" in source
 
 
 def test_wrapper_fails_loudly_on_weight_only_profile_dispatch_contract() -> None:
@@ -145,6 +159,8 @@ def test_wrapper_fails_loudly_on_weight_only_profile_dispatch_contract() -> None
         "candidate_first",
         "candidate_second",
         "baseline_second",
+        "accepted_fp16_first",
+        "accepted_fp16_second",
     ):
         assert f'"$RUN_ROOT/{role}.weight-only-validation.json"' in source
 

@@ -211,7 +211,6 @@ trap finalize EXIT
 COMMON_OVERRIDES=(
   audio_path="$AUDIO"
   device=cuda
-  precision=fp32
   attn_implementation=sdpa
   inference_engine=optimized
   use_server=false
@@ -308,6 +307,7 @@ run_profile() {
   local repo=$2
   local extension_dir=$3
   local candidate=$4
+  local precision=${5:-fp32}
   local output="$RUN_ROOT/$role"
   local compiler_cache="$RUN_ROOT/compiler-cache/$role"
   local init_json="$RUN_ROOT/candidate-initialization/$role.json"
@@ -317,6 +317,14 @@ run_profile() {
   fi
   if [[ -e "$output" || -e "$compiler_cache" ]]; then
     echo "run paths already exist for $role" >&2
+    exit 2
+  fi
+  if [[ "$precision" != fp32 && "$precision" != fp16 ]]; then
+    echo "unsupported precision for $role: $precision" >&2
+    exit 2
+  fi
+  if [[ "$candidate" == 1 && "$precision" != fp32 ]]; then
+    echo "mixed-weight candidate requires FP32 state, got $precision" >&2
     exit 2
   fi
   mkdir -p "$output" \
@@ -332,6 +340,7 @@ run_profile() {
         --config-name "$PROFILE_CONFIG" \
         --output-init-json "$init_json" \
         output_path="$output" \
+        precision="$precision" \
         "${COMMON_OVERRIDES[@]}" \
         "${legacy_reset[@]}"
     else
@@ -339,6 +348,7 @@ run_profile() {
         --config-name "$PROFILE_CONFIG" \
         --target-repo "$BASELINE_REPO" \
         output_path="$output" \
+        precision="$precision" \
         "${COMMON_OVERRIDES[@]}" \
         "${legacy_reset[@]}"
     fi
@@ -401,11 +411,15 @@ run_profile candidate_first "$CANDIDATE_REPO" "$CANDIDATE_TORCH_EXTENSIONS_DIR" 
 run_profile candidate_second "$CANDIDATE_REPO" "$CANDIDATE_TORCH_EXTENSIONS_DIR" 1
 preload_baseline_extensions baseline_second
 run_profile baseline_second "$BASELINE_REPO" "$BASELINE_TORCH_EXTENSIONS_DIR" 0
+run_profile accepted_fp16_first "$BASELINE_REPO" "$BASELINE_TORCH_EXTENSIONS_DIR" 0 fp16
+run_profile accepted_fp16_second "$BASELINE_REPO" "$BASELINE_TORCH_EXTENSIONS_DIR" 0 fp16
 
 BASELINE_FIRST=$(<"$RUN_ROOT/baseline_first.profile-path.txt")
 CANDIDATE_FIRST=$(<"$RUN_ROOT/candidate_first.profile-path.txt")
 CANDIDATE_SECOND=$(<"$RUN_ROOT/candidate_second.profile-path.txt")
 BASELINE_SECOND=$(<"$RUN_ROOT/baseline_second.profile-path.txt")
+ACCEPTED_FP16_FIRST=$(<"$RUN_ROOT/accepted_fp16_first.profile-path.txt")
+ACCEPTED_FP16_SECOND=$(<"$RUN_ROOT/accepted_fp16_second.profile-path.txt")
 
 "$PYTHON" - "$RUN_ROOT" "$BASELINE_COMMIT" \
   "$BASELINE_TORCH_EXTENSIONS_DIR" <<'PY'
@@ -556,6 +570,15 @@ PY
     --mode relaxed \
     --json-output "$RUN_ROOT/reciprocal-analysis.json" \
     --text-output "$RUN_ROOT/reciprocal-analysis.txt"
+
+  "$PYTHON" utils/analyze_weight_only_precision_matrix.py \
+    --candidate-first-profile "$CANDIDATE_FIRST" \
+    --candidate-second-profile "$CANDIDATE_SECOND" \
+    --accepted-fp16-first-profile "$ACCEPTED_FP16_FIRST" \
+    --accepted-fp16-second-profile "$ACCEPTED_FP16_SECOND" \
+    --reciprocal-report "$RUN_ROOT/reciprocal-analysis.json" \
+    --json-output "$RUN_ROOT/precision-matrix-analysis.json" \
+    --text-output "$RUN_ROOT/precision-matrix-analysis.txt"
 )
 
 for artifact in \
@@ -569,8 +592,12 @@ for artifact in \
   "$RUN_ROOT/candidate_first.weight-only-validation.json" \
   "$RUN_ROOT/candidate_second.weight-only-validation.json" \
   "$RUN_ROOT/baseline_second.weight-only-validation.json" \
+  "$RUN_ROOT/accepted_fp16_first.weight-only-validation.json" \
+  "$RUN_ROOT/accepted_fp16_second.weight-only-validation.json" \
   "$RUN_ROOT/reciprocal-analysis.json" \
-  "$RUN_ROOT/reciprocal-analysis.txt"; do
+  "$RUN_ROOT/reciprocal-analysis.txt" \
+  "$RUN_ROOT/precision-matrix-analysis.json" \
+  "$RUN_ROOT/precision-matrix-analysis.txt"; do
   if [[ ! -s "$artifact" ]]; then
     echo "missing required artifact: $artifact" >&2
     exit 2
@@ -579,6 +606,8 @@ done
 
 grep -q '^mode=relaxed$' "$RUN_ROOT/reciprocal-analysis.txt"
 grep -q '^parity.claim=relaxed-nonexact$' "$RUN_ROOT/reciprocal-analysis.txt"
+grep -q '^result_class=documented-drift$' "$RUN_ROOT/precision-matrix-analysis.txt"
+grep -q '^exactness_claim=false$' "$RUN_ROOT/precision-matrix-analysis.txt"
 find "$RUN_ROOT" -type f \
   \( -name '*.profile.json' -o -name '*analysis.json' -o -name '*summary.json' \) \
   -print0 | sort -z | xargs -0 sha256sum
