@@ -1,521 +1,604 @@
-"""Analyze reciprocal full-song encoder-store profiles and the B1/B16 drift audit."""
+"""Analyze the strict-FP32 all-window encoder-precompute ladder."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 from osuT5.osuT5.inference.optimized.scout.encoder_store import (
     STORE_VERSION,
     SUPPORTED_LABELS,
 )
-from utils.fixed_seed_inference import SEED_POLICY_VERSION, stage_seed
-from utils.summarize_inference_profile import compare_reciprocal_profiles
+from utils import analyze_fp32_fresh_baseline as baseline
+from utils import nsight_agent_profile as nsight
+
+
+SCHEMA_VERSION = "mapperatorinator.strict-fp32-encoder-precompute.v1"
+DEFAULT_BATCH_SIZES = (1, 2, 4, 8, 16)
+MINIMUM_REQUEST_SAVING_FRACTION = 0.05
+RTX_2080_TI_TOTAL_BYTES = 11_264 * 1024 * 1024
+
+
+class EncoderGateError(RuntimeError):
+    pass
 
 
 def _load(path: Path, *, name: str) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"cannot read {name} {path}: {exc}") from exc
+        raise EncoderGateError(f"cannot read {name} {path}: {exc}") from exc
     if not isinstance(value, dict):
-        raise ValueError(f"{name} must contain a JSON object")
+        raise EncoderGateError(f"{name} must contain a JSON object")
     return value
 
 
-def _number(value: Any, *, name: str, positive: bool = False) -> float:
+def _finite(value: Any, *, name: str, positive: bool = False) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{name} must be numeric")
+        raise EncoderGateError(f"{name} must be numeric")
     result = float(value)
     if not math.isfinite(result) or result < 0 or (positive and result <= 0):
-        raise ValueError(f"{name} must be finite and non-negative")
+        raise EncoderGateError(f"{name} must be finite and non-negative")
     return result
 
 
-def _records(profile: dict[str, Any], label: str) -> list[dict[str, Any]]:
-    result = [
-        row
-        for row in profile.get("generation", [])
-        if isinstance(row, dict) and row.get("profile_label") == label
-    ]
-    if not result:
-        raise ValueError(f"profile is missing generation label {label!r}")
-    return result
+def _integer(value: Any, *, name: str, positive: bool = False) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise EncoderGateError(f"{name} must be an integer")
+    if value < 0 or (positive and value <= 0):
+        raise EncoderGateError(f"{name} must be non-negative")
+    return value
 
 
-def _tokens(profile: dict[str, Any], label: str) -> list[int]:
-    result: list[int] = []
-    for index, row in enumerate(_records(profile, label)):
-        value = row.get("generated_token_ids")
-        if not isinstance(value, list):
-            raise ValueError(f"{label}[{index}] lacks generated_token_ids")
-        result.extend(int(token) for token in value)
-    return result
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-def _token_comparison(reference: list[int], candidate: list[int]) -> dict[str, Any]:
-    aligned = min(len(reference), len(candidate))
-    mismatches = sum(
-        left != right
-        for left, right in zip(reference[:aligned], candidate[:aligned], strict=True)
-    )
-    first = next(
-        (
-            index
-            for index, (left, right) in enumerate(
-                zip(reference[:aligned], candidate[:aligned], strict=True)
-            )
-            if left != right
-        ),
-        None,
-    )
-    if first is None and len(reference) != len(candidate):
-        first = aligned
-    return {
-        "reference_count": len(reference),
-        "candidate_count": len(candidate),
-        "count_delta": len(candidate) - len(reference),
-        "aligned_count": aligned,
-        "aligned_mismatch_count": mismatches,
-        "aligned_mismatch_fraction": mismatches / aligned if aligned else 0.0,
-        "first_mismatch": first,
-        "exact": reference == candidate,
-    }
+def _profile_and_result(run_dir: Path) -> tuple[dict[str, Any], Path]:
+    profile_path = baseline._path_from_pointer(run_dir, "profile-path.txt")
+    result_path = baseline._path_from_pointer(run_dir, "result-path.txt")
+    return nsight._load_inference_profile(profile_path), result_path
 
 
-def _stage(profile: dict[str, Any], name: str) -> float:
-    matches = [
-        row
-        for row in profile.get("stages", [])
-        if isinstance(row, dict) and row.get("name") == name
-    ]
-    if len(matches) != 1:
-        raise ValueError(f"profile requires exactly one {name!r} stage")
-    return _number(matches[0].get("wall_seconds"), name=f"stage.{name}")
-
-
-def _complete_wall(profile: dict[str, Any]) -> float:
-    stages = [row for row in profile.get("stages", []) if isinstance(row, dict)]
-    if not stages:
-        raise ValueError("profile stages are empty")
-    started = _number(
-        stages[0].get("started_at_perf_counter_seconds"),
-        name="first stage start",
-    )
-    finished = _number(
-        stages[-1].get("finished_at_perf_counter_seconds"),
-        name="last stage finish",
-    )
-    if finished <= started:
-        raise ValueError("profile complete wall is not positive")
-    return finished - started
-
-
-def _label_metrics(profile: dict[str, Any], label: str) -> dict[str, Any]:
-    rows = _records(profile, label)
-    tokens = sum(int(row.get("generated_tokens", 0) or 0) for row in rows)
-    model = sum(
-        _number(
-            row.get("model_elapsed_seconds"),
-            name=f"{label}.model_elapsed_seconds",
-            positive=True,
+def _strict_runtime(
+    profile: Mapping[str, Any],
+    *,
+    expected_commit: str,
+    expected_branch: str,
+    audit: bool,
+) -> None:
+    try:
+        baseline._runtime_contract(
+            profile,
+            expected_commit=expected_commit,
+            expected_branch=expected_branch,
+            exactness_audit=audit,
         )
-        for row in rows
-    )
-    outer = sum(
-        _number(row.get("wall_seconds"), name=f"{label}.wall_seconds")
-        for row in rows
-    )
-    return {
-        "records": len(rows),
-        "tokens": tokens,
-        "model_seconds": model,
-        "outer_seconds": outer,
-        "tokens_per_second": tokens / model,
-        "per_window_generated_tokens": [
-            int(row.get("generated_tokens", 0) or 0) for row in rows
-        ],
-    }
+    except baseline.BaselineError as exc:
+        raise EncoderGateError(str(exc)) from exc
 
 
-def _profile_metrics(profile: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "timing": _label_metrics(profile, "timing_context"),
-        "main": _label_metrics(profile, "main_generation"),
-        "timing_stage_seconds": _stage(profile, "timing_context_generation"),
-        "main_stage_seconds": _stage(profile, "main_generation"),
-        "complete_request_seconds": _complete_wall(profile),
-    }
-
-
-def _validate_seed_metadata(profile: dict[str, Any], *, base_seed: int) -> None:
-    metadata = profile.get("metadata")
-    if not isinstance(metadata, dict):
-        raise ValueError("profile metadata is missing")
-    if metadata.get("reciprocal_seed_policy") != SEED_POLICY_VERSION:
-        raise ValueError("profile reciprocal seed policy is missing")
-    for label in SUPPORTED_LABELS:
-        if metadata.get(f"reciprocal_seed_{label}") != stage_seed(base_seed, label):
-            raise ValueError(f"profile reciprocal seed changed for {label}")
-
-
-def _validate_candidate_store(
-    profile: dict[str, Any],
-    evidence: dict[str, Any],
+def _store_contract(
+    profile: Mapping[str, Any],
+    evidence: Mapping[str, Any],
     *,
     batch_size: int,
 ) -> dict[str, Any]:
     metadata = profile.get("metadata")
     if not isinstance(metadata, dict):
-        raise ValueError("candidate profile metadata is missing")
-    store = metadata.get("optimized_batched_encoder_store")
-    if not isinstance(store, dict):
-        raise ValueError("candidate profile lacks encoder-store metadata")
-    external = evidence.get("encoder_store")
-    if not isinstance(external, dict):
-        raise ValueError("candidate evidence lacks encoder_store")
+        raise EncoderGateError("candidate profile metadata is missing")
+    profile_store = metadata.get("optimized_batched_encoder_store")
+    external_store = evidence.get("encoder_store")
+    if not isinstance(profile_store, dict) or not isinstance(external_store, dict):
+        raise EncoderGateError("candidate encoder-store evidence is missing")
+    if profile_store != external_store:
+        raise EncoderGateError("profile and external encoder-store evidence differ")
     required = {
         "version": STORE_VERSION,
+        "production_default": False,
+        "selector_changes": False,
+        "decoder_changes": False,
+        "model_forward_changes": False,
+        "server_changes": False,
+        "precision": "fp32",
+        "strict_fp32": True,
+        "strict_exactness_required_for_promotion": True,
         "batch_size": batch_size,
         "labels_completed": list(SUPPORTED_LABELS),
-        "production_default": False,
+        "active_processor_count": 0,
     }
     failures = {
-        key: {"expected": expected, "profile": store.get(key), "evidence": external.get(key)}
+        key: {"expected": expected, "actual": external_store.get(key)}
         for key, expected in required.items()
-        if store.get(key) != expected or external.get(key) != expected
+        if external_store.get(key) != expected
     }
-    for key in (
-        "store_count",
-        "shared_across_timing_main",
-        "total_complete_precompute_seconds",
-        "total_output_store_bytes",
-    ):
-        if store.get(key) != external.get(key):
-            failures[key] = {
-                "profile": store.get(key),
-                "evidence": external.get(key),
-            }
     if failures:
-        raise ValueError(f"candidate encoder-store evidence mismatch: {failures}")
-    profile_entries = store.get("entries")
-    external_entries = external.get("entries")
-    if not isinstance(profile_entries, list) or not isinstance(external_entries, list):
-        raise ValueError("candidate encoder-store entries are missing")
-    if len(profile_entries) != len(external_entries):
-        raise ValueError("candidate encoder-store entry count changed")
-    labels_seen: list[str] = []
-    for index, (profile_entry, external_entry) in enumerate(
-        zip(profile_entries, external_entries, strict=True)
-    ):
-        for key in (
-            "entry_index",
-            "labels",
-            "live_window_count",
-            "output_store_bytes",
-            "conditioning_sha256",
-            "complete_precompute_seconds",
+        raise EncoderGateError(f"candidate store contract changed: {failures}")
+    entries = external_store.get("entries")
+    if not isinstance(entries, list) or len(entries) not in {1, 2}:
+        raise EncoderGateError("candidate must expose one shared or two stage stores")
+    total_complete = 0.0
+    total_bytes = 0
+    labels: list[str] = []
+    charged_entries: list[dict[str, Any]] = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise EncoderGateError(f"store entry {index} must be an object")
+        times = {
+            key: _finite(entry.get(key), name=f"entry[{index}].{key}")
+            for key in (
+                "batch_setup_seconds",
+                "input_copy_seconds",
+                "encoder_synchronized_seconds",
+                "storage_allocation_seconds",
+                "output_store_copy_seconds",
+                "complete_precompute_seconds",
+            )
+        }
+        if times["encoder_synchronized_seconds"] <= 0:
+            raise EncoderGateError(f"store entry {index} encoder time is not positive")
+        accounted = sum(
+            times[key]
+            for key in (
+                "batch_setup_seconds",
+                "input_copy_seconds",
+                "encoder_synchronized_seconds",
+                "storage_allocation_seconds",
+                "output_store_copy_seconds",
+            )
+        )
+        if accounted > times["complete_precompute_seconds"] + 0.02:
+            raise EncoderGateError(
+                f"store entry {index} component timings exceed complete wall"
+            )
+        memory = {
+            key: _integer(entry.get(key), name=f"entry[{index}].{key}")
+            for key in (
+                "output_store_bytes",
+                "baseline_allocated_vram_bytes",
+                "baseline_reserved_vram_bytes",
+                "peak_allocated_vram_bytes",
+                "peak_reserved_vram_bytes",
+                "incremental_peak_allocated_vram_bytes",
+                "incremental_peak_reserved_vram_bytes",
+            )
+        }
+        if memory["output_store_bytes"] <= 0:
+            raise EncoderGateError(f"store entry {index} output storage is empty")
+        if (
+            memory["peak_allocated_vram_bytes"]
+            - memory["baseline_allocated_vram_bytes"]
+            != memory["incremental_peak_allocated_vram_bytes"]
         ):
-            if profile_entry.get(key) != external_entry.get(key):
-                raise ValueError(
-                    f"candidate encoder-store entry {index} field {key} changed"
-                )
-        labels_seen.extend(external_entry.get("labels", []))
-        uses = external_entry.get("uses")
-        if not isinstance(uses, dict):
-            raise ValueError(f"candidate encoder-store entry {index} uses are missing")
-        for label in external_entry.get("labels", []):
+            raise EncoderGateError(f"store entry {index} allocated delta is invalid")
+        if memory["incremental_peak_allocated_vram_bytes"] < memory["output_store_bytes"]:
+            raise EncoderGateError(f"store entry {index} does not charge output storage")
+        uses = entry.get("uses")
+        entry_labels = entry.get("labels")
+        if not isinstance(uses, dict) or not isinstance(entry_labels, list):
+            raise EncoderGateError(f"store entry {index} reuse evidence is missing")
+        for label in entry_labels:
             row = uses.get(label)
-            if not isinstance(row, dict) or row.get("rows_reused", 0) <= 0:
-                raise ValueError(f"candidate did not reuse encoder rows for {label}")
-    if sorted(labels_seen) != sorted(SUPPORTED_LABELS):
-        raise ValueError(f"candidate store labels changed: {labels_seen}")
-    return external
+            if not isinstance(row, dict):
+                raise EncoderGateError(f"store entry {index} lacks use {label}")
+            if _integer(row.get("rows_reused"), name=f"entry[{index}].{label}.rows", positive=True) <= 0:
+                raise EncoderGateError(f"store entry {index} reused no rows")
+            if row.get("per_window_device_copy") is not False:
+                raise EncoderGateError("encoder store performs a per-window device copy")
+        labels.extend(str(label) for label in entry_labels)
+        total_complete += times["complete_precompute_seconds"]
+        total_bytes += memory["output_store_bytes"]
+        charged_entries.append({**times, **memory, "labels": entry_labels})
+    if sorted(labels) != sorted(SUPPORTED_LABELS):
+        raise EncoderGateError(f"store stage labels changed: {labels}")
+    if not math.isclose(
+        _finite(
+            external_store.get("total_complete_precompute_seconds"),
+            name="total_complete_precompute_seconds",
+        ),
+        total_complete,
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        raise EncoderGateError("store total precompute wall does not reconcile")
+    if _integer(
+        external_store.get("total_output_store_bytes"),
+        name="total_output_store_bytes",
+        positive=True,
+    ) != total_bytes:
+        raise EncoderGateError("store total output bytes do not reconcile")
+    return {
+        "entry_count": len(entries),
+        "shared_across_timing_main": external_store.get(
+            "shared_across_timing_main"
+        ),
+        "complete_precompute_seconds": total_complete,
+        "output_store_bytes": total_bytes,
+        "peak_allocated_vram_bytes": max(
+            entry["peak_allocated_vram_bytes"] for entry in charged_entries
+        ),
+        "incremental_peak_allocated_vram_bytes": sum(
+            entry["incremental_peak_allocated_vram_bytes"]
+            for entry in charged_entries
+        ),
+        "entries": charged_entries,
+    }
 
 
-def _baseline_has_no_store(profile: dict[str, Any]) -> None:
-    metadata = profile.get("metadata")
-    if not isinstance(metadata, dict):
-        raise ValueError("baseline profile metadata is missing")
-    if "optimized_batched_encoder_store" in metadata:
-        raise ValueError("baseline unexpectedly contains encoder-store metadata")
+def _label_signature(profile: Mapping[str, Any], label: str) -> dict[str, Any]:
+    value = nsight._profile_label_signature(profile, label)
+    if value.get("status") != "available" or not value.get("self_consistent"):
+        raise EncoderGateError(f"{label} token/stopping signature is unavailable")
+    return value
 
 
-def _osu_structure(path: Path) -> dict[str, int]:
-    section = None
-    counts = {"hit_objects": 0, "timing_points": 0}
-    for raw in path.read_text(encoding="utf-8-sig").splitlines():
-        line = raw.strip()
-        if line.startswith("[") and line.endswith("]"):
-            section = line
-            continue
-        if not line or line.startswith("//"):
-            continue
-        if section == "[HitObjects]":
-            counts["hit_objects"] += 1
-        elif section == "[TimingPoints]":
-            counts["timing_points"] += 1
-    return counts
+def _candidate_metrics(profile: Mapping[str, Any]) -> dict[str, Any]:
+    result = {
+        label: baseline._label_metrics(profile, label) for label in SUPPORTED_LABELS
+    }
+    result["request_to_final_osu_wall_seconds"] = baseline._request_wall_seconds(
+        profile
+    )
+    result["peak_cuda_memory_mb"] = baseline._peak_memory_mb(profile)
+    return result
+
+
+def _drift_row(audit: Mapping[str, Any], batch_size: int, *, name: str) -> dict[str, Any]:
+    metadata = audit.get("metadata")
+    variants = audit.get("variants")
+    if not isinstance(metadata, dict) or not isinstance(variants, dict):
+        raise EncoderGateError(f"{name} encoder audit is malformed")
+    if metadata.get("batch_sizes") != list(DEFAULT_BATCH_SIZES):
+        raise EncoderGateError(f"{name} encoder audit batch ladder changed")
+    row = variants.get(str(batch_size))
+    if not isinstance(row, dict):
+        raise EncoderGateError(f"{name} encoder audit lacks B{batch_size}")
+    drift = row.get("encoder_drift_vs_b1")
+    if not isinstance(drift, dict):
+        raise EncoderGateError(f"{name} B{batch_size} lacks drift")
+    windows = _integer(drift.get("window_count"), name=f"{name}.windows", positive=True)
+    exact_windows = _integer(
+        drift.get("exact_window_count"), name=f"{name}.exact_windows"
+    )
+    max_abs = _finite(drift.get("max_abs"), name=f"{name}.max_abs")
+    return {
+        "live_window_count": windows,
+        "exact_window_count": exact_windows,
+        "max_abs": max_abs,
+        "mean_window_max_abs": _finite(
+            drift.get("mean_window_max_abs"), name=f"{name}.mean_window_max_abs"
+        ),
+        "encoder_exact": exact_windows == windows and max_abs == 0.0,
+        "complete_precompute_seconds": _finite(
+            row.get("complete_precompute_seconds"),
+            name=f"{name}.complete_precompute_seconds",
+            positive=True,
+        ),
+        "complete_seconds_saved_vs_b1": float(
+            row.get("complete_seconds_saved_vs_b1")
+        ),
+        "input_copy_seconds": _finite(
+            row.get("input_copy_seconds"), name=f"{name}.input_copy_seconds"
+        ),
+        "storage_allocation_seconds": _finite(
+            row.get("storage_allocation_seconds"),
+            name=f"{name}.storage_allocation_seconds",
+        ),
+        "output_store_copy_seconds": _finite(
+            row.get("output_store_copy_seconds"),
+            name=f"{name}.output_store_copy_seconds",
+        ),
+        "output_store_bytes": _integer(
+            row.get("output_store_bytes"),
+            name=f"{name}.output_store_bytes",
+            positive=True,
+        ),
+        "incremental_peak_vram_bytes": _integer(
+            row.get("incremental_peak_vram_bytes"),
+            name=f"{name}.incremental_peak_vram_bytes",
+            positive=True,
+        ),
+    }
 
 
 def analyze(
-    profile_paths: dict[str, Path],
-    evidence_paths: dict[str, Path],
-    audit_paths: dict[str, Path],
+    baseline_run_root: Path,
+    candidate_run_root: Path,
     *,
-    batch_size: int,
-    base_seed: int,
+    main_audit_path: Path,
+    timing_audit_path: Path,
+    expected_commit: str,
+    expected_branch: str,
+    batch_sizes: Sequence[int] = DEFAULT_BATCH_SIZES,
 ) -> dict[str, Any]:
-    profiles = {
-        role: _load(path, name=f"{role} profile")
-        for role, path in profile_paths.items()
-    }
-    evidence = {
-        role: _load(path, name=f"{role} evidence")
-        for role, path in evidence_paths.items()
-    }
-    for profile in profiles.values():
-        _validate_seed_metadata(profile, base_seed=base_seed)
-    for role in ("baseline_first", "baseline_second"):
-        _baseline_has_no_store(profiles[role])
-        if evidence[role].get("mode") != "baseline":
-            raise ValueError(f"{role} evidence mode changed")
-    stores = {
-        role: _validate_candidate_store(
-            profiles[role],
-            evidence[role],
-            batch_size=batch_size,
+    batch_sizes = tuple(batch_sizes)
+    if batch_sizes != DEFAULT_BATCH_SIZES:
+        raise EncoderGateError(
+            f"strict encoder ladder must be {DEFAULT_BATCH_SIZES}, got {batch_sizes}"
         )
-        for role in ("candidate_second", "candidate_first")
+    if len(expected_commit) != 40:
+        raise EncoderGateError("expected commit must be a full SHA")
+    baseline_analysis = _load(
+        baseline_run_root / "analysis.json", name="baseline analysis"
+    )
+    if baseline_analysis.get("status") != "PASS":
+        raise EncoderGateError("fresh strict-FP32 baseline did not pass")
+    baseline_control, baseline_result = _profile_and_result(
+        baseline_run_root / "run-01"
+    )
+    baseline_audit, baseline_audit_result = _profile_and_result(
+        baseline_run_root / "exactness-audit"
+    )
+    baseline_exactness = baseline._strict_exactness_contract(baseline_audit)
+    baseline_workload = baseline._workload_contract(baseline_control)
+    baseline_preset = baseline._preset_contract(baseline_control)
+    baseline_records = baseline._record_contract(baseline_control)
+    baseline_output_sha = _sha256_file(baseline_result)
+    baseline_structure = nsight.summarize_osu_structure(baseline_result)
+    if _sha256_file(baseline_audit_result) != baseline_output_sha:
+        raise EncoderGateError("baseline control and exactness output bytes differ")
+    baseline_signatures = {
+        label: _label_signature(baseline_control, label)
+        for label in SUPPORTED_LABELS
     }
+    baseline_request_median = _finite(
+        baseline_analysis["aggregates"]["request_to_final_osu_wall_seconds"][
+            "median"
+        ],
+        name="baseline request median",
+        positive=True,
+    )
+    required_request_saving = (
+        baseline_request_median * MINIMUM_REQUEST_SAVING_FRACTION
+    )
+    main_audit = _load(main_audit_path, name="main encoder audit")
+    timing_audit = _load(timing_audit_path, name="timing encoder audit")
 
-    audits = {
-        role: _load(path, name=f"{role} encoder drift audit")
-        for role, path in audit_paths.items()
-    }
-    audit_rows: dict[str, dict[str, Any]] = {}
-    audit_window_counts = set()
-    for role, audit in audits.items():
-        audit_variant = audit.get("variants", {}).get(str(batch_size))
-        if not isinstance(audit_variant, dict):
-            raise ValueError(f"{role} drift audit lacks B{batch_size}")
-        drift = audit_variant.get("encoder_drift_vs_b1")
-        if not isinstance(drift, dict):
-            raise ValueError(f"{role} drift audit lacks B1 comparison")
-        audit_window_counts.add(audit.get("metadata", {}).get("live_window_count"))
-        audit_rows[role] = {
-            "b1_complete_precompute_seconds": audit["variants"]["1"][
-                "complete_precompute_seconds"
-            ],
-            "candidate_complete_precompute_seconds": audit_variant[
-                "complete_precompute_seconds"
-            ],
-            "complete_seconds_saved_vs_b1": audit_variant[
-                "complete_seconds_saved_vs_b1"
-            ],
-            "max_abs_encoder_drift": drift.get("max_abs"),
-            "mean_window_max_abs_encoder_drift": drift.get(
-                "mean_window_max_abs"
-            ),
-            "exact_window_count": drift.get("exact_window_count"),
-            "window_count": drift.get("window_count"),
-            "incremental_peak_vram_bytes": audit_variant.get(
-                "incremental_peak_vram_bytes"
-            ),
-            "output_store_bytes": audit_variant.get("output_store_bytes"),
-        }
-    if len(audit_window_counts) != 1:
-        raise ValueError("main and timing drift audits have different window counts")
-    audit_windows = next(iter(audit_window_counts))
-    for store in stores.values():
-        if any(
-            entry.get("live_window_count") != audit_windows
-            for entry in store["entries"]
+    variants: dict[str, Any] = {}
+    for batch_size in batch_sizes:
+        variant_dir = candidate_run_root / f"b{batch_size}"
+        control_dir = variant_dir / "control"
+        audit_dir = variant_dir / "exactness-audit"
+        control, control_result = _profile_and_result(control_dir)
+        exactness_profile, exactness_result = _profile_and_result(audit_dir)
+        _strict_runtime(
+            control,
+            expected_commit=expected_commit,
+            expected_branch=expected_branch,
+            audit=False,
+        )
+        _strict_runtime(
+            exactness_profile,
+            expected_commit=expected_commit,
+            expected_branch=expected_branch,
+            audit=True,
+        )
+        control_evidence = _load(
+            control_dir / "evidence.json", name=f"B{batch_size} control evidence"
+        )
+        audit_evidence = _load(
+            audit_dir / "evidence.json", name=f"B{batch_size} audit evidence"
+        )
+        if control_evidence.get("profile_pass_kind") != "untraced_control":
+            raise EncoderGateError(f"B{batch_size} control pass kind changed")
+        if audit_evidence.get("profile_pass_kind") != "exactness_audit":
+            raise EncoderGateError(f"B{batch_size} audit pass kind changed")
+        control_store = _store_contract(
+            control, control_evidence, batch_size=batch_size
+        )
+        audit_store = _store_contract(
+            exactness_profile, audit_evidence, batch_size=batch_size
+        )
+        if (
+            control_store["output_store_bytes"]
+            != audit_store["output_store_bytes"]
         ):
-            raise ValueError("drift audit and candidate store window counts differ")
+            raise EncoderGateError(f"B{batch_size} store size is not repeatable")
 
-    reciprocal = compare_reciprocal_profiles(
-        profile_paths["baseline_first"],
-        profile_paths["candidate_second"],
-        profile_paths["candidate_first"],
-        profile_paths["baseline_second"],
-        labels=["main_generation", "timing_context"],
-        regression_tolerance_pct=100.0,
-    )
-    metrics = {role: _profile_metrics(profile) for role, profile in profiles.items()}
-    order_pairs = (
-        ("baseline_first", "candidate_second"),
-        ("baseline_second", "candidate_first"),
-    )
-    orders: list[dict[str, Any]] = []
-    for baseline_role, candidate_role in order_pairs:
-        baseline = metrics[baseline_role]
-        candidate = metrics[candidate_role]
-        request_saved = (
-            baseline["complete_request_seconds"]
-            - candidate["complete_request_seconds"]
+        control_signatures = {
+            label: _label_signature(control, label) for label in SUPPORTED_LABELS
+        }
+        audit_signatures = {
+            label: _label_signature(exactness_profile, label)
+            for label in SUPPORTED_LABELS
+        }
+        control_output_sha = _sha256_file(control_result)
+        audit_output_sha = _sha256_file(exactness_result)
+        control_structure = nsight.summarize_osu_structure(control_result)
+        audit_structure = nsight.summarize_osu_structure(exactness_result)
+        candidate_exactness = baseline._strict_exactness_contract(
+            exactness_profile
         )
-        orders.append(
-            {
-                "baseline": baseline_role,
-                "candidate": candidate_role,
-                "complete_request_seconds_saved": request_saved,
-                "complete_request_speedup_pct": (
-                    request_saved / baseline["complete_request_seconds"] * 100.0
-                ),
-                "timing_stage_seconds_saved": (
-                    baseline["timing_stage_seconds"]
-                    - candidate["timing_stage_seconds"]
-                ),
-                "main_stage_seconds_saved": (
-                    baseline["main_stage_seconds"]
-                    - candidate["main_stage_seconds"]
-                ),
-                "timing_tokens": _token_comparison(
-                    _tokens(profiles[baseline_role], "timing_context"),
-                    _tokens(profiles[candidate_role], "timing_context"),
-                ),
-                "main_tokens": _token_comparison(
-                    _tokens(profiles[baseline_role], "main_generation"),
-                    _tokens(profiles[candidate_role], "main_generation"),
-                ),
-            }
+        main_drift = _drift_row(main_audit, batch_size, name="main")
+        timing_drift = _drift_row(timing_audit, batch_size, name="timing")
+        checks = {
+            "encoder_main_exact": main_drift["encoder_exact"],
+            "encoder_timing_exact": timing_drift["encoder_exact"],
+            "workload_control": baseline._workload_contract(control)
+            == baseline_workload,
+            "workload_audit": baseline._workload_contract(exactness_profile)
+            == baseline_workload,
+            "preset_control": baseline._preset_contract(control) == baseline_preset,
+            "preset_audit": baseline._preset_contract(exactness_profile)
+            == baseline_preset,
+            "dispatch_and_graph_control": baseline._record_contract(control)
+            == baseline_records,
+            "dispatch_and_graph_audit": baseline._record_contract(
+                exactness_profile
+            )
+            == baseline_records,
+            "strict_rng_and_cache": candidate_exactness == baseline_exactness,
+            "output_bytes_control": control_output_sha == baseline_output_sha,
+            "output_bytes_audit": audit_output_sha == baseline_output_sha,
+            "output_structure_control": control_structure == baseline_structure,
+            "output_structure_audit": audit_structure == baseline_structure,
+        }
+        for label in SUPPORTED_LABELS:
+            checks[f"{label}_tokens_control"] = (
+                control_signatures[label]["token_stream_sha256"]
+                == baseline_signatures[label]["token_stream_sha256"]
+            )
+            checks[f"{label}_stopping_control"] = (
+                control_signatures[label]["stopping_sha256"]
+                == baseline_signatures[label]["stopping_sha256"]
+            )
+            checks[f"{label}_tokens_audit"] = (
+                audit_signatures[label]["token_stream_sha256"]
+                == baseline_signatures[label]["token_stream_sha256"]
+            )
+            checks[f"{label}_stopping_audit"] = (
+                audit_signatures[label]["stopping_sha256"]
+                == baseline_signatures[label]["stopping_sha256"]
+            )
+        exact_pass = all(checks.values())
+        metrics = _candidate_metrics(control)
+        request_saving = (
+            baseline_request_median
+            - metrics["request_to_final_osu_wall_seconds"]
         )
+        request_saving_pass = request_saving >= required_request_saving
+        vram_pass = (
+            metrics["peak_cuda_memory_mb"] * 1024 * 1024
+            <= RTX_2080_TI_TOTAL_BYTES
+            and control_store["peak_allocated_vram_bytes"]
+            <= RTX_2080_TI_TOTAL_BYTES
+        )
+        promotion_pass = exact_pass and request_saving_pass and vram_pass
+        variants[str(batch_size)] = {
+            "classification": (
+                "strict-exact-and-fast"
+                if promotion_pass
+                else "strict-exact-insufficient-complete-wall-gain"
+                if exact_pass
+                else "documented-drift-not-promotion-eligible"
+            ),
+            "strict_exactness_pass": exact_pass,
+            "request_saving_pass": request_saving_pass,
+            "vram_pass": vram_pass,
+            "promotion_pass": promotion_pass,
+            "checks": checks,
+            "failed_checks": sorted(
+                name for name, passed in checks.items() if not passed
+            ),
+            "encoder_drift": {"main": main_drift, "timing": timing_drift},
+            "performance": {
+                "baseline_request_median_seconds": baseline_request_median,
+                "candidate_request_seconds": metrics[
+                    "request_to_final_osu_wall_seconds"
+                ],
+                "request_seconds_saved": request_saving,
+                "request_speedup_pct": request_saving
+                / baseline_request_median
+                * 100.0,
+                "required_request_seconds_saved": required_request_saving,
+                "runner_wall_seconds": _finite(
+                    control_evidence.get("run_wall_seconds"),
+                    name=f"B{batch_size}.runner_wall_seconds",
+                    positive=True,
+                ),
+                "peak_cuda_memory_mb": metrics["peak_cuda_memory_mb"],
+                "timing": metrics["timing_context"],
+                "main": metrics["main_generation"],
+            },
+            "store": control_store,
+            "output": {
+                "baseline_sha256": baseline_output_sha,
+                "control_sha256": control_output_sha,
+                "audit_sha256": audit_output_sha,
+                "structure": control_structure,
+            },
+        }
 
-    repeatability = {}
-    for label in SUPPORTED_LABELS:
-        repeatability[f"baseline_{label}"] = _token_comparison(
-            _tokens(profiles["baseline_first"], label),
-            _tokens(profiles["baseline_second"], label),
-        )
-        repeatability[f"candidate_{label}"] = _token_comparison(
-            _tokens(profiles["candidate_first"], label),
-            _tokens(profiles["candidate_second"], label),
-        )
-    candidate_artifacts = [
-        Path(profiles[role]["metadata"]["result_file_path"])
-        for role in ("candidate_first", "candidate_second")
+    winners = [
+        int(batch_size)
+        for batch_size, row in variants.items()
+        if row["promotion_pass"]
     ]
-    baseline_artifacts = [
-        Path(profiles[role]["metadata"]["result_file_path"])
-        for role in ("baseline_first", "baseline_second")
+    exact_variants = [
+        int(batch_size)
+        for batch_size, row in variants.items()
+        if row["strict_exactness_pass"]
     ]
-    repeatability_pass = all(row["exact"] for row in repeatability.values())
-    request_nonregression = all(
-        order["complete_request_seconds_saved"] >= 0.0 for order in orders
-    )
-    report = {
-        "schema_version": 1,
+    return {
+        "schema_version": SCHEMA_VERSION,
         "decision": (
-            "PASS_FULL_SONG_GATE"
-            if repeatability_pass and request_nonregression
-            else "STOP_ENCODER_STORE"
+            "PASS_STRICT_FP32_ENCODER_PRECOMPUTE"
+            if winners
+            else "STOP_ENCODER_PRECOMPUTE"
         ),
-        "batch_size": batch_size,
-        "profiles": {key: str(value) for key, value in profile_paths.items()},
-        "evidence": {key: str(value) for key, value in evidence_paths.items()},
-        "audit_paths": {key: str(value) for key, value in audit_paths.items()},
-        "audits": audit_rows,
-        "metrics": metrics,
-        "orders": orders,
-        "mean_complete_request_seconds_saved": sum(
-            order["complete_request_seconds_saved"] for order in orders
-        )
-        / len(orders),
-        "repeatability": repeatability,
-        "repeatability_pass": repeatability_pass,
-        "request_nonregression_pass": request_nonregression,
-        "baseline_output_repeat": {
-            "sha256_equal": profiles["baseline_first"]["metadata"].get(
-                "result_file_sha256"
-            )
-            == profiles["baseline_second"]["metadata"].get("result_file_sha256"),
-            "structure": [_osu_structure(path) for path in baseline_artifacts],
-        },
-        "candidate_output_repeat": {
-            "sha256_equal": profiles["candidate_first"]["metadata"].get(
-                "result_file_sha256"
-            )
-            == profiles["candidate_second"]["metadata"].get("result_file_sha256"),
-            "structure": [_osu_structure(path) for path in candidate_artifacts],
-        },
-        "reciprocal_exactness": reciprocal,
+        "production_changes": False,
+        "decoder_changes": False,
+        "server_changes": False,
+        "batch_sizes": list(batch_sizes),
+        "baseline_run_root": str(baseline_run_root),
+        "candidate_run_root": str(candidate_run_root),
+        "baseline_request_median_seconds": baseline_request_median,
+        "minimum_request_saving_fraction": MINIMUM_REQUEST_SAVING_FRACTION,
+        "minimum_request_saving_seconds": required_request_saving,
+        "strict_exact_batch_sizes": exact_variants,
+        "promotion_batch_sizes": winners,
+        "variants": variants,
     }
-    return report
 
 
-def _text(report: dict[str, Any]) -> str:
+def _text(report: Mapping[str, Any]) -> str:
     lines = [
         f"decision={report['decision']}",
-        f"batch_size={report['batch_size']}",
-        f"mean_complete_request_seconds_saved={report['mean_complete_request_seconds_saved']:.6f}",
-        f"main_encoder_max_abs_drift={report['audits']['main']['max_abs_encoder_drift']}",
-        f"timing_encoder_max_abs_drift={report['audits']['timing']['max_abs_encoder_drift']}",
-        f"main_encoder_precompute_seconds_saved={report['audits']['main']['complete_seconds_saved_vs_b1']}",
-        f"timing_encoder_precompute_seconds_saved={report['audits']['timing']['complete_seconds_saved_vs_b1']}",
-        f"repeatability_pass={str(report['repeatability_pass']).lower()}",
-        f"request_nonregression_pass={str(report['request_nonregression_pass']).lower()}",
+        f"baseline_request_median_seconds={report['baseline_request_median_seconds']:.6f}",
+        f"minimum_request_saving_seconds={report['minimum_request_saving_seconds']:.6f}",
+        "strict_exact_batch_sizes="
+        + ",".join(str(value) for value in report["strict_exact_batch_sizes"]),
+        "promotion_batch_sizes="
+        + ",".join(str(value) for value in report["promotion_batch_sizes"]),
     ]
-    for index, order in enumerate(report["orders"]):
-        lines.append(
-            f"order_{index}_complete_request_seconds_saved="
-            f"{order['complete_request_seconds_saved']:.6f}"
-        )
-        lines.append(
-            f"order_{index}_main_token_count_delta={order['main_tokens']['count_delta']}"
+    for batch_size, row in report["variants"].items():
+        lines.extend(
+            (
+                f"b{batch_size}_classification={row['classification']}",
+                f"b{batch_size}_strict_exact={str(row['strict_exactness_pass']).lower()}",
+                f"b{batch_size}_request_seconds_saved={row['performance']['request_seconds_saved']:.6f}",
+                f"b{batch_size}_main_encoder_max_abs={row['encoder_drift']['main']['max_abs']}",
+                f"b{batch_size}_timing_encoder_max_abs={row['encoder_drift']['timing']['max_abs']}",
+            )
         )
     return "\n".join(lines) + "\n"
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    for role in (
-        "baseline-first",
-        "candidate-second",
-        "candidate-first",
-        "baseline-second",
-    ):
-        parser.add_argument(f"--{role}-profile", type=Path, required=True)
-        parser.add_argument(f"--{role}-evidence", type=Path, required=True)
+    parser.add_argument("--baseline-run-root", type=Path, required=True)
+    parser.add_argument("--candidate-run-root", type=Path, required=True)
     parser.add_argument("--main-audit", type=Path, required=True)
     parser.add_argument("--timing-audit", type=Path, required=True)
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--base-seed", type=int, default=12345)
+    parser.add_argument("--expected-commit", required=True)
+    parser.add_argument("--expected-branch", required=True)
     parser.add_argument("--json-output", type=Path, required=True)
     parser.add_argument("--text-output", type=Path, required=True)
-    args = parser.parse_args()
-    keys = (
-        "baseline_first",
-        "candidate_second",
-        "candidate_first",
-        "baseline_second",
-    )
+    args = parser.parse_args(argv)
     report = analyze(
-        {
-            key: getattr(args, f"{key}_profile")
-            for key in keys
-        },
-        {
-            key: getattr(args, f"{key}_evidence")
-            for key in keys
-        },
-        {"main": args.main_audit, "timing": args.timing_audit},
-        batch_size=args.batch_size,
-        base_seed=args.base_seed,
+        args.baseline_run_root,
+        args.candidate_run_root,
+        main_audit_path=args.main_audit,
+        timing_audit_path=args.timing_audit,
+        expected_commit=args.expected_commit,
+        expected_branch=args.expected_branch,
     )
     args.json_output.parent.mkdir(parents=True, exist_ok=True)
     args.json_output.write_text(
-        json.dumps(report, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     args.text_output.write_text(_text(report), encoding="utf-8")
     print(_text(report), end="")
-    if report["decision"] != "PASS_FULL_SONG_GATE":
-        raise SystemExit(3)
+    return 0 if report["decision"] == "PASS_STRICT_FP32_ENCODER_PRECOMPUTE" else 3
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

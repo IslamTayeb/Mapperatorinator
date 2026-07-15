@@ -1,87 +1,142 @@
+from copy import deepcopy
+
 import pytest
 
 from osuT5.osuT5.inference.optimized.scout.encoder_store import STORE_VERSION
 from utils.analyze_encoder_store_reciprocal import (
+    EncoderGateError,
+    _drift_row,
+    _store_contract,
     _text,
-    _token_comparison,
-    _validate_candidate_store,
 )
 
 
-def _store():
+def _store(batch_size=16):
     entry = {
         "entry_index": 0,
         "labels": ["timing_context", "main_generation"],
         "live_window_count": 87,
-        "output_store_bytes": 1234,
+        "output_store_bytes": 1024,
         "conditioning_sha256": "a" * 64,
-        "complete_precompute_seconds": 2.0,
+        "batch_setup_seconds": 0.01,
+        "input_copy_seconds": 0.02,
+        "encoder_synchronized_seconds": 0.5,
+        "storage_allocation_seconds": 0.01,
+        "output_store_copy_seconds": 0.01,
+        "complete_precompute_seconds": 0.56,
+        "baseline_allocated_vram_bytes": 1000,
+        "baseline_reserved_vram_bytes": 2000,
+        "peak_allocated_vram_bytes": 2024,
+        "peak_reserved_vram_bytes": 4000,
+        "incremental_peak_allocated_vram_bytes": 1024,
+        "incremental_peak_reserved_vram_bytes": 2000,
         "uses": {
-            "timing_context": {"rows_reused": 87},
-            "main_generation": {"rows_reused": 87},
+            "timing_context": {
+                "rows_reused": 87,
+                "per_window_device_copy": False,
+            },
+            "main_generation": {
+                "rows_reused": 87,
+                "per_window_device_copy": False,
+            },
         },
     }
     return {
         "version": STORE_VERSION,
+        "result_class": "same-precision-gate-with-documented-encoder-drift",
         "production_default": False,
-        "batch_size": 16,
+        "selector_changes": False,
+        "decoder_changes": False,
+        "model_forward_changes": False,
+        "server_changes": False,
+        "precision": "fp32",
+        "strict_fp32": True,
+        "strict_exactness_required_for_promotion": True,
+        "batch_size": batch_size,
         "store_count": 1,
         "shared_across_timing_main": True,
-        "total_complete_precompute_seconds": 2.0,
-        "total_output_store_bytes": 1234,
+        "total_complete_precompute_seconds": 0.56,
+        "total_output_store_bytes": 1024,
         "labels_completed": ["timing_context", "main_generation"],
+        "active_processor_count": 0,
         "entries": [entry],
     }
 
 
-def test_token_comparison_reports_aligned_and_count_drift():
-    row = _token_comparison([1, 2, 3], [1, 9, 3, 4])
-    assert row["count_delta"] == 1
-    assert row["aligned_mismatch_count"] == 1
-    assert row["first_mismatch"] == 1
-    assert not row["exact"]
-
-
-def test_candidate_store_requires_matching_profile_and_external_evidence():
+def test_store_contract_charges_every_time_copy_storage_and_vram_field():
     store = _store()
     profile = {"metadata": {"optimized_batched_encoder_store": store}}
     evidence = {"encoder_store": store}
-    assert _validate_candidate_store(profile, evidence, batch_size=16) is store
 
-    changed = _store()
-    changed["entries"][0]["conditioning_sha256"] = "b" * 64
-    with pytest.raises(ValueError, match="conditioning_sha256"):
-        _validate_candidate_store(
-            profile,
-            {"encoder_store": changed},
-            batch_size=16,
-        )
+    charged = _store_contract(profile, evidence, batch_size=16)
+
+    assert charged["complete_precompute_seconds"] == pytest.approx(0.56)
+    assert charged["output_store_bytes"] == 1024
+    assert charged["incremental_peak_allocated_vram_bytes"] == 1024
 
 
-def test_text_report_contains_both_model_audits():
-    report = {
-        "decision": "PASS_FULL_SONG_GATE",
-        "batch_size": 16,
-        "mean_complete_request_seconds_saved": 0.5,
-        "audits": {
-            "main": {
-                "max_abs_encoder_drift": 1e-4,
-                "complete_seconds_saved_vs_b1": 0.3,
+def test_store_contract_rejects_unmatched_evidence_and_unowned_decoder_changes():
+    store = _store()
+    profile = {"metadata": {"optimized_batched_encoder_store": store}}
+    changed = deepcopy(store)
+    changed["decoder_changes"] = True
+    with pytest.raises(EncoderGateError, match="profile and external"):
+        _store_contract(profile, {"encoder_store": changed}, batch_size=16)
+
+    profile = {"metadata": {"optimized_batched_encoder_store": changed}}
+    with pytest.raises(EncoderGateError, match="contract changed"):
+        _store_contract(profile, {"encoder_store": changed}, batch_size=16)
+
+
+def test_drift_row_classifies_exact_and_nonexact_batches():
+    variants = {}
+    for batch_size in (1, 2, 4, 8, 16):
+        max_abs = 0.0 if batch_size == 1 else 0.001
+        variants[str(batch_size)] = {
+            "complete_precompute_seconds": 1.0,
+            "complete_seconds_saved_vs_b1": 0.0,
+            "input_copy_seconds": 0.1,
+            "storage_allocation_seconds": 0.1,
+            "output_store_copy_seconds": 0.1,
+            "output_store_bytes": 1024,
+            "incremental_peak_vram_bytes": 2048,
+            "encoder_drift_vs_b1": {
+                "window_count": 3,
+                "exact_window_count": 3 if batch_size == 1 else 0,
+                "max_abs": max_abs,
+                "mean_window_max_abs": max_abs,
             },
-            "timing": {
-                "max_abs_encoder_drift": 2e-4,
-                "complete_seconds_saved_vs_b1": 0.2,
-            },
-        },
-        "repeatability_pass": True,
-        "request_nonregression_pass": True,
-        "orders": [
-            {
-                "complete_request_seconds_saved": 0.4,
-                "main_tokens": {"count_delta": 0},
-            }
-        ],
+        }
+    audit = {
+        "metadata": {"batch_sizes": [1, 2, 4, 8, 16]},
+        "variants": variants,
     }
-    text = _text(report)
-    assert "main_encoder_max_abs_drift=0.0001" in text
-    assert "timing_encoder_max_abs_drift=0.0002" in text
+    assert _drift_row(audit, 1, name="main")["encoder_exact"]
+    assert not _drift_row(audit, 16, name="main")["encoder_exact"]
+
+
+def test_text_report_exposes_every_batch_without_creating_a_document():
+    variants = {
+        str(batch_size): {
+            "classification": "documented-drift-not-promotion-eligible",
+            "strict_exactness_pass": False,
+            "performance": {"request_seconds_saved": 0.5},
+            "encoder_drift": {
+                "main": {"max_abs": 0.1},
+                "timing": {"max_abs": 0.2},
+            },
+        }
+        for batch_size in (1, 2, 4, 8, 16)
+    }
+    text = _text(
+        {
+            "decision": "STOP_ENCODER_PRECOMPUTE",
+            "baseline_request_median_seconds": 42.0,
+            "minimum_request_saving_seconds": 2.1,
+            "strict_exact_batch_sizes": [],
+            "promotion_batch_sizes": [],
+            "variants": variants,
+        }
+    )
+    for batch_size in (1, 2, 4, 8, 16):
+        assert f"b{batch_size}_classification=" in text

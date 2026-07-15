@@ -1,4 +1,4 @@
-"""Measure batched all-window encoder precompute on accepted FP32 tensors.
+"""Measure batched all-window encoder precompute on accepted model tensors.
 
 This is a verifier-only ceiling harness.  It reconstructs the exact audio-window
 tensors and conditioning used by the current sequential Processor, then compares
@@ -77,7 +77,6 @@ def validate_batch_sizes(
 def _assert_accepted_args(args) -> None:
     required = {
         "inference_engine": "optimized",
-        "precision": "fp32",
         "attn_implementation": "sdpa",
         "device": "cuda",
         "use_server": False,
@@ -92,9 +91,11 @@ def _assert_accepted_args(args) -> None:
     }
     if mismatches:
         raise ValueError(
-            "batched encoder ceiling requires the accepted FP32 runtime: "
+            "batched encoder ceiling requires the accepted runtime: "
             f"{mismatches}"
         )
+    if args.precision not in {"fp32", "fp16"}:
+        raise ValueError("batched encoder ceiling requires fp32 or fp16")
 
 
 def _tensor_sha256(tensor: torch.Tensor) -> str:
@@ -219,12 +220,14 @@ def _cuda_elapsed(fn) -> tuple[Any, float]:
     return value, time.perf_counter() - started
 
 
-def _encoder_hidden(outputs: Any) -> torch.Tensor:
+def _encoder_hidden(outputs: Any, *, expected_dtype: torch.dtype) -> torch.Tensor:
     hidden = getattr(outputs, "last_hidden_state", None)
     if not isinstance(hidden, torch.Tensor):
         raise TypeError("encoder output does not expose last_hidden_state")
-    if hidden.dtype != torch.float32:
-        raise TypeError(f"accepted encoder output must be FP32, got {hidden.dtype}")
+    if hidden.dtype != expected_dtype:
+        raise TypeError(
+            f"accepted encoder output must be {expected_dtype}, got {hidden.dtype}"
+        )
     if not bool(torch.isfinite(hidden).all().item()):
         raise RuntimeError("encoder output contains non-finite values")
     return hidden
@@ -238,6 +241,7 @@ def _profile_batch_size(
     window_kwargs: Sequence[dict[str, torch.Tensor]],
     batch_size: int,
     warmup: int,
+    expected_dtype: torch.dtype = torch.float32,
 ) -> tuple[dict[str, Any], torch.Tensor]:
     if frames.device.type != "cpu":
         raise ValueError("source window frames must remain on CPU for each variant")
@@ -305,7 +309,7 @@ def _profile_batch_size(
             )
         )
         encoder_seconds += encoded
-        hidden = _encoder_hidden(outputs)
+        hidden = _encoder_hidden(outputs, expected_dtype=expected_dtype)
         current_shape = tuple(hidden.shape[1:])
         if output_shape is None:
             output_shape = current_shape
@@ -456,8 +460,14 @@ def profile_batched_encoder_precompute_ceiling(
         raise RuntimeError("encoder ceiling did not load the accepted optimized runtime")
     model.eval()
     model_dtype = next(model.parameters()).dtype
-    if model_dtype != torch.float32:
-        raise TypeError(f"accepted model parameters must be FP32, got {model_dtype}")
+    expected_dtype = {
+        "fp32": torch.float32,
+        "fp16": torch.float16,
+    }[args.precision]
+    if model_dtype != expected_dtype:
+        raise TypeError(
+            f"accepted model parameters must be {expected_dtype}, got {model_dtype}"
+        )
 
     preprocessor = Preprocessor(args, parallel=False)
     processor = Processor(args, binding, tokenizer)
@@ -486,6 +496,7 @@ def profile_batched_encoder_precompute_ceiling(
             window_kwargs=window_kwargs,
             batch_size=batch_size,
             warmup=warmup,
+            expected_dtype=expected_dtype,
         )
         if reference is None:
             reference = outputs
@@ -518,7 +529,7 @@ def profile_batched_encoder_precompute_ceiling(
     report = {
         "schema_version": SCHEMA_VERSION,
         "metadata": {
-            "result_class": "documented-drift-component-ceiling",
+            "result_class": "same-precision-drift-component-ceiling",
             "scope": "all live audio windows, encoder only",
             "production_wiring": False,
             "server_changes": False,

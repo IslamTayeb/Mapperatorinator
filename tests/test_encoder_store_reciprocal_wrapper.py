@@ -9,30 +9,32 @@ SCRIPT = (
 )
 
 
-def test_wrapper_pins_clean_pushed_2080ti_worktree_and_full_song():
+def test_wrapper_pins_clean_pushed_strict_fp32_2080ti_worktree():
     source = SCRIPT.read_text(encoding="utf-8")
     for fragment in (
         "#SBATCH --partition=gpu-common",
         "#SBATCH --gres=gpu:2080:1",
-        'PROFILE_CONFIG=${PROFILE_CONFIG:-profile_salvalai}',
+        'BASELINE_RUN_ROOT=${MAPPERATORINATOR_BASELINE_RUN_ROOT:?',
         'git -C "$REPO" status --porcelain',
         'git -C "$REPO" rev-parse "$REMOTE_REF"',
-        'NVIDIA GeForce RTX 2080 Ti',
-        'profile_pass_kind=untraced_control',
-        'run_profile baseline_first baseline',
-        'run_profile candidate_second candidate',
-        'run_profile candidate_first candidate',
-        'run_profile baseline_second baseline',
+        'export NVIDIA_TF32_OVERRIDE=0',
+        'EXPECTED_GPU=${MAPPERATORINATOR_EXPECTED_GPU:-2080 Ti}',
+        'precision=fp32',
+        'profile_pass_kind="$pass_kind"',
     ):
         assert fragment in source
 
 
-def test_wrapper_charges_two_model_audits_and_writes_json_text_only():
+def test_wrapper_measures_all_batches_both_passes_and_two_encoder_stages():
     source = SCRIPT.read_text(encoding="utf-8")
+    assert "BATCH_SIZES=(1 2 4 8 16)" in source
     assert source.count("profile_batched_encoder_precompute_ceiling.py") == 2
+    assert source.count("--batch-sizes 1,2,4,8,16") == 2
     assert "auto_select_gamemode_model=false" in source
-    assert '--main-audit "$RUN_ROOT/drift-audit/main/encoder-precompute.json"' in source
-    assert '--timing-audit "$RUN_ROOT/drift-audit/timing/encoder-precompute.json"' in source
+    assert 'run_candidate "$batch_size" untraced_control control' in source
+    assert 'run_candidate "$batch_size" exactness_audit exactness-audit' in source
+    assert '--main-audit "$RUN_ROOT/component/main/encoder-precompute.json"' in source
+    assert '--timing-audit "$RUN_ROOT/component/timing/encoder-precompute.json"' in source
     assert '--json-output "$RUN_ROOT/analysis.json"' in source
     assert '--text-output "$RUN_ROOT/analysis.txt"' in source
     assert ".md" not in source

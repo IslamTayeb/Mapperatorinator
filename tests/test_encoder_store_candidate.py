@@ -184,6 +184,21 @@ def test_temporary_processor_hooks_restore_and_do_not_patch_model_forward():
     assert decoder.forward == original_forward
 
 
+@pytest.mark.parametrize(
+    ("precision", "dtype"),
+    [("fp32", torch.float32), ("fp16", torch.float16)],
+)
+def test_shared_store_policy_is_precision_specific_without_decoder_patches(
+    precision,
+    dtype,
+):
+    manager = BatchedAllWindowEncoderStore(batch_size=2, precision=precision)
+    assert manager.precision == precision
+    assert manager.evidence["precision"] == precision
+    assert manager.evidence["strict_fp32"] is (precision == "fp32")
+    assert dtype in {torch.float32, torch.float16}
+
+
 def test_store_requires_timing_then_main_and_valid_complete_passes():
     manager = BatchedAllWindowEncoderStore(batch_size=2)
     manager._entries.append(
@@ -214,3 +229,8 @@ def test_store_requires_timing_then_main_and_valid_complete_passes():
 def test_store_rejects_invalid_batch_sizes(batch_size):
     with pytest.raises((TypeError, ValueError)):
         BatchedAllWindowEncoderStore(batch_size=batch_size)
+
+
+def test_store_rejects_unsupported_precision():
+    with pytest.raises(ValueError, match="precision"):
+        BatchedAllWindowEncoderStore(batch_size=1, precision="bf16")

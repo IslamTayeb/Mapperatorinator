@@ -1,4 +1,4 @@
-"""Run fixed-seed baseline or opt-in batched encoder-store inference."""
+"""Run a fresh strict-FP32 control or opt-in batched encoder store."""
 
 from __future__ import annotations
 
@@ -13,9 +13,6 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-
-from utils.fixed_seed_inference import fixed_seed_processor_generation  # noqa: E402
-
 
 def _load_args(config_name: str, overrides: list[str]):
     import config  # noqa: F401
@@ -35,7 +32,6 @@ def _load_args(config_name: str, overrides: list[str]):
 def _validate_args(args, *, mode: str, batch_size: int) -> None:
     expected = {
         "inference_engine": "optimized",
-        "precision": "fp32",
         "attn_implementation": "sdpa",
         "device": "cuda",
         "use_server": False,
@@ -53,8 +49,15 @@ def _validate_args(args, *, mode: str, batch_size: int) -> None:
     }
     if failures:
         raise ValueError(f"encoder-store reciprocal args changed: {failures}")
+    if args.precision not in {"fp32", "fp16"}:
+        raise ValueError("encoder-store gate requires precision=fp32 or fp16")
     if mode not in {"baseline", "candidate"}:
         raise ValueError("mode must be baseline or candidate")
+    if args.profile_pass_kind not in {"untraced_control", "exactness_audit"}:
+        raise ValueError(
+            "encoder-store strict gate requires untraced_control or "
+            "exactness_audit"
+        )
     if isinstance(batch_size, bool) or not isinstance(batch_size, int):
         raise TypeError("batch_size must be an integer")
     if batch_size <= 0 or batch_size > int(args.max_batch_size):
@@ -85,6 +88,7 @@ def run(
         store_context = install_batched_encoder_store_candidate(
             inference.Processor,
             batch_size=batch_size,
+            precision=args.precision,
         )
     else:
         from contextlib import nullcontext
@@ -92,8 +96,7 @@ def run(
         store_context = nullcontext(None)
 
     with store_context as manager:
-        with fixed_seed_processor_generation(inference, base_seed=args.seed):
-            inference.main(args)
+        inference.main(args)
     run_wall_seconds = time.perf_counter() - started
     if not math.isfinite(run_wall_seconds) or run_wall_seconds <= 0:
         raise RuntimeError("encoder-store runner produced an invalid wall time")
@@ -103,6 +106,10 @@ def run(
         "config_name": config_name,
         "seed": int(args.seed),
         "batch_size": batch_size if mode == "candidate" else None,
+        "profile_pass_kind": args.profile_pass_kind,
+        "precision": args.precision,
+        "strict_fp32": args.precision == "fp32",
+        "stage_seed_override": False,
         "run_wall_seconds": run_wall_seconds,
         "encoder_store": manager.finalize() if manager is not None else None,
     }

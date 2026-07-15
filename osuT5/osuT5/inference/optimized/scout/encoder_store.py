@@ -13,8 +13,9 @@ import torch
 from transformers.modeling_outputs import BaseModelOutput
 
 
-STORE_VERSION = "batched-all-window-encoder-store-v1"
+STORE_VERSION = "strict-fp32-batched-all-window-encoder-store-v2"
 SUPPORTED_LABELS = ("timing_context", "main_generation")
+SUPPORTED_PRECISIONS = ("fp32", "fp16")
 ENCODER_CONDITIONING_KEYS = (
     "beatmap_idx",
     "difficulty",
@@ -128,6 +129,7 @@ class _StoreEntry:
 @dataclass
 class BatchedAllWindowEncoderStore:
     batch_size: int = 16
+    precision: str = "fp32"
     _entries: list[_StoreEntry] = field(default_factory=list, init=False, repr=False)
     _active: dict[int, _GenerationUse] = field(default_factory=dict, init=False)
     _labels: list[str] = field(default_factory=list, init=False)
@@ -137,6 +139,10 @@ class BatchedAllWindowEncoderStore:
             raise TypeError("encoder store batch_size must be an integer")
         if self.batch_size <= 0:
             raise ValueError("encoder store batch_size must be positive")
+        if self.precision not in SUPPORTED_PRECISIONS:
+            raise ValueError(
+                f"encoder store precision must be one of {SUPPORTED_PRECISIONS}"
+            )
 
     @property
     def evidence(self) -> dict[str, Any]:
@@ -150,8 +156,19 @@ class BatchedAllWindowEncoderStore:
         ]
         return {
             "version": STORE_VERSION,
-            "result_class": "documented-drift",
+            "result_class": (
+                "same-precision-exactness-candidate"
+                if self.batch_size == 1
+                else "same-precision-gate-with-documented-encoder-drift"
+            ),
             "production_default": False,
+            "selector_changes": False,
+            "decoder_changes": False,
+            "model_forward_changes": False,
+            "server_changes": False,
+            "precision": self.precision,
+            "strict_fp32": self.precision == "fp32",
+            "strict_exactness_required_for_promotion": True,
             "batch_size": self.batch_size,
             "store_count": len(entries),
             "shared_across_timing_main": (
@@ -171,8 +188,11 @@ class BatchedAllWindowEncoderStore:
     def _assert_processor(self, processor) -> None:
         if processor.parallel:
             raise EncoderStoreError("encoder store requires sequential generation")
-        if processor.precision != "fp32":
-            raise EncoderStoreError("encoder store currently requires FP32")
+        if processor.precision != self.precision:
+            raise EncoderStoreError(
+                f"encoder store expected precision={self.precision}, got "
+                f"{processor.precision}"
+            )
         if processor.cfg_scale != 1.0:
             raise EncoderStoreError("encoder store requires cfg_scale=1")
         if processor.inference_runtime is None:
@@ -183,10 +203,23 @@ class BatchedAllWindowEncoderStore:
             raise EncoderStoreError("encoder store requires an allocated CUDA device")
         if processor.model.device.type != "cuda":
             raise EncoderStoreError("encoder store model must be resident on CUDA")
-        if processor.model.dtype != torch.float32:
+        expected_dtype = {
+            "fp32": torch.float32,
+            "fp16": torch.float16,
+        }[self.precision]
+        if processor.model.dtype != expected_dtype:
             raise EncoderStoreError(
-                f"encoder store model must be FP32, got {processor.model.dtype}"
+                f"encoder store {self.precision} model must use {expected_dtype}, "
+                f"got {processor.model.dtype}"
             )
+        if self.precision == "fp32" and torch.get_float32_matmul_precision() != "highest":
+            raise EncoderStoreError(
+                "encoder store requires float32_matmul_precision='highest'"
+            )
+        if torch.backends.cuda.matmul.allow_tf32:
+            raise EncoderStoreError("encoder store requires CUDA matmul TF32 disabled")
+        if torch.backends.cudnn.allow_tf32:
+            raise EncoderStoreError("encoder store requires cuDNN TF32 disabled")
         if self.batch_size > int(processor.max_batch_size):
             raise EncoderStoreError(
                 f"encoder store B{self.batch_size} exceeds max_batch_size="
@@ -284,9 +317,13 @@ class BatchedAllWindowEncoderStore:
             hidden = getattr(outputs, "last_hidden_state", None)
             if not isinstance(hidden, torch.Tensor):
                 raise EncoderStoreError("encoder output lacks last_hidden_state")
-            if hidden.dtype != torch.float32 or hidden.device.type != "cuda":
+            expected_dtype = {
+                "fp32": torch.float32,
+                "fp16": torch.float16,
+            }[self.precision]
+            if hidden.dtype != expected_dtype or hidden.device.type != "cuda":
                 raise EncoderStoreError(
-                    "encoder store output must use FP32 CUDA storage"
+                    f"encoder store output must use {expected_dtype} CUDA storage"
                 )
             if not bool(torch.isfinite(hidden).all().item()):
                 raise EncoderStoreError("encoder store output is not finite")
@@ -332,8 +369,22 @@ class BatchedAllWindowEncoderStore:
         peak_reserved = int(torch.cuda.max_memory_reserved())
         evidence = {
             "version": STORE_VERSION,
-            "result_class": "documented-drift",
+            "result_class": (
+                "same-precision-exactness-candidate"
+                if self.batch_size == 1
+                else "same-precision-gate-with-documented-encoder-drift"
+            ),
             "production_default": False,
+            "selector_changes": False,
+            "decoder_changes": False,
+            "model_forward_changes": False,
+            "server_changes": False,
+            "precision": self.precision,
+            "strict_fp32": self.precision == "fp32",
+            "strict_exactness_required_for_promotion": True,
+            "float32_matmul_precision": torch.get_float32_matmul_precision(),
+            "cuda_matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+            "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
             "batch_size": self.batch_size,
             "live_window_count": len(frames),
             "batch_count": len(batches),
@@ -554,10 +605,14 @@ def install_batched_encoder_store_candidate(
     processor_class,
     *,
     batch_size: int = 16,
+    precision: str = "fp32",
 ) -> Iterator[BatchedAllWindowEncoderStore]:
     """Temporarily install reuse without touching selectors or default imports."""
 
-    manager = BatchedAllWindowEncoderStore(batch_size=batch_size)
+    manager = BatchedAllWindowEncoderStore(
+        batch_size=batch_size,
+        precision=precision,
+    )
     original_generate = processor_class.generate
     original_model_generate = processor_class.model_generate
 
@@ -602,5 +657,6 @@ __all__ = [
     "EncoderStoreError",
     "STORE_VERSION",
     "SUPPORTED_LABELS",
+    "SUPPORTED_PRECISIONS",
     "install_batched_encoder_store_candidate",
 ]
