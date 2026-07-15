@@ -19,6 +19,7 @@ OPTIONAL_MODULES = (
     "osuT5.osuT5.utils.train_utils",
     "datasets",
     "wandb",
+    "accelerate",
 )
 
 

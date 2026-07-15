@@ -36,6 +36,7 @@ for name in (
     "osuT5.osuT5.utils.train_utils",
     "datasets",
     "wandb",
+    "accelerate",
 ):
     assert name not in sys.modules, name
 """
@@ -106,6 +107,33 @@ for name in (
     "osuT5.osuT5.model.custom_transformers.t5",
 ):
     assert name not in sys.modules, name
+"""
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_inference_seed_matches_accelerate_cpu_rng_progression() -> None:
+    completed = _run_fresh_python(
+        """
+import random
+import numpy as np
+import torch
+from accelerate.utils import set_seed
+from inference import setup_inference_environment
+
+set_seed(1729)
+expected = (
+    random.random(),
+    float(np.random.random()),
+    float(torch.rand(())),
+)
+setup_inference_environment(1729)
+actual = (
+    random.random(),
+    float(np.random.random()),
+    float(torch.rand(())),
+)
+assert actual == expected
 """
     )
     assert completed.returncode == 0, completed.stderr

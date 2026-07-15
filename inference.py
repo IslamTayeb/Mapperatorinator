@@ -16,8 +16,8 @@ from pathlib import Path
 import random
 
 import hydra
+import numpy as np
 import torch
-from accelerate.utils import set_seed
 from omegaconf import OmegaConf, DictConfig
 from slider import Beatmap
 from transformers.utils import cached_file, is_flash_attn_2_available
@@ -31,9 +31,11 @@ from osuT5.osuT5.dataset.data_utils import events_of_type, TIMING_TYPES, merge_e
 from osuT5.osuT5.inference import Preprocessor, Processor, Postprocessor, BeatmapConfig, GenerationConfig, \
     generation_config_from_beatmap, beatmap_config_from_beatmap, background_line
 from osuT5.osuT5.inference.profiler import InferenceProfiler
+from osuT5.osuT5.inference.server import InferenceClient
 from osuT5.osuT5.model import Mapperatorinator
 from osuT5.osuT5.tokenizer import ContextType
 from osuT5.osuT5.utils import load_model_loaders, resolve_compatible_lora_path, resolve_model_checkpoint_path, get_model_checkpoint_subfolder
+from osu_diffusion.config import DiffusionTrainConfig
 
 
 def get_default_logger():
@@ -131,7 +133,10 @@ def setup_inference_environment(seed: int, *, strict_fp32: bool = False):
         torch.backends.cudnn.allow_tf32 = False
     else:
         torch.set_float32_matmul_precision("high")
-    set_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 def compile_device_and_seed(args: InferenceConfig, verbose=True):
@@ -776,8 +781,6 @@ def load_model_with_server(ckpt_path: str | Path | None, t5_args: TrainConfig, d
 
     if not use_server:
         return model_loader(), tokenizer_loader()
-
-    from osuT5.osuT5.inference.server import InferenceClient
 
     return InferenceClient(
         model_loader,
