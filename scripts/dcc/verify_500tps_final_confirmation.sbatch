@@ -26,7 +26,10 @@ FIVE_SONG_ROOT=${FIVE_SONG_ROOT:-$WORK/data/five-song-profile}
 NATURAL_REPETITIONS=${NATURAL_REPETITIONS:-5}
 FIXED_REPETITIONS=${FIXED_REPETITIONS:-5}
 EXPECTED_MAIN_STEPS=${EXPECTED_MAIN_STEPS:-8294}
-CANDIDATE_RUNTIME_SPEC_SOURCE=${CANDIDATE_RUNTIME_SPEC:-}
+REQUIRE_DIRECT_AOT=${REQUIRE_DIRECT_AOT:-1}
+AOT_NATIVE_EXTENSION_MANIFEST=${AOT_NATIVE_EXTENSION_MANIFEST:-}
+AOT_NATIVE_EXTENSION_MANIFEST_SHA256=${AOT_NATIVE_EXTENSION_MANIFEST_SHA256:-}
+CANDIDATE_RUNTIME_SPEC_SOURCE=${CANDIDATE_RUNTIME_SPEC:-$REPO/scripts/dcc/runtime_specs/k1_int8_fp16_cross_shared_arena.json}
 CANDIDATE_RUNTIME_NAME=${CANDIDATE_RUNTIME_NAME:-k4-split-kv-mixed-weight-shared-rope-k1-remainder-int8-mlp-v1}
 CANDIDATE_RUNTIME_FACTORY=${CANDIDATE_RUNTIME_FACTORY:-utils.final_confirmation_runtime:kblock_shared_rope_weight_plugin}
 CANDIDATE_RUNTIME_KWARGS_JSON=${CANDIDATE_RUNTIME_KWARGS_JSON:-'{"block_size":4,"graph_remainders":true,"initializer_name":"initialize_approximate_int8_mlp_weight_only","shared_rope_binding_index":0,"initializer_binding_index":0,"minimum_bindings":1}'}
@@ -38,6 +41,20 @@ fi
 if [[ "$EXPECTED_MAIN_STEPS" != 8294 ]]; then
   echo "authoritative fixed-work control requires exactly 8294 main steps" >&2
   exit 2
+fi
+if [[ "$REQUIRE_DIRECT_AOT" != 0 && "$REQUIRE_DIRECT_AOT" != 1 ]]; then
+  echo "REQUIRE_DIRECT_AOT must be 0 or 1" >&2
+  exit 2
+fi
+if [[ "$REQUIRE_DIRECT_AOT" == 1 ]]; then
+  if [[ ! -s "$AOT_NATIVE_EXTENSION_MANIFEST" ]]; then
+    echo "authoritative confirmation requires a nonempty direct AOT manifest" >&2
+    exit 2
+  fi
+  if [[ ! "$AOT_NATIVE_EXTENSION_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "AOT_NATIVE_EXTENSION_MANIFEST_SHA256 must be a lowercase SHA-256" >&2
+    exit 2
+  fi
 fi
 if [[ ! -x "$PYTHON" ]]; then
   echo "missing environment Python: $PYTHON" >&2
@@ -100,6 +117,41 @@ export TOKENIZERS_PARALLELISM=false
 export PYTHONHASHSEED=0
 export TMPDIR="$WORK/tmp"
 export TORCH_EXTENSIONS_DIR="$WORK/torch_extensions/final-$COMMIT"
+export TORCH_CUDA_ARCH_LIST=7.5
+
+if [[ "$REQUIRE_DIRECT_AOT" == 1 ]]; then
+  (
+    cd "$REPO"
+    "$PYTHON" - \
+      "$AOT_NATIVE_EXTENSION_MANIFEST" \
+      "$COMMIT" \
+      "$AOT_NATIVE_EXTENSION_MANIFEST_SHA256" \
+      "$RUN_ROOT/aot-manifest-validation.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from osuT5.osuT5.inference.optimized.kernels.native_extension import (
+    validate_direct_manifest,
+)
+
+manifest, commit, expected_hash, output = sys.argv[1:]
+report = validate_direct_manifest(
+    Path(manifest),
+    expected_source_commit=commit,
+    expected_manifest_sha256=expected_hash,
+)
+Path(output).write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+PY
+  )
+  [[ -s "$RUN_ROOT/aot-manifest-validation.json" ]] || {
+    echo "direct AOT manifest validation did not produce evidence" >&2
+    exit 2
+  }
+  export MAPPERATORINATOR_NATIVE_EXTENSION_MANIFEST="$AOT_NATIVE_EXTENSION_MANIFEST"
+else
+  unset MAPPERATORINATOR_NATIVE_EXTENSION_MANIFEST
+fi
 
 echo "host=$(hostname)"
 echo "job_id=${SLURM_JOB_ID:-manual}"
@@ -109,6 +161,7 @@ echo "remote_branch=$REMOTE_BRANCH"
 echo "repo=$REPO"
 echo "run_root=$RUN_ROOT"
 echo "gpu=$GPU_NAME"
+echo "native_extension_mode=$([[ "$REQUIRE_DIRECT_AOT" == 1 ]] && echo direct || echo load_inline)"
 if [[ -n "${SLURM_JOB_ID:-}" ]]; then
   scontrol show job -o "$SLURM_JOB_ID"
 fi

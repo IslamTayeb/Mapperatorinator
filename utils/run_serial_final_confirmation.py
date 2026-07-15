@@ -8,6 +8,7 @@ import json
 import sys
 import time
 import uuid
+from collections import defaultdict
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
@@ -18,7 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from osuT5.osuT5.inference.engine_binding import InferenceEngineBinding
 from osuT5.osuT5.inference.profiler import InferenceProfiler
-from utils.final_confirmation_runtime import load_runtime_plugin
+from utils.final_confirmation_runtime import load_runtime_plugin, native_extension_evidence
 from utils.fixed_seed_inference import (
     fixed_seed_processor_generation,
     rng_state_fingerprints,
@@ -54,6 +55,85 @@ def _songs(path: Path) -> list[dict[str, str]]:
         names.add(name)
         parsed.append({"name": name, "audio_path": str(path_value), "sha256": expected_sha})
     return parsed
+
+
+def _load_model_bindings(inference, args):
+    main_binding, main_tokenizer = inference.load_model_with_engine(
+        args.model_path,
+        args.train,
+        args.device,
+        max_batch_size=args.max_batch_size,
+        use_server=args.use_server,
+        precision=args.precision,
+        attn_implementation=args.attn_implementation,
+        lora_path=args.lora_path,
+        gamemode=args.gamemode,
+        auto_select_gamemode_model=args.auto_select_gamemode_model,
+        inference_engine=args.inference_engine,
+    )
+    separate_timing_model = inference.should_load_separate_timing_model(args)
+    timing_binding, timing_tokenizer = None, None
+    if separate_timing_model:
+        timing_binding, timing_tokenizer = inference.load_model_with_engine(
+            args.model_path,
+            args.train,
+            args.device,
+            max_batch_size=args.max_batch_size,
+            use_server=args.use_server,
+            precision=args.precision,
+            attn_implementation=args.attn_implementation,
+            gamemode=args.gamemode,
+            auto_select_gamemode_model=False,
+            inference_engine=args.inference_engine,
+        )
+    if not isinstance(main_binding, InferenceEngineBinding):
+        raise TypeError("serial confirmation requires an optimized engine binding")
+    if timing_binding is not None and not isinstance(
+        timing_binding, InferenceEngineBinding
+    ):
+        raise TypeError(
+            "serial confirmation requires an optimized timing engine binding"
+        )
+
+    return (
+        main_binding,
+        main_tokenizer,
+        timing_binding,
+        timing_tokenizer,
+        separate_timing_model,
+    )
+
+
+def _wrap_runtime_bindings(main_binding, timing_binding, plugin):
+    shared_indices: defaultdict[str, int] = defaultdict(int)
+    shared_records: list[dict[str, Any]] = []
+    main_binding = plugin.transform_binding(main_binding, binding_index=0)
+    main_runtime = ConfirmationRuntime(
+        main_binding.runtime,
+        mode="natural",
+        manifest=None,
+        indices=shared_indices,
+        records=shared_records,
+    )
+    main_binding = InferenceEngineBinding(main_binding.raw_model, main_runtime)
+    if timing_binding is not None:
+        timing_binding = plugin.transform_binding(timing_binding, binding_index=1)
+        timing_runtime = ConfirmationRuntime(
+            timing_binding.runtime,
+            mode="natural",
+            manifest=None,
+            indices=shared_indices,
+            records=shared_records,
+        )
+        timing_binding = InferenceEngineBinding(
+            timing_binding.raw_model,
+            timing_runtime,
+        )
+    return (
+        main_binding,
+        timing_binding,
+        shared_records,
+    )
 
 
 def run(
@@ -92,26 +172,21 @@ def run(
     rng_before = rng_state_fingerprints()
     model_load_started = time.perf_counter()
     try:
-        binding, tokenizer = inference.load_model_with_engine(
-            first_args.model_path,
-            first_args.train,
-            first_args.device,
-            max_batch_size=first_args.max_batch_size,
-            use_server=first_args.use_server,
-            precision=first_args.precision,
-            attn_implementation=first_args.attn_implementation,
-            lora_path=first_args.lora_path,
-            gamemode=first_args.gamemode,
-            auto_select_gamemode_model=first_args.auto_select_gamemode_model,
-            inference_engine=first_args.inference_engine,
-        )
+        loaded = _load_model_bindings(inference, first_args)
         torch.cuda.synchronize()
         model_load_seconds = time.perf_counter() - model_load_started
-        if not isinstance(binding, InferenceEngineBinding):
-            raise TypeError("serial confirmation requires an optimized engine binding")
-        binding = plugin.transform_binding(binding, binding_index=0)
-        runtime = ConfirmationRuntime(binding.runtime, mode="natural", manifest=None)
-        binding = InferenceEngineBinding(binding.raw_model, runtime)
+        (
+            binding,
+            tokenizer,
+            timing_binding,
+            timing_tokenizer,
+            separate_timing_model,
+        ) = loaded
+        binding, timing_binding, shared_records = _wrap_runtime_bindings(
+            binding,
+            timing_binding,
+            plugin,
+        )
 
         runs: list[dict[str, Any]] = []
         for index, song in enumerate(songs):
@@ -135,9 +210,10 @@ def run(
                 or args.precision != first_args.precision
                 or args.inference_engine != first_args.inference_engine
                 or inference.should_load_separate_timing_model(args)
+                != separate_timing_model
             ):
                 raise RuntimeError(
-                    "serial confirmation songs must share one timing/main model"
+                    "serial confirmation songs must share one model topology"
                 )
             with profiler.stage("build_generation_config"):
                 generation_config, beatmap_config = inference.get_config(args)
@@ -147,26 +223,28 @@ def run(
             reserved_before = int(torch.cuda.memory_reserved())
             torch.cuda.reset_peak_memory_stats()
             rng_song_before = rng_state_fingerprints()
-            record_start = len(runtime.records)
+            record_start = len(shared_records)
             _, result_path = inference.generate(
                 args,
                 generation_config=generation_config,
                 beatmap_config=beatmap_config,
                 model=binding,
                 tokenizer=tokenizer,
+                timing_model=timing_binding,
+                timing_tokenizer=timing_tokenizer,
                 profiler=profiler,
                 verbose=False,
             )
             torch.cuda.synchronize()
             rng_song_after = rng_state_fingerprints()
-            record_end = len(runtime.records)
+            record_end = len(shared_records)
             gc.collect()
             torch.cuda.synchronize()
             result_path = Path(result_path).resolve()
             profile_path = result_path.with_name(result_path.name + ".profile.json")
             if not profile_path.is_file():
                 raise RuntimeError(f"serial song profile is missing: {profile_path}")
-            song_records = runtime.records[record_start:record_end]
+            song_records = shared_records[record_start:record_end]
             logical = {
                 label: sum(
                     int(record["logical_steps"])
@@ -241,6 +319,7 @@ def run(
         ),
         "rng": {"before": rng_before, "after": rng_after},
         "initialization": runtime_evidence["initialization"],
+        "native_extensions": native_extension_evidence(),
         "runs": runs,
     }
     evidence_path.parent.mkdir(parents=True, exist_ok=True)

@@ -18,7 +18,12 @@ from utils.run_final_confirmation import (
     ConfirmationRuntime,
     _load_manifest,
 )
-from utils.run_serial_final_confirmation import _songs
+from osuT5.osuT5.inference.engine_binding import InferenceEngineBinding
+from utils.run_serial_final_confirmation import (
+    _load_model_bindings,
+    _songs,
+    _wrap_runtime_bindings,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -130,6 +135,63 @@ def test_separate_timing_main_bindings_share_fixed_work_indices() -> None:
     ]
 
 
+def test_serial_confirmation_loads_and_wraps_separate_timing_binding() -> None:
+    class FakeInference:
+        def __init__(self):
+            self.calls = []
+
+        def load_model_with_engine(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            index = len(self.calls) - 1
+            return InferenceEngineBinding(f"model-{index}", _Runtime()), f"tokens-{index}"
+
+        @staticmethod
+        def should_load_separate_timing_model(args):
+            return True
+
+    class FakePlugin:
+        def __init__(self):
+            self.indices = []
+
+        def transform_binding(self, binding, *, binding_index):
+            self.indices.append(binding_index)
+            return binding
+
+    args = SimpleNamespace(
+        model_path="model",
+        train=object(),
+        device="cuda",
+        max_batch_size=1,
+        use_server=False,
+        precision="fp32",
+        attn_implementation="sdpa",
+        lora_path="main-only-lora",
+        gamemode=0,
+        auto_select_gamemode_model=True,
+        inference_engine="optimized",
+    )
+    inference = FakeInference()
+    plugin = FakePlugin()
+
+    main, main_tokens, timing, timing_tokens, separate = _load_model_bindings(
+        inference,
+        args,
+    )
+    main, timing, records = _wrap_runtime_bindings(main, timing, plugin)
+
+    assert separate is True
+    assert main_tokens == "tokens-0"
+    assert timing_tokens == "tokens-1"
+    assert isinstance(main.runtime, ConfirmationRuntime)
+    assert isinstance(timing.runtime, ConfirmationRuntime)
+    assert main.runtime.records is timing.runtime.records is records
+    assert plugin.indices == [0, 1]
+    assert inference.calls[0][1]["auto_select_gamemode_model"] is True
+    assert inference.calls[0][1]["lora_path"] == "main-only-lora"
+    assert inference.calls[1][1]["auto_select_gamemode_model"] is False
+    assert "lora_path" not in inference.calls[1][1]
+
+
 def test_runtime_spec_is_imported_without_touching_production_selectors(
     tmp_path: Path,
 ) -> None:
@@ -146,7 +208,9 @@ def test_runtime_spec_is_imported_without_touching_production_selectors(
                 "kwargs": {
                     "block_size": 4,
                     "graph_remainders": True,
-                    "initializer_name": "initialize_approximate_int8_mlp_weight_only",
+                    "initializer_name": "initialize_approximate_int8_mlp_weight_only_cross",
+                    "initializer_kwargs": {"mode": "fp16_packed_projections"},
+                    "shared_static_input_arena": True,
                 },
             }
         )
@@ -154,6 +218,12 @@ def test_runtime_spec_is_imported_without_touching_production_selectors(
     plugin = load_runtime_plugin(spec)
     assert isinstance(plugin, KBlockSharedRopeWeightPlugin)
     assert plugin.name == "selected-fast-runtime"
+
+    bad_kwargs = json.loads(spec.read_text())
+    bad_kwargs["kwargs"]["initializer_kwargs"] = []
+    spec.write_text(json.dumps(bad_kwargs))
+    with pytest.raises(RuntimeError, match="factory"):
+        load_runtime_plugin(spec)
 
     spec.write_text(json.dumps({"schema_version": "wrong"}))
     with pytest.raises(ValueError, match="schema"):
@@ -240,7 +310,12 @@ def test_dcc_wrapper_is_one_serial_authoritative_json_text_gate() -> None:
     assert "FIXED_REPETITIONS=${FIXED_REPETITIONS:-5}" in source
     assert "NATURAL_REPETITIONS=${NATURAL_REPETITIONS:-5}" in source
     assert "CANDIDATE_RUNTIME_SPEC" in source
+    assert "k1_int8_fp16_cross_shared_arena.json" in source
     assert "--runtime-spec" in source
+    assert "REQUIRE_DIRECT_AOT=${REQUIRE_DIRECT_AOT:-1}" in source
+    assert "validate_direct_manifest" in source
+    assert "MAPPERATORINATOR_NATIVE_EXTENSION_MANIFEST" in source
+    assert 'export TORCH_CUDA_ARCH_LIST=7.5' in source
     assert "MAPPERATORINATOR_REMOTE_BRANCH" in source
     assert '[[ "$BRANCH" == DETACHED ]]' in source
     assert "utils/run_final_confirmation.py" in source

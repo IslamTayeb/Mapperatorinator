@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,33 @@ from utils.run_approximate_weight_only import _initialize_with_evidence
 
 
 RUNTIME_SPEC_SCHEMA_VERSION = "mapperatorinator.final-runtime-spec.v1"
+
+
+def native_extension_evidence() -> dict[str, Any]:
+    from osuT5.osuT5.inference.optimized.kernels.native_extension import (
+        MANIFEST_ENV,
+        loaded_extension_records,
+    )
+
+    manifest = os.environ.get(MANIFEST_ENV)
+    records = loaded_extension_records()
+    expected_mode = "direct" if manifest else "load_inline"
+    wrong_modes = {
+        name: record.get("mode")
+        for name, record in records.items()
+        if record.get("mode") != expected_mode
+    }
+    if wrong_modes:
+        raise RuntimeError(
+            f"native extension load mode differs from {expected_mode}: {wrong_modes}"
+        )
+    if manifest and not records:
+        raise RuntimeError("direct AOT manifest selected but no native extension loaded")
+    return {
+        "mode": expected_mode,
+        "manifest": str(Path(manifest).expanduser().resolve()) if manifest else None,
+        "records": records,
+    }
 
 
 def _object(value: Any, *, name: str) -> dict[str, Any]:
@@ -118,6 +146,8 @@ class KBlockSharedRopeWeightPlugin:
         block_size: int,
         graph_remainders: bool,
         initializer_name: str,
+        initializer_kwargs: dict[str, Any] | None = None,
+        shared_static_input_arena: bool = False,
         shared_rope_binding_index: int = 0,
         initializer_binding_index: int = 0,
         minimum_bindings: int = 1,
@@ -128,6 +158,16 @@ class KBlockSharedRopeWeightPlugin:
             raise TypeError("graph_remainders must be boolean")
         if not isinstance(initializer_name, str) or not initializer_name:
             raise ValueError("initializer_name must be non-empty")
+        if initializer_kwargs is None:
+            initializer_kwargs = {}
+        elif not isinstance(initializer_kwargs, dict):
+            raise TypeError("initializer_kwargs must be an object")
+        if not all(isinstance(key, str) and key for key in initializer_kwargs):
+            raise ValueError("initializer_kwargs keys must be non-empty strings")
+        if not isinstance(shared_static_input_arena, bool):
+            raise TypeError("shared_static_input_arena must be boolean")
+        if shared_static_input_arena and not graph_remainders:
+            raise ValueError("shared static-input arena requires graphed remainders")
         for label, value in (
             ("shared_rope_binding_index", shared_rope_binding_index),
             ("initializer_binding_index", initializer_binding_index),
@@ -141,6 +181,8 @@ class KBlockSharedRopeWeightPlugin:
         self._block_size = block_size
         self._graph_remainders = graph_remainders
         self._initializer_name = initializer_name
+        self._initializer_kwargs = dict(initializer_kwargs)
+        self._shared_static_input_arena = shared_static_input_arena
         self._shared_rope_binding_index = shared_rope_binding_index
         self._initializer_binding_index = initializer_binding_index
         self._minimum_bindings = minimum_bindings
@@ -163,6 +205,7 @@ class KBlockSharedRopeWeightPlugin:
             install_k8_candidate(
                 block_size=self._block_size,
                 graph_remainders=self._graph_remainders,
+                shared_static_input_arena=self._shared_static_input_arena,
             )
         )
         return self
@@ -208,7 +251,7 @@ class KBlockSharedRopeWeightPlugin:
                     f"{self._initializer_name!r}"
                 )
             self._initialization = _initialize_with_evidence(
-                initializer,
+                lambda model: initializer(model, **self._initializer_kwargs),
                 binding.raw_model,
             )
         self._bindings += 1
@@ -242,6 +285,7 @@ class KBlockSharedRopeWeightPlugin:
                     "kind": "block_decode",
                     "block_size": self._block_size,
                     "graph_remainders": self._graph_remainders,
+                    "shared_static_input_arena": self._shared_static_input_arena,
                 },
                 {
                     "kind": "shared_decoder_rope",
@@ -252,6 +296,7 @@ class KBlockSharedRopeWeightPlugin:
                     "kind": "runtime_initializer",
                     "binding_index": self._initializer_binding_index,
                     "name": self._initializer_name,
+                    "kwargs": self._initializer_kwargs,
                 },
             ],
         }
@@ -267,4 +312,5 @@ __all__ = [
     "KBlockSharedRopeWeightPlugin",
     "kblock_shared_rope_weight_plugin",
     "load_runtime_plugin",
+    "native_extension_evidence",
 ]

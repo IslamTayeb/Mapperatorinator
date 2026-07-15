@@ -57,6 +57,45 @@ def _runtime_identity(evidence: dict[str, Any], *, variant: str) -> dict[str, An
     }
 
 
+def _native_extension_identity(
+    evidence: dict[str, Any],
+    *,
+    variant: str,
+) -> dict[str, Any]:
+    raw = evidence.get("native_extensions")
+    if not isinstance(raw, dict):
+        raise CandidateAnalysisError(f"{variant} evidence lacks native-extension identity")
+    mode = raw.get("mode")
+    if mode not in {"direct", "load_inline"}:
+        raise CandidateAnalysisError(f"{variant} native-extension mode is invalid")
+    manifest = raw.get("manifest")
+    if (mode == "direct") != isinstance(manifest, str):
+        raise CandidateAnalysisError(
+            f"{variant} direct native-extension manifest selection is inconsistent"
+        )
+    records = raw.get("records")
+    if not isinstance(records, dict) or not records:
+        raise CandidateAnalysisError(f"{variant} loaded no native extensions")
+    normalized: dict[str, Any] = {}
+    for name, record in sorted(records.items()):
+        if not isinstance(name, str) or not isinstance(record, dict):
+            raise CandidateAnalysisError(f"{variant} native-extension records are invalid")
+        if record.get("mode") != mode:
+            raise CandidateAnalysisError(
+                f"{variant} native extension {name} did not use {mode}"
+            )
+        functions = record.get("functions")
+        if not isinstance(functions, list) or not functions:
+            raise CandidateAnalysisError(
+                f"{variant} native extension {name} lacks exported functions"
+            )
+        normalized[name] = {
+            key: record.get(key)
+            for key in ("mode", "source_sha256", "library_sha256", "functions")
+        }
+    return {"mode": mode, "manifest": manifest, "records": normalized}
+
+
 def _rng_material(run: Any) -> dict[str, Any]:
     return {
         key: value
@@ -123,6 +162,14 @@ def _load_natural(
     }
     if len(identities) != 1:
         raise CandidateAnalysisError(f"natural {variant} runtime identity changed")
+    native_identities = {
+        json.dumps(_native_extension_identity(row, variant=variant), sort_keys=True)
+        for row in evidence_rows
+    }
+    if len(native_identities) != 1:
+        raise CandidateAnalysisError(
+            f"natural {variant} native-extension identity changed"
+        )
     return evidence_rows, runs
 
 
@@ -171,6 +218,7 @@ def _load_fixed(root: Path, variant: str, count: int) -> list[dict[str, float]]:
     rows = []
     manifest_hashes = set()
     runtime_identities = set()
+    native_identities = set()
     uuids = set()
     for path in paths:
         evidence = _json(path)
@@ -180,6 +228,9 @@ def _load_fixed(root: Path, variant: str, count: int) -> list[dict[str, float]]:
             raise CandidateAnalysisError(f"fixed evidence identity mismatch: {path}")
         runtime_identities.add(
             json.dumps(_runtime_identity(evidence, variant=variant), sort_keys=True)
+        )
+        native_identities.add(
+            json.dumps(_native_extension_identity(evidence, variant=variant), sort_keys=True)
         )
         run_uuid = evidence.get("run_uuid")
         if not isinstance(run_uuid, str) or run_uuid in uuids:
@@ -230,6 +281,10 @@ def _load_fixed(root: Path, variant: str, count: int) -> list[dict[str, float]]:
         raise CandidateAnalysisError("fixed-work runs did not share one exact manifest")
     if len(runtime_identities) != 1:
         raise CandidateAnalysisError(f"fixed-work {variant} runtime identity changed")
+    if len(native_identities) != 1:
+        raise CandidateAnalysisError(
+            f"fixed-work {variant} native-extension identity changed"
+        )
     return rows
 
 
@@ -265,6 +320,10 @@ def _load_suite(path: Path, candidate: bool) -> tuple[dict[str, Any], list[Any]]
     if evidence.get("schema_version") != SUITE_SCHEMA_VERSION or bool(evidence.get("candidate")) != candidate:
         raise CandidateAnalysisError(f"serial suite identity mismatch: {path}")
     _runtime_identity(
+        evidence,
+        variant="candidate" if candidate else "baseline",
+    )
+    _native_extension_identity(
         evidence,
         variant="candidate" if candidate else "baseline",
     )
@@ -445,6 +504,14 @@ def analyze(
                 candidate_natural_evidence[0],
                 variant="candidate",
             ),
+            "baseline_native_extensions": _native_extension_identity(
+                baseline_natural_evidence[0],
+                variant="baseline",
+            ),
+            "candidate_native_extensions": _native_extension_identity(
+                candidate_natural_evidence[0],
+                variant="candidate",
+            ),
         },
         "fixed_work": {
             "baseline_runs": baseline_fixed,
@@ -516,6 +583,7 @@ def text_report(report: dict[str, Any]) -> str:
         f"natural.candidate_request_wall_median={candidate_summary['complete_request_wall_seconds']['median']:.9f}",
         f"natural.candidate_setup_capture_median={candidate_summary['setup_plus_capture_seconds']['median']:.9f}",
         f"natural.candidate_cold_process_outer_wall_median={candidate_summary['cold_process_outer_wall_seconds']['median']:.9f}",
+        f"native_extensions.candidate_mode={report['runtimes']['candidate_native_extensions']['mode']}",
         f"natural.timing_token_count_delta={divergence['timing_tokens']['token_count_delta']}",
         f"natural.main_token_count_delta={divergence['main_tokens']['token_count_delta']}",
         f"natural.main_stopping_equal={str(divergence['main_tokens']['stopping_equal']).lower()}",

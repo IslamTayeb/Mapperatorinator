@@ -24,7 +24,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from osuT5.osuT5.inference.engine_binding import InferenceEngineBinding
-from utils.final_confirmation_runtime import load_runtime_plugin
+from utils.final_confirmation_runtime import load_runtime_plugin, native_extension_evidence
 from utils.fixed_seed_inference import (
     fixed_seed_processor_generation,
     rng_state_fingerprints,
@@ -358,6 +358,7 @@ def run(
             "max_reserved_bytes": int(torch.cuda.max_memory_reserved()),
         },
         "initialization": runtime_evidence["initialization"],
+        "native_extensions": native_extension_evidence(),
     }
     evidence_path.parent.mkdir(parents=True, exist_ok=True)
     evidence_path.write_text(
