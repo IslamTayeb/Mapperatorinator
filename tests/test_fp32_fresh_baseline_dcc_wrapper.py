@@ -45,4 +45,5 @@ def test_wrapper_pins_clean_pushed_worktree_and_captures_walls() -> None:
     assert "started_ns=$(date +%s%N)" in source
     assert "finished_ns=$(date +%s%N)" in source
     assert '"elapsed_ns":%s' in source
-    assert "analyze_fp32_fresh_baseline.py" in source
+    assert '"$PYTHON" -m utils.analyze_fp32_fresh_baseline' in source
+    assert '"$PYTHON" utils/analyze_fp32_fresh_baseline.py' not in source

@@ -441,7 +441,10 @@ def profile_batched_encoder_precompute_ceiling(
     from osuT5.osuT5.inference.engine_binding import unwrap_engine_binding
 
     compile_args(args, verbose=False)
-    setup_inference_environment(args.seed)
+    setup_inference_environment(
+        args.seed,
+        strict_fp32=args.precision == "fp32",
+    )
     binding, tokenizer = load_model_with_engine(
         args.model_path,
         args.train,

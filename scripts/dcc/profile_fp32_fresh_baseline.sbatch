@@ -202,7 +202,7 @@ done
 # It is deliberately separate and excluded from every authoritative aggregate.
 run_fresh_process exactness-audit exactness_audit
 
-"$PYTHON" utils/analyze_fp32_fresh_baseline.py \
+"$PYTHON" -m utils.analyze_fp32_fresh_baseline \
   --run-root "$RUN_ROOT" \
   --expected-commit "$COMMIT" \
   --expected-branch "$BRANCH" \

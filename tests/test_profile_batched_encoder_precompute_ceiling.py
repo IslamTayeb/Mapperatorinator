@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 import torch
@@ -80,6 +81,14 @@ def test_accepted_args_accepts_shared_fp32_fp16_and_rejects_other_runtime():
         _assert_accepted_args(_accepted_args(precision="bf16"))
     with pytest.raises(ValueError, match="accepted runtime"):
         _assert_accepted_args(_accepted_args(inference_engine="v32"))
+
+
+def test_component_profiler_uses_strict_fp32_environment_only_for_fp32():
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "utils/profile_batched_encoder_precompute_ceiling.py"
+    ).read_text(encoding="utf-8")
+    assert 'strict_fp32=args.precision == "fp32"' in source
 
 
 def test_stack_window_kwargs_preserves_each_live_row_and_rejects_key_drift():

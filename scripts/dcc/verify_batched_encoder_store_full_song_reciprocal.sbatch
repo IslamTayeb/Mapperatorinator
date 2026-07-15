@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=fp32-encoder-store
+#SBATCH --job-name=encoder-store
 #SBATCH --partition=gpu-common
 #SBATCH --account=romerolab
 #SBATCH --cpus-per-task=8
@@ -12,7 +12,7 @@
 set -euo pipefail
 
 die() {
-  echo "strict-fp32-encoder-store: $*" >&2
+  echo "shared-precision-encoder-store: $*" >&2
   exit 2
 }
 
@@ -26,10 +26,11 @@ REPO=${MAPPERATORINATOR_REPO:?Set MAPPERATORINATOR_REPO to the clean encoder-sto
 COMMIT=${MAPPERATORINATOR_COMMIT:?Set MAPPERATORINATOR_COMMIT}
 BRANCH=${MAPPERATORINATOR_BRANCH:?Set MAPPERATORINATOR_BRANCH}
 REMOTE_REF=${MAPPERATORINATOR_REMOTE_REF:?Set MAPPERATORINATOR_REMOTE_REF}
+PRECISION=${MAPPERATORINATOR_PRECISION:?Set MAPPERATORINATOR_PRECISION to fp32 or fp16}
 WORK=${MAPPERATORINATOR_WORK:-/work/imt11/Mapperatorinator}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
-BASELINE_RUN_ROOT=${MAPPERATORINATOR_BASELINE_RUN_ROOT:?Set the passing strict-FP32 baseline run root}
-RUN_LABEL=${RUN_LABEL:-strict-fp32-encoder-precompute}
+BASELINE_RUN_ROOT=${MAPPERATORINATOR_BASELINE_RUN_ROOT:?Set the passing same-precision baseline run root}
+RUN_LABEL=${RUN_LABEL:-${PRECISION}-encoder-precompute}
 RUN_ROOT="$WORK/runs/${RUN_LABEL}-${SLURM_JOB_ID}"
 EXPECTED_GPU=${MAPPERATORINATOR_EXPECTED_GPU:-2080 Ti}
 BATCH_SIZES=(1 2 4 8 16)
@@ -37,6 +38,11 @@ MIN_AVAILABLE_KIB=$((20 * 1024 * 1024))
 
 # Must precede every Python process and CUDA context.
 export NVIDIA_TF32_OVERRIDE=0
+
+case "$PRECISION" in
+  fp32|fp16) ;;
+  *) die "MAPPERATORINATOR_PRECISION must be fp32 or fp16" ;;
+esac
 
 [[ -x "$PYTHON" ]] || die "missing executable Python at $PYTHON"
 [[ -d "$REPO/.git" || -f "$REPO/.git" ]] || die "missing worktree at $REPO"
@@ -101,6 +107,7 @@ fi
   echo "commit=$COMMIT"
   echo "branch=$BRANCH"
   echo "remote_ref=$REMOTE_REF"
+  echo "precision=$PRECISION"
   echo "baseline_run_root=$BASELINE_RUN_ROOT"
   echo "audio=$AUDIO"
   echo "audio_sha256=$(sha256sum "$AUDIO" | awk '{print $1}')"
@@ -131,7 +138,7 @@ cd "$REPO"
 COMMON_OVERRIDES=(
   audio_path="$AUDIO"
   device=cuda
-  precision=fp32
+  precision="$PRECISION"
   attn_implementation=sdpa
   inference_engine=optimized
   use_server=false
@@ -147,14 +154,14 @@ COMMON_OVERRIDES=(
 )
 
 # Independent B1/B2/B4/B8/B16 encoder-only evidence over identical tensors.
-"$PYTHON" utils/profile_batched_encoder_precompute_ceiling.py \
+"$PYTHON" -m utils.profile_batched_encoder_precompute_ceiling \
   --config-name profile_salvalai \
   --report-path "$RUN_ROOT/component/main/encoder-precompute.json" \
   --batch-sizes 1,2,4,8,16 \
   --warmup 1 \
   "${COMMON_OVERRIDES[@]}" \
   output_path="$RUN_ROOT/component/main/unused"
-"$PYTHON" utils/profile_batched_encoder_precompute_ceiling.py \
+"$PYTHON" -m utils.profile_batched_encoder_precompute_ceiling \
   --config-name profile_salvalai \
   --report-path "$RUN_ROOT/component/timing/encoder-precompute.json" \
   --batch-sizes 1,2,4,8,16 \
@@ -182,7 +189,7 @@ run_candidate() {
   local run_dir="$RUN_ROOT/b${batch_size}/$run_name"
   mkdir -p "$run_dir/output"
   local command=(
-    "$PYTHON" utils/run_batched_encoder_store_full_song.py
+    "$PYTHON" -m utils.run_batched_encoder_store_full_song
     --config-name profile_salvalai
     --mode candidate
     --batch-size "$batch_size"
@@ -211,17 +218,19 @@ run_candidate() {
 
 for batch_size in "${BATCH_SIZES[@]}"; do
   run_candidate "$batch_size" untraced_control control
-  run_candidate "$batch_size" exactness_audit exactness-audit
+  run_candidate "$batch_size" exactness_audit exactness-audit-01
+  run_candidate "$batch_size" exactness_audit exactness-audit-02
 done
 
 set +e
-"$PYTHON" utils/analyze_encoder_store_reciprocal.py \
+"$PYTHON" -m utils.analyze_encoder_store_reciprocal \
   --baseline-run-root "$BASELINE_RUN_ROOT" \
   --candidate-run-root "$RUN_ROOT" \
   --main-audit "$RUN_ROOT/component/main/encoder-precompute.json" \
   --timing-audit "$RUN_ROOT/component/timing/encoder-precompute.json" \
   --expected-commit "$COMMIT" \
   --expected-branch "$BRANCH" \
+  --precision "$PRECISION" \
   --json-output "$RUN_ROOT/analysis.json" \
   --text-output "$RUN_ROOT/analysis.txt"
 ANALYSIS_STATUS=$?

@@ -13,7 +13,7 @@ import torch
 from transformers.modeling_outputs import BaseModelOutput
 
 
-STORE_VERSION = "strict-fp32-batched-all-window-encoder-store-v2"
+STORE_VERSION = "shared-precision-batched-all-window-encoder-store-v3"
 SUPPORTED_LABELS = ("timing_context", "main_generation")
 SUPPORTED_PRECISIONS = ("fp32", "fp16")
 ENCODER_CONDITIONING_KEYS = (

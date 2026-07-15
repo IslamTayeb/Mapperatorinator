@@ -190,7 +190,7 @@ done
 run_fresh_process exactness-audit-01 exactness_audit
 run_fresh_process exactness-audit-02 exactness_audit
 
-"$PYTHON" utils/analyze_fp16_fresh_baseline.py \
+"$PYTHON" -m utils.analyze_fp16_fresh_baseline \
   --run-root "$RUN_ROOT" \
   --expected-commit "$COMMIT" \
   --expected-branch "$BRANCH" \
