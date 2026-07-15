@@ -166,7 +166,7 @@ run_role() {
   local run_dir="$RUN_ROOT/$role"
   local output_dir="$run_dir/output"
   local evidence="$run_dir/evidence.json"
-  local extension_dir="$WORK/torch_extensions/exact-shared-${commit}"
+  local extension_dir="$WORK/torch_extensions/exact-shared-${commit}-${PRECISION}"
   local temp_dir="$WORK/tmp/exact-shared-${SLURM_JOB_ID}-${role}"
   mkdir -p "$output_dir" "$extension_dir" "$temp_dir"
   local command=(

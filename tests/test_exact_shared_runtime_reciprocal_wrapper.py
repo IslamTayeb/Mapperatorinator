@@ -7,7 +7,10 @@ SCRIPT = Path("scripts/dcc/profile_exact_shared_runtime_reciprocal.sbatch")
 def test_exact_shared_runtime_wrapper_isolates_native_builds_and_temp_files() -> None:
     source = SCRIPT.read_text(encoding="utf-8")
 
-    assert 'extension_dir="$WORK/torch_extensions/exact-shared-${commit}"' in source
+    assert (
+        'extension_dir="$WORK/torch_extensions/exact-shared-${commit}-${PRECISION}"'
+        in source
+    )
     assert 'temp_dir="$WORK/tmp/exact-shared-${SLURM_JOB_ID}-${role}"' in source
     assert 'TORCH_EXTENSIONS_DIR="$extension_dir" TMPDIR="$temp_dir"' in source
     assert 'PYTHONPATH="$repo"' in source
