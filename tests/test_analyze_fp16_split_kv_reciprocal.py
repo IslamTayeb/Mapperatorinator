@@ -162,6 +162,7 @@ def test_fp16_wrapper_is_serial_by_default_with_explicit_parallel_opt_in():
     assert "MAPPERATORINATOR_ALLOW_PARALLEL_RECIPROCAL:-0" in script
     assert "non_authoritative_parallel_reciprocal" in script
     assert '"$ALLOW_PARALLEL_RECIPROCAL" != 1' in script
+    assert 'TORCH_EXTENSIONS_DIR="$WORK/torch_extensions/$COMMIT"' in script
     assert "run_fresh_process exactness-audit-01 exactness_audit" in script
     assert "run_fresh_process exactness-audit-02 exactness_audit" in script
     assert "--expected-split-kv" in script

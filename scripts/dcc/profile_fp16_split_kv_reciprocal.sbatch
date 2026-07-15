@@ -70,7 +70,7 @@ git -C "$REPO" show-ref --verify --quiet "$REMOTE_REF" \
 
 mkdir -p "$WORK/logs" "$WORK/tmp" "$WORK/cache" \
   "$WORK/cache/torch_inductor" "$WORK/cache/triton" "$WORK/cache/cuda" \
-  "$WORK/torch_extensions" "$RUN_ROOT"
+  "$WORK/torch_extensions/$COMMIT" "$RUN_ROOT"
 export PATH="$(dirname "$PYTHON"):$PATH"
 export XDG_CACHE_HOME="$WORK/cache"
 export HF_HOME="$WORK/cache/huggingface"
@@ -80,7 +80,7 @@ export TRANSFORMERS_OFFLINE=1
 export TORCHINDUCTOR_CACHE_DIR="$WORK/cache/torch_inductor"
 export TRITON_CACHE_DIR="$WORK/cache/triton"
 export CUDA_CACHE_PATH="$WORK/cache/cuda"
-export TORCH_EXTENSIONS_DIR="$WORK/torch_extensions"
+export TORCH_EXTENSIONS_DIR="$WORK/torch_extensions/$COMMIT"
 export TMPDIR="$WORK/tmp"
 export TOKENIZERS_PARALLELISM=false
 
@@ -120,6 +120,7 @@ fi
   echo "expected_preset=$EXPECTED_PRESET"
   echo "run_root=$RUN_ROOT"
   echo "NVIDIA_TF32_OVERRIDE=$NVIDIA_TF32_OVERRIDE"
+  echo "TORCH_EXTENSIONS_DIR=$TORCH_EXTENSIONS_DIR"
   echo "non_authoritative_parallel_reciprocal=$ALLOW_PARALLEL_RECIPROCAL"
   git -C "$REPO" status --short --branch
   "$PYTHON" -c 'import torch, transformers; print(f"torch={torch.__version__}"); print(f"torch_cuda={torch.version.cuda}"); print(f"transformers={transformers.__version__}")'
