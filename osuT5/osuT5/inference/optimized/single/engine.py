@@ -151,6 +151,7 @@ def _build_logits_processor_list(
     lookback_time: float,
     device,
     stateful_monotonic: bool = True,
+    device_conditional_temperature: bool = True,
 ):
     return build_single_logits_processor_list(
         tokenizer,
@@ -164,6 +165,7 @@ def _build_logits_processor_list(
         lookback_time=lookback_time,
         device=device,
         stateful_monotonic=stateful_monotonic,
+        device_conditional_temperature=device_conditional_temperature,
     )
 
 

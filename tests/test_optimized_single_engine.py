@@ -637,6 +637,39 @@ def test_generate_window_preserves_custom_generate_dispatch(monkeypatch):
     assert processor_kwargs["device_conditional_temperature"] is True
 
 
+def test_logits_builder_forwards_device_conditional_temperature(monkeypatch):
+    captured = {}
+
+    def fake_builder(*args, **kwargs):
+        captured.update(kwargs)
+        return ["processor"]
+
+    monkeypatch.setattr(
+        engine_module,
+        "build_single_logits_processor_list",
+        fake_builder,
+    )
+
+    result = engine_module._build_logits_processor_list(
+        object(),
+        cfg_scale=1.0,
+        timeshift_bias=0.0,
+        types_first=True,
+        temperature=0.9,
+        timing_temperature=0.8,
+        mania_column_temperature=0.7,
+        taiko_hit_temperature=0.6,
+        lookback_time=0.0,
+        device=torch.device("cpu"),
+        stateful_monotonic=True,
+        device_conditional_temperature=False,
+    )
+
+    assert result == ["processor"]
+    assert captured["stateful_monotonic"] is True
+    assert captured["device_conditional_temperature"] is False
+
+
 def test_shared_calculation_helpers_preserve_legacy_server_results():
     class FakeTokenizer:
         eos_id = 2
