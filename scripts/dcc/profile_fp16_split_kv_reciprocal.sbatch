@@ -29,6 +29,7 @@ REMOTE_REF=${MAPPERATORINATOR_REMOTE_REF:?Set MAPPERATORINATOR_REMOTE_REF}
 BASELINE_RUN_ROOT=${MAPPERATORINATOR_BASELINE_RUN_ROOT:?Set the accepted FP16 run root}
 BASELINE_ANALYSIS=${MAPPERATORINATOR_BASELINE_ANALYSIS:-$BASELINE_RUN_ROOT/analysis.json}
 MODE=${MAPPERATORINATOR_CANDIDATE_MODE:-initial}
+ALLOW_PARALLEL_RECIPROCAL=${MAPPERATORINATOR_ALLOW_PARALLEL_RECIPROCAL:-0}
 WORK=${MAPPERATORINATOR_WORK:-/work/imt11/Mapperatorinator}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 EXPECTED_GPU=${MAPPERATORINATOR_EXPECTED_GPU:-2080 Ti}
@@ -44,6 +45,9 @@ case "$MODE" in
   confirm) RUN_INDICES=(01 02 03 04 05) ;;
   *) die "MAPPERATORINATOR_CANDIDATE_MODE must be initial or confirm" ;;
 esac
+if [[ "$ALLOW_PARALLEL_RECIPROCAL" != 0 && "$ALLOW_PARALLEL_RECIPROCAL" != 1 ]]; then
+  die "MAPPERATORINATOR_ALLOW_PARALLEL_RECIPROCAL must be 0 or 1"
+fi
 
 [[ -x "$PYTHON" ]] || die "missing executable Python at $PYTHON"
 [[ -d "$REPO/.git" || -f "$REPO/.git" ]] || die "missing worktree at $REPO"
@@ -95,7 +99,7 @@ mapfile -t OTHER_GPU_JOBS < <(
     | awk -F'|' -v current="$SLURM_JOB_ID" \
         '$1 != current && tolower($2) ~ /gpu/ { print }'
 )
-if [[ ${#OTHER_GPU_JOBS[@]} -ne 0 ]]; then
+if [[ ${#OTHER_GPU_JOBS[@]} -ne 0 && "$ALLOW_PARALLEL_RECIPROCAL" != 1 ]]; then
   printf '%s\n' "${OTHER_GPU_JOBS[@]}" >&2
   die "another GPU job is running or pending"
 fi
@@ -116,6 +120,7 @@ fi
   echo "expected_preset=$EXPECTED_PRESET"
   echo "run_root=$RUN_ROOT"
   echo "NVIDIA_TF32_OVERRIDE=$NVIDIA_TF32_OVERRIDE"
+  echo "non_authoritative_parallel_reciprocal=$ALLOW_PARALLEL_RECIPROCAL"
   git -C "$REPO" status --short --branch
   "$PYTHON" -c 'import torch, transformers; print(f"torch={torch.__version__}"); print(f"torch_cuda={torch.version.cuda}"); print(f"transformers={transformers.__version__}")'
   nvidia-smi --query-gpu=name,uuid,driver_version,memory.total,compute_cap --format=csv,noheader

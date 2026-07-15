@@ -152,13 +152,16 @@ def test_fp16_gate_rejects_candidate_cache_or_rng_nondeterminism(tmp_path):
         analyze(root, baseline_path, candidate_path, mode="initial")
 
 
-def test_fp16_wrapper_is_serial_and_has_no_docs_or_default_selector_flags():
+def test_fp16_wrapper_is_serial_by_default_with_explicit_parallel_opt_in():
     script = (
         Path(__file__).resolve().parents[1]
         / "scripts/dcc/profile_fp16_split_kv_reciprocal.sbatch"
     ).read_text(encoding="utf-8")
     assert 'initial) RUN_INDICES=(01)' in script
     assert 'confirm) RUN_INDICES=(01 02 03 04 05)' in script
+    assert "MAPPERATORINATOR_ALLOW_PARALLEL_RECIPROCAL:-0" in script
+    assert "non_authoritative_parallel_reciprocal" in script
+    assert '"$ALLOW_PARALLEL_RECIPROCAL" != 1' in script
     assert "run_fresh_process exactness-audit-01 exactness_audit" in script
     assert "run_fresh_process exactness-audit-02 exactness_audit" in script
     assert "--expected-split-kv" in script
