@@ -72,9 +72,15 @@ RUNS="$RUN_ROOT/runs"
 [[ "$(git -C "$REPO" branch --show-current)" == "$BRANCH" ]] || die "worktree is not on MAPPERATORINATOR_BRANCH=$BRANCH"
 [[ "$(git -C "$REPO" rev-parse "$REMOTE_REF")" == "$COMMIT" ]] || die "pushed remote ref $REMOTE_REF does not match MAPPERATORINATOR_COMMIT"
 
-mkdir -p "$WORK/logs" "$WORK/tmp" "$WORK/cache" \
+TORCH_EXTENSION_ROOT="$WORK/torch_extensions"
+JOB_TMPDIR="$WORK/tmp"
+if [[ "$SELECTED_MODE" == true ]]; then
+  TORCH_EXTENSION_ROOT="$WORK/torch_extensions/selected-runtime-nsight-$COMMIT"
+  JOB_TMPDIR="$WORK/tmp/selected-runtime-nsight-$SLURM_JOB_ID"
+fi
+mkdir -p "$WORK/logs" "$JOB_TMPDIR" "$WORK/cache" \
   "$WORK/cache/torch_inductor" "$WORK/cache/triton" "$WORK/cache/cuda" \
-  "$WORK/torch_extensions" "$CAPABILITIES" "$RUNS"
+  "$TORCH_EXTENSION_ROOT" "$CAPABILITIES" "$RUNS"
 export PATH="$(dirname "$PYTHON"):$PATH"
 export XDG_CACHE_HOME="$WORK/cache"
 export HF_HOME="$WORK/cache/huggingface"
@@ -84,8 +90,8 @@ export TRANSFORMERS_OFFLINE=1
 export TORCHINDUCTOR_CACHE_DIR="$WORK/cache/torch_inductor"
 export TRITON_CACHE_DIR="$WORK/cache/triton"
 export CUDA_CACHE_PATH="$WORK/cache/cuda"
-export TORCH_EXTENSIONS_DIR="$WORK/torch_extensions"
-export TMPDIR="$WORK/tmp"
+export TORCH_EXTENSIONS_DIR="$TORCH_EXTENSION_ROOT"
+export TMPDIR="$JOB_TMPDIR"
 export TOKENIZERS_PARALLELISM=false
 
 for tool in ffmpeg ffprobe nvidia-smi nsys ncu dcgmi; do
