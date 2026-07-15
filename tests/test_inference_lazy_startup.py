@@ -90,3 +90,22 @@ assert "osu_diffusion.utils.models" in sys.modules
 """
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_custom_backbone_configs_do_not_import_model_implementations() -> None:
+    completed = _run_fresh_python(
+        """
+import sys
+from osuT5.osuT5.model.custom_transformers import VarWhisperConfig
+
+assert VarWhisperConfig.__name__ == "VarWhisperConfig"
+for name in (
+    "osuT5.osuT5.model.custom_transformers.modeling_nwhisper",
+    "osuT5.osuT5.model.custom_transformers.modeling_ropewhisper",
+    "osuT5.osuT5.model.custom_transformers.modeling_varwhisper",
+    "osuT5.osuT5.model.custom_transformers.t5",
+):
+    assert name not in sys.modules, name
+"""
+    )
+    assert completed.returncode == 0, completed.stderr
