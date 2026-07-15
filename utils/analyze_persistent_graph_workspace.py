@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import hashlib
 import json
 import math
 from pathlib import Path
+import statistics
 from typing import Any
 
 
@@ -17,6 +19,25 @@ TOPOLOGY_VERSION = (
     "selected-k4-k1-int8-fp16-cross-shared-arena-persistent-graphs-v2"
 )
 VRAM_GROWTH_TOLERANCE_BYTES = 16 * 1024 * 1024
+REQUIRED_CAPTURE_HITS = {
+    "timing_context": (
+        "native_q1_rope_cache_self_attention",
+        "q1_bmm_cross_attention",
+    ),
+    "main_generation": (
+        "native_q1_rope_cache_self_attention",
+        "q1_bmm_cross_attention",
+        "weight_only_self_attention_block",
+        "weight_only_mlp_tail",
+        "weight_only_final_projection",
+        "int8_weight_mlp_tail",
+        "fp16_packed_cross_projection_candidate",
+    ),
+}
+FORBIDDEN_CAPTURE_HITS = (
+    "native_q1_self_attention",
+    "native_cross_mlp_tail",
+)
 
 
 def _object(value: Any, *, name: str) -> dict[str, Any]:
@@ -167,7 +188,62 @@ def _dispatch_topology_pass(
     return True
 
 
-def _profile_metrics(path: Path) -> dict[str, Any]:
+def _dispatch_capture_hits(
+    row: dict[str, Any],
+    *,
+    name: str,
+) -> dict[str, int]:
+    raw = _object(row.get("optimized_dispatch_capture_hits"), name=name)
+    if not raw:
+        raise ValueError(f"{name} must be non-empty")
+    result = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError(f"{name} contains an invalid counter name")
+        result[key] = _integer(value, name=f"{name}.{key}")
+    return result
+
+
+def _dispatch_execution_pass(
+    label: str,
+    hits: dict[str, int],
+    *,
+    expect_capture: bool,
+) -> bool:
+    if any(hits.get(key, 0) != 0 for key in FORBIDDEN_CAPTURE_HITS):
+        return False
+    required = REQUIRED_CAPTURE_HITS[label]
+    if not expect_capture:
+        return all(value == 0 for value in hits.values())
+    if any(key not in hits for key in required):
+        return False
+    layer_hits = hits["native_q1_rope_cache_self_attention"]
+    if layer_hits <= 0 or layer_hits % 12 != 0:
+        return False
+    if label == "timing_context":
+        return hits["q1_bmm_cross_attention"] == layer_hits
+    if any(
+        hits[key] != layer_hits
+        for key in required
+        if key != "weight_only_final_projection"
+    ):
+        return False
+    if layer_hits != 12 * hits["weight_only_final_projection"]:
+        return False
+    split_total = hits.get("native_q1_rope_cache_self_attention_split_kv_8", 0)
+    split_prefix_total = sum(
+        value
+        for key, value in hits.items()
+        if key.startswith(
+            "native_q1_rope_cache_self_attention_split_kv_8_prefix_"
+        )
+    )
+    return split_total == split_prefix_total and split_total <= layer_hits
+
+
+def _profile_metrics(path: Path, *, pass_name: str) -> dict[str, Any]:
+    if pass_name not in PASSES:
+        raise ValueError(f"unknown persistent pass {pass_name!r}")
     root = _object(json.loads(path.read_text(encoding="utf-8")), name=str(path))
     records = _list(root.get("generation"), name=f"{path}.generation")
     stages = _list(root.get("stages"), name=f"{path}.stages")
@@ -224,7 +300,9 @@ def _profile_metrics(path: Path) -> dict[str, Any]:
         stopping = []
         dispatch_modes = []
         dispatch_policies = []
+        dispatch_capture_hits: Counter[str] = Counter()
         k8_topology_checks = []
+        arena_totals = Counter()
         for index, row in enumerate(rows):
             tokens = _list(
                 row.get("generated_token_ids"),
@@ -267,6 +345,12 @@ def _profile_metrics(path: Path) -> dict[str, Any]:
                     name=f"{label}[{index}].optimized_dispatch_policy",
                 )
             )
+            dispatch_capture_hits.update(
+                _dispatch_capture_hits(
+                    row,
+                    name=f"{label}[{index}].optimized_dispatch_capture_hits",
+                )
+            )
             graphs = _object(
                 row.get("optimized_cuda_graphs"),
                 name=f"{label}[{index}].optimized_cuda_graphs",
@@ -275,16 +359,107 @@ def _profile_metrics(path: Path) -> dict[str, Any]:
                 graphs.get("k8_candidate"),
                 name=f"{label}[{index}].k8_candidate",
             )
+            block_replays = _integer(
+                k8.get("block_replays"),
+                name=f"{label}[{index}].block_replays",
+            )
+            remainder_replays = _integer(
+                k8.get("remainder_graph_replays"),
+                name=f"{label}[{index}].remainder_graph_replays",
+            )
+            prefill_steps = _integer(
+                k8.get("prefill_steps"),
+                name=f"{label}[{index}].prefill_steps",
+            )
+            eligible_steps = _integer(
+                k8.get("eligible_steps"),
+                name=f"{label}[{index}].eligible_steps",
+            )
+            remainder_steps = _integer(
+                k8.get("remainder_steps"),
+                name=f"{label}[{index}].remainder_steps",
+            )
+            eager_remainder_steps = _integer(
+                k8.get("eager_remainder_steps"),
+                name=f"{label}[{index}].eager_remainder_steps",
+            )
+            physical_steps = _integer(
+                k8.get("physical_steps"),
+                name=f"{label}[{index}].physical_steps",
+            )
+            logical_steps = _integer(
+                k8.get("logical_steps"),
+                name=f"{label}[{index}].logical_steps",
+            )
+            wasted_steps = _integer(
+                k8.get("wasted_steps"),
+                name=f"{label}[{index}].wasted_steps",
+            )
+            expected_refreshes = int(block_replays + remainder_replays > 0)
+            refreshes = _integer(
+                k8.get("static_input_arena_refreshes"),
+                name=f"{label}[{index}].arena_refreshes",
+            )
+            refresh_calls = _integer(
+                k8.get("static_input_arena_refresh_copy_calls"),
+                name=f"{label}[{index}].arena_refresh_copy_calls",
+            )
+            refresh_bytes = _integer(
+                k8.get("static_input_arena_refresh_copy_bytes"),
+                name=f"{label}[{index}].arena_refresh_copy_bytes",
+            )
+            content_checks = _integer(
+                k8.get("static_input_arena_content_checks"),
+                name=f"{label}[{index}].arena_content_checks",
+            )
+            copy_calls = _integer(
+                k8.get("copy_calls"),
+                name=f"{label}[{index}].copy_calls",
+            )
+            copy_bytes = _integer(
+                k8.get("copy_bytes"),
+                name=f"{label}[{index}].copy_bytes",
+            )
+            arena_evidence_pass = (
+                (
+                    expected_refreshes == 1
+                    and refreshes == 1
+                    and refresh_calls == 4
+                    and refresh_bytes > 0
+                    and content_checks == refresh_calls
+                    and copy_calls == refresh_calls
+                    and copy_bytes == refresh_bytes
+                )
+                or (
+                    expected_refreshes == 0
+                    and refreshes == 0
+                    and refresh_calls == 0
+                    and refresh_bytes == 0
+                    and content_checks == 0
+                    and copy_calls == 0
+                    and copy_bytes == 0
+                )
+            )
+            arena_totals.update(
+                {
+                    "refreshes": refreshes,
+                    "copy_calls": refresh_calls,
+                    "copy_bytes": refresh_bytes,
+                    "content_checks": content_checks,
+                }
+            )
             k8_topology_checks.append(
                 k8.get("block_size") == 4
                 and k8.get("remainder_backend") == "cuda_graph"
                 and k8.get("shared_static_input_arena") is True
                 and k8.get("static_input_arena_content_match") is True
-                and _integer(
-                    k8.get("static_input_arena_content_checks"),
-                    name=f"{label}[{index}].arena_content_checks",
-                )
-                >= 0
+                and eligible_steps == 4 * block_replays
+                and remainder_steps == remainder_replays
+                and eager_remainder_steps == 0
+                and physical_steps
+                == prefill_steps + eligible_steps + remainder_steps
+                and logical_steps + wasted_steps == physical_steps
+                and arena_evidence_pass
             )
         cache_storage = _list(
             last_persistent.get("cache_storage"),
@@ -329,6 +504,8 @@ def _profile_metrics(path: Path) -> dict[str, Any]:
             "stopping": stopping,
             "dispatch_modes": dispatch_modes,
             "dispatch_policies": dispatch_policies,
+            "dispatch_capture_hits": dict(dispatch_capture_hits),
+            "arena_totals": dict(arena_totals),
             "cache_storage": cache_storage,
             "encoder_storage": encoder_storage,
             "arena_storage": arena_storage,
@@ -345,7 +522,13 @@ def _profile_metrics(path: Path) -> dict[str, Any]:
                 dispatch_modes,
                 dispatch_policies,
             ),
-            "k8_topology_pass": all(k8_topology_checks),
+            "dispatch_execution_pass": _dispatch_execution_pass(
+                label,
+                dict(dispatch_capture_hits),
+                expect_capture=pass_name == "cold",
+            ),
+            "k8_topology_pass": all(k8_topology_checks)
+            and all(arena_totals[key] > 0 for key in arena_totals),
             "cross_request_graph_hits": max(
                 int(
                     _object(
@@ -387,13 +570,179 @@ def _profile_metrics(path: Path) -> dict[str, Any]:
     }
 
 
+def _reference_metrics(profile_path: Path, result_path: Path) -> dict[str, Any]:
+    root = _object(
+        json.loads(profile_path.read_text(encoding="utf-8")),
+        name=str(profile_path),
+    )
+    records = _list(root.get("generation"), name=f"{profile_path}.generation")
+    stages = _list(root.get("stages"), name=f"{profile_path}.stages")
+    stage_by_name = {
+        str(stage["name"]): _object(stage, name=f"{profile_path}.stage")
+        for stage in stages
+        if isinstance(stage, dict) and "name" in stage
+    }
+    validate = stage_by_name.get("validate_inputs")
+    final = stage_by_name.get("write_osu") or stage_by_name.get("write_osz")
+    if validate is None or final is None:
+        raise ValueError("reference profile is missing request boundary stages")
+    complete = _number(
+        final.get("finished_at_perf_counter_seconds"),
+        name="reference.final.finished",
+    ) - _number(
+        validate.get("started_at_perf_counter_seconds"),
+        name="reference.validate.started",
+    )
+    if complete <= 0.0:
+        raise ValueError("reference complete request wall must be positive")
+    metadata = _object(root.get("metadata"), name=f"{profile_path}.metadata")
+    recorded_result = Path(str(metadata.get("result_path", "")))
+    if not result_path.is_file() or result_path.stat().st_size <= 0:
+        raise ValueError(f"reference result artifact is missing: {result_path}")
+    if recorded_result.resolve() != result_path.resolve():
+        raise ValueError("reference profile result path does not match manifest")
+
+    labels = {}
+    for label in LABELS:
+        rows = [
+            _object(row, name=f"reference.{label}[]")
+            for row in records
+            if isinstance(row, dict) and row.get("profile_label") == label
+        ]
+        rows.sort(key=lambda row: int(row.get("sequence_index", -1)))
+        if not rows:
+            raise ValueError(f"reference contains no {label} records")
+        token_streams = []
+        stopping = []
+        modes = []
+        policies = []
+        capture_hits: Counter[str] = Counter()
+        k8_topology = []
+        for index, row in enumerate(rows):
+            tokens = _list(
+                row.get("generated_token_ids"),
+                name=f"reference.{label}[{index}].generated_token_ids",
+            )
+            if not all(
+                isinstance(token, int) and not isinstance(token, bool)
+                for token in tokens
+            ):
+                raise ValueError("reference token ids must be integers")
+            generated = _integer(
+                row.get("generated_tokens"),
+                name=f"reference.{label}[{index}].generated_tokens",
+            )
+            if generated != len(tokens):
+                raise ValueError("reference generated-token count is inconsistent")
+            token_streams.append(tokens)
+            stopping.append(
+                (
+                    generated,
+                    _integer(
+                        row.get("output_tokens"),
+                        name=f"reference.{label}[{index}].output_tokens",
+                    ),
+                    _integer(
+                        row.get("prompt_tokens"),
+                        name=f"reference.{label}[{index}].prompt_tokens",
+                    ),
+                )
+            )
+            mode = row.get("optimized_dispatch_mode")
+            if not isinstance(mode, str) or not mode:
+                raise ValueError(f"reference.{label}[{index}] dispatch mode is missing")
+            modes.append(mode)
+            policies.append(
+                _object(
+                    row.get("optimized_dispatch_policy"),
+                    name=f"reference.{label}[{index}].optimized_dispatch_policy",
+                )
+            )
+            capture_hits.update(
+                _dispatch_capture_hits(
+                    row,
+                    name=(
+                        f"reference.{label}[{index}]."
+                        "optimized_dispatch_capture_hits"
+                    ),
+                )
+            )
+            graphs = _object(
+                row.get("optimized_cuda_graphs"),
+                name=f"reference.{label}[{index}].optimized_cuda_graphs",
+            )
+            if "persistent_workspace" in graphs:
+                raise ValueError("reference profile unexpectedly used a persistent pool")
+            k8 = _object(
+                graphs.get("k8_candidate"),
+                name=f"reference.{label}[{index}].k8_candidate",
+            )
+            k8_topology.append(
+                k8.get("block_size") == 4
+                and k8.get("remainder_backend") == "cuda_graph"
+                and k8.get("shared_static_input_arena") is False
+            )
+        labels[label] = {
+            "model_seconds": sum(
+                _number(
+                    row.get("model_elapsed_seconds"),
+                    name=f"reference.{label}.model_elapsed_seconds",
+                )
+                for row in rows
+            ),
+            "outer_wall_seconds": _number(
+                stage_by_name[
+                    "timing_context_generation"
+                    if label == "timing_context"
+                    else "main_generation"
+                ].get("wall_seconds"),
+                name=f"reference.{label}.outer_wall_seconds",
+            ),
+            "token_streams": token_streams,
+            "stopping": stopping,
+            "dispatch_modes": modes,
+            "dispatch_policies": policies,
+            "dispatch_capture_hits": dict(capture_hits),
+            "dispatch_topology_pass": _dispatch_topology_pass(
+                label,
+                modes,
+                policies,
+            ),
+            "dispatch_execution_pass": _dispatch_execution_pass(
+                label,
+                dict(capture_hits),
+                expect_capture=True,
+            ),
+            "k8_topology_pass": all(k8_topology),
+        }
+    return {
+        "profile_path": str(profile_path),
+        "result_path": str(result_path),
+        "result_sha256": _sha256(result_path),
+        "complete_request_wall_seconds": complete,
+        "labels": labels,
+    }
+
+
+def _reference_from_control_row(value: Any, *, name: str) -> dict[str, Any]:
+    row = _object(value, name=name)
+    output_dir = Path(str(row.get("output_dir", "")))
+    if not output_dir.is_dir():
+        raise ValueError(f"{name} output directory is missing: {output_dir}")
+    results = sorted(output_dir.glob("*.osu"))
+    profiles = sorted(output_dir.glob("*.osu.profile.json"))
+    if len(results) != 1 or len(profiles) != 1:
+        raise ValueError(f"{name} must contain exactly one osu and one profile")
+    return _reference_metrics(profiles[0], results[0])
+
+
 def analyze(manifest_path: Path) -> dict[str, Any]:
     manifest = _object(
         json.loads(manifest_path.read_text(encoding="utf-8")),
         name="manifest",
     )
-    if manifest.get("schema_version") != 2:
-        raise ValueError("persistent graph manifest schema_version must be 2")
+    if manifest.get("schema_version") != 3:
+        raise ValueError("persistent graph manifest schema_version must be 3")
     if manifest.get("topology_version") != TOPOLOGY_VERSION:
         raise ValueError("persistent graph manifest topology version changed")
     initialization_path = Path(str(manifest.get("initialization_path", "")))
@@ -446,6 +795,16 @@ def analyze(manifest_path: Path) -> dict[str, Any]:
         initialization.get("pool_initial"),
         name="initialization.pool_initial",
     )
+    control_rows = _object(manifest.get("controls"), name="manifest.controls")
+    if set(control_rows) != {"before", "after"}:
+        raise ValueError("persistent manifest requires before/after controls")
+    controls = {
+        name: _reference_from_control_row(
+            row,
+            name=f"controls.{name}",
+        )
+        for name, row in control_rows.items()
+    }
     results = _object(manifest.get("results"), name="manifest.results")
     if set(results) != set(PASSES):
         raise ValueError(f"persistent graph results must be exactly {list(PASSES)}")
@@ -454,7 +813,10 @@ def analyze(manifest_path: Path) -> dict[str, Any]:
         for pass_name in PASSES
     }
     metrics = {
-        pass_name: _profile_metrics(Path(result_rows[pass_name]["profile_path"]))
+        pass_name: _profile_metrics(
+            Path(result_rows[pass_name]["profile_path"]),
+            pass_name=pass_name,
+        )
         for pass_name in PASSES
     }
     for pass_name in PASSES:
@@ -464,13 +826,64 @@ def analyze(manifest_path: Path) -> dict[str, Any]:
         )
     profile_topology_pass = all(
         metrics[pass_name]["labels"][label]["dispatch_topology_pass"]
+        and metrics[pass_name]["labels"][label]["dispatch_execution_pass"]
         and metrics[pass_name]["labels"][label]["k8_topology_pass"]
         for pass_name in PASSES
+        for label in LABELS
+    ) and all(
+        controls[control_name]["labels"][label]["dispatch_topology_pass"]
+        and controls[control_name]["labels"][label]["dispatch_execution_pass"]
+        and controls[control_name]["labels"][label]["k8_topology_pass"]
+        for control_name in controls
+        for label in LABELS
+    ) and all(
+        metrics["warm1"]["labels"][label]["dispatch_capture_hits"]
+        == metrics["warm2"]["labels"][label]["dispatch_capture_hits"]
         for label in LABELS
     )
     cold = metrics["cold"]
     warm2 = metrics["warm2"]
-    exactness: dict[str, Any] = {"reference": "cold", "passes": {}}
+    control_before = controls["before"]
+    control_after = controls["after"]
+    control_repeatability: dict[str, Any] = {
+        "final_osu": (
+            control_before["result_sha256"] == control_after["result_sha256"]
+        ),
+        "labels": {},
+    }
+    for label in LABELS:
+        left = control_before["labels"][label]
+        right = control_after["labels"][label]
+        control_repeatability["labels"][label] = {
+            "tokens": left["token_streams"] == right["token_streams"],
+            "stopping": left["stopping"] == right["stopping"],
+            "dispatch_mode": left["dispatch_modes"] == right["dispatch_modes"],
+            "dispatch_policy": left["dispatch_policies"] == right["dispatch_policies"],
+            "dispatch_capture_hits": (
+                left["dispatch_capture_hits"] == right["dispatch_capture_hits"]
+            ),
+        }
+    control_comparison: dict[str, Any] = {
+        "final_osu": control_before["result_sha256"] == cold["result_sha256"],
+        "labels": {},
+    }
+    for label in LABELS:
+        left = control_before["labels"][label]
+        right = cold["labels"][label]
+        control_comparison["labels"][label] = {
+            "tokens": left["token_streams"] == right["token_streams"],
+            "stopping": left["stopping"] == right["stopping"],
+            "dispatch_mode": left["dispatch_modes"] == right["dispatch_modes"],
+            "dispatch_policy": (
+                left["dispatch_policies"] == right["dispatch_policies"]
+            ),
+        }
+    exactness: dict[str, Any] = {
+        "reference": "nonpersistent_nonarena_control",
+        "control_repeatability": control_repeatability,
+        "control_vs_cold": control_comparison,
+        "passes": {},
+    }
     for pass_name in WARM_PASSES:
         candidate = metrics[pass_name]
         comparison: dict[str, Any] = {
@@ -504,6 +917,12 @@ def analyze(manifest_path: Path) -> dict[str, Any]:
             for checks in comparison["labels"].values()
         )
         for comparison in exactness["passes"].values()
+    ) and control_repeatability["final_osu"] and all(
+        all(checks.values())
+        for checks in control_repeatability["labels"].values()
+    ) and control_comparison["final_osu"] and all(
+        all(checks.values())
+        for checks in control_comparison["labels"].values()
     )
     capture_seconds = {
         pass_name: sum(
@@ -749,13 +1168,46 @@ def analyze(manifest_path: Path) -> dict[str, Any]:
     memory_pass = all(profile_memory_checks.values()) and all(
         cuda_memory_checks.values()
     ) and all(peak_reset_checks.values())
+    control_medians = {
+        "complete_request_wall_seconds": statistics.median(
+            item["complete_request_wall_seconds"] for item in controls.values()
+        ),
+        **{
+            f"{label}_{field}": statistics.median(
+                item["labels"][label][field] for item in controls.values()
+            )
+            for label in LABELS
+            for field in ("model_seconds", "outer_wall_seconds")
+        },
+    }
     report = {
-        "schema_version": 2,
+        "schema_version": 3,
         "manifest_path": str(manifest_path),
+        "controls": controls,
         "cold": cold,
         "warm1": warm1,
         "warm2": warm2,
         "savings": {
+            "control_median_complete_request_wall_seconds": (
+                control_medians["complete_request_wall_seconds"]
+                - warm2["complete_request_wall_seconds"]
+            ),
+            "control_median_timing_model_seconds": (
+                control_medians["timing_context_model_seconds"]
+                - warm2["labels"]["timing_context"]["model_seconds"]
+            ),
+            "control_median_timing_outer_wall_seconds": (
+                control_medians["timing_context_outer_wall_seconds"]
+                - warm2["labels"]["timing_context"]["outer_wall_seconds"]
+            ),
+            "control_median_main_model_seconds": (
+                control_medians["main_generation_model_seconds"]
+                - warm2["labels"]["main_generation"]["model_seconds"]
+            ),
+            "control_median_main_outer_wall_seconds": (
+                control_medians["main_generation_outer_wall_seconds"]
+                - warm2["labels"]["main_generation"]["outer_wall_seconds"]
+            ),
             "process_call_wall_seconds": (
                 cold["process_call_wall_seconds"]
                 - warm2["process_call_wall_seconds"]
@@ -784,6 +1236,7 @@ def analyze(manifest_path: Path) -> dict[str, Any]:
                 capture_seconds["cold"] - capture_seconds["warm2"]
             ),
         },
+        "control_medians": control_medians,
         "exactness": exactness,
         "exactness_pass": exactness_pass,
         "capture_gate": {
@@ -833,6 +1286,8 @@ def _text(report: dict[str, Any]) -> str:
             f"pool_pass={str(report['pool_pass']).lower()}",
             f"memory_pass={str(report['memory_gate']['pass']).lower()}",
             f"close_pass={str(report['close_pass']).lower()}",
+            "control_repeatability_pass="
+            f"{str(report['exactness']['control_repeatability']['final_osu'] and all(all(checks.values()) for checks in report['exactness']['control_repeatability']['labels'].values())).lower()}",
             f"cold_capture_seconds={report['capture_gate']['capture_seconds']['cold']:.9f}",
             f"warm1_capture_seconds={report['capture_gate']['capture_seconds']['warm1']:.9f}",
             f"warm2_capture_seconds={report['capture_gate']['capture_seconds']['warm2']:.9f}",
@@ -840,6 +1295,8 @@ def _text(report: dict[str, Any]) -> str:
             f"warm2_cross_request_graph_hits={report['cross_request_graph_hits']['warm2']}",
             f"process_call_saving_seconds={savings['process_call_wall_seconds']:.9f}",
             f"complete_request_saving_seconds={savings['complete_request_wall_seconds']:.9f}",
+            "control_median_complete_request_saving_seconds="
+            f"{savings['control_median_complete_request_wall_seconds']:.9f}",
             f"timing_model_saving_seconds={savings['timing_model_seconds']:.9f}",
             f"timing_outer_saving_seconds={savings['timing_outer_wall_seconds']:.9f}",
             f"main_model_saving_seconds={savings['main_model_seconds']:.9f}",

@@ -20,6 +20,26 @@ def _stage(name: str, start: float, wall: float) -> dict:
     }
 
 
+def _capture_hits(*, timing: bool, captured: bool) -> dict[str, int]:
+    hits = {
+        "native_q1_rope_cache_self_attention": 12 if captured else 0,
+        "native_q1_self_attention": 0,
+        "q1_bmm_cross_attention": 12 if captured else 0,
+        "native_cross_mlp_tail": 0,
+    }
+    if not timing:
+        hits.update(
+            {
+                "weight_only_self_attention_block": 12 if captured else 0,
+                "weight_only_mlp_tail": 12 if captured else 0,
+                "weight_only_final_projection": 1 if captured else 0,
+                "int8_weight_mlp_tail": 12 if captured else 0,
+                "fp16_packed_cross_projection_candidate": 12 if captured else 0,
+            }
+        )
+    return hits
+
+
 def _profile(
     root: Path,
     label: str,
@@ -101,13 +121,31 @@ def _profile(
                         }
                     ),
                 },
+                "optimized_dispatch_capture_hits": _capture_hits(
+                    timing=timing,
+                    captured=label == "cold",
+                ),
                 "optimized_cuda_graphs": {
                     "k8_candidate": {
                         "block_size": 4,
+                        "prefill_steps": 1,
+                        "eligible_steps": 4,
+                        "block_replays": 1,
                         "remainder_backend": "cuda_graph",
+                        "remainder_steps": 0,
+                        "remainder_graph_replays": 0,
+                        "eager_remainder_steps": 0,
+                        "physical_steps": 5,
+                        "logical_steps": 5,
+                        "wasted_steps": 0,
                         "shared_static_input_arena": True,
+                        "static_input_arena_refreshes": 1,
+                        "static_input_arena_refresh_copy_calls": 4,
+                        "static_input_arena_refresh_copy_bytes": 256,
                         "static_input_arena_content_match": True,
                         "static_input_arena_content_checks": 4,
+                        "copy_calls": 4,
+                        "copy_bytes": 256,
                     },
                     "persistent_workspace": {
                         "cross_request_graph_hits": cross_request_hits,
@@ -171,6 +209,21 @@ def _manifest(tmp_path: Path, *, warm_capture: float = 0.0) -> Path:
         graph_delta=0,
         cross_request_hits=18,
     )
+    control_dirs = {}
+    for control_name in ("before", "after"):
+        cold_payload = json.loads(cold.read_text(encoding="utf-8"))
+        control_dir = tmp_path / f"control-{control_name}"
+        control_dir.mkdir()
+        control_result = control_dir / "control.osu"
+        control_result.write_text("same map\n", encoding="utf-8")
+        cold_payload["metadata"]["result_path"] = str(control_result)
+        for row in cold_payload["generation"]:
+            graphs = row["optimized_cuda_graphs"]
+            graphs.pop("persistent_workspace", None)
+            graphs["k8_candidate"]["shared_static_input_arena"] = False
+        control_profile = control_dir / "control.osu.profile.json"
+        control_profile.write_text(json.dumps(cold_payload), encoding="utf-8")
+        control_dirs[control_name] = control_dir
     workspace = {
         "signature": "sig",
         "graph_count": 2,
@@ -275,12 +328,16 @@ def _manifest(tmp_path: Path, *, warm_capture: float = 0.0) -> Path:
     path.write_text(
         json.dumps(
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "topology_version": (
                     "selected-k4-k1-int8-fp16-cross-shared-arena-"
                     "persistent-graphs-v2"
                 ),
                 "initialization_path": str(initialization),
+                "controls": {
+                    name: {"output_dir": str(path)}
+                    for name, path in control_dirs.items()
+                },
                 "results": {
                     "cold": {
                         "profile_path": str(cold),
@@ -488,3 +545,98 @@ def test_analyzer_requires_peak_reset_evidence(tmp_path: Path) -> None:
 
     assert report["memory_gate"]["peak_reset_checks"]["warm2"] is False
     assert report["memory_gate"]["pass"] is False
+
+
+def test_analyzer_rejects_zero_arena_refresh_and_content_evidence(
+    tmp_path: Path,
+) -> None:
+    manifest_path = _manifest(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for pass_name in ("cold", "warm1", "warm2"):
+        profile_path = Path(manifest["results"][pass_name]["profile_path"])
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        for row in profile["generation"]:
+            runtime = row["optimized_cuda_graphs"]["k8_candidate"]
+            for field in (
+                "static_input_arena_refreshes",
+                "static_input_arena_refresh_copy_calls",
+                "static_input_arena_refresh_copy_bytes",
+                "static_input_arena_content_checks",
+                "copy_calls",
+                "copy_bytes",
+            ):
+                runtime[field] = 0
+        profile_path.write_text(json.dumps(profile), encoding="utf-8")
+
+    report = analyze(manifest_path)
+
+    assert report["profile_topology_pass"] is False
+    assert report["pass"] is False
+
+
+def test_analyzer_fails_loudly_without_dispatch_execution_evidence(
+    tmp_path: Path,
+) -> None:
+    manifest_path = _manifest(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for pass_name in ("cold", "warm1", "warm2"):
+        profile_path = Path(manifest["results"][pass_name]["profile_path"])
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        for row in profile["generation"]:
+            del row["optimized_dispatch_capture_hits"]
+        profile_path.write_text(json.dumps(profile), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="optimized_dispatch_capture_hits"):
+        analyze(manifest_path)
+
+
+def test_analyzer_rejects_wrong_selected_kernel_hit_relation(tmp_path: Path) -> None:
+    manifest_path = _manifest(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    cold_path = Path(manifest["results"]["cold"]["profile_path"])
+    cold = json.loads(cold_path.read_text(encoding="utf-8"))
+    for row in cold["generation"]:
+        if row["profile_label"] == "main_generation":
+            row["optimized_dispatch_capture_hits"]["q1_bmm_cross_attention"] = 0
+    cold_path.write_text(json.dumps(cold), encoding="utf-8")
+
+    report = analyze(manifest_path)
+
+    assert report["profile_topology_pass"] is False
+    assert report["pass"] is False
+
+
+def test_external_control_rejects_common_mode_candidate_corruption(
+    tmp_path: Path,
+) -> None:
+    manifest_path = _manifest(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for pass_name in ("cold", "warm1", "warm2"):
+        profile_path = Path(manifest["results"][pass_name]["profile_path"])
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        for row in profile["generation"]:
+            row["generated_token_ids"] = [99, 100]
+        profile_path.write_text(json.dumps(profile), encoding="utf-8")
+        result_path = Path(profile["metadata"]["result_path"])
+        result_path.write_text("same corrupted map\n", encoding="utf-8")
+
+    report = analyze(manifest_path)
+
+    assert report["exactness"]["control_vs_cold"]["final_osu"] is False
+    assert report["exactness_pass"] is False
+    assert report["pass"] is False
+
+
+def test_analyzer_rejects_persistent_workspace_in_external_control(
+    tmp_path: Path,
+) -> None:
+    manifest_path = _manifest(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    control_dir = Path(manifest["controls"]["before"]["output_dir"])
+    profile_path = next(control_dir.glob("*.osu.profile.json"))
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    profile["generation"][0]["optimized_cuda_graphs"]["persistent_workspace"] = {}
+    profile_path.write_text(json.dumps(profile), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="persistent pool"):
+        analyze(manifest_path)

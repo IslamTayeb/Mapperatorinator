@@ -121,11 +121,16 @@ def test_runner_reuses_two_bindings_and_closes_pools(monkeypatch, tmp_path: Path
 
     manifest = tmp_path / "manifest.json"
     initialization = tmp_path / "initialization.json"
+    control_before = tmp_path / "control-before"
+    control_after = tmp_path / "control-after"
+    control_before.mkdir()
     runner.run(
         "profile_salvalai",
         ["seed=12345"],
         output_init_json=initialization,
         output_manifest=manifest,
+        control_before_dir=control_before,
+        control_after_dir=control_after,
     )
 
     assert calls == 3
@@ -138,6 +143,10 @@ def test_runner_reuses_two_bindings_and_closes_pools(monkeypatch, tmp_path: Path
     payload = json.loads(manifest.read_text(encoding="utf-8"))
     assert payload["close_completed"] is True
     assert set(payload["results"]) == {"cold", "warm1", "warm2"}
+    assert payload["controls"] == {
+        "before": {"output_dir": str(control_before)},
+        "after": {"output_dir": str(control_after)},
+    }
     assert payload["results"]["cold"]["pool_summary"]["main"]["request_count"] == 0
     assert payload["results"]["warm1"]["pool_summary"]["main"]["request_count"] == 0
     assert payload["results"]["warm2"]["pool_summary"]["main"]["request_count"] == 0

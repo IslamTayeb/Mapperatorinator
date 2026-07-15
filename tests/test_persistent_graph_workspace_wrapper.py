@@ -15,6 +15,9 @@ def test_dcc_wrapper_is_fail_loud_and_runs_one_same_process_pair() -> None:
     assert "refs/remotes/$REMOTE/$BRANCH" in source
     assert "run_persistent_graph_workspace_scout.py" in source
     assert source.count("run_persistent_graph_workspace_scout.py") == 1
+    assert source.count("run_selected_timing_native_self.py") == 2
+    assert "--control-before-dir" in source
+    assert "--control-after-dir" in source
     assert "analyze_persistent_graph_workspace.py" in source
     assert "profile_pass_kind=untraced_control" in source
     assert "^pool_pass=true$" in source
@@ -23,4 +26,5 @@ def test_dcc_wrapper_is_fail_loud_and_runs_one_same_process_pair() -> None:
     assert "^profile_topology_pass=true$" in source
     assert "^memory_pass=true$" in source
     assert "^close_pass=true$" in source
+    assert "^control_repeatability_pass=true$" in source
     assert "sbatch " not in source

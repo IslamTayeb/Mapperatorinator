@@ -66,11 +66,18 @@ def run(
     *,
     output_init_json: Path,
     output_manifest: Path,
+    control_before_dir: Path,
+    control_after_dir: Path,
 ) -> None:
     import inference
 
     args = _load_args(config_name, overrides)
     _validate_args(args)
+    if not control_before_dir.is_dir():
+        raise ValueError(
+            f"persistent graph control-before directory is missing: {control_before_dir}"
+        )
+    control_after_dir.parent.mkdir(parents=True, exist_ok=True)
     output_manifest.parent.mkdir(parents=True, exist_ok=True)
     original_loader = inference.load_model_with_engine
     stack = ExitStack()
@@ -233,9 +240,13 @@ def run(
     output_manifest.write_text(
         json.dumps(
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "topology_version": TOPOLOGY_VERSION,
                 "initialization_path": str(output_init_json),
+                "controls": {
+                    "before": {"output_dir": str(control_before_dir)},
+                    "after": {"output_dir": str(control_after_dir)},
+                },
                 "results": results,
                 "final_pool_summary": final_pool_summary,
                 "close_completed": close_completed,
@@ -253,6 +264,8 @@ def main() -> None:
     parser.add_argument("--config-name", default="profile_salvalai")
     parser.add_argument("--output-init-json", type=Path, required=True)
     parser.add_argument("--output-manifest", type=Path, required=True)
+    parser.add_argument("--control-before-dir", type=Path, required=True)
+    parser.add_argument("--control-after-dir", type=Path, required=True)
     parser.add_argument("overrides", nargs="*")
     parsed = parser.parse_args()
     run(
@@ -260,6 +273,8 @@ def main() -> None:
         parsed.overrides,
         output_init_json=parsed.output_init_json,
         output_manifest=parsed.output_manifest,
+        control_before_dir=parsed.control_before_dir,
+        control_after_dir=parsed.control_after_dir,
     )
 
 

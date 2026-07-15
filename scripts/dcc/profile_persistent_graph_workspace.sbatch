@@ -131,14 +131,31 @@ COMMON_OVERRIDES=(
 )
 
 cd "$REPO"
+mkdir -p "$RUN_ROOT/control-before" "$RUN_ROOT/control-after"
+"$PYTHON" utils/run_selected_timing_native_self.py \
+  --config-name profile_salvalai \
+  --output-init-json "$RUN_ROOT/control-before-initialization.json" \
+  "${COMMON_OVERRIDES[@]}" \
+  output_path="$RUN_ROOT/control-before"
+
 "$PYTHON" utils/run_persistent_graph_workspace_scout.py \
   --config-name profile_salvalai \
   --output-init-json "$RUN_ROOT/initialization.json" \
   --output-manifest "$RUN_ROOT/manifest.json" \
+  --control-before-dir "$RUN_ROOT/control-before" \
+  --control-after-dir "$RUN_ROOT/control-after" \
   "${COMMON_OVERRIDES[@]}"
+
+"$PYTHON" utils/run_selected_timing_native_self.py \
+  --config-name profile_salvalai \
+  --output-init-json "$RUN_ROOT/control-after-initialization.json" \
+  "${COMMON_OVERRIDES[@]}" \
+  output_path="$RUN_ROOT/control-after"
 
 for artifact in \
   "$RUN_ROOT/initialization.json" \
+  "$RUN_ROOT/control-before-initialization.json" \
+  "$RUN_ROOT/control-after-initialization.json" \
   "$RUN_ROOT/manifest.json"; do
   if [[ ! -s "$artifact" ]]; then
     echo "missing persistent graph artifact: $artifact" >&2
@@ -168,3 +185,4 @@ grep -q '^profile_topology_pass=true$' "$RUN_ROOT/analysis.txt"
 grep -q '^pool_pass=true$' "$RUN_ROOT/analysis.txt"
 grep -q '^memory_pass=true$' "$RUN_ROOT/analysis.txt"
 grep -q '^close_pass=true$' "$RUN_ROOT/analysis.txt"
+grep -q '^control_repeatability_pass=true$' "$RUN_ROOT/analysis.txt"
