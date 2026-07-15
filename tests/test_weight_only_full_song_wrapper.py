@@ -92,6 +92,23 @@ def test_wrapper_validates_opt_in_candidate_runner_inside_candidate_repo() -> No
     assert 'echo "candidate_runner=$CANDIDATE_RUNNER"' in source
 
 
+def test_wrapper_has_isolated_parallel_compiled_cross_gate() -> None:
+    source = WRAPPER.read_text(encoding="utf-8")
+
+    assert (
+        "REQUIRE_COMPILED_CROSS_INCREMENTAL="
+        "${REQUIRE_COMPILED_CROSS_INCREMENTAL:-false}" in source
+    )
+    assert "MAPPERATORINATOR_ALLOW_PARALLEL" in source
+    assert "utils/run_k4_shared_rope_fp16_cross_shared_arena.py" in source
+    assert "utils/run_k4_shared_rope_fp16_cross_compiled_bmm.py" in source
+    assert 'JOB_TMPDIR="$WORK/tmp/reciprocal-$SLURM_JOB_ID"' in source
+    assert 'export TMPDIR="$JOB_TMPDIR"' in source
+    assert "compiled_q1_bmm_cross_attention" in source
+    assert "CANDIDATE_REMOTE_BRANCH=${CANDIDATE_REMOTE_BRANCH:-$CANDIDATE_BRANCH}" in source
+    assert 'refs/remotes/$CANDIDATE_REMOTE/$CANDIDATE_REMOTE_BRANCH' in source
+
+
 def test_wrapper_allows_declared_timing_drift_for_k4_composition() -> None:
     source = WRAPPER.read_text(encoding="utf-8")
 

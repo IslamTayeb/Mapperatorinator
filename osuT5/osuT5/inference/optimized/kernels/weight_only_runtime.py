@@ -7,7 +7,7 @@ import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import torch
 from transformers.activations import GELUActivation
@@ -148,6 +148,8 @@ class ApproximateWeightOnlyState:
     int8_mlp_extension_init_seconds: float = 0.0
     int8_mlp_pack_seconds: float = 0.0
     int8_mlp_packed_weight_bytes: int = 0
+    compiled_cross_bmm: Callable[..., torch.Tensor] | None = None
+    compiled_cross_evidence: dict[str, Any] | None = None
 
     @classmethod
     def initialize(
@@ -156,6 +158,7 @@ class ApproximateWeightOnlyState:
         *,
         cross_mode: str = CROSS_ACCEPTED,
         int8_mlp: bool = False,
+        compiled_cross_bmm: bool = False,
     ) -> "ApproximateWeightOnlyState":
         if not isinstance(model, torch.nn.Module):
             raise TypeError("weight-only candidate owner must be a torch module")
@@ -218,6 +221,18 @@ class ApproximateWeightOnlyState:
             preload_int8_mlp_extension()
             torch.cuda.synchronize()
             int8_extension_seconds = time.perf_counter() - int8_extension_start
+        compiled_cross = None
+        compiled_cross_evidence = None
+        if compiled_cross_bmm:
+            if cross_mode != CROSS_FP16_PACKED:
+                raise ValueError(
+                    "compiled cross BMM requires selected FP16 packed cross projections"
+                )
+            from .compiled_cross import prepare_compiled_q1_cross_bmm
+
+            compiled_cross, compiled_cross_evidence = prepare_compiled_q1_cross_bmm(
+                device
+            )
         torch.cuda.synchronize()
         extension_seconds = time.perf_counter() - extension_start
         extension_allocated_after = torch.cuda.memory_allocated(device)
@@ -296,6 +311,8 @@ class ApproximateWeightOnlyState:
             int8_mlp_extension_init_seconds=int8_extension_seconds,
             int8_mlp_pack_seconds=int8_pack_seconds,
             int8_mlp_packed_weight_bytes=int8_packed_bytes,
+            compiled_cross_bmm=compiled_cross,
+            compiled_cross_evidence=compiled_cross_evidence,
         )
 
     def validate_owner(self, model: torch.nn.Module) -> None:
@@ -410,6 +427,18 @@ class ApproximateWeightOnlyState:
                 "extension_init_seconds": self.int8_mlp_extension_init_seconds,
                 "weight_pack_seconds": self.int8_mlp_pack_seconds,
                 "packed_weight_bytes": self.int8_mlp_packed_weight_bytes,
+            }
+        if self.compiled_cross_bmm is not None:
+            if not isinstance(self.compiled_cross_evidence, dict):
+                raise RuntimeError("compiled cross BMM evidence is missing")
+            metadata["compiled_cross_bmm"] = {
+                **self.compiled_cross_evidence,
+                "version": "inductor-q1-cross-bmm-inside-outer-graph-v1",
+                "result_class": "documented-drift",
+                "exactness_claim": False,
+                "scope": "main-model-decoder-cross-attention-only",
+                "accepted_q1_bmm_math": True,
+                "dispatch_counter": "compiled_q1_bmm_cross_attention",
             }
         return metadata
 
@@ -568,12 +597,19 @@ def _cross_mlp_tail_forward(
                 1, 1, module.cross_attn.num_heads, module.cross_attn.head_dim
             ).transpose(1, 2)
     with profile_range(f"{layer_name}.weight_only.cross_bmm_fp32"):
-        cross_output = _q1_bmm_cross_attention(
-            query_states,
-            key_states,
-            value_states,
-            expected_dtype=torch.float32,
-        )
+        if state.compiled_cross_bmm is None:
+            cross_output = _q1_bmm_cross_attention(
+                query_states,
+                key_states,
+                value_states,
+                expected_dtype=torch.float32,
+            )
+        else:
+            cross_output = state.compiled_cross_bmm(
+                query_states,
+                key_states,
+                value_states,
+            )
     cross_output = cross_output.transpose(1, 2).contiguous().view(
         1,
         1,
@@ -627,6 +663,10 @@ def _cross_mlp_tail_forward(
         if state.cross_mode == CROSS_FP16_PACKED:
             dispatch_counts["fp16_packed_cross_projection_candidate"] = (
                 dispatch_counts.get("fp16_packed_cross_projection_candidate", 0) + 1
+            )
+        if state.compiled_cross_bmm is not None:
+            dispatch_counts["compiled_q1_bmm_cross_attention"] = (
+                dispatch_counts.get("compiled_q1_bmm_cross_attention", 0) + 1
             )
     return (hidden_states,) + self_attn_outputs[1:] + (past_key_value,)
 

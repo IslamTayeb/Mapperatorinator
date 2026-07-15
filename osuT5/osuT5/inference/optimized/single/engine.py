@@ -672,6 +672,46 @@ class OptimizedSingleRuntime:
         object.__setattr__(self, "_approximate_weight_only_state", state)
         return state.metadata()
 
+    def initialize_approximate_int8_mlp_weight_only_cross_compiled_bmm(
+        self,
+        model: torch.nn.Module,
+        *,
+        mode: str,
+    ) -> dict[str, Any]:
+        """Compose selected weights/runtime with precompiled cross BMM math."""
+
+        if self.preset.precision != "fp32":
+            raise TypeError("compiled cross composition requires FP32 preset")
+        from ..kernels.weight_only_runtime import (
+            ApproximateWeightOnlyState,
+            CROSS_FP16_PACKED,
+        )
+
+        if mode != CROSS_FP16_PACKED:
+            raise ValueError(
+                "compiled cross composition requires fp16_packed_projections"
+            )
+        existing = self._approximate_weight_only_state
+        if existing is not None:
+            existing.validate_owner(model)
+            if (
+                not existing.int8_mlp_enabled
+                or existing.cross_mode != mode
+                or existing.compiled_cross_bmm is None
+            ):
+                raise RuntimeError(
+                    "optimized runtime already owns a different compiled-cross composition"
+                )
+            return existing.metadata()
+        state = ApproximateWeightOnlyState.initialize(
+            model,
+            cross_mode=mode,
+            int8_mlp=True,
+            compiled_cross_bmm=True,
+        )
+        object.__setattr__(self, "_approximate_weight_only_state", state)
+        return state.metadata()
+
     def for_super_timing(
         self,
         *,

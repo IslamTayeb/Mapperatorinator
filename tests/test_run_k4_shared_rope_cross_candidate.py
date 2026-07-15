@@ -105,6 +105,69 @@ def test_cross_runner_composes_k1_int8_and_records_incremental_mode(
     ]
 
 
+def test_compiled_cross_runner_records_outer_graph_ownership(monkeypatch, tmp_path) -> None:
+    calls = []
+
+    def weight_run(
+        config_name,
+        overrides,
+        output_init_json,
+        *,
+        initializer_name,
+        initializer_kwargs,
+    ):
+        assert initializer_name.endswith("cross_compiled_bmm")
+        output_init_json.write_text(
+            json.dumps(
+                {
+                    "cross_candidate": {"mode": CROSS_FP16_PACKED},
+                    "compiled_cross_bmm": {
+                        "dispatch_counter": "compiled_q1_bmm_cross_attention",
+                        "outer_cuda_graph_owned": True,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def combined_run(
+        config_name,
+        overrides,
+        output_init_json,
+        *,
+        graph_remainders,
+        weight_runner,
+        composition_version,
+        shared_static_input_arena,
+        transition_timing,
+    ):
+        calls.append((shared_static_input_arena, composition_version))
+        weight_runner(config_name, overrides, output_init_json)
+        payload = json.loads(output_init_json.read_text(encoding="utf-8"))
+        payload["combined_runtime"] = composition_version
+        payload["shared_rope"] = {"scope": "main-model-only"}
+        output_init_json.write_text(json.dumps(payload), encoding="utf-8")
+
+    monkeypatch.setattr(candidate, "run_with_initializer", weight_run)
+    monkeypatch.setattr(candidate, "run_combined", combined_run)
+    output = tmp_path / "compiled.json"
+    candidate.run(
+        "profile_salvalai",
+        [],
+        output,
+        mode=CROSS_FP16_PACKED,
+        shared_static_input_arena=True,
+        compiled_cross_bmm=True,
+    )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["compiled_cross_runtime"]["outer_cuda_graph_required"] is True
+    assert payload["compiled_cross_runtime"]["dispatch_counter"] == (
+        "compiled_q1_bmm_cross_attention"
+    )
+    assert calls == [(True, payload["combined_runtime"])]
+
+
 @pytest.mark.parametrize("mode", ["accepted", "split8_attention", "bad"])
 def test_cross_runner_rejects_unselected_mode_before_loading(tmp_path, mode) -> None:
     with pytest.raises(ValueError, match="cross candidate mode"):

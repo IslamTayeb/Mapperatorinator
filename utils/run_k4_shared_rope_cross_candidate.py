@@ -28,6 +28,7 @@ def _enrich_evidence(
     *,
     mode: str,
     composition_version: str,
+    compiled_cross_bmm: bool = False,
 ) -> None:
     try:
         payload = json.loads(output_init_json.read_text(encoding="utf-8"))
@@ -42,6 +43,14 @@ def _enrich_evidence(
         raise RuntimeError("cross candidate composition identity was not recorded")
     if not isinstance(payload.get("shared_rope"), dict):
         raise RuntimeError("cross candidate shared-RoPE evidence is missing")
+    compiled = payload.get("compiled_cross_bmm")
+    if compiled_cross_bmm:
+        if not isinstance(compiled, dict):
+            raise RuntimeError("compiled cross BMM evidence is missing")
+        if compiled.get("dispatch_counter") != "compiled_q1_bmm_cross_attention":
+            raise RuntimeError("compiled cross BMM dispatch identity is wrong")
+    elif compiled is not None:
+        raise RuntimeError("ordinary cross candidate unexpectedly enabled compile")
     if "cross_runtime" in payload:
         raise RuntimeError("cross candidate evidence already contains cross wiring")
     payload["cross_runtime"] = {
@@ -54,6 +63,15 @@ def _enrich_evidence(
         "accepted_q1_bmm_required": True,
         "original_decoder_forward_required": True,
     }
+    if compiled_cross_bmm:
+        payload["compiled_cross_runtime"] = {
+            **compiled,
+            "incremental_control": (
+                "k4-split-kv-mixed-weight-shared-rope-k1-remainder-int8-mlp-"
+                "fp16_packed_projections-v1"
+            ),
+            "outer_cuda_graph_required": True,
+        }
     output_init_json.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -68,6 +86,7 @@ def run(
     mode: str,
     shared_static_input_arena: bool = False,
     transition_timing: bool = False,
+    compiled_cross_bmm: bool = False,
 ) -> None:
     if mode not in CROSS_CANDIDATE_MODES:
         raise ValueError(
@@ -75,7 +94,7 @@ def run(
         )
     composition_version = (
         "k4-split-kv-mixed-weight-shared-rope-k1-remainder-int8-mlp-"
-        f"{mode}-v1"
+        f"{mode}{'-compiled-bmm' if compiled_cross_bmm else ''}-v1"
     )
 
     def weight_runner(
@@ -87,7 +106,11 @@ def run(
             nested_config_name,
             nested_overrides,
             nested_output_init_json,
-            initializer_name="initialize_approximate_int8_mlp_weight_only_cross",
+            initializer_name=(
+                "initialize_approximate_int8_mlp_weight_only_cross_compiled_bmm"
+                if compiled_cross_bmm
+                else "initialize_approximate_int8_mlp_weight_only_cross"
+            ),
             initializer_kwargs={"mode": mode},
         )
 
@@ -105,6 +128,7 @@ def run(
         output_init_json,
         mode=mode,
         composition_version=composition_version,
+        compiled_cross_bmm=compiled_cross_bmm,
     )
 
 

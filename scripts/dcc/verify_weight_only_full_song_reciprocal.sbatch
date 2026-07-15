@@ -22,6 +22,7 @@ CANDIDATE_COMMIT=${CANDIDATE_COMMIT:?Set CANDIDATE_COMMIT}
 BASELINE_BRANCH=${BASELINE_BRANCH:?Set BASELINE_BRANCH explicitly}
 CANDIDATE_BRANCH=${CANDIDATE_BRANCH:?Set CANDIDATE_BRANCH explicitly}
 CANDIDATE_REMOTE=${CANDIDATE_REMOTE:-origin}
+CANDIDATE_REMOTE_BRANCH=${CANDIDATE_REMOTE_BRANCH:-$CANDIDATE_BRANCH}
 PROFILE_CONFIG=${PROFILE_CONFIG:-profile_salvalai}
 BASELINE_RUNNER=${BASELINE_RUNNER:-}
 CANDIDATE_RUNNER=${CANDIDATE_RUNNER:-utils/run_approximate_weight_only.py}
@@ -32,6 +33,8 @@ REQUIRE_K1_REMAINDER_INCREMENTAL=${REQUIRE_K1_REMAINDER_INCREMENTAL:-false}
 REQUIRE_INT8_MLP_INCREMENTAL=${REQUIRE_INT8_MLP_INCREMENTAL:-false}
 REQUIRE_CROSS_INCREMENTAL=${REQUIRE_CROSS_INCREMENTAL:-false}
 REQUIRE_SHARED_ARENA_INCREMENTAL=${REQUIRE_SHARED_ARENA_INCREMENTAL:-false}
+REQUIRE_COMPILED_CROSS_INCREMENTAL=${REQUIRE_COMPILED_CROSS_INCREMENTAL:-false}
+ALLOW_PARALLEL=${MAPPERATORINATOR_ALLOW_PARALLEL:-0}
 CROSS_CANDIDATE_MODE=${CROSS_CANDIDATE_MODE:-accepted}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_LABEL=${RUN_LABEL:-split-weight-full-song-reciprocal}
@@ -113,13 +116,23 @@ if [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" != true \
   echo "REQUIRE_SHARED_ARENA_INCREMENTAL must be true or false" >&2
   exit 2
 fi
+if [[ "$REQUIRE_COMPILED_CROSS_INCREMENTAL" != true \
+  && "$REQUIRE_COMPILED_CROSS_INCREMENTAL" != false ]]; then
+  echo "REQUIRE_COMPILED_CROSS_INCREMENTAL must be true or false" >&2
+  exit 2
+fi
+if [[ "$ALLOW_PARALLEL" != 0 && "$ALLOW_PARALLEL" != 1 ]]; then
+  echo "MAPPERATORINATOR_ALLOW_PARALLEL must be 0 or 1" >&2
+  exit 2
+fi
 enabled_incremental_modes=0
 for enabled in \
   "$REQUIRE_SHARED_ROPE_INCREMENTAL" \
   "$REQUIRE_K1_REMAINDER_INCREMENTAL" \
   "$REQUIRE_INT8_MLP_INCREMENTAL" \
   "$REQUIRE_CROSS_INCREMENTAL" \
-  "$REQUIRE_SHARED_ARENA_INCREMENTAL"; do
+  "$REQUIRE_SHARED_ARENA_INCREMENTAL" \
+  "$REQUIRE_COMPILED_CROSS_INCREMENTAL"; do
   if [[ "$enabled" == true ]]; then
     enabled_incremental_modes=$((enabled_incremental_modes + 1))
   fi
@@ -128,7 +141,24 @@ if (( enabled_incremental_modes > 1 )); then
   echo "shared-RoPE, K1-remainder, INT8 MLP, cross, and shared-arena gates are mutually exclusive" >&2
   exit 2
 fi
-if [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_COMPILED_CROSS_INCREMENTAL" == true ]]; then
+  if [[ "$REQUIRE_K4_CANDIDATE" != true || "$REQUIRE_EXACT_TIMING" != true ]]; then
+    echo "compiled-cross gate requires K4 and exact timing" >&2
+    exit 2
+  fi
+  if [[ "$BASELINE_RUNNER" \
+      != utils/run_k4_shared_rope_fp16_cross_shared_arena.py \
+    || "$CANDIDATE_RUNNER" \
+      != utils/run_k4_shared_rope_fp16_cross_compiled_bmm.py ]]; then
+    echo "compiled-cross gate requires selected shared-arena control and compiled runner" >&2
+    exit 2
+  fi
+  if [[ "$CROSS_CANDIDATE_MODE" != fp16_packed_projections ]]; then
+    echo "compiled-cross gate requires selected FP16 packed cross projections" >&2
+    exit 2
+  fi
+  CROSS_K1_INT8_COMPOSITION=true
+elif [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
   if [[ "$REQUIRE_K4_CANDIDATE" != true || "$REQUIRE_EXACT_TIMING" != true ]]; then
     echo "shared-arena gate requires K4 and exact timing" >&2
     exit 2
@@ -334,7 +364,7 @@ validate_repo() {
 
 validate_repo "$BASELINE_REPO" "$BASELINE_COMMIT" "$BASELINE_BRANCH"
 validate_repo "$CANDIDATE_REPO" "$CANDIDATE_COMMIT" "$CANDIDATE_BRANCH"
-CANDIDATE_REMOTE_REF="refs/remotes/$CANDIDATE_REMOTE/$CANDIDATE_BRANCH"
+CANDIDATE_REMOTE_REF="refs/remotes/$CANDIDATE_REMOTE/$CANDIDATE_REMOTE_BRANCH"
 if ! git -C "$CANDIDATE_REPO" show-ref --verify --quiet "$CANDIDATE_REMOTE_REF"; then
   echo "missing fetched candidate remote ref $CANDIDATE_REMOTE_REF" >&2
   exit 2
@@ -359,24 +389,37 @@ for tool in ffmpeg ffprobe; do
   fi
 done
 
-mkdir -p "$WORK/logs" "$WORK/tmp" "$WORK/cache" \
+JOB_TMPDIR="$WORK/tmp/reciprocal-$SLURM_JOB_ID"
+mkdir -p "$WORK/logs" "$JOB_TMPDIR" "$WORK/cache" \
   "$BASELINE_TORCH_EXTENSIONS_DIR" "$CANDIDATE_TORCH_EXTENSIONS_DIR" \
   "$RUN_ROOT/candidate-initialization" "$RUN_ROOT/baseline-extension-setup"
 
 squeue -h -u "${USER:?}" -t R -o '%A|%b|%j' > "$RUN_ROOT/running-jobs.txt"
 OTHER_GPU_JOBS=$(awk -F'|' -v self="$SLURM_JOB_ID" \
   '$1 != self && tolower($2) ~ /gpu/ {print}' "$RUN_ROOT/running-jobs.txt")
-if [[ -n "$OTHER_GPU_JOBS" ]]; then
+if [[ "$ALLOW_PARALLEL" == 0 && -n "$OTHER_GPU_JOBS" ]]; then
   echo "another GPU job is already running for $USER:" >&2
   echo "$OTHER_GPU_JOBS" >&2
   exit 2
+fi
+if [[ "$ALLOW_PARALLEL" == 1 ]]; then
+  CURRENT_NODE=$(hostname)
+  while IFS='|' read -r job_id gres job_name; do
+    [[ -n "$job_id" && "$job_id" != "$SLURM_JOB_ID" ]] || continue
+    [[ "${gres,,}" == *gpu* ]] || continue
+    OTHER_NODE=$(squeue -h -j "$job_id" -o '%N')
+    if [[ -z "$OTHER_NODE" || "$OTHER_NODE" == "$CURRENT_NODE" ]]; then
+      echo "parallel GPU job $job_id ($job_name) is not pinned to a distinct node" >&2
+      exit 2
+    fi
+  done < "$RUN_ROOT/running-jobs.txt"
 fi
 export XDG_CACHE_HOME="$WORK/cache"
 export HF_HOME="$WORK/cache/huggingface"
 export TRANSFORMERS_CACHE="$WORK/cache/huggingface"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
-export TMPDIR="$WORK/tmp"
+export TMPDIR="$JOB_TMPDIR"
 export TOKENIZERS_PARALLELISM=false
 export PYTHONHASHSEED=0
 
@@ -386,6 +429,7 @@ echo "baseline_commit=$BASELINE_COMMIT"
 echo "candidate_commit=$CANDIDATE_COMMIT"
 echo "baseline_branch=$BASELINE_BRANCH"
 echo "candidate_branch=$CANDIDATE_BRANCH"
+echo "candidate_remote_branch=$CANDIDATE_REMOTE_BRANCH"
 echo "candidate_remote_ref=$CANDIDATE_REMOTE_REF"
 echo "same_commit_gate=true"
 echo "profile_config=$PROFILE_CONFIG"
@@ -399,10 +443,13 @@ echo "require_int8_mlp_incremental=$REQUIRE_INT8_MLP_INCREMENTAL"
 echo "int8_k1_composition=$INT8_K1_COMPOSITION"
 echo "require_cross_incremental=$REQUIRE_CROSS_INCREMENTAL"
 echo "require_shared_arena_incremental=$REQUIRE_SHARED_ARENA_INCREMENTAL"
+echo "require_compiled_cross_incremental=$REQUIRE_COMPILED_CROSS_INCREMENTAL"
+echo "parallel_opt_in=$ALLOW_PARALLEL"
 echo "cross_candidate_mode=$CROSS_CANDIDATE_MODE"
 echo "cross_k1_int8_composition=$CROSS_K1_INT8_COMPOSITION"
 echo "audio=$AUDIO"
 echo "run_root=$RUN_ROOT"
+echo "tmpdir=$TMPDIR"
 echo "extension_cache_mode=$EXTENSION_CACHE_MODE"
 echo "baseline_torch_extensions_dir=$BASELINE_TORCH_EXTENSIONS_DIR"
 echo "candidate_torch_extensions_dir=$CANDIDATE_TORCH_EXTENSIONS_DIR"
@@ -590,7 +637,9 @@ run_profile() {
     validation_role=candidate
   fi
   local validation_cross_mode=accepted
-  if [[ "$REQUIRE_CROSS_INCREMENTAL" == true && "$candidate" == 1 ]]; then
+  if [[ "$REQUIRE_COMPILED_CROSS_INCREMENTAL" == true ]]; then
+    validation_cross_mode=$CROSS_CANDIDATE_MODE
+  elif [[ "$REQUIRE_CROSS_INCREMENTAL" == true && "$candidate" == 1 ]]; then
     validation_cross_mode=$CROSS_CANDIDATE_MODE
   elif [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
     validation_cross_mode=$CROSS_CANDIDATE_MODE
@@ -605,11 +654,13 @@ run_profile() {
   )
   if [[ "$REQUIRE_INT8_MLP_INCREMENTAL" == true \
     || "$CROSS_K1_INT8_COMPOSITION" == true \
-    || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+    || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true \
+    || "$REQUIRE_COMPILED_CROSS_INCREMENTAL" == true ]]; then
     local int8_validation_role=baseline
     if [[ "$candidate" == 1 \
       || "$CROSS_K1_INT8_COMPOSITION" == true \
-      || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+      || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true \
+      || "$REQUIRE_COMPILED_CROSS_INCREMENTAL" == true ]]; then
       int8_validation_role=candidate
     fi
     (
@@ -635,12 +686,14 @@ run_profile() {
   if [[ "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true \
     || "$INT8_K1_COMPOSITION" == true \
     || "$CROSS_K1_INT8_COMPOSITION" == true \
-    || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+    || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true \
+    || "$REQUIRE_COMPILED_CROSS_INCREMENTAL" == true ]]; then
     local remainder_role=control
     if [[ "$candidate" == 1 \
       || "$INT8_K1_COMPOSITION" == true \
       || "$CROSS_K1_INT8_COMPOSITION" == true \
-      || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+      || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true \
+      || "$REQUIRE_COMPILED_CROSS_INCREMENTAL" == true ]]; then
       remainder_role=candidate
     fi
     (
@@ -765,7 +818,8 @@ if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
   || "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true \
   || "$REQUIRE_INT8_MLP_INCREMENTAL" == true \
   || "$REQUIRE_CROSS_INCREMENTAL" == true \
-  || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+  || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true \
+  || "$REQUIRE_COMPILED_CROSS_INCREMENTAL" == true ]]; then
   INITIALIZATION_ROLES=baseline_first,candidate_first,candidate_second,baseline_second
 fi
 "$PYTHON" - "$RUN_ROOT" "$INITIALIZATION_ROLES" \
@@ -775,7 +829,8 @@ fi
   "$INT8_K1_COMPOSITION" \
   "$REQUIRE_CROSS_INCREMENTAL" \
   "$CROSS_CANDIDATE_MODE" \
-  "$CROSS_K1_INT8_COMPOSITION" <<'PY'
+  "$CROSS_K1_INT8_COMPOSITION" \
+  "$REQUIRE_COMPILED_CROSS_INCREMENTAL" <<'PY'
 import json
 import math
 import statistics
@@ -791,6 +846,7 @@ int8_k1_composition = sys.argv[6] == "true"
 require_cross = sys.argv[7] == "true"
 cross_mode = sys.argv[8]
 cross_k1_int8_composition = sys.argv[9] == "true"
+require_compiled_cross = sys.argv[10] == "true"
 shared_rope_both_arms = (
     require_k1_remainder
     or require_int8_mlp
@@ -929,6 +985,28 @@ if require_cross:
         elif runtime is not None:
             raise SystemExit(f"{role}: control unexpectedly contains cross runtime")
 
+if require_compiled_cross:
+    for role in roles:
+        cross = runs[role].get("cross_candidate")
+        if not isinstance(cross, dict) or cross.get("mode") != cross_mode:
+            raise SystemExit(f"{role}: selected FP16 cross mode is missing")
+        if not isinstance(runs[role].get("int8_mlp_overlay"), dict):
+            raise SystemExit(f"{role}: selected INT8 MLP overlay is missing")
+        compiled = runs[role].get("compiled_cross_bmm")
+        runtime = runs[role].get("compiled_cross_runtime")
+        if role.startswith("candidate"):
+            if not isinstance(compiled, dict):
+                raise SystemExit(f"{role}: compiled cross BMM evidence is missing")
+            if compiled.get("dispatch_counter") \
+                != "compiled_q1_bmm_cross_attention":
+                raise SystemExit(f"{role}: compiled cross dispatch identity is wrong")
+            if not isinstance(runtime, dict) or runtime.get(
+                "outer_cuda_graph_required"
+            ) is not True:
+                raise SystemExit(f"{role}: outer CUDA graph ownership is missing")
+        elif compiled is not None or runtime is not None:
+            raise SystemExit(f"{role}: selected control unexpectedly enabled compile")
+
 summary = {
     "schema_version": 1,
     "result_class": "documented-drift",
@@ -969,7 +1047,19 @@ ANALYSIS_DISPATCH_ARGS=(
   --allow-optional-dispatch-delta
     'records.main_generation[[]*].optimized_cuda_graphs.*'
 )
-if [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+if [[ "$REQUIRE_COMPILED_CROSS_INCREMENTAL" == true ]]; then
+  ANALYSIS_EXACT_ARGS=(
+    --require-exact-label timing_context
+    --require-exact-dispatch-label timing_context
+  )
+  ANALYSIS_DISPATCH_ARGS=(
+    --allow-optional-dispatch-delta 'optimized_result_class'
+    --allow-dispatch-delta
+      'records.main_generation[[]*].optimized_dispatch_capture_hits.compiled_q1_bmm_cross_attention'
+    --allow-optional-dispatch-delta
+      'records.main_generation[[]*].optimized_cuda_graphs.*'
+  )
+elif [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
   ANALYSIS_EXACT_ARGS=(
     --require-exact-label timing_context
     --require-exact-label main_generation
