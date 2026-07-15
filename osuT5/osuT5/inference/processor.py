@@ -420,6 +420,13 @@ class Processor(object):
                     if self.profiler.enabled
                     else None
                 )
+                prompt_sha256 = (
+                    hashlib.sha256(
+                        prompt.detach().contiguous().cpu().numpy().tobytes()
+                    ).hexdigest()
+                    if self.profiler.enabled
+                    else None
+                )
                 self._record_generation_profile(
                     profile_label=profile_label,
                     mode="sequential",
@@ -431,6 +438,10 @@ class Processor(object):
                     generation_started_at_perf_counter_seconds=generation_start,
                     generation_finished_at_perf_counter_seconds=generation_finished,
                     prompt_tokens_per_sample=[int(prompt.ne(self.tokenizer.pad_id).sum().item())],
+                    prompt_width=int(prompt.shape[1]),
+                    prompt_sha256_per_sample=(
+                        [prompt_sha256] if prompt_sha256 is not None else None
+                    ),
                     output_tokens_per_sample=[int(result[0].ne(self.tokenizer.pad_id).sum().item())],
                     generated_tokens_per_sample=[int(predicted_tokens.ne(self.tokenizer.pad_id).sum().item())],
                     generated_token_ids=generated_token_ids,
