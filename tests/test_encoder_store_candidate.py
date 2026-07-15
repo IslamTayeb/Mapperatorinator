@@ -70,13 +70,15 @@ def test_inject_reuses_store_row_and_rejects_conditioning_change():
     ]
     store = torch.arange(18, dtype=torch.float32).reshape(3, 2, 3)
     model = object()
+    tokenizer = object()
     entry = SimpleNamespace(
         model=model,
+        tokenizer=tokenizer,
         source_frames=frames,
         conditioning=conditioning,
         store=store,
     )
-    processor = SimpleNamespace(model=model)
+    processor = SimpleNamespace(model=model, tokenizer=tokenizer)
     manager._active[id(processor)] = SimpleNamespace(
         label="timing_context",
         processor_id=id(processor),
@@ -114,6 +116,16 @@ def test_inject_reuses_store_row_and_rejects_conditioning_change():
                 "difficulty": torch.tensor([1.0]),
             },
         )
+    processor.model = model
+    processor.tokenizer = object()
+    with pytest.raises(EncoderStoreError, match="cross-tokenizer"):
+        manager.inject(
+            processor,
+            {
+                "inputs": frames[1].unsqueeze(0),
+                "difficulty": torch.tensor([1.0]),
+            },
+        )
 
 
 def test_compatible_entry_requires_model_source_and_conditioning_identity():
@@ -140,6 +152,11 @@ def test_compatible_entry_requires_model_source_and_conditioning_identity():
     ) is entry
     assert manager._compatible_entry(
         SimpleNamespace(model=object(), tokenizer=tokenizer),
+        (frames, times, 1.0),
+        conditioning,
+    ) is None
+    assert manager._compatible_entry(
+        SimpleNamespace(model=model, tokenizer=object()),
         (frames, times, 1.0),
         conditioning,
     ) is None

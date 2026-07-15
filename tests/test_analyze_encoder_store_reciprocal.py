@@ -5,6 +5,8 @@ import pytest
 from osuT5.osuT5.inference.optimized.scout.encoder_store import STORE_VERSION
 from utils.analyze_encoder_store_reciprocal import (
     EncoderGateError,
+    EXPECTED_PRESET_VERSIONS,
+    _component_audit_contract,
     _drift_row,
     _store_contract,
     _text,
@@ -156,6 +158,44 @@ def test_drift_row_classifies_exact_and_nonexact_batches():
     }
     assert _drift_row(audit, 1, name="main")["encoder_exact"]
     assert not _drift_row(audit, 16, name="main")["encoder_exact"]
+
+
+@pytest.mark.parametrize("precision", ["fp32", "fp16"])
+def test_component_audit_contract_is_bound_to_accepted_same_precision(precision):
+    audit = {
+        "metadata": {
+            "result_class": "same-precision-drift-component-ceiling",
+            "production_wiring": False,
+            "server_changes": False,
+            "source_engine": "optimized",
+            "source_precision": precision,
+            "source_attn_implementation": "sdpa",
+            "batch_sizes": [1, 2, 4, 8, 16],
+            "max_batch_size": 32,
+            "live_window_count": 87,
+            "cuda_device": "NVIDIA GeForce RTX 2080 Ti",
+            "runtime": {
+                "optimized_effective_config": {
+                    "version": EXPECTED_PRESET_VERSIONS[precision],
+                    "precision": precision,
+                    "attn_implementation": "sdpa",
+                    "batch_size": 1,
+                }
+            },
+        },
+        "input_manifest": {
+            "live_window_count": 87,
+            "combined_sha256": "a" * 64,
+        },
+        "variants": {str(value): {} for value in (1, 2, 4, 8, 16)},
+    }
+    _component_audit_contract(audit, name="main", precision=precision)
+
+    audit["metadata"]["runtime"]["optimized_effective_config"][
+        "precision"
+    ] = "fp16" if precision == "fp32" else "fp32"
+    with pytest.raises(EncoderGateError, match="source preset changed"):
+        _component_audit_contract(audit, name="main", precision=precision)
 
 
 def test_text_report_exposes_every_batch_without_creating_a_document():

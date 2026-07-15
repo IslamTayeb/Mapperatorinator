@@ -21,6 +21,10 @@ from utils import nsight_agent_profile as nsight
 SCHEMA_VERSION = "mapperatorinator.shared-precision-encoder-precompute.v2"
 DEFAULT_BATCH_SIZES = (1, 2, 4, 8, 16)
 SUPPORTED_PRECISIONS = ("fp32", "fp16")
+EXPECTED_PRESET_VERSIONS = {
+    "fp32": "accepted-fp32-native-cross-mlp-289-v3",
+    "fp16": fp16_baseline.EXPECTED_PRESET_VERSION,
+}
 MINIMUM_REQUEST_SAVING_FRACTION = 0.05
 RTX_2080_TI_TOTAL_BYTES = 11_264 * 1024 * 1024
 
@@ -448,6 +452,64 @@ def _drift_row(
     }
 
 
+def _component_audit_contract(
+    audit: Mapping[str, Any],
+    *,
+    name: str,
+    precision: str,
+) -> None:
+    metadata = audit.get("metadata")
+    variants = audit.get("variants")
+    manifest = audit.get("input_manifest")
+    if not all(isinstance(value, dict) for value in (metadata, variants, manifest)):
+        raise EncoderGateError(f"{name} encoder audit is malformed")
+    required = {
+        "result_class": "same-precision-drift-component-ceiling",
+        "production_wiring": False,
+        "server_changes": False,
+        "source_engine": "optimized",
+        "source_precision": precision,
+        "source_attn_implementation": "sdpa",
+        "batch_sizes": list(DEFAULT_BATCH_SIZES),
+    }
+    failures = {
+        key: {"expected": expected, "actual": metadata.get(key)}
+        for key, expected in required.items()
+        if metadata.get(key) != expected
+    }
+    if failures:
+        raise EncoderGateError(f"{name} encoder audit contract changed: {failures}")
+    if "2080 Ti" not in str(metadata.get("cuda_device", "")):
+        raise EncoderGateError(f"{name} encoder audit did not use an RTX 2080 Ti")
+    if _integer(
+        metadata.get("max_batch_size"),
+        name=f"{name}.max_batch_size",
+        positive=True,
+    ) < max(DEFAULT_BATCH_SIZES):
+        raise EncoderGateError(f"{name} encoder audit cannot cover B16")
+    live_windows = _integer(
+        metadata.get("live_window_count"),
+        name=f"{name}.live_window_count",
+        positive=True,
+    )
+    if manifest.get("live_window_count") != live_windows:
+        raise EncoderGateError(f"{name} encoder input manifest count changed")
+    combined_sha = manifest.get("combined_sha256")
+    if not isinstance(combined_sha, str) or len(combined_sha) != 64:
+        raise EncoderGateError(f"{name} encoder input manifest hash is invalid")
+    if set(variants) != {str(value) for value in DEFAULT_BATCH_SIZES}:
+        raise EncoderGateError(f"{name} encoder audit variants changed")
+    runtime = metadata.get("runtime")
+    effective = runtime.get("optimized_effective_config") if isinstance(runtime, dict) else None
+    if not isinstance(effective, dict) or (
+        effective.get("version") != EXPECTED_PRESET_VERSIONS[precision]
+        or effective.get("precision") != precision
+        or effective.get("attn_implementation") != "sdpa"
+        or effective.get("batch_size") != 1
+    ):
+        raise EncoderGateError(f"{name} encoder audit source preset changed")
+
+
 def analyze(
     baseline_run_root: Path,
     candidate_run_root: Path,
@@ -526,6 +588,8 @@ def analyze(
     )
     main_audit = _load(main_audit_path, name="main encoder audit")
     timing_audit = _load(timing_audit_path, name="timing encoder audit")
+    _component_audit_contract(main_audit, name="main", precision=precision)
+    _component_audit_contract(timing_audit, name="timing", precision=precision)
 
     variants: dict[str, Any] = {}
     for batch_size in batch_sizes:

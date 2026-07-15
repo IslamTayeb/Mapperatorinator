@@ -252,6 +252,7 @@ class BatchedAllWindowEncoderStore:
         for entry in self._entries:
             if (
                 processor.model is entry.model
+                and processor.tokenizer is entry.tokenizer
                 and sequences[0] is entry.source_frames
                 and sequences[1] is entry.source_frame_times
                 and self._conditioning_equal(entry.conditioning, conditioning)
@@ -493,6 +494,10 @@ class BatchedAllWindowEncoderStore:
         if processor.model is not entry.model:
             raise EncoderStoreError(
                 "encoder store refused accidental cross-model output reuse"
+            )
+        if processor.tokenizer is not entry.tokenizer:
+            raise EncoderStoreError(
+                "encoder store refused accidental cross-tokenizer output reuse"
             )
         window_count = len(entry.source_frames)
         index = use.model_generate_calls % window_count
