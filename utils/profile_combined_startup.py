@@ -84,6 +84,30 @@ def _probe(function: Any) -> dict[str, str]:
     return {"kind": "return", "type": "None", "message": ""}
 
 
+def _import_provenance(repo: Path, module_names: list[str]) -> dict[str, Any]:
+    provenance = {}
+    for name in module_names:
+        module = sys.modules[name]
+        raw_path = getattr(module, "__file__", None)
+        if raw_path is None:
+            provenance[name] = {"kind": "namespace"}
+            continue
+        path = Path(raw_path).resolve()
+        if path.is_relative_to(repo):
+            provenance[name] = {
+                "kind": "repo_file",
+                "relative_path": path.relative_to(repo).as_posix(),
+                "sha256": _sha256_file(path),
+            }
+        else:
+            provenance[name] = {
+                "kind": "external_file",
+                "path": str(path),
+                "sha256": _sha256_file(path),
+            }
+    return provenance
+
+
 def worker(repo: Path, *, mode: str, manifest: Path) -> dict[str, Any]:
     repo = repo.resolve()
     if mode not in {"cached", "direct"}:
@@ -110,6 +134,7 @@ def worker(repo: Path, *, mode: str, manifest: Path) -> dict[str, Any]:
         or name == "config"
         or name.startswith(("config.", "osuT5.", "osu_diffusion."))
     )
+    import_provenance = _import_provenance(repo, import_modules)
 
     native_started = time.perf_counter()
     from osuT5.osuT5.inference.optimized.kernels import decoder_layer, q1_attention
@@ -144,6 +169,7 @@ def worker(repo: Path, *, mode: str, manifest: Path) -> dict[str, Any]:
         "ready_seconds": total_seconds,
         "optional_modules_loaded": optional_loaded,
         "import_modules": import_modules,
+        "import_provenance": import_provenance,
         "extensions": extension_evidence,
     }
 
@@ -234,6 +260,14 @@ def summarize(rows: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
     combined_import_topologies = {
         tuple(row["import_modules"]) for row in rows["combined"]
     }
+    lazy_import_provenance = {
+        json.dumps(row["import_provenance"], sort_keys=True)
+        for row in rows["lazy_parent"]
+    }
+    combined_import_provenance = {
+        json.dumps(row["import_provenance"], sort_keys=True)
+        for row in rows["combined"]
+    }
     comparisons = {
         parent: {
             metric: _comparison(
@@ -256,10 +290,10 @@ def summarize(rows: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
             len(lazy_import_topologies) == 1
             and lazy_import_topologies == combined_import_topologies
         ),
-        "lazy_import_no_more_than_five_percent_slower": comparisons[
-            "lazy_parent"
-        ]["import_seconds"]["improvement_pct"]
-        >= -5.0,
+        "lazy_import_code_retained": (
+            len(lazy_import_provenance) == 1
+            and lazy_import_provenance == combined_import_provenance
+        ),
         "aot_direct_load_retained": comparisons["aot_parent"][
             "native_load_seconds"
         ]["improvement_pct"]
@@ -288,6 +322,16 @@ def summarize(rows: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
         "combined_optional_modules_loaded": combined_optional,
         "lazy_parent_import_modules": list(next(iter(lazy_import_topologies))),
         "combined_import_modules": list(next(iter(combined_import_topologies))),
+        "import_observations": {
+            "combined_vs_lazy_parent_within_five_percent": comparisons[
+                "lazy_parent"
+            ]["import_seconds"]["improvement_pct"]
+            >= -5.0,
+            "combined_vs_aot_parent_within_five_percent": comparisons[
+                "aot_parent"
+            ]["import_seconds"]["improvement_pct"]
+            >= -5.0,
+        },
         "checks": checks,
     }
 

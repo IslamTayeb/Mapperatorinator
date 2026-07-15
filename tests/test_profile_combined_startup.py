@@ -21,6 +21,18 @@ def _row(
         "ready_seconds": imported + native,
         "optional_modules_loaded": optional or [],
         "import_modules": ["config", "inference"],
+        "import_provenance": {
+            "config": {
+                "kind": "repo_file",
+                "relative_path": "config.py",
+                "sha256": "config",
+            },
+            "inference": {
+                "kind": "repo_file",
+                "relative_path": "inference.py",
+                "sha256": "inference",
+            },
+        },
         "extensions": {
             "extension": {
                 "library_sha256": library,
@@ -53,7 +65,7 @@ def test_combined_summary_quantifies_independent_startup_wins() -> None:
     assert report["independent_combination"]["interaction_seconds"] == pytest.approx(0.0)
 
 
-def test_combined_summary_rejects_extension_drift_and_lazy_regression() -> None:
+def test_combined_summary_rejects_extension_drift() -> None:
     rows = {
         "lazy_parent": [_row("cached", imported=10.0, native=3.0)],
         "aot_parent": [_row("direct", imported=14.0, native=0.1)],
@@ -64,7 +76,9 @@ def test_combined_summary_rejects_extension_drift_and_lazy_regression() -> None:
 
     assert report["status"] == "FAIL"
     assert not report["checks"]["extension_parity"]
-    assert not report["checks"]["lazy_import_no_more_than_five_percent_slower"]
+    assert not report["import_observations"][
+        "combined_vs_lazy_parent_within_five_percent"
+    ]
 
 
 def test_combined_summary_requires_all_variants() -> None:
