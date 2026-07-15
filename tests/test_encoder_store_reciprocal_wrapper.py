@@ -28,6 +28,8 @@ def test_wrapper_pins_clean_pushed_same_precision_2080ti_worktree():
         'EXPECTED_GPU=${MAPPERATORINATOR_EXPECTED_GPU:-2080 Ti}',
         'precision="$PRECISION"',
         'profile_pass_kind="$pass_kind"',
+        "MAPPERATORINATOR_ALLOW_PARALLEL_RECIPROCAL:-0",
+        "parallel_reciprocal_opt_in=$ALLOW_PARALLEL_RECIPROCAL",
     ):
         assert fragment in source
 

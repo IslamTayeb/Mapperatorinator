@@ -30,6 +30,7 @@ PRECISION=${MAPPERATORINATOR_PRECISION:?Set MAPPERATORINATOR_PRECISION to fp32 o
 WORK=${MAPPERATORINATOR_WORK:-/work/imt11/Mapperatorinator}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 BASELINE_RUN_ROOT=${MAPPERATORINATOR_BASELINE_RUN_ROOT:?Set the passing same-precision baseline run root}
+ALLOW_PARALLEL_RECIPROCAL=${MAPPERATORINATOR_ALLOW_PARALLEL_RECIPROCAL:-0}
 RUN_LABEL=${RUN_LABEL:-${PRECISION}-encoder-precompute}
 RUN_ROOT="$WORK/runs/${RUN_LABEL}-${SLURM_JOB_ID}"
 EXPECTED_GPU=${MAPPERATORINATOR_EXPECTED_GPU:-2080 Ti}
@@ -43,6 +44,8 @@ case "$PRECISION" in
   fp32|fp16) ;;
   *) die "MAPPERATORINATOR_PRECISION must be fp32 or fp16" ;;
 esac
+[[ "$ALLOW_PARALLEL_RECIPROCAL" == 0 || "$ALLOW_PARALLEL_RECIPROCAL" == 1 ]] \
+  || die "MAPPERATORINATOR_ALLOW_PARALLEL_RECIPROCAL must be 0 or 1"
 
 [[ -x "$PYTHON" ]] || die "missing executable Python at $PYTHON"
 [[ -d "$REPO/.git" || -f "$REPO/.git" ]] || die "missing worktree at $REPO"
@@ -95,9 +98,13 @@ mapfile -t OTHER_GPU_JOBS < <(
     | awk -F'|' -v current="$SLURM_JOB_ID" \
         '$1 != current && tolower($2) ~ /gpu/ { print }'
 )
-if [[ ${#OTHER_GPU_JOBS[@]} -ne 0 ]]; then
+if [[ ${#OTHER_GPU_JOBS[@]} -ne 0 && "$ALLOW_PARALLEL_RECIPROCAL" != 1 ]]; then
   printf '%s\n' "${OTHER_GPU_JOBS[@]}" >&2
   die "another GPU job is running or pending"
+fi
+if [[ ${#OTHER_GPU_JOBS[@]} -ne 0 ]]; then
+  printf '%s\n' "${OTHER_GPU_JOBS[@]}" >&2
+  echo "parallel_reciprocal_opt_in=1" >&2
 fi
 
 {
@@ -112,6 +119,7 @@ fi
   echo "audio=$AUDIO"
   echo "audio_sha256=$(sha256sum "$AUDIO" | awk '{print $1}')"
   echo "run_root=$RUN_ROOT"
+  echo "parallel_reciprocal_opt_in=$ALLOW_PARALLEL_RECIPROCAL"
   echo "NVIDIA_TF32_OVERRIDE=$NVIDIA_TF32_OVERRIDE"
   git -C "$REPO" status --short --branch
   "$PYTHON" -c 'import torch, transformers; print(f"torch={torch.__version__}"); print(f"torch_cuda={torch.version.cuda}"); print(f"transformers={transformers.__version__}")'
