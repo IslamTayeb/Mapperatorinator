@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import hashlib
+import os
 import re
 from typing import Any
 
@@ -111,6 +112,10 @@ class ConditionalWhileProbeResult:
     cuda_driver_version: int
     device_name: str
     device_capability: tuple[int, int]
+    float32_matmul_precision: str
+    cuda_matmul_allow_tf32: bool
+    cudnn_allow_tf32: bool
+    nvidia_tf32_override: str
     seed: int
     iterations: int
     eager_samples: list[int]
@@ -145,6 +150,28 @@ def _state_sha256(state: torch.Tensor) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _enforce_strict_fp32_policy() -> dict[str, Any]:
+    override = os.environ.get("NVIDIA_TF32_OVERRIDE")
+    if override != "0":
+        raise RuntimeError(
+            "strict FP32 probe requires NVIDIA_TF32_OVERRIDE=0 before process start"
+        )
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    precision = torch.get_float32_matmul_precision()
+    cuda_allow_tf32 = bool(torch.backends.cuda.matmul.allow_tf32)
+    cudnn_allow_tf32 = bool(torch.backends.cudnn.allow_tf32)
+    if precision != "highest" or cuda_allow_tf32 or cudnn_allow_tf32:
+        raise RuntimeError("strict FP32 policy did not remain highest/TF32-disabled")
+    return {
+        "float32_matmul_precision": precision,
+        "cuda_matmul_allow_tf32": cuda_allow_tf32,
+        "cudnn_allow_tf32": cudnn_allow_tf32,
+        "nvidia_tf32_override": override,
+    }
+
+
 def _cuda_check(result: tuple[Any, ...], operation: str) -> tuple[Any, ...]:
     from cuda.bindings import runtime
 
@@ -166,9 +193,7 @@ def _require_environment(device: torch.device) -> dict[str, Any]:
             "conditional-WHILE probe requires a PyTorch CUDA 12.8+ build; "
             f"found {torch.version.cuda}"
         )
-    capability = tuple(
-        int(value) for value in torch.cuda.get_device_capability(device)
-    )
+    capability = tuple(int(value) for value in torch.cuda.get_device_capability(device))
     if capability != REQUIRED_CAPABILITY:
         raise RuntimeError(
             "conditional-WHILE probe is an RTX 2080 Ti/SM75 experiment; "
@@ -195,10 +220,10 @@ def _require_environment(device: torch.device) -> dict[str, Any]:
     if missing:
         raise RuntimeError(f"cuda-python lacks conditional graph APIs: {missing}")
 
-    runtime_version, = _cuda_check(
+    (runtime_version,) = _cuda_check(
         runtime.cudaRuntimeGetVersion(), "cudaRuntimeGetVersion"
     )
-    driver_version, = _cuda_check(
+    (driver_version,) = _cuda_check(
         runtime.cudaDriverGetVersion(), "cudaDriverGetVersion"
     )
     if int(runtime_version) < 12080 or int(driver_version) < 12080:
@@ -276,7 +301,7 @@ def _capture_control_graph(
 def _add_while_node(parent: Any) -> tuple[Any, Any]:
     from cuda.bindings import runtime
 
-    handle, = _cuda_check(
+    (handle,) = _cuda_check(
         runtime.cudaGraphConditionalHandleCreate(
             parent,
             1,
@@ -310,7 +335,7 @@ def _add_child_sequence(
     previous = None
     for name, child in (("sampler", sampler_graph), ("control", control_graph)):
         dependencies = None if previous is None else (previous,)
-        previous, = _cuda_check(
+        (previous,) = _cuda_check(
             runtime.cudaGraphAddChildGraphNode(
                 body,
                 dependencies,
@@ -348,6 +373,7 @@ def run_conditional_while_multinomial_probe(
     if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
         raise ValueError("seed must be a non-negative integer")
 
+    precision_policy = _enforce_strict_fp32_policy()
     if not torch.cuda.is_available():
         raise RuntimeError("conditional-WHILE probe requires an allocated CUDA GPU")
     device = torch.device("cuda", torch.cuda.current_device())
@@ -399,7 +425,7 @@ def run_conditional_while_multinomial_probe(
 
     from cuda.bindings import runtime
 
-    parent, = _cuda_check(runtime.cudaGraphCreate(0), "cudaGraphCreate")
+    (parent,) = _cuda_check(runtime.cudaGraphCreate(0), "cudaGraphCreate")
     executable = None
     try:
         handle, body = _add_while_node(parent)
@@ -420,7 +446,7 @@ def run_conditional_while_multinomial_probe(
             conditional_handle=handle,
         )
         _add_child_sequence(body, sampler_graph, control_graph)
-        executable, = _cuda_check(
+        (executable,) = _cuda_check(
             runtime.cudaGraphInstantiate(parent, 0),
             "cudaGraphInstantiate",
         )
@@ -478,6 +504,7 @@ def run_conditional_while_multinomial_probe(
             and conditional_matches_ordinary
             and conditional_generator_matches_ordinary
         ),
+        **precision_policy,
         **environment,
     )
 
@@ -486,5 +513,6 @@ __all__ = [
     "ConditionalWhileProbeResult",
     "PROBE_BACKEND",
     "RNG_POLICY",
+    "_enforce_strict_fp32_policy",
     "run_conditional_while_multinomial_probe",
 ]

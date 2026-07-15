@@ -67,6 +67,31 @@ def test_probe_rejects_invalid_iterations_before_cuda_initialization() -> None:
         probe.run_conditional_while_multinomial_probe(iterations=33)
 
 
+def test_probe_requires_process_level_tf32_override_before_cuda(monkeypatch) -> None:
+    monkeypatch.delenv("NVIDIA_TF32_OVERRIDE", raising=False)
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_available",
+        lambda: (_ for _ in ()).throw(AssertionError("CUDA must stay cold")),
+    )
+
+    with pytest.raises(RuntimeError, match="NVIDIA_TF32_OVERRIDE=0"):
+        probe.run_conditional_while_multinomial_probe(iterations=2)
+
+
+def test_strict_fp32_policy_is_recorded(monkeypatch) -> None:
+    monkeypatch.setenv("NVIDIA_TF32_OVERRIDE", "0")
+
+    policy = probe._enforce_strict_fp32_policy()
+
+    assert policy == {
+        "float32_matmul_precision": "highest",
+        "cuda_matmul_allow_tf32": False,
+        "cudnn_allow_tf32": False,
+        "nvidia_tf32_override": "0",
+    }
+
+
 def test_state_hash_requires_generator_state_storage() -> None:
     state = torch.arange(16, dtype=torch.uint8)
     assert len(probe._state_sha256(state)) == 64
