@@ -134,6 +134,9 @@ def test_wrapper_runs_five_controls_and_two_non_authoritative_audits():
     assert "for run_index in 01 02 03 04 05" in script
     assert "run_fresh_process exactness-audit-01 exactness_audit" in script
     assert "run_fresh_process exactness-audit-02 exactness_audit" in script
+    assert "MAPPERATORINATOR_ALLOW_PARALLEL_BASELINE:-0" in script
+    assert "non_authoritative_parallel_baseline" in script
+    assert '"$ALLOW_PARALLEL_BASELINE" != 1' in script
     assert "precision=fp16" in script
     assert "accepted-fp16" not in script
     assert ".md" not in script

@@ -26,6 +26,7 @@ REPO=${MAPPERATORINATOR_REPO:?Set MAPPERATORINATOR_REPO to the clean FP16 baseli
 COMMIT=${MAPPERATORINATOR_COMMIT:?Set MAPPERATORINATOR_COMMIT}
 BRANCH=${MAPPERATORINATOR_BRANCH:?Set MAPPERATORINATOR_BRANCH}
 REMOTE_REF=${MAPPERATORINATOR_REMOTE_REF:?Set MAPPERATORINATOR_REMOTE_REF}
+ALLOW_PARALLEL_BASELINE=${MAPPERATORINATOR_ALLOW_PARALLEL_BASELINE:-0}
 WORK=${MAPPERATORINATOR_WORK:-/work/imt11/Mapperatorinator}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 EXPECTED_GPU=${MAPPERATORINATOR_EXPECTED_GPU:-2080 Ti}
@@ -35,6 +36,10 @@ MIN_AVAILABLE_KIB=$((20 * 1024 * 1024))
 
 # This must be visible before every fresh process creates a CUDA context.
 export NVIDIA_TF32_OVERRIDE=0
+
+if [[ "$ALLOW_PARALLEL_BASELINE" != 0 && "$ALLOW_PARALLEL_BASELINE" != 1 ]]; then
+  die "MAPPERATORINATOR_ALLOW_PARALLEL_BASELINE must be 0 or 1"
+fi
 
 [[ -x "$PYTHON" ]] || die "missing executable Python at $PYTHON"
 [[ -d "$REPO/.git" || -f "$REPO/.git" ]] || die "missing worktree at $REPO"
@@ -84,7 +89,7 @@ mapfile -t OTHER_GPU_JOBS < <(
     | awk -F'|' -v current="$SLURM_JOB_ID" \
         '$1 != current && tolower($2) ~ /gpu/ { print }'
 )
-if [[ ${#OTHER_GPU_JOBS[@]} -ne 0 ]]; then
+if [[ ${#OTHER_GPU_JOBS[@]} -ne 0 && "$ALLOW_PARALLEL_BASELINE" != 1 ]]; then
   printf '%s\n' "${OTHER_GPU_JOBS[@]}" >&2
   die "another GPU job is running or pending"
 fi
@@ -100,6 +105,7 @@ fi
   echo "audio_sha256=$(sha256sum "$AUDIO" | awk '{print $1}')"
   echo "run_root=$RUN_ROOT"
   echo "NVIDIA_TF32_OVERRIDE=$NVIDIA_TF32_OVERRIDE"
+  echo "non_authoritative_parallel_baseline=$ALLOW_PARALLEL_BASELINE"
   git -C "$REPO" status --short --branch
   "$PYTHON" -c 'import torch, transformers; print(f"torch={torch.__version__}"); print(f"torch_cuda={torch.version.cuda}"); print(f"transformers={transformers.__version__}")'
   nvidia-smi --query-gpu=name,uuid,driver_version,memory.total,compute_cap --format=csv,noheader
