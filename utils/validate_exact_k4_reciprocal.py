@@ -118,15 +118,21 @@ def _artifact_exact(left: Mapping[str, Any], right: Mapping[str, Any]) -> dict[s
     }
 
 
-def _dispatch_policy(profile: Mapping[str, Any]) -> dict[str, list[dict[str, Any]]]:
-    by_label: dict[str, list[dict[str, Any]]] = {label: [] for label in LABELS}
+def _dispatch_policy(profile: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    by_label: dict[str, dict[str, Any]] = {
+        label: {"records": [], "used_dispatches": {}} for label in LABELS
+    }
     for index, record in enumerate(profile["generation"]):
         if not isinstance(record, Mapping) or record.get("profile_label") not in LABELS:
             continue
         hits = record.get("optimized_dispatch_capture_hits")
         if not isinstance(hits, Mapping):
             raise GateError(f"generation[{index}] lacks optimized dispatch metadata")
-        by_label[str(record["profile_label"])].append(
+        label = str(record["profile_label"])
+        used = by_label[label]["used_dispatches"]
+        for key, value in hits.items():
+            used[str(key)] = bool(used.get(str(key), False) or int(value) > 0)
+        by_label[label]["records"].append(
             {
                 "record_key": nsight._profile_record_key(record, index),
                 "decoder_loop_backend": record.get("decoder_loop_backend"),
@@ -144,15 +150,12 @@ def _dispatch_policy(profile: Mapping[str, Any]) -> dict[str, list[dict[str, Any
                 "native_cross_mlp_tail_disabled_reason": record.get(
                     "native_cross_mlp_tail_disabled_reason"
                 ),
-                # Capture multiplicity differs between K1 and K4. Eligibility and
-                # actual use must not: compare positive-hit topology, not raw calls.
-                "positive_dispatches": {
-                    str(key): int(value) > 0 for key, value in sorted(hits.items())
-                },
             }
         )
-    if any(not records for records in by_label.values()):
+    if any(not value["records"] for value in by_label.values()):
         raise GateError("dispatch policy is missing timing or main records")
+    for value in by_label.values():
+        value["used_dispatches"] = dict(sorted(value["used_dispatches"].items()))
     return by_label
 
 
@@ -215,15 +218,28 @@ def _candidate_contract(profile: Mapping[str, Any], *, name: str) -> dict[str, A
                     "status_reads",
                     "terminal_rollbacks",
                     "generator_offset_corrections",
-                    "generator_offset_increment",
                 )
             }
+            raw_offset_increment = stats.get("generator_offset_increment")
+            if values["block_replays"] == 0:
+                if raw_offset_increment is not None:
+                    raise GateError(
+                        "exact-K4 generator_offset_increment must be null when no "
+                        "K4 block executes"
+                    )
+            else:
+                values["generator_offset_increment"] = _integer(
+                    stats, "generator_offset_increment"
+                )
         except GateError as exc:
             failures.append(f"{name}.generation[{index}]: {exc}")
             continue
         if values["block_size"] != BLOCK_SIZE:
             failures.append(f"{name}.generation[{index}] block size is not four")
-        if values["generator_offset_increment"] != OFFSET_INCREMENT:
+        if (
+            values["block_replays"] > 0
+            and values["generator_offset_increment"] != OFFSET_INCREMENT
+        ):
             failures.append(f"{name}.generation[{index}] RNG offset increment is not four")
         if stats.get("rng_policy") != RNG_POLICY:
             failures.append(f"{name}.generation[{index}] RNG policy changed")

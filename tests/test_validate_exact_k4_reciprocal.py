@@ -274,6 +274,51 @@ def test_rng_offset_or_drift_change_fails(tmp_path: Path):
     assert any("strict RNG exactness" in failure for failure in report["failures"])
 
 
+def test_zero_block_remainder_record_accepts_null_generator_increment():
+    profile = _profile(candidate=True, exactness=False)
+    record = _record(
+        "main_generation",
+        candidate=True,
+        exactness=False,
+        seconds=0.1,
+    )
+    record["generated_tokens"] = 1
+    stats = record["optimized_cuda_graphs"]["exact_k4_candidate"]
+    stats.update(
+        {
+            "eligible_steps": 0,
+            "block_replays": 0,
+            "remainder_steps": 0,
+            "physical_steps": 1,
+            "logical_steps": 1,
+            "wasted_steps": 0,
+            "terminal_rollbacks": 0,
+            "generator_offset_corrections": 0,
+            "generator_offset_increment": None,
+        }
+    )
+    profile["generation"].append(record)
+
+    contract = gate._candidate_contract(profile, name="candidate")
+
+    assert contract["pass"] is True
+    assert contract["totals"]["main_generation"]["logical_steps"] == 5
+
+
+def test_dispatch_capture_reuse_compares_aggregate_topology():
+    baseline = _profile(candidate=False, exactness=False)
+    candidate = _profile(candidate=True, exactness=False)
+    for profile in (baseline, candidate):
+        reused = dict(profile["generation"][1])
+        reused["sequence_index"] = 1
+        reused["optimized_dispatch_capture_hits"] = {
+            key: 0 for key in reused["optimized_dispatch_capture_hits"]
+        }
+        profile["generation"].append(reused)
+
+    assert gate._dispatch_policy(baseline) == gate._dispatch_policy(candidate)
+
+
 def test_cache_or_rng_signature_change_fails(tmp_path: Path):
     performance, baseline, candidate = _paths(tmp_path)
     payload = json.loads(candidate.read_text())
