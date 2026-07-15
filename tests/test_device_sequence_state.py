@@ -274,3 +274,7 @@ def test_reciprocal_wrapper_is_serial_by_default_with_explicit_parallel_opt_in()
     assert "MAPPERATORINATOR_ALLOW_PARALLEL_RECIPROCAL:-0" in source
     assert "MAPPERATORINATOR_ALLOW_PARALLEL_RECIPROCAL must be 0 or 1" in source
     assert "parallel_reciprocal_opt_in=$ALLOW_PARALLEL_RECIPROCAL" in source
+    assert "MAPPERATORINATOR_SHARED_ROPE_BASELINE:-0" in source
+    assert "utils/run_exact_rope_device_state.py" in source
+    assert "utils/run_strict_shared_rope.py" in source
+    assert "shared_rope_baseline=$SHARED_ROPE_BASELINE" in source

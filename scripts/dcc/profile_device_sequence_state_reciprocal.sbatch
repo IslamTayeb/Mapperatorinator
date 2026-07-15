@@ -31,6 +31,7 @@ WORK=${MAPPERATORINATOR_WORK:-/work/imt11/Mapperatorinator}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 EXPECTED_GPU=${MAPPERATORINATOR_EXPECTED_GPU:-2080 Ti}
 ALLOW_PARALLEL_RECIPROCAL=${MAPPERATORINATOR_ALLOW_PARALLEL_RECIPROCAL:-0}
+SHARED_ROPE_BASELINE=${MAPPERATORINATOR_SHARED_ROPE_BASELINE:-0}
 RUN_LABEL=${RUN_LABEL:-device-sequence-state-$PRECISION}
 RUN_ROOT="$WORK/runs/${RUN_LABEL}-${SLURM_JOB_ID}"
 
@@ -43,6 +44,8 @@ esac
 [[ -x "$PYTHON" ]] || die "missing executable Python at $PYTHON"
 [[ "$ALLOW_PARALLEL_RECIPROCAL" == 0 || "$ALLOW_PARALLEL_RECIPROCAL" == 1 ]] \
   || die "MAPPERATORINATOR_ALLOW_PARALLEL_RECIPROCAL must be 0 or 1"
+[[ "$SHARED_ROPE_BASELINE" == 0 || "$SHARED_ROPE_BASELINE" == 1 ]] \
+  || die "MAPPERATORINATOR_SHARED_ROPE_BASELINE must be 0 or 1"
 [[ -d "$REPO/.git" || -f "$REPO/.git" ]] || die "missing worktree at $REPO"
 [[ -f "$AUDIO" ]] || die "missing input audio at $AUDIO"
 [[ ! -e "$RUN_ROOT" ]] || die "refusing to overwrite $RUN_ROOT"
@@ -102,6 +105,7 @@ fi
   echo "remote_ref=$REMOTE_REF"
   echo "precision=$PRECISION"
   echo "parallel_reciprocal_opt_in=$ALLOW_PARALLEL_RECIPROCAL"
+  echo "shared_rope_baseline=$SHARED_ROPE_BASELINE"
   echo "run_root=$RUN_ROOT"
   echo "audio_sha256=$(sha256sum "$AUDIO" | awk '{print $1}')"
   "$PYTHON" -c 'import torch, transformers; print(f"torch={torch.__version__}"); print(f"transformers={transformers.__version__}")'
@@ -149,11 +153,26 @@ run_role() {
   local run_dir="$RUN_ROOT/$role"
   mkdir -p "$run_dir/output"
   local command
-  if [[ "$kind" == candidate ]]; then
+  if [[ "$kind" == candidate && "$SHARED_ROPE_BASELINE" == 1 ]]; then
+    command=(
+      "$PYTHON" utils/run_exact_rope_device_state.py
+      --config-name profile_salvalai
+      --rope-evidence-path "$run_dir/rope-evidence.json"
+      --activation-manifest "$run_dir/activation.json"
+      "${COMMON_ARGS[@]:2}" output_path="$run_dir/output"
+    )
+  elif [[ "$kind" == candidate ]]; then
     command=(
       "$PYTHON" utils/run_device_sequence_state_candidate.py
       --activation-manifest "$run_dir/activation.json"
       -- "${COMMON_ARGS[@]}" output_path="$run_dir/output"
+    )
+  elif [[ "$SHARED_ROPE_BASELINE" == 1 ]]; then
+    command=(
+      "$PYTHON" utils/run_strict_shared_rope.py
+      --config-name profile_salvalai
+      --evidence-path "$run_dir/rope-evidence.json"
+      "${COMMON_ARGS[@]:2}" output_path="$run_dir/output"
     )
   else
     command=(
@@ -177,7 +196,7 @@ import pathlib
 import sys
 
 payload = json.loads(pathlib.Path(sys.argv[1]).read_text())
-assert payload == {
+plain = {
     "accepted_dispatch_replaced": False,
     "candidate": "preallocated_batch1_device_sequence_state",
     "decode_loop_calls": payload["decode_loop_calls"],
@@ -185,8 +204,22 @@ assert payload == {
     "enabled": True,
     "schema_version": 1,
 }
+combined = {
+    "accepted_dispatch_replaced": False,
+    "candidate": "shared_rope_plus_preallocated_batch1_device_sequence_state",
+    "decode_loop_calls": payload["decode_loop_calls"],
+    "decoder_layer_replaced": False,
+    "device_sequence_state_enabled": True,
+    "enabled": True,
+    "schema_version": 1,
+    "shared_rope_enabled": True,
+}
+assert payload in (plain, combined)
 assert isinstance(payload["decode_loop_calls"], int) and payload["decode_loop_calls"] > 0
 PY
+  fi
+  if [[ "$SHARED_ROPE_BASELINE" == 1 ]]; then
+    require_nonempty "$run_dir/rope-evidence.json"
   fi
   PROFILE_PATHS[$role]=$profile
   OSU_PATHS[$role]=$osu
