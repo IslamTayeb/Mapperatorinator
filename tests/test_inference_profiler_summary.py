@@ -187,7 +187,16 @@ def test_processor_records_specialized_dispatch_capture_hits():
             "elapsed_seconds": 0.5,
             "tokens_per_second": 8.0,
             "optimized_dispatch_capture_hits": hits,
+            "optimized_device_conditional_temperature_requested": True,
+            "optimized_device_conditional_temperature_condition_count": 2,
+            "optimized_device_conditional_temperature_specialized_calls": 4,
+            "optimized_device_conditional_temperature_v32_fallback_calls": 0,
         },
     )
 
     assert processor.profiler.generation[0]["optimized_dispatch_capture_hits"] == hits
+    record = processor.profiler.generation[0]
+    assert record["optimized_device_conditional_temperature_requested"] is True
+    assert record["optimized_device_conditional_temperature_condition_count"] == 2
+    assert record["optimized_device_conditional_temperature_specialized_calls"] == 4
+    assert record["optimized_device_conditional_temperature_v32_fallback_calls"] == 0
