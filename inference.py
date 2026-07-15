@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import importlib
 import multiprocessing
@@ -22,22 +24,16 @@ from transformers.utils import cached_file, is_flash_attn_2_available
 from importlib import metadata
 from packaging.version import Version
 
-import osu_diffusion
 from utils import routed_pickle
 from config import InferenceConfig
-from diffusion_pipeline import DiffisionPipeline
 from osuT5.osuT5.config import TrainConfig
 from osuT5.osuT5.dataset.data_utils import events_of_type, TIMING_TYPES, merge_events
 from osuT5.osuT5.inference import Preprocessor, Processor, Postprocessor, BeatmapConfig, GenerationConfig, \
     generation_config_from_beatmap, beatmap_config_from_beatmap, background_line
 from osuT5.osuT5.inference.profiler import InferenceProfiler
-from osuT5.osuT5.inference.server import InferenceClient
-from osuT5.osuT5.inference.super_timing_generator import SuperTimingGenerator
 from osuT5.osuT5.model import Mapperatorinator
 from osuT5.osuT5.tokenizer import ContextType
 from osuT5.osuT5.utils import load_model_loaders, resolve_compatible_lora_path, resolve_model_checkpoint_path, get_model_checkpoint_subfolder
-from osu_diffusion import DiT_models
-from osu_diffusion.config import DiffusionTrainConfig
 
 
 def get_default_logger():
@@ -634,6 +630,8 @@ def generate(
     # Auto generate timing if not provided in in_context and required for the model and this output_type
     timing_events, timing_times, timing = None, None, None
     if args.super_timing and (len(args.in_context) == 0 or ContextType.NONE in args.in_context):
+        from osuT5.osuT5.inference.super_timing_generator import SuperTimingGenerator
+
         with profiler.stage("super_timing_generation"):
             super_timing_generator = SuperTimingGenerator(args, timing_model, timing_tokenizer, profiler=profiler)
             timing_events, timing_times = super_timing_generator.generate(audio, generation_config, verbose=verbose)
@@ -699,6 +697,8 @@ def generate(
 
     # Generate positions with diffusion
     if args.generate_positions and args.gamemode in [0, 2] and ContextType.MAP in output_type:
+        from diffusion_pipeline import DiffisionPipeline
+
         with profiler.stage("diffusion_position_generation"):
             diffusion_pipeline = DiffisionPipeline(args, diff_model, diff_tokenizer, refine_model)
             events = diffusion_pipeline.generate(
@@ -774,6 +774,11 @@ def load_model_with_server(ckpt_path: str | Path | None, t5_args: TrainConfig, d
         generation_compile=generation_compile,
     )
 
+    if not use_server:
+        return model_loader(), tokenizer_loader()
+
+    from osuT5.osuT5.inference.server import InferenceClient
+
     return InferenceClient(
         model_loader,
         tokenizer_loader,
@@ -784,7 +789,7 @@ def load_model_with_server(ckpt_path: str | Path | None, t5_args: TrainConfig, d
             gamemode=gamemode,
             auto_select_gamemode_model=auto_select_gamemode_model,
         ),
-    ) if use_server else model_loader(), tokenizer_loader()
+    )
 
 
 def load_model_with_engine(
@@ -873,6 +878,9 @@ def load_diff_model(
         diff_args: DiffusionTrainConfig,
         device,
 ):
+    import osu_diffusion
+    from osu_diffusion import DiT_models
+
     if not os.path.exists(ckpt_path) and ckpt_path != "":
         tokenizer_file = cached_file(ckpt_path, "tokenizer.pkl")
         model_file = cached_file(ckpt_path, "model_ema.pkl")
