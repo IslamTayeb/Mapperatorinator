@@ -65,6 +65,47 @@ def _binding(model, precision: str):
     return SimpleNamespace(raw_model=model, runtime=runtime)
 
 
+@pytest.mark.parametrize("precision", ("fp32", "fp16"))
+def test_real_profile_config_accepts_both_shared_rope_precisions(
+    precision,
+    monkeypatch,
+):
+    monkeypatch.setenv("NVIDIA_TF32_OVERRIDE", "0")
+    args = candidate._load_args(
+        "profile_salvalai",
+        [
+            f"precision={precision}",
+            "inference_engine=optimized",
+            "attn_implementation=sdpa",
+            "device=cuda",
+            "use_server=false",
+            "parallel=false",
+            "cfg_scale=1.0",
+            "num_beams=1",
+            "profile_inference=true",
+            "super_timing=false",
+            "generate_positions=false",
+        ],
+    )
+
+    assert args.precision == precision
+    candidate._validate_args(args)
+
+
+def test_real_accepted_presets_keep_specialized_topology_for_both_dtypes():
+    from osuT5.osuT5.inference.optimized.single.engine import (
+        OPTIMIZED_PRESETS,
+        _optimized_config_metadata,
+    )
+
+    for precision in ("fp32", "fp16"):
+        metadata = _optimized_config_metadata(OPTIMIZED_PRESETS[precision])
+        assert metadata["precision"] == precision
+        assert metadata["q1_bmm_cross_attention"] is True
+        assert metadata["native_q1_self_attention"] is True
+        assert metadata["native_q1_rope_cache_self_attention"] is True
+
+
 @pytest.mark.parametrize(
     ("precision", "dtype"),
     (("fp32", torch.float32), ("fp16", torch.float16)),
