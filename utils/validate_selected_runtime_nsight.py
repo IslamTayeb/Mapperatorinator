@@ -25,7 +25,7 @@ PASS_KINDS = {
     "selected_graph": "nsys_graph",
     "selected_node": "nsys_node",
 }
-RUNTIME_NAME = "k4-k1-int8-fp16-packed-cross"
+RUNTIME_NAME = "k4-k1-int8-fp16-packed-cross-shared-arena"
 RUNTIME_FACTORY = (
     "utils.final_confirmation_runtime:kblock_shared_rope_weight_plugin"
 )
@@ -93,6 +93,7 @@ def _runtime_contract(evidence: dict[str, Any], *, run_id: str) -> dict[str, Any
     expected_kwargs = {
         "block_size": 4,
         "graph_remainders": True,
+        "shared_static_input_arena": True,
         "initializer_name": INITIALIZER,
         "initializer_kwargs": {"mode": CROSS_FP16_PACKED},
         "shared_rope_binding_index": 0,
@@ -139,6 +140,11 @@ def _runtime_contract(evidence: dict[str, Any], *, run_id: str) -> dict[str, Any
     _required_equal(block.get("block_size"), 4, name=f"{run_id}.block_size")
     _required_equal(
         block.get("graph_remainders"), True, name=f"{run_id}.graph_remainders"
+    )
+    _required_equal(
+        block.get("shared_static_input_arena"),
+        True,
+        name=f"{run_id}.shared_static_input_arena",
     )
     initializer = _object(
         by_kind.get("runtime_initializer"), name=f"{run_id}.runtime_initializer"

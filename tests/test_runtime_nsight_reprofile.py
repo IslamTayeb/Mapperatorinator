@@ -240,6 +240,7 @@ def test_dcc_wrapper_is_fixed_work_runtime_spec_driven_and_report_only():
     assert "request_pipeline.csv" in wrapper
     assert spec["kwargs"]["block_size"] == 4
     assert spec["kwargs"]["graph_remainders"] is True
+    assert spec["kwargs"]["shared_static_input_arena"] is True
     assert spec["kwargs"]["initializer_name"] == (
         "initialize_approximate_int8_mlp_weight_only_cross"
     )
@@ -279,6 +280,7 @@ def test_selected_runtime_contract_requires_exact_composed_topology():
     kwargs = {
         "block_size": 4,
         "graph_remainders": True,
+        "shared_static_input_arena": True,
         "initializer_name": "initialize_approximate_int8_mlp_weight_only_cross",
         "initializer_kwargs": {"mode": "fp16_packed_projections"},
         "shared_rope_binding_index": 0,
@@ -290,13 +292,18 @@ def test_selected_runtime_contract_requires_exact_composed_topology():
         "expected_main_steps": 8294,
         "labels": {"main_generation": {"logical_steps": 8294}},
         "runtime": {
-            "name": "k4-k1-int8-fp16-packed-cross",
+            "name": "k4-k1-int8-fp16-packed-cross-shared-arena",
             "factory": "utils.final_confirmation_runtime:kblock_shared_rope_weight_plugin",
             "binding_count": 2,
             "spec": {"kwargs": kwargs},
             "initialization": initialization,
             "temporary_hooks": [
-                {"kind": "block_decode", "block_size": 4, "graph_remainders": True},
+                {
+                    "kind": "block_decode",
+                    "block_size": 4,
+                    "graph_remainders": True,
+                    "shared_static_input_arena": True,
+                },
                 {"kind": "shared_decoder_rope", "binding_index": 0, "stats": stats},
                 {
                     "kind": "runtime_initializer",

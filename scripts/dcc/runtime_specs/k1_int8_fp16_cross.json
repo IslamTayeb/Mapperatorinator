@@ -1,10 +1,11 @@
 {
   "schema_version": "mapperatorinator.final-runtime-spec.v1",
-  "name": "k4-k1-int8-fp16-packed-cross",
+  "name": "k4-k1-int8-fp16-packed-cross-shared-arena",
   "factory": "utils.final_confirmation_runtime:kblock_shared_rope_weight_plugin",
   "kwargs": {
     "block_size": 4,
     "graph_remainders": true,
+    "shared_static_input_arena": true,
     "initializer_name": "initialize_approximate_int8_mlp_weight_only_cross",
     "initializer_kwargs": {
       "mode": "fp16_packed_projections"

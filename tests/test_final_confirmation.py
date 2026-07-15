@@ -146,6 +146,7 @@ def test_runtime_spec_is_imported_without_touching_production_selectors(
                 "kwargs": {
                     "block_size": 4,
                     "graph_remainders": True,
+                    "shared_static_input_arena": True,
                     "initializer_name": "initialize_approximate_int8_mlp_weight_only_cross",
                     "initializer_kwargs": {"mode": "fp16_packed_projections"},
                 },
@@ -155,6 +156,7 @@ def test_runtime_spec_is_imported_without_touching_production_selectors(
     plugin = load_runtime_plugin(spec)
     assert isinstance(plugin, KBlockSharedRopeWeightPlugin)
     assert plugin.name == "selected-fast-runtime"
+    assert plugin._shared_static_input_arena is True
 
     bad_kwargs = json.loads(spec.read_text())
     bad_kwargs["kwargs"]["initializer_kwargs"] = []

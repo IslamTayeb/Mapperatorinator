@@ -117,6 +117,7 @@ class KBlockSharedRopeWeightPlugin:
         spec: dict[str, Any],
         block_size: int,
         graph_remainders: bool,
+        shared_static_input_arena: bool = False,
         initializer_name: str,
         initializer_kwargs: dict[str, Any] | None = None,
         shared_rope_binding_index: int = 0,
@@ -127,6 +128,10 @@ class KBlockSharedRopeWeightPlugin:
             raise ValueError("runtime block_size must be one of 1, 2, 4, or 8")
         if not isinstance(graph_remainders, bool):
             raise TypeError("graph_remainders must be boolean")
+        if not isinstance(shared_static_input_arena, bool):
+            raise TypeError("shared_static_input_arena must be boolean")
+        if shared_static_input_arena and not graph_remainders:
+            raise ValueError("shared static-input arena requires graphed remainders")
         if not isinstance(initializer_name, str) or not initializer_name:
             raise ValueError("initializer_name must be non-empty")
         if initializer_kwargs is None:
@@ -147,6 +152,7 @@ class KBlockSharedRopeWeightPlugin:
         self._spec = spec
         self._block_size = block_size
         self._graph_remainders = graph_remainders
+        self._shared_static_input_arena = shared_static_input_arena
         self._initializer_name = initializer_name
         self._initializer_kwargs = dict(initializer_kwargs)
         self._shared_rope_binding_index = shared_rope_binding_index
@@ -171,6 +177,7 @@ class KBlockSharedRopeWeightPlugin:
             install_k8_candidate(
                 block_size=self._block_size,
                 graph_remainders=self._graph_remainders,
+                shared_static_input_arena=self._shared_static_input_arena,
             )
         )
         return self
@@ -250,6 +257,7 @@ class KBlockSharedRopeWeightPlugin:
                     "kind": "block_decode",
                     "block_size": self._block_size,
                     "graph_remainders": self._graph_remainders,
+                    "shared_static_input_arena": self._shared_static_input_arena,
                 },
                 {
                     "kind": "shared_decoder_rope",
