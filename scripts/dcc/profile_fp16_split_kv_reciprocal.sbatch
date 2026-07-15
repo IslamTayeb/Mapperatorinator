@@ -203,7 +203,7 @@ done
 run_fresh_process exactness-audit-01 exactness_audit
 run_fresh_process exactness-audit-02 exactness_audit
 
-"$PYTHON" utils/analyze_fp16_fresh_baseline.py \
+"$PYTHON" -m utils.analyze_fp16_fresh_baseline \
   --run-root "$RUN_ROOT" \
   --expected-commit "$COMMIT" \
   --expected-branch "$BRANCH" \
@@ -216,7 +216,7 @@ require_nonempty "$RUN_ROOT/candidate-analysis.json"
 require_nonempty "$RUN_ROOT/candidate-analysis.txt"
 
 set +e
-"$PYTHON" utils/analyze_fp16_split_kv_reciprocal.py \
+"$PYTHON" -m utils.analyze_fp16_split_kv_reciprocal \
   --baseline-run-root "$BASELINE_RUN_ROOT" \
   --baseline-analysis "$BASELINE_ANALYSIS" \
   --candidate-analysis "$RUN_ROOT/candidate-analysis.json" \

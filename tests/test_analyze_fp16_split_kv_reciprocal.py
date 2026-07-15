@@ -163,5 +163,9 @@ def test_fp16_wrapper_is_serial_and_has_no_docs_or_default_selector_flags():
     assert "run_fresh_process exactness-audit-02 exactness_audit" in script
     assert "--expected-split-kv" in script
     assert "precision=fp16" in script
+    assert '"$PYTHON" -m utils.analyze_fp16_fresh_baseline' in script
+    assert '"$PYTHON" -m utils.analyze_fp16_split_kv_reciprocal' in script
+    assert '"$PYTHON" utils/analyze_fp16_fresh_baseline.py' not in script
+    assert '"$PYTHON" utils/analyze_fp16_split_kv_reciprocal.py' not in script
     assert ".md" not in script
     assert ".html" not in script
