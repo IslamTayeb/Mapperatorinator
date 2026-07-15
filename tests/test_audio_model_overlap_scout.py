@@ -18,7 +18,11 @@ from osuT5.osuT5.inference.audio_preparation import (
 from osuT5.osuT5.inference.optimized.audio_model_overlap_scout import (
     AudioPreparationTask,
 )
-from utils.profile_audio_model_overlap import RUN_ORDER, analyze_reciprocal
+from utils.profile_audio_model_overlap import (
+    RUN_ORDER,
+    SELECTED_STACK_VERSION,
+    analyze_reciprocal,
+)
 
 
 class _Loader:
@@ -40,6 +44,7 @@ def _success_manifest(path: Path, *, result_hash: str = "osu") -> None:
         "audio_worker": None,
         "result_sha256": result_hash,
         "profile_contract": {"seed": 12345},
+        "selected_topology": {"version": SELECTED_STACK_VERSION},
         "generation_signature": {
             label: {
                 "token_stream_sha256": f"{label}-tokens",
@@ -170,7 +175,8 @@ class AudioModelOverlapScoutTest(unittest.TestCase):
             "-c",
             "\n".join(
                 [
-                    "import contextlib, io, sys",
+                    "import contextlib, io, sys, warnings",
+                    "warnings.filterwarnings('ignore', message='Couldn.t find ffmpeg or avconv.*', category=RuntimeWarning)",
                     "stdout=io.StringIO()",
                     "stderr=io.StringIO()",
                     "with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):",
@@ -223,6 +229,7 @@ class AudioModelOverlapScoutTest(unittest.TestCase):
 
         self.assertTrue(report["promotion_pass"])
         self.assertTrue(report["exactness_pass"])
+        self.assertTrue(report["exactness"]["selected_topology_pass"])
         self.assertEqual(
             report["performance"]["paired_cold_wall_savings_seconds"],
             [1.0, 1.0],
@@ -255,6 +262,21 @@ class AudioModelOverlapScoutTest(unittest.TestCase):
         self.assertEqual(report["status"], "setup_failure")
         self.assertIs(report["performance_conclusion_allowed"], False)
         self.assertIs(report["promotion_pass"], False)
+
+    def test_dcc_wrapper_pins_selected_stack_and_half_second_gate(self) -> None:
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "dcc"
+            / "profile_audio_model_overlap_reciprocal.sbatch"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('refs/remotes/$REMOTE/$BRANCH', source)
+        self.assertIn('rev-parse "$REMOTE_REF"', source)
+        self.assertIn("preload_weight_only_extension", source)
+        self.assertIn("preload_int8_mlp_extension", source)
+        self.assertIn("--minimum-saving-seconds 0.5", source)
+        self.assertIn("super_timing=false", source)
 
 
 if __name__ == "__main__":

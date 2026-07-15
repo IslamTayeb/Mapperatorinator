@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import hashlib
 import json
 import os
@@ -26,6 +27,7 @@ RUN_ORDER = (
 )
 PROFILE_LABELS = ("timing_context", "main_generation")
 MIN_COLD_WALL_SAVING_SECONDS = 0.5
+SELECTED_STACK_VERSION = "selected-k4-k1-int8-fp16-cross-7569d50-v1"
 CONTRACT_METADATA_KEYS = (
     "model_path",
     "audio_path",
@@ -183,6 +185,34 @@ def _profile_signature(profile: dict[str, Any]) -> dict[str, Any]:
     return labels
 
 
+def _selected_topology(profile: dict[str, Any], shared_rope: dict[str, Any]) -> dict[str, Any]:
+    from utils.validate_int8_mlp_full_song_profile import (
+        validate_profile as validate_int8,
+    )
+    from utils.validate_k1_remainder_profile import validate as validate_k1
+    from utils.validate_k4_profile_contract import validate as validate_k4
+    from utils.validate_weight_only_full_song_profile import validate_profile
+
+    if shared_rope.get("computes") != shared_rope.get("expected_computes"):
+        raise RuntimeError("selected audio scout shared-RoPE compute count changed")
+    if shared_rope.get("reuses") != shared_rope.get("expected_reuses"):
+        raise RuntimeError("selected audio scout shared-RoPE reuse count changed")
+    if int(shared_rope.get("reuses", 0)) <= 0:
+        raise RuntimeError("selected audio scout did not reuse decoder RoPE")
+    return {
+        "version": SELECTED_STACK_VERSION,
+        "weight_only": validate_profile(
+            profile,
+            role="candidate",
+            cross_mode="fp16_packed_projections",
+        ),
+        "int8_mlp": validate_int8(profile, role="candidate"),
+        "k1_remainder": validate_k1(profile, role="candidate"),
+        "k4": validate_k4(profile, role="candidate", block_size=4),
+        "shared_rope": shared_rope,
+    }
+
+
 def _manifest_from_success(
     *,
     mode: str,
@@ -191,6 +221,7 @@ def _manifest_from_success(
     inner_wall_seconds: float,
     audio_task,
     prepared_audio,
+    shared_rope: dict[str, Any],
 ) -> dict[str, Any]:
     profile = _load_json(profile_path)
     metadata = profile.get("metadata")
@@ -242,6 +273,7 @@ def _manifest_from_success(
             key: metadata.get(key) for key in CONTRACT_METADATA_KEYS
         },
         "generation_signature": _profile_signature(profile),
+        "selected_topology": _selected_topology(profile, shared_rope),
         "profile_stage_wall_seconds": profile.get("summary", {}).get(
             "stage_wall_seconds",
             {},
@@ -264,6 +296,7 @@ def run_single(
     complete_started = time.perf_counter()
     audio_task = None
     prepared_audio = None
+    stack = ExitStack()
     try:
         from inference import (
             compile_args,
@@ -288,6 +321,13 @@ def run_single(
         profiler = InferenceProfiler.from_args(args)
         _record_stage(profiler, "compile_args", compile_args, args, False)
         _assert_scout_args(args)
+        from osuT5.osuT5.inference.optimized.single.k8_runtime import (
+            install_k8_candidate,
+        )
+
+        stack.enter_context(
+            install_k8_candidate(block_size=4, graph_remainders=True)
+        )
         _record_stage(
             profiler,
             "setup_inference_environment",
@@ -329,6 +369,28 @@ def run_single(
             auto_select_gamemode_model=args.auto_select_gamemode_model,
             inference_engine=args.inference_engine,
         )
+        from osuT5.osuT5.inference.optimized.kernels.weight_only_runtime import (
+            CROSS_FP16_PACKED,
+        )
+        from osuT5.osuT5.inference.optimized.scout.shared_rope import (
+            SharedRopeStats,
+            shared_decoder_rope_context,
+        )
+
+        shared_rope_stats = SharedRopeStats()
+        stack.enter_context(
+            shared_decoder_rope_context(
+                model.raw_model,
+                stats=shared_rope_stats,
+            )
+        )
+        _record_stage(
+            profiler,
+            "initialize_selected_main_stack",
+            model.runtime.initialize_approximate_int8_mlp_weight_only_cross,
+            model.raw_model,
+            mode=CROSS_FP16_PACKED,
+        )
 
         timing_model, timing_tokenizer = None, None
         if should_load_separate_timing_model(args):
@@ -348,16 +410,15 @@ def run_single(
                 inference_engine=args.inference_engine,
             )
 
-        if mode == "overlap":
-            from osuT5.osuT5.inference.optimized.audio_model_overlap_scout import (
-                preload_accepted_native_extensions,
-            )
+        from osuT5.osuT5.inference.optimized.audio_model_overlap_scout import (
+            preload_accepted_native_extensions,
+        )
 
-            _record_stage(
-                profiler,
-                "preload_accepted_native_extensions",
-                preload_accepted_native_extensions,
-            )
+        _record_stage(
+            profiler,
+            "preload_accepted_native_extensions",
+            preload_accepted_native_extensions,
+        )
 
         generation_config, beatmap_config = _record_stage(
             profiler,
@@ -395,6 +456,7 @@ def run_single(
             inner_wall_seconds=time.perf_counter() - complete_started,
             audio_task=audio_task,
             prepared_audio=prepared_audio,
+            shared_rope=shared_rope_stats.as_dict(),
         )
         _write_json(manifest_path, manifest)
         return manifest
@@ -414,6 +476,8 @@ def run_single(
         }
         _write_json(manifest_path, failure)
         raise
+    finally:
+        stack.close()
 
 
 def _run_child(
@@ -516,6 +580,13 @@ def analyze_reciprocal(
 
     audio_hashes = [manifest["audio"]["audio_array_sha256"] for manifest in manifests]
     contracts = [manifest["profile_contract"] for manifest in manifests]
+    topologies = [manifest.get("selected_topology") for manifest in manifests]
+    if any(
+        not isinstance(topology, dict)
+        or topology.get("version") != SELECTED_STACK_VERSION
+        for topology in topologies
+    ):
+        raise ValueError("audio/model overlap run lacks selected-stack topology")
     results = [manifest["result_sha256"] for manifest in manifests]
     token_hashes = {
         label: [
@@ -534,6 +605,7 @@ def analyze_reciprocal(
     exactness = {
         "audio_array_hash_pass": _all_equal(audio_hashes),
         "profile_contract_pass": _all_equal(contracts),
+        "selected_topology_pass": _all_equal(topologies),
         "result_osu_hash_pass": _all_equal(results),
         "token_stream_pass": all(_all_equal(values) for values in token_hashes.values()),
         "stopping_pass": all(_all_equal(values) for values in stopping_hashes.values()),

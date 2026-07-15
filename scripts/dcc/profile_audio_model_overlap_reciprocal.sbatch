@@ -15,6 +15,7 @@ PYTHON=${MAPPERATORINATOR_PYTHON:-/hpc/group/romerolab/imt11/envs/mapperatorinat
 REPO=${MAPPERATORINATOR_REPO:?Set MAPPERATORINATOR_REPO to the clean scout worktree}
 COMMIT=${MAPPERATORINATOR_COMMIT:?Set MAPPERATORINATOR_COMMIT to the pushed scout commit}
 BRANCH=${MAPPERATORINATOR_BRANCH:?Set MAPPERATORINATOR_BRANCH to the scout branch}
+REMOTE=${MAPPERATORINATOR_REMOTE:-origin}
 WORK=${MAPPERATORINATOR_WORK:-/work/imt11/Mapperatorinator}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_LABEL=${RUN_LABEL:-audio-model-overlap-reciprocal}
@@ -41,6 +42,15 @@ if [[ "$(git -C "$REPO" branch --show-current)" != "$BRANCH" ]]; then
   echo "scout worktree is not on MAPPERATORINATOR_BRANCH=$BRANCH" >&2
   exit 2
 fi
+REMOTE_REF="refs/remotes/$REMOTE/$BRANCH"
+if ! git -C "$REPO" show-ref --verify --quiet "$REMOTE_REF"; then
+  echo "missing fetched remote ref $REMOTE_REF" >&2
+  exit 2
+fi
+if [[ "$(git -C "$REPO" rev-parse "$REMOTE_REF")" != "$COMMIT" ]]; then
+  echo "pushed remote ref differs from MAPPERATORINATOR_COMMIT" >&2
+  exit 2
+fi
 if [[ ! -f "$AUDIO" ]]; then
   echo "missing audio at $AUDIO" >&2
   exit 2
@@ -57,10 +67,11 @@ export TRANSFORMERS_OFFLINE=1
 export TORCHINDUCTOR_CACHE_DIR="$WORK/cache/torch_inductor"
 export TRITON_CACHE_DIR="$WORK/cache/triton"
 export CUDA_CACHE_PATH="$WORK/cache/cuda"
-export TORCH_EXTENSIONS_DIR="$WORK/torch_extensions"
+export TORCH_EXTENSIONS_DIR="$WORK/torch_extensions/audio-overlap-${COMMIT:0:12}"
 export TMPDIR="$WORK/tmp"
 export TOKENIZERS_PARALLELISM=false
 export PATH="$(dirname "$PYTHON"):$PATH"
+mkdir -p "$TORCH_EXTENSIONS_DIR"
 
 for tool in ffmpeg ffprobe nvidia-smi; do
   if ! command -v "$tool" >/dev/null 2>&1; then
@@ -94,6 +105,26 @@ if [[ "$GPU_NAME" != *"2080 Ti"* ]]; then
 fi
 
 cd "$REPO"
+"$PYTHON" - <<'PY'
+from osuT5.osuT5.inference.optimized.kernels.decoder_layer import (
+    preload_native_decoder_layer,
+)
+from osuT5.osuT5.inference.optimized.kernels.q1_attention import (
+    preload_native_q1_attention,
+)
+from osuT5.osuT5.inference.optimized.kernels.weight_only import (
+    preload_weight_only_extension,
+)
+from osuT5.osuT5.inference.optimized.scout.int8_mlp import (
+    preload_int8_mlp_extension,
+)
+
+preload_native_q1_attention()
+preload_native_decoder_layer()
+preload_weight_only_extension()
+preload_int8_mlp_extension()
+PY
+
 set +e
 "$PYTHON" utils/profile_audio_model_overlap.py reciprocal \
   --python "$PYTHON" \
@@ -109,6 +140,7 @@ set +e
   parallel=false \
   cfg_scale=1.0 \
   num_beams=1 \
+  super_timing=false \
   generate_positions=false
 STATUS=$?
 set -e
