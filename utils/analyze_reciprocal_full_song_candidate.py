@@ -584,6 +584,13 @@ def _require_equal(values: Mapping[str, Any], *, name: str) -> None:
 
 
 def _validate_workloads(runs: Mapping[str, ParsedRun], *, mode: str) -> dict[str, Any]:
+    precisions = {run.precision for run in runs.values()}
+    if mode == "exact-fp32" and precisions != {"fp32"}:
+        raise CandidateAnalysisError("exact-fp32 mode requires all four profiles to be fp32")
+    if mode == "exact-same-precision" and len(precisions) != 1:
+        raise CandidateAnalysisError(
+            "exact-same-precision mode requires all four profiles to use one precision"
+        )
     baseline = {role: runs[role].workload for role in BASELINE_ROLES}
     candidate = {role: runs[role].workload for role in CANDIDATE_ROLES}
     _require_equal(baseline, name="baseline workload")
@@ -601,13 +608,6 @@ def _validate_workloads(runs: Mapping[str, ParsedRun], *, mode: str) -> dict[str
     if undeclared:
         raise CandidateAnalysisError(
             f"baseline/candidate workload differs outside precision: {undeclared}"
-        )
-    precisions = {run.precision for run in runs.values()}
-    if mode == "exact-fp32" and precisions != {"fp32"}:
-        raise CandidateAnalysisError("exact-fp32 mode requires all four profiles to be fp32")
-    if mode == "exact-same-precision" and len(precisions) != 1:
-        raise CandidateAnalysisError(
-            "exact-same-precision mode requires all four profiles to use one precision"
         )
     return {
         "baseline_sha256": _sha256_json(runs["baseline_first"].workload),
