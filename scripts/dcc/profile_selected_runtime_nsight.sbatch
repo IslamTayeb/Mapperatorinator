@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=runtime-nsight-fixed8294
+#SBATCH --job-name=runtime-nsight-fixed7149
 #SBATCH --partition=gpu-common
 #SBATCH --account=romerolab
 #SBATCH --cpus-per-task=8
@@ -12,7 +12,7 @@
 set -euo pipefail
 
 die() {
-  echo "runtime-nsight-fixed8294: $*" >&2
+  echo "runtime-nsight-fixed7149: $*" >&2
   exit 2
 }
 
@@ -33,7 +33,7 @@ RUNTIME_SPEC_SOURCE=${MAPPERATORINATOR_RUNTIME_SPEC:-$REPO/scripts/dcc/runtime_s
 RUN_ROOT="$WORK/runs/selected-runtime-nsight-$SLURM_JOB_ID"
 RUNS="$RUN_ROOT/runs"
 CAPABILITIES="$RUN_ROOT/capabilities"
-EXPECTED_MAIN_STEPS=8294
+EXPECTED_MAIN_STEPS=7149
 
 [[ -x "$PYTHON" ]] || die "missing executable Python at $PYTHON"
 [[ -d "$REPO/.git" || -f "$REPO/.git" ]] || die "missing profiler worktree at $REPO"
@@ -250,7 +250,8 @@ run_nsys() {
 }
 
 # The accepted run creates the sole fixed-work manifest. Every selected arm
-# replays that exact 8,294-main-step schedule through a runtime spec.
+# replays that exact 7,149-main-step schedule through a runtime spec. This is
+# the accepted natural work count on the pinned valid historical branch.
 run_confirmation accepted_record record-fixed-work untraced_control false false false
 require_nonempty "$RUN_ROOT/fixed-work.json"
 run_confirmation selected_control replay-fixed-work untraced_control false false true

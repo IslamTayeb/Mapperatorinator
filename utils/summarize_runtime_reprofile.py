@@ -18,7 +18,7 @@ if str(REPO_ROOT) not in sys.path:
 from utils import nsight_agent_profile as nsight
 
 
-EXPECTED_MAIN_STEPS = 8294
+EXPECTED_MAIN_STEPS = 7149
 
 
 def _load(path: Path) -> dict[str, Any]:

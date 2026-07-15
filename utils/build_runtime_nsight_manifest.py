@@ -33,7 +33,7 @@ PAIRED_CONTROL = {
     "selected_graph": "selected_control",
     "selected_node": "selected_control",
 }
-EXPECTED_MAIN_STEPS = 8294
+EXPECTED_MAIN_STEPS = 7149
 
 
 def _sha256(path: Path) -> str:
@@ -240,7 +240,7 @@ def _run(
     metadata = profile["metadata"]
     return {
         "run_id": run_id,
-        "run_group_id": "selected-runtime-fixed8294" if candidate else "accepted-fixed8294",
+        "run_group_id": "selected-runtime-fixed7149" if candidate else "accepted-fixed7149",
         "precision": "fp32",
         "engine_variant": runtime_name,
         "engine_preset_version": metadata.get("optimized_effective_config_version"),

@@ -30,7 +30,7 @@ RUNTIME_FACTORY = (
     "utils.final_confirmation_runtime:kblock_shared_rope_weight_plugin"
 )
 INITIALIZER = "initialize_approximate_int8_mlp_weight_only_cross"
-EXPECTED_MAIN_STEPS = 8294
+EXPECTED_MAIN_STEPS = 7149
 
 
 def _object(value: Any, *, name: str) -> dict[str, Any]:

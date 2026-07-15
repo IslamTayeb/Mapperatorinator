@@ -65,7 +65,7 @@ def _evidence() -> dict:
     return {
         "labels": {
             "timing_context": {"logical_steps": 200},
-            "main_generation": {"logical_steps": 8294},
+            "main_generation": {"logical_steps": 7149},
         }
     }
 
@@ -85,9 +85,9 @@ def _osu(path: Path, x: int) -> Path:
 def test_fixed_work_stage_uses_logical_steps_not_consumer_token_count():
     result = _stage(_profile([3, 4, 5]), _evidence(), "main_generation")
 
-    assert result["logical_steps"] == 8294
+    assert result["logical_steps"] == 7149
     assert result["consumer_tokens"] == 3
-    assert result["fixed_work_tokens_per_second"] == pytest.approx(8294 / 3)
+    assert result["fixed_work_tokens_per_second"] == pytest.approx(7149 / 3)
     assert result["post_model_seconds"] == 1.0
 
 
@@ -129,7 +129,7 @@ def test_csv_export_keeps_kernel_family_launch_and_gap_evidence(tmp_path):
         "fixed_work_tokens_per_second": 200 / 1.5,
     }
     main = {
-        "logical_steps": 8294,
+        "logical_steps": 7149,
         "consumer_tokens": 8000,
         "outer_wall_seconds": 30.0,
         "synchronized_model_seconds": 25.0,
@@ -222,7 +222,7 @@ def test_dcc_wrapper_is_fixed_work_runtime_spec_driven_and_report_only():
     )
 
     assert "#SBATCH --time=01:00:00" in wrapper
-    assert "EXPECTED_MAIN_STEPS=8294" in wrapper
+    assert "EXPECTED_MAIN_STEPS=7149" in wrapper
     assert "MAPPERATORINATOR_RUNTIME_SPEC" in wrapper
     assert "selected_control" in wrapper
     assert "selected_budget" not in wrapper
@@ -289,8 +289,8 @@ def test_selected_runtime_contract_requires_exact_composed_topology():
     }
     evidence = {
         "candidate": True,
-        "expected_main_steps": 8294,
-        "labels": {"main_generation": {"logical_steps": 8294}},
+        "expected_main_steps": 7149,
+        "labels": {"main_generation": {"logical_steps": 7149}},
         "runtime": {
             "name": "k4-k1-int8-fp16-packed-cross-shared-arena",
             "factory": "utils.final_confirmation_runtime:kblock_shared_rope_weight_plugin",
