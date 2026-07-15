@@ -211,13 +211,23 @@ def test_shared_rope_rejects_unsupported_state_before_execution() -> None:
             )
 
 
-def test_context_requires_every_original_decoder_layer_dispatch() -> None:
+def test_context_allows_the_existing_nonfused_self_attention_fallback() -> None:
     model = _Model()
     plan = build_shared_decoder_rope_plan(model)
-    with pytest.raises(RuntimeError, match="did not visit every decoder layer"):
-        with shared_decoder_rope_forward_context(plan):
-            shared_decoder_rope(
-                model.layers[0].self_attn.rotary_emb,
-                torch.ones(1, 1, 4),
-                torch.tensor([[3]]),
-            )
+    original_fallback = model.layers[1].self_attn.rotary_emb.forward
+    with shared_decoder_rope_forward_context(plan):
+        shared_decoder_rope(
+            model.layers[0].self_attn.rotary_emb,
+            torch.ones(1, 1, 4),
+            torch.tensor([[3]]),
+        )
+        fallback_output = model.layers[1].self_attn.rotary_emb(
+            torch.ones(1, 1, 4),
+            torch.tensor([[3]]),
+        )
+
+    assert all(torch.isfinite(value).all() for value in fallback_output)
+    assert (
+        model.layers[1].self_attn.rotary_emb.forward.__func__
+        is original_fallback.__func__
+    )

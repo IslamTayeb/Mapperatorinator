@@ -287,19 +287,12 @@ class _SharedDecoderRopeForward:
         return cached.output
 
     def finish(self) -> None:
-        expected = set(self.plan.members_by_module_id)
-        if self.visited_module_ids != expected:
-            missing = sorted(
-                member.name
-                for member in self.plan.members
-                if id(member.module) not in self.visited_module_ids
-            )
-            raise RuntimeError(
-                "shared decoder RoPE did not visit every decoder layer: "
-                + ", ".join(missing)
-            )
-        if len(self.cache) != self.plan.group_count:
-            raise RuntimeError("shared decoder RoPE did not compute every group")
+        visited_groups = {
+            self.plan.members_by_module_id[module_id].group_id
+            for module_id in self.visited_module_ids
+        }
+        if set(self.cache) != visited_groups:
+            raise RuntimeError("shared decoder RoPE lifecycle is inconsistent")
 
 
 _ACTIVE_FORWARD: ContextVar[_SharedDecoderRopeForward | None] = ContextVar(

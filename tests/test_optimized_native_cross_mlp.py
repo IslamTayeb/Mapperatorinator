@@ -277,6 +277,11 @@ def test_ordinary_generate_window_installs_shared_specialized_dispatch(monkeypat
             return {}
 
         @staticmethod
+        def shared_rope_plan_for_window(model):
+            del model
+            return SimpleNamespace(summary=lambda: {"validated": True})
+
+        @staticmethod
         def graph_profile_summary():
             return {
                 "graph_count": 0,
@@ -322,6 +327,7 @@ def test_ordinary_generate_window_installs_shared_specialized_dispatch(monkeypat
         "q1_bmm_cross_attention": True,
         "native_q1_self_attention": True,
         "native_q1_rope_cache_self_attention": True,
+        "share_decoder_rope": True,
         "native_cross_mlp_tail": True,
         "optimized_expected_dtype": torch.float16,
     }
@@ -329,6 +335,7 @@ def test_ordinary_generate_window_installs_shared_specialized_dispatch(monkeypat
         "q1_bmm_cross_attention": True,
         "native_q1_self_attention": False,
         "native_q1_rope_cache_self_attention": False,
+        "share_decoder_rope": False,
         "native_cross_mlp_tail": False,
         "optimized_expected_dtype": torch.float16,
     }
@@ -400,6 +407,7 @@ def test_batched_super_timing_window_deliberately_disables_all_native_dispatch(
         "q1_bmm_cross_attention": False,
         "native_q1_self_attention": False,
         "native_q1_rope_cache_self_attention": False,
+        "share_decoder_rope": False,
         "native_cross_mlp_tail": False,
         "optimized_expected_dtype": torch.float16,
     }
@@ -408,6 +416,8 @@ def test_batched_super_timing_window_deliberately_disables_all_native_dispatch(
         "native_q1_self_attention": 0,
         "q1_bmm_cross_attention": 0,
         "native_cross_mlp_tail": 0,
+        "shared_decoder_rope_compute": 0,
+        "shared_decoder_rope_reuse": 0,
     }
     assert stats["optimized_dispatch_mode"] == "framework_batch"
     assert stats["optimized_batched_super_timing"] is True
