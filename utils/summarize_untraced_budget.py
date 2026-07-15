@@ -29,6 +29,15 @@ EXTERNAL_TRANSFER_NAMES = (
     "model_input_dtype_conversion",
     "final_device_to_host",
 )
+STRICT_FP32_METADATA = {
+    "precision": "fp32",
+    "inference_engine": "optimized",
+    "attn_implementation": "sdpa",
+    "float32_matmul_precision": "highest",
+    "cuda_matmul_allow_tf32": False,
+    "cudnn_allow_tf32": False,
+    "nvidia_tf32_override": "0",
+}
 CUDA_EVENT_REGION_NAMES = frozenset(
     {
         "prefill",
@@ -69,6 +78,32 @@ def _count(value: Any, *, name: str, positive: bool = False) -> int:
 
 def _close(left: float, right: float) -> bool:
     return math.isclose(left, right, rel_tol=1e-9, abs_tol=1e-9)
+
+
+def _validate_runtime_metadata(
+    metadata: dict[str, Any],
+    *,
+    pass_kind: str,
+    authoritative: bool,
+) -> None:
+    expected = {
+        **STRICT_FP32_METADATA,
+        "profile_pass_kind": pass_kind,
+        "authoritative_performance": authoritative,
+        "strict_exactness_evidence": False,
+        "untraced_budget_enabled": pass_kind == "untraced_budget",
+        "profile_detail_ranges": False,
+        "profile_cuda_capture": False,
+    }
+    mismatches = {
+        key: {"expected": value, "actual": metadata.get(key)}
+        for key, value in expected.items()
+        if metadata.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(
+            f"{pass_kind} runtime metadata is not strict FP32: {mismatches}"
+        )
 
 
 def _parse_region(value: Any, *, name: str) -> dict[str, Any]:
@@ -417,12 +452,11 @@ def summarize(payload: Any) -> dict[str, Any]:
     if root.get("schema_version") != 1:
         raise ValueError("profile.schema_version must be 1")
     metadata = _object(root.get("metadata"), name="profile.metadata")
-    if metadata.get("profile_pass_kind") != "untraced_budget":
-        raise ValueError("profile must use profile_pass_kind=untraced_budget")
-    if metadata.get("profile_detail_ranges") is not False:
-        raise ValueError("untraced budget profile must disable detail ranges")
-    if metadata.get("profile_cuda_capture") is not False:
-        raise ValueError("untraced budget profile must disable profiler capture")
+    _validate_runtime_metadata(
+        metadata,
+        pass_kind="untraced_budget",
+        authoritative=False,
+    )
     generation = root.get("generation")
     if not isinstance(generation, list) or not generation:
         raise ValueError("profile.generation must be a non-empty list")
@@ -492,8 +526,11 @@ def add_control_comparison(
 ) -> dict[str, Any]:
     control = _object(control_payload, name="control_profile")
     metadata = _object(control.get("metadata"), name="control_profile.metadata")
-    if metadata.get("profile_pass_kind") != "untraced_control":
-        raise ValueError("control profile must use profile_pass_kind=untraced_control")
+    _validate_runtime_metadata(
+        metadata,
+        pass_kind="untraced_control",
+        authoritative=True,
+    )
     summary = _object(control.get("summary"), name="control_profile.summary")
     by_label = _object(
         summary.get("generation_by_label"),

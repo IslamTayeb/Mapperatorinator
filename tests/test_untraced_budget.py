@@ -28,9 +28,19 @@ def _profile_payload(budget):
     return {
         "schema_version": 1,
         "metadata": {
+            "precision": "fp32",
+            "inference_engine": "optimized",
+            "attn_implementation": "sdpa",
             "profile_pass_kind": "untraced_budget",
+            "authoritative_performance": False,
+            "strict_exactness_evidence": False,
+            "untraced_budget_enabled": True,
             "profile_detail_ranges": False,
             "profile_cuda_capture": False,
+            "float32_matmul_precision": "highest",
+            "cuda_matmul_allow_tf32": False,
+            "cudnn_allow_tf32": False,
+            "nvidia_tf32_override": "0",
         },
         "generation": [
             {
@@ -109,7 +119,12 @@ def test_summarizer_validates_schema_and_reconciliation(monkeypatch, tmp_path):
     assert report["overall"]["generated_tokens"] == 10
     assert report["overall"]["reconciliation_error_fraction"] <= 0.02
     control = {
-        "metadata": {"profile_pass_kind": "untraced_control"},
+        "metadata": {
+            **payload["metadata"],
+            "profile_pass_kind": "untraced_control",
+            "authoritative_performance": True,
+            "untraced_budget_enabled": False,
+        },
         "summary": {
             "generation_by_label": {
                 "main_generation": {
@@ -137,4 +152,12 @@ def test_summarizer_rejects_traced_or_control_profiles(monkeypatch):
     payload = _profile_payload(_finished_budget(monkeypatch))
     payload["metadata"]["profile_pass_kind"] = "untraced_control"
     with pytest.raises(ValueError, match="untraced_budget"):
+        summarize(payload)
+
+
+def test_summarizer_rejects_non_strict_fp32_metadata(monkeypatch):
+    payload = _profile_payload(_finished_budget(monkeypatch))
+    payload["metadata"]["cuda_matmul_allow_tf32"] = True
+
+    with pytest.raises(ValueError, match="not strict FP32"):
         summarize(payload)

@@ -628,6 +628,8 @@ def test_generate_window_preserves_custom_generate_dispatch(monkeypatch):
     custom_generate = captured["custom_generate"]
     assert isinstance(custom_generate, partial)
     assert custom_generate.func is engine_module.active_prefix_decode_generate
+    assert custom_generate.keywords["untraced_budget_recorder"] is None
+    assert "untraced_budget" not in stats
 
 
 def test_untraced_budget_pass_is_opt_in_and_returned_in_stats(monkeypatch):

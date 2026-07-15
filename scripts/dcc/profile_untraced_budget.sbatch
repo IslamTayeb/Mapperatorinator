@@ -26,7 +26,12 @@ WORK=${MAPPERATORINATOR_WORK:-/work/imt11/Mapperatorinator}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 EXPECTED_GPU=${MAPPERATORINATOR_EXPECTED_GPU:-2080 Ti}
 EXPECTED_MAIN_TOKENS=${MAPPERATORINATOR_EXPECTED_MAIN_TOKENS:-8294}
-RUN_ROOT="$WORK/runs/untraced-budget-${SLURM_JOB_ID}"
+RUN_LABEL=${RUN_LABEL:-strict-fp32-untraced-budget}
+RUN_ROOT="$WORK/runs/${RUN_LABEL}-${SLURM_JOB_ID}"
+MIN_AVAILABLE_KIB=$((20 * 1024 * 1024))
+
+# This must exist before the first Python process or CUDA context.
+export NVIDIA_TF32_OVERRIDE=0
 
 [[ -x "$PYTHON" ]] || die "missing Python: $PYTHON"
 [[ -d "$REPO/.git" || -f "$REPO/.git" ]] || die "missing worktree: $REPO"
@@ -35,17 +40,37 @@ RUN_ROOT="$WORK/runs/untraced-budget-${SLURM_JOB_ID}"
 [[ -z "$(git -C "$REPO" status --porcelain)" ]] || die "worktree is dirty"
 [[ "$(git -C "$REPO" rev-parse HEAD)" == "$COMMIT" ]] || die "HEAD does not match commit"
 [[ "$(git -C "$REPO" branch --show-current)" == "$BRANCH" ]] || die "worktree branch mismatch"
+git -C "$REPO" show-ref --verify --quiet "$REMOTE_REF" \
+  || die "missing pushed remote ref $REMOTE_REF"
 [[ "$(git -C "$REPO" rev-parse "$REMOTE_REF")" == "$COMMIT" ]] || die "remote ref does not match commit"
 
 export PATH="$(dirname "$PYTHON"):$PATH"
-for tool in ffmpeg ffprobe nvidia-smi; do
+for tool in ffmpeg ffprobe nvidia-smi scontrol squeue sha256sum date df; do
   command -v "$tool" >/dev/null 2>&1 || die "missing executable: $tool"
 done
-mapfile -t GPU_NAMES < <(nvidia-smi --query-gpu=name --format=csv,noheader)
-[[ ${#GPU_NAMES[@]} -eq 1 ]] || die "expected one visible GPU"
-[[ "${GPU_NAMES[0]}" == *"$EXPECTED_GPU"* ]] || die "expected $EXPECTED_GPU, got ${GPU_NAMES[0]}"
+mapfile -t GPU_ROWS < <(
+  nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader
+)
+[[ ${#GPU_ROWS[@]} -eq 1 ]] || die "expected one visible GPU"
+[[ "${GPU_ROWS[0]}" == *"$EXPECTED_GPU"*", 7.5" ]] \
+  || die "expected $EXPECTED_GPU/SM75, got ${GPU_ROWS[0]}"
+
+mapfile -t OTHER_GPU_JOBS < <(
+  squeue -h -u "$USER" -t RUNNING,PENDING -o '%A|%b|%j' \
+    | awk -F'|' -v current="$SLURM_JOB_ID" \
+        '$1 != current && tolower($2) ~ /gpu/ { print }'
+)
+if [[ ${#OTHER_GPU_JOBS[@]} -ne 0 ]]; then
+  printf '%s\n' "${OTHER_GPU_JOBS[@]}" >&2
+  die "another GPU job is running or pending for $USER"
+fi
 
 mkdir -p "$WORK/logs" "$WORK/cache" "$WORK/tmp" "$RUN_ROOT"
+AVAILABLE_KIB=$(df -Pk "$WORK" | awk 'NR == 2 {print $4}')
+[[ "$AVAILABLE_KIB" =~ ^[0-9]+$ ]] \
+  || die "could not determine available storage for $WORK"
+(( AVAILABLE_KIB >= MIN_AVAILABLE_KIB )) \
+  || die "run-root filesystem has only $AVAILABLE_KIB KiB free"
 export XDG_CACHE_HOME="$WORK/cache"
 export HF_HOME="$WORK/cache/huggingface"
 export TRANSFORMERS_CACHE="$WORK/cache/huggingface"
@@ -54,6 +79,15 @@ export TRANSFORMERS_OFFLINE=1
 export TORCH_EXTENSIONS_DIR="$WORK/torch_extensions"
 export TMPDIR="$WORK/tmp"
 export TOKENIZERS_PARALLELISM=false
+
+finalize() {
+  if [[ -d "$RUN_ROOT" ]]; then
+    find "$RUN_ROOT" -type f ! -name sha256sums.txt -print0 \
+      | sort -z \
+      | xargs -0 -r sha256sum > "$RUN_ROOT/sha256sums.txt"
+  fi
+}
+trap finalize EXIT
 
 {
   echo "host=$(hostname)"
@@ -65,10 +99,15 @@ export TOKENIZERS_PARALLELISM=false
   echo "python=$PYTHON"
   echo "audio=$AUDIO"
   echo "audio_sha256=$(sha256sum "$AUDIO" | awk '{print $1}')"
+  echo "run_root=$RUN_ROOT"
+  echo "run_root_available_kib=$AVAILABLE_KIB"
+  echo "NVIDIA_TF32_OVERRIDE=$NVIDIA_TF32_OVERRIDE"
   git -C "$REPO" status --short --branch
   "$PYTHON" -c 'import torch,transformers; print(f"torch={torch.__version__}"); print(f"cuda={torch.version.cuda}"); print(f"transformers={transformers.__version__}")'
-  nvidia-smi --query-gpu=name,uuid,driver_version,memory.total --format=csv,noheader
+  nvidia-smi --query-gpu=name,uuid,driver_version,memory.total,compute_cap --format=csv,noheader
   scontrol show job -o "$SLURM_JOB_ID"
+  squeue -u "$USER" -o '%.18i %.40j %.10T %.24b'
+  df -h "$WORK"
 } | tee "$RUN_ROOT/preflight.txt"
 
 cd "$REPO"
@@ -96,7 +135,18 @@ run_profile() {
   )
   printf '%q ' "${command[@]}" > "$run_dir/command.txt"
   printf '\n' >> "$run_dir/command.txt"
+  local started_ns finished_ns elapsed_ns exit_code
+  started_ns=$(date +%s%N)
+  set +e
   "${command[@]}" > "$run_dir/stdout.txt" 2> "$run_dir/stderr.txt"
+  exit_code=$?
+  set -e
+  finished_ns=$(date +%s%N)
+  elapsed_ns=$((finished_ns - started_ns))
+  printf '{"started_unix_ns":%s,"finished_unix_ns":%s,"elapsed_ns":%s,"exit_code":%s}\n' \
+    "$started_ns" "$finished_ns" "$elapsed_ns" "$exit_code" \
+    > "$run_dir/process-wall.json"
+  [[ $exit_code -eq 0 ]] || die "$pass_kind failed with exit code $exit_code"
   mapfile -t profiles < <(find "$run_dir/output" -type f -name '*.profile.json' | sort)
   [[ ${#profiles[@]} -eq 1 ]] || die "expected one profile for $pass_kind"
   [[ -s "${profiles[0]}" ]] || die "empty profile for $pass_kind"
@@ -143,6 +193,8 @@ if int(main.get("generated_tokens", -1)) != expected_tokens:
         f"expected {expected_tokens} fixed-work main tokens, "
         f"got {main.get('generated_tokens')}"
     )
+if float(main.get("reconciliation_error_fraction", 1.0)) > 0.02:
+    raise SystemExit("main-generation budget did not reconcile within 2%")
 PY
 
 echo "PASS_UNTRACED_BUDGET run_root=$RUN_ROOT"
