@@ -93,6 +93,7 @@ def _conditional_temperature(cls):
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 @pytest.mark.parametrize(
     "tokens",
     [
@@ -104,7 +105,7 @@ def _conditional_temperature(cls):
         [0, 0, 0, 0],
     ],
 )
-def test_device_conditional_temperature_matches_v32_batch1_exactly(tokens):
+def test_device_conditional_temperature_matches_v32_batch1_exactly(tokens, dtype):
     baseline = _conditional_temperature(V32ConditionalTemperatureLogitsWarper)
     candidate = _conditional_temperature(
         OptimizedConditionalTemperatureLogitsWarper
@@ -112,7 +113,7 @@ def test_device_conditional_temperature_matches_v32_batch1_exactly(tokens):
     input_ids = torch.tensor([tokens], dtype=torch.long)
     scores = torch.tensor(
         [[-3.25, -0.0, 0.1, 1.0, 19.75]],
-        dtype=torch.float32,
+        dtype=dtype,
     )
 
     assert torch.equal(
@@ -124,6 +125,26 @@ def test_device_conditional_temperature_matches_v32_batch1_exactly(tokens):
         "specialized_calls": 1,
         "v32_fallback_calls": 0,
     }
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float64])
+def test_device_conditional_temperature_rejects_unaccepted_score_dtype(dtype):
+    candidate = _conditional_temperature(
+        OptimizedConditionalTemperatureLogitsWarper
+    )
+    with pytest.raises(TypeError, match="FP32 or FP16"):
+        candidate(torch.tensor([[10]]), torch.zeros((1, 4), dtype=dtype))
+
+
+def test_device_conditional_temperature_rejects_non_int64_tokens():
+    candidate = _conditional_temperature(
+        OptimizedConditionalTemperatureLogitsWarper
+    )
+    with pytest.raises(TypeError, match="int64"):
+        candidate(
+            torch.tensor([[10]], dtype=torch.int32),
+            torch.zeros((1, 4), dtype=torch.float16),
+        )
 
 
 def test_device_conditional_temperature_matches_v32_batched_fallback():

@@ -48,7 +48,7 @@ OPTIMIZED_PRESETS = MappingProxyType(
             torch_dtype=torch.float32,
         ),
         "fp16": OptimizedPreset(
-            version="accepted-fp16-all-fused-v2",
+            version="candidate-shared-fp16-device-temperature-v1",
             result_class="documented-drift",
             precision="fp16",
             torch_dtype=torch.float16,
@@ -134,7 +134,7 @@ def _optimized_config_metadata(preset: OptimizedPreset) -> dict[str, Any]:
         "native_q1_self_attention": True,
         "native_q1_rope_cache_self_attention": True,
         "native_cross_mlp_tail": True,
-        "device_conditional_temperature": preset.precision == "fp32",
+        "device_conditional_temperature": True,
     }
 
 
@@ -271,6 +271,7 @@ def _generate_window(
         specialized_batch
         and _native_cross_mlp_tail_enabled(context_type=context_type)
     )
+    device_conditional_temperature = specialized_batch
     processors = _build_logits_processor_list(
         tokenizer,
         cfg_scale=cfg_scale,
@@ -283,7 +284,7 @@ def _generate_window(
         lookback_time=lookback_time,
         device=model.device,
         stateful_monotonic=specialized_batch,
-        device_conditional_temperature=preset.precision == "fp32",
+        device_conditional_temperature=device_conditional_temperature,
     )
     cache = context_state.cache_for_window(
         model,
@@ -386,14 +387,13 @@ def _generate_window(
     )
     conditional_temperature_stats = conditional_temperature_profile_stats(processors)
     if (
-        preset.precision == "fp32"
-        and batch_size == 1
+        device_conditional_temperature
         and types_first
         and conditional_temperature_stats["condition_count"] > 0
         and conditional_temperature_stats["specialized_calls"] <= 0
     ):
         raise RuntimeError(
-            "strict FP32 device conditional-temperature path was requested but "
+            "same-precision device conditional-temperature path was requested but "
             "never dispatched"
         )
     stats.update({
@@ -461,7 +461,7 @@ def _generate_window(
         ),
         "optimized_dispatch_capture_hits": dict(dispatch_counts),
         "optimized_device_conditional_temperature_requested": (
-            preset.precision == "fp32"
+            device_conditional_temperature
         ),
         "optimized_device_conditional_temperature_condition_count": (
             conditional_temperature_stats["condition_count"]

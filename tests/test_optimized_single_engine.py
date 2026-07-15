@@ -58,10 +58,10 @@ def _loader_kwargs(**overrides):
     return values
 
 
-def test_runtime_metadata_exposes_strict_fp32_candidate_and_accepted_fp16():
+def test_runtime_metadata_exposes_shared_device_temperature_candidates():
     expected_versions = {
         "fp32": "candidate-strict-fp32-device-temperature-v1",
-        "fp16": "accepted-fp16-all-fused-v2",
+        "fp16": "candidate-shared-fp16-device-temperature-v1",
     }
     for precision, version in expected_versions.items():
         metadata = OptimizedSingleRuntime(
@@ -90,7 +90,7 @@ def test_runtime_metadata_exposes_strict_fp32_candidate_and_accepted_fp16():
             "native_q1_self_attention": True,
             "native_q1_rope_cache_self_attention": True,
             "native_cross_mlp_tail": True,
-            "device_conditional_temperature": precision == "fp32",
+            "device_conditional_temperature": True,
         }
 
 

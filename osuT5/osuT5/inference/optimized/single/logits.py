@@ -65,12 +65,24 @@ class ConditionalTemperatureLogitsWarper(
         input_ids: torch.LongTensor,
         scores: torch.FloatTensor,
     ) -> torch.Tensor:
+        if input_ids.ndim != 2 or scores.ndim != 2:
+            raise ValueError(
+                "optimized conditional temperature requires rank-2 tokens and scores"
+            )
         if not self.conditionals or input_ids.shape[0] != 1:
             self.v32_fallback_calls += 1
             return super().__call__(input_ids, scores)
         if scores.shape[0] != 1:
             raise ValueError(
                 "optimized conditional temperature requires matching batch-1 scores"
+            )
+        if input_ids.dtype != torch.long:
+            raise TypeError(
+                "optimized conditional temperature requires int64 token storage"
+            )
+        if scores.dtype not in {torch.float32, torch.float16}:
+            raise TypeError(
+                "optimized conditional temperature supports FP32 or FP16 scores"
             )
         if input_ids.device != scores.device:
             raise ValueError(
