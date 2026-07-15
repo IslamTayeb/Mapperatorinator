@@ -97,12 +97,22 @@ if ! git -C "$REPO" show-ref --verify --quiet "$REMOTE_REF" \
 fi
 
 export PATH="$(dirname "$PYTHON"):$PATH"
-for tool in ffmpeg ffprobe; do
+for tool in ffmpeg ffprobe nvidia-smi scontrol squeue sha256sum df; do
   command -v "$tool" >/dev/null 2>&1 || { echo "missing $tool" >&2; exit 2; }
 done
 GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n1)
 if [[ "$GPU_NAME" != "NVIDIA GeForce RTX 2080 Ti" ]]; then
   echo "final confirmation requires RTX 2080 Ti, got $GPU_NAME" >&2
+  exit 2
+fi
+mapfile -t OTHER_GPU_JOBS < <(
+  squeue -h -u "$USER" -t RUNNING,PENDING -o '%A|%b|%j' \
+    | awk -F'|' -v current="${SLURM_JOB_ID:-manual}" \
+        '$1 != current && tolower($2) ~ /gpu/ { print }'
+)
+if [[ ${#OTHER_GPU_JOBS[@]} -ne 0 ]]; then
+  printf '%s\n' "${OTHER_GPU_JOBS[@]}" >&2
+  echo "another user GPU job exists" >&2
   exit 2
 fi
 
@@ -153,19 +163,25 @@ else
   unset MAPPERATORINATOR_NATIVE_EXTENSION_MANIFEST
 fi
 
-echo "host=$(hostname)"
-echo "job_id=${SLURM_JOB_ID:-manual}"
-echo "commit=$COMMIT"
-echo "branch=$BRANCH"
-echo "remote_branch=$REMOTE_BRANCH"
-echo "repo=$REPO"
-echo "run_root=$RUN_ROOT"
-echo "gpu=$GPU_NAME"
-echo "native_extension_mode=$([[ "$REQUIRE_DIRECT_AOT" == 1 ]] && echo direct || echo load_inline)"
-if [[ -n "${SLURM_JOB_ID:-}" ]]; then
-  scontrol show job -o "$SLURM_JOB_ID"
-fi
-nvidia-smi -L
+{
+  echo "host=$(hostname)"
+  echo "job_id=${SLURM_JOB_ID:-manual}"
+  echo "commit=$COMMIT"
+  echo "branch=$BRANCH"
+  echo "remote_branch=$REMOTE_BRANCH"
+  echo "repo=$REPO"
+  echo "run_root=$RUN_ROOT"
+  echo "gpu=$GPU_NAME"
+  echo "native_extension_mode=$([[ "$REQUIRE_DIRECT_AOT" == 1 ]] && echo direct || echo load_inline)"
+  echo "runtime_spec=$CANDIDATE_RUNTIME_SPEC_SOURCE"
+  "$PYTHON" -c 'import torch, transformers; print(f"torch={torch.__version__}"); print(f"torch_cuda={torch.version.cuda}"); print(f"transformers={transformers.__version__}")'
+  if [[ -n "${SLURM_JOB_ID:-}" ]]; then
+    scontrol show job -o "$SLURM_JOB_ID"
+  fi
+  squeue -u "$USER" -o '%.18i %.40j %.10T %.24b'
+  nvidia-smi -L
+  df -h "$WORK"
+} | tee "$RUN_ROOT/preflight.txt"
 nvidia-smi \
   --query-gpu=timestamp,uuid,utilization.gpu,memory.used,memory.total,power.draw,clocks.sm,temperature.gpu \
   --format=csv -l 1 > "$RUN_ROOT/nvidia-smi.csv" &

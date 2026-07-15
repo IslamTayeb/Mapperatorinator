@@ -317,6 +317,8 @@ def test_dcc_wrapper_is_one_serial_authoritative_json_text_gate() -> None:
     assert "MAPPERATORINATOR_NATIVE_EXTENSION_MANIFEST" in source
     assert 'export TORCH_CUDA_ARCH_LIST=7.5' in source
     assert "MAPPERATORINATOR_REMOTE_BRANCH" in source
+    assert "another user GPU job exists" in source
+    assert 'tee "$RUN_ROOT/preflight.txt"' in source
     assert '[[ "$BRANCH" == DETACHED ]]' in source
     assert "utils/run_final_confirmation.py" in source
     assert "utils/run_serial_final_confirmation.py" in source
