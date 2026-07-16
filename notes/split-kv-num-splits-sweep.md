@@ -40,3 +40,17 @@ One sealed reciprocal — no endless sweeps.
 - Exclude `dcc-core-gpu-ferc-s-h36-9`
 - Reciprocal: `TMPDIR=/work/imt11/Mapperatorinator/tmp/reciprocal-$JOBID`
 - Reciprocal: `TORCH_EXTENSIONS_DIR=.../torch_extensions/reciprocal-$JOBID/...`
+
+## Sealed decision (reseal `49955271`)
+
+**DROP.**
+
+| Metric | Baseline median | Candidate (16) | Delta |
+| --- | --- | --- | --- |
+| main_model_seconds | 17.280 | 17.310 | **+0.030s** (regress) |
+| main_tps | 493.74 | 492.89 | −0.85 |
+| fixed_8294_main_seconds | 16.798 | 16.827 | +0.029s |
+| complete_request_wall | 26.513 | 26.491 | −0.021s |
+| Tokens / final map | OK | OK | exact labels + `final_map_equal` |
+
+Promote bar was sealed wall ≤ baseline−0.05s. Main model wall regressed ~0.03s; not a promote. One sealed reciprocal — stop.
