@@ -67,11 +67,12 @@ def _time_callable(
 ) -> tuple[float, Any, bool]:
     import torch
 
+    # Warm first so cuBLAS/allocator workspace settles before the stability check.
     torch.cuda.synchronize()
-    allocated_before = int(torch.cuda.memory_allocated())
     for _ in range(warmup):
         callable_()
     torch.cuda.synchronize()
+    allocated_before = int(torch.cuda.memory_allocated())
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
