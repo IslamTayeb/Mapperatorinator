@@ -631,7 +631,13 @@ class VarWhisperAttention(nn.Module):
                 if optimized_attn_outputs is not None:
                     attn_outputs = optimized_attn_outputs
                 else:
-                    if runtime_hooks.fuse_self_norm_wqkv:
+                    # Only decoder decode binds `_scout_self_norm_weight`. Encoder
+                    # and prefill keep the normal RMSNorm→Wqkv path even when the
+                    # scout flag is set on the shared attention hooks.
+                    if (
+                        runtime_hooks.fuse_self_norm_wqkv
+                        and getattr(self, "_scout_self_norm_weight", None) is not None
+                    ):
                         raise RuntimeError(
                             "fuse_self_norm_wqkv requires native q1 RoPE/cache "
                             "self-attention; refusing unnormalized Wqkv fallback"
@@ -807,7 +813,11 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
         residual = hidden_states
         layer_name = f"decoder.layer{self.self_attn.layer_idx}"
         profile_ranges = detail_ranges_enabled()
-        fuse_self_norm_wqkv = attention_runtime_hooks().fuse_self_norm_wqkv
+        # Fuse only one-token decode: encoder/prefill must keep separate RMSNorm.
+        fuse_self_norm_wqkv = (
+            attention_runtime_hooks().fuse_self_norm_wqkv
+            and hidden_states.shape[:2] == (1, 1)
+        )
         if fuse_self_norm_wqkv:
             from ...inference.optimized.scout.self_norm_wqkv import (
                 attach_decoder_norm_for_fuse,
