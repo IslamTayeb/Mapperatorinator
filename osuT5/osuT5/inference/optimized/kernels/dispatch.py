@@ -13,6 +13,16 @@ from ..single.runtime_context import (
 )
 
 
+def _flatten_bh1d(attn_output: torch.Tensor) -> torch.Tensor:
+    """Collapse [1, heads, 1, head_dim] → [1, 1, hidden]; opt-in zero-copy."""
+
+    from ..scout.decode_cast_elim import zero_copy_attn_layout_enabled
+
+    if zero_copy_attn_layout_enabled():
+        return attn_output.reshape(1, 1, -1)
+    return attn_output.transpose(1, 2).contiguous().view(1, 1, -1)
+
+
 def _q1_bmm_cross_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -150,22 +160,25 @@ def sdpa_q1_attention_forward(
         and value.shape[0] == 1
     )
     if use_native_q1_self_attention:
-        attn_output = native_q1_attention(
-            query,
-            key,
-            value,
-            attention_mask,
-        ).transpose(1, 2).contiguous()
+        attn_output = _flatten_bh1d(
+            native_q1_attention(
+                query,
+                key,
+                value,
+                attention_mask,
+            )
+        )
         if dispatch_counts is not None:
             dispatch_counts["native_q1_self_attention"] += 1
     elif use_q1_bmm_cross_attention:
-        attn_output = _q1_bmm_cross_attention(
-            query,
-            key,
-            value,
-            expected_dtype=expected_dtype,
+        attn_output = _flatten_bh1d(
+            _q1_bmm_cross_attention(
+                query,
+                key,
+                value,
+                expected_dtype=expected_dtype,
+            )
         )
-        attn_output = attn_output.transpose(1, 2).contiguous()
         if dispatch_counts is not None:
             dispatch_counts["q1_bmm_cross_attention"] += 1
     else:
@@ -270,8 +283,7 @@ def q1_rope_cache_self_attention_forward(
             attention_mask_for_native,
             int(prefix_length),
         )
-    output = output.transpose(1, 2).contiguous()
-    output = output.view(bs, -1, module.all_head_size)
+    output = _flatten_bh1d(output)
     if dispatch_counts is not None:
         dispatch_counts["native_q1_rope_cache_self_attention"] += 1
     return (output,)

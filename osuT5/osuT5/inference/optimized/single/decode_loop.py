@@ -155,6 +155,7 @@ def active_prefix_decode_generate(
     shared_graph_cache: dict[tuple[Any, ...], dict[str, Any]] | None = None,
     stable_encoder_holder: dict[str, BaseModelOutput] | None = None,
     preallocated_batch1_state: bool = False,
+    reuse_logits_workspace: bool = False,
     **model_kwargs,
 ) -> torch.LongTensor:
     """Fixed-batch HF loop with persistent active-prefix CUDA graphs."""
@@ -185,6 +186,7 @@ def active_prefix_decode_generate(
     )
     batch_size, cur_len = input_ids.shape[:2]
     sequence_state = None
+    logits_workspace: dict[str, torch.Tensor] = {}
     if preallocated_batch1_state:
         if batch_size != 1:
             raise ValueError(
@@ -303,11 +305,20 @@ def active_prefix_decode_generate(
                     )
 
         with profile_range("generation.logits_processors"):
-            next_logits = outputs.logits[:, -1, :].to(
-                copy=True,
-                dtype=torch.float32,
-                device=input_ids.device,
-            )
+            if reuse_logits_workspace:
+                from ..scout.decode_cast_elim import materialize_next_logits
+
+                next_logits = materialize_next_logits(
+                    outputs.logits,
+                    device=input_ids.device,
+                    workspace=logits_workspace,
+                )
+            else:
+                next_logits = outputs.logits[:, -1, :].to(
+                    copy=True,
+                    dtype=torch.float32,
+                    device=input_ids.device,
+                )
             next_scores = logits_processor(input_ids, next_logits)
         with profile_range("generation.sampling"):
             if generation_config.do_sample:
