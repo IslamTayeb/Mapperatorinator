@@ -88,7 +88,7 @@ def test_q1_kernel_import_does_not_build_and_loader_is_singleton(monkeypatch):
     assert q1_attention.preload_native_q1_attention() is extension
     assert q1_attention.preload_native_q1_attention() is extension
     assert len(calls) == 1
-    assert calls[0]["name"] == "mapperatorinator_q1_attention"
+    assert calls[0]["name"] == "mapperatorinator_q1_attention_splitkv_runtime"
     assert calls[0]["functions"] == [
         "q1_attention",
         "q1_rope_cache_attention",
@@ -142,7 +142,8 @@ def test_q1_kernel_import_does_not_build_and_loader_is_singleton(monkeypatch):
         assert "extern __shared__ float shared_mem[]" in body
     assert source.count('asm("trap;")') == 2
     assert "split-KV q1 requires fp32 storage" in source
-    assert "constexpr int split_count = 8;" in source
+    assert "split_count_arg == 4 || split_count_arg == 6" in source
+    assert "int64_t split_count_arg" in source
     assert "properties.major == 7 && properties.minor == 5" in source
 
 
@@ -258,7 +259,8 @@ def test_fp32_sm75_live_prefix_routes_split8_and_other_cases_fall_back(
     q1_attention.native_q1_rope_cache_attention(*arguments, 128)
 
     assert [kind for kind, _ in calls] == ["split8", "accepted"]
-    assert calls[0][1][-1] == 640
+    assert calls[0][1][-2] == 640
+    assert calls[0][1][-1] == 8
     assert calls[1][1][-1] == 128
 
 

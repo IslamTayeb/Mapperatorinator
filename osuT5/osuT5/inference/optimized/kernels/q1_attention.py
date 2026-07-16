@@ -8,8 +8,33 @@ _NATIVE_Q1_ATTENTION = None
 _SUPPORTED_DTYPES = (torch.float32, torch.float16)
 _SPLIT_KV_Q1_PREFIXES = frozenset(range(192, 833, 64))
 _SPLIT_KV_Q1_SPLITS = 8
+_ALLOWED_SPLIT_KV_SPLITS = frozenset({4, 6, 8, 12, 16})
+_SPLIT_KV_SPLITS_ENV = "MAPPERATORINATOR_SPLIT_KV_SPLITS"
 _ACCEPTED_ROPE_CACHE_VARIANT = "accepted"
 _SPLIT_KV_ROPE_CACHE_VARIANT = "split_kv_8"
+
+
+def configured_split_kv_q1_splits() -> int:
+    """Return the active split-KV grid size (default 8; env override for sweep)."""
+
+    import os
+
+    raw = os.environ.get(_SPLIT_KV_SPLITS_ENV)
+    if raw is None or raw == "":
+        return _SPLIT_KV_Q1_SPLITS
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{_SPLIT_KV_SPLITS_ENV} must be an int in "
+            f"{sorted(_ALLOWED_SPLIT_KV_SPLITS)}, got {raw!r}"
+        ) from exc
+    if value not in _ALLOWED_SPLIT_KV_SPLITS:
+        raise ValueError(
+            f"{_SPLIT_KV_SPLITS_ENV} must be one of "
+            f"{sorted(_ALLOWED_SPLIT_KV_SPLITS)}, got {value}"
+        )
+    return value
 
 
 def _device_capability(device: torch.device) -> tuple[int, int]:
@@ -795,7 +820,8 @@ torch::Tensor split_kv_q1_rope_cache_attention(
         torch::Tensor sin,
         torch::Tensor cache_position,
         c10::optional<torch::Tensor> mask,
-        int64_t active_prefix_len) {
+        int64_t active_prefix_len,
+        int64_t split_count_arg) {
     TORCH_CHECK(qkv.is_cuda() && cache_keys.is_cuda() && cache_values.is_cuda(),
         "split-KV qkv/cache tensors must be CUDA");
     TORCH_CHECK(cos.is_cuda() && sin.is_cuda() && cache_position.is_cuda(),
@@ -834,7 +860,11 @@ torch::Tensor split_kv_q1_rope_cache_attention(
     const int heads = static_cast<int>(qkv.size(3));
     const int head_dim = static_cast<int>(qkv.size(4));
     const int max_cache_len = static_cast<int>(cache_keys.size(2));
-    constexpr int split_count = 8;
+    TORCH_CHECK(
+        split_count_arg == 4 || split_count_arg == 6 || split_count_arg == 8
+            || split_count_arg == 12 || split_count_arg == 16,
+        "split-KV split_count must be one of {4, 6, 8, 12, 16}");
+    const int split_count = static_cast<int>(split_count_arg);
     TORCH_CHECK(head_dim > 0 && head_dim % 2 == 0,
         "split-KV head_dim must be positive and even");
     TORCH_CHECK(active_prefix_len >= split_count
@@ -925,7 +955,7 @@ torch::Tensor split_kv_q1_rope_cache_attention(
 """
 
     _NATIVE_Q1_ATTENTION = load_inline(
-        name="mapperatorinator_q1_attention",
+        name="mapperatorinator_q1_attention_splitkv_runtime",
         cpp_sources=(
             "#include <torch/extension.h>\n"
             "torch::Tensor q1_attention(torch::Tensor q, torch::Tensor k, torch::Tensor v, "
@@ -936,7 +966,8 @@ torch::Tensor split_kv_q1_rope_cache_attention(
             "torch::Tensor split_kv_q1_rope_cache_attention(torch::Tensor qkv, "
             "torch::Tensor cache_keys, torch::Tensor cache_values, torch::Tensor cos, "
             "torch::Tensor sin, torch::Tensor cache_position, "
-            "c10::optional<torch::Tensor> mask, int64_t active_prefix_len);\n"
+            "c10::optional<torch::Tensor> mask, int64_t active_prefix_len, "
+            "int64_t split_count);\n"
         ),
         cuda_sources=cuda_source,
         functions=[
@@ -1008,6 +1039,7 @@ def native_q1_rope_cache_attention(
             cache_position,
             mask,
             int(active_prefix_length),
+            int(configured_split_kv_q1_splits()),
         )
     return extension.q1_rope_cache_attention(
         qkv,

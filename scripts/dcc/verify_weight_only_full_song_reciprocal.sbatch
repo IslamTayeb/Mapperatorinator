@@ -34,6 +34,7 @@ REQUIRE_INT8_MLP_INCREMENTAL=${REQUIRE_INT8_MLP_INCREMENTAL:-false}
 REQUIRE_CROSS_INCREMENTAL=${REQUIRE_CROSS_INCREMENTAL:-false}
 REQUIRE_SHARED_ARENA_INCREMENTAL=${REQUIRE_SHARED_ARENA_INCREMENTAL:-false}
 REQUIRE_COMPILED_CROSS_INCREMENTAL=${REQUIRE_COMPILED_CROSS_INCREMENTAL:-false}
+REQUIRE_SPLIT_KV_NUM_SPLITS_INCREMENTAL=${REQUIRE_SPLIT_KV_NUM_SPLITS_INCREMENTAL:-false}
 ALLOW_PARALLEL=${MAPPERATORINATOR_ALLOW_PARALLEL:-0}
 CROSS_CANDIDATE_MODE=${CROSS_CANDIDATE_MODE:-accepted}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
@@ -121,6 +122,11 @@ if [[ "$REQUIRE_COMPILED_CROSS_INCREMENTAL" != true \
   echo "REQUIRE_COMPILED_CROSS_INCREMENTAL must be true or false" >&2
   exit 2
 fi
+if [[ "$REQUIRE_SPLIT_KV_NUM_SPLITS_INCREMENTAL" != true \
+  && "$REQUIRE_SPLIT_KV_NUM_SPLITS_INCREMENTAL" != false ]]; then
+  echo "REQUIRE_SPLIT_KV_NUM_SPLITS_INCREMENTAL must be true or false" >&2
+  exit 2
+fi
 if [[ "$ALLOW_PARALLEL" != 0 && "$ALLOW_PARALLEL" != 1 ]]; then
   echo "MAPPERATORINATOR_ALLOW_PARALLEL must be 0 or 1" >&2
   exit 2
@@ -132,13 +138,14 @@ for enabled in \
   "$REQUIRE_INT8_MLP_INCREMENTAL" \
   "$REQUIRE_CROSS_INCREMENTAL" \
   "$REQUIRE_SHARED_ARENA_INCREMENTAL" \
-  "$REQUIRE_COMPILED_CROSS_INCREMENTAL"; do
+  "$REQUIRE_COMPILED_CROSS_INCREMENTAL" \
+  "$REQUIRE_SPLIT_KV_NUM_SPLITS_INCREMENTAL"; do
   if [[ "$enabled" == true ]]; then
     enabled_incremental_modes=$((enabled_incremental_modes + 1))
   fi
 done
 if (( enabled_incremental_modes > 1 )); then
-  echo "shared-RoPE, K1-remainder, INT8 MLP, cross, and shared-arena gates are mutually exclusive" >&2
+  echo "shared-RoPE, K1-remainder, INT8 MLP, cross, shared-arena, and num-splits gates are mutually exclusive" >&2
   exit 2
 fi
 if [[ "$REQUIRE_COMPILED_CROSS_INCREMENTAL" == true ]]; then
@@ -155,6 +162,27 @@ if [[ "$REQUIRE_COMPILED_CROSS_INCREMENTAL" == true ]]; then
   fi
   if [[ "$CROSS_CANDIDATE_MODE" != fp16_packed_projections ]]; then
     echo "compiled-cross gate requires selected FP16 packed cross projections" >&2
+    exit 2
+  fi
+  CROSS_K1_INT8_COMPOSITION=true
+elif [[ "$REQUIRE_SPLIT_KV_NUM_SPLITS_INCREMENTAL" == true ]]; then
+  if [[ "$REQUIRE_K4_CANDIDATE" != true || "$REQUIRE_EXACT_TIMING" != true ]]; then
+    echo "split-KV num_splits gate requires K4 and exact timing" >&2
+    exit 2
+  fi
+  if [[ "$BASELINE_RUNNER" \
+      != utils/run_k4_shared_rope_fp16_cross_shared_arena.py \
+    || "$CANDIDATE_RUNNER" \
+      != utils/run_k4_shared_rope_fp16_cross_shared_arena_split_kv_num_splits.py ]]; then
+    echo "split-KV num_splits gate requires shared-arena control and num_splits runner" >&2
+    exit 2
+  fi
+  if [[ "$CROSS_CANDIDATE_MODE" != fp16_packed_projections ]]; then
+    echo "split-KV num_splits gate requires selected FP16 packed cross projections" >&2
+    exit 2
+  fi
+  if [[ -z "${MAPPERATORINATOR_SPLIT_KV_SPLITS:-}" ]]; then
+    echo "split-KV num_splits gate requires MAPPERATORINATOR_SPLIT_KV_SPLITS" >&2
     exit 2
   fi
   CROSS_K1_INT8_COMPOSITION=true
@@ -444,6 +472,8 @@ echo "int8_k1_composition=$INT8_K1_COMPOSITION"
 echo "require_cross_incremental=$REQUIRE_CROSS_INCREMENTAL"
 echo "require_shared_arena_incremental=$REQUIRE_SHARED_ARENA_INCREMENTAL"
 echo "require_compiled_cross_incremental=$REQUIRE_COMPILED_CROSS_INCREMENTAL"
+echo "require_split_kv_num_splits_incremental=$REQUIRE_SPLIT_KV_NUM_SPLITS_INCREMENTAL"
+echo "split_kv_splits=${MAPPERATORINATOR_SPLIT_KV_SPLITS:-}"
 echo "parallel_opt_in=$ALLOW_PARALLEL"
 echo "cross_candidate_mode=$CROSS_CANDIDATE_MODE"
 echo "cross_k1_int8_composition=$CROSS_K1_INT8_COMPOSITION"
@@ -504,6 +534,7 @@ preload_baseline_extensions() {
   fi
   (
     export TORCH_EXTENSIONS_DIR="$BASELINE_TORCH_EXTENSIONS_DIR"
+    unset MAPPERATORINATOR_SPLIT_KV_SPLITS
     cd "$BASELINE_REPO"
     "$PYTHON" - "$output" "$role" "$BASELINE_COMMIT" \
       "$BASELINE_TORCH_EXTENSIONS_DIR" <<'PY'
@@ -600,6 +631,13 @@ run_profile() {
     export TORCHINDUCTOR_CACHE_DIR="$compiler_cache/torch_inductor"
     export TRITON_CACHE_DIR="$compiler_cache/triton"
     export CUDA_CACHE_PATH="$compiler_cache/cuda"
+    if [[ "$REQUIRE_SPLIT_KV_NUM_SPLITS_INCREMENTAL" == true ]]; then
+      if [[ "$candidate" == 1 ]]; then
+        export MAPPERATORINATOR_SPLIT_KV_SPLITS="${MAPPERATORINATOR_SPLIT_KV_SPLITS:?}"
+      else
+        unset MAPPERATORINATOR_SPLIT_KV_SPLITS
+      fi
+    fi
     cd "$repo"
     if [[ "$runtime_candidate" == 1 ]]; then
       "$PYTHON" "$CANDIDATE_REPO/$runner" \
@@ -638,6 +676,8 @@ run_profile() {
   fi
   local validation_cross_mode=accepted
   if [[ "$REQUIRE_COMPILED_CROSS_INCREMENTAL" == true ]]; then
+    validation_cross_mode=$CROSS_CANDIDATE_MODE
+  elif [[ "$REQUIRE_SPLIT_KV_NUM_SPLITS_INCREMENTAL" == true ]]; then
     validation_cross_mode=$CROSS_CANDIDATE_MODE
   elif [[ "$REQUIRE_CROSS_INCREMENTAL" == true && "$candidate" == 1 ]]; then
     validation_cross_mode=$CROSS_CANDIDATE_MODE
@@ -819,7 +859,8 @@ if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
   || "$REQUIRE_INT8_MLP_INCREMENTAL" == true \
   || "$REQUIRE_CROSS_INCREMENTAL" == true \
   || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true \
-  || "$REQUIRE_COMPILED_CROSS_INCREMENTAL" == true ]]; then
+  || "$REQUIRE_COMPILED_CROSS_INCREMENTAL" == true \
+  || "$REQUIRE_SPLIT_KV_NUM_SPLITS_INCREMENTAL" == true ]]; then
   INITIALIZATION_ROLES=baseline_first,candidate_first,candidate_second,baseline_second
 fi
 "$PYTHON" - "$RUN_ROOT" "$INITIALIZATION_ROLES" \

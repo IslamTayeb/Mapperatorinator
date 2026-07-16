@@ -29,6 +29,12 @@ SPLIT_KV_Q1_PREFIX_BUCKETS = tuple(range(192, 833, 64))
 SPLIT_KV_Q1_SPLIT_COUNT = 8
 
 
+def _active_split_kv_q1_split_count() -> int:
+    from ..kernels.q1_attention import configured_split_kv_q1_splits
+
+    return configured_split_kv_q1_splits()
+
+
 @dataclass(frozen=True, slots=True)
 class OptimizedPreset:
     version: str
@@ -133,7 +139,7 @@ def _optimized_config_metadata(preset: OptimizedPreset) -> dict[str, Any]:
         "native_q1_rope_cache_self_attention": True,
         "native_q1_rope_cache_split_kv": preset.torch_dtype == torch.float32,
         "native_q1_rope_cache_split_kv_split_count": (
-            SPLIT_KV_Q1_SPLIT_COUNT
+            _active_split_kv_q1_split_count()
             if preset.torch_dtype == torch.float32
             else None
         ),
