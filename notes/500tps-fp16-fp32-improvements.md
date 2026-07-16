@@ -188,11 +188,11 @@ Do not fold multiple improvements into one line. Projections are never productio
 
 | Rank | Improvement (#) | FP16 main_tps | FP32 main_tps | Status |
 | --- | ---: | ---: | ---: | --- |
-| — | #12 q1 RoPE/cache head-group CTA scheduling | pending | pending | **OPEN** — FP16 `50000634`; FP32 `50000635` (RUNNING @ `64372cde`) |
 | 1 | #1 shared-RoPE + device state | **366.11** | 313.05 | **GRADUATED tip** |
 | 2 | #2 shared-runtime packaging | 313.54 | **317.46** | **SEALED** pin only |
-| — | #3–#7c, #10 above | — | — | no graduate |
-| — | #11 self Wo linear (no residual) | — | — | **STOP_NO_PROMOTE** |
+| — | #3–#7c, #10–#11 | — | — | no graduate |
+| — | #12 q1 RoPE/cache headgroup | pending | pending | **OPEN** `50000634`/`635` @ `64372cde` |
+| — | #13 compiled self Wqkv/Wo | pending | pending | **OPEN** `50001853`/`854` @ `3164875a` |
 
 **Still short of 500:** FP16 needs ≤15.618 s main (−5.71 s from tip).
 
@@ -250,7 +250,7 @@ When any new lever, FIX tip, or scout job lands:
 | Not this lever | §6 Wo+residual; §7 RMSNorm+Wqkv; §10 final-norm+proj_out; INT8; bare split-KV |
 | Ledger rule | Own section only; do not fold into §6/§7/§10 |
 
-## 12. Native q1 RoPE/cache head-group CTA scheduling — **OPEN**
+## 12. Native q1 RoPE/cache head-group CTA scheduling — **STOP_NO_PROMOTE**
 
 | Field | Value |
 | --- | --- |
@@ -261,13 +261,14 @@ When any new lever, FIX tip, or scout job lands:
 | Execution tip / immutable ref | **`dd5d8e58`** / `q1-rope-cache-headgroup-scout-dd5d8e58-r4` (wrapper FIX; was `64372cde`) |
 | Opt-in | `q1_rope_cache_headgroup_candidate_context` → `native_q1_rope_cache_headgroup` (V32 cold default) |
 | Kernel | `q1_rope_cache_attention_headgroup` (HEADS_PER_CTA=2, block 128×2) |
-| Prior infra fails | FP16/FP32 `50000634`/`635` + retries `50002697`/`698` — all FAILED exit 1:0 after baseline: `profile: unbound variable` at sbatch L102 (`local profile=${profiles[0]} osu=${profile%.profile.json}` under `set -u`). Candidate never ran. |
-| FIX | Split into two `local` lines in `profile_q1_rope_cache_headgroup_reciprocal.sbatch` (`dd5d8e58`). |
-| Jobs | FP16 **`50024784`**; FP32 **`50024785`** (`ALLOW_PARALLEL=1`, unique RUN_LABEL/TMPDIR/TORCH_EXTENSIONS via job id) |
-| Run roots | `/work/imt11/Mapperatorinator/runs/q1-headgroup-fp16-r4-dd5d8e58-50024784/`; `.../q1-headgroup-fp32-r4-dd5d8e58-50024785/` |
-| Exact | pending (fixed runs) |
-| Measured | pending (fixed runs) |
-| Decision | **OPEN** — prior fails are wrapper INFRA, not **STOP_NO_PROMOTE**; harvest only after fixed reciprocal lands |
+| Prior infra fails | `50000634`/`635` + `50002697`/`698` — `profile: unbound variable` after baseline (candidate never ran). FIX: split locals (`dd5d8e58`). |
+| Jobs (r4 FIX) | FP16 **`50024784`** FAILED 1:0 00:07:24 (z25-20); FP32 **`50024785`** FAILED 1:0 00:06:27 (z25-21) — all four reciprocal legs present |
+| Run roots | `/work/imt11/Mapperatorinator/runs/q1-headgroup-fp{16,32}-r4-dd5d8e58-5002478{4,5}/` |
+| Exact | **PASS** — FP16/FP32 tok match (7809 / 8294); `.osu` sha match; headgroup engaged (174 calls both legs) |
+| Measured | FP16 main_tps **310.50 → 268.20 (−42.3 / −13.6%)**; FP32 **321.28 → 290.19 (−31.1 / −9.7%)**. Second legs same direction (FP16 313.7→267.2; FP32 317.0→288.5). |
+| Analyzer | FAILED unused expected delta `*optimized_cuda_graphs*` (allowlist mismatch) — does not change the exact-but-regress claim |
+| Decision | **STOP_NO_PROMOTE** — exact but main regress; do not grind allowlist for a slower lever |
+| Revisit | Only with a new scheduling hypothesis that shows component ≥5% headroom without e2e regress |
 | Not this lever | §6/§7/§10/§11 math replaces; INT8; bare split-KV; compiled-cross |
 | Ledger rule | Own section only |
 
@@ -276,12 +277,12 @@ When any new lever, FIX tip, or scout job lands:
 | Field | Value |
 | --- | --- |
 | What | Owned `torch.compile` of tip-exact one-token self-attn `Wqkv` + `Wo` via `F.linear` (prepare before outer CUDA graph). **Not** `native_one_token_linear` / §11 |
-| Hypothesis | Exact reciprocal ≥5% main_model vs tip `55949274` on SALVALAI from remaining eager gemm/projection (~26% nsight family) |
+| Hypothesis | Exact reciprocal ≥5% main_model vs tip `55949274` on SALVALAI from remaining eager gemm/projection (~26% nsight family): FP16 primary ≤20.264 s / ≥384.4 TPS (from 21.330 s / 366.11) |
 | Base tip | `55949274` |
 | Branch / WT | `codex/exact-compiled-self-proj` / DCC `exact-compiled-self-proj` (`codex/exact-compiled-self-proj-dcc`) |
 | Tip / commit | **`3164875a`** |
 | Opt-in | `compiled_self_proj_candidate_context` → `compiled_self_wqkv` + `compiled_out_proj` (V32 cold default) |
-| Compile | `torch.compile(F.linear region, fullgraph=True, dynamic=False, mode="default")`; SM75; bitwise warmup gate — no max-autotune |
+| Compile | `torch.compile(F.linear region, fullgraph=True, dynamic=False, mode="default")`; SM75; bitwise warmup gate (raise if not equal) — no max-autotune |
 | Jobs | FP16 **`50001853`** FAILED 1:0 00:04:13 (z25-20); FP32 **`50001854`** FAILED 1:0 00:04:45 (z25-20) |
 | Run roots | `/work/imt11/Mapperatorinator/runs/compiled-self-proj-fp{16,32}-5000185{3,4}/` (both have `baseline_first` + `candidate_first`) |
 | Exact | **n/a** — candidate crashed mid-song before `.osu`/profile; no analyzer reciprocal |
