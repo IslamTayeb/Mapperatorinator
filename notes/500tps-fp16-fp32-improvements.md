@@ -188,7 +188,7 @@ Do not fold multiple improvements into one line. Projections are never productio
 
 | Rank | Improvement (#) | FP16 main_tps | FP32 main_tps | Status |
 | --- | ---: | ---: | ---: | --- |
-| — | #12 q1 RoPE/cache head-group CTA scheduling | pending | pending | **OPEN** — FP16 `49998739`; FP32 `49998740` submitted |
+| — | #12 q1 RoPE/cache head-group CTA scheduling | pending | pending | **OPEN** — repaired FP16 `50000130`; FP32 `50000131` submitted at `64372cde` |
 | 1 | #1 shared-RoPE + device state | **366.11** | 313.05 | **GRADUATED tip** |
 | 2 | #2 shared-runtime packaging | 313.54 | **317.46** | **SEALED** pin only |
 | — | #3–#7c, #10 above | — | — | no graduate |
@@ -258,11 +258,11 @@ When any new lever, FIX tip, or scout job lands:
 | Hypothesis | Exact reciprocal ≥5% main_model vs tip `55949274` from q1 scheduling / fewer underfilled CTAs (nsight ~19%) |
 | Base tip | `55949274` |
 | Branch / WT | `codex/exact-q1-rope-cache-headgroup` / local `exact-q1-rope-cache-headgroup` |
-| Tip / commit | **`9d034259`** |
+| Execution tip / immutable ref | **`64372cde`** / `q1-rope-cache-headgroup-scout-64372cde` |
 | Opt-in | `q1_rope_cache_headgroup_candidate_context` → `native_q1_rope_cache_headgroup` (V32 cold default) |
 | Kernel | `q1_rope_cache_attention_headgroup` (HEADS_PER_CTA=2, block 128×2) |
-| Jobs | FP16 **`49998739`**; FP32 **`49998740`** (submitted) |
-| Run roots | `/work/imt11/Mapperatorinator/runs/q1-headgroup-fp{16,32}-<jobid>/` (match RUN_LABEL) |
+| Jobs | FP16 **`50000130`**; FP32 **`50000131`** (submitted); prior `49998739`/`49998740` and `49999138`/`49999139` failed wrapper infrastructure before execution, not **STOP_NO_PROMOTE** |
+| Run roots | `/work/imt11/Mapperatorinator/runs/q1-headgroup-fp{16,32}-r2-64372cde-<jobid>/` |
 | Exact | pending |
 | Measured | pending |
 | Decision | **OPEN** — scout submitted |
