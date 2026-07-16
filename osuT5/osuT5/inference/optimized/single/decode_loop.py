@@ -90,7 +90,13 @@ def _stable_encoder_outputs(
             attentions=encoder_outputs.attentions,
         )
     else:
-        current.last_hidden_state.copy_(source)
+        from ..scout.decode_cast_copy_activation import decode_cast_copy_requested
+
+        if (
+            not decode_cast_copy_requested()
+            or current.last_hidden_state.data_ptr() != source.data_ptr()
+        ):
+            current.last_hidden_state.copy_(source)
     return holder["encoder_outputs"]
 
 
@@ -229,6 +235,7 @@ def active_prefix_decode_generate(
     graph_cache = shared_graph_cache if shared_graph_cache is not None else {}
     this_peer_finished = False
     unfinished = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
+    logits_fp32_buffer: torch.Tensor | None = None
 
     while model._has_unfinished_sequences(
         this_peer_finished,
@@ -303,11 +310,29 @@ def active_prefix_decode_generate(
                     )
 
         with profile_range("generation.logits_processors"):
-            next_logits = outputs.logits[:, -1, :].to(
-                copy=True,
-                dtype=torch.float32,
-                device=input_ids.device,
-            )
+            from ..scout.decode_cast_copy_activation import decode_cast_copy_requested
+
+            last_logits = outputs.logits[:, -1, :]
+            if decode_cast_copy_requested():
+                if (
+                    logits_fp32_buffer is None
+                    or logits_fp32_buffer.shape != last_logits.shape
+                    or logits_fp32_buffer.device != input_ids.device
+                    or logits_fp32_buffer.dtype != torch.float32
+                ):
+                    logits_fp32_buffer = torch.empty(
+                        last_logits.shape,
+                        dtype=torch.float32,
+                        device=input_ids.device,
+                    )
+                logits_fp32_buffer.copy_(last_logits)
+                next_logits = logits_fp32_buffer
+            else:
+                next_logits = last_logits.to(
+                    copy=True,
+                    dtype=torch.float32,
+                    device=input_ids.device,
+                )
             next_scores = logits_processor(input_ids, next_logits)
         with profile_range("generation.sampling"):
             if generation_config.do_sample:

@@ -149,15 +149,27 @@ def sdpa_q1_attention_forward(
         and key.shape[0] == 1
         and value.shape[0] == 1
     )
+    from ..scout.decode_cast_copy_activation import decode_cast_copy_requested
+
+    layout_fuse = decode_cast_copy_requested()
     if use_native_q1_self_attention:
         attn_output = native_q1_attention(
             query,
             key,
             value,
             attention_mask,
-        ).transpose(1, 2).contiguous()
+        )
+        if layout_fuse:
+            # [1, heads, 1, dim] is already packed head-major; reshape skips transpose+copy.
+            attn_output = attn_output.reshape(bs, -1, dim)
+        else:
+            attn_output = attn_output.transpose(1, 2).contiguous().view(bs, -1, dim)
         if dispatch_counts is not None:
             dispatch_counts["native_q1_self_attention"] += 1
+            if layout_fuse:
+                dispatch_counts["attn_layout_reshape_no_contiguous"] = (
+                    dispatch_counts.get("attn_layout_reshape_no_contiguous", 0) + 1
+                )
     elif use_q1_bmm_cross_attention:
         attn_output = _q1_bmm_cross_attention(
             query,
@@ -165,12 +177,19 @@ def sdpa_q1_attention_forward(
             value,
             expected_dtype=expected_dtype,
         )
-        attn_output = attn_output.transpose(1, 2).contiguous()
+        if layout_fuse:
+            attn_output = attn_output.reshape(bs, -1, dim)
+        else:
+            attn_output = attn_output.transpose(1, 2).contiguous().view(bs, -1, dim)
         if dispatch_counts is not None:
             dispatch_counts["q1_bmm_cross_attention"] += 1
+            if layout_fuse:
+                dispatch_counts["attn_layout_reshape_no_contiguous"] = (
+                    dispatch_counts.get("attn_layout_reshape_no_contiguous", 0) + 1
+                )
     else:
         return None
-    return (attn_output.view(bs, -1, dim),)
+    return (attn_output,)
 
 
 def q1_rope_cache_self_attention_forward(
@@ -270,8 +289,19 @@ def q1_rope_cache_self_attention_forward(
             attention_mask_for_native,
             int(prefix_length),
         )
-    output = output.transpose(1, 2).contiguous()
-    output = output.view(bs, -1, module.all_head_size)
-    if dispatch_counts is not None:
-        dispatch_counts["native_q1_rope_cache_self_attention"] += 1
+    from ..scout.decode_cast_copy_activation import decode_cast_copy_requested
+
+    if decode_cast_copy_requested():
+        # Kernel writes [1, heads, 1, dim] head-major; reshape avoids transpose+contiguous copy.
+        output = output.reshape(bs, -1, module.all_head_size)
+        if dispatch_counts is not None:
+            dispatch_counts["native_q1_rope_cache_self_attention"] += 1
+            dispatch_counts["attn_layout_reshape_no_contiguous"] = (
+                dispatch_counts.get("attn_layout_reshape_no_contiguous", 0) + 1
+            )
+    else:
+        output = output.transpose(1, 2).contiguous()
+        output = output.view(bs, -1, module.all_head_size)
+        if dispatch_counts is not None:
+            dispatch_counts["native_q1_rope_cache_self_attention"] += 1
     return (output,)
