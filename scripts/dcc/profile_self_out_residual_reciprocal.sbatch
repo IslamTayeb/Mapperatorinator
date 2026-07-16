@@ -231,6 +231,10 @@ run_role baseline_second baseline
   --baseline-second-profile "${PROFILE_PATHS[baseline_second]}" \
   --baseline-second-osu "${OSU_PATHS[baseline_second]}" \
   --mode "$ANALYSIS_MODE" \
+  --allow-dispatch-delta '*native_self_out_residual*' \
+  --allow-dispatch-delta '*self_out_residual*' \
+  --allow-dispatch-delta '*native_one_token_linear_residual*' \
+  --allow-dispatch-delta '*optimized_cuda_graphs*' \
   --json-output "$RUN_ROOT/analysis.json" \
   --text-output "$RUN_ROOT/analysis.txt"
 require_nonempty "$RUN_ROOT/analysis.json"
