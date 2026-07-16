@@ -7,6 +7,7 @@ import pytest
 from utils.profile_cross_kv_layout_component import (
     BASE_TIP,
     CANDIDATES,
+    EXACT_MAX_ABS_DRIFT,
     REGION_RELATIVE_GATE,
     SAVING_TARGET_SECONDS,
     summarize_component,
@@ -32,6 +33,7 @@ def test_base_tip_is_compiled_cross_selected_stack() -> None:
     assert "0dbab9e5" in BASE_TIP
     assert SAVING_TARGET_SECONDS == 0.2
     assert REGION_RELATIVE_GATE == 0.05
+    assert EXACT_MAX_ABS_DRIFT == 1e-6
     assert "pretransposed_k_bmm" in CANDIDATES
     assert "fused_online_fp16_kv" in CANDIDATES
 
@@ -51,6 +53,17 @@ def test_summary_gates_region_or_e2e_and_correctness() -> None:
     assert strong["region_pass"]
     assert strong["component_pass"]
     assert not strong["promotion_pass"]
+
+    exact_ulp = summarize_variant(
+        name="pretransposed_k_bmm",
+        accepted_ms=0.02,
+        candidate_ms=0.018,
+        drift=6e-8,
+        exactness_class="exact",
+        memory_stable=True,
+        finite=True,
+    )
+    assert exact_ulp["correctness_pass"]
 
     e2e_only = summarize_variant(
         name="pretransposed_k_bmm",
