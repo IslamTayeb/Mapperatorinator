@@ -34,6 +34,7 @@ REQUIRE_INT8_MLP_INCREMENTAL=${REQUIRE_INT8_MLP_INCREMENTAL:-false}
 REQUIRE_CROSS_INCREMENTAL=${REQUIRE_CROSS_INCREMENTAL:-false}
 REQUIRE_SHARED_ARENA_INCREMENTAL=${REQUIRE_SHARED_ARENA_INCREMENTAL:-false}
 REQUIRE_COMPILED_CROSS_INCREMENTAL=${REQUIRE_COMPILED_CROSS_INCREMENTAL:-false}
+REQUIRE_CROSS_OUT_LAYOUT_FUSED_INCREMENTAL=${REQUIRE_CROSS_OUT_LAYOUT_FUSED_INCREMENTAL:-false}
 ALLOW_PARALLEL=${MAPPERATORINATOR_ALLOW_PARALLEL:-0}
 CROSS_CANDIDATE_MODE=${CROSS_CANDIDATE_MODE:-accepted}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
@@ -121,6 +122,11 @@ if [[ "$REQUIRE_COMPILED_CROSS_INCREMENTAL" != true \
   echo "REQUIRE_COMPILED_CROSS_INCREMENTAL must be true or false" >&2
   exit 2
 fi
+if [[ "$REQUIRE_CROSS_OUT_LAYOUT_FUSED_INCREMENTAL" != true \
+  && "$REQUIRE_CROSS_OUT_LAYOUT_FUSED_INCREMENTAL" != false ]]; then
+  echo "REQUIRE_CROSS_OUT_LAYOUT_FUSED_INCREMENTAL must be true or false" >&2
+  exit 2
+fi
 if [[ "$ALLOW_PARALLEL" != 0 && "$ALLOW_PARALLEL" != 1 ]]; then
   echo "MAPPERATORINATOR_ALLOW_PARALLEL must be 0 or 1" >&2
   exit 2
@@ -132,13 +138,14 @@ for enabled in \
   "$REQUIRE_INT8_MLP_INCREMENTAL" \
   "$REQUIRE_CROSS_INCREMENTAL" \
   "$REQUIRE_SHARED_ARENA_INCREMENTAL" \
-  "$REQUIRE_COMPILED_CROSS_INCREMENTAL"; do
+  "$REQUIRE_COMPILED_CROSS_INCREMENTAL" \
+  "$REQUIRE_CROSS_OUT_LAYOUT_FUSED_INCREMENTAL"; do
   if [[ "$enabled" == true ]]; then
     enabled_incremental_modes=$((enabled_incremental_modes + 1))
   fi
 done
 if (( enabled_incremental_modes > 1 )); then
-  echo "shared-RoPE, K1-remainder, INT8 MLP, cross, and shared-arena gates are mutually exclusive" >&2
+  echo "incremental full-song gates are mutually exclusive" >&2
   exit 2
 fi
 if [[ "$REQUIRE_COMPILED_CROSS_INCREMENTAL" == true ]]; then
@@ -155,6 +162,23 @@ if [[ "$REQUIRE_COMPILED_CROSS_INCREMENTAL" == true ]]; then
   fi
   if [[ "$CROSS_CANDIDATE_MODE" != fp16_packed_projections ]]; then
     echo "compiled-cross gate requires selected FP16 packed cross projections" >&2
+    exit 2
+  fi
+  CROSS_K1_INT8_COMPOSITION=true
+elif [[ "$REQUIRE_CROSS_OUT_LAYOUT_FUSED_INCREMENTAL" == true ]]; then
+  if [[ "$REQUIRE_K4_CANDIDATE" != true || "$REQUIRE_EXACT_TIMING" != true ]]; then
+    echo "cross-out-layout-fused gate requires K4 and exact timing" >&2
+    exit 2
+  fi
+  if [[ "$BASELINE_RUNNER" \
+      != utils/run_k4_shared_rope_fp16_cross_shared_arena.py \
+    || "$CANDIDATE_RUNNER" \
+      != utils/run_k4_shared_rope_fp16_cross_shared_arena_layout_fused.py ]]; then
+    echo "cross-out-layout-fused gate requires selected shared-arena control and layout-fused runner" >&2
+    exit 2
+  fi
+  if [[ "$CROSS_CANDIDATE_MODE" != fp16_packed_projections ]]; then
+    echo "cross-out-layout-fused gate requires selected FP16 packed cross projections" >&2
     exit 2
   fi
   CROSS_K1_INT8_COMPOSITION=true
@@ -389,7 +413,7 @@ for tool in ffmpeg ffprobe; do
   fi
 done
 
-JOB_TMPDIR="$WORK/tmp/reciprocal-$SLURM_JOB_ID"
+JOB_TMPDIR=${MAPPERATORINATOR_JOB_TMPDIR:-$WORK/tmp/reciprocal-$SLURM_JOB_ID}
 mkdir -p "$WORK/logs" "$JOB_TMPDIR" "$WORK/cache" \
   "$BASELINE_TORCH_EXTENSIONS_DIR" "$CANDIDATE_TORCH_EXTENSIONS_DIR" \
   "$RUN_ROOT/candidate-initialization" "$RUN_ROOT/baseline-extension-setup"
@@ -444,6 +468,7 @@ echo "int8_k1_composition=$INT8_K1_COMPOSITION"
 echo "require_cross_incremental=$REQUIRE_CROSS_INCREMENTAL"
 echo "require_shared_arena_incremental=$REQUIRE_SHARED_ARENA_INCREMENTAL"
 echo "require_compiled_cross_incremental=$REQUIRE_COMPILED_CROSS_INCREMENTAL"
+echo "require_cross_out_layout_fused_incremental=$REQUIRE_CROSS_OUT_LAYOUT_FUSED_INCREMENTAL"
 echo "parallel_opt_in=$ALLOW_PARALLEL"
 echo "cross_candidate_mode=$CROSS_CANDIDATE_MODE"
 echo "cross_k1_int8_composition=$CROSS_K1_INT8_COMPOSITION"
@@ -637,7 +662,8 @@ run_profile() {
     validation_role=candidate
   fi
   local validation_cross_mode=accepted
-  if [[ "$REQUIRE_COMPILED_CROSS_INCREMENTAL" == true ]]; then
+  if [[ "$REQUIRE_COMPILED_CROSS_INCREMENTAL" == true \
+    || "$REQUIRE_CROSS_OUT_LAYOUT_FUSED_INCREMENTAL" == true ]]; then
     validation_cross_mode=$CROSS_CANDIDATE_MODE
   elif [[ "$REQUIRE_CROSS_INCREMENTAL" == true && "$candidate" == 1 ]]; then
     validation_cross_mode=$CROSS_CANDIDATE_MODE
@@ -819,7 +845,8 @@ if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
   || "$REQUIRE_INT8_MLP_INCREMENTAL" == true \
   || "$REQUIRE_CROSS_INCREMENTAL" == true \
   || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true \
-  || "$REQUIRE_COMPILED_CROSS_INCREMENTAL" == true ]]; then
+  || "$REQUIRE_COMPILED_CROSS_INCREMENTAL" == true \
+  || "$REQUIRE_CROSS_OUT_LAYOUT_FUSED_INCREMENTAL" == true ]]; then
   INITIALIZATION_ROLES=baseline_first,candidate_first,candidate_second,baseline_second
 fi
 "$PYTHON" - "$RUN_ROOT" "$INITIALIZATION_ROLES" \
@@ -830,7 +857,8 @@ fi
   "$REQUIRE_CROSS_INCREMENTAL" \
   "$CROSS_CANDIDATE_MODE" \
   "$CROSS_K1_INT8_COMPOSITION" \
-  "$REQUIRE_COMPILED_CROSS_INCREMENTAL" <<'PY'
+  "$REQUIRE_COMPILED_CROSS_INCREMENTAL" \
+  "$REQUIRE_CROSS_OUT_LAYOUT_FUSED_INCREMENTAL" <<'PY'
 import json
 import math
 import statistics
@@ -847,6 +875,7 @@ require_cross = sys.argv[7] == "true"
 cross_mode = sys.argv[8]
 cross_k1_int8_composition = sys.argv[9] == "true"
 require_compiled_cross = sys.argv[10] == "true"
+require_layout_fused = sys.argv[11] == "true"
 shared_rope_both_arms = (
     require_k1_remainder
     or require_int8_mlp
@@ -1007,6 +1036,27 @@ if require_compiled_cross:
         elif compiled is not None or runtime is not None:
             raise SystemExit(f"{role}: selected control unexpectedly enabled compile")
 
+if require_layout_fused:
+    for role in roles:
+        cross = runs[role].get("cross_candidate")
+        if not isinstance(cross, dict) or cross.get("mode") != cross_mode:
+            raise SystemExit(f"{role}: selected FP16 cross mode is missing")
+        if not isinstance(runs[role].get("int8_mlp_overlay"), dict):
+            raise SystemExit(f"{role}: selected INT8 MLP overlay is missing")
+        if runs[role].get("compiled_cross_bmm") is not None \
+            or runs[role].get("compiled_cross_runtime") is not None:
+            raise SystemExit(f"{role}: layout-fused must not compose compiled-cross")
+        layout = runs[role].get("cross_out_layout_fused")
+        if role.startswith("candidate"):
+            if not isinstance(layout, dict) or layout.get("enabled") is not True:
+                raise SystemExit(f"{role}: cross-out layout-fused evidence is missing")
+            if layout.get("compiled_cross_composed") is not False:
+                raise SystemExit(f"{role}: layout-fused must declare no compile compose")
+            if layout.get("variant") != "heads_view_fused":
+                raise SystemExit(f"{role}: layout-fused variant is wrong")
+        elif layout is not None:
+            raise SystemExit(f"{role}: selected control unexpectedly enabled layout fusion")
+
 summary = {
     "schema_version": 1,
     "result_class": "documented-drift",
@@ -1058,6 +1108,18 @@ if [[ "$REQUIRE_COMPILED_CROSS_INCREMENTAL" == true ]]; then
       'records.main_generation[[]*].optimized_dispatch_capture_hits.compiled_q1_bmm_cross_attention'
     --allow-optional-dispatch-delta
       'records.main_generation[[]*].optimized_cuda_graphs.*'
+  )
+elif [[ "$REQUIRE_CROSS_OUT_LAYOUT_FUSED_INCREMENTAL" == true ]]; then
+  # Same selected shared-arena stack; layout fusion should not change dispatch
+  # counters. Keep timing exact and forbid undeclared topology drift.
+  ANALYSIS_EXACT_ARGS=(
+    --require-exact-label timing_context
+    --require-exact-label main_generation
+    --require-exact-dispatch-label timing_context
+    --require-exact-dispatch-label main_generation
+  )
+  ANALYSIS_DISPATCH_ARGS=(
+    --allow-optional-dispatch-delta 'optimized_result_class'
   )
 elif [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
   ANALYSIS_EXACT_ARGS=(
@@ -1238,7 +1300,9 @@ fi
 if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
   || "$REQUIRE_INT8_MLP_INCREMENTAL" == true \
   || "$REQUIRE_CROSS_INCREMENTAL" == true \
-  || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+  || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true \
+  || "$REQUIRE_COMPILED_CROSS_INCREMENTAL" == true \
+  || "$REQUIRE_CROSS_OUT_LAYOUT_FUSED_INCREMENTAL" == true ]]; then
   for artifact in \
     "$RUN_ROOT/candidate-initialization/baseline_first.json" \
     "$RUN_ROOT/candidate-initialization/baseline_second.json"; do
@@ -1259,7 +1323,8 @@ grep -q "^parity.claim=$ANALYSIS_CLAIM$" "$RUN_ROOT/reciprocal-analysis.txt"
 if [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true \
   || "$REQUIRE_K1_REMAINDER_INCREMENTAL" == true \
   || "$REQUIRE_CROSS_INCREMENTAL" == true \
-  || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
+  || "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true \
+  || "$REQUIRE_CROSS_OUT_LAYOUT_FUSED_INCREMENTAL" == true ]]; then
   grep -q '^parity.cross_candidate_exact=true$' \
     "$RUN_ROOT/reciprocal-analysis.txt"
 fi
@@ -1269,6 +1334,9 @@ EXPECTED_EXACT_LABELS=none
 EXPECTED_EXACT_DISPATCH_LABELS=none
 if [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
   EXPECTED_EXACT_LABELS=timing_context,main_generation
+elif [[ "$REQUIRE_CROSS_OUT_LAYOUT_FUSED_INCREMENTAL" == true ]]; then
+  EXPECTED_EXACT_LABELS=timing_context,main_generation
+  EXPECTED_EXACT_DISPATCH_LABELS=timing_context,main_generation
 elif [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
   EXPECTED_EXACT_LABELS=timing_context,main_generation
   EXPECTED_EXACT_DISPATCH_LABELS=$EXPECTED_EXACT_LABELS

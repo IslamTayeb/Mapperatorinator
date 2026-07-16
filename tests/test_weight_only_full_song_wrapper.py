@@ -102,7 +102,10 @@ def test_wrapper_has_isolated_parallel_compiled_cross_gate() -> None:
     assert "MAPPERATORINATOR_ALLOW_PARALLEL" in source
     assert "utils/run_k4_shared_rope_fp16_cross_shared_arena.py" in source
     assert "utils/run_k4_shared_rope_fp16_cross_compiled_bmm.py" in source
-    assert 'JOB_TMPDIR="$WORK/tmp/reciprocal-$SLURM_JOB_ID"' in source
+    assert (
+        'JOB_TMPDIR=${MAPPERATORINATOR_JOB_TMPDIR:-$WORK/tmp/reciprocal-$SLURM_JOB_ID}'
+        in source
+    )
     assert 'export TMPDIR="$JOB_TMPDIR"' in source
     assert "compiled_q1_bmm_cross_attention" in source
     assert "CANDIDATE_REMOTE_BRANCH=${CANDIDATE_REMOTE_BRANCH:-$CANDIDATE_BRANCH}" in source
