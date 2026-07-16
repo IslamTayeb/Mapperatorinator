@@ -188,7 +188,7 @@ Do not fold multiple improvements into one line. Projections are never productio
 
 | Rank | Improvement (#) | FP16 main_tps | FP32 main_tps | Status |
 | --- | ---: | ---: | ---: | --- |
-| — | #12 q1 RoPE/cache head-group CTA scheduling | pending | pending | **OPEN** — FP16 `49998160`; FP32 `49998162` submitted |
+| — | #12 q1 RoPE/cache head-group CTA scheduling | pending | pending | **OPEN** — FP16 `49998739`; FP32 `49998740` submitted |
 | 1 | #1 shared-RoPE + device state | **366.11** | 313.05 | **GRADUATED tip** |
 | 2 | #2 shared-runtime packaging | 313.54 | **317.46** | **SEALED** pin only |
 | — | #3–#7c, #10 above | — | — | no graduate |
@@ -261,7 +261,7 @@ When any new lever, FIX tip, or scout job lands:
 | Tip / commit | **`9d034259`** |
 | Opt-in | `q1_rope_cache_headgroup_candidate_context` → `native_q1_rope_cache_headgroup` (V32 cold default) |
 | Kernel | `q1_rope_cache_attention_headgroup` (HEADS_PER_CTA=2, block 128×2) |
-| Jobs | FP16 **`49998160`**; FP32 **`49998162`** (submitted) |
+| Jobs | FP16 **`49998739`**; FP32 **`49998740`** (submitted) |
 | Run roots | `/work/imt11/Mapperatorinator/runs/q1-headgroup-fp{16,32}-<jobid>/` (match RUN_LABEL) |
 | Exact | pending |
 | Measured | pending |
