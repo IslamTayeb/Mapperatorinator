@@ -8,9 +8,36 @@ _NATIVE_Q1_ATTENTION = None
 _SUPPORTED_DTYPES = (torch.float32, torch.float16)
 _SPLIT_KV_Q1_PREFIXES = frozenset(range(192, 833, 64))
 _SPLIT_KV_Q1_SPLITS = 8
+_FLASHDECODE_SPLIT_CHOICES = (8, 16, 32)
+_FLASHDECODE_LONG_PREFIX = 448
+_FLASHDECODE_XLONG_PREFIX = 704
 _ACCEPTED_ROPE_CACHE_VARIANT = "accepted"
 _SPLIT_KV_ROPE_CACHE_VARIANT = "split_kv_8"
 _COALESCED_SPLIT_KV_ROPE_CACHE_VARIANT = "split_kv_8_coalesced"
+_FLASHDECODE_SPLIT_KV_ROPE_CACHE_VARIANT = "split_kv_flashdecode"
+
+
+def flashdecode_split_count(active_prefix_length: int) -> int:
+    """Bounded FlashDecode-style split count for long-prefix decode occupancy.
+
+    Keeps the accepted 8-way split on shorter buckets and raises the grid on
+    long prefixes so ``heads * splits`` better fills SM75 (68 SMs) without
+    rewriting the merge algebra.
+    """
+
+    if (
+        isinstance(active_prefix_length, bool)
+        or not isinstance(active_prefix_length, int)
+        or active_prefix_length <= 0
+    ):
+        raise ValueError(
+            f"active_prefix_length must be a positive int, got {active_prefix_length!r}"
+        )
+    if active_prefix_length >= _FLASHDECODE_XLONG_PREFIX:
+        return 32
+    if active_prefix_length >= _FLASHDECODE_LONG_PREFIX:
+        return 16
+    return 8
 
 
 def _device_capability(device: torch.device) -> tuple[int, int]:
@@ -61,6 +88,20 @@ def native_q1_rope_cache_attention_coalesced_variant(
         == _SPLIT_KV_ROPE_CACHE_VARIANT
     ):
         return _COALESCED_SPLIT_KV_ROPE_CACHE_VARIANT
+    return _ACCEPTED_ROPE_CACHE_VARIANT
+
+
+def native_q1_rope_cache_attention_flashdecode_variant(
+    qkv: torch.Tensor,
+    active_prefix_length: int,
+) -> str:
+    """Select the opt-in FlashDecode occupancy path only where split-KV is accepted."""
+
+    if (
+        native_q1_rope_cache_attention_variant(qkv, active_prefix_length)
+        == _SPLIT_KV_ROPE_CACHE_VARIANT
+    ):
+        return _FLASHDECODE_SPLIT_KV_ROPE_CACHE_VARIANT
     return _ACCEPTED_ROPE_CACHE_VARIANT
 
 
@@ -908,6 +949,7 @@ torch::Tensor split_kv_q1_rope_cache_attention_impl(
         torch::Tensor cache_position,
         c10::optional<torch::Tensor> mask,
         int64_t active_prefix_len,
+        int64_t split_count_arg,
         bool coalesced) {
     TORCH_CHECK(qkv.is_cuda() && cache_keys.is_cuda() && cache_values.is_cuda(),
         "split-KV qkv/cache tensors must be CUDA");
@@ -943,11 +985,14 @@ torch::Tensor split_kv_q1_rope_cache_attention_impl(
         "split-KV cos/sin must have shape [1, 1, D]");
     TORCH_CHECK(cache_position.numel() == 1,
         "split-KV cache_position must contain one element");
+    TORCH_CHECK(
+        split_count_arg == 8 || split_count_arg == 16 || split_count_arg == 32,
+        "split-KV split_count must be one of {8, 16, 32}");
 
     const int heads = static_cast<int>(qkv.size(3));
     const int head_dim = static_cast<int>(qkv.size(4));
     const int max_cache_len = static_cast<int>(cache_keys.size(2));
-    constexpr int split_count = 8;
+    const int split_count = static_cast<int>(split_count_arg);
     TORCH_CHECK(head_dim > 0 && head_dim % 2 == 0,
         "split-KV head_dim must be positive and even");
     TORCH_CHECK(active_prefix_len >= split_count
@@ -1073,7 +1118,7 @@ torch::Tensor split_kv_q1_rope_cache_attention(
         int64_t active_prefix_len) {
     return split_kv_q1_rope_cache_attention_impl(
         qkv, cache_keys, cache_values, cos, sin, cache_position, mask,
-        active_prefix_len, false);
+        active_prefix_len, /*split_count=*/8, /*coalesced=*/false);
 }
 
 torch::Tensor split_kv_q1_rope_cache_attention_coalesced(
@@ -1087,12 +1132,30 @@ torch::Tensor split_kv_q1_rope_cache_attention_coalesced(
         int64_t active_prefix_len) {
     return split_kv_q1_rope_cache_attention_impl(
         qkv, cache_keys, cache_values, cos, sin, cache_position, mask,
-        active_prefix_len, true);
+        active_prefix_len, /*split_count=*/8, /*coalesced=*/true);
+}
+
+torch::Tensor split_kv_q1_rope_cache_attention_flashdecode(
+        torch::Tensor qkv,
+        torch::Tensor cache_keys,
+        torch::Tensor cache_values,
+        torch::Tensor cos,
+        torch::Tensor sin,
+        torch::Tensor cache_position,
+        c10::optional<torch::Tensor> mask,
+        int64_t active_prefix_len,
+        int64_t split_count) {
+    // Occupancy scout: same partial/merge kernels as accepted split-KV, with a
+    // FlashDecode-style runtime split count. Keep coalesced=false so this gate
+    // isolates split-count/layout from the coalesced-load candidate.
+    return split_kv_q1_rope_cache_attention_impl(
+        qkv, cache_keys, cache_values, cos, sin, cache_position, mask,
+        active_prefix_len, split_count, /*coalesced=*/false);
 }
 """
 
     _NATIVE_Q1_ATTENTION = load_inline(
-        name="mapperatorinator_q1_attention",
+        name="mapperatorinator_q1_attention_flashdecode",
         cpp_sources=(
             "#include <torch/extension.h>\n"
             "torch::Tensor q1_attention(torch::Tensor q, torch::Tensor k, torch::Tensor v, "
@@ -1108,6 +1171,11 @@ torch::Tensor split_kv_q1_rope_cache_attention_coalesced(
             "torch::Tensor cache_keys, torch::Tensor cache_values, torch::Tensor cos, "
             "torch::Tensor sin, torch::Tensor cache_position, "
             "c10::optional<torch::Tensor> mask, int64_t active_prefix_len);\n"
+            "torch::Tensor split_kv_q1_rope_cache_attention_flashdecode(torch::Tensor qkv, "
+            "torch::Tensor cache_keys, torch::Tensor cache_values, torch::Tensor cos, "
+            "torch::Tensor sin, torch::Tensor cache_position, "
+            "c10::optional<torch::Tensor> mask, int64_t active_prefix_len, "
+            "int64_t split_count);\n"
         ),
         cuda_sources=cuda_source,
         functions=[
@@ -1115,6 +1183,7 @@ torch::Tensor split_kv_q1_rope_cache_attention_coalesced(
             "q1_rope_cache_attention",
             "split_kv_q1_rope_cache_attention",
             "split_kv_q1_rope_cache_attention_coalesced",
+            "split_kv_q1_rope_cache_attention_flashdecode",
         ],
         extra_cuda_cflags=["-O3"],
         verbose=False,
@@ -1235,6 +1304,65 @@ def native_q1_rope_cache_attention_coalesced(
             cache_position,
             mask,
             int(active_prefix_length),
+        )
+    return extension.q1_rope_cache_attention(
+        qkv,
+        cache_keys,
+        cache_values,
+        cos,
+        sin,
+        cache_position,
+        mask,
+        int(active_prefix_length),
+    )
+
+
+def native_q1_rope_cache_attention_flashdecode(
+        qkv: torch.Tensor,
+        cache_keys: torch.Tensor,
+        cache_values: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        cache_position: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        active_prefix_length: int,
+) -> torch.Tensor:
+    """Opt-in FlashDecode occupancy split-KV with the accepted short-prefix fallback."""
+
+    _validate_rope_cache_inputs(
+        qkv,
+        cache_keys,
+        cache_values,
+        cos,
+        sin,
+        cache_position,
+        active_prefix_length,
+    )
+    mask = _native_mask(
+        attention_mask,
+        device=qkv.device,
+        expected_numel=int(active_prefix_length),
+    )
+    extension = _load_native_q1_attention()
+    if (
+        native_q1_rope_cache_attention_flashdecode_variant(
+            qkv, active_prefix_length
+        )
+        == _FLASHDECODE_SPLIT_KV_ROPE_CACHE_VARIANT
+    ):
+        splits = flashdecode_split_count(int(active_prefix_length))
+        if splits not in _FLASHDECODE_SPLIT_CHOICES:
+            raise RuntimeError(f"flashdecode split count {splits} is out of bounds")
+        return extension.split_kv_q1_rope_cache_attention_flashdecode(
+            qkv,
+            cache_keys,
+            cache_values,
+            cos,
+            sin,
+            cache_position,
+            mask,
+            int(active_prefix_length),
+            int(splits),
         )
     return extension.q1_rope_cache_attention(
         qkv,
