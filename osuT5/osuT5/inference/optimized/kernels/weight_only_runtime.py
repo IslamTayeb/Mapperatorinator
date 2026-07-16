@@ -610,20 +610,27 @@ def _cross_mlp_tail_forward(
                 key_states,
                 value_states,
             )
-    cross_output = cross_output.transpose(1, 2).contiguous().view(
-        1,
-        1,
-        module.cross_attn.all_head_size,
-    )
     if state.cross_mode == CROSS_FP16_PACKED:
+        from .cross_out_epilogue import (
+            cross_out_layout_fused_enabled,
+            cross_out_proj_residual,
+        )
+
         with profile_range(f"{layer_name}.weight_only.cross_out_fp16_weight"):
-            hidden_states = weight_only_linear_residual(
+            hidden_states = cross_out_proj_residual(
                 cross_output,
                 hidden_states,
                 output_pack,
+                layout_fused=cross_out_layout_fused_enabled(),
+                fuse_residual=True,
                 outputs_per_block=8,
             )
     else:
+        cross_output = cross_output.transpose(1, 2).contiguous().view(
+            1,
+            1,
+            module.cross_attn.all_head_size,
+        )
         with profile_range(f"{layer_name}.weight_only.cross_out_fp32"):
             hidden_states = native_one_token_linear_residual(
                 cross_output,
