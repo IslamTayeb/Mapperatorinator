@@ -64,6 +64,11 @@ def attention_runtime_context(
 ) -> Iterator[None]:
     if expected_dtype not in {torch.float32, torch.float16}:
         raise TypeError("optimized attention supports only float32 or float16")
+    if fuse_self_norm_wqkv and not native_q1_rope_cache_self_attention:
+        raise RuntimeError(
+            "fuse_self_norm_wqkv requires native_q1_rope_cache_self_attention; "
+            "refusing to skip self_attn RMSNorm without the native q1 path"
+        )
     from ..kernels.dispatch import (
         q1_rope_cache_self_attention_forward,
         sdpa_q1_attention_forward,
