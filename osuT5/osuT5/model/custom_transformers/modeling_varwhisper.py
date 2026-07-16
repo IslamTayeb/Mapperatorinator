@@ -1,6 +1,7 @@
 """PyTorch VarWhisper model."""
 import copy
 import math
+from contextlib import nullcontext
 from functools import partial
 from typing import Optional, Tuple, Union
 
@@ -671,6 +672,16 @@ class VarWhisperAttention(nn.Module):
                         )
 
         hidden_states, *rest = attn_outputs
+        self_out_residual_forward = attention_runtime_hooks().self_out_residual_forward
+        if self_out_residual_forward is not None:
+            fused = self_out_residual_forward(
+                module=self,
+                attn_output=hidden_states,
+                range_prefix=range_prefix,
+                profile_ranges=profile_ranges,
+            )
+            if fused is not None:
+                return fused, *rest, past_key_value
         if profile_ranges:
             with profile_range(f"{range_prefix}.out_proj"):
                 hidden_states = self.out_drop(self.Wo(hidden_states))
@@ -809,8 +820,26 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
             hidden_states = self.self_attn_layer_norm(hidden_states)
 
         # Self Attention
-        if profile_ranges:
-            with profile_range(f"{layer_name}.self_attn"):
+        self_residual_bind = decoder_layer_runtime_hooks().self_attn_residual_bind
+        residual_cm = (
+            self_residual_bind(residual)
+            if self_residual_bind is not None
+            else nullcontext()
+        )
+        with residual_cm:
+            if profile_ranges:
+                with profile_range(f"{layer_name}.self_attn"):
+                    self_attn_outputs = self.self_attn(
+                        hidden_states=hidden_states,
+                        past_key_value=past_key_value,
+                        attention_mask=attention_mask,
+                        cache_position=cache_position,
+                        position_ids=position_ids,
+                        cu_seqlens=cu_seqlens,
+                        max_seqlen=max_seqlen,
+                        output_attentions=output_attentions
+                    )
+            else:
                 self_attn_outputs = self.self_attn(
                     hidden_states=hidden_states,
                     past_key_value=past_key_value,
@@ -821,19 +850,11 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
                     max_seqlen=max_seqlen,
                     output_attentions=output_attentions
                 )
-        else:
-            self_attn_outputs = self.self_attn(
-                hidden_states=hidden_states,
-                past_key_value=past_key_value,
-                attention_mask=attention_mask,
-                cache_position=cache_position,
-                position_ids=position_ids,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                output_attentions=output_attentions
-            )
         hidden_states = self_attn_outputs[0]
-        if profile_ranges:
+        consume_fused = decoder_layer_runtime_hooks().consume_self_out_residual_fused
+        if consume_fused is not None and consume_fused():
+            pass
+        elif profile_ranges:
             with profile_range(f"{layer_name}.self.residual"):
                 hidden_states = residual + hidden_states
         else:

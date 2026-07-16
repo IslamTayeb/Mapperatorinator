@@ -98,12 +98,23 @@ def attention_runtime_context(
             expected_dtype=expected_dtype,
             dispatch_counts=dispatch_counts,
         )
+    self_out_residual_forward = None
+    from ..kernels.self_out_residual_activation import self_out_residual_requested
+
+    if self_out_residual_requested():
+        from ..kernels.self_out_residual import apply_self_out_residual_if_requested
+
+        self_out_residual_forward = partial(
+            apply_self_out_residual_if_requested,
+            dispatch_counts=dispatch_counts,
+        )
     hooks = AttentionRuntimeHooks(
         sdpa_attention_inputs=attention_runtime_hooks().sdpa_attention_inputs,
         sdpa_attention_forward=sdpa_attention_forward,
         q1_rope_cache_self_attention_forward=(
             q1_rope_cache_self_attention
         ),
+        self_out_residual_forward=self_out_residual_forward,
     )
     with attention_runtime_hooks_context(hooks):
         yield
@@ -125,8 +136,21 @@ def decoder_layer_runtime_context(
             native_cross_mlp_tail_forward,
             dispatch_counts=dispatch_counts,
         )
+    self_attn_residual_bind = None
+    consume_self_out_residual_fused = None
+    from ..kernels.self_out_residual_activation import (
+        consume_self_out_residual_fused as _consume_fused,
+        self_attn_residual_bind as _bind_residual,
+        self_out_residual_requested,
+    )
+
+    if self_out_residual_requested():
+        self_attn_residual_bind = _bind_residual
+        consume_self_out_residual_fused = _consume_fused
     hooks = DecoderLayerRuntimeHooks(
         cross_mlp_tail_forward=cross_mlp_tail_forward,
+        self_attn_residual_bind=self_attn_residual_bind,
+        consume_self_out_residual_fused=consume_self_out_residual_fused,
     )
     with decoder_layer_runtime_hooks_context(hooks):
         yield

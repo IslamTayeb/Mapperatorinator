@@ -12,11 +12,14 @@ class AttentionRuntimeHooks:
     sdpa_attention_inputs: Callable[..., Any] | None = None
     sdpa_attention_forward: Callable[..., Any] | None = None
     q1_rope_cache_self_attention_forward: Callable[..., Any] | None = None
+    self_out_residual_forward: Callable[..., Any] | None = None
 
 
 @dataclass(frozen=True)
 class DecoderLayerRuntimeHooks:
     cross_mlp_tail_forward: Callable[..., Any] | None = None
+    self_attn_residual_bind: Callable[..., Any] | None = None
+    consume_self_out_residual_fused: Callable[[], bool] | None = None
 
 
 _EMPTY_ATTENTION_RUNTIME_HOOKS = AttentionRuntimeHooks()
