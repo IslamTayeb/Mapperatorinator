@@ -114,6 +114,7 @@ def decoder_layer_runtime_context(
     *,
     native_cross_mlp_tail: bool = False,
     dispatch_counts: dict[str, int] | None = None,
+    compiled_cross_bmm=None,
 ) -> Iterator[None]:
     cross_mlp_tail_forward = None
     if native_cross_mlp_tail:
@@ -124,6 +125,7 @@ def decoder_layer_runtime_context(
         cross_mlp_tail_forward = partial(
             native_cross_mlp_tail_forward,
             dispatch_counts=dispatch_counts,
+            compiled_cross_bmm=compiled_cross_bmm,
         )
     hooks = DecoderLayerRuntimeHooks(
         cross_mlp_tail_forward=cross_mlp_tail_forward,

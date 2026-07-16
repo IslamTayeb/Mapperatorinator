@@ -306,7 +306,24 @@ def _generate_window(
         "native_q1_self_attention": 0,
         "q1_bmm_cross_attention": 0,
         "native_cross_mlp_tail": 0,
+        "compiled_q1_bmm_cross_attention": 0,
     }
+
+    compiled_cross_bmm = None
+    compiled_cross_evidence = None
+    from ..kernels.compiled_cross_activation import compiled_cross_requested
+
+    if compiled_cross_requested():
+        if not native_cross_mlp_tail:
+            raise RuntimeError(
+                "compiled q1 cross BMM requires native cross+MLP tail"
+            )
+        from ..kernels.compiled_cross import prepare_compiled_q1_cross_bmm
+
+        compiled_cross_bmm, compiled_cross_evidence = prepare_compiled_q1_cross_bmm(
+            model.device,
+            expected_dtype,
+        )
 
     rng_before = (
         rng_progression_signature(model.device)
@@ -324,6 +341,7 @@ def _generate_window(
         native_cross_mlp_tail=native_cross_mlp_tail,
         optimized_expected_dtype=expected_dtype,
         optimized_dispatch_counts=dispatch_counts,
+        compiled_cross_bmm=compiled_cross_bmm,
     ):
         if sync_model_timing:
             sync_cuda_for_model(model)
@@ -428,6 +446,19 @@ def _generate_window(
                     else "timing_context"
                 ),
             },
+            "compiled_q1_bmm_cross_attention": {
+                "requested": compiled_cross_requested(),
+                "enabled": compiled_cross_bmm is not None,
+                "disabled_reason": (
+                    None
+                    if compiled_cross_bmm is not None
+                    else None
+                    if not compiled_cross_requested()
+                    else "native_cross_mlp_tail_disabled"
+                    if not native_cross_mlp_tail
+                    else "prepare_failed"
+                ),
+            },
         },
         "native_cross_mlp_tail_requested": specialized_batch,
         "native_cross_mlp_tail_enabled": native_cross_mlp_tail,
@@ -455,6 +486,11 @@ def _generate_window(
         ),
         "optimized_cuda_graphs": context_state.graph_profile_summary(),
     })
+    if compiled_cross_evidence is not None:
+        stats["compiled_cross_bmm"] = {
+            **compiled_cross_evidence,
+            "enabled": True,
+        }
     if strict_exactness is not None:
         stats["strict_exactness"] = strict_exactness
     return result, stats

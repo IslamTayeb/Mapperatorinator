@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 import torch
 from transformers.activations import GELUActivation
@@ -15,6 +15,9 @@ from .decoder_layer import (
     native_one_token_rmsnorm_linear,
 )
 from .dispatch import _q1_bmm_cross_attention
+
+
+CompiledCrossBmm = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
 
 
 _SUPPORTED_DTYPES = (torch.float32, torch.float16)
@@ -95,6 +98,7 @@ def native_cross_mlp_tail_forward(
     encoder_cu_seqlens: torch.Tensor | None,
     layer_name: str,
     dispatch_counts: dict[str, int] | None = None,
+    compiled_cross_bmm: CompiledCrossBmm | None = None,
 ) -> tuple[Any, ...] | None:
     """Run the dtype-aware native cross+MLP island when decode inputs qualify."""
 
@@ -144,12 +148,19 @@ def native_cross_mlp_tail_forward(
         ).transpose(1, 2)
 
     with profile_range(f"{layer_name}.native_cross_mlp_tail.cross_bmm"):
-        cross_attention_output = _q1_bmm_cross_attention(
-            query_states,
-            key_states,
-            value_states,
-            expected_dtype=hidden_states.dtype,
-        )
+        if compiled_cross_bmm is not None:
+            cross_attention_output = compiled_cross_bmm(
+                query_states,
+                key_states,
+                value_states,
+            )
+        else:
+            cross_attention_output = _q1_bmm_cross_attention(
+                query_states,
+                key_states,
+                value_states,
+                expected_dtype=hidden_states.dtype,
+            )
 
     with profile_range(f"{layer_name}.native_cross_mlp_tail.cross_out"):
         hidden_states = native_one_token_linear_residual(
@@ -175,6 +186,10 @@ def native_cross_mlp_tail_forward(
     if dispatch_counts is not None:
         dispatch_counts["native_cross_mlp_tail"] += 1
         dispatch_counts["q1_bmm_cross_attention"] += 1
+        if compiled_cross_bmm is not None:
+            dispatch_counts["compiled_q1_bmm_cross_attention"] = (
+                dispatch_counts.get("compiled_q1_bmm_cross_attention", 0) + 1
+            )
     return (hidden_states,) + self_attn_outputs[1:] + (past_key_value,)
 
 
