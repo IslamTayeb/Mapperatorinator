@@ -58,6 +58,7 @@ def attention_runtime_context(
     q1_bmm_cross_attention: bool = False,
     native_q1_self_attention: bool = False,
     native_q1_rope_cache_self_attention: bool = False,
+    skip_out_proj: bool = False,
     expected_dtype: torch.dtype = torch.float32,
     dispatch_counts: dict[str, int] | None = None,
 ) -> Iterator[None]:
@@ -104,6 +105,7 @@ def attention_runtime_context(
         q1_rope_cache_self_attention_forward=(
             q1_rope_cache_self_attention
         ),
+        skip_out_proj=skip_out_proj,
     )
     with attention_runtime_hooks_context(hooks):
         yield
@@ -113,20 +115,34 @@ def attention_runtime_context(
 def decoder_layer_runtime_context(
     *,
     native_cross_mlp_tail: bool = False,
+    native_self_out_residual: bool = False,
     dispatch_counts: dict[str, int] | None = None,
 ) -> Iterator[None]:
     cross_mlp_tail_forward = None
-    if native_cross_mlp_tail:
+    self_out_residual_forward = None
+    if native_cross_mlp_tail or native_self_out_residual:
         from ..kernels import decoder_layer
-        from ..kernels.cross_mlp import native_cross_mlp_tail_forward
 
         decoder_layer.preload_native_decoder_layer()
+    if native_cross_mlp_tail:
+        from ..kernels.cross_mlp import native_cross_mlp_tail_forward
+
         cross_mlp_tail_forward = partial(
             native_cross_mlp_tail_forward,
             dispatch_counts=dispatch_counts,
         )
+    if native_self_out_residual:
+        from ..scout.self_out_residual_fusion import (
+            native_self_out_residual_forward,
+        )
+
+        self_out_residual_forward = partial(
+            native_self_out_residual_forward,
+            dispatch_counts=dispatch_counts,
+        )
     hooks = DecoderLayerRuntimeHooks(
         cross_mlp_tail_forward=cross_mlp_tail_forward,
+        self_out_residual_forward=self_out_residual_forward,
     )
     with decoder_layer_runtime_hooks_context(hooks):
         yield
