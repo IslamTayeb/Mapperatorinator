@@ -52,6 +52,7 @@ def generation_profile_context(
         q1_bmm_cross_attention: bool = False,
         native_q1_self_attention: bool = False,
         native_q1_rope_cache_self_attention: bool = False,
+        native_q1_rope_cache_headgroup: bool = False,
         native_cross_mlp_tail: bool = False,
         optimized_expected_dtype: torch.dtype = torch.float32,
         optimized_dispatch_counts: dict[str, int] | None = None,
@@ -84,6 +85,9 @@ def generation_profile_context(
                 native_q1_self_attention=native_q1_self_attention,
                 native_q1_rope_cache_self_attention=(
                     native_q1_rope_cache_self_attention
+                ),
+                native_q1_rope_cache_headgroup=(
+                    native_q1_rope_cache_headgroup
                 ),
                 expected_dtype=optimized_expected_dtype,
                 dispatch_counts=optimized_dispatch_counts,

@@ -58,6 +58,7 @@ def attention_runtime_context(
     q1_bmm_cross_attention: bool = False,
     native_q1_self_attention: bool = False,
     native_q1_rope_cache_self_attention: bool = False,
+    native_q1_rope_cache_headgroup: bool = False,
     expected_dtype: torch.dtype = torch.float32,
     dispatch_counts: dict[str, int] | None = None,
 ) -> Iterator[None]:
@@ -78,6 +79,21 @@ def attention_runtime_context(
         native_q1_rope_cache_attention = (
             q1_attention.native_q1_rope_cache_attention
         )
+        if (
+            native_q1_rope_cache_self_attention
+            and native_q1_rope_cache_headgroup
+        ):
+            headgroup_attention = (
+                q1_attention.native_q1_rope_cache_attention_headgroup
+            )
+
+            def native_q1_rope_cache_attention(*args, **kwargs):
+                output = headgroup_attention(*args, **kwargs)
+                if dispatch_counts is not None:
+                    dispatch_counts["native_q1_rope_cache_headgroup"] = (
+                        dispatch_counts.get("native_q1_rope_cache_headgroup", 0) + 1
+                    )
+                return output
     sdpa_attention_forward = None
     if q1_bmm_cross_attention or native_q1_self_attention:
         sdpa_attention_forward = partial(

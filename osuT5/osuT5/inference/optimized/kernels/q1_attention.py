@@ -566,10 +566,198 @@ torch::Tensor q1_rope_cache_attention(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
+
+template<typename scalar_t, int BLOCK_SIZE, int HEADS_PER_CTA>
+__global__ void q1_rope_cache_attention_headgroup_kernel(
+        const scalar_t* __restrict__ qkv,
+        scalar_t* __restrict__ cache_keys,
+        scalar_t* __restrict__ cache_values,
+        const scalar_t* __restrict__ cos,
+        const scalar_t* __restrict__ sin,
+        const int64_t* __restrict__ cache_position,
+        const float* __restrict__ mask,
+        scalar_t* __restrict__ out,
+        int heads,
+        int active_prefix_len,
+        int max_cache_len,
+        int head_dim,
+        long long qkv_qkv_stride,
+        long long qkv_head_stride,
+        long long qkv_dim_stride,
+        long long cache_head_stride,
+        long long cache_len_stride,
+        long long cache_dim_stride,
+        long long cos_dim_stride,
+        long long sin_dim_stride,
+        int has_mask) {
+    const int head = blockIdx.x * HEADS_PER_CTA + threadIdx.y;
+    const int tid = threadIdx.x;
+    const bool active_head = head < heads;
+    const int shared_stride = active_prefix_len + BLOCK_SIZE + head_dim;
+    extern __shared__ float shared_mem[];
+    float* head_shared = shared_mem + threadIdx.y * shared_stride;
+    float* scores = head_shared;
+    float* scratch = scores + active_prefix_len;
+    float* query_shared = scratch + BLOCK_SIZE;
+
+    if (active_head) {
+        const int write_pos = static_cast<int>(cache_position[0]);
+        if (write_pos < 0 || write_pos >= active_prefix_len || write_pos >= max_cache_len) {
+            asm("trap;");
+        }
+        using Traits = Q1ScalarTraits<scalar_t>;
+        const int half_dim = head_dim / 2;
+        for (int dim = tid; dim < head_dim; dim += BLOCK_SIZE) {
+            const int rotated_dim = dim < half_dim ? dim + half_dim : dim - half_dim;
+            const float sign = dim < half_dim ? -1.0f : 1.0f;
+            const float cos_v = Traits::load(cos[dim * cos_dim_stride]);
+            const float sin_v = Traits::load(sin[dim * sin_dim_stride]);
+            const long long q_base = head * qkv_head_stride;
+            const float q_raw = Traits::load(qkv[q_base + dim * qkv_dim_stride]);
+            const float q_rot_raw = Traits::load(qkv[
+                q_base + rotated_dim * qkv_dim_stride]);
+            const float k_raw = Traits::load(qkv[
+                q_base + qkv_qkv_stride + dim * qkv_dim_stride]);
+            const float k_rot_raw = Traits::load(qkv[
+                q_base + qkv_qkv_stride + rotated_dim * qkv_dim_stride]);
+            const float v_raw = Traits::load(qkv[
+                q_base + 2 * qkv_qkv_stride + dim * qkv_dim_stride]);
+            const float q_value = q_raw * cos_v + sign * q_rot_raw * sin_v;
+            const float k_value = k_raw * cos_v + sign * k_rot_raw * sin_v;
+            query_shared[dim] = q_value;
+            cache_keys[head * cache_head_stride + write_pos * cache_len_stride
+                + dim * cache_dim_stride] = Traits::store(k_value);
+            cache_values[head * cache_head_stride + write_pos * cache_len_stride
+                + dim * cache_dim_stride] = Traits::store(v_raw);
+        }
+    }
+    __syncthreads();
+
+    float max_score = -FLT_MAX;
+    if (active_head) {
+        using Traits = Q1ScalarTraits<scalar_t>;
+        const float scale = rsqrtf(static_cast<float>(head_dim));
+        for (int pos = tid; pos < active_prefix_len; pos += BLOCK_SIZE) {
+            float score = 0.0f;
+            const scalar_t* kp = cache_keys + head * cache_head_stride
+                + pos * cache_len_stride;
+            for (int dim = 0; dim < head_dim; ++dim) {
+                score += query_shared[dim] * Traits::load(kp[dim * cache_dim_stride]);
+            }
+            score *= scale;
+            if (has_mask) {
+                score += mask[pos];
+            }
+            scores[pos] = score;
+            max_score = fmaxf(max_score, score);
+        }
+        scratch[tid] = max_score;
+    }
+    __syncthreads();
+    for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+        if (active_head && tid < stride) {
+            scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
+        }
+        __syncthreads();
+    }
+    if (active_head) {
+        max_score = scratch[0];
+    }
+
+    float denom = 0.0f;
+    if (active_head) {
+        for (int pos = tid; pos < active_prefix_len; pos += BLOCK_SIZE) {
+            const float weight = expf(scores[pos] - max_score);
+            scores[pos] = weight;
+            denom += weight;
+        }
+        scratch[tid] = denom;
+    }
+    __syncthreads();
+    for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+        if (active_head && tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (active_head) {
+        using Traits = Q1ScalarTraits<scalar_t>;
+        denom = scratch[0];
+        for (int dim = tid; dim < head_dim; dim += BLOCK_SIZE) {
+            float numer = 0.0f;
+            for (int pos = 0; pos < active_prefix_len; ++pos) {
+                numer += scores[pos] * Traits::load(cache_values[
+                    head * cache_head_stride + pos * cache_len_stride
+                    + dim * cache_dim_stride
+                ]);
+            }
+            out[head * head_dim + dim] = Traits::store(numer / denom);
+        }
+    }
+}
+
+torch::Tensor q1_rope_cache_attention_headgroup(
+        torch::Tensor qkv,
+        torch::Tensor cache_keys,
+        torch::Tensor cache_values,
+        torch::Tensor cos,
+        torch::Tensor sin,
+        torch::Tensor cache_position,
+        c10::optional<torch::Tensor> mask,
+        int64_t active_prefix_len) {
+    const int heads = static_cast<int>(qkv.size(3));
+    const int head_dim = static_cast<int>(qkv.size(4));
+    const int max_cache_len = static_cast<int>(cache_keys.size(2));
+    TORCH_CHECK(qkv.is_cuda() && cache_keys.is_cuda() && cache_values.is_cuda(), "qkv/cache tensors must be CUDA");
+    TORCH_CHECK(cos.is_cuda() && sin.is_cuda() && cache_position.is_cuda(), "rope/cache_position tensors must be CUDA");
+    TORCH_CHECK(qkv.scalar_type() == cache_keys.scalar_type()
+            && qkv.scalar_type() == cache_values.scalar_type()
+            && qkv.scalar_type() == cos.scalar_type()
+            && qkv.scalar_type() == sin.scalar_type(), "qkv/cache/cos/sin dtype mismatch");
+    TORCH_CHECK(qkv.scalar_type() == torch::kFloat32 || qkv.scalar_type() == torch::kFloat16, "qkv/cache/cos/sin must be fp32 or fp16");
+    TORCH_CHECK(cache_position.scalar_type() == torch::kLong && cache_position.numel() == 1, "cache_position must be one int64");
+    TORCH_CHECK(qkv.dim() == 5 && qkv.size(0) == 1 && qkv.size(1) == 1 && qkv.size(2) == 3, "qkv must have shape [1, 1, 3, H, D]");
+    TORCH_CHECK(cache_keys.dim() == 4 && cache_values.dim() == 4 && cache_keys.size(0) == 1 && cache_values.size(0) == 1, "cache tensors must have shape [1, H, L, D]");
+    TORCH_CHECK(cache_keys.size(1) == heads && cache_values.size(1) == heads && cache_keys.size(2) == cache_values.size(2) && cache_keys.size(3) == head_dim && cache_values.size(3) == head_dim, "cache shape mismatch");
+    TORCH_CHECK(cos.dim() == 3 && sin.dim() == 3
+            && cos.size(0) == 1 && cos.size(1) == 1 && cos.size(2) == head_dim
+            && sin.size(0) == 1 && sin.size(1) == 1 && sin.size(2) == head_dim,
+        "cos/sin shape mismatch");
+    TORCH_CHECK(head_dim % 2 == 0 && active_prefix_len > 0 && active_prefix_len <= max_cache_len, "invalid RoPE/cache dimensions");
+    c10::cuda::CUDAGuard device_guard(qkv.device());
+    auto output = torch::empty({1, heads, 1, head_dim}, qkv.options());
+    const float* mask_ptr = nullptr;
+    int has_mask = 0;
+    torch::Tensor mask_contiguous;
+    if (mask.has_value()) {
+        mask_contiguous = mask.value().contiguous();
+        TORCH_CHECK(mask_contiguous.is_cuda() && mask_contiguous.scalar_type() == torch::kFloat32
+            && mask_contiguous.numel() == active_prefix_len, "mask must be CUDA fp32 with active_prefix_len elements");
+        mask_ptr = mask_contiguous.data_ptr<float>();
+        has_mask = 1;
+    }
+    constexpr int block_size = 128;
+    constexpr int heads_per_cta = 2;
+    const size_t shared_bytes = static_cast<size_t>(heads_per_cta)
+        * static_cast<size_t>(active_prefix_len + block_size + head_dim) * sizeof(float);
+    TORCH_CHECK(shared_bytes <= 48 * 1024, "q1 RoPE/cache headgroup shared memory exceeds 48KB");
+    const dim3 grid((heads + heads_per_cta - 1) / heads_per_cta);
+    const dim3 block(block_size, heads_per_cta);
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    if (qkv.scalar_type() == torch::kFloat32) {
+        q1_rope_cache_attention_headgroup_kernel<float, block_size, heads_per_cta><<<grid, block, shared_bytes, stream>>>(
+            qkv.data_ptr<float>(), cache_keys.data_ptr<float>(), cache_values.data_ptr<float>(), cos.data_ptr<float>(), sin.data_ptr<float>(), cache_position.data_ptr<int64_t>(), mask_ptr, output.data_ptr<float>(), heads, active_prefix_len, max_cache_len, head_dim, qkv.stride(2), qkv.stride(3), qkv.stride(4), cache_keys.stride(1), cache_keys.stride(2), cache_keys.stride(3), cos.stride(2), sin.stride(2), has_mask);
+    } else {
+        q1_rope_cache_attention_headgroup_kernel<__half, block_size, heads_per_cta><<<grid, block, shared_bytes, stream>>>(
+            reinterpret_cast<const __half*>(qkv.data_ptr()), reinterpret_cast<__half*>(cache_keys.data_ptr()), reinterpret_cast<__half*>(cache_values.data_ptr()), reinterpret_cast<const __half*>(cos.data_ptr()), reinterpret_cast<const __half*>(sin.data_ptr()), cache_position.data_ptr<int64_t>(), mask_ptr, reinterpret_cast<__half*>(output.data_ptr()), heads, active_prefix_len, max_cache_len, head_dim, qkv.stride(2), qkv.stride(3), qkv.stride(4), cache_keys.stride(1), cache_keys.stride(2), cache_keys.stride(3), cos.stride(2), sin.stride(2), has_mask);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
 """
 
     _NATIVE_Q1_ATTENTION = load_inline(
-        name="mapperatorinator_q1_attention",
+        name="mapperatorinator_q1_attention_headgroup",
         cpp_sources=(
             "#include <torch/extension.h>\n"
             "torch::Tensor q1_attention(torch::Tensor q, torch::Tensor k, torch::Tensor v, "
@@ -577,9 +765,12 @@ torch::Tensor q1_rope_cache_attention(
             "torch::Tensor q1_rope_cache_attention(torch::Tensor qkv, torch::Tensor cache_keys, "
             "torch::Tensor cache_values, torch::Tensor cos, torch::Tensor sin, "
             "torch::Tensor cache_position, c10::optional<torch::Tensor> mask, int64_t active_prefix_len);\n"
+            "torch::Tensor q1_rope_cache_attention_headgroup(torch::Tensor qkv, torch::Tensor cache_keys, "
+            "torch::Tensor cache_values, torch::Tensor cos, torch::Tensor sin, "
+            "torch::Tensor cache_position, c10::optional<torch::Tensor> mask, int64_t active_prefix_len);\n"
         ),
         cuda_sources=cuda_source,
-        functions=["q1_attention", "q1_rope_cache_attention"],
+        functions=["q1_attention", "q1_rope_cache_attention", "q1_rope_cache_attention_headgroup"],
         extra_cuda_cflags=["-O3"],
         verbose=False,
     )
@@ -639,5 +830,30 @@ def native_q1_rope_cache_attention(
         sin,
         cache_position,
         mask,
+        int(active_prefix_length),
+    )
+
+
+def native_q1_rope_cache_attention_headgroup(
+        qkv: torch.Tensor,
+        cache_keys: torch.Tensor,
+        cache_values: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        cache_position: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        active_prefix_length: int,
+) -> torch.Tensor:
+    _validate_rope_cache_inputs(
+        qkv, cache_keys, cache_values, cos, sin, cache_position, active_prefix_length
+    )
+    mask = _native_mask(
+        attention_mask,
+        device=qkv.device,
+        expected_numel=int(active_prefix_length),
+    )
+    extension = _load_native_q1_attention()
+    return extension.q1_rope_cache_attention_headgroup(
+        qkv, cache_keys, cache_values, cos, sin, cache_position, mask,
         int(active_prefix_length),
     )
