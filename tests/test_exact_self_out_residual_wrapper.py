@@ -11,6 +11,8 @@ def test_exact_self_out_residual_wrapper_uses_unique_tmpdir() -> None:
     assert "SLURM_TMPDIR" in source
     assert "torch_extensions-exact-self-out-residual-" in source
     assert "--allow-dispatch-delta" in source
+    assert "*native_self_out_residual*" in source
+    assert "*optimized_cuda_graphs*" in source
     assert "exact_self_out_residual_reciprocal=PASS" in source
     assert "MAPPERATORINATOR_ALLOW_PARALLEL_RECIPROCAL:-0" in source
 

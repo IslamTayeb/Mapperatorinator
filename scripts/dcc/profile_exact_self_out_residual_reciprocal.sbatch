@@ -233,6 +233,7 @@ run_role baseline_second baseline
   --mode "$ANALYSIS_MODE" \
   --allow-dispatch-delta '*native_self_out_residual*' \
   --allow-dispatch-delta '*self_out_residual*' \
+  --allow-dispatch-delta '*optimized_cuda_graphs*' \
   --json-output "$RUN_ROOT/analysis.json" \
   --text-output "$RUN_ROOT/analysis.txt"
 require_nonempty "$RUN_ROOT/analysis.json"
