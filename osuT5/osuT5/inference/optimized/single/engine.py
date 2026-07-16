@@ -228,9 +228,7 @@ def _generate_window(
     if context_type is not None:
         context_type = ContextType(context_type)
     if precision != preset.precision or cfg_scale != 1.0:
-        raise ValueError(
-            "optimized single runtime configuration changed after validation."
-        )
+        raise ValueError("optimized single runtime configuration changed after validation.")
     if batch_size != 1 and not allow_batched_decode:
         raise ValueError("optimized single runtime requires batch_size=1.")
     if int(generate_kwargs.get("num_beams", 1)) != 1:
@@ -245,17 +243,25 @@ def _generate_window(
         specialized_dispatch_batch_size <= 0
     ):
         raise ValueError("specialized dispatch batch size must be positive")
-    specialized_batch = batch_size == 1 and specialized_dispatch_batch_size in {None, 1}
+    specialized_batch = (
+        batch_size == 1
+        and specialized_dispatch_batch_size in {None, 1}
+    )
     batched_policy_disabled_reason = (
         "batch_gt_1"
         if batch_size > 1
-        else "nominal_batched_policy" if not specialized_batch else None
+        else "nominal_batched_policy"
+        if not specialized_batch
+        else None
     )
     q1_bmm_cross_attention = specialized_batch
-    native_q1_self_attention = specialized_batch and context_type != ContextType.TIMING
+    native_q1_self_attention = (
+        specialized_batch and context_type != ContextType.TIMING
+    )
     native_q1_rope_cache_self_attention = native_q1_self_attention
-    native_cross_mlp_tail = specialized_batch and _native_cross_mlp_tail_enabled(
-        context_type=context_type
+    native_cross_mlp_tail = (
+        specialized_batch
+        and _native_cross_mlp_tail_enabled(context_type=context_type)
     )
     processors = _build_logits_processor_list(
         tokenizer,
@@ -292,7 +298,9 @@ def _generate_window(
     graph_capture_seconds_before = float(
         getattr(context_state, "graph_capture_seconds", 0.0)
     )
-    graph_decode_replays_before = int(getattr(context_state, "graph_decode_replays", 0))
+    graph_decode_replays_before = int(
+        getattr(context_state, "graph_decode_replays", 0)
+    )
     dispatch_counts = {
         "native_q1_rope_cache_self_attention": 0,
         "native_q1_self_attention": 0,
@@ -325,7 +333,9 @@ def _generate_window(
             return prepared_proj_out(hidden_states, weight, bias)
 
     rng_before = (
-        rng_progression_signature(model.device) if collect_strict_exactness else None
+        rng_progression_signature(model.device)
+        if collect_strict_exactness
+        else None
     )
     with torch.autocast(
         device_type=model.device.type,
@@ -390,104 +400,95 @@ def _generate_window(
         pad_token_id,
         elapsed_seconds,
     )
-    stats.update(
-        {
-            "precision": precision,
-            "context_type": context_type.value if context_type is not None else None,
-            "decoder_loop_backend": "active_prefix_cuda_graph",
-            "torch_compile_enabled": False,
-            "optimized_effective_config_version": preset.version,
-            "optimized_batched_super_timing": allow_batched_decode,
-            "optimized_dispatch_mode": (
-                "accepted_batch1" if specialized_batch else "framework_batch"
-            ),
-            "optimized_dispatch_policy": {
-                "q1_bmm_cross_attention": {
-                    "requested": specialized_batch,
-                    "enabled": q1_bmm_cross_attention,
-                    "disabled_reason": (
-                        None
-                        if q1_bmm_cross_attention
-                        else batched_policy_disabled_reason
-                    ),
-                },
-                "native_q1_self_attention": {
-                    "requested": specialized_batch,
-                    "enabled": native_q1_self_attention,
-                    "disabled_reason": (
-                        None
-                        if native_q1_self_attention
-                        else (
-                            batched_policy_disabled_reason
-                            if not specialized_batch
-                            else "timing_context"
-                        )
-                    ),
-                },
-                "native_q1_rope_cache_self_attention": {
-                    "requested": specialized_batch,
-                    "enabled": native_q1_rope_cache_self_attention,
-                    "disabled_reason": (
-                        None
-                        if native_q1_rope_cache_self_attention
-                        else (
-                            batched_policy_disabled_reason
-                            if not specialized_batch
-                            else "timing_context"
-                        )
-                    ),
-                },
-                "compiled_proj_out": {
-                    "requested": compiled_proj_out_requested(),
-                    "enabled": compiled_proj_out is not None,
-                    "disabled_reason": (
-                        None
-                        if compiled_proj_out is not None
-                        else (
-                            None
-                            if not compiled_proj_out_requested()
-                            else "prepare_failed"
-                        )
-                    ),
-                },
-                "native_cross_mlp_tail": {
-                    "requested": specialized_batch,
-                    "enabled": native_cross_mlp_tail,
-                    "disabled_reason": (
-                        None
-                        if native_cross_mlp_tail
-                        else (
-                            batched_policy_disabled_reason
-                            if not specialized_batch
-                            else "timing_context"
-                        )
-                    ),
-                },
+    stats.update({
+        "precision": precision,
+        "context_type": context_type.value if context_type is not None else None,
+        "decoder_loop_backend": "active_prefix_cuda_graph",
+        "torch_compile_enabled": False,
+        "optimized_effective_config_version": preset.version,
+        "optimized_batched_super_timing": allow_batched_decode,
+        "optimized_dispatch_mode": (
+            "accepted_batch1" if specialized_batch else "framework_batch"
+        ),
+        "optimized_dispatch_policy": {
+            "q1_bmm_cross_attention": {
+                "requested": specialized_batch,
+                "enabled": q1_bmm_cross_attention,
+                "disabled_reason": (
+                    None
+                    if q1_bmm_cross_attention
+                    else batched_policy_disabled_reason
+                ),
             },
-            "native_cross_mlp_tail_requested": specialized_batch,
-            "native_cross_mlp_tail_enabled": native_cross_mlp_tail,
-            "native_cross_mlp_tail_disabled_reason": (
-                batched_policy_disabled_reason
-                if not specialized_batch
-                else "timing_context" if not native_cross_mlp_tail else None
-            ),
-            "optimized_dispatch_capture_hits": dict(dispatch_counts),
-            "decode_graph_count_before": graph_count_before,
-            "decode_graph_count_after": int(getattr(context_state, "graph_count", 0)),
-            "decode_graph_count_delta": (
-                int(getattr(context_state, "graph_count", 0)) - graph_count_before
-            ),
-            "decode_graph_capture_seconds_delta": (
-                float(getattr(context_state, "graph_capture_seconds", 0.0))
-                - graph_capture_seconds_before
-            ),
-            "decode_graph_replays_delta": (
-                int(getattr(context_state, "graph_decode_replays", 0))
-                - graph_decode_replays_before
-            ),
-            "optimized_cuda_graphs": context_state.graph_profile_summary(),
-        }
-    )
+            "native_q1_self_attention": {
+                "requested": specialized_batch,
+                "enabled": native_q1_self_attention,
+                "disabled_reason": (
+                    None
+                    if native_q1_self_attention
+                    else batched_policy_disabled_reason
+                    if not specialized_batch
+                    else "timing_context"
+                ),
+            },
+            "native_q1_rope_cache_self_attention": {
+                "requested": specialized_batch,
+                "enabled": native_q1_rope_cache_self_attention,
+                "disabled_reason": (
+                    None
+                    if native_q1_rope_cache_self_attention
+                    else batched_policy_disabled_reason
+                    if not specialized_batch
+                    else "timing_context"
+                ),
+            },
+            "compiled_proj_out": {
+                "requested": compiled_proj_out_requested(),
+                "enabled": compiled_proj_out is not None,
+                "disabled_reason": (
+                    None if compiled_proj_out is not None
+                    else None if not compiled_proj_out_requested()
+                    else "prepare_failed"
+                ),
+            },
+            "native_cross_mlp_tail": {
+                "requested": specialized_batch,
+                "enabled": native_cross_mlp_tail,
+                "disabled_reason": (
+                    None
+                    if native_cross_mlp_tail
+                    else batched_policy_disabled_reason
+                    if not specialized_batch
+                    else "timing_context"
+                ),
+            },
+        },
+        "native_cross_mlp_tail_requested": specialized_batch,
+        "native_cross_mlp_tail_enabled": native_cross_mlp_tail,
+        "native_cross_mlp_tail_disabled_reason": (
+            batched_policy_disabled_reason
+            if not specialized_batch
+            else "timing_context"
+            if not native_cross_mlp_tail
+            else None
+        ),
+        "optimized_dispatch_capture_hits": dict(dispatch_counts),
+        "decode_graph_count_before": graph_count_before,
+        "decode_graph_count_after": int(getattr(context_state, "graph_count", 0)),
+        "decode_graph_count_delta": (
+            int(getattr(context_state, "graph_count", 0))
+            - graph_count_before
+        ),
+        "decode_graph_capture_seconds_delta": (
+            float(getattr(context_state, "graph_capture_seconds", 0.0))
+            - graph_capture_seconds_before
+        ),
+        "decode_graph_replays_delta": (
+            int(getattr(context_state, "graph_decode_replays", 0))
+            - graph_decode_replays_before
+        ),
+        "optimized_cuda_graphs": context_state.graph_profile_summary(),
+    })
     if compiled_proj_out_evidence is not None:
         stats["compiled_proj_out"] = {**compiled_proj_out_evidence, "enabled": True}
     if strict_exactness is not None:
@@ -501,13 +502,14 @@ class OptimizedSingleRuntime:
 
     def __post_init__(self):
         if not isinstance(self.preset, OptimizedPreset):
-            raise TypeError("optimized runtime requires an immutable OptimizedPreset.")
-        if not any(
-            self.preset is candidate for candidate in OPTIMIZED_PRESETS.values()
-        ):
-            raise ValueError(
-                "optimized runtime requires a registered precision preset."
+            raise TypeError(
+                "optimized runtime requires an immutable OptimizedPreset."
             )
+        if not any(
+            self.preset is candidate
+            for candidate in OPTIMIZED_PRESETS.values()
+        ):
+            raise ValueError("optimized runtime requires a registered precision preset.")
 
     def new_context_state(self) -> ProductionDecodeSession:
         return ProductionDecodeSession()
@@ -581,13 +583,15 @@ class OptimizedSuperTimingRuntime:
 
     def __post_init__(self):
         if not any(
-            self.preset is candidate for candidate in OPTIMIZED_PRESETS.values()
+            self.preset is candidate
+            for candidate in OPTIMIZED_PRESETS.values()
         ):
             raise ValueError(
                 "optimized super-timing runtime requires a registered preset"
             )
-        if isinstance(self.configured_max_batch_size, bool) or not isinstance(
-            self.configured_max_batch_size, int
+        if (
+            isinstance(self.configured_max_batch_size, bool)
+            or not isinstance(self.configured_max_batch_size, int)
         ):
             raise TypeError(
                 "optimized super-timing configured max batch size must be an integer"
@@ -715,7 +719,9 @@ class OptimizedSuperTimingRuntime:
                 "osuT5.osuT5.inference.optimized.single.engine"
             ),
             "optimized_super_timing_result_class": (
-                self.preset.result_class if self.public_wiring else "component-scout"
+                self.preset.result_class
+                if self.public_wiring
+                else "component-scout"
             ),
         }
 

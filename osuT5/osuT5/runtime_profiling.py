@@ -45,17 +45,17 @@ def detail_ranges_context(enabled: bool) -> Iterator[None]:
 
 @contextmanager
 def generation_profile_context(
-    *,
-    detail_ranges: bool = False,
-    sdpa_backend: str | None = None,
-    active_prefix_self_attention_length: int | None = None,
-    q1_bmm_cross_attention: bool = False,
-    native_q1_self_attention: bool = False,
-    native_q1_rope_cache_self_attention: bool = False,
-    native_cross_mlp_tail: bool = False,
-    optimized_expected_dtype: torch.dtype = torch.float32,
-    optimized_dispatch_counts: dict[str, int] | None = None,
-    compiled_proj_out=None,
+        *,
+        detail_ranges: bool = False,
+        sdpa_backend: str | None = None,
+        active_prefix_self_attention_length: int | None = None,
+        q1_bmm_cross_attention: bool = False,
+        native_q1_self_attention: bool = False,
+        native_q1_rope_cache_self_attention: bool = False,
+        native_cross_mlp_tail: bool = False,
+        optimized_expected_dtype: torch.dtype = torch.float32,
+        optimized_dispatch_counts: dict[str, int] | None = None,
+        compiled_proj_out=None,
 ) -> Iterator[None]:
     """Temporarily enable opt-in generation profiling controls."""
     global _DETAIL_RANGES_ENABLED
@@ -153,17 +153,13 @@ def sdpa_backend_context(requested_backend: str | None) -> Iterator[None]:
     try:
         from torch.nn.attention import SDPBackend, sdpa_kernel
     except ImportError as exc:
-        raise RuntimeError(
-            "This PyTorch build does not expose torch.nn.attention.sdpa_kernel"
-        ) from exc
+        raise RuntimeError("This PyTorch build does not expose torch.nn.attention.sdpa_kernel") from exc
 
     backend_key = requested_backend.strip().lower()
     backend_name = _SDPA_BACKEND_ALIASES.get(backend_key)
     if backend_name is None:
         valid = ", ".join(sorted(_SDPA_BACKEND_ALIASES))
-        raise ValueError(
-            f"Unknown SDPA backend '{requested_backend}'. Expected one of: {valid}"
-        )
+        raise ValueError(f"Unknown SDPA backend '{requested_backend}'. Expected one of: {valid}")
 
     try:
         backend = getattr(SDPBackend, backend_name)
