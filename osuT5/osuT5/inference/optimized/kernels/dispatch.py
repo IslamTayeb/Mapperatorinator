@@ -189,6 +189,7 @@ def q1_rope_cache_self_attention_forward(
     native_q1_rope_cache_attention: Callable[..., torch.Tensor] | None,
     expected_dtype: torch.dtype = torch.float32,
     dispatch_counts: dict[str, int] | None = None,
+    compiled_wqkv=None,
 ) -> tuple[torch.Tensor] | None:
     prefix_length = active_prefix_self_attention_length()
     use_native_q1_rope_cache_self_attention = (
@@ -207,7 +208,37 @@ def q1_rope_cache_self_attention_forward(
     if not use_native_q1_rope_cache_self_attention:
         return None
 
-    if profile_ranges:
+    if compiled_wqkv is not None:
+        if profile_ranges:
+            with profile_range(f"{range_prefix}.qkv_proj"):
+                qkv = compiled_wqkv(
+                    hidden_states,
+                    module.Wqkv.weight,
+                    module.Wqkv.bias,
+                ).view(
+                    bs,
+                    -1,
+                    3,
+                    module.num_heads,
+                    module.head_dim,
+                )
+        else:
+            qkv = compiled_wqkv(
+                hidden_states,
+                module.Wqkv.weight,
+                module.Wqkv.bias,
+            ).view(
+                bs,
+                -1,
+                3,
+                module.num_heads,
+                module.head_dim,
+            )
+        if dispatch_counts is not None:
+            dispatch_counts["compiled_self_wqkv"] = (
+                dispatch_counts.get("compiled_self_wqkv", 0) + 1
+            )
+    elif profile_ranges:
         with profile_range(f"{range_prefix}.qkv_proj"):
             qkv = module.Wqkv(hidden_states).view(
                 bs,

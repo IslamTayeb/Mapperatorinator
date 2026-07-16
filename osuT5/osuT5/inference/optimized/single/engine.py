@@ -306,7 +306,27 @@ def _generate_window(
         "native_q1_self_attention": 0,
         "q1_bmm_cross_attention": 0,
         "native_cross_mlp_tail": 0,
+        "compiled_self_wqkv": 0,
+        "compiled_self_wo": 0,
     }
+
+    compiled_wqkv = None
+    compiled_wo = None
+    compiled_self_proj_evidence = None
+    from ..kernels.compiled_self_proj_activation import compiled_self_proj_requested
+
+    if compiled_self_proj_requested() and native_q1_rope_cache_self_attention:
+        from ..kernels.compiled_self_proj import prepare_compiled_self_projections
+
+        compiled_wqkv, prepared_wo, compiled_self_proj_evidence = (
+            prepare_compiled_self_projections(model, expected_dtype)
+        )
+
+        def compiled_wo(hidden_states, weight, bias):
+            dispatch_counts["compiled_self_wo"] = (
+                dispatch_counts.get("compiled_self_wo", 0) + 1
+            )
+            return prepared_wo(hidden_states, weight, bias)
 
     rng_before = (
         rng_progression_signature(model.device)
@@ -324,6 +344,8 @@ def _generate_window(
         native_cross_mlp_tail=native_cross_mlp_tail,
         optimized_expected_dtype=expected_dtype,
         optimized_dispatch_counts=dispatch_counts,
+        compiled_wqkv=compiled_wqkv,
+        compiled_wo=compiled_wo,
     ):
         if sync_model_timing:
             sync_cuda_for_model(model)
@@ -428,6 +450,19 @@ def _generate_window(
                     else "timing_context"
                 ),
             },
+            "compiled_self_proj": {
+                "requested": compiled_self_proj_requested(),
+                "enabled": compiled_wqkv is not None and compiled_wo is not None,
+                "disabled_reason": (
+                    None
+                    if compiled_wqkv is not None and compiled_wo is not None
+                    else None
+                    if not compiled_self_proj_requested()
+                    else "native_q1_rope_cache_self_attention_disabled"
+                    if not native_q1_rope_cache_self_attention
+                    else "prepare_failed"
+                ),
+            },
         },
         "native_cross_mlp_tail_requested": specialized_batch,
         "native_cross_mlp_tail_enabled": native_cross_mlp_tail,
@@ -455,6 +490,11 @@ def _generate_window(
         ),
         "optimized_cuda_graphs": context_state.graph_profile_summary(),
     })
+    if compiled_self_proj_evidence is not None:
+        stats["compiled_self_proj"] = {
+            **compiled_self_proj_evidence,
+            "enabled": True,
+        }
     if strict_exactness is not None:
         stats["strict_exactness"] = strict_exactness
     return result, stats

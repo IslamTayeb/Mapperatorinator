@@ -671,7 +671,12 @@ class VarWhisperAttention(nn.Module):
                         )
 
         hidden_states, *rest = attn_outputs
-        if profile_ranges:
+        compiled_out_proj = attention_runtime_hooks().compiled_out_proj
+        if compiled_out_proj is not None:
+            hidden_states = self.out_drop(
+                compiled_out_proj(hidden_states, self.Wo.weight, self.Wo.bias)
+            )
+        elif profile_ranges:
             with profile_range(f"{range_prefix}.out_proj"):
                 hidden_states = self.out_drop(self.Wo(hidden_states))
         else:

@@ -12,6 +12,7 @@ class AttentionRuntimeHooks:
     sdpa_attention_inputs: Callable[..., Any] | None = None
     sdpa_attention_forward: Callable[..., Any] | None = None
     q1_rope_cache_self_attention_forward: Callable[..., Any] | None = None
+    compiled_out_proj: Callable[..., Any] | None = None
 
 
 @dataclass(frozen=True)

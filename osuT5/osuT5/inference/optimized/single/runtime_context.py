@@ -60,6 +60,8 @@ def attention_runtime_context(
     native_q1_rope_cache_self_attention: bool = False,
     expected_dtype: torch.dtype = torch.float32,
     dispatch_counts: dict[str, int] | None = None,
+    compiled_wqkv=None,
+    compiled_wo=None,
 ) -> Iterator[None]:
     if expected_dtype not in {torch.float32, torch.float16}:
         raise TypeError("optimized attention supports only float32 or float16")
@@ -97,6 +99,7 @@ def attention_runtime_context(
             ),
             expected_dtype=expected_dtype,
             dispatch_counts=dispatch_counts,
+            compiled_wqkv=compiled_wqkv,
         )
     hooks = AttentionRuntimeHooks(
         sdpa_attention_inputs=attention_runtime_hooks().sdpa_attention_inputs,
@@ -104,6 +107,7 @@ def attention_runtime_context(
         q1_rope_cache_self_attention_forward=(
             q1_rope_cache_self_attention
         ),
+        compiled_out_proj=compiled_wo,
     )
     with attention_runtime_hooks_context(hooks):
         yield

@@ -55,6 +55,8 @@ def generation_profile_context(
         native_cross_mlp_tail: bool = False,
         optimized_expected_dtype: torch.dtype = torch.float32,
         optimized_dispatch_counts: dict[str, int] | None = None,
+        compiled_wqkv=None,
+        compiled_wo=None,
 ) -> Iterator[None]:
     """Temporarily enable opt-in generation profiling controls."""
     global _DETAIL_RANGES_ENABLED
@@ -87,6 +89,8 @@ def generation_profile_context(
                 ),
                 expected_dtype=optimized_expected_dtype,
                 dispatch_counts=optimized_dispatch_counts,
+                compiled_wqkv=compiled_wqkv,
+                compiled_wo=compiled_wo,
             )
         optimized_decoder_layer_context = decoder_layer_runtime_hooks_context(
             DecoderLayerRuntimeHooks()
