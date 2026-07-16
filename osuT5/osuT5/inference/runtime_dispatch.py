@@ -19,10 +19,20 @@ class DecoderLayerRuntimeHooks:
     cross_mlp_tail_forward: Callable[..., Any] | None = None
 
 
+@dataclass(frozen=True)
+class OutputProjectionRuntimeHooks:
+    """Opt-in final LM-head projection hook (cold default off)."""
+
+    compiled_proj_out: Callable[..., Any] | None = None
+    dispatch_counts: dict[str, int] | None = None
+
+
 _EMPTY_ATTENTION_RUNTIME_HOOKS = AttentionRuntimeHooks()
 _ATTENTION_RUNTIME_HOOKS = _EMPTY_ATTENTION_RUNTIME_HOOKS
 _EMPTY_DECODER_LAYER_RUNTIME_HOOKS = DecoderLayerRuntimeHooks()
 _DECODER_LAYER_RUNTIME_HOOKS = _EMPTY_DECODER_LAYER_RUNTIME_HOOKS
+_EMPTY_OUTPUT_PROJECTION_RUNTIME_HOOKS = OutputProjectionRuntimeHooks()
+_OUTPUT_PROJECTION_RUNTIME_HOOKS = _EMPTY_OUTPUT_PROJECTION_RUNTIME_HOOKS
 
 
 def attention_runtime_hooks() -> AttentionRuntimeHooks:
@@ -31,6 +41,10 @@ def attention_runtime_hooks() -> AttentionRuntimeHooks:
 
 def decoder_layer_runtime_hooks() -> DecoderLayerRuntimeHooks:
     return _DECODER_LAYER_RUNTIME_HOOKS
+
+
+def output_projection_runtime_hooks() -> OutputProjectionRuntimeHooks:
+    return _OUTPUT_PROJECTION_RUNTIME_HOOKS
 
 
 @contextmanager
@@ -59,3 +73,17 @@ def decoder_layer_runtime_hooks_context(
         yield
     finally:
         _DECODER_LAYER_RUNTIME_HOOKS = previous
+
+
+@contextmanager
+def output_projection_runtime_hooks_context(
+    hooks: OutputProjectionRuntimeHooks,
+) -> Iterator[None]:
+    global _OUTPUT_PROJECTION_RUNTIME_HOOKS
+
+    previous = _OUTPUT_PROJECTION_RUNTIME_HOOKS
+    _OUTPUT_PROJECTION_RUNTIME_HOOKS = hooks
+    try:
+        yield
+    finally:
+        _OUTPUT_PROJECTION_RUNTIME_HOOKS = previous

@@ -1,4 +1,5 @@
 """PyTorch VarWhisper model."""
+
 import copy
 import math
 from functools import partial
@@ -12,7 +13,12 @@ from torch import nn
 from torch.nn import CrossEntropyLoss
 from transformers import GradientCheckpointingLayer
 from transformers.activations import ACT2FN
-from transformers.cache_utils import Cache, DynamicCache, EncoderDecoderCache, StaticCache
+from transformers.cache_utils import (
+    Cache,
+    DynamicCache,
+    EncoderDecoderCache,
+    StaticCache,
+)
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 from transformers.modeling_outputs import (
     BaseModelOutput,
@@ -35,12 +41,17 @@ from ...runtime_profiling import (
 from ...inference.runtime_dispatch import (
     attention_runtime_hooks,
     decoder_layer_runtime_hooks,
+    output_projection_runtime_hooks,
 )
 from .configuration_varwhisper import VarWhisperConfig
 
 if is_flash_attn_2_available():
-    from flash_attn.flash_attn_interface import flash_attn_varlen_kvpacked_func, flash_attn_varlen_qkvpacked_func, \
-    flash_attn_qkvpacked_func, flash_attn_kvpacked_func
+    from flash_attn.flash_attn_interface import (
+        flash_attn_varlen_kvpacked_func,
+        flash_attn_varlen_qkvpacked_func,
+        flash_attn_qkvpacked_func,
+        flash_attn_kvpacked_func,
+    )
     from flash_attn.layers.rotary import RotaryEmbedding
     from flash_attn.ops.triton.rotary import apply_rotary
 else:
@@ -174,7 +185,9 @@ class VarWhisperFlashRotaryEmbedding(RotaryEmbedding):
             should pass in max_seqlen, which will update the cos / sin cache up to that length.
         """
         if cu_seqlens is None:
-            return super().forward(qkv, max_seqlen=max_seqlen, seqlen_offset=seqlen_offset)
+            return super().forward(
+                qkv, max_seqlen=max_seqlen, seqlen_offset=seqlen_offset
+            )
 
         if max_seqlen is not None:
             self._update_cos_sin_cache(max_seqlen, device=qkv.device, dtype=qkv.dtype)
@@ -197,15 +210,14 @@ class VarWhisperRotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
 
     def __init__(
-            self,
-            config: VarWhisperConfig,
-            max_seqlen: Optional[int] = None,
-            device=None
+        self, config: VarWhisperConfig, max_seqlen: Optional[int] = None, device=None
     ):
         super().__init__()
         # BC: "rope_type" was originally "type"
         if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
-            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
+            self.rope_type = config.rope_scaling.get(
+                "rope_type", config.rope_scaling.get("type")
+            )
         else:
             self.rope_type = "default"
         self.max_seq_len_cached = config.max_position_embeddings
@@ -214,19 +226,32 @@ class VarWhisperRotaryEmbedding(nn.Module):
         self.config = config
         self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
-        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device, seq_len=max_seqlen)
+        inv_freq, self.attention_scaling = self.rope_init_fn(
+            self.config, device, seq_len=max_seqlen
+        )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = self.inv_freq
 
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
     def forward(self, x, position_ids):
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+        inv_freq_expanded = (
+            self.inv_freq[None, :, None]
+            .float()
+            .expand(position_ids.shape[0], -1, 1)
+            .to(x.device)
+        )
         position_ids_expanded = position_ids[:, None, :].float()
 
-        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+        device_type = (
+            x.device.type
+            if isinstance(x.device.type, str) and x.device.type != "mps"
+            else "cpu"
+        )
         with torch.autocast(device_type=device_type, enabled=False):  # Force float32
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            freqs = (
+                inv_freq_expanded.float() @ position_ids_expanded.float()
+            ).transpose(1, 2)
             emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos() * self.attention_scaling
             sin = emb.sin() * self.attention_scaling
@@ -288,8 +313,12 @@ def eager_attention_forward(
     attn_weights = attn_weights + attention_mask
 
     # upcast attention to fp32
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    attn_weights = nn.functional.dropout(attn_weights, p=module.attention_dropout, training=module.training)
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+        query.dtype
+    )
+    attn_weights = nn.functional.dropout(
+        attn_weights, p=module.attention_dropout, training=module.training
+    )
     attn_output = torch.matmul(attn_weights, value)
     attn_output = attn_output.transpose(1, 2).contiguous()
     attn_output = attn_output.view(bs, -1, dim)
@@ -325,18 +354,31 @@ def flash_attention_forward(
         if cu_seqlens is None:
             attn_func = partial(flash_attn_qkvpacked_func, qkv=qkv)
         else:
-            attn_func = partial(flash_attn_varlen_qkvpacked_func, qkv=qkv, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+            attn_func = partial(
+                flash_attn_varlen_qkvpacked_func,
+                qkv=qkv,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
     else:
         if cu_seqlens is None:
-            attn_func = partial(flash_attn_kvpacked_func,q=qkv, kv=kv)
+            attn_func = partial(flash_attn_kvpacked_func, q=qkv, kv=kv)
         else:
-            attn_func = partial(flash_attn_varlen_kvpacked_func, q=qkv, kv=kv, cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens_k, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen_k)
+            attn_func = partial(
+                flash_attn_varlen_kvpacked_func,
+                q=qkv,
+                kv=kv,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen_k,
+            )
 
     attn = attn_func(
         dropout_p=module.attention_dropout if module.training else 0.0,
         deterministic=module.deterministic_flash_attn,
         window_size=local_attention,
-        causal=module.is_causal
+        causal=module.is_causal,
     )
 
     if convert_dtype:
@@ -422,13 +464,13 @@ class VarWhisperAttention(nn.Module):
     """
 
     def __init__(
-            self,
-            config: VarWhisperConfig,
-            num_heads: int,
-            max_position_embeddings: int,
-            layer_idx: int = 1,
-            is_causal: bool = False,
-            is_cross_attention: bool = False,
+        self,
+        config: VarWhisperConfig,
+        num_heads: int,
+        max_position_embeddings: int,
+        layer_idx: int = 1,
+        is_causal: bool = False,
+        is_cross_attention: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -448,14 +490,27 @@ class VarWhisperAttention(nn.Module):
         self.head_dim = config.d_model // self.num_heads
         self.all_head_size = self.head_dim * self.num_heads
         if self.is_cross_attention:
-            self.Wq = nn.Linear(config.d_model, 1 * self.all_head_size, bias=config.attention_bias)
-            self.Wkv = nn.Linear(config.d_model, 2 * self.all_head_size, bias=config.attention_bias)
+            self.Wq = nn.Linear(
+                config.d_model, 1 * self.all_head_size, bias=config.attention_bias
+            )
+            self.Wkv = nn.Linear(
+                config.d_model, 2 * self.all_head_size, bias=config.attention_bias
+            )
         else:
-            self.Wqkv = nn.Linear(config.d_model, 3 * self.all_head_size, bias=config.attention_bias)
+            self.Wqkv = nn.Linear(
+                config.d_model, 3 * self.all_head_size, bias=config.attention_bias
+            )
 
         if layer_idx % config.global_attn_every_n_layers != 0:
-            self.local_attention = (config.local_attention // 2, config.local_attention // 2)
-            rope_theta = config.local_rope_theta if config.local_rope_theta is not None else config.global_rope_theta
+            self.local_attention = (
+                config.local_attention // 2,
+                config.local_attention // 2,
+            )
+            rope_theta = (
+                config.local_rope_theta
+                if config.local_rope_theta is not None
+                else config.global_rope_theta
+            )
             self.max_position_embeddings = config.local_attention
         else:
             self.local_attention = (-1, -1)
@@ -465,7 +520,9 @@ class VarWhisperAttention(nn.Module):
             self.rotary_emb = None
         elif config._attn_implementation == "flash_attention_2":
             self.rotary_emb = VarWhisperFlashRotaryEmbedding(
-                dim=self.head_dim, max_seqlen=self.max_position_embeddings, base=rope_theta
+                dim=self.head_dim,
+                max_seqlen=self.max_position_embeddings,
+                base=rope_theta,
             )
         else:
             config_copy = copy.deepcopy(config)
@@ -475,7 +532,11 @@ class VarWhisperAttention(nn.Module):
             self.rotary_emb = VarWhisperRotaryEmbedding(config=config_copy)
 
         self.Wo = nn.Linear(config.d_model, config.d_model, bias=config.attention_bias)
-        self.out_drop = nn.Dropout(config.attention_dropout) if config.attention_dropout > 0.0 else nn.Identity()
+        self.out_drop = (
+            nn.Dropout(config.attention_dropout)
+            if config.attention_dropout > 0.0
+            else nn.Identity()
+        )
 
     def forward(
         self,
@@ -526,15 +587,25 @@ class VarWhisperAttention(nn.Module):
         if self.config._attn_implementation == "flash_attention_2":
             if self.is_cross_attention:
                 q = self.Wq(hidden_states)
-                q = q.view(-1, self.num_heads, self.head_dim) if is_varlen else q.view(bs, -1, self.num_heads, self.head_dim)
+                q = (
+                    q.view(-1, self.num_heads, self.head_dim)
+                    if is_varlen
+                    else q.view(bs, -1, self.num_heads, self.head_dim)
+                )
 
                 if past_key_value and is_updated:
                     # reuse k,v, cross_attentions
                     key_states, value_states = past_key_value[self.layer_idx]
-                    kv = torch.stack((key_states, value_states), dim=2).transpose(1, 3)  # (bs, seqlen, 2, nheads, head_dim)
+                    kv = torch.stack((key_states, value_states), dim=2).transpose(
+                        1, 3
+                    )  # (bs, seqlen, 2, nheads, head_dim)
                 else:
                     kv = self.Wkv(key_value_states)
-                    kv = kv.view(-1, 2, self.num_heads, self.head_dim) if is_varlen else kv.view(bs, -1, 2, self.num_heads, self.head_dim)
+                    kv = (
+                        kv.view(-1, 2, self.num_heads, self.head_dim)
+                        if is_varlen
+                        else kv.view(bs, -1, 2, self.num_heads, self.head_dim)
+                    )
 
                     if past_key_value is not None:
                         key_states, value_states = kv.transpose(1, 3).unbind(dim=2)
@@ -543,24 +614,43 @@ class VarWhisperAttention(nn.Module):
                 attn_outputs = attn_func(qkv=q, kv=kv)
             else:
                 qkv = self.Wqkv(hidden_states)
-                qkv = qkv.view(-1, 3, self.num_heads, self.head_dim) if is_varlen else qkv.view(bs, -1, 3, self.num_heads, self.head_dim)
+                qkv = (
+                    qkv.view(-1, 3, self.num_heads, self.head_dim)
+                    if is_varlen
+                    else qkv.view(bs, -1, 3, self.num_heads, self.head_dim)
+                )
 
                 qkv = self.rotary_emb.forward(
                     qkv,
                     cu_seqlens=cu_seqlens,
                     max_seqlen=max_seqlen,
-                    seqlen_offset=position_ids[:, 0] if position_ids is not None and max_seqlen is not None else 0,
+                    seqlen_offset=(
+                        position_ids[:, 0]
+                        if position_ids is not None and max_seqlen is not None
+                        else 0
+                    ),
                 )
 
                 if past_key_value is not None:
                     q, key_states, value_states = qkv.unbind(dim=2)
 
-                    key_states, value_states = key_states.transpose(1, 2), value_states.transpose(1, 2) # (bs, nheads, seqlen, head_dim)
+                    key_states, value_states = key_states.transpose(
+                        1, 2
+                    ), value_states.transpose(
+                        1, 2
+                    )  # (bs, nheads, seqlen, head_dim)
                     key_states, value_states = past_key_value.update(
-                        key_states, value_states, self.layer_idx, {"cache_position": cache_position}
+                        key_states,
+                        value_states,
+                        self.layer_idx,
+                        {"cache_position": cache_position},
                     )
-                    kv = torch.stack((key_states, value_states), dim=2).transpose(1, 3)  # (bs, seqlen, 2, nheads, head_dim)
-                    kv = kv[:, :cache_position[-1] + 1]  # trim to the current cache position
+                    kv = torch.stack((key_states, value_states), dim=2).transpose(
+                        1, 3
+                    )  # (bs, seqlen, 2, nheads, head_dim)
+                    kv = kv[
+                        :, : cache_position[-1] + 1
+                    ]  # trim to the current cache position
 
                     attn_outputs = attn_func(qkv=q, kv=kv)
                 else:
@@ -569,9 +659,17 @@ class VarWhisperAttention(nn.Module):
             if self.is_cross_attention:
                 if profile_ranges:
                     with profile_range(f"{range_prefix}.q_proj"):
-                        query_states = self.Wq(hidden_states).view(bs, -1, self.num_heads, self.head_dim).transpose(1, 2)
+                        query_states = (
+                            self.Wq(hidden_states)
+                            .view(bs, -1, self.num_heads, self.head_dim)
+                            .transpose(1, 2)
+                        )
                 else:
-                    query_states = self.Wq(hidden_states).view(bs, -1, self.num_heads, self.head_dim).transpose(1, 2)
+                    query_states = (
+                        self.Wq(hidden_states)
+                        .view(bs, -1, self.num_heads, self.head_dim)
+                        .transpose(1, 2)
+                    )
 
                 if past_key_value and is_updated:
                     # reuse k,v, cross_attentions
@@ -583,18 +681,26 @@ class VarWhisperAttention(nn.Module):
                 else:
                     if profile_ranges:
                         with profile_range(f"{range_prefix}.kv_proj"):
-                            kv = self.Wkv(key_value_states).view(bs, -1, 2, self.num_heads, self.head_dim)
+                            kv = self.Wkv(key_value_states).view(
+                                bs, -1, 2, self.num_heads, self.head_dim
+                            )
                             key_states, value_states = kv.transpose(1, 3).unbind(dim=2)
                     else:
-                        kv = self.Wkv(key_value_states).view(bs, -1, 2, self.num_heads, self.head_dim)
+                        kv = self.Wkv(key_value_states).view(
+                            bs, -1, 2, self.num_heads, self.head_dim
+                        )
                         key_states, value_states = kv.transpose(1, 3).unbind(dim=2)
 
                     if past_key_value is not None:
                         if profile_ranges:
                             with profile_range(f"{range_prefix}.cache_update"):
-                                past_key_value.update(key_states, value_states, self.layer_idx)
+                                past_key_value.update(
+                                    key_states, value_states, self.layer_idx
+                                )
                         else:
-                            past_key_value.update(key_states, value_states, self.layer_idx)
+                            past_key_value.update(
+                                key_states, value_states, self.layer_idx
+                            )
                 if profile_ranges:
                     with profile_range(f"{range_prefix}.sdpa"):
                         attn_outputs = attn_func(
@@ -633,28 +739,55 @@ class VarWhisperAttention(nn.Module):
                 else:
                     if profile_ranges:
                         with profile_range(f"{range_prefix}.qkv_proj"):
-                            qkv = self.Wqkv(hidden_states).view(bs, -1, 3, self.num_heads, self.head_dim)
-                            query_states, key_states, value_states = qkv.transpose(1, 3).unbind(dim=2)
+                            qkv = self.Wqkv(hidden_states).view(
+                                bs, -1, 3, self.num_heads, self.head_dim
+                            )
+                            query_states, key_states, value_states = qkv.transpose(
+                                1, 3
+                            ).unbind(dim=2)
                     else:
-                        qkv = self.Wqkv(hidden_states).view(bs, -1, 3, self.num_heads, self.head_dim)
-                        query_states, key_states, value_states = qkv.transpose(1, 3).unbind(dim=2)
+                        qkv = self.Wqkv(hidden_states).view(
+                            bs, -1, 3, self.num_heads, self.head_dim
+                        )
+                        query_states, key_states, value_states = qkv.transpose(
+                            1, 3
+                        ).unbind(dim=2)
 
                     if profile_ranges:
                         with profile_range(f"{range_prefix}.rope"):
-                            cos, sin = self.rotary_emb(query_states, position_ids=position_ids)
-                            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+                            cos, sin = self.rotary_emb(
+                                query_states, position_ids=position_ids
+                            )
+                            query_states, key_states = apply_rotary_pos_emb(
+                                query_states, key_states, cos, sin
+                            )
                     else:
-                        cos, sin = self.rotary_emb(query_states, position_ids=position_ids)
-                        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+                        cos, sin = self.rotary_emb(
+                            query_states, position_ids=position_ids
+                        )
+                        query_states, key_states = apply_rotary_pos_emb(
+                            query_states, key_states, cos, sin
+                        )
 
                     if past_key_value is not None:
                         # sin and cos are specific to RoPE models; cache_position needed for the static cache
-                        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                        cache_kwargs = {
+                            "sin": sin,
+                            "cos": cos,
+                            "cache_position": cache_position,
+                        }
                         if profile_ranges:
                             with profile_range(f"{range_prefix}.cache_update"):
-                                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+                                key_states, value_states = past_key_value.update(
+                                    key_states,
+                                    value_states,
+                                    self.layer_idx,
+                                    cache_kwargs,
+                                )
                         else:
-                            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+                            key_states, value_states = past_key_value.update(
+                                key_states, value_states, self.layer_idx, cache_kwargs
+                            )
 
                     if profile_ranges:
                         with profile_range(f"{range_prefix}.sdpa"):
@@ -701,11 +834,11 @@ class VarWhisperEncoderLayer(GradientCheckpointingLayer):
         self.final_layer_norm = nn.RMSNorm(self.embed_dim)
 
     def forward(
-            self,
-            hidden_states: torch.Tensor,
-            attention_mask: torch.Tensor,
-            position_ids: Optional[torch.LongTensor] = None,
-            output_attentions: bool = False,
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: Optional[torch.LongTensor] = None,
+        output_attentions: bool = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -730,16 +863,22 @@ class VarWhisperEncoderLayer(GradientCheckpointingLayer):
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
         hidden_states = self.activation_fn(self.fc1(hidden_states))
-        hidden_states = nn.functional.dropout(hidden_states, p=self.activation_dropout, training=self.training)
+        hidden_states = nn.functional.dropout(
+            hidden_states, p=self.activation_dropout, training=self.training
+        )
         hidden_states = self.fc2(hidden_states)
-        hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+        hidden_states = nn.functional.dropout(
+            hidden_states, p=self.dropout, training=self.training
+        )
         hidden_states = residual + hidden_states
 
         if hidden_states.dtype == torch.float16 and (
-                torch.isinf(hidden_states).any() or torch.isnan(hidden_states).any()
+            torch.isinf(hidden_states).any() or torch.isnan(hidden_states).any()
         ):
             clamp_value = torch.finfo(hidden_states.dtype).max - 1000
-            hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
+            hidden_states = torch.clamp(
+                hidden_states, min=-clamp_value, max=clamp_value
+            )
 
         return (hidden_states,) + attn_outputs[1:]  # add attentions if outputted
 
@@ -774,18 +913,18 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
         self.final_layer_norm = nn.RMSNorm(self.embed_dim)
 
     def forward(
-            self,
-            hidden_states: torch.Tensor,
-            attention_mask: Optional[torch.Tensor] = None,
-            encoder_hidden_states: Optional[torch.Tensor] = None,
-            past_key_value: Optional[EncoderDecoderCache] = None,
-            cache_position: Optional[torch.LongTensor] = None,
-            position_ids: Optional[torch.LongTensor] = None,
-            cu_seqlens: Optional[torch.LongTensor] = None,
-            max_seqlen: Optional[int] = None,
-            encoder_cu_seqlens: Optional[torch.LongTensor] = None,
-            encoder_max_seqlen: Optional[int] = None,
-            output_attentions: Optional[bool] = False,
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        past_key_value: Optional[EncoderDecoderCache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        cu_seqlens: Optional[torch.LongTensor] = None,
+        max_seqlen: Optional[int] = None,
+        encoder_cu_seqlens: Optional[torch.LongTensor] = None,
+        encoder_max_seqlen: Optional[int] = None,
+        output_attentions: Optional[bool] = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -819,7 +958,7 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
                     position_ids=position_ids,
                     cu_seqlens=cu_seqlens,
                     max_seqlen=max_seqlen,
-                    output_attentions=output_attentions
+                    output_attentions=output_attentions,
                 )
         else:
             self_attn_outputs = self.self_attn(
@@ -830,7 +969,7 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
                 position_ids=position_ids,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
-                output_attentions=output_attentions
+                output_attentions=output_attentions,
             )
         hidden_states = self_attn_outputs[0]
         if profile_ranges:
@@ -839,9 +978,7 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
         else:
             hidden_states = residual + hidden_states
 
-        optimized_tail_forward = (
-            decoder_layer_runtime_hooks().cross_mlp_tail_forward
-        )
+        optimized_tail_forward = decoder_layer_runtime_hooks().cross_mlp_tail_forward
         if optimized_tail_forward is not None:
             optimized_outputs = optimized_tail_forward(
                 module=self,
@@ -877,7 +1014,7 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
                         max_seqlen=max_seqlen,
                         cu_seqlens_k=encoder_cu_seqlens,
                         max_seqlen_k=encoder_max_seqlen,
-                        output_attentions=output_attentions
+                        output_attentions=output_attentions,
                     )
             else:
                 cross_attn_outputs = self.cross_attn(
@@ -889,7 +1026,7 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
                     max_seqlen=max_seqlen,
                     cu_seqlens_k=encoder_cu_seqlens,
                     max_seqlen_k=encoder_max_seqlen,
-                    output_attentions=output_attentions
+                    output_attentions=output_attentions,
                 )
             hidden_states = cross_attn_outputs[0]
             if profile_ranges:
@@ -988,7 +1125,7 @@ class VarWhisperPreTrainedModel(PreTrainedModel):
 class VarWhisperEncoder(VarWhisperPreTrainedModel):
     def __init__(self, config: VarWhisperConfig):
         super().__init__(config)
-        self.dropout:float = config.dropout
+        self.dropout: float = config.dropout
 
         embed_dim = config.d_model
         self.num_mel_bins: int = config.num_mel_bins
@@ -998,7 +1135,12 @@ class VarWhisperEncoder(VarWhisperPreTrainedModel):
         self.conv1 = nn.Conv1d(self.num_mel_bins, embed_dim, kernel_size=3, padding=1)
         self.conv2 = nn.Conv1d(embed_dim, embed_dim, kernel_size=3, stride=2, padding=1)
 
-        self.layers = nn.ModuleList([VarWhisperEncoderLayer(config, layer_idx=layer_idx) for layer_idx in range(config.encoder_layers)])
+        self.layers = nn.ModuleList(
+            [
+                VarWhisperEncoderLayer(config, layer_idx=layer_idx)
+                for layer_idx in range(config.encoder_layers)
+            ]
+        )
         self.layer_norm = nn.RMSNorm(config.d_model)
 
         self.gradient_checkpointing = False
@@ -1017,29 +1159,42 @@ class VarWhisperEncoder(VarWhisperPreTrainedModel):
         self.conv1 = value
 
     def forward(
-            self,
-            input_features,
-            attention_mask=None,
-            output_attentions=None,
-            output_hidden_states=None,
-            return_dict=None,
+        self,
+        input_features,
+        attention_mask=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
     ):
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
         inputs_embeds = nn.functional.gelu(self.conv1(input_features))
         inputs_embeds = nn.functional.gelu(self.conv2(inputs_embeds))
 
         inputs_embeds = inputs_embeds.permute(0, 2, 1)
 
-        position_ids = torch.arange(inputs_embeds.size(1), device=inputs_embeds.device).unsqueeze(0).repeat(
-            inputs_embeds.size(0), 1)
+        position_ids = (
+            torch.arange(inputs_embeds.size(1), device=inputs_embeds.device)
+            .unsqueeze(0)
+            .repeat(inputs_embeds.size(0), 1)
+        )
 
         hidden_states = inputs_embeds
 
-        hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+        hidden_states = nn.functional.dropout(
+            hidden_states, p=self.dropout, training=self.training
+        )
 
         encoder_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
@@ -1069,9 +1224,15 @@ class VarWhisperEncoder(VarWhisperPreTrainedModel):
             encoder_states = encoder_states + (hidden_states,)
 
         if not return_dict:
-            return tuple(v for v in [hidden_states, encoder_states, all_attentions] if v is not None)
+            return tuple(
+                v
+                for v in [hidden_states, encoder_states, all_attentions]
+                if v is not None
+            )
         return BaseModelOutput(
-            last_hidden_state=hidden_states, hidden_states=encoder_states, attentions=all_attentions
+            last_hidden_state=hidden_states,
+            hidden_states=encoder_states,
+            attentions=all_attentions,
         )
 
 
@@ -1080,7 +1241,14 @@ def _unpad_varwhisper_input(
     attention_mask: torch.Tensor,
     position_ids: Optional[torch.Tensor] = None,
     labels: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+]:
     """
     Remove padding from input sequences.
 
@@ -1101,7 +1269,9 @@ def _unpad_varwhisper_input(
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
     indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
     max_seqlen_in_batch = int(seqlens_in_batch.max().item())
-    cu_seqlens = torch.nn.functional.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
+    cu_seqlens = torch.nn.functional.pad(
+        torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+    )
 
     if inputs.dim() == 2:
         unpadded_inputs = inputs.flatten()[indices]
@@ -1110,19 +1280,36 @@ def _unpad_varwhisper_input(
         shape = batch * seqlen
         unpadded_inputs = inputs.view(shape, *rest)[indices]
 
-    unpadded_position_ids = position_ids.flatten()[indices] if position_ids is not None else None
+    unpadded_position_ids = (
+        position_ids.flatten()[indices] if position_ids is not None else None
+    )
     unpadded_labels = labels.flatten()[indices] if labels is not None else None
 
-    return unpadded_inputs, indices, cu_seqlens, max_seqlen_in_batch, unpadded_position_ids, unpadded_labels
+    return (
+        unpadded_inputs,
+        indices,
+        cu_seqlens,
+        max_seqlen_in_batch,
+        unpadded_position_ids,
+        unpadded_labels,
+    )
 
 
-def _unpad_encoder_hidden_states(encoder_hidden_states: torch.Tensor,):
+def _unpad_encoder_hidden_states(
+    encoder_hidden_states: torch.Tensor,
+):
     # encoder_hidden_states contains no padding, so we just flatten it and compute cu_seqlens
     batch, seqlen, *rest = encoder_hidden_states.shape
     shape = batch * seqlen
     unpadded_encoder_hidden_states = encoder_hidden_states.view(shape, *rest)
 
-    encoder_cu_seqlens = torch.arange(0, shape + 1, step=seqlen, dtype=torch.int32, device=encoder_hidden_states.device)
+    encoder_cu_seqlens = torch.arange(
+        0,
+        shape + 1,
+        step=seqlen,
+        dtype=torch.int32,
+        device=encoder_hidden_states.device,
+    )
 
     return unpadded_encoder_hidden_states, encoder_cu_seqlens, seqlen
 
@@ -1151,7 +1338,9 @@ def _pad_varwhisper_output(
         padded_inputs = output.view(batch, seqlen)
     else:
         _, *rest = inputs.shape
-        output = torch.zeros(batch * seqlen, *rest, dtype=inputs.dtype, device=inputs.device)
+        output = torch.zeros(
+            batch * seqlen, *rest, dtype=inputs.dtype, device=inputs.device
+        )
         output[indices] = inputs
         padded_inputs = output.view(batch, seqlen, *rest)
 
@@ -1167,10 +1356,15 @@ class VarWhisperDecoder(VarWhisperPreTrainedModel):
         self.padding_idx: int = config.pad_token_id
         self.embed_scale = math.sqrt(config.d_model) if config.scale_embedding else 1.0
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.d_model, self.padding_idx)
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size, config.d_model, self.padding_idx
+        )
 
         self.layers = nn.ModuleList(
-            [VarWhisperDecoderLayer(config, layer_idx) for layer_idx in range(config.decoder_layers)]
+            [
+                VarWhisperDecoderLayer(config, layer_idx)
+                for layer_idx in range(config.decoder_layers)
+            ]
         )
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
         self._use_sdpa = config._attn_implementation == "sdpa"
@@ -1188,40 +1382,54 @@ class VarWhisperDecoder(VarWhisperPreTrainedModel):
         self.embed_tokens = value
 
     def forward(
-            self,
-            input_ids=None,
-            attention_mask=None,
-            encoder_hidden_states=None,
-            past_key_values=None,
-            inputs_embeds=None,
-            position_ids=None,
-            use_cache=None,
-            output_attentions=None,
-            output_hidden_states=None,
-            return_dict=None,
-            cache_position=None,
+        self,
+        input_ids=None,
+        attention_mask=None,
+        encoder_hidden_states=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        position_ids=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        cache_position=None,
     ):
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
+        )
         output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
 
         # retrieve input_ids and inputs_embeds
         if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
+            raise ValueError(
+                "You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time"
+            )
         elif input_ids is not None:
             input_ids = input_ids.view(-1, input_ids.shape[-1])
             batch_size, seq_len = input_ids.shape[:2]
         elif inputs_embeds is not None:
             batch_size, seq_len = inputs_embeds.shape[:2]
         else:
-            raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
+            raise ValueError(
+                "You have to specify either decoder_input_ids or decoder_inputs_embeds"
+            )
         device = input_ids.device if input_ids is not None else inputs_embeds.device
 
         if attention_mask is None:
-            attention_mask = torch.ones((batch_size, seq_len), device=device, dtype=torch.bool)
+            attention_mask = torch.ones(
+                (batch_size, seq_len), device=device, dtype=torch.bool
+            )
 
         repad = False
         cu_seqlens, max_seqlen = None, self.config.max_target_positions
@@ -1230,17 +1438,21 @@ class VarWhisperDecoder(VarWhisperPreTrainedModel):
             repad = True
             if inputs_embeds is None:
                 with torch.no_grad():
-                    input_ids, indices, cu_seqlens, max_seqlen, *_ = _unpad_varwhisper_input(
-                        inputs=input_ids, attention_mask=attention_mask
+                    input_ids, indices, cu_seqlens, max_seqlen, *_ = (
+                        _unpad_varwhisper_input(
+                            inputs=input_ids, attention_mask=attention_mask
+                        )
                     )
             else:
-                inputs_embeds, indices, cu_seqlens, max_seqlen, *_ = _unpad_varwhisper_input(
-                    inputs=inputs_embeds, attention_mask=attention_mask
+                inputs_embeds, indices, cu_seqlens, max_seqlen, *_ = (
+                    _unpad_varwhisper_input(
+                        inputs=inputs_embeds, attention_mask=attention_mask
+                    )
                 )
 
             if encoder_hidden_states is not None:
-                encoder_hidden_states, encoder_cu_seqlens, encoder_max_seqlen = _unpad_encoder_hidden_states(
-                    encoder_hidden_states.contiguous()
+                encoder_hidden_states, encoder_cu_seqlens, encoder_max_seqlen = (
+                    _unpad_encoder_hidden_states(encoder_hidden_states.contiguous())
                 )
 
         if inputs_embeds is None:
@@ -1249,7 +1461,9 @@ class VarWhisperDecoder(VarWhisperPreTrainedModel):
         return_legacy_cache = False
         return_self_attention_cache = False
         if use_cache or past_key_values is not None:
-            if isinstance(past_key_values, Cache) and not isinstance(past_key_values, EncoderDecoderCache):
+            if isinstance(past_key_values, Cache) and not isinstance(
+                past_key_values, EncoderDecoderCache
+            ):
                 return_self_attention_cache = True
                 past_key_values = EncoderDecoderCache(past_key_values, DynamicCache())
             elif not isinstance(past_key_values, EncoderDecoderCache):
@@ -1269,20 +1483,28 @@ class VarWhisperDecoder(VarWhisperPreTrainedModel):
 
         if cache_position is None:
             cache_position = torch.arange(
-                past_key_values_length, past_key_values_length + seq_len, device=inputs_embeds.device
+                past_key_values_length,
+                past_key_values_length + seq_len,
+                device=inputs_embeds.device,
             )
 
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0).repeat(batch_size, 1)
 
         hidden_states = inputs_embeds
-        hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+        hidden_states = nn.functional.dropout(
+            hidden_states, p=self.dropout, training=self.training
+        )
 
         causal_mask = self._update_causal_mask(
             attention_mask,
             inputs_embeds,
             cache_position,
-            past_key_values.self_attention_cache if past_key_values is not None else None,
+            (
+                past_key_values.self_attention_cache
+                if past_key_values is not None
+                else None
+            ),
             output_attentions,
         )
 
@@ -1296,7 +1518,9 @@ class VarWhisperDecoder(VarWhisperPreTrainedModel):
         # decoder layers
         all_hidden_states: tuple = () if output_hidden_states else None
         all_self_attns: tuple = () if output_attentions else None
-        all_cross_attentions: tuple = () if (output_attentions and encoder_hidden_states is not None) else None
+        all_cross_attentions: tuple = (
+            () if (output_attentions and encoder_hidden_states is not None) else None
+        )
 
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
@@ -1338,7 +1562,9 @@ class VarWhisperDecoder(VarWhisperPreTrainedModel):
             )
             if all_hidden_states is not None:
                 all_hidden_states = tuple(
-                    _pad_varwhisper_output(inputs=hs, indices=indices, batch=batch_size, seqlen=seq_len)
+                    _pad_varwhisper_output(
+                        inputs=hs, indices=indices, batch=batch_size, seqlen=seq_len
+                    )
                     for hs in all_hidden_states
                 )
         # If the attention implementation is FA2 and there is no need for repadding, there might still be the batch
@@ -1359,7 +1585,13 @@ class VarWhisperDecoder(VarWhisperPreTrainedModel):
         if not return_dict:
             return tuple(
                 v
-                for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, all_cross_attentions]
+                for v in [
+                    hidden_states,
+                    next_cache,
+                    all_hidden_states,
+                    all_self_attns,
+                    all_cross_attentions,
+                ]
                 if v is not None
             )
         return BaseModelOutputWithPastAndCrossAttentions(
@@ -1372,12 +1604,12 @@ class VarWhisperDecoder(VarWhisperPreTrainedModel):
 
     # Copied from transformers.models.llama.modeling_llama.LlamaModel._update_causal_mask
     def _update_causal_mask(
-            self,
-            attention_mask: torch.Tensor,
-            input_tensor: torch.Tensor,
-            cache_position: torch.Tensor,
-            past_key_values: Cache,
-            output_attentions: bool,
+        self,
+        attention_mask: torch.Tensor,
+        input_tensor: torch.Tensor,
+        cache_position: torch.Tensor,
+        past_key_values: Cache,
+        output_attentions: bool,
     ):
         if self.config._attn_implementation == "flash_attention_2":
             if attention_mask is not None and 0.0 in attention_mask:
@@ -1387,16 +1619,22 @@ class VarWhisperDecoder(VarWhisperPreTrainedModel):
         # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument, in
         # order to dispatch on Flash Attention 2. This feature is not compatible with static cache, as SDPA will fail
         # to infer the attention mask.
-        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+        past_seen_tokens = (
+            past_key_values.get_seq_length() if past_key_values is not None else 0
+        )
         using_static_cache = isinstance(past_key_values, StaticCache)
 
         # When output attentions is True, sdpa implementation's forward method calls the eager implementation's forward
-        if self.config._attn_implementation == "sdpa" and not using_static_cache and not output_attentions:
+        if (
+            self.config._attn_implementation == "sdpa"
+            and not using_static_cache
+            and not output_attentions
+        ):
             if AttentionMaskConverter._ignore_causal_mask_sdpa(
-                    attention_mask,
-                    inputs_embeds=input_tensor,
-                    past_key_values_length=past_seen_tokens,
-                    is_training=self.training,
+                attention_mask,
+                inputs_embeds=input_tensor,
+                past_key_values_length=past_seen_tokens,
+                is_training=self.training,
             ):
                 return None
 
@@ -1423,30 +1661,32 @@ class VarWhisperDecoder(VarWhisperPreTrainedModel):
         )
 
         if (
-                self.config._attn_implementation == "sdpa"
-                and attention_mask is not None
-                and attention_mask.device.type == "cuda"
-                and not output_attentions
+            self.config._attn_implementation == "sdpa"
+            and attention_mask is not None
+            and attention_mask.device.type == "cuda"
+            and not output_attentions
         ):
             # Attend to all tokens in fully masked rows in the causal_mask, for example the relevant first rows when
             # using left padding. This is required by F.scaled_dot_product_attention memory-efficient attention path.
             # Details: https://github.com/pytorch/pytorch/issues/110213
             min_dtype = torch.finfo(dtype).min
-            causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, min_dtype)
+            causal_mask = AttentionMaskConverter._unmask_unattended(
+                causal_mask, min_dtype
+            )
 
         return causal_mask
 
     @staticmethod
     # Copied from transformers.models.llama.modeling_llama.LlamaModel._prepare_4d_causal_attention_mask_with_cache_position
     def _prepare_4d_causal_attention_mask_with_cache_position(
-            attention_mask: torch.Tensor,
-            sequence_length: int,
-            target_length: int,
-            dtype: torch.dtype,
-            device: torch.device,
-            cache_position: torch.Tensor,
-            batch_size: int,
-            **kwargs,
+        attention_mask: torch.Tensor,
+        sequence_length: int,
+        target_length: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        cache_position: torch.Tensor,
+        batch_size: int,
+        **kwargs,
     ):
         if attention_mask is not None and attention_mask.dim() == 4:
             # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
@@ -1454,20 +1694,30 @@ class VarWhisperDecoder(VarWhisperPreTrainedModel):
         else:
             min_dtype = torch.finfo(dtype).min
             causal_mask = torch.full(
-                (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device
+                (sequence_length, target_length),
+                fill_value=min_dtype,
+                dtype=dtype,
+                device=device,
             )
             if sequence_length != 1:
                 causal_mask = torch.triu(causal_mask, diagonal=1)
-            causal_mask *= torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
+            causal_mask *= torch.arange(
+                target_length, device=device
+            ) > cache_position.reshape(-1, 1)
             causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
             if attention_mask is not None:
-                causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
+                causal_mask = (
+                    causal_mask.clone()
+                )  # copy to contiguous memory for in-place edit
                 mask_length = attention_mask.shape[-1]
-                padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :]
-                padding_mask = padding_mask == 0
-                causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
-                    padding_mask, min_dtype
+                padding_mask = (
+                    causal_mask[:, :, :, :mask_length]
+                    + attention_mask[:, None, None, :]
                 )
+                padding_mask = padding_mask == 0
+                causal_mask[:, :, :, :mask_length] = causal_mask[
+                    :, :, :, :mask_length
+                ].masked_fill(padding_mask, min_dtype)
 
         return causal_mask
 
@@ -1501,27 +1751,39 @@ class VarWhisperModel(VarWhisperPreTrainedModel):
         self.encoder._freeze_parameters()
 
     def forward(
-            self,
-            input_features: Optional[torch.FloatTensor] = None,
-            attention_mask: Optional[torch.LongTensor] = None,
-            decoder_input_ids: Optional[torch.LongTensor] = None,
-            decoder_attention_mask: Optional[torch.LongTensor] = None,
-            encoder_outputs: Optional[Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]] = None,
-            past_key_values: Optional[Union[EncoderDecoderCache, Tuple[torch.FloatTensor]]] = None,
-            decoder_inputs_embeds: Optional[Tuple[torch.FloatTensor]] = None,
-            decoder_position_ids: Optional[Tuple[torch.LongTensor]] = None,
-            use_cache: Optional[bool] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-            cache_position: Optional[torch.LongTensor] = None,
+        self,
+        input_features: Optional[torch.FloatTensor] = None,
+        attention_mask: Optional[torch.LongTensor] = None,
+        decoder_input_ids: Optional[torch.LongTensor] = None,
+        decoder_attention_mask: Optional[torch.LongTensor] = None,
+        encoder_outputs: Optional[
+            Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]
+        ] = None,
+        past_key_values: Optional[
+            Union[EncoderDecoderCache, Tuple[torch.FloatTensor]]
+        ] = None,
+        decoder_inputs_embeds: Optional[Tuple[torch.FloatTensor]] = None,
+        decoder_position_ids: Optional[Tuple[torch.LongTensor]] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple[torch.Tensor], Seq2SeqModelOutput]:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
+        )
         output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
 
         if encoder_outputs is None:
             encoder_outputs = self.encoder(
@@ -1570,7 +1832,9 @@ class VarWhisperModel(VarWhisperPreTrainedModel):
         )
 
 
-class VarWhisperForConditionalGeneration(WhisperGenerationMixin, VarWhisperPreTrainedModel):
+class VarWhisperForConditionalGeneration(
+    WhisperGenerationMixin, VarWhisperPreTrainedModel
+):
     base_model_prefix = "model"
     _tied_weights_keys = ["proj_out.weight"]
 
@@ -1606,23 +1870,27 @@ class VarWhisperForConditionalGeneration(WhisperGenerationMixin, VarWhisperPreTr
         self.model.encoder._freeze_parameters()
 
     def forward(
-            self,
-            input_features: Optional[torch.FloatTensor] = None,
-            attention_mask: Optional[torch.LongTensor] = None,
-            decoder_input_ids: Optional[torch.LongTensor] = None,
-            decoder_attention_mask: Optional[torch.LongTensor] = None,
-            encoder_outputs: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
-            past_key_values: Optional[Union[EncoderDecoderCache, Tuple[torch.FloatTensor]]] = None,
-            decoder_inputs_embeds: Optional[Tuple[torch.FloatTensor]] = None,
-            decoder_position_ids: Optional[Tuple[torch.LongTensor]] = None,
-            labels: Optional[torch.LongTensor] = None,
-            use_cache: Optional[bool] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-            cache_position: Optional[torch.LongTensor] = None,
+        self,
+        input_features: Optional[torch.FloatTensor] = None,
+        attention_mask: Optional[torch.LongTensor] = None,
+        decoder_input_ids: Optional[torch.LongTensor] = None,
+        decoder_attention_mask: Optional[torch.LongTensor] = None,
+        encoder_outputs: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+        past_key_values: Optional[
+            Union[EncoderDecoderCache, Tuple[torch.FloatTensor]]
+        ] = None,
+        decoder_inputs_embeds: Optional[Tuple[torch.FloatTensor]] = None,
+        decoder_position_ids: Optional[Tuple[torch.LongTensor]] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple[torch.Tensor], Seq2SeqLMOutput]:
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
 
         outputs = self.model(
             input_features,
@@ -1639,7 +1907,21 @@ class VarWhisperForConditionalGeneration(WhisperGenerationMixin, VarWhisperPreTr
             return_dict=return_dict,
             cache_position=cache_position,
         )
-        if detail_ranges_enabled():
+        proj_hooks = output_projection_runtime_hooks()
+        compiled_proj_out = proj_hooks.compiled_proj_out
+        if compiled_proj_out is not None:
+            if outputs[0].ndim < 2 or tuple(outputs[0].shape[:2]) != (1, 1):
+                raise RuntimeError(
+                    "compiled proj_out is decode-only (1,1,*); refusing shape "
+                    f"{tuple(outputs[0].shape)}"
+                )
+            lm_logits = compiled_proj_out(
+                outputs[0], self.proj_out.weight, self.proj_out.bias
+            )
+            if proj_hooks.dispatch_counts is not None:
+                counts = proj_hooks.dispatch_counts
+                counts["compiled_proj_out"] = counts.get("compiled_proj_out", 0) + 1
+        elif detail_ranges_enabled():
             with profile_range("decoder.output_projection"):
                 lm_logits = self.proj_out(outputs[0])
         else:
@@ -1650,7 +1932,9 @@ class VarWhisperForConditionalGeneration(WhisperGenerationMixin, VarWhisperPreTr
             loss_fct = CrossEntropyLoss()
             # move labels to correct device to enable PP
             labels = labels.to(lm_logits.device)
-            loss = loss_fct(lm_logits.view(-1, self.config.vocab_size), labels.reshape(-1))
+            loss = loss_fct(
+                lm_logits.view(-1, self.config.vocab_size), labels.reshape(-1)
+            )
 
         if not return_dict:
             output = (lm_logits,) + outputs[1:]
@@ -1669,15 +1953,15 @@ class VarWhisperForConditionalGeneration(WhisperGenerationMixin, VarWhisperPreTr
         )
 
     def prepare_inputs_for_generation(
-            self,
-            decoder_input_ids,
-            past_key_values=None,
-            use_cache=None,
-            encoder_outputs=None,
-            attention_mask=None,
-            decoder_attention_mask=None,
-            cache_position=None,
-            **kwargs,
+        self,
+        decoder_input_ids,
+        past_key_values=None,
+        use_cache=None,
+        encoder_outputs=None,
+        attention_mask=None,
+        decoder_attention_mask=None,
+        cache_position=None,
+        **kwargs,
     ):
         # Overwritten -- encoder-decoder whisper has custom logic, but it's close to the general function. Next time
         # this function needs to be touched, let's try to sort out the commonalities between the two and remove the
@@ -1690,7 +1974,11 @@ class VarWhisperForConditionalGeneration(WhisperGenerationMixin, VarWhisperPreTr
         past_length = 0
         if past_key_values is not None:
             if isinstance(past_key_values, EncoderDecoderCache):
-                past_length = cache_position[0] if cache_position is not None else past_key_values.get_seq_length()
+                past_length = (
+                    cache_position[0]
+                    if cache_position is not None
+                    else past_key_values.get_seq_length()
+                )
             else:
                 past_length = past_key_values[0][0].shape[2]
 
@@ -1706,27 +1994,31 @@ class VarWhisperForConditionalGeneration(WhisperGenerationMixin, VarWhisperPreTr
             if decoder_position_ids is not None:
                 decoder_position_ids = decoder_position_ids[:, remove_prefix_length:]
                 # This `clone` call is needed to avoid recapturing cuda graphs with `torch.compile`'s  `mode="reduce-overhead`, as otherwise the input `position_ids` would have various stride during the decoding. Here, simply using `.contiguous()` is not sufficient as in the batch size = 1 case, `position_ids` is already contiguous but with varying stride which retriggers a capture.
-                decoder_position_ids = decoder_position_ids.clone(memory_format=torch.contiguous_format)
+                decoder_position_ids = decoder_position_ids.clone(
+                    memory_format=torch.contiguous_format
+                )
 
         if cache_position is None:
             cache_position = torch.arange(
-                past_length, past_length + decoder_input_ids.shape[1], device=decoder_input_ids.device
+                past_length,
+                past_length + decoder_input_ids.shape[1],
+                device=decoder_input_ids.device,
             )
         elif use_cache:
-            cache_position = cache_position[-decoder_input_ids.shape[1]:]
+            cache_position = cache_position[-decoder_input_ids.shape[1] :]
 
         # The `contiguous()` here is necessary to have a static stride during decoding. torchdynamo otherwise
         # recompiles graphs as the stride of the inputs is a guard. Ref: https://github.com/huggingface/transformers/pull/29114
         decoder_input_ids = decoder_input_ids.contiguous()
 
         if (
-                isinstance(past_key_values, EncoderDecoderCache)
-                and (
+            isinstance(past_key_values, EncoderDecoderCache)
+            and (
                 isinstance(past_key_values.self_attention_cache, StaticCache)
                 or isinstance(past_key_values.cross_attention_cache, StaticCache)
-        )
-                and decoder_attention_mask is not None
-                and decoder_attention_mask.ndim == 2
+            )
+            and decoder_attention_mask is not None
+            and decoder_attention_mask.ndim == 2
         ):
             batch_size, sequence_length = decoder_input_ids.shape
 
