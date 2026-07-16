@@ -631,6 +631,11 @@ class VarWhisperAttention(nn.Module):
                 if optimized_attn_outputs is not None:
                     attn_outputs = optimized_attn_outputs
                 else:
+                    if runtime_hooks.fuse_self_norm_wqkv:
+                        raise RuntimeError(
+                            "fuse_self_norm_wqkv requires native q1 RoPE/cache "
+                            "self-attention; refusing unnormalized Wqkv fallback"
+                        )
                     if profile_ranges:
                         with profile_range(f"{range_prefix}.qkv_proj"):
                             qkv = self.Wqkv(hidden_states).view(bs, -1, 3, self.num_heads, self.head_dim)
@@ -802,15 +807,40 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
         residual = hidden_states
         layer_name = f"decoder.layer{self.self_attn.layer_idx}"
         profile_ranges = detail_ranges_enabled()
-        if profile_ranges:
+        fuse_self_norm_wqkv = attention_runtime_hooks().fuse_self_norm_wqkv
+        if fuse_self_norm_wqkv:
+            from ...inference.optimized.scout.self_norm_wqkv import (
+                attach_decoder_norm_for_fuse,
+            )
+
+            attach_decoder_norm_for_fuse(
+                self_attn=self.self_attn,
+                self_attn_layer_norm=self.self_attn_layer_norm,
+                hidden_dtype=hidden_states.dtype,
+            )
+            # Fused q1 path owns RMSNorm+Wqkv; keep residual unnormalized.
+            hidden_states = residual
+        elif profile_ranges:
             with profile_range(f"{layer_name}.self_attn_norm"):
                 hidden_states = self.self_attn_layer_norm(hidden_states)
         else:
             hidden_states = self.self_attn_layer_norm(hidden_states)
 
         # Self Attention
-        if profile_ranges:
-            with profile_range(f"{layer_name}.self_attn"):
+        try:
+            if profile_ranges:
+                with profile_range(f"{layer_name}.self_attn"):
+                    self_attn_outputs = self.self_attn(
+                        hidden_states=hidden_states,
+                        past_key_value=past_key_value,
+                        attention_mask=attention_mask,
+                        cache_position=cache_position,
+                        position_ids=position_ids,
+                        cu_seqlens=cu_seqlens,
+                        max_seqlen=max_seqlen,
+                        output_attentions=output_attentions
+                    )
+            else:
                 self_attn_outputs = self.self_attn(
                     hidden_states=hidden_states,
                     past_key_value=past_key_value,
@@ -821,17 +851,13 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
                     max_seqlen=max_seqlen,
                     output_attentions=output_attentions
                 )
-        else:
-            self_attn_outputs = self.self_attn(
-                hidden_states=hidden_states,
-                past_key_value=past_key_value,
-                attention_mask=attention_mask,
-                cache_position=cache_position,
-                position_ids=position_ids,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                output_attentions=output_attentions
-            )
+        finally:
+            if fuse_self_norm_wqkv:
+                from ...inference.optimized.scout.self_norm_wqkv import (
+                    clear_decoder_norm_for_fuse,
+                )
+
+                clear_decoder_norm_for_fuse(self.self_attn)
         hidden_states = self_attn_outputs[0]
         if profile_ranges:
             with profile_range(f"{layer_name}.self.residual"):

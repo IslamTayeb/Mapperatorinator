@@ -58,6 +58,7 @@ def attention_runtime_context(
     q1_bmm_cross_attention: bool = False,
     native_q1_self_attention: bool = False,
     native_q1_rope_cache_self_attention: bool = False,
+    fuse_self_norm_wqkv: bool = False,
     expected_dtype: torch.dtype = torch.float32,
     dispatch_counts: dict[str, int] | None = None,
 ) -> Iterator[None]:
@@ -78,6 +79,10 @@ def attention_runtime_context(
         native_q1_rope_cache_attention = (
             q1_attention.native_q1_rope_cache_attention
         )
+    if fuse_self_norm_wqkv:
+        from ..kernels import decoder_layer
+
+        decoder_layer.preload_native_decoder_layer()
     sdpa_attention_forward = None
     if q1_bmm_cross_attention or native_q1_self_attention:
         sdpa_attention_forward = partial(
@@ -104,6 +109,7 @@ def attention_runtime_context(
         q1_rope_cache_self_attention_forward=(
             q1_rope_cache_self_attention
         ),
+        fuse_self_norm_wqkv=fuse_self_norm_wqkv,
     )
     with attention_runtime_hooks_context(hooks):
         yield

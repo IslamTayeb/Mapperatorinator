@@ -207,7 +207,53 @@ def q1_rope_cache_self_attention_forward(
     if not use_native_q1_rope_cache_self_attention:
         return None
 
-    if profile_ranges:
+    from ...runtime_dispatch import attention_runtime_hooks
+    from ..scout.self_norm_wqkv import native_fused_self_norm_wqkv
+
+    fuse_self_norm_wqkv = attention_runtime_hooks().fuse_self_norm_wqkv
+    if fuse_self_norm_wqkv:
+        norm_weight = getattr(module, "_scout_self_norm_weight", None)
+        norm_eps = getattr(module, "_scout_self_norm_eps", None)
+        if norm_weight is None or norm_eps is None:
+            raise RuntimeError(
+                "fuse_self_norm_wqkv requires decoder-attached RMSNorm params"
+            )
+        if profile_ranges:
+            with profile_range(f"{range_prefix}.norm_qkv_proj"):
+                qkv = native_fused_self_norm_wqkv(
+                    hidden_states,
+                    norm_weight,
+                    module.Wqkv.weight,
+                    module.Wqkv.bias,
+                    eps=float(norm_eps),
+                    outputs_per_block=8,
+                ).view(
+                    bs,
+                    -1,
+                    3,
+                    module.num_heads,
+                    module.head_dim,
+                )
+        else:
+            qkv = native_fused_self_norm_wqkv(
+                hidden_states,
+                norm_weight,
+                module.Wqkv.weight,
+                module.Wqkv.bias,
+                eps=float(norm_eps),
+                outputs_per_block=8,
+            ).view(
+                bs,
+                -1,
+                3,
+                module.num_heads,
+                module.head_dim,
+            )
+        if dispatch_counts is not None:
+            dispatch_counts["native_self_norm_wqkv"] = (
+                dispatch_counts.get("native_self_norm_wqkv", 0) + 1
+            )
+    elif profile_ranges:
         with profile_range(f"{range_prefix}.qkv_proj"):
             qkv = module.Wqkv(hidden_states).view(
                 bs,

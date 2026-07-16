@@ -12,6 +12,9 @@ class AttentionRuntimeHooks:
     sdpa_attention_inputs: Callable[..., Any] | None = None
     sdpa_attention_forward: Callable[..., Any] | None = None
     q1_rope_cache_self_attention_forward: Callable[..., Any] | None = None
+    # When True, VarWhisperDecoderLayer skips self_attn_layer_norm and the
+    # q1 RoPE/cache path owns RMSNorm+Wqkv fusion. Default False preserves tip.
+    fuse_self_norm_wqkv: bool = False
 
 
 @dataclass(frozen=True)

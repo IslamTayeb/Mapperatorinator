@@ -53,6 +53,7 @@ def generation_profile_context(
         native_q1_self_attention: bool = False,
         native_q1_rope_cache_self_attention: bool = False,
         native_cross_mlp_tail: bool = False,
+        native_self_norm_wqkv: bool = False,
         optimized_expected_dtype: torch.dtype = torch.float32,
         optimized_dispatch_counts: dict[str, int] | None = None,
 ) -> Iterator[None]:
@@ -74,6 +75,7 @@ def generation_profile_context(
             q1_bmm_cross_attention
             or native_q1_self_attention
             or native_q1_rope_cache_self_attention
+            or native_self_norm_wqkv
         ):
             from osuT5.osuT5.inference.optimized.single.runtime_context import (
                 attention_runtime_context,
@@ -85,6 +87,7 @@ def generation_profile_context(
                 native_q1_rope_cache_self_attention=(
                     native_q1_rope_cache_self_attention
                 ),
+                fuse_self_norm_wqkv=native_self_norm_wqkv,
                 expected_dtype=optimized_expected_dtype,
                 dispatch_counts=optimized_dispatch_counts,
             )
