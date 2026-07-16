@@ -247,6 +247,7 @@ def _load_real_wo_layers(*, precision: str, model_path: str | None) -> list[dict
         load_model_with_engine,
         setup_inference_environment,
     )
+    from osuT5.osuT5.inference.engine_binding import unwrap_engine_binding
 
     # profile_salvalai.yaml pins a Mac-local audio_path; component loading only
     # needs model weights, but compile_args still validates audio existence.
@@ -288,9 +289,12 @@ def _load_real_wo_layers(*, precision: str, model_path: str | None) -> list[dict
         auto_select_gamemode_model=args.auto_select_gamemode_model,
         inference_engine="optimized",
     )
-    model = getattr(binding, "model", binding)
+    model, _runtime = unwrap_engine_binding(binding)
     if not isinstance(model, torch.nn.Module):
-        raise TypeError("optimized engine did not expose a torch.nn.Module")
+        raise TypeError(
+            "optimized engine did not expose a torch.nn.Module "
+            f"(binding_type={type(binding).__name__})"
+        )
     model.eval()
     return _extract_self_wo_layers(model)
 
