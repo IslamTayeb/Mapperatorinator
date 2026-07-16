@@ -631,17 +631,25 @@ class VarWhisperAttention(nn.Module):
                 if optimized_attn_outputs is not None:
                     attn_outputs = optimized_attn_outputs
                 else:
-                    # Only decoder decode binds `_scout_self_norm_weight`. Encoder
-                    # and prefill keep the normal RMSNorm→Wqkv path even when the
-                    # scout flag is set on the shared attention hooks.
+                    # Decoder may have skipped RMSNorm expecting fused q1. If the
+                    # native path did not take over, restore RMSNorm before Wqkv
+                    # instead of raising (TIMING disables q1; prefix/dtype may also
+                    # skip). Encoder never binds `_scout_self_norm_weight`.
+                    scout_norm_weight = getattr(
+                        self, "_scout_self_norm_weight", None
+                    )
+                    scout_norm_eps = getattr(self, "_scout_self_norm_eps", None)
                     if (
-                        runtime_hooks.fuse_self_norm_wqkv
-                        and getattr(self, "_scout_self_norm_weight", None) is not None
+                        scout_norm_weight is not None
+                        and scout_norm_eps is not None
                     ):
-                        raise RuntimeError(
-                            "fuse_self_norm_wqkv requires native q1 RoPE/cache "
-                            "self-attention; refusing unnormalized Wqkv fallback"
+                        variance = hidden_states.pow(2).mean(
+                            dim=-1, keepdim=True
                         )
+                        hidden_states = hidden_states * torch.rsqrt(
+                            variance + float(scout_norm_eps)
+                        )
+                        hidden_states = hidden_states * scout_norm_weight
                     if profile_ranges:
                         with profile_range(f"{range_prefix}.qkv_proj"):
                             qkv = self.Wqkv(hidden_states).view(bs, -1, 3, self.num_heads, self.head_dim)
@@ -813,9 +821,13 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
         residual = hidden_states
         layer_name = f"decoder.layer{self.self_attn.layer_idx}"
         profile_ranges = detail_ranges_enabled()
-        # Fuse only one-token decode: encoder/prefill must keep separate RMSNorm.
+        # Fuse only when native q1 RoPE/cache is hooked and this is one-token
+        # decode. TIMING (and other tip paths) leave the hook unset; encoder /
+        # prefill must keep separate RMSNorm.
+        runtime_hooks = attention_runtime_hooks()
         fuse_self_norm_wqkv = (
-            attention_runtime_hooks().fuse_self_norm_wqkv
+            runtime_hooks.fuse_self_norm_wqkv
+            and runtime_hooks.q1_rope_cache_self_attention_forward is not None
             and hidden_states.shape[:2] == (1, 1)
         )
         if fuse_self_norm_wqkv:

@@ -4,7 +4,8 @@ Importing this module does not change production dispatch. The candidate
 context patches ``engine.generation_profile_context`` so the graduated tip
 (shared-RoPE + device state + native cross+MLP) additionally:
 
-1. skips ``self_attn_layer_norm`` in the decoder layer
+1. skips ``self_attn_layer_norm`` in the decoder layer **only when** native
+   q1 RoPE/cache self-attention is live (not TIMING; not encoder/prefill)
 2. fuses ``RMSNorm + Wqkv`` via ``native_one_token_rmsnorm_linear`` (3×d)
 
 No INT8 / weight-only paths.

@@ -81,13 +81,20 @@ def generation_profile_context(
                 attention_runtime_context,
             )
 
+            # Fuse owns RMSNorm only when native q1 RoPE/cache is live.
+            # Tip disables that hook for TIMING; arming fuse there skips
+            # RMSNorm during CUDA-graph capture and then refuses fallback.
+            fuse_self_norm_wqkv = bool(
+                native_self_norm_wqkv
+                and native_q1_rope_cache_self_attention
+            )
             optimized_attention_context = attention_runtime_context(
                 q1_bmm_cross_attention=q1_bmm_cross_attention,
                 native_q1_self_attention=native_q1_self_attention,
                 native_q1_rope_cache_self_attention=(
                     native_q1_rope_cache_self_attention
                 ),
-                fuse_self_norm_wqkv=native_self_norm_wqkv,
+                fuse_self_norm_wqkv=fuse_self_norm_wqkv,
                 expected_dtype=optimized_expected_dtype,
                 dispatch_counts=optimized_dispatch_counts,
             )
