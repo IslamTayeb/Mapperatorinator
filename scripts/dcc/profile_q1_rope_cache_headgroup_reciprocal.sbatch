@@ -89,7 +89,9 @@ cd "$REPO"
 COMMON_ARGS=(--config-name profile_salvalai audio_path="$AUDIO" device=cuda precision="$PRECISION" attn_implementation=sdpa inference_engine=optimized use_server=false parallel=false cfg_scale=1.0 num_beams=1 seed=12345 profile_inference=true profile_detail_ranges=false profile_cuda_capture=false profile_pass_kind=untraced_control)
 declare -A PROFILE_PATHS OSU_PATHS EVIDENCE_PATHS
 run_role() {
-  local role=$1 kind=$2 run_dir="$RUN_ROOT/$role"
+  local role=$1
+  local kind=$2
+  local run_dir="$RUN_ROOT/$role"
   mkdir -p "$run_dir/output"
   local evidence="$run_dir/evidence.json"
   local command=("$PYTHON" utils/run_exact_q1_rope_cache_headgroup.py --mode "$kind" --config-name profile_salvalai --rope-evidence-path "$run_dir/rope-evidence.json" --evidence-manifest "$evidence" "${COMMON_ARGS[@]:2}" output_path="$run_dir/output")
