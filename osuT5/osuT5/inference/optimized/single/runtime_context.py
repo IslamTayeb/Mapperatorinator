@@ -130,3 +130,26 @@ def decoder_layer_runtime_context(
     )
     with decoder_layer_runtime_hooks_context(hooks):
         yield
+
+
+@contextmanager
+def output_projection_runtime_context(
+    *,
+    fuse_final_norm_proj_out: bool = False,
+    dispatch_counts: dict[str, int] | None = None,
+) -> Iterator[None]:
+    from ...runtime_dispatch import (
+        OutputProjectionRuntimeHooks,
+        output_projection_runtime_hooks_context,
+    )
+
+    if fuse_final_norm_proj_out:
+        from ..kernels import decoder_layer
+
+        decoder_layer.preload_native_decoder_layer()
+    hooks = OutputProjectionRuntimeHooks(
+        fuse_final_norm_proj_out=fuse_final_norm_proj_out,
+        dispatch_counts=dispatch_counts,
+    )
+    with output_projection_runtime_hooks_context(hooks):
+        yield

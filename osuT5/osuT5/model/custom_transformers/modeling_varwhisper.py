@@ -35,6 +35,7 @@ from ...runtime_profiling import (
 from ...inference.runtime_dispatch import (
     attention_runtime_hooks,
     decoder_layer_runtime_hooks,
+    output_projection_runtime_hooks,
 )
 from .configuration_varwhisper import VarWhisperConfig
 
@@ -1323,7 +1324,20 @@ class VarWhisperDecoder(VarWhisperPreTrainedModel):
                 if encoder_hidden_states is not None:
                     all_cross_attentions += (layer_outputs[2],)
 
-        if detail_ranges_enabled():
+        fuse_proj_out = (
+            output_projection_runtime_hooks().fuse_final_norm_proj_out
+            and hidden_states.shape[:2] == (1, 1)
+        )
+        if fuse_proj_out:
+            from ...inference.optimized.scout.proj_out import (
+                attach_final_norm_for_fuse,
+            )
+
+            attach_final_norm_for_fuse(
+                self,
+                hidden_dtype=hidden_states.dtype,
+            )
+        elif detail_ranges_enabled():
             with profile_range("decoder.final_norm"):
                 hidden_states = self.layer_norm(hidden_states)
         else:
@@ -1639,11 +1653,24 @@ class VarWhisperForConditionalGeneration(WhisperGenerationMixin, VarWhisperPreTr
             return_dict=return_dict,
             cache_position=cache_position,
         )
-        if detail_ranges_enabled():
-            with profile_range("decoder.output_projection"):
+        fuse_hooks = output_projection_runtime_hooks()
+        lm_logits = None
+        if fuse_hooks.fuse_final_norm_proj_out:
+            from ...inference.optimized.scout.proj_out import (
+                try_native_fused_proj_out,
+            )
+
+            lm_logits = try_native_fused_proj_out(
+                lm_module=self,
+                hidden_states=outputs[0],
+                dispatch_counts=fuse_hooks.dispatch_counts,
+            )
+        if lm_logits is None:
+            if detail_ranges_enabled():
+                with profile_range("decoder.output_projection"):
+                    lm_logits = self.proj_out(outputs[0])
+            else:
                 lm_logits = self.proj_out(outputs[0])
-        else:
-            lm_logits = self.proj_out(outputs[0])
 
         loss = None
         if labels is not None:

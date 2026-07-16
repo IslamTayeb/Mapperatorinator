@@ -53,6 +53,7 @@ def generation_profile_context(
         native_q1_self_attention: bool = False,
         native_q1_rope_cache_self_attention: bool = False,
         native_cross_mlp_tail: bool = False,
+        native_proj_out: bool = False,
         optimized_expected_dtype: torch.dtype = torch.float32,
         optimized_dispatch_counts: dict[str, int] | None = None,
 ) -> Iterator[None]:
@@ -63,8 +64,10 @@ def generation_profile_context(
         from osuT5.osuT5.inference.runtime_dispatch import (
             AttentionRuntimeHooks,
             DecoderLayerRuntimeHooks,
+            OutputProjectionRuntimeHooks,
             attention_runtime_hooks_context,
             decoder_layer_runtime_hooks_context,
+            output_projection_runtime_hooks_context,
         )
 
         optimized_attention_context = attention_runtime_hooks_context(
@@ -100,6 +103,22 @@ def generation_profile_context(
                 native_cross_mlp_tail=True,
                 dispatch_counts=optimized_dispatch_counts,
             )
+        optimized_output_projection_context = (
+            output_projection_runtime_hooks_context(
+                OutputProjectionRuntimeHooks()
+            )
+        )
+        if native_proj_out:
+            from osuT5.osuT5.inference.optimized.single.runtime_context import (
+                output_projection_runtime_context,
+            )
+
+            optimized_output_projection_context = (
+                output_projection_runtime_context(
+                    fuse_final_norm_proj_out=True,
+                    dispatch_counts=optimized_dispatch_counts,
+                )
+            )
         optimized_active_prefix_context = nullcontext()
         if (
             active_prefix_self_attention_length is not None
@@ -117,6 +136,7 @@ def generation_profile_context(
         with (
             optimized_attention_context,
             optimized_decoder_layer_context,
+            optimized_output_projection_context,
             optimized_active_prefix_context,
             sdpa_backend_context(sdpa_backend),
         ):
