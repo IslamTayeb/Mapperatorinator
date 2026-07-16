@@ -33,6 +33,7 @@ case "$PRECISION" in
 esac
 
 ALLOW_PARALLEL=${ALLOW_PARALLEL:-${MAPPERATORINATOR_ALLOW_PARALLEL:-1}}
+AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_LABEL=${RUN_LABEL:-self-out-residual-component-$PRECISION}
 RUN_ROOT="$WORK/runs/${RUN_LABEL}-${SLURM_JOB_ID:-manual}"
 
@@ -43,6 +44,8 @@ for tool in "$PYTHON" nvidia-smi; do
   fi
 done
 [[ -d "$REPO/.git" || -f "$REPO/.git" ]] || die "missing worktree at $REPO"
+[[ -f "$AUDIO" ]] || die "missing audio: $AUDIO"
+export MAPPERATORINATOR_AUDIO="$AUDIO"
 [[ -z "$(git -C "$REPO" status --porcelain)" ]] || {
   git -C "$REPO" status --short >&2
   die "scout worktree is dirty"
@@ -107,6 +110,7 @@ fi
   echo "remote=$REMOTE"
   echo "precision=$PRECISION"
   echo "allow_parallel=$ALLOW_PARALLEL"
+  echo "audio=$AUDIO"
   echo "repo=$REPO"
   echo "python=$PYTHON"
   echo "run_root=$RUN_ROOT"

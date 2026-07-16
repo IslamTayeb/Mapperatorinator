@@ -30,6 +30,8 @@ def test_sbatch_isolates_job_tmpdir_and_excludes_h36_9() -> None:
     assert "TORCH_EXTENSIONS_DIR" in source
     assert "TMPDIR" in source
     assert "ALLOW_PARALLEL" in source
+    assert "MAPPERATORINATOR_AUDIO" in source
+    assert "salvalai.mp3" in source
 
 
 def test_tip_gates_use_five_percent_of_graduated_main() -> None:

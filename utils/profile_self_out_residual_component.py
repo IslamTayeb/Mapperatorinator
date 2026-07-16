@@ -17,8 +17,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -189,6 +191,26 @@ def _load_args(config_name: str, overrides: list[str]):
     return OmegaConf.to_object(cfg) if isinstance(cfg, DictConfig) else cfg
 
 
+def _resolve_component_audio_path() -> Path:
+    """Satisfy compile_paths without requiring the Mac-local profile_salvalai path.
+
+    Component profiling only loads Wo weights; audio is never decoded.
+    Prefer MAPPERATORINATOR_AUDIO / DCC SALVALAI, else a disposable dummy .mp3.
+    """
+    candidates: list[Path] = []
+    env = os.environ.get("MAPPERATORINATOR_AUDIO")
+    if env:
+        candidates.append(Path(env))
+    candidates.append(Path("/work/imt11/Mapperatorinator/data/salvalai.mp3"))
+    for path in candidates:
+        if path.is_file():
+            return path
+    dummy_dir = Path(tempfile.mkdtemp(prefix="self_out_residual_component_"))
+    dummy = dummy_dir / "dummy.mp3"
+    dummy.write_bytes(b"")
+    return dummy
+
+
 def _extract_self_wo_layers(model) -> list[dict[str, Any]]:
     from osuT5.osuT5.model.custom_transformers.modeling_varwhisper import (
         VarWhisperDecoderLayer,
@@ -226,6 +248,9 @@ def _load_real_wo_layers(*, precision: str, model_path: str | None) -> list[dict
         setup_inference_environment,
     )
 
+    # profile_salvalai.yaml pins a Mac-local audio_path; component loading only
+    # needs model weights, but compile_args still validates audio existence.
+    audio_path = _resolve_component_audio_path()
     overrides = [
         "device=cuda",
         f"precision={precision}",
@@ -237,6 +262,8 @@ def _load_real_wo_layers(*, precision: str, model_path: str | None) -> list[dict
         "num_beams=1",
         "seed=12345",
         "profile_inference=false",
+        f"audio_path={audio_path}",
+        f"output_path={audio_path.parent}",
     ]
     if model_path:
         overrides.append(f"model_path={model_path}")
