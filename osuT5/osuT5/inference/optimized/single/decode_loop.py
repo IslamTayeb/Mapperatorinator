@@ -302,16 +302,29 @@ def active_prefix_decode_generate(
                         encoder_outputs,
                     )
 
+        from ..kernels.compiled_decode_logits_finalize_activation import (
+            active_decode_logits_finalize,
+        )
+
+        logits_finalize = active_decode_logits_finalize()
         with profile_range("generation.logits_processors"):
-            next_logits = outputs.logits[:, -1, :].to(
-                copy=True,
-                dtype=torch.float32,
-                device=input_ids.device,
-            )
+            if logits_finalize is not None:
+                next_logits = logits_finalize.materialize_logits(
+                    outputs.logits[:, -1, :]
+                )
+            else:
+                next_logits = outputs.logits[:, -1, :].to(
+                    copy=True,
+                    dtype=torch.float32,
+                    device=input_ids.device,
+                )
             next_scores = logits_processor(input_ids, next_logits)
         with profile_range("generation.sampling"):
             if generation_config.do_sample:
-                probabilities = nn.functional.softmax(next_scores, dim=-1)
+                if logits_finalize is not None:
+                    probabilities = logits_finalize.softmax(next_scores)
+                else:
+                    probabilities = nn.functional.softmax(next_scores, dim=-1)
                 next_tokens = torch.multinomial(probabilities, num_samples=1).squeeze(1)
             else:
                 next_tokens = torch.argmax(next_scores, dim=-1)

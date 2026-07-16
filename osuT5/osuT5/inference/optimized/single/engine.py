@@ -306,7 +306,24 @@ def _generate_window(
         "native_q1_self_attention": 0,
         "q1_bmm_cross_attention": 0,
         "native_cross_mlp_tail": 0,
+        "compiled_decode_logits_finalize": 0,
     }
+
+    decode_logits_finalize = None
+    decode_logits_finalize_evidence = None
+    from ..kernels.compiled_decode_logits_finalize_activation import (
+        compiled_decode_logits_finalize_requested,
+        decode_logits_finalize_activation_context,
+    )
+
+    if compiled_decode_logits_finalize_requested():
+        from ..kernels.compiled_decode_logits_finalize import (
+            prepare_decode_logits_finalize,
+        )
+
+        decode_logits_finalize, decode_logits_finalize_evidence = (
+            prepare_decode_logits_finalize(model)
+        )
 
     rng_before = (
         rng_progression_signature(model.device)
@@ -317,6 +334,8 @@ def _generate_window(
         device_type=model.device.type,
         dtype=torch.bfloat16,
         enabled=precision == "amp",
+    ), decode_logits_finalize_activation_context(
+        decode_logits_finalize
     ), generation_profile_context(
         q1_bmm_cross_attention=q1_bmm_cross_attention,
         native_q1_self_attention=native_q1_self_attention,
@@ -345,6 +364,10 @@ def _generate_window(
         if sync_model_timing:
             sync_cuda_for_model(model)
         elapsed_seconds = time.perf_counter() - start_time
+    if decode_logits_finalize is not None:
+        dispatch_counts["compiled_decode_logits_finalize"] = int(
+            decode_logits_finalize.hits.get("compiled_softmax", 0)
+        )
 
     strict_exactness = None
     if collect_strict_exactness:
@@ -428,6 +451,17 @@ def _generate_window(
                     else "timing_context"
                 ),
             },
+            "compiled_decode_logits_finalize": {
+                "requested": compiled_decode_logits_finalize_requested(),
+                "enabled": decode_logits_finalize is not None,
+                "disabled_reason": (
+                    None
+                    if decode_logits_finalize is not None
+                    else None
+                    if not compiled_decode_logits_finalize_requested()
+                    else "prepare_failed"
+                ),
+            },
         },
         "native_cross_mlp_tail_requested": specialized_batch,
         "native_cross_mlp_tail_enabled": native_cross_mlp_tail,
@@ -437,6 +471,12 @@ def _generate_window(
             else "timing_context"
             if not native_cross_mlp_tail
             else None
+        ),
+        "compiled_decode_logits_finalize_requested": (
+            compiled_decode_logits_finalize_requested()
+        ),
+        "compiled_decode_logits_finalize_enabled": (
+            decode_logits_finalize is not None
         ),
         "optimized_dispatch_capture_hits": dict(dispatch_counts),
         "decode_graph_count_before": graph_count_before,
@@ -455,6 +495,12 @@ def _generate_window(
         ),
         "optimized_cuda_graphs": context_state.graph_profile_summary(),
     })
+    if decode_logits_finalize_evidence is not None:
+        stats["compiled_decode_logits_finalize"] = {
+            **decode_logits_finalize_evidence,
+            "hits": dict(decode_logits_finalize.hits),
+            "enabled": True,
+        }
     if strict_exactness is not None:
         stats["strict_exactness"] = strict_exactness
     return result, stats
