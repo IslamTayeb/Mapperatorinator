@@ -99,7 +99,9 @@ run_role() {
   "${command[@]}" > "$run_dir/stdout.txt" 2> "$run_dir/stderr.txt"
   mapfile -t profiles < <(find "$run_dir/output" -type f -name '*.profile.json' | sort)
   [[ ${#profiles[@]} -eq 1 ]] || die "$role produced ${#profiles[@]} profiles"
-  local profile=${profiles[0]} osu=${profile%.profile.json}
+  # Split locals: under set -u, `local a=$x b=$a` leaves a unbound while expanding b.
+  local profile=${profiles[0]}
+  local osu=${profile%.profile.json}
   require_nonempty "$profile"; require_nonempty "$osu"; require_nonempty "$evidence"
   "$PYTHON" - "$evidence" "$kind" <<'PY'
 import json, pathlib, sys

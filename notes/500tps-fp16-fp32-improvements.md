@@ -258,13 +258,36 @@ When any new lever, FIX tip, or scout job lands:
 | Hypothesis | Exact reciprocal ≥5% main_model vs tip `55949274` from q1 scheduling / fewer underfilled CTAs (nsight ~19%) |
 | Base tip | `55949274` |
 | Branch / WT | `codex/exact-q1-rope-cache-headgroup` / local+DCC `exact-q1-rope-cache-headgroup` |
-| Execution tip / immutable ref | **`64372cde`** / `q1-rope-cache-headgroup-scout-64372cde-r2` |
+| Execution tip / immutable ref | pending after wrapper FIX (was **`64372cde`** / `q1-rope-cache-headgroup-scout-64372cde-r2`) |
 | Opt-in | `q1_rope_cache_headgroup_candidate_context` → `native_q1_rope_cache_headgroup` (V32 cold default) |
 | Kernel | `q1_rope_cache_attention_headgroup` (HEADS_PER_CTA=2, block 128×2) |
-| Jobs | FP16 **`50000634`**; FP32 **`50000635`** (RUNNING). Prior `49998739`/`740` + retries FAILED ~12s on wrapper `role: unbound variable` — infra FIX, not **STOP_NO_PROMOTE** |
-| Run roots | `/work/imt11/Mapperatorinator/runs/q1-headgroup-fp16-r3-64372cde-50000634/`; `.../q1-headgroup-fp32-r3-64372cde-50000635/` |
-| Exact | pending |
-| Measured | pending |
-| Decision | **OPEN** — r3 scouts submitted and past preflight |
+| Prior infra fails | FP16/FP32 `50000634`/`635` + retries `50002697`/`698` — all FAILED exit 1:0 after baseline: `profile: unbound variable` at sbatch L102 (`local profile=${profiles[0]} osu=${profile%.profile.json}` under `set -u`). Candidate never ran. |
+| FIX | Split into two `local` lines (sibling reciprocals already do this). |
+| Jobs | **pending resubmit** after FIX push (prior IDs are not lever evidence) |
+| Run roots (prior) | `/work/imt11/Mapperatorinator/runs/q1-headgroup-fp{16,32}-r3-64372cde-<jobid>/` — baseline only |
+| Exact | pending (fixed runs) |
+| Measured | pending (fixed runs) |
+| Decision | **OPEN** — prior fails are wrapper INFRA, not **STOP_NO_PROMOTE**; harvest only after fixed reciprocal lands |
 | Not this lever | §6/§7/§10/§11 math replaces; INT8; bare split-KV; compiled-cross |
 | Ledger rule | Own section only |
+
+## 13. Owned compile-before-capture self Wqkv + Wo GEMVs — **STOP_NO_PROMOTE**
+
+| Field | Value |
+| --- | --- |
+| What | Owned `torch.compile` of tip-exact one-token self-attn `Wqkv` + `Wo` via `F.linear` (prepare before outer CUDA graph). **Not** `native_one_token_linear` / §11 |
+| Hypothesis | Exact reciprocal ≥5% main_model vs tip `55949274` on SALVALAI from remaining eager gemm/projection (~26% nsight family) |
+| Base tip | `55949274` |
+| Branch / WT | `codex/exact-compiled-self-proj` / DCC `exact-compiled-self-proj` (`codex/exact-compiled-self-proj-dcc`) |
+| Tip / commit | **`3164875a`** |
+| Opt-in | `compiled_self_proj_candidate_context` → `compiled_self_wqkv` + `compiled_out_proj` (V32 cold default) |
+| Compile | `torch.compile(F.linear region, fullgraph=True, dynamic=False, mode="default")`; SM75; bitwise warmup gate — no max-autotune |
+| Jobs | FP16 **`50001853`** FAILED 1:0 00:04:13 (z25-20); FP32 **`50001854`** FAILED 1:0 00:04:45 (z25-20) |
+| Run roots | `/work/imt11/Mapperatorinator/runs/compiled-self-proj-fp{16,32}-5000185{3,4}/` (both have `baseline_first` + `candidate_first`) |
+| Exact | **n/a** — candidate crashed mid-song before `.osu`/profile; no analyzer reciprocal |
+| Measured | No candidate `main_tps`. Baseline-only (not a claim): FP16 **319.93** TPS / 24.408 s (7809); FP32 **262.04** / 31.651 s (8294). Candidate died ~window 3/87 after Dynamo recompiles. |
+| Analyzer / root cause | `torch._dynamo.exc.FailOnRecompileLimitHit` on `_linear_region` (`compiled_self_proj.py:66`): `fullgraph=True` + `dynamic=False` hit `recompile_limit` (8) because tensor `x` size at index 1 varied (FP16 expected 1024 actual 564; FP32 expected 1024 actual 617). Lever design fail — not wrapper infra. |
+| Decision | **STOP_NO_PROMOTE** — candidate unused for reciprocal (crash); not FIX+resubmit (compile/dynamic-shape failure, not unbound-var infra) |
+| Revisit | Only with a new exactness hypothesis that owns dynamic seq lengths (or confines compile to fixed `(1,1)` decode GEMV shapes without timing-prefix pollution) |
+| Not this lever | §3 compiled-cross BMM; §6/§7/§10/§11 native math replaces; §12 q1 headgroup; INT8 |
+| Ledger rule | Own section only; do not fold into §3/§11/§12 |

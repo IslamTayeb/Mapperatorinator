@@ -69,14 +69,21 @@ Packaging note: `notes/exact-shared-runtime-packaging.md`. Exactness sealed. **N
 
 **Parallel-guard lesson:** with `ALLOW_PARALLEL_RECIPROCAL=0`, do **not** pre-queue a dependent sibling — PENDING GPU jobs trip the guard.
 
-## §12 Native q1 RoPE/cache head-group CTA scheduling — **OPEN**
+## §12 Native q1 RoPE/cache head-group CTA scheduling — **OPEN** (infra FIX → resubmit)
 
-- Execution tip: `codex/exact-q1-rope-cache-headgroup` @ **`64372cde`** (tag `q1-rope-cache-headgroup-scout-64372cde-r2`; base `55949274`).
 - Lever: packs two independent q1 RoPE/cache attention heads in each 128×2 CTA while retaining each head’s reduction order; it does not replace Wo, proj_out, or RMSNorm math.
-- Reciprocal jobs: FP16 **`50000634`**; FP32 **`50000635`** — RUNNING (`ALLOW_PARALLEL_RECIPROCAL=1`).
-- Prior attempts: `49998160`/`162` remote-ref race; `49998739`/`740` (+ retries) FAILED ~12s on wrapper `role: unbound variable` before candidate execution — infra FIX, not lever **STOP_NO_PROMOTE**.
-- Run roots: `/work/imt11/Mapperatorinator/runs/q1-headgroup-fp16-r3-64372cde-50000634/`; `.../q1-headgroup-fp32-r3-64372cde-50000635/`.
-- Next action: harvest exactness and untraced `main_model` reciprocal evidence; promote only on an exact ≥5% result.
+- Prior tip `64372cde` jobs `50000634`/`635` + retries `50002697`/`698` all FAILED exit 1:0 after baseline: wrapper `profile: unbound variable` (`local profile=… osu=${profile…}` under `set -u`). Candidate never ran — **INFRA**, not lever **STOP_NO_PROMOTE**.
+- FIX: split those locals onto separate lines in `profile_q1_rope_cache_headgroup_reciprocal.sbatch`; commit + push on `codex/exact-q1-rope-cache-headgroup`; resubmit FP16+FP32 with unique TMPDIR/TORCH_EXTENSIONS and `ALLOW_PARALLEL=1`.
+- Jobs / tip / run roots: **update after resubmit** (see live jobs table).
+- Next action: harvest exactness + untraced `main_model` on the fixed runs only; promote only on exact ≥5%.
+
+## §13 Owned compile-before-capture self Wqkv + Wo — **STOP_NO_PROMOTE**
+
+- Tip `3164875a` (`codex/exact-compiled-self-proj` / DCC `exact-compiled-self-proj-dcc`).
+- Jobs FP16 **`50001853`** / FP32 **`50001854`** FAILED 1:0 (~4–5 min). Both have `baseline_first` + `candidate_first`.
+- Candidate crash: `FailOnRecompileLimitHit` on `_linear_region` (`fullgraph=True`, `dynamic=False`) — seq-len mismatch (expected 1024, actual 564/617). No reciprocal exactness / `main_tps`.
+- Baseline-only (not a claim): FP16 ~319.93 TPS / 24.408 s; FP32 ~262.04 / 31.651 s.
+- Decision: **STOP_NO_PROMOTE** (lever design fail). Do not fold into §11/§12. Revisit only with owned dynamic shapes or fixed `(1,1)` decode-only compile.
 
 ## Branches / worktrees
 
@@ -88,7 +95,8 @@ Packaging note: `notes/exact-shared-runtime-packaging.md`. Exactness sealed. **N
 | FP32/FP16 | `codex/exact-self-norm-wqkv` | **`fd126612`** | r3 **STOP_NO_PROMOTE** (`49982390`/`391`); do not bare-retry |
 | FP32/FP16 | `codex/exact-proj-out-fuse` | **`585ffc90`** | §10 final-norm+proj_out — **STOP_NO_PROMOTE** (`49989856`/`857`) |
 | FP32/FP16 | `codex/exact-self-wo-linear` | **`c48f5b8b`** | §11 Wo one-token linear — **STOP_NO_PROMOTE** (`49993296`/`297` exactness collapse) |
-| FP32/FP16 | `codex/exact-q1-rope-cache-headgroup` | **`64372cde`** | §12 q1 RoPE/cache head-group CTA — **OPEN** (FP16 `50000634` / FP32 `50000635` RUNNING) |
+| FP32/FP16 | `codex/exact-q1-rope-cache-headgroup` | FIX pending → new tip | §12 q1 headgroup — **OPEN** (wrapper FIX; prior `64372cde` infra fail) |
+| FP32/FP16 | `codex/exact-compiled-self-proj` | **`3164875a`** | §13 compiled self Wqkv/Wo — **STOP_NO_PROMOTE** (`50001853`/`854`) |
 | FP32/FP16 | `codex/exact-self-rmsnorm-wqkv` | `55949274` | empty stub WT — superseded by `exact-self-norm-wqkv` |
 | FP32/FP16 | `codex/exact-decode-cast-elim` | **`a354624f`** | **DROP** (exact; main −19 TPS on `49974095`) |
 | FP32/FP16 | `codex/exact-decode-cast-copy` | **`11766d07`** | **DROP** r2 cast/copy (exact main regress `49976415`/`416`) |
@@ -182,10 +190,10 @@ Artifacts: `/work/imt11/Mapperatorinator/runs/{exact-decode-cast-copy-fp16-49974
 
 | Job | Node | Candidate | Slurm | Decision |
 | --- | --- | --- | --- | --- |
-| **`49998739`** | — | §12 q1 headgroup FP16 @ `9d034259` | **PENDING** | reciprocal scout submitted; exact/measured pending |
-| **`49998740`** | — | §12 q1 headgroup FP32 @ `9d034259` | **PENDING** | reciprocal scout submitted; exact/measured pending |
-| **`50000634`** | — | §12 q1 headgroup FP16 @ `64372cde` | **RUNNING** | r3 reciprocal scout past preflight; exact/measured pending |
-| **`50000635`** | — | §12 q1 headgroup FP32 @ `64372cde` | **RUNNING** | r3 reciprocal scout past preflight; exact/measured pending |
+| **`50000634`/`635`** | z25-20 | §12 q1 headgroup @ `64372cde` | **FAILED** 1:0 | infra `profile: unbound variable` after baseline — not STOP |
+| **`50002697`/`698`** | z25-20 | §12 q1 headgroup retry @ `64372cde` | **FAILED** 1:0 | same unbound `profile` — not STOP |
+| **`50001853`** | z25-20 | §13 compiled-self-proj FP16 @ `3164875a` | **FAILED** 1:0 | `FailOnRecompileLimitHit` — **STOP_NO_PROMOTE** |
+| **`50001854`** | z25-20 | §13 compiled-self-proj FP32 @ `3164875a` | **FAILED** 1:0 | same — **STOP_NO_PROMOTE** |
 | **`49993296`** | — | §11 self-Wo linear FP16 @ `c48f5b8b` | **FAILED** | exactness collapse 7809→518 — **STOP_NO_PROMOTE** |
 | **`49993297`** | — | §11 self-Wo linear FP32 @ `c48f5b8b` | **FAILED** | exactness collapse 8294→562 — **STOP_NO_PROMOTE** |
 | **`49989856`** | z25-20 | **proj-out FP16** @ `585ffc90` | **FAILED** | exactness FAIL 7809→7869 / HO 645→588 — **STOP_NO_PROMOTE** |
@@ -215,7 +223,7 @@ Artifacts: `/work/imt11/Mapperatorinator/runs/{exact-decode-cast-copy-fp16-49974
 2. ~~self-out Wo+residual~~ **STOP_NO_PROMOTE** / DROP — last look `49978677`/`678` FAILED (unused `*native_one_token_linear_residual*` + undeclared dispatch; fusion not engaged).
 3. ~~self norm+Wqkv r3 `fd126612`~~ **STOP_NO_PROMOTE** (`49982390` exactness FAIL; `49982391` &lt;5%).
 4. ~~Owned final-norm+proj_out~~ **STOP_NO_PROMOTE** (ledger §10).
-5. **§11 STOP_NO_PROMOTE** (`49993296`/`297` exactness collapse). **Harvest §12** q1 RoPE/cache headgroup reciprocal jobs `50000634`/`50000635` @ `64372cde` (not another Wo/proj_out fuse).
+5. **§11 STOP_NO_PROMOTE**. **§13 STOP_NO_PROMOTE** (`50001853`/`854`). **§12 OPEN** — harvest fixed wrapper resubmit (not prior `64372cde` infra fails).
 6. q1 self-attn only with new sizing vs prior STOP_NO_GAIN.
 7. Serialize graduation after independent ≥5% exact PASS.
 
@@ -241,9 +249,10 @@ Artifacts: `/work/imt11/Mapperatorinator/runs/{exact-decode-cast-copy-fp16-49974
 1. ~~Auth / graduate device-state~~ **DONE**.
 2. ~~Compiled-cross / cast-elim / cast-copy~~ **DROP / STOP_NO_PROMOTE**.
 3. ~~Harvest norm+Wqkv r3 / proj_out~~ **STOP_NO_PROMOTE**.
-4. ~~Harvest §11 self-wo linear~~ **STOP_NO_PROMOTE** (exactness collapse). **Harvest §12** q1 RoPE/cache headgroup jobs `50000634`/`50000635` @ `64372cde`.
-5. No hybrid ContiguousKv / INT8 / DP4A / CUTLASS for the 500 claim.
-6. No merge without approval.
+4. ~~Harvest §11 self-wo linear~~ **STOP_NO_PROMOTE** (exactness collapse).
+5. ~~Harvest §13 compiled self Wqkv/Wo~~ **STOP_NO_PROMOTE** (`50001853`/`854` FailOnRecompileLimitHit).
+6. **Harvest §12** after wrapper FIX resubmit (prior `50000634`/`635`/`2697`/`2698` infra only).
+7. No hybrid ContiguousKv / INT8 / DP4A / CUTLASS for the 500 claim. No merge without approval.
 
 ## Standing orders
 
@@ -251,7 +260,7 @@ Artifacts: `/work/imt11/Mapperatorinator/runs/{exact-decode-cast-copy-fp16-49974
 - One candidate per worktree/node; serialize graduation.
 - Never present projections as production TPS.
 - V32 cold default; optimized under `osuT5/.../inference/optimized/`.
-- Wake 2026-07-16: §11 Wo-linear **STOP_NO_PROMOTE** (exactness collapse). §12 q1 RoPE/cache headgroup is **OPEN**: FP16 `50000634` / FP32 `50000635` RUNNING at `64372cde`; harvest `/work/imt11/Mapperatorinator/runs/q1-headgroup-fp{16,32}-r3-64372cde-<jobid>/`. Tip still FP16 **366.11** / −5.71 s. Ledger: `notes/500tps-fp16-fp32-improvements.md`. No merge. No hybrid-500.
+- Wake 2026-07-16: §11 **STOP_NO_PROMOTE**. §13 compiled-self-proj **STOP_NO_PROMOTE** (`50001853`/`854`). §12 q1 headgroup **OPEN** after wrapper FIX (prior `64372cde` jobs infra-only). Tip still FP16 **366.11** / −5.71 s. Ledger: `notes/500tps-fp16-fp32-improvements.md`. No merge. No hybrid-500.
 
 ## Outside-research ranking (FP16/FP32)
 
