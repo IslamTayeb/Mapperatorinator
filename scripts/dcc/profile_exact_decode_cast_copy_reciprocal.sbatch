@@ -232,7 +232,6 @@ run_role baseline_second baseline
   --baseline-second-osu "${OSU_PATHS[baseline_second]}" \
   --mode "$ANALYSIS_MODE" \
   --allow-dispatch-delta '*attn_layout_reshape_no_contiguous*' \
-  --allow-dispatch-delta '*decode_cast_copy*' \
   --json-output "$RUN_ROOT/analysis.json" \
   --text-output "$RUN_ROOT/analysis.txt"
 require_nonempty "$RUN_ROOT/analysis.json"

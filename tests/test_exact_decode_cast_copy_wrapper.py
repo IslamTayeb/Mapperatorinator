@@ -11,6 +11,7 @@ def test_exact_decode_cast_copy_wrapper_uses_unique_tmpdir() -> None:
     assert "SLURM_TMPDIR" in source
     assert "torch_extensions-exact-decode-cast-copy-" in source
     assert "--allow-dispatch-delta" in source
+    assert "*attn_layout_reshape_no_contiguous*" in source
     assert "exact_decode_cast_copy_reciprocal=PASS" in source
     assert "MAPPERATORINATOR_ALLOW_PARALLEL_RECIPROCAL:-0" in source
 
