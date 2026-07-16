@@ -15,6 +15,11 @@ from .dispatch import _q1_bmm_cross_attention
 
 CompiledCross = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
 
+_COMPILED_CACHE: dict[
+    tuple[int, torch.dtype],
+    tuple[CompiledCross, dict[str, float | bool | str]],
+] = {}
+
 
 def prepare_compiled_q1_cross_bmm(
     device: torch.device,
@@ -31,6 +36,19 @@ def prepare_compiled_q1_cross_bmm(
         raise RuntimeError(
             f"compiled q1 cross BMM requires SM75, got sm_{capability[0]}{capability[1]}"
         )
+
+    cache_key = (
+        device.index if device.index is not None else torch.cuda.current_device(),
+        dtype,
+    )
+    cached = _COMPILED_CACHE.get(cache_key)
+    if cached is not None:
+        compiled, evidence = cached
+        return compiled, {
+            **evidence,
+            "cache_hit": True,
+            "compile_and_first_call_seconds": 0.0,
+        }
 
     def _cross_region(
         query: torch.Tensor,
@@ -62,7 +80,7 @@ def prepare_compiled_q1_cross_bmm(
     max_abs = float((eager.float() - actual.float()).abs().max().item())
     if not torch.isfinite(actual).all().item():
         raise RuntimeError("compiled q1 cross BMM produced non-finite warmup output")
-    return compiled, {
+    evidence: dict[str, float | bool | str] = {
         "mode": "max-autotune-no-cudagraphs",
         "fullgraph": True,
         "dynamic": False,
@@ -71,7 +89,10 @@ def prepare_compiled_q1_cross_bmm(
         "compile_and_first_call_seconds": compile_seconds,
         "warmup_max_abs": max_abs,
         "warmup_bitwise_equal": bool(torch.equal(eager, actual)),
+        "cache_hit": False,
     }
+    _COMPILED_CACHE[cache_key] = (compiled, evidence)
+    return compiled, dict(evidence)
 
 
 __all__ = ["CompiledCross", "prepare_compiled_q1_cross_bmm"]
