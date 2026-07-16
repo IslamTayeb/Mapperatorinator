@@ -313,11 +313,7 @@ def _generate_window(
     compiled_cross_evidence = None
     from ..kernels.compiled_cross_activation import compiled_cross_requested
 
-    if compiled_cross_requested():
-        if not native_cross_mlp_tail:
-            raise RuntimeError(
-                "compiled q1 cross BMM requires native cross+MLP tail"
-            )
+    if compiled_cross_requested() and native_cross_mlp_tail:
         from ..kernels.compiled_cross import prepare_compiled_q1_cross_bmm
 
         compiled_cross_bmm, compiled_cross_evidence = prepare_compiled_q1_cross_bmm(
