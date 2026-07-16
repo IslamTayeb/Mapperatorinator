@@ -26,7 +26,8 @@ One sealed reciprocal — no endless sweeps.
 | Reciprocal | `/work/imt11/Mapperatorinator/runs/split-kv-num-splits-16-49953714/` |
 | Status | **FAILED at analyzer only** — undeclared `optimized_effective_config.native_q1_rope_cache_split_kv_split_count`; unused default main_generation hit patterns |
 | Fix | declare split_count delta; optional selected-stack capture-hit patterns (DP4A pattern) |
-| Reseal | `verify_split_kv_num_splits_reciprocal.sbatch` with `MAPPERATORINATOR_SPLIT_KV_SPLITS=16` |
+| Reseal job | `49955271` (`split-kv-num-splits-16`, tip `178a966c`) |
+| Reseal script | `verify_split_kv_num_splits_reciprocal.sbatch` with `MAPPERATORINATOR_SPLIT_KV_SPLITS=16` |
 
 ## Paths
 
