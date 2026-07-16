@@ -109,6 +109,41 @@ def test_wrapper_has_isolated_parallel_compiled_cross_gate() -> None:
     assert 'refs/remotes/$CANDIDATE_REMOTE/$CANDIDATE_REMOTE_BRANCH' in source
 
 
+def test_wrapper_declares_split_kv_num_splits_effective_config_delta() -> None:
+    source = WRAPPER.read_text(encoding="utf-8")
+
+    assert (
+        "REQUIRE_SPLIT_KV_NUM_SPLITS_INCREMENTAL="
+        "${REQUIRE_SPLIT_KV_NUM_SPLITS_INCREMENTAL:-false}" in source
+    )
+    split_analysis = source.split(
+        'elif [[ "$REQUIRE_SPLIT_KV_NUM_SPLITS_INCREMENTAL" == true ]]; then\n'
+        "  # Selected shared-arena control already owns",
+        1,
+    )[1].split(
+        'elif [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then',
+        1,
+    )[0]
+    assert (
+        "optimized_effective_config.native_q1_rope_cache_split_kv_split_count"
+        in split_analysis
+    )
+    assert (
+        "--allow-optional-dispatch-delta\n"
+        "      'records.main_generation[[]*].optimized_dispatch_capture_hits'"
+        in split_analysis
+    )
+    assert (
+        "--allow-optional-dispatch-delta\n"
+        "      'records.main_generation[[]*].optimized_dispatch_capture_hits.*'"
+        in split_analysis
+    )
+    assert "native_cross_mlp_tail_*" not in split_analysis
+    assert "--require-exact-label timing_context" in split_analysis
+    assert "--require-exact-dispatch-label timing_context" in split_analysis
+    assert "--require-exact-label main_generation" not in split_analysis
+
+
 def test_wrapper_allows_declared_timing_drift_for_k4_composition() -> None:
     source = WRAPPER.read_text(encoding="utf-8")
 

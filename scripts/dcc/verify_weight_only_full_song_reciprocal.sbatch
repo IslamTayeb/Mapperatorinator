@@ -1100,6 +1100,25 @@ if [[ "$REQUIRE_COMPILED_CROSS_INCREMENTAL" == true ]]; then
     --allow-optional-dispatch-delta
       'records.main_generation[[]*].optimized_cuda_graphs.*'
   )
+elif [[ "$REQUIRE_SPLIT_KV_NUM_SPLITS_INCREMENTAL" == true ]]; then
+  # Selected shared-arena control already owns packed cross, INT8 MLP, arena,
+  # and split-KV@8. Candidate only changes split_count in effective config;
+  # token-dependent secondary hit counts may still differ under documented drift.
+  ANALYSIS_EXACT_ARGS=(
+    --require-exact-label timing_context
+    --require-exact-dispatch-label timing_context
+  )
+  ANALYSIS_DISPATCH_ARGS=(
+    --allow-optional-dispatch-delta 'optimized_result_class'
+    --allow-dispatch-delta
+      'optimized_effective_config.native_q1_rope_cache_split_kv_split_count'
+    --allow-optional-dispatch-delta
+      'records.main_generation[[]*].optimized_dispatch_capture_hits'
+    --allow-optional-dispatch-delta
+      'records.main_generation[[]*].optimized_dispatch_capture_hits.*'
+    --allow-optional-dispatch-delta
+      'records.main_generation[[]*].optimized_cuda_graphs.*'
+  )
 elif [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
   ANALYSIS_EXACT_ARGS=(
     --require-exact-label timing_context
@@ -1310,6 +1329,9 @@ EXPECTED_EXACT_LABELS=none
 EXPECTED_EXACT_DISPATCH_LABELS=none
 if [[ "$REQUIRE_SHARED_ARENA_INCREMENTAL" == true ]]; then
   EXPECTED_EXACT_LABELS=timing_context,main_generation
+elif [[ "$REQUIRE_SPLIT_KV_NUM_SPLITS_INCREMENTAL" == true ]]; then
+  EXPECTED_EXACT_LABELS=timing_context
+  EXPECTED_EXACT_DISPATCH_LABELS=$EXPECTED_EXACT_LABELS
 elif [[ "$REQUIRE_SHARED_ROPE_INCREMENTAL" == true ]]; then
   EXPECTED_EXACT_LABELS=timing_context,main_generation
   EXPECTED_EXACT_DISPATCH_LABELS=$EXPECTED_EXACT_LABELS
