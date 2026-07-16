@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=compiled-self-proj
+#SBATCH --job-name=compiled-self-decode
 #SBATCH --partition=gpu-common
 #SBATCH --account=romerolab
 #SBATCH --cpus-per-task=8
@@ -12,7 +12,7 @@
 set -euo pipefail
 
 die() {
-  echo "compiled-self-proj: $*" >&2
+  echo "compiled-self-proj-decode-only: $*" >&2
   exit 2
 }
 
@@ -31,10 +31,10 @@ WORK=${MAPPERATORINATOR_WORK:-/work/imt11/Mapperatorinator}
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 EXPECTED_GPU=${MAPPERATORINATOR_EXPECTED_GPU:-2080 Ti}
 ALLOW_PARALLEL_RECIPROCAL=${MAPPERATORINATOR_ALLOW_PARALLEL_RECIPROCAL:-0}
-RUN_LABEL=${RUN_LABEL:-compiled-self-proj-$PRECISION}
+RUN_LABEL=${RUN_LABEL:-compiled-self-proj-decode-only-$PRECISION}
 RUN_ROOT="$WORK/runs/${RUN_LABEL}-${SLURM_JOB_ID}"
-JOB_TMP="${SLURM_TMPDIR:-/tmp}/imt11-compiled-self-proj-${SLURM_JOB_ID}"
-JOB_EXT="$WORK/tmp/torch_extensions-compiled-self-proj-${SLURM_JOB_ID}"
+JOB_TMP="${SLURM_TMPDIR:-/tmp}/imt11-compiled-self-proj-decode-only-${SLURM_JOB_ID}"
+JOB_EXT="$WORK/tmp/torch_extensions-compiled-self-proj-decode-only-${SLURM_JOB_ID}"
 
 case "$PRECISION" in
   fp32) ANALYSIS_MODE=exact-fp32 ;;
@@ -182,7 +182,8 @@ payload = json.loads(pathlib.Path(sys.argv[1]).read_text())
 role = sys.argv[2]
 expected = {
     "accepted_dispatch_replaced": False,
-    "candidate": "exact_device_state_plus_compiled_self_proj",
+    "candidate": "exact_device_state_plus_compiled_self_proj_decode_only",
+    "compiled_self_proj_decode_only": True,
     "compiled_self_proj_enabled": role == "candidate",
     "decode_loop_calls": payload["decode_loop_calls"],
     "decoder_layer_replaced": False,
@@ -274,4 +275,4 @@ assert evidence[2]["compiled_self_proj_enabled"] is True
 assert evidence[3]["compiled_self_proj_enabled"] is False
 PY
 
-echo "compiled_self_proj_reciprocal=PASS"
+echo "compiled_self_proj_decode_only_reciprocal=PASS"

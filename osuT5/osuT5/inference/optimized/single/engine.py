@@ -323,6 +323,16 @@ def _generate_window(
         )
 
         def compiled_wo(hidden_states, weight, bias):
+            if (
+                not isinstance(hidden_states, torch.Tensor)
+                or hidden_states.ndim < 2
+                or int(hidden_states.shape[0]) != 1
+                or int(hidden_states.shape[1]) != 1
+            ):
+                raise RuntimeError(
+                    "compiled self Wo is decode-only (1,1,*); refusing shape "
+                    f"{tuple(getattr(hidden_states, 'shape', ()))}"
+                )
             dispatch_counts["compiled_self_wo"] = (
                 dispatch_counts.get("compiled_self_wo", 0) + 1
             )

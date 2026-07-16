@@ -42,7 +42,7 @@ def _activation_payload(
     return {
         "schema_version": 1,
         "role": mode,
-        "candidate": "exact_device_state_plus_compiled_self_proj",
+        "candidate": "exact_device_state_plus_compiled_self_proj_decode_only",
         "enabled": mode == "candidate",
         "decode_loop_calls": calls,
         "decoder_layer_replaced": False,
@@ -50,6 +50,7 @@ def _activation_payload(
         "shared_rope_enabled": True,
         "device_sequence_state_enabled": True,
         "compiled_self_proj_enabled": mode == "candidate",
+        "compiled_self_proj_decode_only": True,
         "rng_after_seed": rng_after_seed,
         "rng_after_inference": rng_after_inference,
     }
@@ -83,7 +84,7 @@ def run(
 
     import inference as inference_module
     from osuT5.osuT5.inference.optimized.kernels.compiled_self_proj_activation import (
-        compiled_self_proj_candidate_context,
+        compiled_self_proj_decode_only_candidate_context,
     )
     from osuT5.osuT5.inference.optimized.scout.device_sequence_state import (
         device_sequence_state_candidate_context,
@@ -108,7 +109,7 @@ def run(
         with ExitStack() as stack:
             activation = stack.enter_context(device_sequence_state_candidate_context())
             if mode == "candidate":
-                stack.enter_context(compiled_self_proj_candidate_context())
+                stack.enter_context(compiled_self_proj_decode_only_candidate_context())
             run_shared_rope(config_name, overrides, rope_evidence_path)
         rng_after_inference = _rng_fingerprint()
     finally:

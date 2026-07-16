@@ -1,6 +1,7 @@
-"""Opt-in torch.compile one-token self-attn Wqkv/Wo GEMVs prepared before outer CUDA capture.
+"""Opt-in torch.compile decode-only (1,1) self-attn Wqkv/Wo GEMVs before outer CUDA capture.
 
 Exact FP16/FP32 path only — owned F.linear regions, no native_one_token_linear / INT8.
+Call sites must refuse variable-seq prefill (see modeling_varwhisper Wo gate).
 """
 
 from __future__ import annotations
@@ -168,6 +169,8 @@ def prepare_compiled_self_projections(
     )
     evidence: dict[str, object] = {
         "enabled": True,
+        "decode_only": True,
+        "decode_shape": [1, 1],
         "layer_count": len(decoder_layers),
         "wqkv": wqkv_evidence,
         "wo": wo_evidence,

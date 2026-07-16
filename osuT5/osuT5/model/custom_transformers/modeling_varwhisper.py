@@ -671,8 +671,16 @@ class VarWhisperAttention(nn.Module):
                         )
 
         hidden_states, *rest = attn_outputs
+        # Decode-only: compiled Wo is warmed at (1,1,*). Prefill/variable seq must
+        # stay on eager Wo — otherwise Dynamo recompiles and hits FailOnRecompileLimitHit.
         compiled_out_proj = attention_runtime_hooks().compiled_out_proj
-        if compiled_out_proj is not None:
+        use_compiled_out_proj = (
+            compiled_out_proj is not None
+            and hidden_states.ndim >= 2
+            and int(hidden_states.shape[0]) == 1
+            and int(hidden_states.shape[1]) == 1
+        )
+        if use_compiled_out_proj:
             hidden_states = self.out_drop(
                 compiled_out_proj(hidden_states, self.Wo.weight, self.Wo.bias)
             )
