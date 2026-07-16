@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import time
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import torch
 from torch import nn
@@ -653,6 +653,23 @@ _ACTIVE_BLOCK_SIZE: int | None = None
 _ACTIVE_GRAPH_REMAINDERS: bool | None = None
 _ACTIVE_SHARED_STATIC_INPUT_ARENA: bool | None = None
 _ACTIVE_TRANSITION_TIMING: bool | None = None
+_ACTIVE_ENTRY_SNAPSHOTTER: Callable[["_K8GraphEntry", int], Any] | None = None
+
+
+def _attach_entry_profile_snapshot(
+    raw_entry: dict[str, Any],
+    entry: "_K8GraphEntry",
+    *,
+    active_prefix_length: int,
+) -> None:
+    """Attach opt-in pre-replay evidence without changing default K4 ownership."""
+
+    snapshotter = _ACTIVE_ENTRY_SNAPSHOTTER
+    if snapshotter is None:
+        return
+    snapshot = snapshotter(entry, active_prefix_length)
+    if snapshot is not None:
+        raw_entry["profile_pre_replay_snapshot"] = snapshot
 
 
 _TRANSITION_STAGES = (
@@ -1486,6 +1503,11 @@ def k8_active_prefix_decode_generate(
                 "decode_replays": 0,
                 "k8_stats": stats,
             }
+            _attach_entry_profile_snapshot(
+                raw_entry,
+                entry,
+                active_prefix_length=prefix,
+            )
             graph_cache[key] = raw_entry
             if shared_static_input_arena:
                 stats["static_input_arena_graph_entries"] += 1
@@ -1629,11 +1651,13 @@ def install_k8_candidate(
     graph_remainders: bool = False,
     shared_static_input_arena: bool = False,
     transition_timing: bool = False,
+    entry_snapshotter: Callable[[_K8GraphEntry, int], Any] | None = None,
 ) -> Iterator[None]:
     """Temporarily install a bounded block candidate for an explicit runner."""
 
     global _ACTIVE_BLOCK_SIZE, _ACTIVE_GRAPH_REMAINDERS, _ACTIVE_K8_LIFECYCLE
     global _ACTIVE_SHARED_STATIC_INPUT_ARENA, _ACTIVE_TRANSITION_TIMING
+    global _ACTIVE_ENTRY_SNAPSHOTTER
     from . import engine
 
     block_size = _validate_block_size(block_size)
@@ -1643,6 +1667,8 @@ def install_k8_candidate(
         raise TypeError("shared_static_input_arena must be a bool")
     if not isinstance(transition_timing, bool):
         raise TypeError("transition_timing must be a bool")
+    if entry_snapshotter is not None and not callable(entry_snapshotter):
+        raise TypeError("entry_snapshotter must be callable or None")
     if shared_static_input_arena and not graph_remainders:
         raise ValueError("shared static-input arena requires graphed remainders")
     if (
@@ -1651,6 +1677,7 @@ def install_k8_candidate(
         or _ACTIVE_GRAPH_REMAINDERS is not None
         or _ACTIVE_SHARED_STATIC_INPUT_ARENA is not None
         or _ACTIVE_TRANSITION_TIMING is not None
+        or _ACTIVE_ENTRY_SNAPSHOTTER is not None
     ):
         raise RuntimeError("K8 candidate context cannot be nested")
     lifecycle = _K8GraphLifecycle()
@@ -1660,6 +1687,7 @@ def install_k8_candidate(
     _ACTIVE_GRAPH_REMAINDERS = graph_remainders
     _ACTIVE_SHARED_STATIC_INPUT_ARENA = shared_static_input_arena
     _ACTIVE_TRANSITION_TIMING = transition_timing
+    _ACTIVE_ENTRY_SNAPSHOTTER = entry_snapshotter
     engine.active_prefix_decode_generate = k8_active_prefix_decode_generate
     try:
         yield
@@ -1673,6 +1701,7 @@ def install_k8_candidate(
             _ACTIVE_GRAPH_REMAINDERS = None
             _ACTIVE_SHARED_STATIC_INPUT_ARENA = None
             _ACTIVE_TRANSITION_TIMING = None
+            _ACTIVE_ENTRY_SNAPSHOTTER = None
 
 
 __all__ = [

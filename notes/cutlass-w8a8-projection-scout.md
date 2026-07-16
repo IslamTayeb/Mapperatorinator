@@ -29,6 +29,13 @@ the compiled-cross confirmation job; parent tip `0dbab9e5`.
 `summary.conservative_fixed_main_saving_seconds` (hot∩cold) vs gate `0.3s`,
 plus `metadata.cutlass_available` / `metadata.scout_backend`.
 
+## DCC jobs
+
+| Job | Node | Tip | Slurm | Note |
+| --- | --- | --- | --- | --- |
+| `49952996` | z25-20 | `dcfee9ac` | **FAILED** `1:0` | `install_k8_candidate(... entry_snapshotter=...)` missing on arena tip; fixed by porting opt-in snapshotter. |
+| (resubmit) | (exclude h36-9) | post-fix tip | pending | Isolated TMPDIR / TORCH_EXTENSIONS_DIR. |
+
 ## Submit (after commit+push+DCC sync)
 
 ```bash

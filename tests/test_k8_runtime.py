@@ -915,6 +915,41 @@ def test_install_exposes_and_restores_graph_remainder_policy():
     assert k8_runtime._ACTIVE_GRAPH_REMAINDERS is None
 
 
+def test_install_exposes_opt_in_entry_snapshotter_and_attaches_evidence():
+    calls = []
+
+    def snapshotter(entry, prefix):
+        calls.append((entry, prefix))
+        return {"prefix": prefix, "owned": True}
+
+    entry = object()
+    raw = {}
+    with install_k8_candidate(
+        block_size=4,
+        graph_remainders=True,
+        entry_snapshotter=snapshotter,
+    ):
+        assert k8_runtime._ACTIVE_ENTRY_SNAPSHOTTER is snapshotter
+        k8_runtime._attach_entry_profile_snapshot(
+            raw,
+            entry,
+            active_prefix_length=128,
+        )
+
+    assert calls == [(entry, 128)]
+    assert raw["profile_pre_replay_snapshot"] == {
+        "prefix": 128,
+        "owned": True,
+    }
+    assert k8_runtime._ACTIVE_ENTRY_SNAPSHOTTER is None
+
+
+def test_install_rejects_non_callable_entry_snapshotter():
+    with pytest.raises(TypeError, match="entry_snapshotter must be callable"):
+        with install_k8_candidate(entry_snapshotter=object()):
+            pass
+
+
 def test_install_exposes_and_restores_shared_arena_and_transition_timing():
     with install_k8_candidate(
         block_size=4,
