@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=cross-resid-epilogue
+#SBATCH --job-name=cross-residual-epilogue
 #SBATCH --partition=gpu-common
 #SBATCH --account=romerolab
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=48G
+#SBATCH --mem=32G
 #SBATCH --gres=gpu:2080:1
-#SBATCH --time=00:30:00
+#SBATCH --time=00:20:00
 #SBATCH --output=/work/imt11/Mapperatorinator/logs/%x-%j.out
 #SBATCH --error=/work/imt11/Mapperatorinator/logs/%x-%j.err
-# Keep clear of authoritative confirmation pins when they are active.
+# Keep clear of authoritative confirmation pins.
 #SBATCH --exclude=dcc-core-gpu-ferc-s-h36-9
 
 set -euo pipefail
@@ -20,12 +20,10 @@ REPO=${MAPPERATORINATOR_REPO:?Set MAPPERATORINATOR_REPO to the clean worktree}
 COMMIT=${MAPPERATORINATOR_COMMIT:?Set MAPPERATORINATOR_COMMIT to the pushed commit}
 BRANCH=${MAPPERATORINATOR_BRANCH:?Set MAPPERATORINATOR_BRANCH to the branch}
 REMOTE=${MAPPERATORINATOR_REMOTE:-origin}
-AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 RUN_ROOT="$WORK/runs/cross-residual-epilogue-component-${SLURM_JOB_ID:-manual}"
-TORCH_EXTENSIONS_DIR="$WORK/torch_extensions/cross-residual-epilogue-$COMMIT-${SLURM_JOB_ID:-manual}"
 
 export PATH="$(dirname "$PYTHON"):$PATH"
-for tool in "$PYTHON" ffmpeg ffprobe nvidia-smi; do
+for tool in "$PYTHON" nvidia-smi; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "missing required tool: $tool" >&2
     exit 2
@@ -54,14 +52,10 @@ if ! git -C "$REPO" show-ref --verify --quiet "$REMOTE_REF" \
   echo "pushed $REMOTE branch does not match MAPPERATORINATOR_COMMIT" >&2
   exit 2
 fi
-if [[ ! -f "$AUDIO" ]]; then
-  echo "missing SALVALAI audio at $AUDIO" >&2
-  exit 2
-fi
 
 mkdir -p "$WORK/logs" "$WORK/tmp" "$WORK/cache" \
   "$WORK/cache/torch_inductor" "$WORK/cache/triton" "$WORK/cache/cuda" \
-  "$TORCH_EXTENSIONS_DIR" "$RUN_ROOT"
+  "$WORK/torch_extensions" "$RUN_ROOT"
 export XDG_CACHE_HOME="$WORK/cache"
 export HF_HOME="$WORK/cache/huggingface"
 export TRANSFORMERS_CACHE="$WORK/cache/huggingface"
@@ -70,13 +64,15 @@ export TRANSFORMERS_OFFLINE=1
 export TORCHINDUCTOR_CACHE_DIR="$WORK/cache/torch_inductor"
 export TRITON_CACHE_DIR="$WORK/cache/triton"
 export CUDA_CACHE_PATH="$WORK/cache/cuda"
-export TORCH_EXTENSIONS_DIR
-export TORCH_CUDA_ARCH_LIST=7.5
-export TMPDIR="$WORK/tmp/cross-residual-epilogue-${SLURM_JOB_ID:-manual}"
-mkdir -p "$TMPDIR"
+export TORCH_EXTENSIONS_DIR="$WORK/torch_extensions/cross-residual-epilogue-$COMMIT-$SLURM_JOB_ID"
+# Unique per-job TMPDIR (node-local preferred when available).
+if [[ -d /tmp ]] && [[ -w /tmp ]]; then
+  export TMPDIR="/tmp/mapperatorinator-cross-residual-${SLURM_JOB_ID:-manual}-$$"
+else
+  export TMPDIR="$WORK/tmp/cross-residual-epilogue-${SLURM_JOB_ID:-manual}"
+fi
+mkdir -p "$TMPDIR" "$TORCH_EXTENSIONS_DIR"
 export TOKENIZERS_PARALLELISM=false
-# Do not enable layout fusion during the baseline capture song.
-unset MAPPERATORINATOR_CROSS_OUT_LAYOUT_FUSED || true
 
 GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1)
 GPU_CAPABILITY=$($PYTHON -c 'import torch; print("".join(map(str, torch.cuda.get_device_capability())))')
@@ -103,28 +99,15 @@ nvidia-smi --query-gpu=name,uuid,driver_version,memory.total --format=csv,nohead
 cd "$REPO"
 set +e
 "$PYTHON" utils/profile_cross_residual_epilogue_component.py \
-  --config-name profile_salvalai \
   --report-path "$RUN_ROOT/component.json" \
-  --output-path "$RUN_ROOT/baseline-capture" \
   --warmup 100 \
   --iters 1000 \
-  audio_path="$AUDIO" \
-  device=cuda \
-  precision=fp32 \
-  attn_implementation=sdpa \
-  inference_engine=optimized \
-  use_server=false \
-  parallel=false \
-  cfg_scale=1.0 \
-  num_beams=1 \
-  seed=12345
+  --seed 12345
 STATUS=$?
 set -e
-if [[ ! -s "$RUN_ROOT/component.json" ]]; then
-  echo "profiler failed before producing component.json (status=$STATUS)" >&2
-  exit "$STATUS"
+echo "component_exit=$STATUS"
+if [[ -f "$RUN_ROOT/component.json" ]]; then
+  echo "wrote $RUN_ROOT/component.json"
+  echo "HARVEST: projected_main_saving_seconds / any_component_pass / stop_condition"
 fi
-sha256sum "$RUN_ROOT/component.json"
-echo "HARVEST: projected_main_saving_seconds / sizing_pass / already_landed_residual_fusion_saving_seconds"
-echo "HARVEST: path=$RUN_ROOT/component.json"
 exit "$STATUS"

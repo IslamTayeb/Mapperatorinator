@@ -1,11 +1,13 @@
-"""Size cross out_proj layout+residual epilogue fusion vs selected production bridge.
+"""Cheap component gate for cross out_proj+residual epilogue fusion.
 
-Baseline (production): transpose+contiguous+view + fused Wo residual.
-Candidate (layout-fused): reshape view + fused Wo residual.
-Diagnostic (unfused residual): contiguous flatten + Wo + separate add.
+Synthetic fixed-shape tensors matching selected FP16-packed cross out
+(``[1,12,1,64]`` attention output, ``[1,1,768]`` residual, FP16 Wo).
+No full-song capture. Compiled-cross BMM is not composed.
 
-Does not compose with compiled-cross BMM. Full-song only if projected
-main saving >= SAVING_TARGET_SECONDS.
+Hypothesis: eliminating the accepted ``transpose+contiguous`` materialization
+(or measuring residual-fusion headroom via an unfused split diagnostic)
+projects ≥0.08s main-model saving on fixed SALVALAI work, or ≥5% of the
+measured accepted cross_out_residual region.
 """
 
 from __future__ import annotations
@@ -17,40 +19,28 @@ from pathlib import Path
 import subprocess
 import sys
 import time
-from typing import Any
+from typing import Any, Callable
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import torch  # noqa: E402
-
-from utils.profile_native_prefix_dtype_scout import (  # noqa: E402
-    CapturedGraph,
-    _accepted_main_session_run,
-    _assert_scout_args,
-    _capture_cuda_graph,
-    _capture_representative_layer,
-    _load_args,
-    _max_abs,
-    _reciprocal_graph_rounds,
-)
-
 
 DECODER_LAYERS = 12
-MAX_ABS_DRIFT = 1e-3
+HEADS = 12
+HEAD_DIM = 64
+HIDDEN = HEADS * HEAD_DIM
+# Ranking stop: projected component <~0.08s → skip full song.
 SAVING_TARGET_SECONDS = 0.08
-FIXED_MAIN_GENERATED_TOKENS = 8_294
-FIXED_MAIN_DECODE_REPLAYS = 8_207
-FIXED_MAIN_WINDOWS = 87
-BASE_TIP_CHOICE = {
-    "selected": "codex/500tps-arena-compiled-cross-last-mile@0dbab9e5",
-    "reason": (
-        "cross Wo residual already fused in selected stack; this scout measures "
-        "remaining BMM→Wo contiguous-copy elimination only, without compiled-cross"
-    ),
-}
+REGION_RELATIVE_GATE = 0.05
+MAX_ABS_DRIFT = 1e-5
+FIXED_MAIN_GENERATED_TOKENS = 8_532
+BASE_TIP = "codex/500tps-arena-compiled-cross-last-mile@0dbab9e5"
+CANDIDATES = (
+    "heads_view_fused",
+    "split_linear_then_add",
+)
 
 
 def _git_head() -> str:
@@ -62,347 +52,296 @@ def _git_head() -> str:
     ).stdout.strip()
 
 
-def validate_live_graph_cache(
-    graph_cache: dict[Any, dict[str, Any]],
-) -> dict[int, dict[str, Any]]:
-    if not isinstance(graph_cache, dict) or not graph_cache:
-        raise ValueError("live graph cache must be a non-empty mapping")
-    entries: dict[int, dict[str, Any]] = {}
-    for entry in graph_cache.values():
-        if not isinstance(entry, dict):
-            raise TypeError("live graph cache entries must be mappings")
-        prefix = entry.get("active_prefix_length")
-        count = entry.get("decode_replays")
-        if (
-            isinstance(prefix, bool)
-            or not isinstance(prefix, int)
-            or prefix <= 0
-            or prefix in entries
-        ):
-            raise ValueError(f"invalid or duplicate live prefix {prefix!r}")
-        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
-            raise ValueError(f"live prefix {prefix} has invalid replay count {count!r}")
-        missing = [
-            name for name in ("graph", "outputs", "static_inputs") if name not in entry
-        ]
-        if missing:
-            raise ValueError(f"live prefix {prefix} is missing {missing}")
-        entries[prefix] = entry
-    return dict(sorted(entries.items()))
+def _max_abs(left: Any, right: Any) -> float:
+    return float((left - right).abs().max().item())
 
 
-def validate_fixed_main_work(
-    run: dict[str, Any],
-    entries: dict[int, dict[str, Any]],
-) -> dict[str, Any]:
-    processor = run.get("processor")
-    stats = getattr(processor, "last_generation_stats", None)
-    if not isinstance(stats, dict):
-        raise RuntimeError("main Processor did not expose aggregate generation stats")
-    generated_tokens = stats.get("generated_tokens")
-    if isinstance(generated_tokens, bool) or not isinstance(generated_tokens, int):
-        raise RuntimeError("main generated-token count is missing or invalid")
-    decode_replays = sum(int(entry["decode_replays"]) for entry in entries.values())
-    windows = generated_tokens - decode_replays
-    expected = (
-        FIXED_MAIN_GENERATED_TOKENS,
-        FIXED_MAIN_DECODE_REPLAYS,
-        FIXED_MAIN_WINDOWS,
-    )
-    actual = (generated_tokens, decode_replays, windows)
-    if actual != expected:
-        raise RuntimeError(
-            "fixed SALVALAI work changed: "
-            f"expected tokens/replays/windows={expected}, got {actual}"
-        )
-    return {
-        "generated_tokens": generated_tokens,
-        "decode_replays": decode_replays,
-        "prefill_windows": windows,
-        "bucket_counts": {
-            str(prefix): int(entry["decode_replays"])
-            for prefix, entry in entries.items()
-        },
-    }
-
-
-def summarize_component(
-    buckets: dict[str, dict[str, Any]],
+def _time_callable(
+    callable_: Callable[[], Any],
     *,
-    total_replays: int,
-) -> dict[str, Any]:
-    if not buckets or total_replays <= 0:
-        raise ValueError("component summary requires buckets and positive total replays")
-    measured = 0
-    baseline_weighted_ms = 0.0
-    candidate_weighted_ms = 0.0
-    unfused_weighted_ms = 0.0
-    failures: dict[str, list[str]] = {}
-    for prefix, entry in sorted(buckets.items(), key=lambda item: int(item[0])):
-        count = int(entry["decode_replays"])
-        baseline_ms = float(entry["baseline_ms_per_call"])
-        candidate_ms = float(entry["candidate_ms_per_call"])
-        unfused_ms = float(entry["unfused_residual_ms_per_call"])
-        if count <= 0 or min(baseline_ms, candidate_ms, unfused_ms) <= 0:
-            raise ValueError(f"prefix {prefix} has invalid count or timing")
-        if not all(
-            math.isfinite(value) for value in (baseline_ms, candidate_ms, unfused_ms)
-        ):
-            raise ValueError(f"prefix {prefix} has non-finite timing")
-        measured += count
-        baseline_weighted_ms += count * baseline_ms
-        candidate_weighted_ms += count * candidate_ms
-        unfused_weighted_ms += count * unfused_ms
-        bucket_failures: list[str] = []
-        if not bool(entry.get("baseline_memory_stable")):
-            bucket_failures.append("baseline_memory_stable")
-        if not bool(entry.get("candidate_memory_stable")):
-            bucket_failures.append("candidate_memory_stable")
-        if not bool(entry.get("unfused_memory_stable")):
-            bucket_failures.append("unfused_memory_stable")
-        for name, value in entry["drift"].items():
-            if not math.isfinite(float(value)) or float(value) < 0:
-                bucket_failures.append(f"{name}_invalid")
-            elif float(value) > MAX_ABS_DRIFT:
-                bucket_failures.append(f"{name}_above_{MAX_ABS_DRIFT}")
-        if bucket_failures:
-            failures[prefix] = bucket_failures
-    if measured > total_replays:
-        raise ValueError("measured replay count exceeds live total")
-    baseline_seconds = DECODER_LAYERS * baseline_weighted_ms / 1000.0
-    candidate_seconds = DECODER_LAYERS * candidate_weighted_ms / 1000.0
-    unfused_seconds = DECODER_LAYERS * unfused_weighted_ms / 1000.0
-    saving = baseline_seconds - candidate_seconds
-    landed_fusion_saving = unfused_seconds - baseline_seconds
-    coverage_pass = measured == total_replays
-    correctness_pass = not failures
-    sizing_pass = saving >= SAVING_TARGET_SECONDS
-    return {
-        "measured_replays": measured,
-        "total_replays": total_replays,
-        "coverage_fraction": measured / total_replays,
-        "coverage_pass": coverage_pass,
-        "weighted_baseline_seconds_12_layers": baseline_seconds,
-        "weighted_candidate_seconds_12_layers": candidate_seconds,
-        "weighted_unfused_residual_seconds_12_layers": unfused_seconds,
-        "projected_main_saving_seconds": saving,
-        "already_landed_residual_fusion_saving_seconds": landed_fusion_saving,
-        "saving_target_seconds": SAVING_TARGET_SECONDS,
-        "weighted_local_speedup": (
-            baseline_weighted_ms / candidate_weighted_ms
-        ),
-        "correctness_failures": failures,
-        "correctness_pass": correctness_pass,
-        "sizing_pass": sizing_pass,
-        "promotion_pass": coverage_pass and correctness_pass and sizing_pass,
-    }
-
-
-class _null_context:
-    def __enter__(self):
-        return None
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
-
-
-def _cross_out_inputs(capture):
-    from osuT5.osuT5.inference.optimized.kernels.dispatch import (
-        _q1_bmm_cross_attention,
-    )
-    from osuT5.osuT5.inference.optimized.kernels.weight_only import PackedLinear
-    from osuT5.osuT5.inference.optimized.scout.native_prefix import _norm
-
-    module = capture.module
-    cross_attn = module.cross_attn
-    residual = capture.hidden_states
-    # Build a post-self residual proxy: use captured hidden as the residual that
-    # cross out_proj would add into (selected stack uses the post-self state).
-    normalized = _norm(module.cross_attn_layer_norm, residual)
-    query = torch.nn.functional.linear(
-        normalized, cross_attn.Wq.weight, cross_attn.Wq.bias
-    )
-    query = query.view(1, 1, cross_attn.num_heads, cross_attn.head_dim).transpose(1, 2)
-    cache_layer = capture.past_key_value.cross_attention_cache.layers[
-        int(cross_attn.layer_idx)
-    ]
-    keys = getattr(cache_layer, "keys")
-    values = getattr(cache_layer, "values")
-    if not isinstance(keys, torch.Tensor) or not isinstance(values, torch.Tensor):
-        raise RuntimeError("cross cache keys/values missing for representative layer")
-    cross_output = _q1_bmm_cross_attention(
-        query.contiguous(),
-        keys.contiguous(),
-        values.contiguous(),
-        expected_dtype=torch.float32,
-    )
-    if not cross_output.is_contiguous():
-        cross_output = cross_output.contiguous()
-    packed = PackedLinear.from_module(cross_attn.Wo)
-    return cross_output.detach(), residual.detach(), packed
-
-
-@torch.no_grad()
-def profile_component(
-    args,
-    *,
-    output_path: Path,
     warmup: int,
     iters: int,
-) -> dict[str, Any]:
-    if not torch.cuda.is_available():
-        raise RuntimeError("cross residual epilogue profiler requires CUDA")
-    if torch.cuda.get_device_capability() != (7, 5):
-        raise RuntimeError("cross residual epilogue profiler requires SM75")
-    if warmup < 1 or iters < 1:
-        raise ValueError("warmup and iters must be positive")
-    _assert_scout_args(args)
-    output_path.mkdir(parents=True, exist_ok=True)
-    run = _accepted_main_session_run(args, output_path=output_path)
-    model = run["model"]
-    model.eval()
-    entries = validate_live_graph_cache(run["session"].graph_cache)
-    work = validate_fixed_main_work(run, entries)
+) -> tuple[float, Any, bool]:
+    import torch
 
-    from osuT5.osuT5.inference.optimized.kernels.cross_out_epilogue import (
-        cross_out_proj_residual,
+    torch.cuda.synchronize()
+    allocated_before = int(torch.cuda.memory_allocated())
+    for _ in range(warmup):
+        callable_()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    last = None
+    for _ in range(iters):
+        last = callable_()
+    end.record()
+    torch.cuda.synchronize()
+    if last is None:
+        raise RuntimeError("timing loop produced no output")
+    allocated_after = int(torch.cuda.memory_allocated())
+    ms_per_call = float(start.elapsed_time(end)) / float(iters)
+    memory_stable = allocated_after <= allocated_before
+    return ms_per_call, last.detach(), memory_stable
+
+
+def summarize_variant(
+    *,
+    name: str,
+    accepted_ms: float,
+    candidate_ms: float,
+    drift: float,
+    exactness_class: str,
+    memory_stable: bool,
+    finite: bool,
+) -> dict[str, Any]:
+    if min(accepted_ms, candidate_ms) <= 0 or not all(
+        math.isfinite(value) for value in (accepted_ms, candidate_ms, drift)
+    ):
+        raise ValueError(f"{name} has invalid timing or drift")
+    accepted_seconds = (
+        DECODER_LAYERS * FIXED_MAIN_GENERATED_TOKENS * accepted_ms / 1000.0
     )
+    candidate_seconds = (
+        DECODER_LAYERS * FIXED_MAIN_GENERATED_TOKENS * candidate_ms / 1000.0
+    )
+    saving = accepted_seconds - candidate_seconds
+    region_fraction = (accepted_ms - candidate_ms) / accepted_ms
+    if exactness_class == "exact":
+        correctness_pass = finite and memory_stable and drift <= MAX_ABS_DRIFT
+    else:
+        correctness_pass = finite and memory_stable and drift <= MAX_ABS_DRIFT
+    region_pass = region_fraction >= REGION_RELATIVE_GATE
+    e2e_pass = saving >= SAVING_TARGET_SECONDS
+    # Only faster-than-accepted candidates can promote; split diagnostic may be slower.
+    sizing_pass = (region_pass or e2e_pass) and saving > 0.0
+    return {
+        "candidate": name,
+        "exactness_class": exactness_class,
+        "accepted_ms_per_call": accepted_ms,
+        "candidate_ms_per_call": candidate_ms,
+        "local_speedup": accepted_ms / candidate_ms,
+        "region_relative_saving": region_fraction,
+        "region_relative_gate": REGION_RELATIVE_GATE,
+        "region_pass": region_pass,
+        "weighted_accepted_seconds_12_layers": accepted_seconds,
+        "weighted_candidate_seconds_12_layers": candidate_seconds,
+        "projected_main_saving_seconds": saving,
+        "saving_target_seconds": SAVING_TARGET_SECONDS,
+        "e2e_pass": e2e_pass,
+        "sizing_pass": sizing_pass,
+        "max_abs_drift_vs_accepted": drift,
+        "max_abs_drift_gate": MAX_ABS_DRIFT,
+        "finite_outputs": finite,
+        "memory_stable": memory_stable,
+        "correctness_pass": correctness_pass,
+        "component_pass": correctness_pass and sizing_pass,
+        "promotion_pass": False,
+    }
+
+
+def summarize_component(variants: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    if not variants:
+        raise ValueError("component summary requires variants")
+    ranked = sorted(
+        variants.values(),
+        key=lambda row: float(row["projected_main_saving_seconds"]),
+        reverse=True,
+    )
+    best = ranked[0]
+    any_component_pass = any(bool(row["component_pass"]) for row in variants.values())
+    return {
+        "best_candidate": best["candidate"],
+        "best_projected_main_saving_seconds": best["projected_main_saving_seconds"],
+        "best_region_relative_saving": best["region_relative_saving"],
+        "saving_target_seconds": SAVING_TARGET_SECONDS,
+        "region_relative_gate": REGION_RELATIVE_GATE,
+        "any_component_pass": any_component_pass,
+        "promotion_pass": False,
+        "variants": variants,
+        "stop_condition": (
+            None
+            if any_component_pass
+            else "STOP_CROSS_RESIDUAL_EPILOGUE_COMPONENT"
+        ),
+    }
+
+
+def profile_component(*, warmup: int, iters: int, seed: int) -> dict[str, Any]:
+    import torch
+
     from osuT5.osuT5.inference.optimized.kernels.weight_only import (
+        PackedLinear,
         preload_weight_only_extension,
     )
+    from osuT5.osuT5.inference.optimized.scout.cross_residual_epilogue import (
+        accepted_cross_out_residual,
+        heads_view_cross_out_residual,
+        scout_metadata,
+        split_linear_then_add_cross_out,
+    )
 
-    torch.cuda.synchronize()
-    started = time.perf_counter()
-    preload_weight_only_extension()
-    torch.cuda.synchronize()
-    preload_seconds = time.perf_counter() - started
-
-    buckets: dict[str, Any] = {}
-    for prefix, accepted in entries.items():
-        capture = _capture_representative_layer(
-            model, accepted["static_inputs"], prefix=prefix
+    if not torch.cuda.is_available():
+        raise RuntimeError("cross residual epilogue component requires CUDA")
+    if warmup < 1 or iters < 1:
+        raise ValueError("warmup and iters must be positive")
+    device = torch.device("cuda")
+    capability = torch.cuda.get_device_capability(device)
+    if capability != (7, 5):
+        raise RuntimeError(
+            f"component requires SM75, got sm_{capability[0]}{capability[1]}"
         )
-        cross_output, residual, packed = _cross_out_inputs(capture)
 
-        def baseline_call() -> torch.Tensor:
-            return cross_out_proj_residual(
-                cross_output,
-                residual,
-                packed,
-                layout_fused=False,
-                fuse_residual=True,
-            )
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    with torch.no_grad():
+        attn = torch.randn(
+            (1, HEADS, 1, HEAD_DIM), device=device, dtype=torch.float32
+        ).contiguous()
+        residual = torch.randn(
+            (1, 1, HIDDEN), device=device, dtype=torch.float32
+        ).contiguous()
+        source_weight = torch.randn(
+            (HIDDEN, HIDDEN), device=device, dtype=torch.float32
+        ).contiguous()
+        source_bias = torch.randn(
+            (HIDDEN,), device=device, dtype=torch.float32
+        ).contiguous()
+        packed = PackedLinear(
+            weight=source_weight.to(dtype=torch.float16).contiguous(),
+            bias=source_bias,
+            source_weight_bytes=source_weight.numel() * source_weight.element_size(),
+        )
 
-        def candidate_call() -> torch.Tensor:
-            return cross_out_proj_residual(
-                cross_output,
-                residual,
-                packed,
-                layout_fused=True,
-                fuse_residual=True,
-            )
+        preload_started = time.perf_counter()
+        preload_weight_only_extension()
+        torch.cuda.synchronize()
+        preload_seconds = time.perf_counter() - preload_started
 
-        def unfused_call() -> torch.Tensor:
-            return cross_out_proj_residual(
-                cross_output,
-                residual,
-                packed,
-                layout_fused=False,
-                fuse_residual=False,
-            )
-
-        calls = {
-            "baseline": baseline_call,
-            "layout_fused": candidate_call,
-            "unfused_residual": unfused_call,
-        }
-        graphs: dict[str, CapturedGraph] = {}
-        snapshots: dict[str, torch.Tensor] = {}
-        for name, call in calls.items():
-            graphs[name] = _capture_cuda_graph(
-                call, context=lambda: _null_context(), warmup=0
-            )
-            snapshots[name] = graphs[name].outputs.detach().float().cpu().clone()
-        timings, rounds, memory = _reciprocal_graph_rounds(
-            {name: graph.graph for name, graph in graphs.items()},
-            restore=lambda: None,
+        accepted_ms, accepted_out, accepted_stable = _time_callable(
+            lambda: accepted_cross_out_residual(attn, residual, packed),
             warmup=warmup,
             iters=iters,
         )
-        buckets[str(prefix)] = {
-            "decode_replays": int(accepted["decode_replays"]),
-            "baseline_ms_per_call": timings["baseline"],
-            "candidate_ms_per_call": timings["layout_fused"],
-            "unfused_residual_ms_per_call": timings["unfused_residual"],
-            "baseline_memory_stable": bool(memory["baseline"]),
-            "candidate_memory_stable": bool(memory["layout_fused"]),
-            "unfused_memory_stable": bool(memory["unfused_residual"]),
-            "drift": {
-                "layout_fused_vs_baseline_max_abs": _max_abs(
-                    snapshots["baseline"], snapshots["layout_fused"]
-                ),
-                "unfused_vs_baseline_max_abs": _max_abs(
-                    snapshots["baseline"], snapshots["unfused_residual"]
-                ),
-            },
-            "rounds": rounds,
-        }
+        if not accepted_stable:
+            raise RuntimeError("accepted cross_out timing allocated memory")
 
+        callables: dict[str, tuple[str, Callable[[], Any]]] = {
+            "heads_view_fused": (
+                "exact",
+                lambda: heads_view_cross_out_residual(attn, residual, packed),
+            ),
+            "split_linear_then_add": (
+                "exact",
+                lambda: split_linear_then_add_cross_out(attn, residual, packed),
+            ),
+        }
+        variants: dict[str, dict[str, Any]] = {}
+        for name in CANDIDATES:
+            exactness_class, callable_ = callables[name]
+            candidate_ms, candidate_out, memory_stable = _time_callable(
+                callable_,
+                warmup=warmup,
+                iters=iters,
+            )
+            drift = _max_abs(accepted_out, candidate_out)
+            finite = bool(torch.isfinite(candidate_out).all().item())
+            variants[name] = summarize_variant(
+                name=name,
+                accepted_ms=accepted_ms,
+                candidate_ms=candidate_ms,
+                drift=drift,
+                exactness_class=exactness_class,
+                memory_stable=memory_stable,
+                finite=finite,
+            )
+
+    summary = summarize_component(variants)
     return {
         "schema_version": 1,
         "metadata": {
-            "candidate": "cross_out_layout_fused_residual_epilogue",
-            "hypothesis": (
-                "eliminate transpose+contiguous before fused Wo+residual on the "
-                "cross path; residual fusion itself is already production"
-            ),
-            "exactness_claim": False,
-            "base_tip_choice": BASE_TIP_CHOICE,
             "commit": _git_head(),
-            "precision": "fp32_acts_fp16_wo_weights",
-            "decoder_layers": DECODER_LAYERS,
+            "base_tip": BASE_TIP,
+            "candidate_scope": "component_only_no_production_wiring",
+            "hypothesis": (
+                "Cross out_proj+residual epilogue: drop accepted "
+                "transpose+contiguous materialization (heads_view_fused) or "
+                "measure unfused residual-add tax (split_linear_then_add); "
+                "≥0.08s main or ≥5% of accepted cross_out_residual region; "
+                "compiled-cross BMM not composed"
+            ),
+            "exactness_claim": True,
+            "note": (
+                "Synthetic fixed-shape component; not production throughput. "
+                "Both candidates compared against accepted selected reshape+"
+                "weight_only_linear_residual path."
+            ),
+            "scout": scout_metadata(),
             "warmup": warmup,
             "iters": iters,
+            "seed": seed,
             "extension_preload_seconds": preload_seconds,
-            "device_name": torch.cuda.get_device_name(),
-            "compute_capability": list(torch.cuda.get_device_capability()),
-            "compiled_cross_composed": False,
+            "fixed_main_generated_tokens": FIXED_MAIN_GENERATED_TOKENS,
+            "decoder_layers": DECODER_LAYERS,
+            "gpu_name": torch.cuda.get_device_name(device),
+            "gpu_capability": f"sm_{capability[0]}{capability[1]}",
         },
-        "fixed_main_work": work,
-        "summary": summarize_component(
-            buckets, total_replays=int(work["decode_replays"])
-        ),
-        "buckets": buckets,
+        "summary": summary,
     }
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config-name", default="profile_salvalai")
+def _write_text(path: Path, result: dict[str, Any]) -> None:
+    summary = result["summary"]
+    lines = [
+        "Cross out_proj+residual epilogue component scout",
+        f"commit={result['metadata']['commit']}",
+        f"base_tip={result['metadata']['base_tip']}",
+        f"best_candidate={summary['best_candidate']}",
+        f"best_projected_main_saving_seconds="
+        f"{summary['best_projected_main_saving_seconds']:.9f}",
+        f"best_region_relative_saving={summary['best_region_relative_saving']:.6f}",
+        f"any_component_pass={str(summary['any_component_pass']).lower()}",
+        f"promotion_pass={str(summary['promotion_pass']).lower()}",
+        f"stop_condition={summary['stop_condition']}",
+    ]
+    for name, row in summary["variants"].items():
+        lines.append(
+            f"variant={name} candidate_ms={row['candidate_ms_per_call']:.6f} "
+            f"saving={row['projected_main_saving_seconds']:.6f} "
+            f"region={row['region_relative_saving']:.4f} "
+            f"drift={row['max_abs_drift_vs_accepted']:.6g} "
+            f"component_pass={str(row['component_pass']).lower()}"
+        )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--report-path", type=Path, required=True)
-    parser.add_argument("--output-path", type=Path, required=True)
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--iters", type=int, default=1000)
-    parser.add_argument("overrides", nargs="*")
-    cli = parser.parse_args()
-    overrides = list(cli.overrides)
-    if not any(value.startswith("output_path=") for value in overrides):
-        overrides.append(f"output_path={cli.output_path}")
-    args = _load_args(cli.config_name, overrides)
-    report = profile_component(
-        args,
-        output_path=cli.output_path,
-        warmup=cli.warmup,
-        iters=cli.iters,
+    parser.add_argument("--seed", type=int, default=12345)
+    args = parser.parse_args(argv)
+
+    result = profile_component(
+        warmup=args.warmup,
+        iters=args.iters,
+        seed=args.seed,
     )
-    cli.report_path.parent.mkdir(parents=True, exist_ok=True)
-    cli.report_path.write_text(
-        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    print(json.dumps(report["summary"], indent=2, sort_keys=True))
-    if not report["summary"]["promotion_pass"]:
-        raise SystemExit("STOP_CROSS_RESIDUAL_EPILOGUE_COMPONENT")
+    args.report_path.parent.mkdir(parents=True, exist_ok=True)
+    args.report_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    _write_text(args.report_path.with_suffix(".txt"), result)
+
+    summary = result["summary"]
+    print(json.dumps({"summary": summary}, indent=2))
+    if not summary["any_component_pass"]:
+        print("STOP_CROSS_RESIDUAL_EPILOGUE_COMPONENT", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
