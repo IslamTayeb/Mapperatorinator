@@ -102,6 +102,40 @@ __global__ void rmsnorm_linear_warp_group_kernel(
     }
 }
 
+
+template<typename scalar_t, int OUTPUTS_PER_BLOCK>
+__global__ void linear_warp_group_kernel(
+        const scalar_t* __restrict__ input,
+        const scalar_t* __restrict__ weight,
+        const scalar_t* __restrict__ bias,
+        scalar_t* __restrict__ output,
+        int hidden_dim,
+        int has_bias) {
+    int warp_id = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    int out_idx = blockIdx.x * OUTPUTS_PER_BLOCK + warp_id;
+    if (warp_id >= OUTPUTS_PER_BLOCK || out_idx >= hidden_dim) {
+        return;
+    }
+
+    const scalar_t* w = weight + out_idx * hidden_dim;
+    float sum = 0.0f;
+    for (int idx = lane; idx < hidden_dim; idx += 32) {
+        sum += static_cast<float>(input[idx]) * static_cast<float>(w[idx]);
+    }
+
+    unsigned mask = 0xffffffffu;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(mask, sum, offset);
+    }
+    if (lane == 0) {
+        if (has_bias) {
+            sum += static_cast<float>(bias[out_idx]);
+        }
+        output[out_idx] = static_cast<scalar_t>(sum);
+    }
+}
+
 template<typename scalar_t, int OUTPUTS_PER_BLOCK>
 __global__ void linear_residual_warp_group_kernel(
         const scalar_t* __restrict__ input,
@@ -462,6 +496,84 @@ torch::Tensor one_token_rmsnorm_linear(
     return output;
 }
 
+
+torch::Tensor one_token_linear(
+        torch::Tensor input,
+        torch::Tensor weight,
+        c10::optional<torch::Tensor> bias,
+        int64_t outputs_per_block) {
+    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
+    TORCH_CHECK(weight.device() == input.device(), "weight/input device mismatch");
+    TORCH_CHECK(
+            input.scalar_type() == torch::kFloat32
+            || input.scalar_type() == torch::kFloat16,
+            "input must be fp32 or fp16");
+    TORCH_CHECK(weight.scalar_type() == input.scalar_type(),
+            "weight dtype must match input");
+    TORCH_CHECK(input.dim() == 3 && input.size(0) == 1 && input.size(1) == 1,
+            "input must have shape [1, 1, hidden_dim]");
+    TORCH_CHECK(weight.dim() == 2, "weight must have shape [hidden_dim, hidden_dim]");
+
+    const int hidden_dim = static_cast<int>(input.size(2));
+    TORCH_CHECK(weight.size(0) == hidden_dim && weight.size(1) == hidden_dim, "weight hidden_dim mismatch");
+    TORCH_CHECK(outputs_per_block == 2 || outputs_per_block == 4 || outputs_per_block == 8,
+            "unsupported outputs_per_block; expected 2, 4, or 8");
+
+    c10::cuda::CUDAGuard device_guard(input.device());
+
+    auto input_contiguous = input.contiguous();
+    auto weight_contiguous = weight.contiguous();
+
+    torch::Tensor bias_contiguous;
+    const void* bias_ptr = nullptr;
+    int has_bias = 0;
+    if (bias.has_value()) {
+        bias_contiguous = bias.value().contiguous();
+        TORCH_CHECK(bias_contiguous.is_cuda(), "bias must be CUDA");
+        TORCH_CHECK(bias_contiguous.device() == input.device(), "bias/input device mismatch");
+        TORCH_CHECK(bias_contiguous.scalar_type() == input.scalar_type(),
+                "bias dtype must match input");
+        TORCH_CHECK(bias_contiguous.numel() == hidden_dim, "bias/hidden_dim mismatch");
+        bias_ptr = bias_contiguous.data_ptr();
+        has_bias = 1;
+    }
+
+    auto output = torch::empty({1, 1, hidden_dim}, input.options());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+            input.scalar_type(), "one_token_linear", [&] {
+        const auto* bias = static_cast<const scalar_t*>(bias_ptr);
+        if (outputs_per_block == 2) {
+            linear_warp_group_kernel<scalar_t, 2><<<(hidden_dim + 1) / 2, 64, 0, stream>>>(
+                input_contiguous.data_ptr<scalar_t>(),
+                weight_contiguous.data_ptr<scalar_t>(),
+                bias,
+                output.data_ptr<scalar_t>(),
+                hidden_dim,
+                has_bias);
+        } else if (outputs_per_block == 4) {
+            linear_warp_group_kernel<scalar_t, 4><<<(hidden_dim + 3) / 4, 128, 0, stream>>>(
+                input_contiguous.data_ptr<scalar_t>(),
+                weight_contiguous.data_ptr<scalar_t>(),
+                bias,
+                output.data_ptr<scalar_t>(),
+                hidden_dim,
+                has_bias);
+        } else {
+            linear_warp_group_kernel<scalar_t, 8><<<(hidden_dim + 7) / 8, 256, 0, stream>>>(
+                input_contiguous.data_ptr<scalar_t>(),
+                weight_contiguous.data_ptr<scalar_t>(),
+                bias,
+                output.data_ptr<scalar_t>(),
+                hidden_dim,
+                has_bias);
+        }
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
 torch::Tensor one_token_linear_residual(
         torch::Tensor input,
         torch::Tensor residual,
@@ -561,12 +673,15 @@ torch::Tensor one_token_linear_residual(
             "torch::Tensor one_token_rmsnorm_linear("
             "torch::Tensor input, torch::Tensor norm_weight, torch::Tensor linear_weight, "
             "c10::optional<torch::Tensor> linear_bias, double eps, int64_t outputs_per_block);\n"
+            "torch::Tensor one_token_linear("
+            "torch::Tensor input, torch::Tensor weight, "
+            "c10::optional<torch::Tensor> bias, int64_t outputs_per_block);\n"
             "torch::Tensor one_token_linear_residual("
             "torch::Tensor input, torch::Tensor residual, torch::Tensor weight, "
             "c10::optional<torch::Tensor> bias, int64_t outputs_per_block);\n"
         ),
         cuda_sources=cuda_source,
-        functions=["one_token_mlp_residual", "one_token_rmsnorm_linear", "one_token_linear_residual"],
+        functions=["one_token_mlp_residual", "one_token_rmsnorm_linear", "one_token_linear", "one_token_linear_residual"],
         extra_cuda_cflags=["-O3"],
         verbose=False,
     )
@@ -620,6 +735,23 @@ def native_one_token_rmsnorm_linear(
         int(outputs_per_block),
     )
 
+
+
+
+def native_one_token_linear(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        *,
+        outputs_per_block: int,
+) -> torch.Tensor:
+    extension = _load_native_decoder_layer()
+    return extension.one_token_linear(
+        input,
+        weight,
+        bias,
+        int(outputs_per_block),
+    )
 
 def native_one_token_linear_residual(
         input: torch.Tensor,

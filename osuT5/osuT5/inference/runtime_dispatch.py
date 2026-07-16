@@ -12,11 +12,15 @@ class AttentionRuntimeHooks:
     sdpa_attention_inputs: Callable[..., Any] | None = None
     sdpa_attention_forward: Callable[..., Any] | None = None
     q1_rope_cache_self_attention_forward: Callable[..., Any] | None = None
+    # When True, VarWhisperAttention returns pre-Wo activations so a decoder
+    # hook can own out_proj. Default False preserves V32/tip.
+    skip_out_proj: bool = False
 
 
 @dataclass(frozen=True)
 class DecoderLayerRuntimeHooks:
     cross_mlp_tail_forward: Callable[..., Any] | None = None
+    self_wo_linear_forward: Callable[..., Any] | None = None
 
 
 _EMPTY_ATTENTION_RUNTIME_HOOKS = AttentionRuntimeHooks()
