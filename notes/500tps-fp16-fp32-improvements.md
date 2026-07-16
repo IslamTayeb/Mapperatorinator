@@ -258,13 +258,13 @@ When any new lever, FIX tip, or scout job lands:
 | Hypothesis | Exact reciprocal ≥5% main_model vs tip `55949274` from q1 scheduling / fewer underfilled CTAs (nsight ~19%) |
 | Base tip | `55949274` |
 | Branch / WT | `codex/exact-q1-rope-cache-headgroup` / local+DCC `exact-q1-rope-cache-headgroup` |
-| Execution tip / immutable ref | pending after wrapper FIX (was **`64372cde`** / `q1-rope-cache-headgroup-scout-64372cde-r2`) |
+| Execution tip / immutable ref | **`dd5d8e58`** / `q1-rope-cache-headgroup-scout-dd5d8e58-r4` (wrapper FIX; was `64372cde`) |
 | Opt-in | `q1_rope_cache_headgroup_candidate_context` → `native_q1_rope_cache_headgroup` (V32 cold default) |
 | Kernel | `q1_rope_cache_attention_headgroup` (HEADS_PER_CTA=2, block 128×2) |
 | Prior infra fails | FP16/FP32 `50000634`/`635` + retries `50002697`/`698` — all FAILED exit 1:0 after baseline: `profile: unbound variable` at sbatch L102 (`local profile=${profiles[0]} osu=${profile%.profile.json}` under `set -u`). Candidate never ran. |
-| FIX | Split into two `local` lines (sibling reciprocals already do this). |
-| Jobs | **pending resubmit** after FIX push (prior IDs are not lever evidence) |
-| Run roots (prior) | `/work/imt11/Mapperatorinator/runs/q1-headgroup-fp{16,32}-r3-64372cde-<jobid>/` — baseline only |
+| FIX | Split into two `local` lines in `profile_q1_rope_cache_headgroup_reciprocal.sbatch` (`dd5d8e58`). |
+| Jobs | FP16 **`50024784`**; FP32 **`50024785`** (`ALLOW_PARALLEL=1`, unique RUN_LABEL/TMPDIR/TORCH_EXTENSIONS via job id) |
+| Run roots | `/work/imt11/Mapperatorinator/runs/q1-headgroup-fp16-r4-dd5d8e58-50024784/`; `.../q1-headgroup-fp32-r4-dd5d8e58-50024785/` |
 | Exact | pending (fixed runs) |
 | Measured | pending (fixed runs) |
 | Decision | **OPEN** — prior fails are wrapper INFRA, not **STOP_NO_PROMOTE**; harvest only after fixed reciprocal lands |
