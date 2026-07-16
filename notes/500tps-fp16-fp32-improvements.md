@@ -188,7 +188,7 @@ Do not fold multiple improvements into one line. Projections are never productio
 
 | Rank | Improvement (#) | FP16 main_tps | FP32 main_tps | Status |
 | --- | ---: | ---: | ---: | --- |
-| — | #12 q1 RoPE/cache head-group CTA scheduling | pending | pending | **OPEN** — repaired FP16 `50000634`; FP32 `50000635` submitted at `64372cde` |
+| — | #12 q1 RoPE/cache head-group CTA scheduling | pending | pending | **OPEN** — FP16 `50000634`; FP32 `50000635` (RUNNING @ `64372cde`) |
 | 1 | #1 shared-RoPE + device state | **366.11** | 313.05 | **GRADUATED tip** |
 | 2 | #2 shared-runtime packaging | 313.54 | **317.46** | **SEALED** pin only |
 | — | #3–#7c, #10 above | — | — | no graduate |
@@ -257,14 +257,14 @@ When any new lever, FIX tip, or scout job lands:
 | What | Pack 2 heads/CTA on already-exact native q1 RoPE/cache path (identical per-head reduction order; no Wo/proj_out/RMSNorm math replace) |
 | Hypothesis | Exact reciprocal ≥5% main_model vs tip `55949274` from q1 scheduling / fewer underfilled CTAs (nsight ~19%) |
 | Base tip | `55949274` |
-| Branch / WT | `codex/exact-q1-rope-cache-headgroup` / local `exact-q1-rope-cache-headgroup` |
+| Branch / WT | `codex/exact-q1-rope-cache-headgroup` / local+DCC `exact-q1-rope-cache-headgroup` |
 | Execution tip / immutable ref | **`64372cde`** / `q1-rope-cache-headgroup-scout-64372cde-r2` |
 | Opt-in | `q1_rope_cache_headgroup_candidate_context` → `native_q1_rope_cache_headgroup` (V32 cold default) |
 | Kernel | `q1_rope_cache_attention_headgroup` (HEADS_PER_CTA=2, block 128×2) |
-| Jobs | FP16 **`50000634`**; FP32 **`50000635`** (submitted); prior `49998739`/`49998740` and `49999138`/`49999139` failed wrapper infrastructure before execution, not **STOP_NO_PROMOTE** |
-| Run roots | `/work/imt11/Mapperatorinator/runs/q1-headgroup-fp{16,32}-r2-64372cde-<jobid>/` |
+| Jobs | FP16 **`50000634`**; FP32 **`50000635`** (RUNNING). Prior `49998739`/`740` + retries FAILED ~12s on wrapper `role: unbound variable` — infra FIX, not **STOP_NO_PROMOTE** |
+| Run roots | `/work/imt11/Mapperatorinator/runs/q1-headgroup-fp16-r3-64372cde-50000634/`; `.../q1-headgroup-fp32-r3-64372cde-50000635/` |
 | Exact | pending |
 | Measured | pending |
-| Decision | **OPEN** — scout submitted |
+| Decision | **OPEN** — r3 scouts submitted and past preflight |
 | Not this lever | §6/§7/§10/§11 math replaces; INT8; bare split-KV; compiled-cross |
 | Ledger rule | Own section only |
