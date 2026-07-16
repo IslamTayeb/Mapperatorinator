@@ -64,11 +64,13 @@ def _time_callable(
 ) -> tuple[float, Any, bool]:
     import torch
 
+    # Prime once so extension/allocator growth is not charged to the timed window.
+    callable_()
     torch.cuda.synchronize()
-    allocated_before = int(torch.cuda.memory_allocated())
     for _ in range(warmup):
         callable_()
     torch.cuda.synchronize()
+    allocated_before = int(torch.cuda.memory_allocated())
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
@@ -79,10 +81,12 @@ def _time_callable(
     torch.cuda.synchronize()
     if last is None:
         raise RuntimeError("timing loop produced no output")
+    # Retain only the final output; drop intermediate refs before the check.
+    last = last.detach()
     allocated_after = int(torch.cuda.memory_allocated())
     ms_per_call = float(start.elapsed_time(end)) / float(iters)
-    memory_stable = allocated_after <= allocated_before
-    return ms_per_call, last.detach(), memory_stable
+    memory_stable = allocated_after <= allocated_before + last.numel() * last.element_size()
+    return ms_per_call, last, memory_stable
 
 
 def summarize_variant(
