@@ -306,6 +306,7 @@ def _generate_window(
         "native_q1_self_attention": 0,
         "q1_bmm_cross_attention": 0,
         "native_cross_mlp_tail": 0,
+        "elementwise_fusion_attn_pack": 0,
     }
 
     rng_before = (

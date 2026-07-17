@@ -270,8 +270,26 @@ def q1_rope_cache_self_attention_forward(
             attention_mask_for_native,
             int(prefix_length),
         )
-    output = output.transpose(1, 2).contiguous()
-    output = output.view(bs, -1, module.all_head_size)
+    from .elementwise_fusion import (
+        elementwise_fusion_requested,
+        fused_pack_q1_attn_out,
+    )
+
+    if elementwise_fusion_requested():
+        output = fused_pack_q1_attn_out(
+            output,
+            batch_size=bs,
+            num_heads=module.num_heads,
+            head_dim=module.head_dim,
+            all_head_size=module.all_head_size,
+        )
+        if dispatch_counts is not None:
+            dispatch_counts["elementwise_fusion_attn_pack"] = (
+                dispatch_counts.get("elementwise_fusion_attn_pack", 0) + 1
+            )
+    else:
+        output = output.transpose(1, 2).contiguous()
+        output = output.view(bs, -1, module.all_head_size)
     if dispatch_counts is not None:
         dispatch_counts["native_q1_rope_cache_self_attention"] += 1
     return (output,)
