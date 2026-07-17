@@ -78,13 +78,26 @@ def _model_output_dtype(model) -> torch.dtype:
 
 @contextmanager
 def teacher_aligned_runtime_context(*, precision: str) -> Iterator[None]:
-    """Arm the same native decode hooks optimized MAP generation uses."""
+    """Arm native decode hooks for turbo teacher verify.
+
+    §54 Stage A: when ``MAPPERATORINATOR_TURBO_VERIFY_MROW`` is on (default),
+    arm m≤8-row warp-group islands + rope/KV-cache-write around SDPA.
+    Sequential Q=1 greedy/canary still uses the aligned q1 hooks (m=1 falls
+    through m-row kernels too). Bit-exact optimized presets are untouched.
+    """
     from ..optimized.single.runtime_context import (
         attention_runtime_context,
         decoder_layer_runtime_context,
     )
 
     dtype = torch.float16 if precision == "fp16" else torch.float32
+    from .mrow_verify import mrow_verify_enabled, mrow_verify_runtime_context
+
+    if mrow_verify_enabled():
+        with mrow_verify_runtime_context(precision=precision):
+            yield
+        return
+
     with attention_runtime_context(
         q1_bmm_cross_attention=True,
         native_q1_self_attention=True,
