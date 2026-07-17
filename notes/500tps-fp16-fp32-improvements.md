@@ -1083,59 +1083,70 @@ Primary path to 500 under the scope ruling. Bit-exact Track A remains valid but 
 4. **No §44 / no 500 claim** until a scout ≥**384** sustained; song wall wins; tip stays `55949274`/366.11 until then.
 5. **Persistent caches across windows** everywhere — never rebuild verify_fp/graph caches per window (`speculate.py` per-window teardown class of bug).
 
-## 46. Baseline glue-elimination v2 (W-BASE) — **OPEN STUB**
+## 46. Baseline glue-elimination v2 (W-BASE) — **STOP_NO_PROMOTE**
 
 | Field | Value |
 | --- | --- |
 | What | Independent no-speculation path: cut ~0.88 ms/tok non-model glue on optimized engine |
-| Worker | **W-BASE** — own branch; possibly bit-exact |
-| Targets | persistent sampling-tail graph (temp+top-p sort+softmax+multinomial; §29c Philox PASS); device token buffer vs `torch.cat`; pinned-flag EOS vs per-token `.max()==0` sync |
-| Not | bare §29 retry — v2 mandates persistent cross-window caches + separate small tail graph |
-| Ceiling | **~540 TPS** (1/1.853 ms) — projection |
-| Gate | e2e scout ≥**450**; if bitwise holds, can graduate EXACT tip itself |
-| Status | **OPEN** |
-| Campaign tip | `55949274` / **366.11** — no 500 claim yet |
+| Worker | **W-BASE** — branch `codex/exact-baseline-glue-v2` |
+| Tip / commit | **`3987bd5c`** (base `55949274`) |
+| Targets | persistent sampling-tail graph (temp+top-p sort+softmax+multinomial; §29b Philox); tip device token buffer; pinned-flag EOS |
+| Not | bare §29 retry — persistent cross-window sample cache + separate small tail graph |
+| Opt-in | `baseline_glue_v2_candidate_context` (V32 cold default) |
+| Smoke | FP16 **`50150069`** z25-21 — **exact PASS** tok **1322**; RNG equal; hits **1322** |
+| Budget | base **297.63** → cand **297.33** TPS; **−0.003 ≪ 0.15** ms/tok → **MISS** |
+| Scout | **not submitted** (kill) |
+| Decision | **STOP_NO_PROMOTE** — Philox/top-p-in-graph exactness holds; no glue headroom on tip composition |
+| Revisit | Only with new ≥0.15 ms/tok evidence that removes the host/forward↔sample round-trip — not another sample-graph tweak |
+| Handoff | `notes/500tps-section46-handoff.md` |
+| Campaign tip | still `55949274` / **366.11** — no tip graduate; no 500 claim |
 | Ledger rule | Own section only |
 
-## 47. Keep-accepted-KV + O(1) rollback (W-KV) — **OPEN STUB**
+## 47. Keep-accepted-KV + O(1) rollback (W-KV) — **GATES PASS**
 
 | Field | Value |
 | --- | --- |
 | What | keep-accepted-KV under sampled DOCUMENTED DRIFT; O(1) `cache_position` rewind + in-graph stale masking |
-| Worker | **W-KV** — branch `codex/turbo-keep-accepted-kv` |
+| Worker | **W-KV** — branch `codex/turbo-keep-accepted-kv` @ **`d3cd6939`** |
 | Rules | accepted tokens NEVER re-forwarded (teacher or draft); q1 bucket from rolled-back length; greedy TIER1a stays crop-rebuild/aligned-Q1 |
 | Gates | teacher forwards/cycle == **1**; **−10 ms/cycle** vs §45; TIER1a still PASS in canary mode |
 | Kill | cannot get teacher forwards/cycle==1 without breaking canary-mode separation → STOP with number |
-| Status | **OPEN** |
-| Campaign tip | `55949274` / **366.11** |
+| Canary | **`50150072` PASS** (crop-rebuild TIER1a; 3/3 seeds) |
+| Scout | **`50150073`**: forwards/cycle **1.0**; accepted_reforwards **0**; median cycle **32.61 ms** (Δ **−12.39** vs §45 ~45); main_tps **36.69** directional |
+| Status | **GATES PASS** — ready for integrator merge with §48/§49; **no merge**; kill not triggered |
+| Handoff | `notes/500tps-section47-handoff.md` |
+| Campaign tip | `55949274` / **366.11** — **no 500 claim** |
 | Ledger rule | Own section only |
 
-## 48. Graph-native K=γ verify (W-VG) — **OPEN (code + in-loop probe)**
+## 48. Graph-native K=γ verify (W-VG) — **STOP_KILL**
 
 | Field | Value |
 | --- | --- |
 | What | Lift k>1 graph gate; graph-native verify with static `{ids[1,γ], cache_position[γ]}`; mask in-graph; **no HF prepare_inputs** (device-scalar sync) |
-| Worker | **W-VG** — branch `codex/turbo-graph-native-verify` |
+| Worker | **W-VG** — branch `codex/turbo-graph-native-verify` @ `be491a4f` |
 | Pattern | production capture + side-stream warmup (§41 zero-logits bug) |
 | Wiring | `verify_fastpath.py` graph-native path; persistent `TurboRuntime.verify_fastpath`; `utils/s48_graph_native_verify_inloop.py` |
-| Gate | in-loop c_verify ≤**1.2×** (≤2.22 ms) measured inside the real cycle, not a harness |
-| Kill | verify stuck &gt;1.35× after graph-native attempt → STOP |
-| Status | **OPEN** — measuring in-loop (see handoff jobs) |
+| In-loop | job **`50150290`**: path `graph_native_k`, prepare_inputs=**0**, c_verify=**3.075 ms**, Q1=**1.842 ms**, ratio=**1.669×** |
+| Gate | in-loop c_verify ≤**1.2×** (≤2.22 ms) — **MISS** |
+| Kill | verify stuck &gt;1.35× after graph-native attempt → **STOP_KILL** (1.669×) |
+| Status | **STOP_KILL** — do not grind; revisit only with new mechanism |
 | Handoff | `notes/500tps-section48-handoff.md` |
 | Campaign tip | `55949274` / **366.11** — **no 500 claim** |
 | Ledger rule | Own section only |
 
-## 49. Graphed draft chain (W-DG) — **OPEN STUB**
+## 49. Graphed draft chain (W-DG) — **MISS_UNDER_KILL**
 
 | Field | Value |
 | --- | --- |
 | What | Merge §42; draft on StaticCache; chain γ=3 steps in **ONE** graph incl. in-graph sampling (Philox graph-safe per §29c) + embedding feedback |
-| Worker | **W-DG** — own branch |
-| Note | with keep-KV the discarded 3rd forward becomes next cycle's first |
+| Worker | **W-DG** — `codex/turbo-graphed-draft-chain` @ **`d2f09578`** (impl `9fa531ab`) |
+| Note | with keep-KV the discarded 3rd forward becomes next cycle's first; persistent session chain-graph cache |
 | Gate | 3 drafts ≤**1.2 ms** total |
 | Kill | draft chain &gt;2 ms → STOP |
-| Status | **OPEN** |
-| Campaign tip | `55949274` / **366.11** |
+| Measured | job **`50150142`** (2080 Ti FP16, pure graph replay): γ=3 chain median **1.257 ms** (prefix128 **1.219**, prefix256 **1.257**); ~**0.42 ms/tok** vs §42's 1.08 |
+| Status | **MISS_UNDER_KILL** — STOP_NO_PROMOTE; no grind (kill not triggered) |
+| Handoff | `notes/500tps-section49-graphed-draft-chain.md` |
+| Campaign tip | `55949274` / **366.11** — **no 500 claim** |
 | Ledger rule | Own section only |
 
 ## 50. Config / margin sweep (W-ACC) — **QUEUED** (after cycle &lt;10 ms)

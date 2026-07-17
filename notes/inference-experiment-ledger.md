@@ -29,4 +29,6 @@ Historical artifact hashes, intermediate failures, and per-job commands are
 evidence, not standing instructions. Use Git history only when auditing a
 specific old decision.
 
-**§48 W-VG graph-native K=γ verify — OPEN** (2026-07-17): branch `codex/turbo-graph-native-verify`. Lifted k>1 graph gate; static `{ids[1,γ], cache_position[γ]}`; mask in-graph; no HF prepare_inputs on hot path; production side-stream warmup; persistent verify_fp across windows. In-loop probe `utils/s48_graph_native_verify_inloop.py`. Gate ≤1.2× / kill >1.35×. Handoff: `notes/500tps-section48-handoff.md`. Tip still `55949274` / **366.11**. No 500 claim.
+**§48 W-VG graph-native K=γ verify — STOP_KILL** (2026-07-17): branch `codex/turbo-graph-native-verify`. Lifted k>1 graph gate; static `{ids[1,γ], cache_position[γ]}`; mask in-graph; no HF prepare_inputs on hot path; production side-stream warmup; persistent verify_fp across windows. In-loop probe `utils/s48_graph_native_verify_inloop.py`. Gate ≤1.2× / kill >1.35×. Handoff: `notes/500tps-section48-handoff.md`. Tip still `55949274` / **366.11**. No 500 claim.
+
+**§48 W-VG graph-native K=γ verify — STOP_KILL** (2026-07-17): `50150290` @ `be491a4f` — path `graph_native_k`, prepare_inputs=0, in-loop c_verify **3.075 ms** / Q1 **1.842 ms** = **1.669×** >1.35 kill (≈§41 1.686× band). Gate ≤1.2 MISS. No grind. Handoff: `notes/500tps-section48-handoff.md`. Tip still `55949274` / **366.11**. No 500 claim.
