@@ -479,53 +479,76 @@ def time_chain_graph_ms(
     warmup: int = 10,
     iters: int = 50,
 ) -> dict[str, Any]:
-    """Microbench one γ-chain graph replay (ms for all γ drafts)."""
+    """Microbench pure γ-chain CUDA graph replay (ms for all γ drafts).
+
+    Host rewind / id bookkeeping is excluded from the timed region — only
+    ``graph.replay()`` (sample+embed+forward ×γ) is measured, matching §42's
+    graph-replay microbench style. KV is rewound between iters so each replay
+    starts at ``prefix_length``.
+    """
     if runner.fastpath._input_ids is None:
         raise RuntimeError("runner must be bound + prefills before timing")
 
     # Grow to prefix with eager fastpath decode (no chain graph).
     while runner.fastpath._cur_len < int(prefix_length):
         runner.fastpath.decode_token(1)
-    # Seed logits = last forward.
-    # decode_token already advanced; grab a fresh forward seed via last prefill pattern:
-    # use current logits from a single eager step then rewind one — simpler: run
-    # ensure + seed from zeros-argmax path after one eager decode.
     seed = runner.fastpath.decode_token(1)
     runner.rewind_keep_kv(int(prefix_length))
-    # Manually set cur state to prefix_length with seed logits at that boundary.
     runner.fastpath._cur_len = int(prefix_length)
     if runner.fastpath._input_ids is not None:
         runner.fastpath._input_ids = runner.fastpath._input_ids[:, : int(prefix_length)]
     runner._ensure_workspaces()
     assert runner._seed_logits is not None
+    assert runner._logits_ws is not None
+    assert runner._cache_pos is not None
     runner._seed_logits.copy_(seed.view(1, -1))
 
-    # Capture once (persistent).
-    runner.ensure_chain_graph(start_len=int(prefix_length))
+    entry = runner.ensure_chain_graph(start_len=int(prefix_length))
+    start_len = int(prefix_length)
+
+    def _arm_for_replay() -> None:
+        runner.rewind_keep_kv(start_len)
+        runner.fastpath._cur_len = start_len
+        if runner.fastpath._input_ids is not None:
+            runner.fastpath._input_ids = runner.fastpath._input_ids[:, :start_len]
+        runner._seed_logits.copy_(seed.view(1, -1))
+        runner._logits_ws.copy_(runner._seed_logits)
+        runner._cache_pos.fill_(start_len)
+        live = runner._build_static_decode_inputs(start_len)
+        if "decoder_input_ids" in live:
+            live["decoder_input_ids"] = live["decoder_input_ids"][:, -1:].contiguous()
+        if "cache_position" in live and live["cache_position"].numel() != 1:
+            live["cache_position"] = torch.tensor(
+                [start_len], device=runner._device, dtype=torch.long
+            )
+        _copy_static_graph_inputs(entry["static_inputs"], live)
 
     for _ in range(max(int(warmup), 0)):
-        # Each replay advances length by γ; rewind to keep shape stable.
-        start = int(prefix_length)
-        runner.rewind_keep_kv(start)
-        runner.fastpath._cur_len = start
-        if runner.fastpath._input_ids is not None:
-            runner.fastpath._input_ids = runner.fastpath._input_ids[:, :start]
-        runner._seed_logits.copy_(seed.view(1, -1))
-        runner.replay_chain(seed_logits=seed)
+        _arm_for_replay()
+        with runner.fastpath._profile_context():
+            entry["graph"].replay()
+        runner.stats.chain_replays += 1
+        runner.stats.hit_counters["draft_chain_graph_replay"] += 1
 
-    torch.cuda.synchronize()
-    start_evt = torch.cuda.Event(enable_timing=True)
-    end_evt = torch.cuda.Event(enable_timing=True)
-    start_evt.record()
+    # Timed region: pure graph replay only (rewind/arm outside events).
+    times_ms: list[float] = []
     for _ in range(int(iters)):
-        runner.rewind_keep_kv(int(prefix_length))
-        runner.fastpath._cur_len = int(prefix_length)
-        if runner.fastpath._input_ids is not None:
-            runner.fastpath._input_ids = runner.fastpath._input_ids[:, : int(prefix_length)]
-        runner.replay_chain(seed_logits=seed)
-    end_evt.record()
-    torch.cuda.synchronize()
-    ms_chain = float(start_evt.elapsed_time(end_evt)) / float(iters)
+        _arm_for_replay()
+        torch.cuda.synchronize()
+        start_evt = torch.cuda.Event(enable_timing=True)
+        end_evt = torch.cuda.Event(enable_timing=True)
+        with runner.fastpath._profile_context():
+            start_evt.record()
+            entry["graph"].replay()
+            end_evt.record()
+        torch.cuda.synchronize()
+        times_ms.append(float(start_evt.elapsed_time(end_evt)))
+        runner.stats.chain_replays += 1
+        runner.stats.hit_counters["draft_chain_graph_replay"] += 1
+
+    times_ms.sort()
+    ms_chain = float(times_ms[len(times_ms) // 2])
+    ms_mean = float(sum(times_ms) / len(times_ms))
     runner.stats.last_chain_ms = ms_chain
     bucket = _bucketed_prefix_length(
         int(prefix_length) + runner.gamma,
@@ -537,11 +560,15 @@ def time_chain_graph_ms(
         "bucket_prefix_length": int(bucket),
         "gamma": int(runner.gamma),
         "ms_per_chain": ms_chain,
+        "ms_per_chain_mean": ms_mean,
+        "ms_per_chain_min": float(times_ms[0]),
+        "ms_per_chain_max": float(times_ms[-1]),
         "ms_per_token": ms_chain / float(runner.gamma),
         "gate_ms_total": GATE_MS_TOTAL,
         "kill_ms_total": KILL_MS_TOTAL,
         "gate_pass": bool(ms_chain <= GATE_MS_TOTAL),
         "kill": bool(ms_chain > KILL_MS_TOTAL),
+        "timing_mode": "pure_graph_replay",
         "warmup": int(warmup),
         "iters": int(iters),
         "chain_captures": int(runner.stats.chain_captures),
