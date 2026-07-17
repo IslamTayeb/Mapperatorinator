@@ -76,18 +76,20 @@ def find_profile(run_root: Path) -> Path:
 
 
 def resolve_inference_config(cfg) -> InferenceConfig:
-    args_inf = OmegaConf.to_object(OmegaConf.merge(OmegaConf.structured(InferenceConfig), cfg))
-    if isinstance(args_inf, InferenceConfig):
-        return args_inf
+    """Build InferenceConfig without requiring hydra MISSING fields."""
     from dataclasses import fields
 
     base = InferenceConfig()
+    container = OmegaConf.to_container(cfg, resolve=True)
+    if not isinstance(container, dict):
+        raise TypeError("expected hydra cfg container dict")
     for f in fields(InferenceConfig):
-        if f.name in cfg:
+        if f.name == "hydra":
+            continue
+        if f.name in container:
+            setattr(base, f.name, container[f.name])
+        elif f.name in cfg:
             setattr(base, f.name, OmegaConf.select(cfg, f.name))
-    for k, v in OmegaConf.to_container(cfg, resolve=True).items():
-        if hasattr(base, k):
-            setattr(base, k, v)
     return base
 
 
