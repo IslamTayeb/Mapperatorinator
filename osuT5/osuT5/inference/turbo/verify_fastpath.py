@@ -194,6 +194,10 @@ class TeacherVerifyFastpath:
     ) -> dict[str, Any]:
         mk = dict(model_kwargs)
         mk.pop("cache_position", None)
+        # Never feed raw audio into decode/graph capture once encoder_outputs exist.
+        if mk.get("encoder_outputs") is not None:
+            for key in ("frames", "inputs", "input_features"):
+                mk.pop(key, None)
         length = int(decoder_input_ids.shape[1])
         mk["decoder_attention_mask"] = torch.ones(
             (1, length),
@@ -204,6 +208,8 @@ class TeacherVerifyFastpath:
             decoder_input_ids,
             **mk,
         )
+        for key in ("frames", "inputs", "input_features"):
+            model_inputs.pop(key, None)
         if "cache_position" in model_inputs:
             model_kwargs["cache_position"] = model_inputs["cache_position"]
         return model_inputs
