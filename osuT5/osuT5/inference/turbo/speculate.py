@@ -456,63 +456,66 @@ def speculative_generate_window(
     start_time = time.perf_counter()
 
     # Draft stays on DynamicCache / eager; teacher arms optimized hooks (§41).
+    # One outer context — @contextmanager CMs are one-shot and cannot be reused
+    # per verify/rebuild step (AttributeError: args on second enter).
     precision_key = "fp16" if precision == "fp16" else "fp32"
-    teacher_ctx = (
+    aligned_greedy = bool(
+        verify_fp is not None and verify_fp.graph_aligned and greedy
+    )
+    teacher_runtime = (
         teacher_aligned_runtime_context(precision=precision_key)
         if verify_fp is not None
         else nullcontext()
     )
-    aligned_greedy = bool(
-        verify_fp is not None and verify_fp.graph_aligned and greedy
-    )
 
-    with teacher_ctx:
+    with teacher_runtime:
         teacher_last, teacher_mk = _prefill(
             teacher, prompt_ids=prompt_ids, model_kwargs=teacher_mk
         )
-    # Drop raw audio after prefill so Q=1 CUDA graphs never re-enter the encoder
-    # (capture-illegal host sync / dtype branches — see microbench 50147547).
-    if teacher_mk.get("encoder_outputs") is not None:
-        for _audio_key in ("frames", "inputs", "input_features"):
-            teacher_mk.pop(_audio_key, None)
-        draft_mk["encoder_outputs"] = teacher_mk["encoder_outputs"]
-    draft_last, draft_mk = _prefill(
-        draft, prompt_ids=prompt_ids, model_kwargs=draft_mk
-    )
-    if draft_mk.get("encoder_outputs") is not None:
-        for _audio_key in ("frames", "inputs", "input_features"):
-            draft_mk.pop(_audio_key, None)
-
-    sequences = prompt_ids
-    prompt_len = int(prompt_ids.shape[1])
-    accepted_total = 0
-    verify_steps = 0
-    draft_calls = 0
-    stopped = False
-
-    while sequences.shape[1] < max_length and not stopped:
-        remaining = max_length - int(sequences.shape[1])
-        L = int(sequences.shape[1])
-        this_gamma = min(int(gamma), remaining)
-
-        draft_ids, q_probs, draft_mk, _draft_hit_eos, _draft_tail_logits = _draft_k_tokens(
-            draft,
-            prompt_ids=sequences,
-            last_logits=draft_last,
-            model_kwargs=draft_mk,
-            gamma=this_gamma,
-            greedy=greedy,
-            temperature=spec_temperature,
-            top_p=spec_top_p,
-            processors=processors,
-            rng=rng,
-            max_new_tokens=remaining,
-            eos_ids=eos_ids,
+        # Drop raw audio after prefill so Q=1 CUDA graphs never re-enter the encoder
+        # (capture-illegal host sync / dtype branches — see microbench 50147547).
+        if teacher_mk.get("encoder_outputs") is not None:
+            for _audio_key in ("frames", "inputs", "input_features"):
+                teacher_mk.pop(_audio_key, None)
+            draft_mk["encoder_outputs"] = teacher_mk["encoder_outputs"]
+        draft_last, draft_mk = _prefill(
+            draft, prompt_ids=prompt_ids, model_kwargs=draft_mk
         )
-        draft_calls += 1
-        actual_gamma = len(draft_ids)
+        if draft_mk.get("encoder_outputs") is not None:
+            for _audio_key in ("frames", "inputs", "input_features"):
+                draft_mk.pop(_audio_key, None)
 
-        with teacher_ctx:
+        sequences = prompt_ids
+        prompt_len = int(prompt_ids.shape[1])
+        accepted_total = 0
+        verify_steps = 0
+        draft_calls = 0
+        stopped = False
+
+        while sequences.shape[1] < max_length and not stopped:
+            remaining = max_length - int(sequences.shape[1])
+            L = int(sequences.shape[1])
+            this_gamma = min(int(gamma), remaining)
+
+            draft_ids, q_probs, draft_mk, _draft_hit_eos, _draft_tail_logits = (
+                _draft_k_tokens(
+                    draft,
+                    prompt_ids=sequences,
+                    last_logits=draft_last,
+                    model_kwargs=draft_mk,
+                    gamma=this_gamma,
+                    greedy=greedy,
+                    temperature=spec_temperature,
+                    top_p=spec_top_p,
+                    processors=processors,
+                    rng=rng,
+                    max_new_tokens=remaining,
+                    eos_ids=eos_ids,
+                )
+            )
+            draft_calls += 1
+            actual_gamma = len(draft_ids)
+
             p_logits, p_probs, bonus_logits, teacher_mk = _verify_draft_tokens(
                 teacher,
                 prompt_ids=sequences,
@@ -525,89 +528,90 @@ def speculative_generate_window(
                 top_p=spec_top_p,
                 verify_fastpath=verify_fp,
             )
-        verify_steps += 1
+            verify_steps += 1
 
-        if greedy:
-            n_accepted = 0
-            residual = None
-            for i, tok in enumerate(draft_ids):
-                teacher_tok = int(torch.argmax(p_logits[i]).item())
-                if tok == teacher_tok:
-                    n_accepted += 1
-                else:
-                    residual = teacher_tok
-                    break
-        else:
-            n_accepted, residual = reject_sample_prefix(
-                p_probs=p_probs[:actual_gamma],
-                q_probs=q_probs[:actual_gamma],
-                draft_token_ids=draft_ids,
-                rng=rng,
+            if greedy:
+                n_accepted = 0
+                residual = None
+                for i, tok in enumerate(draft_ids):
+                    teacher_tok = int(torch.argmax(p_logits[i]).item())
+                    if tok == teacher_tok:
+                        n_accepted += 1
+                    else:
+                        residual = teacher_tok
+                        break
+            else:
+                n_accepted, residual = reject_sample_prefix(
+                    p_probs=p_probs[:actual_gamma],
+                    q_probs=q_probs[:actual_gamma],
+                    draft_token_ids=draft_ids,
+                    rng=rng,
+                )
+
+            # Commit tokens from verify logits, then rebuild KV from L.
+            # Aligned greedy: sequential Q=1 (same as optimized decode). Else K-forward.
+            n_keep = min(n_accepted, remaining)
+            bonus_tok: int | None = None
+            residual_tok: int | None = None
+            if residual is not None and n_keep < remaining:
+                residual_tok = int(residual)
+            elif (
+                residual is None
+                and n_accepted == actual_gamma
+                and n_keep == actual_gamma
+                and n_keep < remaining
+                and not any(int(t) in eos_ids for t in draft_ids[:n_keep])
+            ):
+                bonus_prefix = torch.cat(
+                    [
+                        sequences,
+                        torch.tensor(
+                            [draft_ids],
+                            device=sequences.device,
+                            dtype=sequences.dtype,
+                        ),
+                    ],
+                    dim=-1,
+                )
+                bonus_processed = _apply_processors(
+                    processors,
+                    bonus_prefix,
+                    bonus_logits.unsqueeze(0),
+                ).squeeze(0)
+                bonus_tok, _ = _sample_from_logits(
+                    bonus_processed,
+                    greedy=greedy,
+                    temperature=spec_temperature,
+                    top_p=spec_top_p,
+                    rng=rng,
+                )
+
+            extra: list[int] = []
+            if residual_tok is not None:
+                extra.append(residual_tok)
+            elif bonus_tok is not None:
+                extra.append(int(bonus_tok))
+
+            commit = list(draft_ids[:n_keep]) + extra
+            commit = commit[:remaining]
+            if not commit:
+                raise RuntimeError("turbo speculative step committed zero tokens")
+
+            crop_self_cache(teacher_cache, L)
+            crop_self_cache(draft_cache, L)
+            _align_decoder_mask(teacher_mk, length=L, device=sequences.device)
+            _align_decoder_mask(draft_mk, length=L, device=sequences.device)
+
+            commit_t = torch.tensor(
+                [commit], device=sequences.device, dtype=sequences.dtype
             )
-
-        # Commit tokens from verify logits, then rebuild KV from L.
-        # Aligned greedy: sequential Q=1 (same as optimized decode). Else K-forward.
-        n_keep = min(n_accepted, remaining)
-        bonus_tok: int | None = None
-        residual_tok: int | None = None
-        if residual is not None and n_keep < remaining:
-            residual_tok = int(residual)
-        elif (
-            residual is None
-            and n_accepted == actual_gamma
-            and n_keep == actual_gamma
-            and n_keep < remaining
-            and not any(int(t) in eos_ids for t in draft_ids[:n_keep])
-        ):
-            bonus_prefix = torch.cat(
-                [
-                    sequences,
-                    torch.tensor(
-                        [draft_ids], device=sequences.device, dtype=sequences.dtype
-                    ),
-                ],
-                dim=-1,
+            sequences = torch.cat([sequences, commit_t], dim=-1)
+            _align_decoder_mask(
+                teacher_mk, length=int(sequences.shape[1]), device=sequences.device
             )
-            bonus_processed = _apply_processors(
-                processors,
-                bonus_prefix,
-                bonus_logits.unsqueeze(0),
-            ).squeeze(0)
-            bonus_tok, _ = _sample_from_logits(
-                bonus_processed,
-                greedy=greedy,
-                temperature=spec_temperature,
-                top_p=spec_top_p,
-                rng=rng,
+            _align_decoder_mask(
+                draft_mk, length=int(sequences.shape[1]), device=sequences.device
             )
-
-        extra: list[int] = []
-        if residual_tok is not None:
-            extra.append(residual_tok)
-        elif bonus_tok is not None:
-            extra.append(int(bonus_tok))
-
-        commit = list(draft_ids[:n_keep]) + extra
-        commit = commit[:remaining]
-        if not commit:
-            raise RuntimeError("turbo speculative step committed zero tokens")
-
-        crop_self_cache(teacher_cache, L)
-        crop_self_cache(draft_cache, L)
-        _align_decoder_mask(teacher_mk, length=L, device=sequences.device)
-        _align_decoder_mask(draft_mk, length=L, device=sequences.device)
-
-        commit_t = torch.tensor(
-            [commit], device=sequences.device, dtype=sequences.dtype
-        )
-        sequences = torch.cat([sequences, commit_t], dim=-1)
-        _align_decoder_mask(
-            teacher_mk, length=int(sequences.shape[1]), device=sequences.device
-        )
-        _align_decoder_mask(
-            draft_mk, length=int(sequences.shape[1]), device=sequences.device
-        )
-        with teacher_ctx:
             if aligned_greedy and verify_fp is not None:
                 # Rebuild commit via sequential Q=1 (graph-aligned).
                 teacher_last_local = teacher_last
@@ -650,20 +654,20 @@ def speculative_generate_window(
                 teacher_last = (
                     teacher_out.logits[:, -1, :].float().squeeze(0).clone()
                 )
-        draft_out, draft_mk = _forward_decoder(
-            draft, decoder_input_ids=sequences, model_kwargs=draft_mk
-        )
-        draft_last = draft_out.logits[:, -1, :].float().squeeze(0).clone()
+            draft_out, draft_mk = _forward_decoder(
+                draft, decoder_input_ids=sequences, model_kwargs=draft_mk
+            )
+            draft_last = draft_out.logits[:, -1, :].float().squeeze(0).clone()
 
-        accepted_total += len(commit)
-        session.accepted_tokens_total += len(commit)
-        session.verify_steps += 1
-        session.draft_calls += 1
+            accepted_total += len(commit)
+            session.accepted_tokens_total += len(commit)
+            session.verify_steps += 1
+            session.draft_calls += 1
 
-        for tok in commit:
-            if int(tok) in eos_ids:
-                stopped = True
-                break
+            for tok in commit:
+                if int(tok) in eos_ids:
+                    stopped = True
+                    break
 
     if sync_model_timing:
         sync_cuda_for_model(teacher)
