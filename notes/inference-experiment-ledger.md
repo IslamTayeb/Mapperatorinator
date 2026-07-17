@@ -29,4 +29,6 @@ Historical artifact hashes, intermediate failures, and per-job commands are
 evidence, not standing instructions. Use Git history only when auditing a
 specific old decision.
 
-**§48 W-VG graph-native K=γ verify — OPEN** (2026-07-17): branch `codex/turbo-graph-native-verify`. Lifted k>1 graph gate; static `{ids[1,γ], cache_position[γ]}`; mask in-graph; no HF prepare_inputs on hot path; production side-stream warmup; persistent verify_fp across windows. In-loop probe `utils/s48_graph_native_verify_inloop.py`. Gate ≤1.2× / kill >1.35×. Handoff: `notes/500tps-section48-handoff.md`. Tip still `55949274` / **366.11**. No 500 claim.
+**§48 W-VG graph-native K=γ verify — STOP_KILL** (2026-07-17): `50150290` @ `be491a4f` — c_verify **3.075 ms** / **1.669×**. Handoff: `notes/500tps-section48-handoff.md`. Tip `55949274` / **366.11**.
+
+**§54 Stage A — PASS** (Track 2) on `codex/turbo-verify-fused-mrow` @ **`1faca2db`**: **`50152588`** c_verify **2.467 ms** / **1.332×**; E=**1.842** ΔE=**−0.013**; canary **`50154498` PASS**. Stage B authorized. Tip `55949274` / **366.11**. No merge. No 500 claim. Handoff: `notes/500tps-section54-handoff.md`.

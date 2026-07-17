@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""§54 Stage A in-loop c_verify + runtime E + path hits.
+"""§54 Stage B in-loop c_verify + runtime E + path hits.
 
-Interim gate: c_verify ≤1.35× (~2.5 ms). Kill Stage A if no path to ≤2.5 ms.
-Mandatory: re-measure accepted/verify E (ΔE ≥ −0.05 vs unfused §48 baseline);
-greedy TIER1a canary stays on aligned Q=1 (assert via separate canary job).
+Gate: c_verify ≤1.25× (~2.3 ms). Kill: >1.45× after Stage B.
+Mandatory: ΔE ≥ −0.05 vs Stage A (or unfused) control; canary separate.
 
-Does not re-grind unfused §48. Tip 55949274 / 366.11. No 500 claim.
+Tip 55949274 / 366.11. No 500 claim. Do not re-grind unfused §48.
 """
 from __future__ import annotations
 
@@ -34,16 +33,14 @@ from osuT5.osuT5.inference.engine_binding import unwrap_engine_binding  # noqa: 
 from inference import load_model_with_engine  # noqa: E402
 from osuT5.osuT5.runtime_profiling import generation_profile_context  # noqa: E402
 
-# §54 interim: ≤1.35× (~2.5 ms). Kill if no path to absolute ≤2.5 ms.
-INTERIM_RATIO = 1.35
-ABS_GATE_MS = 2.5
-# Unfused §48 in-loop E (accepted/verify) from integrator-era scouts ~1.06;
-# Stage A must not lose more than 0.05 vs the just-measured unfused control.
+GATE_RATIO = 1.25
+ABS_GATE_MS = 2.3
+KILL_RATIO = 1.45
 DELTA_E_MIN = -0.05
 FALLBACK_Q1_MS = 1.853
-# Sealed §48 reference (do not re-grind).
 S48_C_VERIFY_MS = 3.075
-S48_RATIO = 1.669
+S54A_C_VERIFY_MS = 2.467
+S54A_RATIO = 1.332
 
 
 def _clone_kwargs(src: dict[str, Any]) -> dict[str, Any]:
@@ -97,11 +94,6 @@ def main() -> int:
     ap.add_argument("--max-new-tokens", type=int, default=256)
     ap.add_argument("--seed", type=int, default=12345)
     ap.add_argument("--gamma", type=int, default=3)
-    ap.add_argument(
-        "--skip-unfused-control",
-        action="store_true",
-        help="Skip MROW=0 control (use sealed §48 constants for ΔE baseline only)",
-    )
     args = ap.parse_args()
 
     os.chdir(REPO)
@@ -114,16 +106,18 @@ def main() -> int:
     os.environ["MAPPERATORINATOR_TURBO_VERIFY_CUDA_TIMER"] = "1"
     os.environ["MAPPERATORINATOR_TURBO_STEP_PROFILE"] = "1"
     os.environ["MAPPERATORINATOR_TURBO_VERIFY_MROW"] = "1"
-    # Stage A measures SDPA core; Stage B split-KV is a separate gate.
-    os.environ["MAPPERATORINATOR_TURBO_VERIFY_MROW_STAGE_B"] = "0"
+    os.environ["MAPPERATORINATOR_TURBO_VERIFY_MROW_STAGE_B"] = "1"
 
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
-    # Preload m-row extension before timed window.
     from osuT5.osuT5.inference.optimized.kernels.m_row import preload_native_m_row
+    from osuT5.osuT5.inference.optimized.kernels.m_row_split_kv import (
+        preload_native_m_row_split_kv,
+    )
 
     preload_native_m_row()
+    preload_native_m_row_split_kv()
 
     args_inf = s36.load_args(
         args.config_name,
@@ -233,40 +227,40 @@ def main() -> int:
         "pad_token_id": getattr(tokenizer, "pad_id", None),
     }
 
-    unfused_e = None
-    unfused_c_verify = None
-    if not args.skip_unfused_control:
-        os.environ["MAPPERATORINATOR_TURBO_VERIFY_MROW"] = "0"
-        session_u = runtime.new_context_state()
-        verify_fp_u = runtime.ensure_verify_fastpath(raw)
-        session_u.verify_fastpath = verify_fp_u
-        if verify_fp_u is not None:
-            verify_fp_u.graph_cache.clear()
-            verify_fp_u.graph_captures = 0
-            verify_fp_u.graph_replays = 0
-            verify_fp_u.graph_native_replays = 0
-            verify_fp_u.prepare_inputs_calls = 0
-            verify_fp_u.forward_ms_total = 0.0
-            verify_fp_u.forward_timed_calls = 0
-        _r_u, stats_u = _run_window(
-            runtime=runtime,
-            raw=raw,
-            tokenizer=tokenizer,
-            model_kwargs=model_kwargs,
-            generate_kwargs=generate_kwargs,
-            session=session_u,
-            verify_fp=verify_fp_u,
-        )
-        unfused_e = stats_u.get("turbo_accepted_per_verify")
-        if verify_fp_u is not None and verify_fp_u.forward_timed_calls > 0:
-            unfused_c_verify = float(
-                verify_fp_u.forward_ms_total / verify_fp_u.forward_timed_calls
-            )
-        del session_u
-        torch.cuda.empty_cache()
-
+    # Stage A control (MROW=1, STAGE_B=0) for ΔE baseline.
     os.environ["MAPPERATORINATOR_TURBO_VERIFY_MROW"] = "1"
     os.environ["MAPPERATORINATOR_TURBO_VERIFY_MROW_STAGE_B"] = "0"
+    session_a = runtime.new_context_state()
+    verify_fp_a = runtime.ensure_verify_fastpath(raw)
+    session_a.verify_fastpath = verify_fp_a
+    if verify_fp_a is not None:
+        verify_fp_a.graph_cache.clear()
+        verify_fp_a.graph_captures = 0
+        verify_fp_a.graph_replays = 0
+        verify_fp_a.graph_native_replays = 0
+        verify_fp_a.prepare_inputs_calls = 0
+        verify_fp_a.forward_ms_total = 0.0
+        verify_fp_a.forward_timed_calls = 0
+    _r_a, stats_a = _run_window(
+        runtime=runtime,
+        raw=raw,
+        tokenizer=tokenizer,
+        model_kwargs=model_kwargs,
+        generate_kwargs=generate_kwargs,
+        session=session_a,
+        verify_fp=verify_fp_a,
+    )
+    stage_a_e = stats_a.get("turbo_accepted_per_verify")
+    stage_a_c_verify = None
+    if verify_fp_a is not None and verify_fp_a.forward_timed_calls > 0:
+        stage_a_c_verify = float(
+            verify_fp_a.forward_ms_total / verify_fp_a.forward_timed_calls
+        )
+    del session_a
+    torch.cuda.empty_cache()
+
+    os.environ["MAPPERATORINATOR_TURBO_VERIFY_MROW"] = "1"
+    os.environ["MAPPERATORINATOR_TURBO_VERIFY_MROW_STAGE_B"] = "1"
     session = runtime.new_context_state()
     verify_fp = runtime.ensure_verify_fastpath(raw)
     session.verify_fastpath = verify_fp
@@ -299,32 +293,32 @@ def main() -> int:
         ratio = float(c_verify_ms) / float(q1_ms)
 
     e_runtime = stats.get("turbo_accepted_per_verify")
-    e_base = float(unfused_e) if unfused_e is not None else None
+    e_base = float(stage_a_e) if stage_a_e is not None else None
     delta_e = None
     if e_runtime is not None and e_base is not None:
         delta_e = float(e_runtime) - float(e_base)
 
-    interim_pass = (
+    gate_pass = (
         c_verify_ms is not None
         and c_verify_ms <= ABS_GATE_MS
         and ratio is not None
-        and ratio <= INTERIM_RATIO
+        and ratio <= GATE_RATIO
     )
-    kill_no_path = c_verify_ms is not None and c_verify_ms > ABS_GATE_MS
+    kill = ratio is not None and ratio > KILL_RATIO
     e_ok = delta_e is None or delta_e >= DELTA_E_MIN
     path = stats.get("turbo_verify_path")
     path_ok = path == "graph_native_k"
 
-    if interim_pass and e_ok and path_ok:
-        decision = "STAGE_A_PASS"
-    elif kill_no_path:
-        decision = "STAGE_A_KILL"
+    if gate_pass and e_ok and path_ok:
+        decision = "STAGE_B_PASS"
+    elif kill:
+        decision = "STAGE_B_KILL"
     else:
-        decision = "STAGE_A_MISS"
+        decision = "STAGE_B_MISS"
 
     out = {
         "section": 54,
-        "stage": "A",
+        "stage": "B",
         "worker": "Track2-verify-kernels",
         "commit": os.popen(f"git -C {REPO} rev-parse HEAD").read().strip(),
         "branch": os.popen(f"git -C {REPO} branch --show-current").read().strip(),
@@ -332,22 +326,25 @@ def main() -> int:
         "campaign_tip_fp16_main_tps": 366.11,
         "gamma": int(args.gamma),
         "mrow_enabled": True,
+        "stage_b_enabled": True,
         "q1_step_ms": q1_ms,
         "q1_meta": q1_meta,
         "c_verify_ms_inloop": c_verify_ms,
         "c_verify_ratio_vs_q1": ratio,
         "abs_gate_ms": ABS_GATE_MS,
-        "interim_ratio": INTERIM_RATIO,
+        "gate_ratio": GATE_RATIO,
+        "kill_ratio": KILL_RATIO,
         "s48_sealed_c_verify_ms": S48_C_VERIFY_MS,
-        "s48_sealed_ratio": S48_RATIO,
-        "unfused_control_c_verify_ms": unfused_c_verify,
-        "unfused_control_E": unfused_e,
+        "s54a_sealed_c_verify_ms": S54A_C_VERIFY_MS,
+        "s54a_sealed_ratio": S54A_RATIO,
+        "stage_a_control_c_verify_ms": stage_a_c_verify,
+        "stage_a_control_E": stage_a_e,
         "E_runtime_accepted_per_verify": e_runtime,
         "delta_E": delta_e,
         "delta_E_gate": DELTA_E_MIN,
         "delta_E_ok": e_ok,
-        "interim_pass": interim_pass,
-        "kill_no_path_to_2_5ms": kill_no_path,
+        "gate_pass": gate_pass,
+        "kill_gt_1_45x": kill,
         "decision": decision,
         "turbo_verify_path": path,
         "path_hit_graph_native": path_ok,
@@ -372,9 +369,8 @@ def main() -> int:
             )
         },
         "tokens": int(result.shape[-1]) if hasattr(result, "shape") else None,
-        "stage_b_authorized": bool(interim_pass and e_ok and path_ok),
         "note": (
-            "§54 Stage A m-row islands around SDPA. "
+            "§54 Stage B row-tiled m-row split-KV. "
             "Do not re-grind unfused §48. Tip unchanged. No 500 claim."
         ),
     }

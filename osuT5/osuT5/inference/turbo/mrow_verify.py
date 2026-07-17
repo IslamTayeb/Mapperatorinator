@@ -1,7 +1,7 @@
-"""§54 Stage A: turbo-only m≤8 verify path around SDPA.
+"""§54 Stage A/B: turbo-only m≤8 verify path.
 
-Arms m-row warp-group cross/MLP island + rope/KV-cache-write fusion.
-Self-attention core stays SDPA (Stage B owns fused split-KV attention).
+Stage A: m-row warp-group cross/MLP + rope/KV-cache-write around SDPA.
+Stage B: replace SDPA with row-tiled m-row split-KV (per-row KV lengths).
 """
 from __future__ import annotations
 
@@ -28,6 +28,12 @@ from ..optimized.single.runtime_context import active_prefix_self_attention_leng
 
 def mrow_verify_enabled() -> bool:
     raw = os.environ.get("MAPPERATORINATOR_TURBO_VERIFY_MROW", "1").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+def mrow_stage_b_enabled() -> bool:
+    """Stage B split-KV attention core (default on once Stage A landed)."""
+    raw = os.environ.get("MAPPERATORINATOR_TURBO_VERIFY_MROW_STAGE_B", "1").strip().lower()
     return raw not in {"0", "false", "off", "no"}
 
 
@@ -250,17 +256,54 @@ def m_row_sdpa_self_attention_forward(
     key_states = cache_layer.keys[:, :, :prefix_length, :]
     value_states = cache_layer.values[:, :, :prefix_length, :]
 
-    attn_mask = attention_mask
-    if (
-        isinstance(attn_mask, torch.Tensor)
-        and attn_mask.shape[-1] > key_states.shape[2]
-    ):
-        attn_mask = attn_mask[..., : key_states.shape[2]]
+    if mrow_stage_b_enabled():
+        from ..optimized.kernels.m_row_split_kv import (
+            native_m_row_split_kv_attention,
+            preload_native_m_row_split_kv,
+        )
 
-    from torch.nn.functional import scaled_dot_product_attention
+        preload_native_m_row_split_kv()
+        # Causal draft visibility: row r attends to positions [0, cache_pos[r]].
+        row_lengths = (cache_position.view(-1).to(dtype=torch.int32) + 1).contiguous()
+        row_lengths.clamp_(min=1, max=int(prefix_length))
+        if profile_ranges:
+            with profile_range(f"{range_prefix}.m_row_split_kv"):
+                attn_output = native_m_row_split_kv_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    row_lengths,
+                    max_prefix_len=int(prefix_length),
+                )
+        else:
+            attn_output = native_m_row_split_kv_attention(
+                query_states,
+                key_states,
+                value_states,
+                row_lengths,
+                max_prefix_len=int(prefix_length),
+            )
+    else:
+        attn_mask = attention_mask
+        if (
+            isinstance(attn_mask, torch.Tensor)
+            and attn_mask.shape[-1] > key_states.shape[2]
+        ):
+            attn_mask = attn_mask[..., : key_states.shape[2]]
 
-    if profile_ranges:
-        with profile_range(f"{range_prefix}.sdpa"):
+        from torch.nn.functional import scaled_dot_product_attention
+
+        if profile_ranges:
+            with profile_range(f"{range_prefix}.sdpa"):
+                attn_output = scaled_dot_product_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attn_mask=attn_mask,
+                    dropout_p=0.0,
+                    is_causal=False,
+                )
+        else:
             attn_output = scaled_dot_product_attention(
                 query_states,
                 key_states,
@@ -269,15 +312,6 @@ def m_row_sdpa_self_attention_forward(
                 dropout_p=0.0,
                 is_causal=False,
             )
-    else:
-        attn_output = scaled_dot_product_attention(
-            query_states,
-            key_states,
-            value_states,
-            attn_mask=attn_mask,
-            dropout_p=0.0,
-            is_causal=False,
-        )
     # Match q1_rope_cache hook: return pre-Wo attn; modeling applies Wo.
     attn_output = attn_output.transpose(1, 2).contiguous().view(
         bs, m, module.all_head_size
@@ -348,6 +382,10 @@ def mrow_verify_runtime_context(
 
     dtype = torch.float16 if precision == "fp16" else torch.float32
     preload_native_m_row()
+    if mrow_stage_b_enabled():
+        from ..optimized.kernels.m_row_split_kv import preload_native_m_row_split_kv
+
+        preload_native_m_row_split_kv()
     with attention_runtime_context(
         q1_bmm_cross_attention=True,
         native_q1_self_attention=True,
@@ -391,6 +429,7 @@ def mrow_verify_runtime_context(
 
 __all__ = [
     "mrow_verify_enabled",
+    "mrow_stage_b_enabled",
     "mrow_verify_runtime_context",
     "m_row_cross_mlp_tail_forward",
     "m_row_sdpa_self_attention_forward",

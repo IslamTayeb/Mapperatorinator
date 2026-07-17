@@ -39,6 +39,8 @@ export MAPPERATORINATOR_TURBO_TEACHER_ALIGNED=1
 export MAPPERATORINATOR_TURBO_VERIFY_CUDA_GRAPH=1
 # m-row armed, but Q=1 canary must fall through to aligned q1 hooks.
 export MAPPERATORINATOR_TURBO_VERIFY_MROW=1
+# Q=1 canary falls through aligned hooks; keep Stage B off for clarity.
+export MAPPERATORINATOR_TURBO_VERIFY_MROW_STAGE_B=0
 
 cd "$REPO"
 {
