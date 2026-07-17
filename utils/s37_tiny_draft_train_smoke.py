@@ -182,17 +182,16 @@ def teacher_force_logits(
     return out.logits.float()
 
 
-def teacher_force_loss(
+def _forward_kwargs(
     model,
     *,
     frames: torch.Tensor,
     decoder_input_ids: torch.Tensor,
     decoder_attention_mask: torch.Tensor,
-    labels: torch.Tensor,
     song_position: torch.Tensor | None,
     precision: str,
     cond_kwargs: dict[str, Any],
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
     kw = {}
     for k, v in cond_kwargs.items():
         if isinstance(v, torch.Tensor):
@@ -205,9 +204,32 @@ def teacher_force_loss(
     frames = frames.to(model.device)
     dec = decoder_input_ids.to(model.device)
     attn = decoder_attention_mask.to(model.device)
-    labels = labels.to(model.device)
     if song_position is not None:
         kw["song_position"] = song_position.to(model.device)
+    return frames, dec, attn, kw
+
+
+def teacher_force_loss(
+    model,
+    *,
+    frames: torch.Tensor,
+    decoder_input_ids: torch.Tensor,
+    decoder_attention_mask: torch.Tensor,
+    labels: torch.Tensor,
+    song_position: torch.Tensor | None,
+    precision: str,
+    cond_kwargs: dict[str, Any],
+) -> torch.Tensor:
+    frames, dec, attn, kw = _forward_kwargs(
+        model,
+        frames=frames,
+        decoder_input_ids=decoder_input_ids,
+        decoder_attention_mask=decoder_attention_mask,
+        song_position=song_position,
+        precision=precision,
+        cond_kwargs=cond_kwargs,
+    )
+    labels = labels.to(model.device)
     with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=(precision == "fp16")):
         out = model.forward(
             frames=frames,
@@ -227,6 +249,72 @@ def teacher_force_loss(
         )
         return loss
     return out.loss
+
+
+def distill_ce_kl_loss(
+    draft,
+    teacher,
+    *,
+    frames: torch.Tensor,
+    decoder_input_ids: torch.Tensor,
+    decoder_attention_mask: torch.Tensor,
+    labels: torch.Tensor,
+    song_position: torch.Tensor | None,
+    draft_precision: str,
+    teacher_precision: str,
+    cond_kwargs: dict[str, Any],
+    kl_weight: float,
+    kl_temp: float,
+) -> tuple[torch.Tensor, float, float]:
+    """Hard-label CE + soft KL(teacher || draft). Returns (loss, ce, kl)."""
+    frames_d, dec, attn, kw = _forward_kwargs(
+        draft,
+        frames=frames,
+        decoder_input_ids=decoder_input_ids,
+        decoder_attention_mask=decoder_attention_mask,
+        song_position=song_position,
+        precision=draft_precision,
+        cond_kwargs=cond_kwargs,
+    )
+    labels_d = labels.to(draft.device)
+    with torch.autocast(
+        device_type="cuda", dtype=torch.float16, enabled=(draft_precision == "fp16")
+    ):
+        out_d = draft.forward(
+            frames=frames_d,
+            decoder_input_ids=dec,
+            decoder_attention_mask=attn,
+            use_cache=False,
+            **kw,
+        )
+    logits_d = out_d.logits.float()
+    ce = F.cross_entropy(
+        logits_d.reshape(-1, logits_d.size(-1)),
+        labels_d.reshape(-1),
+        ignore_index=-100,
+    )
+    if kl_weight <= 0.0:
+        return ce, float(ce.detach()), 0.0
+    with torch.no_grad():
+        logits_t = teacher_force_logits(
+            teacher,
+            frames=frames,
+            decoder_input_ids=decoder_input_ids,
+            decoder_attention_mask=decoder_attention_mask,
+            song_position=song_position,
+            precision=teacher_precision,
+            cond_kwargs=cond_kwargs,
+        )
+    t = max(float(kl_temp), 1e-5)
+    log_q = F.log_softmax(logits_d / t, dim=-1)
+    p = F.softmax(logits_t.to(logits_d.device) / t, dim=-1)
+    # Mask pad / non-supervised positions (labels == -100)
+    mask = labels_d.ne(-100)
+    kl_tok = F.kl_div(log_q, p, reduction="none").sum(dim=-1)
+    kl = (kl_tok * mask).sum() / mask.sum().clamp_min(1)
+    # Standard KD scaling by T^2
+    loss = (1.0 - kl_weight) * ce + kl_weight * (t * t) * kl
+    return loss, float(ce.detach()), float(kl.detach())
 
 
 def prepare_contexts(processor, args_inf, generation_config, song_length: float, osu_path: Path):
@@ -419,9 +507,22 @@ def main() -> None:
     ap.add_argument("--precision", default="fp16")
     ap.add_argument("--temperature", type=float, default=0.9)
     ap.add_argument("--top-p", type=float, default=0.9)
-    ap.add_argument("--max-map-windows", type=int, default=16, help="windows for train+eval smoke")
+    ap.add_argument(
+        "--max-map-windows",
+        type=int,
+        default=16,
+        help="windows for train+eval; 0 = all map dumps",
+    )
     ap.add_argument("--train-steps", type=int, default=100)
     ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--kl-weight", type=float, default=0.0, help="mix weight for KL(teacher||draft); 0=CE only")
+    ap.add_argument("--kl-temp", type=float, default=2.0, help="softmax temperature for KL distillation")
+    ap.add_argument(
+        "--resume-ckpt",
+        type=Path,
+        default=None,
+        help="optional draft_smoke.pt / train ckpt to continue from",
+    )
     ap.add_argument("--seed", type=int, default=12345)
     args = ap.parse_args()
 
@@ -486,6 +587,16 @@ def main() -> None:
     draft = draft.float()
     draft.to(device)
     train_precision = "fp32"
+    resumed_from = None
+    if args.resume_ckpt is not None:
+        ckpt = torch.load(args.resume_ckpt, map_location="cpu")
+        state = ckpt.get("draft_state_dict", ckpt)
+        missing, unexpected = draft.load_state_dict(state, strict=False)
+        resumed_from = str(args.resume_ckpt)
+        print(
+            f"resumed_ckpt={resumed_from} missing={len(missing)} unexpected={len(unexpected)}",
+            flush=True,
+        )
 
     preprocessor = Preprocessor(args_inf, parallel=False)
     # Processor binds to teacher for prompt/tokenization helpers only
@@ -551,32 +662,47 @@ def main() -> None:
     draft.train()
     t_train = time.perf_counter()
     losses: list[float] = []
+    ce_losses: list[float] = []
+    kl_losses: list[float] = []
     skipped_nonfinite = 0
+    log_every = 20 if args.train_steps <= 200 else max(50, args.train_steps // 40)
     for step in range(args.train_steps):
         w = windows[step % len(windows)]
         opt.zero_grad(set_to_none=True)
-        loss = teacher_force_loss(
+        loss, ce_v, kl_v = distill_ce_kl_loss(
             draft,
+            teacher,
             frames=w["frames"],
             decoder_input_ids=w["dec_in"],
             decoder_attention_mask=w["dec_attn"],
             labels=w["labels"],
             song_position=w["song_pos"],
-            precision=train_precision,
+            draft_precision=train_precision,
+            teacher_precision=args.precision,
             cond_kwargs=cond_kwargs,
+            kl_weight=args.kl_weight,
+            kl_temp=args.kl_temp,
         )
         if not torch.isfinite(loss):
             skipped_nonfinite += 1
             losses.append(float("nan"))
-            if step == 0 or (step + 1) % 20 == 0 or step + 1 == args.train_steps:
+            ce_losses.append(float("nan"))
+            kl_losses.append(float("nan"))
+            if step == 0 or (step + 1) % log_every == 0 or step + 1 == args.train_steps:
                 print(f"step={step+1}/{args.train_steps} loss=nan (skip)", flush=True)
             continue
         loss.backward()
         torch.nn.utils.clip_grad_norm_(trainable, 1.0)
         opt.step()
         losses.append(float(loss.detach().float().cpu()))
-        if step == 0 or (step + 1) % 20 == 0 or step + 1 == args.train_steps:
-            print(f"step={step+1}/{args.train_steps} loss={losses[-1]:.4f}", flush=True)
+        ce_losses.append(ce_v)
+        kl_losses.append(kl_v)
+        if step == 0 or (step + 1) % log_every == 0 or step + 1 == args.train_steps:
+            print(
+                f"step={step+1}/{args.train_steps} loss={losses[-1]:.4f} "
+                f"ce={ce_v:.4f} kl={kl_v:.4f}",
+                flush=True,
+            )
     train_s = time.perf_counter() - t_train
 
     print("eval_after_train…", flush=True)
@@ -603,6 +729,10 @@ def main() -> None:
                 "draft_state_dict": draft.state_dict(),
                 "init_layers": list(DRAFT_INIT_LAYERS),
                 "train_steps": args.train_steps,
+                "kl_weight": args.kl_weight,
+                "kl_temp": args.kl_temp,
+                "lr": args.lr,
+                "resumed_from": resumed_from,
                 "tip_commit": "55949274",
             },
             args.ckpt_out,
@@ -610,7 +740,7 @@ def main() -> None:
         print(f"wrote_ckpt {args.ckpt_out}", flush=True)
 
     result = {
-        "schema": "s37-tiny-draft-train-smoke-v1",
+        "schema": "s37-tiny-draft-train-v2",
         "tip_commit": "55949274",
         "dump_run": str(args.dump_run),
         "dump_profile": str(profile_path),
@@ -621,17 +751,22 @@ def main() -> None:
         "teacher_decoder_layers": n_layers,
         "draft_decoder_layers": 2,
         "draft_init_layers": list(DRAFT_INIT_LAYERS),
-        "draft_config": "2-layer same-width CE distill smoke",
+        "draft_config": "2-layer same-width CE+KL distill",
         "map_windows": len(windows),
         "train_steps": args.train_steps,
         "lr": args.lr,
+        "kl_weight": args.kl_weight,
+        "kl_temp": args.kl_temp,
+        "resumed_from": resumed_from,
         "train_wall_seconds": train_s,
         "train_precision": train_precision,
         "train_loss_first": losses[0] if losses else None,
         "train_loss_last": losses[-1] if losses else None,
+        "train_ce_last": ce_losses[-1] if ce_losses else None,
+        "train_kl_last": kl_losses[-1] if kl_losses else None,
         "skipped_nonfinite_steps": skipped_nonfinite,
-        "prior_smoke_job": "50146182",
-        "fix": "fp32 draft train + grad clip (fp16 CE NaN)",
+        "prior_smoke_job": "50146230",
+        "fix": "fp32 draft CE+KL + grad clip; resume optional; all-window longer train",
         "baseline_acceptance": baseline,
         "after_train_acceptance": after,
         "gate_decision": after["gate_decision"],
@@ -641,7 +776,7 @@ def main() -> None:
         "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
         "hostname": os.environ.get("HOSTNAME") or os.uname().nodename,
         "note": (
-            "§37 smoke only. Not production TPS. TIER1 pack required before turbo/500 claim. "
+            "§37 train/acceptance only. Not production TPS. TIER1 pack required before turbo/500 claim. "
             "INT8 hybrid is not FP16."
         ),
     }
