@@ -67,10 +67,13 @@ def aligned_teacher_argmax_at(
     """Prefill + force prefix via sequential Q=1; return next-step argmax."""
     os.environ.setdefault("MAPPERATORINATOR_TURBO_VERIFY_FASTPATH", "1")
     os.environ.setdefault("MAPPERATORINATOR_TURBO_TEACHER_ALIGNED", "1")
-    os.environ.setdefault("MAPPERATORINATOR_TURBO_VERIFY_CUDA_GRAPH", "1")
+    # Prefer eager Q=1 + native hooks for canary numerics; CUDA-graph Q=1
+    # currently degenerates to zero logits on sequential force (50148138).
+    os.environ["MAPPERATORINATOR_TURBO_VERIFY_CUDA_GRAPH"] = "0"
     fp = build_teacher_verify_fastpath(teacher)
     if fp is None:
         raise RuntimeError("verify fastpath disabled")
+    fp.use_cuda_graph = False
     cache = allocate_teacher_static_cache(teacher, cfg_scale=1.0)
     mk = spec._move_model_kwargs(teacher, model_kwargs)
     mk.pop("decoder_input_ids", None)
@@ -147,7 +150,7 @@ def optimized_argmax_at(
     gw = {
         "max_new_tokens": max_new,
         "do_sample": False,
-        "temperature": 0.0,
+        "temperature": 1.0,  # ignored when do_sample=False; HF rejects 0.0
         "precision": "fp16",
         "cfg_scale": 1.0,
         "num_beams": 1,
