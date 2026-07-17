@@ -2,7 +2,7 @@
 
 **Status:** **STOP_ESCALATE** (2026-07-17)  
 **Branch / WT:** `codex/turbo-canary-fix` @ `/work/projects/Mapperatorinator-worktrees/turbo-canary-fix`  
-**Base turbo tip:** `3bfd7bdb` (KV commit replay). Campaign tip unchanged: `55949274` / **366.11**.  
+**Base turbo tip:** `3bfd7bdb` (KV commit replay). **§40 tip:** `d3b8b2ca` (logit dump + STOP handoff only; no runtime fix). Campaign tip unchanged: `55949274` / **366.11**.  
 **Do not** tip-graduate turbo or claim 500. **Do not** harvest/duplicate §39 or scout `50147054`.
 
 ## Classification
