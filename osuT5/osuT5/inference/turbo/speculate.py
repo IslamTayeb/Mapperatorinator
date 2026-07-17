@@ -177,6 +177,18 @@ def _sample_from_logits(
     return tok, probs
 
 
+def _stash_encoder_outputs(outputs: Any, model_kwargs: dict[str, Any]) -> dict[str, Any]:
+    from transformers.modeling_outputs import BaseModelOutput
+
+    if model_kwargs.get("encoder_outputs") is not None:
+        return model_kwargs
+    enc = getattr(outputs, "encoder_last_hidden_state", None)
+    if enc is None:
+        return model_kwargs
+    model_kwargs["encoder_outputs"] = BaseModelOutput(last_hidden_state=enc)
+    return model_kwargs
+
+
 def _forward_decoder(
     model,
     *,
@@ -205,6 +217,7 @@ def _forward_decoder(
         model_kwargs,
         is_encoder_decoder=True,
     )
+    model_kwargs = _stash_encoder_outputs(outputs, model_kwargs)
     return outputs, model_kwargs
 
 

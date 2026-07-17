@@ -116,6 +116,19 @@ def _move_kwargs(model, model_kwargs: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _stash_encoder_outputs(outputs: Any, mk: dict[str, Any]) -> dict[str, Any]:
+    """Ensure encoder_outputs survives even if HF update omits it."""
+    from transformers.modeling_outputs import BaseModelOutput
+
+    if mk.get("encoder_outputs") is not None:
+        return mk
+    enc = getattr(outputs, "encoder_last_hidden_state", None)
+    if enc is None:
+        return mk
+    mk["encoder_outputs"] = BaseModelOutput(last_hidden_state=enc)
+    return mk
+
+
 @torch.no_grad()
 def prefill(model, prompt_ids: torch.Tensor, model_kwargs: dict[str, Any]):
     mk = dict(model_kwargs)
@@ -132,6 +145,7 @@ def prefill(model, prompt_ids: torch.Tensor, model_kwargs: dict[str, Any]):
     mk = model._update_model_kwargs_for_generation(
         outputs, mk, is_encoder_decoder=True
     )
+    mk = _stash_encoder_outputs(outputs, mk)
     return outputs.logits[:, -1, :].float().squeeze(0), mk
 
 
@@ -154,10 +168,10 @@ def timed_cuda(fn, *, warmup: int, iters: int) -> float:
 def _strip_audio_after_prefill(mk: dict[str, Any]) -> dict[str, Any]:
     """Keep encoder_outputs only — re-encoding inside CUDA graphs is illegal."""
     out = dict(mk)
-    for key in ("frames", "inputs", "input_features"):
-        out.pop(key, None)
     if out.get("encoder_outputs") is None:
         raise RuntimeError("prefill did not produce encoder_outputs")
+    for key in ("frames", "inputs", "input_features", "input_values", "inputs_embeds"):
+        out.pop(key, None)
     return out
 
 
