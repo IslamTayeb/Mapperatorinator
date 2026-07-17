@@ -554,7 +554,9 @@ def active_prefix_decode_generate(
                     cur_len += 1
         del outputs
 
-    if whole_token_step and whole_token_hits <= 0:
+    # Windows that stop after the post-prefill non-graph token never enter
+    # decode graph replay (decode_steps == 0). Require hits only when decode ran.
+    if whole_token_step and decode_steps > 0 and whole_token_hits <= 0:
         raise RuntimeError(
             "whole-token-step CUDA graph requested but recorded zero replays"
         )
