@@ -114,23 +114,36 @@ def build_first_map_window_kwargs(
 
 
 def _ensure_encoder_outputs(model, model_kwargs: dict[str, Any]) -> dict[str, Any]:
-    mk = {
-        key: value.to(model.device) if isinstance(value, torch.Tensor) else value
-        for key, value in model_kwargs.items()
-    }
-    if "inputs" in mk and "frames" not in mk:
-        mk["frames"] = mk.pop("inputs")
-    if mk.get("encoder_outputs") is not None:
-        return mk
-    prompt = mk.get("decoder_input_ids")
-    if prompt is None:
-        raise RuntimeError("model_kwargs missing decoder_input_ids")
-    # One forward to populate encoder_outputs via prepare_inputs path.
-    from osuT5.osuT5.inference.turbo.speculate import _prefill, _move_model_kwargs
+    from transformers.modeling_outputs import BaseModelOutput
 
+    from osuT5.osuT5.inference.cache_utils import get_cache
+    from osuT5.osuT5.inference.turbo.speculate import _forward_decoder, _move_model_kwargs
+
+    if model_kwargs.get("encoder_outputs") is not None:
+        return {
+            key: value.to(model.device) if isinstance(value, torch.Tensor) else value
+            for key, value in model_kwargs.items()
+        }
+    if model_kwargs.get("decoder_input_ids") is None:
+        raise RuntimeError("model_kwargs missing decoder_input_ids")
+
+    # HF _update_model_kwargs_for_generation does not always stash encoder_outputs.
+    # Run one cached forward and wrap encoder_last_hidden_state explicitly.
     mk2 = _move_model_kwargs(model, model_kwargs)
     prompt_ids = mk2.pop("decoder_input_ids")
-    _logits, mk2 = _prefill(model, prompt_ids=prompt_ids, model_kwargs=mk2)
+    mk2["past_key_values"] = get_cache(model, 1, 1, 1.0)
+    mk2["use_cache"] = True
+    outputs, mk2 = _forward_decoder(
+        model, decoder_input_ids=prompt_ids, model_kwargs=mk2
+    )
+    if mk2.get("encoder_outputs") is None:
+        enc = getattr(outputs, "encoder_last_hidden_state", None)
+        if enc is None:
+            raise RuntimeError(
+                "teacher forward returned no encoder_last_hidden_state"
+            )
+        mk2["encoder_outputs"] = BaseModelOutput(last_hidden_state=enc)
+    mk2["decoder_input_ids"] = prompt_ids
     return mk2
 
 
