@@ -33,10 +33,10 @@ def verify_fastpath_enabled() -> bool:
 
 
 def use_verify_cuda_graphs() -> bool:
-    # Default ON for Q=1 canary alignment; K-token capture still opt-in via
-    # allow_graph on forward_k (microbench sets True).
-    raw = os.environ.get("MAPPERATORINATOR_TURBO_VERIFY_CUDA_GRAPH", "1").strip().lower()
-    return raw not in {"0", "false", "off", "no"}
+    # Default OFF: sequential Q=1 CUDA graphs returned zero logits (50148138).
+    # K-token microbench opts in via --cuda-graph-verify / allow_graph=True.
+    raw = os.environ.get("MAPPERATORINATOR_TURBO_VERIFY_CUDA_GRAPH", "0").strip().lower()
+    return raw in {"1", "true", "on", "yes"}
 
 
 def graph_aligned_teacher_enabled() -> bool:
@@ -341,13 +341,17 @@ class TeacherVerifyFastpath:
         decoder_input_ids: torch.LongTensor,
         model_kwargs: dict[str, Any],
     ) -> tuple[Any, dict[str, Any]]:
-        """One optimized-style Q=1 step (graph-aligned when CUDA graph on)."""
+        """One optimized-style Q=1 step (eager + native hooks).
+
+        CUDA graphs disabled here until sequential Q=1 capture is proven
+        non-degenerate (see canary 50148138 zero-logits).
+        """
         self.q1_steps += 1
         return self._forward_shaped(
             decoder_input_ids=decoder_input_ids,
             model_kwargs=model_kwargs,
             k=1,
-            allow_graph=self.use_cuda_graph,
+            allow_graph=False,
         )
 
     def verify_sequential_q1(
