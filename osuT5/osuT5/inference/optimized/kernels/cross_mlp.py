@@ -127,7 +127,12 @@ def native_cross_mlp_tail_forward(
         cache_layer,
     )
 
-    outputs_per_block = 8
+    from .native_mlp_outputs_per_block import (
+        effective_native_mlp_outputs_per_block,
+        native_mlp_outputs_per_block_requested,
+    )
+
+    outputs_per_block = effective_native_mlp_outputs_per_block()
     with profile_range(f"{layer_name}.native_cross_mlp_tail.cross_q"):
         query_states = native_one_token_rmsnorm_linear(
             hidden_states,
@@ -175,6 +180,10 @@ def native_cross_mlp_tail_forward(
     if dispatch_counts is not None:
         dispatch_counts["native_cross_mlp_tail"] += 1
         dispatch_counts["q1_bmm_cross_attention"] += 1
+        if native_mlp_outputs_per_block_requested():
+            dispatch_counts["native_mlp_outputs_per_block"] = (
+                int(dispatch_counts.get("native_mlp_outputs_per_block", 0)) + 1
+            )
     return (hidden_states,) + self_attn_outputs[1:] + (past_key_value,)
 
 

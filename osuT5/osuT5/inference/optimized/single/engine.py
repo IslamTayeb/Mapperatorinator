@@ -306,7 +306,17 @@ def _generate_window(
         "native_q1_self_attention": 0,
         "q1_bmm_cross_attention": 0,
         "native_cross_mlp_tail": 0,
+        "native_mlp_outputs_per_block": 0,
     }
+
+    from ..kernels.native_mlp_outputs_per_block import (
+        TIP_DEFAULT_OUTPUTS_PER_BLOCK,
+        effective_native_mlp_outputs_per_block,
+        native_mlp_outputs_per_block_requested,
+    )
+
+    _mlp_opb_requested = native_mlp_outputs_per_block_requested()
+    _mlp_opb_effective = effective_native_mlp_outputs_per_block()
 
     rng_before = (
         rng_progression_signature(model.device)
@@ -439,6 +449,14 @@ def _generate_window(
             else None
         ),
         "optimized_dispatch_capture_hits": dict(dispatch_counts),
+        "native_mlp_outputs_per_block": {
+            "requested": _mlp_opb_requested,
+            "tip_default": int(TIP_DEFAULT_OUTPUTS_PER_BLOCK),
+            "effective": int(_mlp_opb_effective),
+            "candidate_size": (
+                int(_mlp_opb_effective) if _mlp_opb_requested else None
+            ),
+        },
         "decode_graph_count_before": graph_count_before,
         "decode_graph_count_after": int(getattr(context_state, "graph_count", 0)),
         "decode_graph_count_delta": (
