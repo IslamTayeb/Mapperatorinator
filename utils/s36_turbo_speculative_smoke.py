@@ -262,11 +262,17 @@ def main() -> None:
     del helper_model, processor
     torch.cuda.empty_cache()
 
+    def _clone_kwargs(src: dict[str, Any]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for key, value in src.items():
+            out[key] = value.clone() if isinstance(value, torch.Tensor) else value
+        return out
+
     turbo_run = run_engine_window(
         engine_name="turbo",
         args_inf=args_inf,
         draft_ckpt=args.draft_ckpt,
-        model_kwargs=model_kwargs,
+        model_kwargs=_clone_kwargs(model_kwargs),
         generate_kwargs=generate_kwargs,
     )
     print(
@@ -284,24 +290,40 @@ def main() -> None:
             engine_name="optimized",
             args_inf=args_inf,
             draft_ckpt=None,
-            model_kwargs=model_kwargs,
+            model_kwargs=_clone_kwargs(model_kwargs),
             generate_kwargs=generate_kwargs,
         )
         turbo_tok = turbo_run["result_tokens"]
         opt_tok = opt_run["result_tokens"]
         match = turbo_tok == opt_tok
         first_mismatch = None
+        window = None
         if not match:
             n = min(len(turbo_tok), len(opt_tok))
             first_mismatch = next(
                 (i for i in range(n) if turbo_tok[i] != opt_tok[i]),
                 n,
             )
+            lo = max(0, int(first_mismatch) - 2)
+            hi = min(n, int(first_mismatch) + 3)
+            window = {
+                "prompt_len": prompt_len,
+                "abs_index": first_mismatch,
+                "gen_index": (
+                    None
+                    if first_mismatch is None
+                    else int(first_mismatch) - int(prompt_len)
+                ),
+                "turbo_slice": turbo_tok[lo:hi],
+                "optimized_slice": opt_tok[lo:hi],
+                "slice_start": lo,
+            }
         canary = {
             "match": match,
             "turbo_len": len(turbo_tok),
             "optimized_len": len(opt_tok),
             "first_mismatch": first_mismatch,
+            "mismatch_window": window,
             "optimized_wall_s": opt_run["wall_s"],
             "optimized_stats": {
                 k: opt_run["stats"].get(k)
@@ -312,8 +334,11 @@ def main() -> None:
                     "decoder_loop_backend",
                 )
             },
+            "turbo_gamma": turbo_run["stats"].get("turbo_gamma"),
         }
         print(f"tier1a_greedy_canary_match={match}", flush=True)
+        if window is not None:
+            print(f"tier1a_mismatch_window={window}", flush=True)
 
     payload = {
         "section": "36",

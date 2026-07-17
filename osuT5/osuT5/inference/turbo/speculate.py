@@ -111,7 +111,9 @@ def _apply_processors(
     input_ids: torch.LongTensor,
     logits: torch.Tensor,
 ) -> torch.Tensor:
-    scores = logits.float()
+    # Always clone: MonotonicTimeShift mutates scores in-place; sharing storage
+    # with cached teacher logits corrupts later verify / bonus steps.
+    scores = logits.float().clone()
     if len(processors) == 0:
         return scores
     return processors(input_ids, scores)
@@ -393,7 +395,7 @@ def speculative_generate_window(
         L = int(sequences.shape[1])
         this_gamma = min(int(gamma), remaining)
 
-        draft_ids, q_probs, draft_mk, _draft_hit_eos, draft_tail_logits = _draft_k_tokens(
+        draft_ids, q_probs, draft_mk, _draft_hit_eos, _draft_tail_logits = _draft_k_tokens(
             draft,
             prompt_ids=sequences,
             last_logits=draft_last,
@@ -441,8 +443,10 @@ def speculative_generate_window(
                 rng=rng,
             )
 
-        # Keep accepted draft KV prefix in teacher cache (L+n); only forward
-        # residual/bonus. Avoids crop-to-L + full replay drift.
+        # Commit tokens from verify logits, then rebuild KV from L via a single
+        # multi-token forward of the commit. Keeping the verify-time accepted
+        # prefix (L+n) + residual-only forward caused TIER1a mismatch@110
+        # (prompt_len=108 → 3rd generated token) on smoke 50146929.
         n_keep = min(n_accepted, remaining)
         bonus_tok: int | None = None
         residual_tok: int | None = None
@@ -477,59 +481,41 @@ def speculative_generate_window(
                 rng=rng,
             )
 
-        if n_keep == 0 and residual_tok is None:
-            raise RuntimeError("turbo speculative step committed zero tokens")
-
-        crop_self_cache(teacher_cache, L + n_keep)
-        crop_self_cache(draft_cache, L + n_keep)
-        if n_keep > 0:
-            keep_t = torch.tensor(
-                [draft_ids[:n_keep]], device=sequences.device, dtype=sequences.dtype
-            )
-            sequences = torch.cat([sequences, keep_t], dim=-1)
-        _align_decoder_mask(
-            teacher_mk, length=int(sequences.shape[1]), device=sequences.device
-        )
-        _align_decoder_mask(
-            draft_mk, length=int(sequences.shape[1]), device=sequences.device
-        )
-
         extra: list[int] = []
         if residual_tok is not None:
             extra.append(residual_tok)
         elif bonus_tok is not None:
             extra.append(int(bonus_tok))
 
-        if extra:
-            extra_t = torch.tensor(
-                [extra], device=sequences.device, dtype=sequences.dtype
-            )
-            sequences = torch.cat([sequences, extra_t], dim=-1)
-            _align_decoder_mask(
-                teacher_mk, length=int(sequences.shape[1]), device=sequences.device
-            )
-            _align_decoder_mask(
-                draft_mk, length=int(sequences.shape[1]), device=sequences.device
-            )
-            teacher_out, teacher_mk = _forward_decoder(
-                teacher, decoder_input_ids=sequences, model_kwargs=teacher_mk
-            )
-            teacher_last = teacher_out.logits[:, -1, :].float().squeeze(0)
-            draft_out, draft_mk = _forward_decoder(
-                draft, decoder_input_ids=sequences, model_kwargs=draft_mk
-            )
-            draft_last = draft_out.logits[:, -1, :].float().squeeze(0)
-        else:
-            # No residual/bonus forward: caches already hold the kept prefix.
-            if n_keep == actual_gamma:
-                teacher_last = bonus_logits.float()
-                draft_last = draft_tail_logits.float()
-            else:
-                # n_keep < gamma without residual should not happen under Leviathan.
-                teacher_last = p_logits[n_keep].float()
-                draft_last = draft_tail_logits.float()
-
         commit = list(draft_ids[:n_keep]) + extra
+        commit = commit[:remaining]
+        if not commit:
+            raise RuntimeError("turbo speculative step committed zero tokens")
+
+        crop_self_cache(teacher_cache, L)
+        crop_self_cache(draft_cache, L)
+        _align_decoder_mask(teacher_mk, length=L, device=sequences.device)
+        _align_decoder_mask(draft_mk, length=L, device=sequences.device)
+
+        commit_t = torch.tensor(
+            [commit], device=sequences.device, dtype=sequences.dtype
+        )
+        sequences = torch.cat([sequences, commit_t], dim=-1)
+        _align_decoder_mask(
+            teacher_mk, length=int(sequences.shape[1]), device=sequences.device
+        )
+        _align_decoder_mask(
+            draft_mk, length=int(sequences.shape[1]), device=sequences.device
+        )
+        teacher_out, teacher_mk = _forward_decoder(
+            teacher, decoder_input_ids=sequences, model_kwargs=teacher_mk
+        )
+        teacher_last = teacher_out.logits[:, -1, :].float().squeeze(0).clone()
+        draft_out, draft_mk = _forward_decoder(
+            draft, decoder_input_ids=sequences, model_kwargs=draft_mk
+        )
+        draft_last = draft_out.logits[:, -1, :].float().squeeze(0).clone()
+
         accepted_total += len(commit)
         session.accepted_tokens_total += len(commit)
         session.verify_steps += 1

@@ -143,13 +143,17 @@ class TurboRuntime:
             context_state.verify_steps += 1
             return result, stats
 
+        gamma = self.preset.gamma
+        gamma_env = os.environ.get("MAPPERATORINATOR_TURBO_GAMMA", "").strip()
+        if gamma_env:
+            gamma = max(1, int(gamma_env))
         return speculative_generate_window(
             teacher=model,
             draft=self.draft,
             tokenizer=tokenizer,
             model_kwargs=model_kwargs,
             generate_kwargs=dict(generate_kwargs),
-            gamma=self.preset.gamma,
+            gamma=gamma,
             temperature=self.preset.temperature,
             top_p=self.preset.top_p,
             session=context_state,

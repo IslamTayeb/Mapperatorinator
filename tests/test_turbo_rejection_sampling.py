@@ -4,6 +4,7 @@ import torch
 
 from osuT5.osuT5.inference.turbo.rejection import (
     acceptance_alpha,
+    apply_temp_top_p,
     expected_accepted,
     reject_sample_prefix,
     residual_distribution,
@@ -69,3 +70,11 @@ def test_reject_sample_rejects_when_q_overconfident():
             assert 0 <= resid < v
             break
     assert rejected
+
+
+def test_apply_temp_top_p_normalizes():
+    logits = torch.tensor([[2.0, 1.0, 0.0, -4.0]])
+    probs = apply_temp_top_p(logits, temperature=0.9, top_p=0.9)
+    assert probs.shape == logits.shape
+    assert torch.isfinite(probs).all()
+    assert abs(float(probs.sum().item()) - 1.0) < 1e-5
