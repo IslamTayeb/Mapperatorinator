@@ -31,4 +31,4 @@ specific old decision.
 
 **§48 W-VG graph-native K=γ verify — STOP_KILL** (2026-07-17): `50150290` @ `be491a4f` — c_verify **3.075 ms** / **1.669×**. Handoff: `notes/500tps-section48-handoff.md`. Tip `55949274` / **366.11**.
 
-**§54 Stage A — PASS** (Track 2) on `codex/turbo-verify-fused-mrow` @ **`1faca2db`**: **`50152588`** c_verify **2.467 ms** / **1.332×**; E=**1.842** ΔE=**−0.013**; canary **`50154498` PASS**. Stage B authorized. Tip `55949274` / **366.11**. No merge. No 500 claim. Handoff: `notes/500tps-section54-handoff.md`.
+**§54 Stage A — PASS** (Track 2) on `codex/turbo-verify-fused-mrow` @ **`1faca2db`**: **`50152588`** c_verify **2.467 ms** / **1.332×**; E=**1.842** ΔE=**−0.013**; canary **`50154498` PASS**. Stage B authorized. Tip `55949274` / **366.11**. No merge. No 500 claim. RELAUNCH #3 audit confirms auth jobs (no re-submit). Handoff: `notes/500tps-section54-handoff.md`.

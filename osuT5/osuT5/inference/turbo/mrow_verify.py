@@ -32,9 +32,9 @@ def mrow_verify_enabled() -> bool:
 
 
 def mrow_stage_b_enabled() -> bool:
-    """Stage B split-KV attention core (default on once Stage A landed)."""
-    raw = os.environ.get("MAPPERATORINATOR_TURBO_VERIFY_MROW_STAGE_B", "1").strip().lower()
-    return raw not in {"0", "false", "off", "no"}
+    """Stage B split-KV attention core (opt-in; Stage A SDPA remains default)."""
+    raw = os.environ.get("MAPPERATORINATOR_TURBO_VERIFY_MROW_STAGE_B", "0").strip().lower()
+    return raw in {"1", "true", "on", "yes"}
 
 
 def _norm_eps(module: torch.nn.Module, dtype: torch.dtype) -> float:

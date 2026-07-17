@@ -1,9 +1,9 @@
 # §54 Verify kernels Stage A/B — handoff (Track 2)
 
-**Status:** **Stage A PASS** → Stage B authorized  
+**Status:** **Stage A PASS** · **Stage B MISS** (no kill; STOP Stage B grind)  
 **Track:** Endgame **Track 2** (500-enabler A)  
 **Numbering:** **§54** — package-original “§51 verify” renamed to avoid collision with vacated §51 / §53 EAGLE  
-**Branch / WT:** `codex/turbo-verify-fused-mrow` @ **`1faca2db`**  
+**Branch / WT:** `codex/turbo-verify-fused-mrow` @ **`9d91c5d2`** (+ default-off follow-up)  
 **Campaign tip:** `55949274` / FP16 **366.11** — **no merge**; **no 500 claim**  
 **Package:** `notes/500tps-turbo-endgame-package.md`
 
@@ -14,17 +14,18 @@
 | Q1 step | 1.842–1.853 ms |
 | Unfused graph-native K=3 verify | **3.075 ms** (1.669×) — **§48 sealed; do not re-grind** |
 | Draft chain γ=3 | 1.257 ms (§49) |
+| **Stage A auth c_verify** | **2.467 ms** (**1.332×**) — keep |
 
 ## Stage plan
 
-| Stage | Work | Gate | Kill |
-| --- | --- | --- | --- |
-| **A** | m≤8-row extensions of owned warp-group kernels (`fc1_gelu`, `fc2_residual`, one-token linears, rope+KV-cache-write fusion) around SDPA | in-loop c_verify ≤**1.35×** (~2.5 ms) | — |
-| **B** | m-row split-KV rope-cache attention (per-row KV lengths; row-tiled; avoid per-(head,row) m× KV re-read) | ≤**1.25×** (~2.3 ms) | **>1.45×** after Stage B |
+| Stage | Work | Gate | Kill | Result |
+| --- | --- | --- | --- | --- |
+| **A** | m≤8-row warp-group islands + rope/KV-cache-write around SDPA | ≤**1.35×** (~2.5 ms) | — | **PASS** |
+| **B** | row-tiled m-row split-KV (per-row KV lengths) | ≤**1.25×** (~2.3 ms) | **>1.45×** | **MISS** 1.412× (2.602 ms) |
 
-**Mandatory per stage:** (a) re-measure runtime E (ΔE ≥ **−0.05**); (b) greedy TIER1a canary unaffected. Grid: Stage B + current draft → **505–554** TPS.
+**Mandatory per stage:** (a) re-measure runtime E (ΔE ≥ **−0.05**); (b) greedy TIER1a canary unaffected.
 
-## Stage A harvest (tip `1faca2db`)
+## Stage A harvest (`1faca2db`)
 
 | Metric | Value | Evidence |
 | --- | --- | --- |
@@ -33,38 +34,35 @@
 | Q1 step | **1.852 ms** | optimized cuda_graph |
 | in-loop c_verify | **2.467 ms** | CUDA-event avg |
 | ratio | **1.332×** | vs Q1; interim ≤1.35 / abs ≤2.5 ms |
-| E (accepted/verify) | **1.842** | ΔE **−0.013** ≥ −0.05 vs same-job unfused control E=1.855 |
-| Unfused control c_verify (same tip, MROW=0) | 2.618 ms | not a re-grind of sealed §48 3.075 |
-| TIER1a canary | **PASS** | `50154498` argmax 2213 / s40 ref; `canary_path_status=PASS` |
-| Stage B | **Y** (authorized) | interim gate hit + ΔE + canary |
+| E (accepted/verify) | **1.842** | ΔE **−0.013** ≥ −0.05 vs unfused control E=1.855 |
+| TIER1a canary | **PASS** | `50154498` argmax 2213 |
 
-Artifacts (DCC):  
-`/work/imt11/Mapperatorinator/runs/s54-mrow-stage-a-50152588/`  
-`/work/imt11/Mapperatorinator/runs/s54-mrow-canary-50154498/`
+## Stage B harvest (`9d91c5d2`)
 
-### Jobs
+| Metric | Value | Evidence |
+| --- | --- | --- |
+| Decision | **STAGE_B_MISS** | `50181231` (scavenger-gpu / 2080 Ti) |
+| Path | **`graph_native_k`** | prepare_inputs=0; replays=262 |
+| Q1 step | **1.843 ms** | same job |
+| in-loop c_verify | **2.602 ms** | **1.412×** — gate ≤1.25 / ≤2.3 **MISS**; kill >1.45 **not hit** |
+| vs Stage A control (same job) | 2.577 ms | Stage B **regress** vs SDPA core |
+| E | **1.816** | ΔE **−0.039** ≥ −0.05 vs Stage A control E=1.855 |
+| TIER1a canary | **PASS** | `50181232` |
+
+**STOP Stage B grind.** Naive row-tiled split-KV does not beat Stage A SDPA on SM75; keep Stage A as the verify path (`MAPPERATORINATOR_TURBO_VERIFY_MROW_STAGE_B` default **off**). Revisit only with a different attention mechanism (shared-arena / flash-decode-style, not this partial/merge tax).
+
+## Jobs
 
 | Job | Role | Commit | Result |
 | --- | --- | --- | --- |
-| `50151205` | Stage A (pre-import-fix) | `cd71b686` | FAILED `osuT5.runtime_profiling` import |
-| `50151206` | Canary | `cd71b686` | CANCELLED |
-| `50152588` | Stage A auth | `1faca2db` | **STAGE_A_PASS** 2.467 ms / **1.332×** |
-| `50154498` | TIER1a canary | `1faca2db` | **PASS** |
-| `50180928`/`50180929` | Relaunch confirm | `1faca2db` | CANCELLED (redundant; auth harvest already tip-matched) |
-
-## What landed (Stage A)
-
-| Piece | Change |
-| --- | --- |
-| Kernels | `osuT5/.../optimized/kernels/m_row.py` — m≤8 fc1_gelu / fc2_residual / rmsnorm_linear / linear_residual / rope+KV-cache-write |
-| Turbo wire | `turbo/mrow_verify.py` + `teacher_aligned_runtime_context` arms m-row for K>1; m=1 falls through aligned q1 (canary) |
-| Probe | `utils/s54_mrow_verify_stage_a.py` + `jobs/s54-mrow-*.sbatch` |
-| Import fix | `1faca2db` — `runtime_profiling` path |
-
-## Stage B next
-
-Replace Stage A SDPA attention core with **row-tiled m-row split-KV** (per-row KV lengths; reuse KV across rows in-block). Gate ≤1.25× (~2.3 ms); kill >1.45×. Re-measure E + canary. No §48 unfused grind. Tip unchanged.
+| `50151205` | Stage A | `cd71b686` | FAILED import |
+| `50152588` | Stage A auth | `1faca2db` | **PASS** 2.467 ms / **1.332×** |
+| `50154498` | Canary | `1faca2db` | **PASS** |
+| `50180928`/`29` | Relaunch confirm | `1faca2db` | CANCELLED (redundant) |
+| `50181079`/`80` | Stage B (gpu-common) | `9d91c5d2` | CANCELLED (queue) |
+| `50181231` | Stage B auth | `9d91c5d2` | **MISS** 2.602 ms / **1.412×** |
+| `50181232` | Canary | `9d91c5d2` | **PASS** |
 
 ## Standing
 
-No merge to main. No §48 unfused grind. No trees. Tip stays `55949274` / **366.11**. No 500 claim.
+No merge to main. No §48 unfused grind. Tip stays `55949274` / **366.11**. No 500 claim. Stage A is the retained Track-2 verify win.
