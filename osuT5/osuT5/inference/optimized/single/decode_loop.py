@@ -428,7 +428,9 @@ def active_prefix_decode_generate(
                     )
                 whole_token_buffers["scores_workspace"].copy_(scores)
 
-                # 3) Sample + index_copy_ CUDA graph on fixed workspaces.
+                # 3) Eager sample + index_copy_ (exact). CUDA-graph multinomial
+                # diverged at the first decode token vs tip (smoke 50143356);
+                # revisit sample-graph once Philox/capture semantics match eager.
                 write_at = int(sequence_state.length)
                 max_length = int(sequence_state.sequence.shape[1])
                 if write_at < 0 or write_at >= max_length:
@@ -437,36 +439,28 @@ def active_prefix_decode_generate(
                         f"{write_at} not in [0, {max_length})"
                     )
                 whole_token_buffers["write_index"].fill_(write_at)
-                sample_key = (
-                    "whole_token_sample",
-                    bool(generation_config.do_sample),
-                    vocab,
-                    max_length,
-                )
-                sample_entry = graph_cache.get(sample_key)
-                if sample_entry is None:
-                    with profile_range("generation.decode_graph_capture_setup"):
-                        sample_graph, sample_capture_seconds = (
-                            _capture_whole_token_sample_cuda_graph(
-                                scores_workspace=whole_token_buffers[
-                                    "scores_workspace"
-                                ],
-                                next_tokens=whole_token_buffers["next_tokens"],
-                                write_index=whole_token_buffers["write_index"],
-                                sequence=sequence_state.sequence,
-                                do_sample=bool(generation_config.do_sample),
+                with profile_range("generation.sampling"):
+                    if generation_config.do_sample:
+                        probabilities = nn.functional.softmax(
+                            whole_token_buffers["scores_workspace"],
+                            dim=-1,
+                        )
+                        sampled = torch.multinomial(
+                            probabilities, num_samples=1
+                        ).squeeze(1)
+                        whole_token_buffers["next_tokens"].copy_(sampled)
+                    else:
+                        whole_token_buffers["next_tokens"].copy_(
+                            torch.argmax(
+                                whole_token_buffers["scores_workspace"],
+                                dim=-1,
                             )
                         )
-                    sample_entry = {
-                        "graph": sample_graph,
-                        "capture_seconds": sample_capture_seconds,
-                        "decode_replays": 0,
-                    }
-                    graph_cache[sample_key] = sample_entry
-                else:
-                    with profile_range("generation.decode_graph_replay"):
-                        sample_entry["graph"].replay()
-                sample_entry["decode_replays"] += 1
+                sequence_state.sequence.index_copy_(
+                    1,
+                    whole_token_buffers["write_index"],
+                    whole_token_buffers["next_tokens"].unsqueeze(0),
+                )
                 whole_token_hits += 1
                 record_whole_token_step_cuda_graph_hit()
                 used_whole_token_graph = True
