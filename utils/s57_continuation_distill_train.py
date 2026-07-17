@@ -228,7 +228,10 @@ def eval_acceptance_sliced(
         lq = logits_q[0, start:end].cpu()
         if lp.numel() == 0:
             continue
-        finite = torch.isfinite(lp).all(dim=-1) & torch.isfinite(lq).all(dim=-1)
+        # Drop positions whose hard label is outside draft/teacher proj_out
+        dump = torch.tensor(w["dump_tokens"], dtype=torch.long)
+        in_vocab = dump.lt(lp.shape[-1])
+        finite = torch.isfinite(lp).all(dim=-1) & torch.isfinite(lq).all(dim=-1) & in_vocab
         if int(finite.sum()) == 0:
             continue
         p = apply_temp_top_p(lp[finite], temperature, top_p)
@@ -507,6 +510,19 @@ def sample_window(windows: list[dict], weights: dict[str, float], rng: random.Ra
     return windows[-1]
 
 
+def sanitize_labels(labels: torch.Tensor, vocab_size: int) -> torch.Tensor:
+    """Mask pad/OOV targets. Timing dumps include ids ≥ vocab_size_out (proj_out=4069)."""
+    out = labels.clone()
+    # keep ignore_index (-100); drop anything outside [0, vocab_size)
+    bad = out.ge(0) & out.ge(vocab_size)
+    out = out.masked_fill(bad, -100)
+    return out
+
+
+def window_has_supervised(labels: torch.Tensor) -> bool:
+    return bool(labels.ne(-100).any().item())
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--shards", type=Path, default=DEFAULT_SHARDS)
@@ -624,10 +640,38 @@ def main() -> None:
     for k, v in cond_hold.items():
         cond_by_ctx.setdefault(k, v)
 
+    # proj_out vocab (timing dumps can exceed this; mask those targets)
+    vocab_size = int(get_decoder(teacher).embed_tokens.num_embeddings)
+    try:
+        vocab_size = int(teacher.transformer.proj_out.weight.shape[0])
+    except Exception:
+        pass
+    print(f"proj_out_vocab={vocab_size}", flush=True)
+    oov_masked = 0
+    kept_train = []
+    for w in train_windows:
+        w = dict(w)
+        lab = sanitize_labels(w["labels"], vocab_size)
+        oov_masked += int(((w["labels"] >= 0) & (w["labels"] >= vocab_size)).sum().item())
+        w["labels"] = lab
+        if window_has_supervised(lab):
+            kept_train.append(w)
+    train_windows = kept_train
+    kept_hold = []
+    for w in hold_windows:
+        w = dict(w)
+        # holdout eval uses dump_tokens logits slice — keep labels sanitized for consistency
+        w["labels"] = sanitize_labels(w["labels"], vocab_size)
+        kept_hold.append(w)
+    hold_windows = kept_hold
+
     role_counts = {}
     for w in train_windows:
         role_counts[w["role"]] = role_counts.get(w["role"], 0) + 1
-    print(f"train_windows={len(train_windows)} roles={role_counts}", flush=True)
+    print(
+        f"train_windows={len(train_windows)} roles={role_counts} oov_label_positions_masked={oov_masked}",
+        flush=True,
+    )
     print(
         f"holdout_windows={len(hold_windows)} roles="
         f"{ {r: sum(1 for w in hold_windows if w['role']==r) for r in ('map0','map_rest','timing')} }",
