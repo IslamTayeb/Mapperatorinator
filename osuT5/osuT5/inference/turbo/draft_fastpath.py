@@ -61,18 +61,25 @@ def sync_draft_decoder_layer_count(draft) -> int:
     return n
 
 
+class _ExactDepthCacheConfig:
+    """Minimal config so StaticCache allocates exactly ``num_layers`` slots."""
+
+    def __init__(self, num_layers: int):
+        self.num_hidden_layers = int(num_layers)
+        self.layer_types = ["full_attention"] * int(num_layers)
+
+    def get_text_config(self, decoder: bool = False):
+        return self
+
+
 def get_draft_cache(model, *, batch_size: int = 1, cfg_scale: float = 1.0) -> MapperatorinatorCache:
     """StaticCache sized to the model's decoder depth (not encoder depth).
 
     ``get_cache(model.config)`` uses MapperatorinatorConfig.num_hidden_layers
-    (encoder depth, often 12). Whisper-style ``backbone_config`` with
-    ``get_text_config(decoder=True)`` yields the true decoder layer count.
+    (encoder depth, often 12). Draft/teacher runners pass the live decoder depth.
     """
     n_layers = sync_draft_decoder_layer_count(model)
-    backbone = getattr(getattr(model, "config", None), "backbone_config", None)
-    cache_config = backbone if backbone is not None else model.config
-    if hasattr(cache_config, "decoder_layers"):
-        cache_config.decoder_layers = n_layers
+    cache_config = _ExactDepthCacheConfig(n_layers)
     cache_kwargs = {
         "config": cache_config,
         "max_batch_size": batch_size * (2 if cfg_scale > 1 else 1),
@@ -82,11 +89,11 @@ def get_draft_cache(model, *, batch_size: int = 1, cfg_scale: float = 1.0) -> Ma
     }
     decoder_cache = StaticCache(**cache_kwargs)
     encoder_kwargs = dict(cache_kwargs)
+    # Cross-attn cache depth follows decoder layers (one cross block per layer).
     encoder_kwargs["max_cache_len"] = int(model.config.max_source_positions)
     encoder_cache = StaticCache(**encoder_kwargs)
-    # Sanity: self-attn layers should match decoder depth when backbone is used.
     self_layers = len(getattr(decoder_cache, "layers", []) or [])
-    if self_layers and self_layers != n_layers:
+    if self_layers != n_layers:
         raise RuntimeError(
             f"draft StaticCache has {self_layers} layers but decoder has {n_layers}"
         )
