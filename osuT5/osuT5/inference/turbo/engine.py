@@ -16,7 +16,7 @@ from typing import Any
 from ..engine_binding import InferenceEngineBinding
 from .fused_step import install_tier2_fused_numerics
 
-TURBO_PRESET_VERSION = "turbo-tier2-fused-step-s38-v1"
+TURBO_PRESET_VERSION = "turbo-tier2-fused-step-s38-v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,8 +66,9 @@ class TurboRuntime:
             "turbo_tier2_required": True,
             "turbo_speculative": False,
             "note": (
-                "§38 TIER2 fused decoder step (fp32 accumulate, 7-stage). "
-                "Not bit-exact. Not a 500 claim. Campaign tip 55949274/366.11."
+                "§38 TIER2 fused decoder step (7-stage; storage-dtype GEMM; "
+                "fp32 reductions). Not bit-exact. Not a 500 claim. "
+                "Campaign tip 55949274/366.11."
             ),
             **(self._install_meta or {}),
         }

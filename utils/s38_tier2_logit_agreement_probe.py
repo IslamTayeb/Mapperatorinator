@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """§38 rung-1: teacher-forced TIER2 logit agreement on real tensors.
 
-Compares tip ``optimized`` (teacher) vs ``turbo`` TIER2 fused fp32-accumulate
-decoder numerics (candidate) over dumped SALVALAI map token sequences.
+Compares tip ``optimized`` (teacher) vs ``turbo`` TIER2 7-stage fused
+decoder numerics (candidate; storage-dtype GEMM + fp32 reductions) over
+dumped SALVALAI map token sequences.
 
 Gates (docs/inference_evidence_packs.md TIER2):
   - max relative logit delta ≤ 1e-2
@@ -427,7 +428,9 @@ def main() -> None:
         "dump_profile": str(profile_path),
         "teacher_engine": "optimized",
         "candidate_engine": "turbo",
-        "candidate_preset": "turbo-tier2-fused-step-s38-v1",
+        "candidate_preset": "turbo-tier2-fused-step-s38-v2",
+        "fusion_path": "seven_kernel_fused_layer",
+        "blanket_linear_wrap": False,
         "positions": pos_n,
         "windows": windows_done,
         "max_rel_logit_delta": max_rel_all,
