@@ -306,7 +306,15 @@ def _generate_window(
         "native_q1_self_attention": 0,
         "q1_bmm_cross_attention": 0,
         "native_cross_mlp_tail": 0,
+        "whole_token_step_cuda_graph": 0,
     }
+
+    from ..kernels.whole_token_step_cuda_graph import (
+        whole_token_step_cuda_graph_hits,
+        whole_token_step_cuda_graph_requested,
+    )
+
+    _whole_token_step_requested = whole_token_step_cuda_graph_requested()
 
     rng_before = (
         rng_progression_signature(model.device)
@@ -347,6 +355,11 @@ def _generate_window(
         elapsed_seconds = time.perf_counter() - start_time
 
     strict_exactness = None
+    if _whole_token_step_requested:
+        dispatch_counts["whole_token_step_cuda_graph"] = int(
+            whole_token_step_cuda_graph_hits()
+        )
+
     if collect_strict_exactness:
         with profile_range("generation.strict_exactness_evidence"):
             rng_after = rng_progression_signature(model.device)

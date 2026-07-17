@@ -6,6 +6,10 @@ from torch import nn
 from transformers.modeling_outputs import BaseModelOutput
 
 from ....runtime_profiling import profile_range
+from ..kernels.whole_token_step_cuda_graph import (
+    record_whole_token_step_cuda_graph_hit,
+    whole_token_step_cuda_graph_requested,
+)
 from .runtime_context import active_prefix_self_attention_context
 
 
@@ -123,6 +127,73 @@ def _capture_decode_cuda_graph(
     return graph, graph_outputs, time.perf_counter() - started
 
 
+def _capture_whole_token_step_cuda_graph(
+    model,
+    static_inputs: dict[str, Any],
+    *,
+    active_prefix_length: int,
+    warmup: int,
+    logits_processor,
+    processor_input_ids: torch.Tensor,
+    logits_workspace: torch.Tensor,
+    next_tokens: torch.Tensor,
+    write_index: torch.Tensor,
+    sequence: torch.Tensor,
+    do_sample: bool,
+) -> tuple[torch.cuda.CUDAGraph, Any, float]:
+    """Capture forward + logits/sample/append (no per-token hard sync).
+
+    ``processor_input_ids`` must be a fixed-shape tensor (the preallocated
+    sequence buffer). Growing active-prefix views are not CUDA-graph safe.
+    """
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("whole-token-step CUDA graph requires CUDA")
+    if write_index.shape != (1,) or write_index.dtype != torch.long:
+        raise ValueError("write_index must be int64 shape [1]")
+    if next_tokens.shape != (1,) or next_tokens.dtype != torch.long:
+        raise ValueError("next_tokens must be int64 shape [1]")
+    if sequence.ndim != 2 or sequence.shape[0] != 1:
+        raise ValueError("sequence must have shape [1, max_length]")
+    if processor_input_ids.shape != sequence.shape:
+        raise ValueError("processor_input_ids must match preallocated sequence shape")
+
+    def _token_step() -> Any:
+        with active_prefix_self_attention_context(active_prefix_length):
+            graph_outputs = model(**static_inputs, return_dict=True)
+        last = graph_outputs.logits[:, -1, :]
+        if last.dtype == torch.float32:
+            logits_workspace.copy_(last)
+        else:
+            logits_workspace.copy_(last.to(dtype=torch.float32))
+        scores = logits_processor(processor_input_ids, logits_workspace)
+        if do_sample:
+            probabilities = nn.functional.softmax(scores, dim=-1)
+            sampled = torch.multinomial(probabilities, num_samples=1).squeeze(1)
+            next_tokens.copy_(sampled)
+        else:
+            next_tokens.copy_(torch.argmax(scores, dim=-1))
+        sequence.index_copy_(1, write_index, next_tokens.unsqueeze(0))
+        return graph_outputs
+
+    started = time.perf_counter()
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    graph_outputs = None
+    with torch.cuda.stream(capture_stream):
+        for _ in range(max(int(warmup), 0)):
+            graph_outputs = _token_step()
+    torch.cuda.current_stream().wait_stream(capture_stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_outputs = _token_step()
+    # Capture execution already produced this step's sample/append. Do not
+    # replay here (would double-consume CUDA RNG). Later tokens replay only.
+    torch.cuda.synchronize()
+    return graph, graph_outputs, time.perf_counter() - started
+
+
 def _cuda_graph_signature(
     active_prefix_length: int,
     model_inputs: dict[str, Any],
@@ -229,6 +300,17 @@ def active_prefix_decode_generate(
     graph_cache = shared_graph_cache if shared_graph_cache is not None else {}
     this_peer_finished = False
     unfinished = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
+    whole_token_step = whole_token_step_cuda_graph_requested()
+    if whole_token_step and sequence_state is None:
+        raise RuntimeError(
+            "whole-token-step CUDA graph requires preallocated batch-one sequence state"
+        )
+    if whole_token_step and not cuda_graph_forward:
+        raise RuntimeError(
+            "whole-token-step CUDA graph requires cuda_graph_forward=True"
+        )
+    whole_token_buffers: dict[str, torch.Tensor] | None = None
+    whole_token_hits = 0
 
     while model._has_unfinished_sequences(
         this_peer_finished,
@@ -236,6 +318,7 @@ def active_prefix_decode_generate(
         device=input_ids.device,
     ):
         model_inputs = model.prepare_inputs_for_generation(input_ids, **model_kwargs)
+        used_whole_token_graph = False
         if is_prefill:
             with profile_range("generation.encoder_prefill"):
                 outputs = model(**model_inputs, return_dict=True)
@@ -254,6 +337,75 @@ def active_prefix_decode_generate(
             if cuda_graph_forward and not use_graph:
                 with active_prefix_self_attention_context(prefix_length):
                     outputs = model(**model_inputs, return_dict=True)
+            elif use_graph and whole_token_step:
+                assert sequence_state is not None
+                vocab = int(model.config.vocab_size)
+                if whole_token_buffers is None:
+                    whole_token_buffers = {
+                        "logits_workspace": torch.empty(
+                            (batch_size, vocab),
+                            device=input_ids.device,
+                            dtype=torch.float32,
+                        ),
+                        "next_tokens": torch.empty(
+                            (batch_size,),
+                            device=input_ids.device,
+                            dtype=torch.long,
+                        ),
+                        "write_index": torch.zeros(
+                            (1,),
+                            device=input_ids.device,
+                            dtype=torch.long,
+                        ),
+                    }
+                graph_key = (
+                    "whole_token_step",
+                    *_cuda_graph_signature(prefix_length, model_inputs),
+                )
+                graph_entry = graph_cache.get(graph_key)
+                whole_token_buffers["write_index"].fill_(sequence_state.length)
+                if graph_entry is None:
+                    static_inputs = _clone_static_graph_inputs(model_inputs)
+                    with profile_range("generation.decode_graph_capture_setup"):
+                        graph, outputs, capture_seconds = (
+                            _capture_whole_token_step_cuda_graph(
+                                model,
+                                static_inputs,
+                                active_prefix_length=prefix_length,
+                                warmup=cuda_graph_warmup,
+                                logits_processor=logits_processor,
+                                processor_input_ids=sequence_state.sequence,
+                                logits_workspace=whole_token_buffers[
+                                    "logits_workspace"
+                                ],
+                                next_tokens=whole_token_buffers["next_tokens"],
+                                write_index=whole_token_buffers["write_index"],
+                                sequence=sequence_state.sequence,
+                                do_sample=bool(generation_config.do_sample),
+                            )
+                        )
+                    graph_entry = {
+                        "graph": graph,
+                        "outputs": outputs,
+                        "static_inputs": static_inputs,
+                        "active_prefix_length": prefix_length,
+                        "capture_seconds": capture_seconds,
+                        "decode_replays": 0,
+                        "whole_token_step": True,
+                    }
+                    graph_cache[graph_key] = graph_entry
+                else:
+                    _copy_static_graph_inputs(
+                        graph_entry["static_inputs"],
+                        model_inputs,
+                    )
+                    with profile_range("generation.decode_graph_replay"):
+                        graph_entry["graph"].replay()
+                graph_entry["decode_replays"] += 1
+                whole_token_hits += 1
+                record_whole_token_step_cuda_graph_hit()
+                outputs = graph_entry["outputs"]
+                used_whole_token_graph = True
             elif use_graph:
                 graph_key = _cuda_graph_signature(prefix_length, model_inputs)
                 graph_entry = graph_cache.get(graph_key)
@@ -302,38 +454,61 @@ def active_prefix_decode_generate(
                         encoder_outputs,
                     )
 
-        with profile_range("generation.logits_processors"):
-            next_logits = outputs.logits[:, -1, :].to(
-                copy=True,
-                dtype=torch.float32,
-                device=input_ids.device,
+        if used_whole_token_graph:
+            assert sequence_state is not None
+            assert whole_token_buffers is not None
+            # Append already happened inside the replayed graph via index_copy_.
+            next_tokens = whole_token_buffers["next_tokens"]
+            sequence_state.length = int(whole_token_buffers["write_index"].item()) + 1
+            input_ids = sequence_state.active
+            this_peer_finished = sequence_state.stopping_policy.stopped(
+                next_tokens,
+                next_length=sequence_state.length,
             )
-            next_scores = logits_processor(input_ids, next_logits)
-        with profile_range("generation.sampling"):
-            if generation_config.do_sample:
-                probabilities = nn.functional.softmax(next_scores, dim=-1)
-                next_tokens = torch.multinomial(probabilities, num_samples=1).squeeze(1)
-            else:
-                next_tokens = torch.argmax(next_scores, dim=-1)
+            cur_len = sequence_state.length
+        else:
+            with profile_range("generation.logits_processors"):
+                next_logits = outputs.logits[:, -1, :].to(
+                    copy=True,
+                    dtype=torch.float32,
+                    device=input_ids.device,
+                )
+                next_scores = logits_processor(input_ids, next_logits)
+            with profile_range("generation.sampling"):
+                if generation_config.do_sample:
+                    probabilities = nn.functional.softmax(next_scores, dim=-1)
+                    next_tokens = torch.multinomial(
+                        probabilities, num_samples=1
+                    ).squeeze(1)
+                else:
+                    next_tokens = torch.argmax(next_scores, dim=-1)
 
-        with profile_range("generation.token_append_and_stopping"):
-            if sequence_state is not None:
-                input_ids, this_peer_finished = sequence_state.append(next_tokens)
-                cur_len = sequence_state.length
-            else:
-                if has_eos:
-                    next_tokens = next_tokens * unfinished + pad_token_id * (1 - unfinished)
-                input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
-                stopped = stopping_criteria(input_ids, scores)
-                if not isinstance(stopped, torch.Tensor) or tuple(stopped.shape) != (
-                    batch_size,
-                ):
-                    raise RuntimeError(
-                        "batched stopping criteria must return one value per row"
+            with profile_range("generation.token_append_and_stopping"):
+                if sequence_state is not None:
+                    input_ids, this_peer_finished = sequence_state.append(next_tokens)
+                    cur_len = sequence_state.length
+                else:
+                    if has_eos:
+                        next_tokens = next_tokens * unfinished + pad_token_id * (
+                            1 - unfinished
+                        )
+                    input_ids = torch.cat(
+                        [input_ids, next_tokens[:, None]], dim=-1
                     )
-                unfinished = unfinished & ~stopped.to(dtype=torch.bool)
-                this_peer_finished = unfinished.max() == 0
-                cur_len += 1
+                    stopped = stopping_criteria(input_ids, scores)
+                    if not isinstance(stopped, torch.Tensor) or tuple(
+                        stopped.shape
+                    ) != (batch_size,):
+                        raise RuntimeError(
+                            "batched stopping criteria must return one value per row"
+                        )
+                    unfinished = unfinished & ~stopped.to(dtype=torch.bool)
+                    this_peer_finished = unfinished.max() == 0
+                    cur_len += 1
         del outputs
 
+    if whole_token_step and whole_token_hits <= 0:
+        raise RuntimeError(
+            "whole-token-step CUDA graph requested but recorded zero replays"
+        )
     return input_ids
