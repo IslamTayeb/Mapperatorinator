@@ -36,6 +36,11 @@ class MonotonicTimeShiftLogitsProcessor(_V32MonotonicTimeShiftLogitsProcessor):
         scores: torch.FloatTensor,
     ) -> torch.FloatTensor:
         seq_len = input_ids.shape[1]
+        # Preallocated whole-token buffers keep a fixed shape[1]; growing-view
+        # incremental updates never apply. Full-scan matches active-prefix
+        # semantics when the unused tail is pad-filled.
+        if self._state_seq_len is not None and seq_len == self._state_seq_len:
+            return self._full_scan_call(input_ids, scores)
         if self._state_seq_len is None or seq_len != self._state_seq_len + 1:
             self._initialize_batch1_state(input_ids)
         else:

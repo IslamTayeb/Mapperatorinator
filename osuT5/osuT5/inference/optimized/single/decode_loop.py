@@ -69,6 +69,36 @@ def _copy_static_graph_inputs(
         static_value.copy_(value)
 
 
+def _pad_sequence_tail_for_whole_token_graph(
+    sequence_state,
+    pad_token_id,
+) -> None:
+    """Fill unused preallocated tail so fixed-shape processor scans stay exact.
+
+    Whole-token capture passes the full ``[1, max_length]`` sequence buffer into
+    logits processors (CUDA-graph address stability). Uninitialized tail bytes
+    would poison monotonic time-shift full scans; pad tokens are outside the
+    time-shift / SOS ranges for this model family.
+    """
+
+    if pad_token_id is None:
+        raise RuntimeError(
+            "whole-token-step CUDA graph requires generation_config pad_token_id"
+        )
+    if isinstance(pad_token_id, torch.Tensor):
+        if pad_token_id.numel() != 1:
+            raise RuntimeError("pad_token_id must be a scalar tensor")
+        pad_value = int(pad_token_id.item())
+    else:
+        pad_value = int(pad_token_id)
+    max_length = int(sequence_state.sequence.shape[1])
+    length = int(sequence_state.length)
+    if length < 0 or length > max_length:
+        raise RuntimeError("sequence_state.length outside preallocated buffer")
+    if length < max_length:
+        sequence_state.sequence[:, length:].fill_(pad_value)
+
+
 def _stable_encoder_outputs(
     holder: dict[str, BaseModelOutput],
     encoder_outputs: Any,
@@ -341,6 +371,10 @@ def active_prefix_decode_generate(
                 assert sequence_state is not None
                 vocab = int(model.config.vocab_size)
                 if whole_token_buffers is None:
+                    _pad_sequence_tail_for_whole_token_graph(
+                        sequence_state,
+                        pad_token_id,
+                    )
                     whole_token_buffers = {
                         "logits_workspace": torch.empty(
                             (batch_size, vocab),
