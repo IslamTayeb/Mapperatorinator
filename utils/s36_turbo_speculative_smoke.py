@@ -68,8 +68,11 @@ def build_first_map_window_kwargs(processor, args_inf, generation_config, song_l
     )
     [prompt, _uncond], _max_len = processor.pad_prompts([cond_prompt, uncond_prompt])
     prompt_ids = prompt[0, : int(prompt[0].ne(processor.tokenizer.pad_id).sum().item())].cpu()
+    # prepare_frames already ensures batch dim [B, T]; do not unsqueeze again.
+    if frames_p.ndim == 1:
+        frames_p = frames_p.unsqueeze(0)
     model_kwargs: dict[str, Any] = {
-        "inputs": frames_p.unsqueeze(0) if frames_p.ndim == 2 else frames_p,
+        "inputs": frames_p,
         "decoder_input_ids": prompt_ids.unsqueeze(0),
         "decoder_attention_mask": torch.ones_like(prompt_ids.unsqueeze(0)),
         **cond_kwargs,

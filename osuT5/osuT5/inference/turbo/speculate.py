@@ -99,8 +99,10 @@ def _move_model_kwargs(model, model_kwargs: dict[str, Any]) -> dict[str, Any]:
         )
         for key, value in out.items()
     }
-    if "frames" not in out and "inputs" in out:
-        out["frames"] = out["inputs"]
+    if "inputs" in out:
+        # Mapperatorinator.forward takes `frames`; keep a single audio tensor.
+        frames = out.pop("inputs")
+        out["frames"] = out.get("frames", frames)
     return out
 
 
