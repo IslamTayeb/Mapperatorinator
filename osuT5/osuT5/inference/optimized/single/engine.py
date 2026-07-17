@@ -314,24 +314,36 @@ def _generate_window(
     from ..kernels.compiled_proj_out_activation import compiled_proj_out_requested
 
     if compiled_proj_out_requested():
-        # §20 r2 FIX: try prepare; skip only when LM head lacks rank-2 weight
-        # (timing windows). Do not pre-gate on context_type/dtype guesses that
-        # left MAP hits at 0 in r1 (50129762/763).
+        # §21 FIX: engage compiled proj_out on MAP. r1 (§20 @ 91977df2) pre-gated
+        # on context_type/dtype and left hits at 0 (prepare_failed). Unwrap binding,
+        # try prepare, and skip only on known LM-head shape/dtype refusals.
+        from ...engine_binding import unwrap_engine_binding
         from ..kernels.compiled_proj_out import prepare_compiled_proj_out
 
+        raw_model, _runtime = unwrap_engine_binding(model)
         try:
             prepared_proj_out, compiled_proj_out_evidence = prepare_compiled_proj_out(
-                model, expected_dtype
+                raw_model, expected_dtype
             )
-        except RuntimeError as exc:
-            if "rank-2 weight" not in str(exc):
+        except (RuntimeError, TypeError) as exc:
+            message = str(exc)
+            skippable = (
+                "rank-2 weight" in message
+                or "dtype must match" in message
+                or "bias must match" in message
+            )
+            if not skippable:
                 raise
             compiled_proj_out = None
             compiled_proj_out_evidence = {
                 "enabled": False,
                 "decode_only": True,
-                "disabled_reason": "missing_rank2_proj_out_weight",
-                "prepare_error": str(exc),
+                "disabled_reason": (
+                    "missing_rank2_proj_out_weight"
+                    if "rank-2 weight" in message
+                    else "proj_out_dtype_mismatch"
+                ),
+                "prepare_error": message,
             }
         else:
 
@@ -461,9 +473,14 @@ def _generate_window(
                 "requested": compiled_proj_out_requested(),
                 "enabled": compiled_proj_out is not None,
                 "disabled_reason": (
-                    None if compiled_proj_out is not None
-                    else None if not compiled_proj_out_requested()
-                    else "prepare_failed"
+                    None
+                    if compiled_proj_out is not None
+                    else None
+                    if not compiled_proj_out_requested()
+                    else (
+                        (compiled_proj_out_evidence or {}).get("disabled_reason")
+                        or "prepare_failed"
+                    )
                 ),
             },
             "native_cross_mlp_tail": {
@@ -505,7 +522,10 @@ def _generate_window(
         "optimized_cuda_graphs": context_state.graph_profile_summary(),
     })
     if compiled_proj_out_evidence is not None:
-        stats["compiled_proj_out"] = {**compiled_proj_out_evidence, "enabled": True}
+        stats["compiled_proj_out"] = {
+            **compiled_proj_out_evidence,
+            "enabled": compiled_proj_out is not None,
+        }
     if strict_exactness is not None:
         stats["strict_exactness"] = strict_exactness
     return result, stats
