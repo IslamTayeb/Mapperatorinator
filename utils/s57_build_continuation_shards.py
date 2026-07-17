@@ -161,10 +161,21 @@ def main() -> None:
         action="store_true",
         help="Also index tip long map_rest (low train weight later; not primary)",
     )
+    ap.add_argument(
+        "--turbo-dump",
+        action="append",
+        default=[],
+        metavar="SONG=RUN_DIR_OR_PROFILE",
+        help=(
+            "§57b multi-song short map_rest turbo dump (repeatable). "
+            "Includes map0/map_rest/timing from turbo short-continuation profiles."
+        ),
+    )
     args = ap.parse_args()
 
     rows: list[dict] = []
     sources: list[dict] = []
+    turbo_dump_songs: set[str] = set()
 
     s55_profile = find_profile(args.s55_run)
     s55_rows = extract_windows(s55_profile, song_id="salvalai", source="s55_turbo")
@@ -201,8 +212,44 @@ def main() -> None:
         }
     )
 
+    for spec in args.turbo_dump:
+        if "=" not in spec:
+            raise SystemExit(f"--turbo-dump expects SONG=PATH, got {spec!r}")
+        song_id, raw = spec.split("=", 1)
+        song_id = song_id.strip()
+        run_path = Path(raw.strip())
+        if not run_path.exists():
+            print(f"WARN: missing turbo dump {run_path}", flush=True)
+            continue
+        profile = find_profile(run_path)
+        dump_rows = extract_windows(profile, song_id=song_id, source="s57b_turbo")
+        rest = [r for r in dump_rows if r["role"] == "map_rest"]
+        med = (
+            sorted(r["generated_tokens"] for r in rest)[len(rest) // 2] if rest else None
+        )
+        rows.extend(dump_rows)
+        turbo_dump_songs.add(song_id)
+        sources.append(
+            {
+                "song_id": song_id,
+                "source": "s57b_turbo",
+                "profile": str(profile),
+                "run_root": str(run_path.resolve()),
+                "n_windows": len(dump_rows),
+                "primary": True,
+                "note": (
+                    f"§57b turbo short map_rest (n={len(rest)}, med≈{med}) + timing"
+                ),
+            }
+        )
+
     if args.include_five_song_timing:
         for song_id, path in FIVE_SONG.items():
+            if song_id in turbo_dump_songs:
+                # Prefer short-rest turbo dump for that song; skip long tip-style rest
+                # and avoid double-counting timing from five-song.
+                print(f"skip five_song for {song_id}: covered by s57b_turbo", flush=True)
+                continue
             if not path.exists():
                 print(f"WARN: missing {path}", flush=True)
                 continue
@@ -242,9 +289,9 @@ def main() -> None:
         "summary": summary,
         "windows": rows,
         "note": (
-            "Hard-label shards for §57 continuation(+timing) CE/KL. "
-            "Primary short map_rest/timing from s55 turbo scout. "
-            "Offline held-out E claimed separately; no runtime wire."
+            "Hard-label shards for §57/§57b continuation(+timing) CE/KL. "
+            "Primary short map_rest/timing from s55 + optional multi-song "
+            "s57b turbo dumps. Offline held-out E claimed separately; no runtime wire."
         ),
     }
     shards_path.write_text(json.dumps(payload, indent=2) + "\n")

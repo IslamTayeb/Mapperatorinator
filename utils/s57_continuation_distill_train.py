@@ -76,6 +76,12 @@ AUDIO_SALVALAI = Path("/work/imt11/Mapperatorinator/data/salvalai.mp3")
 FIVE_SONG_AUDIO = {
     "pegasus": Path("/work/imt11/Mapperatorinator/data/five-song-profile/pegasus.mp3"),
     "lambada": Path("/work/imt11/Mapperatorinator/data/five-song-profile/lambada.mp3"),
+    "ela-ke-leitada": Path(
+        "/work/imt11/Mapperatorinator/data/five-song-profile/ela-ke-leitada.mp3"
+    ),
+    "nube-negra": Path(
+        "/work/imt11/Mapperatorinator/data/five-song-profile/nube-negra.mp3"
+    ),
 }
 
 
@@ -384,6 +390,35 @@ def materialize_from_shards(
                 "osu": find_osu(prof.parent) if list(prof.parent.glob("**/beatmap*.osu")) else prof,
             }
 
+    # §57b multi-song turbo dumps: prefer paths recorded in shard sources.
+    audio_by_song = {"salvalai": AUDIO_SALVALAI, **FIVE_SONG_AUDIO}
+    for src in shards.get("sources") or []:
+        song_id = str(src.get("song_id") or "")
+        source = str(src.get("source") or "")
+        if source != "s57b_turbo" or not song_id:
+            continue
+        profile = Path(str(src.get("profile") or ""))
+        run_root = Path(str(src.get("run_root") or profile.parent))
+        if not profile.exists() and run_root.exists():
+            profile = find_profile(run_root)
+        if not profile.exists():
+            print(f"WARN: s57b_turbo profile missing for {song_id}: {profile}", flush=True)
+            continue
+        audio = audio_by_song.get(song_id)
+        if audio is None:
+            cand = Path(f"/work/imt11/Mapperatorinator/data/five-song-profile/{song_id}.mp3")
+            audio = cand if cand.exists() else AUDIO_SALVALAI
+        try:
+            osu = find_osu(run_root)
+        except Exception:
+            osu = find_osu(profile.parent) if list(profile.parent.glob("**/beatmap*.osu")) else profile
+        source_paths[(song_id, "s57b_turbo")] = {
+            "audio": audio,
+            "dump_run": run_root,
+            "profile": profile,
+            "osu": osu,
+        }
+
     all_windows: list[dict] = []
     cond_by_ctx: dict[str, dict] = {}
     metas: list[dict] = []
@@ -544,7 +579,7 @@ def main() -> None:
     ap.add_argument(
         "--song-filter",
         default="salvalai",
-        help="primary song; empty = all songs in shards",
+        help="primary song; empty string = all songs in shards (§57b multi-song)",
     )
     ap.add_argument("--baseline-rest-e", type=float, default=1.121)
     args = ap.parse_args()
@@ -801,10 +836,14 @@ def main() -> None:
         "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
         "hostname": os.environ.get("HOSTNAME") or os.uname().nodename,
         "note": (
-            "§57 offline continuation(+timing) distill. "
+            "§57/§57b offline continuation(+timing) distill. "
             "Do not wire turbo until held-out map_rest clears and in-loop full-song confirms. "
             "Strict rejection-sampling remains merge candidate."
         ),
+        "section": "57b" if any(
+            (m or {}).get("source") == "s57b_turbo" for m in (train_meta or [])
+        )
+        else "57",
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(result, indent=2) + "\n")
