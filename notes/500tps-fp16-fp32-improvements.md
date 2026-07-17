@@ -908,12 +908,12 @@ Primary path to 500 under the scope ruling. Bit-exact Track A remains valid but 
 | Not this lever | §39 sibling; INT8-as-FP16 |
 | Ledger rule | Own section only |
 
-## 38. Tier-2 relaxed fused decoder step — **STOP_NO_PROMOTE**
+## 38. Tier-2 relaxed fused decoder step — **PARKED** (was STOP_NO_PROMOTE)
 
 | Field | Value |
 | --- | --- |
 | What | TIER2 relaxed-numerics fused decoder step (7-kernel layer: norm+Wqkv, q1, Wo+res, cross block, fc1, fc2+res, glue; fp32 reductions) behind `inference_engine=turbo` |
-| Status | **STOP_NO_PROMOTE** — TIER2 quality **PASS**; perf budget **MISS** |
+| Status | **PARKED** — strategy shift: turbo deep-research package supersedes §38; was STOP_NO_PROMOTE (quality PASS; perf MISS) |
 | Branch / WT | `codex/turbo-tier2-fused-step` / tip `03f8a494` (fusion `24ee13bd`; base `55949274`) |
 | Rung 1a | Blanket fp32 Linear wrap — `50149339`/`50149340` @ `c77aab55`: top1 PASS; max_rel **FAIL** (superseded) |
 | Rung 1b | True 7-stage — `50149619`/`50149620` @ `24ee13bd`: max_rel **0** / top1 **1.0** / n=7809 |

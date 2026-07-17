@@ -1,10 +1,12 @@
 # §38 TIER2 fused decoder step — handoff
 
-**Status:** **STOP_NO_PROMOTE** (quality PASS; perf budget MISS) — 2026-07-17  
+**Status:** **PARKED** (strategy shift) — was **STOP_NO_PROMOTE** (quality PASS; perf budget MISS) — 2026-07-17  
 **Branch / WT:** `codex/turbo-tier2-fused-step` @ `/work/projects/Mapperatorinator-worktrees/turbo-tier2-fused-step`  
-**Code tip:** `03f8a494` (fusion `24ee13bd`)  
+**Code tip:** `8b9c396e` (fusion `24ee13bd`)  
 **Base tip:** `55949274`  
 **Campaign tip unchanged:** `55949274` / FP16 **366.11** — **no 500 claim**; **no tip graduate**; **no merge**; **no reciprocal**.
+
+**Park reason:** turbo deep-research package supersedes §38 as primary. No more §38 jobs. Siblings own §46/§47/§48/§49.
 
 
 ## Decision
@@ -14,8 +16,9 @@
 | TIER2 quality (max_rel≤1e-2 ∧ top1≥99.5% ∧ n≥100k) | **PASS** |
 | Perf budget ≥0.15 ms/token vs tip (before reciprocal) | **MISS** — saved **0.0069** ms/tok |
 | Promote / merge / 500 claim | **No** |
+| Current posture | **PARKED** — do not grind fusion; do not submit §38 jobs |
 
-**Revisit:** only with a deeper CUDA launch-collapse (true fewer kernels on **one-token decode**, not teacher-forced proxy) showing measured ≥0.15 ms/token. Do not bare-retry this Python 7-stage rearrange.
+**Revisit:** only if deep-research track explicitly reopens Tier-2 fusion with a deeper one-token CUDA launch-collapse (≥0.15 ms/tok measured). Do not bare-retry the Python 7-stage rearrange.
 
 
 ## Quality evidence
