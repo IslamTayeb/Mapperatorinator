@@ -1,9 +1,7 @@
-"""Turbo runtime scaffold (Track C §37 → §36-style).
+"""Turbo runtime (Track C §37).
 
 Immutable preset: 2-layer CE/KL draft + Leviathan rejection sampling vs tip teacher.
 Not bit-exact. TIER1 evidence pack required before any 500 / ship claim.
-Full-song speculative generate_window wiring is the next implementation rung;
-this scaffold owns draft load, rejection primitives, and the public turbo flag.
 """
 from __future__ import annotations
 
@@ -17,14 +15,15 @@ import torch
 from ..engine_binding import InferenceEngineBinding
 from .draft import DEFAULT_DRAFT_CKPT_ENV, load_draft_from_ckpt
 from .rejection import apply_temp_top_p, reject_sample_prefix
+from .speculate import speculative_generate_window
 
-TURBO_PRESET_VERSION = "turbo-tiny-draft-s37-scaffold-v1"
+TURBO_PRESET_VERSION = "turbo-tiny-draft-s37-speculative-v1"
 PRIMARY_GAMMA = 5
 
 
 @dataclass
 class TurboDecodeSession:
-    """Request-local mutable state for turbo (scaffold)."""
+    """Request-local mutable state for turbo speculative decode."""
 
     accepted_tokens_total: int = 0
     verify_steps: int = 0
@@ -68,7 +67,7 @@ class TurboRuntime:
     preset: TurboPreset
     draft: Any
     draft_meta: dict[str, Any]
-    speculative_generate_wired: bool = False
+    speculative_generate_wired: bool = True
 
     def new_context_state(self) -> TurboDecodeSession:
         return TurboDecodeSession()
@@ -89,7 +88,7 @@ class TurboRuntime:
             ),
             "turbo_tier1_required": True,
             "note": (
-                "§37 turbo scaffold. Rejection sampling + draft loaded. "
+                "§37 turbo speculative draft+verify. "
                 "Not a production TPS claim. TIER1 before ship."
             ),
         }
@@ -122,32 +121,39 @@ class TurboRuntime:
     ):
         if not isinstance(context_state, TurboDecodeSession):
             raise TypeError("turbo runtime requires TurboDecodeSession")
-        allow_fallback = os.environ.get("MAPPERATORINATOR_TURBO_ALLOW_TEACHER_FALLBACK", "") == "1"
-        if not self.speculative_generate_wired and not allow_fallback:
-            raise RuntimeError(
-                "turbo scaffold open (§37): draft + rejection sampling are ready, but "
-                "full-song speculative generate_window is not wired yet. "
-                "Next rung: wire draft+verify loop into generate_window. "
-                "For plumbing-only tests set MAPPERATORINATOR_TURBO_ALLOW_TEACHER_FALLBACK=1. "
-                "TIER1 required before any turbo/500 claim. "
-                f"draft_ckpt={self.draft_meta.get('ckpt_path')}"
-            )
-        # Plumbing fallback: teacher-only generate (not speculation; not a TPS claim).
-        from ..server import model_generate
+        allow_fallback = (
+            os.environ.get("MAPPERATORINATOR_TURBO_ALLOW_TEACHER_FALLBACK", "") == "1"
+        )
+        if not self.speculative_generate_wired:
+            if not allow_fallback:
+                raise RuntimeError(
+                    "turbo speculative generate_window is not wired. "
+                    f"draft_ckpt={self.draft_meta.get('ckpt_path')}"
+                )
+            from ..server import model_generate
 
-        gw = dict(generate_kwargs)
-        for k in (
-            "collect_strict_exactness",
-            "sync_model_timing",
-        ):
-            gw.pop(k, None)
-        result, stats = model_generate(model, tokenizer, model_kwargs, gw)
-        stats = dict(stats or {})
-        stats["turbo_scaffold"] = True
-        stats["turbo_teacher_fallback"] = True
-        stats["turbo_speculative"] = False
-        context_state.verify_steps += 1
-        return result, stats
+            gw = dict(generate_kwargs)
+            for k in ("collect_strict_exactness", "sync_model_timing"):
+                gw.pop(k, None)
+            result, stats = model_generate(model, tokenizer, model_kwargs, gw)
+            stats = dict(stats or {})
+            stats["turbo_scaffold"] = True
+            stats["turbo_teacher_fallback"] = True
+            stats["turbo_speculative"] = False
+            context_state.verify_steps += 1
+            return result, stats
+
+        return speculative_generate_window(
+            teacher=model,
+            draft=self.draft,
+            tokenizer=tokenizer,
+            model_kwargs=model_kwargs,
+            generate_kwargs=dict(generate_kwargs),
+            gamma=self.preset.gamma,
+            temperature=self.preset.temperature,
+            top_p=self.preset.top_p,
+            session=context_state,
+        )
 
 
 def load_turbo_runtime(
@@ -170,7 +176,7 @@ def load_turbo_runtime(
         preset=TURBO_PRESETS[precision],
         draft=draft,
         draft_meta=meta,
-        speculative_generate_wired=False,
+        speculative_generate_wired=True,
     )
 
 
@@ -186,7 +192,6 @@ def load_turbo_engine(
         raise TypeError("turbo inference requires loader_kwargs.")
     precision = str(loader_kwargs.get("precision", "fp32"))
     teacher, tokenizer = model_loader(**loader_kwargs)
-    # Unwrap optimized binding if nested
     from ..engine_binding import unwrap_engine_binding
 
     raw_teacher, _inner = unwrap_engine_binding(teacher)

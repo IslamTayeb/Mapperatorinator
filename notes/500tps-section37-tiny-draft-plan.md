@@ -1,7 +1,7 @@
 # §37 Tiny draft — plan (Track C)
 
-**Status:** OPEN — train `50146289` E[acc]=**2.921** → turbo scaffold @ `8a9e1e98` (speculative generate_window next; TIER1 before ship).
-**Tip:** `55949274` / FP16 **366.11** (unchanged). **No merge.** TIER1 required before any 500 / `turbo` claim.
+**Status:** OPEN — train `50146289` E[acc]=**2.921** → turbo speculative `generate_window` wired (this tip). TIER1 before ship.
+**Tip (campaign auth):** `55949274` / FP16 **366.11** (unchanged). **No merge.** Do not claim tip graduate / 500 until TIER1+perf.
 **Not this work:** §39 hybrid TIER3 (sibling); INT8-as-FP16.
 
 ## Choice this rung
@@ -30,20 +30,14 @@ Draft: `decoder_layers=2`, `d_model=768`, vocab 4097; share / freeze teacher enc
 | 2 Turbo scaffold | `inference_engine=turbo` draft+verify (rejection sampling) | TIER1 + TPS rungs |
 | 3 EAGLE revisit | only if 2-layer saturates &lt;1.3 after serious train | new hypothesis |
 
-### Tree-draft plan (rung 1b — only if train &lt;1.8)
-
-If longer CE/KL lands **1.3≤E&lt;1.8**, do **not** open full turbo ship yet. Next:
-
-1. Keep the 2-layer draft; at each step sample **K∈{2,4}** draft continuations (γ=5) under temp/top-p 0.9.
-2. Verify with tip teacher via standard rejection sampling; take first fully accepted chain or longest prefix.
-3. Report effective E[accepted/step] = mean accepted tokens / verify-step (same formula as α-probe, but measured).
-4. If effective E≥1.8 → open §36-style turbo scaffold with tree verify; else EAGLE / more data.
-
 ## Artifacts
 
 - Branch / WT: `codex/turbo-tiny-draft` / `turbo-tiny-draft`
-- Scripts: `utils/s37_build_distill_shards.py`, `utils/s37_tiny_draft_train_smoke.py`
-- Sbatch: `jobs/s37-tiny-draft-smoke.sbatch`, `jobs/s37-tiny-draft-train.sbatch`
+- Scripts: `utils/s37_build_distill_shards.py`, `utils/s37_tiny_draft_train_smoke.py`, `utils/s36_turbo_speculative_smoke.py`
+- Sbatch: `jobs/s37-tiny-draft-smoke.sbatch`, `jobs/s37-tiny-draft-train.sbatch`, `jobs/s36-turbo-speculative-smoke.sbatch`, `jobs/s36-turbo-fp16-perf-scout.sbatch`
 - Smoke: `/work/imt11/Mapperatorinator/runs/s37-tiny-draft-smoke-50146230/`
 - Train: `/work/imt11/Mapperatorinator/runs/s37-tiny-draft-train-50146289/` (E=2.921)
-- Turbo: `osuT5/osuT5/inference/turbo/` + `inference_engine=turbo`
+- Draft ckpt: `/work/imt11/Mapperatorinator/runs/s37-tiny-draft-train-50146289/draft_train.pt`
+- Turbo: `osuT5/osuT5/inference/turbo/` (`inference_engine=turbo`)
+  - `speculate.py`: draft K + batched teacher verify + Leviathan reject + KV crop
+  - Env: `MAPPERATORINATOR_TURBO_DRAFT_CKPT`
