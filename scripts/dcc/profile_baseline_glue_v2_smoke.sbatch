@@ -196,14 +196,16 @@ def flatten_token_ids(profile: dict) -> list[int]:
     return tokens
 
 def main_model_seconds(profile: dict) -> float:
-    stages = profile.get("stages") or {}
-    main = stages.get("main_generation") or {}
-    value = main.get("synchronized_model_seconds")
-    if value is None:
-        value = main.get("elapsed_seconds")
-    if value is None:
-        raise RuntimeError("profile missing main_generation timing")
-    return float(value)
+    records = profile.get("generation") or []
+    if not isinstance(records, list) or not records:
+        raise RuntimeError("profile missing generation records for timing")
+    total = 0.0
+    for record in records:
+        value = record.get("model_elapsed_seconds")
+        if value is None:
+            raise RuntimeError("generation record missing model_elapsed_seconds")
+        total += float(value)
+    return total
 
 baseline_profile = load_json(pathlib.Path(pathlib.Path(sys.argv[1]).read_text().strip()))
 candidate_profile = load_json(pathlib.Path(pathlib.Path(sys.argv[2]).read_text().strip()))

@@ -1,39 +1,56 @@
 # §46 Baseline glue-elimination v2 (W-BASE) — handoff
 
-**Status:** **OPEN** — implementation landed; smoke/scout pending  
-**Branch / WT:** `codex/exact-baseline-glue-v2`  
-**Base tip:** `55949274` / FP16 **366.11**  
+**Status:** **STOP_NO_PROMOTE** — exact PASS; budget MISS  
+**Branch / WT:** `codex/exact-baseline-glue-v2` / DCC `.../Mapperatorinator-worktrees/exact-baseline-glue-v2`  
+**Code tip:** `3987bd5c` (gate-parser fix may follow)  
+**Base / campaign tip:** `55949274` / FP16 **366.11** — **unchanged**  
 **Not:** bare §29 retry — persistent cross-window sample cache + separate small tail graph
 
-## What
+## Decision
 
-Independent no-speculation path targeting ~0.88 ms/tok non-model glue:
-
-1. Persistent sampling-tail CUDA graph (temp + top-p sort + softmax + multinomial; Philox register + RNG-restore capture warmup)
-2. Device token buffer (tip composition `preallocated_batch1_state`)
-3. Pinned-flag EOS (async D2H + event) instead of `unfinished.max() == 0`
-
-## Opt-in
-
-- `baseline_glue_v2_candidate_context()` → `preallocated_batch1_state` + `pinned_eos_flag` + `sampling_tail_cuda_graph`
-- V32 cold default unchanged; production engine kwargs unchanged until graduate
-
-## Gates
-
-| Gate | Bar |
+| Gate | Result |
 | --- | --- |
-| Smoke | token IDs + RNG equal; sampling-tail hits > 0 |
-| Kill | cannot show ≥**0.15 ms/tok** glue cut with persistent caches |
-| Scout | e2e ≥**450** TPS; if bitwise holds → EXACT tip graduate candidate |
+| Smoke exact (tok + RNG + hits) | **PASS** — tok **1322**=1322; RNG equal; hits **1322** |
+| Glue cut ≥0.15 ms/tok | **MISS** — **−0.003** ms/tok (base 297.63 → cand 297.33 TPS on smoke15) |
+| e2e scout ≥450 | **not submitted** (kill criterion) |
+| Tip graduate / merge / 500 claim | **No** |
+
+**Kill:** cannot show ≥0.15 ms/tok glue cut with persistent caches → **STOP_NO_PROMOTE**. Do not bare-retry sample-graph shape tweaks.
+
+## Evidence
+
+| Job | Node | Result |
+| --- | --- | --- |
+| **`50150069`** | z25-21 | smoke COMPLETED analysis FAILED only on stage-schema parser; artifacts valid |
+
+Run root: `/work/imt11/Mapperatorinator/runs/baseline-glue-v2-smoke-fp16-50150069/`  
+Corrected gate: `smoke_gate.json` (model_elapsed sum).
+
+| Metric | Baseline (tip composition) | Candidate |
+| --- | --- | --- |
+| tokens | 1322 | 1322 |
+| model_s | 4.442 | 4.446 |
+| TPS | 297.63 | 297.33 |
+| sampling-tail hits | 0 | 1322 |
+| RNG / tokens | — | equal |
+
+## What landed
+
+1. Persistent sampling-tail CUDA graph (temp + top-p + softmax + multinomial; Philox register + RNG-restore capture)
+2. Tip device token buffer (`preallocated_batch1_state`)
+3. Pinned-flag EOS (async D2H + event)
+4. Session-static sample workspaces in `shared_graph_cache` (cross-window)
+
+## Why no headroom
+
+Separate small tail graph is bit-exact and persistent, but host gap + second graph launch ≈ cost of eager TopP/sample on tip composition. Matches §29b lesson (Philox-in-graph possible; no bit-exact ms/tok headroom).
+
+## Revisit
+
+Only with **new** measured ≥0.15 ms/tok evidence on tip composition — e.g. collapsing forward+sample into one replay without per-window capture tax, or removing the host round-trip another way. Not another isolated sample-graph tweak. Not turbo.
 
 ## Scripts
 
-- Smoke: `scripts/dcc/profile_baseline_glue_v2_smoke.sbatch` (`profile_salvalai_smoke15`)
-- Scout: `scripts/dcc/profile_baseline_glue_v2_scout.sbatch` (`profile_salvalai`)
-- Runner: `utils/run_exact_baseline_glue_v2.py` (tip composition baseline = shared-RoPE + device-state)
-
-Unique `TMPDIR` / `TORCH_EXTENSIONS_DIR` per job id. Prefer serial GPU vs turbo workers (≤2 total).
-
-## Campaign tip
-
-Unchanged until scout passes: `55949274` / **366.11**. No 500 claim. No merge.
+- `scripts/dcc/profile_baseline_glue_v2_smoke.sbatch`
+- `scripts/dcc/profile_baseline_glue_v2_scout.sbatch` (unused after kill)
+- `utils/run_exact_baseline_glue_v2.py`
