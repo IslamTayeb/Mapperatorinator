@@ -327,7 +327,6 @@ def active_prefix_decode_generate(
     is_prefill = True
     scores = None
     decode_steps = 0
-    graph_cache = shared_graph_cache if shared_graph_cache is not None else {}
     this_peer_finished = False
     unfinished = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
     whole_token_step = whole_token_step_cuda_graph_requested()
@@ -339,6 +338,13 @@ def active_prefix_decode_generate(
         raise RuntimeError(
             "whole-token-step CUDA graph requires cuda_graph_forward=True"
         )
+    # Whole-token graphs bind sequence/write_index addresses inside the capture.
+    # Never reuse the session shared cache across windows — those tensors are
+    # reallocated per generate_window and replaying a stale graph OOBs index_copy_.
+    if whole_token_step:
+        graph_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
+    else:
+        graph_cache = shared_graph_cache if shared_graph_cache is not None else {}
     whole_token_buffers: dict[str, torch.Tensor] | None = None
     whole_token_hits = 0
 
@@ -397,7 +403,14 @@ def active_prefix_decode_generate(
                     *_cuda_graph_signature(prefix_length, model_inputs),
                 )
                 graph_entry = graph_cache.get(graph_key)
-                whole_token_buffers["write_index"].fill_(sequence_state.length)
+                write_at = int(sequence_state.length)
+                max_length = int(sequence_state.sequence.shape[1])
+                if write_at < 0 or write_at >= max_length:
+                    raise RuntimeError(
+                        "whole-token-step write_index out of range: "
+                        f"{write_at} not in [0, {max_length})"
+                    )
+                whole_token_buffers["write_index"].fill_(write_at)
                 if graph_entry is None:
                     static_inputs = _clone_static_graph_inputs(model_inputs)
                     with profile_range("generation.decode_graph_capture_setup"):
