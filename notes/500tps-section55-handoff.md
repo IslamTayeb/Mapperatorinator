@@ -1,50 +1,56 @@
-# §55 Track1 bank — in-loop E raise → scout → graduate?
+# §55 Track1 bank — STOP / hand to §53–§54
 
-**Status:** OPEN — cheap in-loop E probe first  
-**Branch / WT:** `codex/turbo-s55-bank` @ `/work/projects/Mapperatorinator-worktrees/turbo-integrator`  
+**Status:** **STOP_TRACK1_BANK** — full-song in-loop E still ≪1.7  
+**Branch / WT:** `codex/turbo-s55-bank` @ `3e751815`  
 **Base:** integrator `44ab1f3e` (§47 `d3cd6939` + §49 chain)  
-**Campaign tip unchanged:** `55949274` / FP16 **366.11** — **no merge to main**; **no 500 claim**.
+**Campaign tip unchanged:** `55949274` / FP16 **366.11** — **no merge**; **no §44**; **no turbo tip graduate**; **no 500 claim**.
 
-## Reality check (§52)
+## Reality check
 
-Scout `50150615` @ `44ab1f3e`: main_tps **38.61**, path hits LAND, **E≈1.06 ≪ 1.7**.  
-Root cause: TF tip-dump E ≠ in-loop map E. **Do not** blind re-scout same tip/1-layer.
-
-## §55 plan
-
-1. **Raise in-loop E** toward ≥1.7 cheaply:
-   - Prefer §43 **multi-song 2-layer** `draft_multsong.pt`, γ=5, temp/top_p 0.9
-   - Align sampling with offline probe: **structural processors OFF**; chain uses **temp+top-p** for sample + q
-   - Log **E per window** (`turbo_E_*`, `per_window_E` in scout summary)
-2. **Only if E≥1.7:** one instrumented FP16 SALVALAI scout (`jobs/s55-turbo-fp16-pathhit-scout.sbatch`)
-   - Counters: accepted/verify, NVTX draft/verify/accept/glue, graph hits, **cycle-glue ≤0.4 ms**
-   - If E healthy and TPS >8% under 417–436 → STOP diagnose wall
-3. **If scout ≥384.4 sustained AND E healthy:** fire §44 TIER1 → GRADUATE turbo tip as separate line (bit-exact tip unchanged). Merge candidate per §34.
-4. **If cannot get in-loop E≥1.7 cheaply:** STOP Track1 bank; hand to §53/§54.
+§52 sealed at **38.61 TPS / E≈1.06**. Do not blind re-scout 1-layer tip.  
+§55 tried the cheap E fix (multsong 2-layer + offline-aligned sampling + chain top-p).
 
 ## Jobs
 
-| Phase | Script | Notes |
+| Phase | Job | Result |
 | --- | --- | --- |
-| In-loop E probe | `jobs/s55-inloop-e-probe.sbatch` | 512 tok map window; gate E≥1.7 |
-| Scout (gated) | `jobs/s55-turbo-fp16-pathhit-scout.sbatch` | unique TMPDIR/TORCH_EXTENSIONS |
+| In-loop E probe (1 map window, 512 tok) | **`50151167`** | **E=1.977** (median cycle 2.0) — **false green** for full song |
+| FP16 path-hit scout (SALVALAI full) | **`50152542`** | main_tps **37.99**; median E **1.0** / mean **1.074**; path_ok **true** |
 
-## Env (probe + scout)
+### Scout `50152542` (z25? h36-5, 2080 Ti, FP16)
 
-```
-MAPPERATORINATOR_TURBO_DRAFT_CKPT=.../draft_multsong.pt
-MAPPERATORINATOR_TURBO_GAMMA=5
-MAPPERATORINATOR_TURBO_STRUCTURAL_PROCESSORS=0
-MAPPERATORINATOR_TURBO_DRAFT_CHAIN_GRAPH=1
-MAPPERATORINATOR_TURBO_STEP_PROFILE=1
-```
+| Metric | Value |
+| --- | ---: |
+| commit | `3e751815` |
+| draft | `draft_multsong.pt` γ=5, structural_processors=0 |
+| main_tps | **37.99** (≪ 384; ≪ tip 366.11) |
+| median / mean E | **1.0** / **1.074** |
+| cycle-glue median | **0.454 ms** (gate ≤0.4 **MISS**) |
+| draft / verify / rebuild ms | 3.90 / 15.78 / 14.99 |
+| path hits | chain replay **1190**, native verify **829**, eager_fallback **0**, keep-KV on |
+| recommend §44 / graduate | **NO** / **NO** |
 
-## Ruling (fill after jobs)
+Artifact: `/work/imt11/Mapperatorinator/runs/s55-turbo-fp16-scout-50152542/`
+
+## Diagnosis
+
+1. **Single-window probe ≠ full-song in-loop E.** Probe window was map-only AR draft on a tip-like prefix → E≈1.98. Full song mixes timing windows (E≈1) + many model-committed map windows → median E collapses to **1.0** (same band as §52/§47).
+2. Multsong 2-layer + offline-aligned temp/top-p + chain top-p **does not** restore full-song E≥1.7 cheaply.
+3. Path hits land; wall still ~38 TPS — acceptance, not wiring, remains binding.
+
+## Ruling
+
+**STOP Track1 bank attempt.** Do **not** §44. Do **not** graduate turbo tip. Tip stays `55949274` / **366.11**.  
+Hand off to **§54** (verify kernels) and **§53** (EAGLE; already STOP_KILL on held-out/in-loop — do not re-open without new architecture).
+
+## Return block
 
 | Field | Value |
 | --- | --- |
-| In-loop E | TBD |
-| Scout job / TPS | TBD / TBD |
-| Graduate Y/N | TBD |
+| In-loop E (probe / scout) | **1.977** (1-window) / **1.074 mean · 1.0 median** (full song) |
+| Scout job / numbers | **`50152542`** / **37.99 TPS**, path_ok, E unhealthy |
+| Graduate Y/N | **N** |
 
-Tip stays `55949274` / **366.11** until graduate line is authorized.
+## Not this lever
+
+Merge to main; 500 claim; bare §52b; claiming probe E as production acceptance.
