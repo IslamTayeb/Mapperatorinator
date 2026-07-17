@@ -314,22 +314,26 @@ def _generate_window(
     from ..kernels.compiled_proj_out_activation import compiled_proj_out_requested
 
     if compiled_proj_out_requested():
-        # §15 FIX / §20: skip prepare on TIMING windows and when proj_out is not
-        # a rank-2 Linear weight (timing models lack a usable LM head).
-        proj_out_module = getattr(model, "proj_out", None)
-        proj_out_weight = getattr(proj_out_module, "weight", None)
-        can_prepare_compiled_proj_out = (
-            context_type != ContextType.TIMING
-            and isinstance(proj_out_weight, torch.Tensor)
-            and proj_out_weight.ndim == 2
-            and proj_out_weight.dtype == expected_dtype
-        )
-        if can_prepare_compiled_proj_out:
-            from ..kernels.compiled_proj_out import prepare_compiled_proj_out
+        # §20 r2 FIX: try prepare; skip only when LM head lacks rank-2 weight
+        # (timing windows). Do not pre-gate on context_type/dtype guesses that
+        # left MAP hits at 0 in r1 (50129762/763).
+        from ..kernels.compiled_proj_out import prepare_compiled_proj_out
 
+        try:
             prepared_proj_out, compiled_proj_out_evidence = prepare_compiled_proj_out(
                 model, expected_dtype
             )
+        except RuntimeError as exc:
+            if "rank-2 weight" not in str(exc):
+                raise
+            compiled_proj_out = None
+            compiled_proj_out_evidence = {
+                "enabled": False,
+                "decode_only": True,
+                "disabled_reason": "missing_rank2_proj_out_weight",
+                "prepare_error": str(exc),
+            }
+        else:
 
             def compiled_proj_out(hidden_states, weight, bias):
                 if (
@@ -342,16 +346,6 @@ def _generate_window(
                         f"{tuple(getattr(hidden_states, 'shape', ()))}"
                     )
                 return prepared_proj_out(hidden_states, weight, bias)
-        else:
-            compiled_proj_out_evidence = {
-                "enabled": False,
-                "decode_only": True,
-                "disabled_reason": (
-                    "timing_context"
-                    if context_type == ContextType.TIMING
-                    else "missing_rank2_proj_out_weight"
-                ),
-            }
 
     rng_before = (
         rng_progression_signature(model.device)
