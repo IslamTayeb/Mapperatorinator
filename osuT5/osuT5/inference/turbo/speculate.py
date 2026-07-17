@@ -143,6 +143,14 @@ def _forward_decoder(
     model_kwargs: dict[str, Any],
 ) -> tuple[Any, dict[str, Any]]:
     """Cached forward; returns (outputs, updated model_kwargs)."""
+    # Drop stale 1-token cache_position from the previous HF update helper so
+    # multi-token verify/draft commits recompute arange(past, past+n).
+    model_kwargs.pop("cache_position", None)
+    _align_decoder_mask(
+        model_kwargs,
+        length=int(decoder_input_ids.shape[1]),
+        device=decoder_input_ids.device,
+    )
     model_inputs = model.prepare_inputs_for_generation(
         decoder_input_ids,
         **model_kwargs,
