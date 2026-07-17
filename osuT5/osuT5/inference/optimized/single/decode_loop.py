@@ -161,26 +161,27 @@ def _capture_whole_token_sample_cuda_graph(
     *,
     scores_workspace: torch.Tensor,
     next_tokens: torch.Tensor,
-    write_index: torch.Tensor,
-    sequence: torch.Tensor,
     do_sample: bool,
 ) -> tuple[torch.cuda.CUDAGraph, float]:
-    """Capture softmax/multinomial/append against fixed workspaces.
+    """Capture fixed-shape softmax/multinomial with Philox-safe generator state.
 
-    Logits processors stay eager on the growing active prefix (exact). This
-    graph only owns the fixed-shape sample + ``index_copy_`` tail.
+    Logits processors and ``index_copy_`` append stay eager. Capture is warmup
+    only: register the default CUDA generator, restore RNG after capture, and
+    let the caller always ``replay()`` so the first real token matches eager
+    Philox (smoke ``50143356`` drifted at generated index 1 when capture was
+    treated as the first sample).
     """
 
     if not torch.cuda.is_available():
         raise RuntimeError("whole-token-step CUDA graph requires CUDA")
-    if write_index.shape != (1,) or write_index.dtype != torch.long:
-        raise ValueError("write_index must be int64 shape [1]")
     if next_tokens.shape != (1,) or next_tokens.dtype != torch.long:
         raise ValueError("next_tokens must be int64 shape [1]")
-    if sequence.ndim != 2 or sequence.shape[0] != 1:
-        raise ValueError("sequence must have shape [1, max_length]")
     if scores_workspace.ndim != 2 or scores_workspace.shape[0] != 1:
         raise ValueError("scores_workspace must have shape [1, vocab]")
+    if scores_workspace.device != next_tokens.device:
+        raise ValueError("scores_workspace and next_tokens must share a device")
+    if scores_workspace.device.type != "cuda":
+        raise RuntimeError("whole-token sample graph requires CUDA tensors")
 
     def _sample_step() -> None:
         if do_sample:
@@ -189,13 +190,24 @@ def _capture_whole_token_sample_cuda_graph(
             next_tokens.copy_(sampled)
         else:
             next_tokens.copy_(torch.argmax(scores_workspace, dim=-1))
-        sequence.index_copy_(1, write_index, next_tokens.unsqueeze(0))
 
     started = time.perf_counter()
+    device = scores_workspace.device
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    generator = torch.cuda.default_generators[device_index]
+    rng_before = torch.cuda.get_rng_state(device)
+
     graph = torch.cuda.CUDAGraph()
+    # Explicit registration matches the cudagraph multinomial probe
+    # (``49231654`` / ``49231667``): required for non-default generators and
+    # safe for the default Philox stream under replay.
+    graph.register_generator_state(generator)
     with torch.cuda.graph(graph):
         _sample_step()
-    # Capture execution already sampled/appended. Do not replay here.
+    # Discard capture-time sample / offset advance; first real use is replay.
+    torch.cuda.set_rng_state(rng_before, device)
     torch.cuda.synchronize()
     return graph, time.perf_counter() - started
 
@@ -314,13 +326,11 @@ def active_prefix_decode_generate(
         raise RuntimeError(
             "whole-token-step CUDA graph requires cuda_graph_forward=True"
         )
-    # Whole-token graphs bind sequence/write_index addresses inside the capture.
-    # Never reuse the session shared cache across windows — those tensors are
-    # reallocated per generate_window and replaying a stale graph OOBs index_copy_.
-    if whole_token_step:
-        graph_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
-    else:
-        graph_cache = shared_graph_cache if shared_graph_cache is not None else {}
+    # Forward graphs reuse the session shared cache (tip amortization). Sample
+    # graphs bind only session-static scores/next_tokens workspaces — append
+    # stays eager ``index_copy_`` on the per-window preallocated sequence, so
+    # sharing the cache across windows is address-safe.
+    graph_cache = shared_graph_cache if shared_graph_cache is not None else {}
     whole_token_buffers: dict[str, torch.Tensor] | None = None
     whole_token_hits = 0
 
@@ -352,6 +362,7 @@ def active_prefix_decode_generate(
             elif use_graph and whole_token_step:
                 assert sequence_state is not None
                 vocab = int(model.config.vocab_size)
+                do_sample = bool(generation_config.do_sample)
                 if whole_token_buffers is None:
                     _pad_sequence_tail_for_whole_token_graph(
                         sequence_state,
@@ -363,23 +374,13 @@ def active_prefix_decode_generate(
                             device=input_ids.device,
                             dtype=torch.float32,
                         ),
-                        "scores_workspace": torch.empty(
-                            (batch_size, vocab),
-                            device=input_ids.device,
-                            dtype=torch.float32,
-                        ),
-                        "next_tokens": torch.empty(
-                            (batch_size,),
-                            device=input_ids.device,
-                            dtype=torch.long,
-                        ),
                         "write_index": torch.zeros(
                             (1,),
                             device=input_ids.device,
                             dtype=torch.long,
                         ),
                     }
-                # 1) Forward CUDA graph (same shape pinning as tip).
+                # 1) Forward CUDA graph (shared-cache amortized like tip).
                 forward_key = (
                     "whole_token_forward",
                     *_cuda_graph_signature(prefix_length, model_inputs),
@@ -426,11 +427,48 @@ def active_prefix_decode_generate(
                         sequence_state.active,
                         whole_token_buffers["logits_workspace"],
                     )
-                whole_token_buffers["scores_workspace"].copy_(scores)
 
-                # 3) Eager sample + index_copy_ (exact). CUDA-graph multinomial
-                # diverged at the first decode token vs tip (smoke 50143356);
-                # revisit sample-graph once Philox/capture semantics match eager.
+                # 3) Philox-safe sample CUDA graph on session-static workspaces;
+                #    append via eager prealloc ``index_copy_``.
+                sample_key = (
+                    "whole_token_sample",
+                    do_sample,
+                    vocab,
+                    str(input_ids.device),
+                )
+                sample_entry = graph_cache.get(sample_key)
+                if sample_entry is None:
+                    scores_workspace = torch.empty(
+                        (batch_size, vocab),
+                        device=input_ids.device,
+                        dtype=torch.float32,
+                    )
+                    next_tokens_buf = torch.empty(
+                        (batch_size,),
+                        device=input_ids.device,
+                        dtype=torch.long,
+                    )
+                    scores_workspace.copy_(scores)
+                    with profile_range("generation.decode_graph_capture_setup"):
+                        sample_graph, sample_capture_seconds = (
+                            _capture_whole_token_sample_cuda_graph(
+                                scores_workspace=scores_workspace,
+                                next_tokens=next_tokens_buf,
+                                do_sample=do_sample,
+                            )
+                        )
+                    sample_entry = {
+                        "kind": "whole_token_sample",
+                        "graph": sample_graph,
+                        "scores_workspace": scores_workspace,
+                        "next_tokens": next_tokens_buf,
+                        "capture_seconds": sample_capture_seconds,
+                        "decode_replays": 0,
+                    }
+                    graph_cache[sample_key] = sample_entry
+                else:
+                    sample_entry["scores_workspace"].copy_(scores)
+
                 write_at = int(sequence_state.length)
                 max_length = int(sequence_state.sequence.shape[1])
                 if write_at < 0 or write_at >= max_length:
@@ -440,27 +478,14 @@ def active_prefix_decode_generate(
                     )
                 whole_token_buffers["write_index"].fill_(write_at)
                 with profile_range("generation.sampling"):
-                    if generation_config.do_sample:
-                        probabilities = nn.functional.softmax(
-                            whole_token_buffers["scores_workspace"],
-                            dim=-1,
-                        )
-                        sampled = torch.multinomial(
-                            probabilities, num_samples=1
-                        ).squeeze(1)
-                        whole_token_buffers["next_tokens"].copy_(sampled)
-                    else:
-                        whole_token_buffers["next_tokens"].copy_(
-                            torch.argmax(
-                                whole_token_buffers["scores_workspace"],
-                                dim=-1,
-                            )
-                        )
+                    sample_entry["graph"].replay()
                 sequence_state.sequence.index_copy_(
                     1,
                     whole_token_buffers["write_index"],
-                    whole_token_buffers["next_tokens"].unsqueeze(0),
+                    sample_entry["next_tokens"].unsqueeze(0),
                 )
+                sample_entry["decode_replays"] += 1
+                whole_token_buffers["next_tokens"] = sample_entry["next_tokens"]
                 whole_token_hits += 1
                 record_whole_token_step_cuda_graph_hit()
                 used_whole_token_graph = True

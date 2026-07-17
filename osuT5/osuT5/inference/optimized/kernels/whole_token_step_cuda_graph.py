@@ -1,10 +1,11 @@
 """Opt-in whole-token-step CUDA graph capture (structure lever).
 
-Tip today graphs only the decoder forward, then runs logits / top-p /
-softmax / multinomial / append / EOS on the host side of each token.
-Candidate expands the replayed region to include those post-forward
-steps against preallocated buffers (index_copy_ / static workspaces)
-and avoids per-token ``torch.cuda.synchronize``.
+Tip graphs the decoder forward, then runs logits / softmax / multinomial /
+append / EOS eagerly. Candidate keeps eager logits processors + prealloc
+``index_copy_`` append, and graphs the fixed-shape softmax/multinomial tail
+with Philox-safe ``CUDAGraph.register_generator_state`` (capture is warmup;
+replay always owns the real sample). Forward + sample graphs share the
+session cache so capture is amortized across windows.
 
 V32 cold default remains unchanged. Exactness still required for
 graduate. Speculative / WHILE / occupancy levers are separate sections.
