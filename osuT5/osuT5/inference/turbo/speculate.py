@@ -21,6 +21,10 @@ from ..logit_processors import (
     MonotonicTimeShiftLogitsProcessor,
     TimeshiftBias,
 )
+from .draft_chain_graph import (
+    DraftChainGraphRunner,
+    draft_chain_graph_enabled,
+)
 from .kv_rollback import (
     align_kwargs_after_rewind,
     reset_self_cache,
@@ -534,7 +538,7 @@ def speculative_generate_window(
     )
 
     # Persist StaticCache + verify_fp across windows (session); never rebuild
-    # graph/bucket caches per window (§47).
+    # graph/bucket caches per window (§47/§52).
     if getattr(session, "teacher_cache", None) is None:
         session.teacher_cache = get_teacher_cache(teacher, cfg_scale=1.0)
     else:
@@ -566,7 +570,6 @@ def speculative_generate_window(
         sync_cuda_for_model(teacher)
     start_time = time.perf_counter()
 
-    # Draft stays on DynamicCache / eager; teacher arms optimized hooks (§41).
     # One outer context — @contextmanager CMs are one-shot and cannot be reused
     # per verify/rebuild step (AttributeError: args on second enter).
     precision_key = "fp16" if precision == "fp16" else "fp32"
@@ -579,6 +582,25 @@ def speculative_generate_window(
     kv_commit_mode = (
         "crop_to_L_full_rebuild" if canary_kv_mode else "keep_accepted_o1_rewind"
     )
+    # §49/§52: graphed draft chain on sampled path only (canary stays eager).
+    use_draft_chain = bool(
+        draft_chain_graph_enabled()
+        and (not canary_kv_mode)
+        and (not greedy)
+        and prompt_ids.device.type == "cuda"
+    )
+    draft_dtype = torch.float16 if precision_key == "fp16" else torch.float32
+    chain_runner: DraftChainGraphRunner | None = None
+    if use_draft_chain:
+        chain_runner = getattr(session, "draft_chain_runner", None)
+        if chain_runner is None or chain_runner.model is not draft:
+            chain_runner = DraftChainGraphRunner(
+                draft,
+                dtype=draft_dtype,
+                gamma=int(gamma),
+                temperature=float(spec_temperature),
+            )
+            session.draft_chain_runner = chain_runner
     teacher_runtime = (
         teacher_aligned_runtime_context(precision=precision_key)
         if verify_fp is not None
@@ -590,6 +612,9 @@ def speculative_generate_window(
     window_teacher_extra_q1 = 0
     window_teacher_accepted_reforwards = 0
     window_draft_accepted_reforwards = 0
+    window_keep_kv_rewinds = 0
+    window_draft_chain_cycles = 0
+    window_draft_eager_cycles = 0
 
     with teacher_runtime:
         teacher_last, teacher_mk = _prefill(
@@ -602,12 +627,21 @@ def speculative_generate_window(
             for _audio_key in ("frames", "inputs", "input_features"):
                 teacher_mk.pop(_audio_key, None)
             draft_mk["encoder_outputs"] = teacher_mk["encoder_outputs"]
-        draft_last, draft_mk = _prefill(
-            draft, prompt_ids=prompt_ids, model_kwargs=draft_mk
-        )
-        if draft_mk.get("encoder_outputs") is not None:
-            for _audio_key in ("frames", "inputs", "input_features"):
-                draft_mk.pop(_audio_key, None)
+        if use_draft_chain and chain_runner is not None:
+            chain_bind_mk = {
+                key: value
+                for key, value in draft_mk.items()
+                if key != "past_key_values"
+            }
+            chain_runner.bind(model_kwargs=chain_bind_mk, prompt_ids=prompt_ids)
+            draft_last = chain_runner.prefill()
+        else:
+            draft_last, draft_mk = _prefill(
+                draft, prompt_ids=prompt_ids, model_kwargs=draft_mk
+            )
+            if draft_mk.get("encoder_outputs") is not None:
+                for _audio_key in ("frames", "inputs", "input_features"):
+                    draft_mk.pop(_audio_key, None)
 
         sequences = prompt_ids
         prompt_len = int(prompt_ids.shape[1])
@@ -628,27 +662,65 @@ def speculative_generate_window(
             this_gamma = min(int(gamma), remaining)
 
             timer.begin()
-            (
-                draft_ids,
-                q_probs,
-                draft_mk,
-                _draft_hit_eos,
-                _draft_tail_logits,
-                draft_logits_after,
-            ) = _draft_k_tokens(
-                draft,
-                prompt_ids=sequences,
-                last_logits=draft_last,
-                model_kwargs=draft_mk,
-                gamma=this_gamma,
-                greedy=greedy,
-                temperature=spec_temperature,
-                top_p=spec_top_p,
-                processors=processors,
-                rng=rng,
-                max_new_tokens=remaining,
-                eos_ids=eos_ids,
+            used_chain_this_cycle = bool(
+                use_draft_chain
+                and chain_runner is not None
+                and this_gamma == int(chain_runner.gamma)
             )
+            if used_chain_this_cycle:
+                (
+                    draft_ids,
+                    q_probs,
+                    draft_logits_after,
+                    _draft_tail_logits,
+                ) = chain_runner.replay_chain(seed_logits=draft_last)
+                # Truncate on EOS (chain does not early-stop in-graph).
+                trimmed: list[int] = []
+                trimmed_logits: list[torch.Tensor] = []
+                for i, tok in enumerate(draft_ids):
+                    trimmed.append(int(tok))
+                    trimmed_logits.append(draft_logits_after[i])
+                    if int(tok) in eos_ids:
+                        break
+                draft_ids = trimmed
+                draft_logits_after = trimmed_logits
+                q_probs = q_probs[: len(draft_ids)]
+                _draft_hit_eos = bool(draft_ids and int(draft_ids[-1]) in eos_ids)
+                window_draft_chain_cycles += 1
+            else:
+                if use_draft_chain and chain_runner is not None:
+                    chain_runner.stats.hit_counters["draft_chain_eager_fallback"] += 1
+                    # Resync eager DynamicCache from current sequences once.
+                    reset_self_cache(draft_cache)
+                    draft_mk["past_key_values"] = draft_cache
+                    draft_last, draft_mk = _prefill(
+                        draft, prompt_ids=sequences, model_kwargs=draft_mk
+                    )
+                    if draft_mk.get("encoder_outputs") is not None:
+                        for _audio_key in ("frames", "inputs", "input_features"):
+                            draft_mk.pop(_audio_key, None)
+                (
+                    draft_ids,
+                    q_probs,
+                    draft_mk,
+                    _draft_hit_eos,
+                    _draft_tail_logits,
+                    draft_logits_after,
+                ) = _draft_k_tokens(
+                    draft,
+                    prompt_ids=sequences,
+                    last_logits=draft_last,
+                    model_kwargs=draft_mk,
+                    gamma=this_gamma,
+                    greedy=greedy,
+                    temperature=spec_temperature,
+                    top_p=spec_top_p,
+                    processors=processors,
+                    rng=rng,
+                    max_new_tokens=remaining,
+                    eos_ids=eos_ids,
+                )
+                window_draft_eager_cycles += 1
             timer.add("draft")
             draft_calls += 1
             actual_gamma = len(draft_ids)
@@ -809,9 +881,13 @@ def speculative_generate_window(
                 rewind_self_cache(
                     teacher_cache, keep_len, occupied_end=occupied_end
                 )
-                rewind_self_cache(
-                    draft_cache, keep_len, occupied_end=occupied_end
-                )
+                if used_chain_this_cycle and chain_runner is not None:
+                    chain_runner.rewind_keep_kv(keep_len)
+                else:
+                    rewind_self_cache(
+                        draft_cache, keep_len, occupied_end=occupied_end
+                    )
+                window_keep_kv_rewinds += 1
                 if n_keep > 0:
                     keep_t = torch.tensor(
                         [draft_ids[:n_keep]],
@@ -822,9 +898,10 @@ def speculative_generate_window(
                 align_kwargs_after_rewind(
                     teacher_mk, length=keep_len, device=sequences.device
                 )
-                align_kwargs_after_rewind(
-                    draft_mk, length=keep_len, device=sequences.device
-                )
+                if not (used_chain_this_cycle and chain_runner is not None):
+                    align_kwargs_after_rewind(
+                        draft_mk, length=keep_len, device=sequences.device
+                    )
 
                 if extra:
                     extra_t = torch.tensor(
@@ -848,12 +925,16 @@ def speculative_generate_window(
                     )
                     window_teacher_forwards += 1
                     window_teacher_extra_q1 += 1
-                    draft_out, draft_mk = _forward_decoder(
-                        draft, decoder_input_ids=sequences, model_kwargs=draft_mk
-                    )
-                    draft_last = (
-                        draft_out.logits[:, -1, :].float().squeeze(0).clone()
-                    )
+                    if used_chain_this_cycle and chain_runner is not None:
+                        draft_last = chain_runner.fastpath.decode_token(int(extra[0]))
+                        chain_runner._seed_logits.copy_(draft_last.view(1, -1))
+                    else:
+                        draft_out, draft_mk = _forward_decoder(
+                            draft, decoder_input_ids=sequences, model_kwargs=draft_mk
+                        )
+                        draft_last = (
+                            draft_out.logits[:, -1, :].float().squeeze(0).clone()
+                        )
                 else:
                     if n_keep <= 0:
                         raise RuntimeError(
@@ -861,6 +942,8 @@ def speculative_generate_window(
                         )
                     teacher_last = teacher_raw_after[n_keep - 1].float().clone()
                     draft_last = draft_logits_after[n_keep - 1].float().clone()
+                    if used_chain_this_cycle and chain_runner is not None:
+                        chain_runner._seed_logits.copy_(draft_last.view(1, -1))
                 timer.add("rebuild")
             timer.steps += 1
 
@@ -933,6 +1016,10 @@ def speculative_generate_window(
             "turbo_teacher_forwards_per_cycle": teacher_forwards_per_cycle,
             "turbo_teacher_extra_q1_per_cycle": teacher_extra_q1_per_cycle,
             "turbo_persistent_verify_fp": True,
+            "turbo_draft_chain_enabled": bool(use_draft_chain),
+            "turbo_draft_chain_cycles_window": window_draft_chain_cycles,
+            "turbo_draft_eager_cycles_window": window_draft_eager_cycles,
+            "turbo_keep_accepted_o1_rewind_cycles_window": window_keep_kv_rewinds,
             "turbo_verify_graph_entries": (
                 len(verify_fp.graph_cache) if verify_fp is not None else 0
             ),
@@ -940,6 +1027,39 @@ def speculative_generate_window(
                 accepted_total=accepted_total, verify_steps=verify_steps
             ),
             **(verify_fp.profile_metadata() if verify_fp is not None else {}),
+            **(
+                chain_runner.profile_metadata()
+                if chain_runner is not None
+                else {"turbo_draft_chain_graph": False}
+            ),
         }
     )
+    # Flat path-hit counters for §52 scout harvest (also nested above).
+    verify_meta = verify_fp.profile_metadata() if verify_fp is not None else {}
+    chain_hits = (
+        dict(chain_runner.stats.hit_counters) if chain_runner is not None else {}
+    )
+    stats["turbo_path_hit_counters"] = {
+        "draft_chain_graph_replay": int(chain_hits.get("draft_chain_graph_replay", 0)),
+        "draft_chain_graph_capture": int(chain_hits.get("draft_chain_graph_capture", 0)),
+        "draft_chain_eager_fallback": int(
+            chain_hits.get("draft_chain_eager_fallback", 0)
+        ),
+        "verify_graph_native_replays": int(
+            verify_meta.get("turbo_verify_graph_native_replays", 0) or 0
+        ),
+        "verify_graph_replays": int(
+            verify_meta.get("turbo_verify_graph_replays", 0) or 0
+        ),
+        "verify_graph_captures": int(
+            verify_meta.get("turbo_verify_graph_captures", 0) or 0
+        ),
+        "verify_prepare_inputs_calls": int(
+            verify_meta.get("turbo_verify_prepare_inputs_calls", 0) or 0
+        ),
+        "keep_accepted_o1_rewind_cycles": int(window_keep_kv_rewinds),
+        "crop_to_L_full_rebuild": int(1 if canary_kv_mode else 0),
+        "draft_chain_cycles_window": int(window_draft_chain_cycles),
+        "draft_eager_cycles_window": int(window_draft_eager_cycles),
+    }
     return result, stats

@@ -1621,6 +1621,18 @@ class Processor(object):
             "turbo_verify_graph_replays",
             "turbo_verify_graph_entries",
             "turbo_persistent_verify_fp",
+            "turbo_draft_chain_enabled",
+            "turbo_draft_chain_cycles_window",
+            "turbo_draft_eager_cycles_window",
+            "turbo_keep_accepted_o1_rewind_cycles_window",
+            "turbo_draft_chain_graph",
+            "turbo_draft_chain_replays",
+            "turbo_draft_chain_captures",
+            "turbo_draft_chain_hit_counters",
+            "turbo_verify_graph_native",
+            "turbo_verify_graph_native_replays",
+            "turbo_verify_prepare_inputs_calls",
+            "turbo_path_hit_counters",
         ):
             if stats.get(key) is not None:
                 record[key] = stats[key]

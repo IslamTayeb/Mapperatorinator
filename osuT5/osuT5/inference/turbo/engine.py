@@ -1,8 +1,8 @@
-"""Turbo runtime (Track C §45 integrator).
+"""Turbo runtime (Track C §52 integrator: §47+§49 path-hit scout).
 
-Immutable preset: §43 1-layer draft (K=1, γ=3, temp=0.9) + Leviathan rejection
-sampling vs §41 graph-aligned teacher. Not bit-exact. Full TIER1 before any
-500 / ship claim. Campaign tip remains 55949274 / FP16 366.11.
+Immutable preset: §43 1-layer draft (K=1, γ=3, temp=0.9) + §49 graphed draft
+chain + §47 keep-KV + §48 graph-native verify (no grind). Not bit-exact.
+Campaign tip remains 55949274 / FP16 366.11.
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from .draft import DEFAULT_DRAFT_CKPT_ENV, load_draft_from_ckpt
 from .rejection import apply_temp_top_p, reject_sample_prefix
 from .speculate import speculative_generate_window
 
-TURBO_PRESET_VERSION = "turbo-keep-accepted-kv-s47-v1"
+TURBO_PRESET_VERSION = "turbo-integrator-s52-kv-dg-v1"
 PRIMARY_GAMMA = 3
 
 
@@ -41,6 +41,7 @@ class TurboDecodeSession:
     teacher_extra_q1_forwards: int = 0
     teacher_accepted_reforwards: int = 0
     draft_accepted_reforwards: int = 0
+    draft_chain_runner: Any | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,8 +104,9 @@ class TurboRuntime:
             "turbo_verify_fastpath_default": True,
             "turbo_tree_k": 1,
             "note": (
-                "§47 W-KV: sampled keep-accepted-KV O(1) rewind (DOCUMENTED "
-                "DRIFT under §34); greedy TIER1a keeps crop-rebuild/aligned-Q1. "
+                "§52 integrator: §47 keep-KV + §49 graphed draft chain + §48 "
+                "graph-native verify (no VG grind). Sampled path DOCUMENTED "
+                "DRIFT under §34; greedy TIER1a stays crop-rebuild/aligned-Q1. "
                 "Campaign tip 55949274/366.11. No 500 claim."
             ),
         }
