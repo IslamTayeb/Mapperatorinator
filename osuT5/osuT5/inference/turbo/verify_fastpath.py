@@ -537,6 +537,13 @@ class TeacherVerifyFastpath:
             self.graph_native_replays += 1
             outputs = entry.outputs
 
+        # HF update expects cache_position from the just-executed forward.
+        model_kwargs["cache_position"] = entry.static_cache_position.clone()
+        model_kwargs["decoder_attention_mask"] = torch.ones(
+            (1, past_length + int(k)),
+            device=entry.static_ids.device,
+            dtype=torch.long,
+        )
         model_kwargs = self.model._update_model_kwargs_for_generation(
             outputs,
             model_kwargs,
