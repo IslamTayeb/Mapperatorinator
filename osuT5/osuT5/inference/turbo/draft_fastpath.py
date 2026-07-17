@@ -16,7 +16,7 @@ from ...runtime_profiling import generation_profile_context
 from transformers import StaticCache
 from transformers.modeling_outputs import BaseModelOutput
 
-from ..cache_utils import MapperatorinatorCache
+from ..cache_utils import MapperatorinatorCache, get_cache
 from ..optimized.single.decode_loop import (
     _bucketed_prefix_length,
     _capture_decode_cuda_graph,
@@ -194,14 +194,15 @@ class DraftFastpathRunner:
     ) -> None:
         if prompt_ids.ndim != 2 or prompt_ids.shape[0] != 1:
             raise ValueError("draft fastpath requires batch_size=1 prompt_ids")
-        # Own a decoder-depth StaticCache; do not use ProductionDecodeSession's
-        # get_cache(model.config) path (encoder-depth layer count).
+        # Use HF get_cache for storage init compatibility on this transformers
+        # build. Extra unused self/cross slots (encoder-depth) are harmless for
+        # the 2-layer draft; exact-depth shim remains available via get_draft_cache.
         signature = ProductionDecodeSession._state_signature(
             self.model, batch_size=1, num_beams=1, cfg_scale=1.0
         )
         cache = self.session.caches.get(signature)
         if cache is None:
-            cache = get_draft_cache(self.model, batch_size=1, cfg_scale=1.0)
+            cache = get_cache(self.model, 1, 1, 1.0)
             self.session.caches[signature] = cache
         else:
             cache.self_attention_cache.reset()
@@ -465,15 +466,12 @@ def time_graph_replay_ms(
             runner._max_cache_len,
         )
         static_inputs = _clone_static_graph_inputs(model_inputs)
-        # One eager validate + JIT outside capture, then capture with its warmup.
-        with active_prefix_self_attention_context(bucket):
-            _ = runner.model(**static_inputs, return_dict=True)
-        torch.cuda.synchronize()
+        # Match optimized decode_loop capture: warmup+capture on static buffers.
         graph, _outputs, capture_seconds = _capture_decode_cuda_graph(
             runner.model,
             static_inputs,
             active_prefix_length=bucket,
-            warmup=max(int(runner.cuda_graph_warmup), 1),
+            warmup=max(int(runner.cuda_graph_warmup), 2),
         )
         for _ in range(max(int(warmup), 0)):
             graph.replay()

@@ -216,67 +216,99 @@ def bench_model_graph(
     iters: int,
     label: str,
 ) -> dict[str, Any]:
-    runner = DraftFastpathRunner(
-        model,
-        dtype=dtype,
-        enable_native_kernels=True,
-        cuda_graph=True,
-    )
     bind_kwargs = dict(model_kwargs)
     bind_kwargs.pop("decoder_input_ids", None)
-    runner.bind(model_kwargs=bind_kwargs, prompt_ids=prompt_ids)
-    runner.prefill()
-    runner.warm_native_kernels()
     rows = []
     for prefix in prefixes:
-        # Fresh runner per prefix so timing starts from a clean graph capture.
-        r = DraftFastpathRunner(
+        # Eager native first (fresh runner) so a later graph CUDA fault cannot
+        # erase the only measurement.
+        eager_runner = DraftFastpathRunner(
             model,
             dtype=dtype,
             enable_native_kernels=True,
-            cuda_graph=True,
-            cuda_graph_warmup=2,
+            cuda_graph=False,
         )
-        r.bind(model_kwargs=bind_kwargs, prompt_ids=prompt_ids)
-        r.prefill()
-        r.warm_native_kernels()
+        eager_runner.bind(model_kwargs=bind_kwargs, prompt_ids=prompt_ids)
+        eager_runner.prefill()
+        eager_runner.warm_native_kernels()
+        eager_row = _time_eager_native_ms(
+            eager_runner,
+            prefix_length=prefix,
+            warmup=warmup,
+            iters=iters,
+        )
+        eager_row["timing_mode"] = "eager_native"
+        print(
+            f"[{label}] eager prefix={prefix} "
+            f"ms/token={eager_row['ms_per_token']:.4f}",
+            flush=True,
+        )
+
+        graph_row = None
+        graph_error = None
         try:
-            row = time_graph_replay_ms(
-                r, prefix_length=prefix, warmup=warmup, iters=iters
+            # In-process graph attempt after eager measurement for this prefix.
+            graph_runner = DraftFastpathRunner(
+                model,
+                dtype=dtype,
+                enable_native_kernels=True,
+                cuda_graph=True,
+                cuda_graph_warmup=2,
             )
-            row["timing_mode"] = "cuda_graph_replay"
-        except Exception as exc:  # noqa: BLE001 - surface and fall back
-            print(
-                f"[{label}] graph timing failed at prefix={prefix}: {exc!r}; "
-                "falling back to eager native step timing",
-                flush=True,
-            )
-            row = _time_eager_native_ms(
-                r,
+            graph_runner.bind(model_kwargs=bind_kwargs, prompt_ids=prompt_ids)
+            graph_runner.prefill()
+            graph_runner.warm_native_kernels()
+            graph_row = time_graph_replay_ms(
+                graph_runner,
                 prefix_length=prefix,
                 warmup=warmup,
                 iters=iters,
             )
-            row["timing_mode"] = "eager_native_fallback"
-            row["graph_error"] = repr(exc)
+            graph_row["timing_mode"] = "cuda_graph_replay"
+            print(
+                f"[{label}] graph prefix={prefix} "
+                f"ms/token={graph_row['ms_per_token']:.4f}",
+                flush=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            graph_error = repr(exc)
+            print(
+                f"[{label}] graph timing failed at prefix={prefix}: {exc!r}",
+                flush=True,
+            )
+            # Device may be poisoned; stop further prefixes after recording eager.
+            row = dict(eager_row)
+            row["graph_error"] = graph_error
+            row["label"] = label
+            row["layers"] = eager_runner.layer_count
+            rows.append(row)
+            break
+
+        row = dict(graph_row or eager_row)
+        row["eager_ms_per_token"] = float(eager_row["ms_per_token"])
         row["label"] = label
-        row["layers"] = r.layer_count
+        row["layers"] = eager_runner.layer_count
         rows.append(row)
-        print(
-            f"[{label}] prefix={prefix} bucket={row['bucket_prefix_length']} "
-            f"ms/token={row['ms_per_token']:.4f} layers={r.layer_count} "
-            f"mode={row['timing_mode']}",
-            flush=True,
-        )
-    ms_values = [float(r["ms_per_token"]) for r in rows]
+
+    if not rows:
+        raise RuntimeError(f"no timing rows for {label}")
+    # Prefer graph timings when present.
+    ms_values = [
+        float(r.get("ms_per_token"))
+        for r in rows
+        if r.get("timing_mode") == "cuda_graph_replay"
+    ] or [float(r["ms_per_token"]) for r in rows]
     return {
         "label": label,
-        "layers": int(rows[0]["layers"]) if rows else None,
+        "layers": int(rows[0]["layers"]),
         "rows": rows,
         "median_ms_per_token": float(sorted(ms_values)[len(ms_values) // 2]),
         "min_ms_per_token": float(min(ms_values)),
         "max_ms_per_token": float(max(ms_values)),
-        "dispatch_counts_last": rows[-1]["dispatch_counts"] if rows else {},
+        "dispatch_counts_last": rows[-1].get("dispatch_counts", {}),
+        "used_cuda_graph": any(
+            r.get("timing_mode") == "cuda_graph_replay" for r in rows
+        ),
     }
 
 
