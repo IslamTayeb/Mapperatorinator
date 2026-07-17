@@ -1,4 +1,8 @@
-"""§37 2-layer same-width draft construction for turbo scaffold."""
+"""§37/§43 N-layer same-width draft construction for turbo.
+
+§43 perf default is 1-layer (init_layers=(0,)) with γ=3; quality alt is
+2-layer multi-song. Ckpt payload carries init_layers.
+"""
 from __future__ import annotations
 
 import copy
@@ -17,12 +21,12 @@ def get_decoder(model: nn.Module) -> nn.Module:
     return model.transformer.model.decoder
 
 
-def build_two_layer_draft(
+def build_n_layer_draft(
     teacher: nn.Module,
     init_layers: tuple[int, ...] = DRAFT_INIT_LAYERS,
 ) -> nn.Module:
-    if len(init_layers) != 2:
-        raise ValueError(f"expected 2 init layers, got {init_layers}")
+    if len(init_layers) < 1:
+        raise ValueError(f"expected >=1 init layers, got {init_layers}")
     draft = copy.deepcopy(teacher)
     dec_t = get_decoder(teacher)
     dec_d = get_decoder(draft)
@@ -31,7 +35,7 @@ def build_two_layer_draft(
         if i < 0 or i >= n:
             raise ValueError(f"init layer {i} out of range for {n} layers")
     dec_d.layers = nn.ModuleList([copy.deepcopy(dec_t.layers[i]) for i in init_layers])
-    # Keep config in sync so cache / layer-count helpers see a 2-layer decoder.
+    # Keep config in sync so cache / layer-count helpers see the draft depth.
     n_layers = len(init_layers)
     for cfg in (
         getattr(draft, "config", None),
@@ -44,6 +48,14 @@ def build_two_layer_draft(
         p.requires_grad = False
     draft.eval()
     return draft
+
+
+def build_two_layer_draft(
+    teacher: nn.Module,
+    init_layers: tuple[int, ...] = DRAFT_INIT_LAYERS,
+) -> nn.Module:
+    """Backward-compatible alias for build_n_layer_draft."""
+    return build_n_layer_draft(teacher, init_layers)
 
 
 def resolve_draft_ckpt(path: str | Path | None = None) -> Path:
@@ -68,7 +80,7 @@ def load_draft_from_ckpt(
     payload = torch.load(path, map_location="cpu")
     state = payload.get("draft_state_dict", payload)
     init_layers = tuple(payload.get("init_layers", DRAFT_INIT_LAYERS))
-    draft = build_two_layer_draft(teacher, init_layers)
+    draft = build_n_layer_draft(teacher, init_layers)
     # Timing / non-gamemode teachers can differ in vocab size from the §37
     # gamemode=0 distill ckpt. Load only shape-compatible tensors.
     model_sd = draft.state_dict()
@@ -87,6 +99,7 @@ def load_draft_from_ckpt(
     meta = {
         "ckpt_path": str(path),
         "init_layers": list(init_layers),
+        "n_layers": len(init_layers),
         "missing_keys": list(missing),
         "unexpected_keys": list(unexpected),
         "skipped_shape_keys": skipped_shape,
