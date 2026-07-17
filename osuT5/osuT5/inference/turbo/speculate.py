@@ -11,8 +11,8 @@ from typing import Any, Sequence
 import torch
 from transformers import DynamicCache, LogitsProcessorList
 
+from ...event import ContextType, EventType
 from ..cache_utils import MapperatorinatorCache
-from ..event import ContextType, EventType
 from ..generation_utils import build_generation_stats, eos_token_ids, sync_cuda_for_model
 from ..logit_processors import (
     LookbackBiasLogitsWarper,
