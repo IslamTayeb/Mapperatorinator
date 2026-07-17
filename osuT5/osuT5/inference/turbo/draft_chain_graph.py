@@ -18,7 +18,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 
 from ..optimized.single.decode_loop import (
     _bucketed_prefix_length,
@@ -33,9 +32,11 @@ from .draft_fastpath import (
     _align_decoder_mask,
     _strip_audio_inputs,
 )
+from .rejection import apply_temp_top_p
 
 DRAFT_CHAIN_GRAPH_ENV = "MAPPERATORINATOR_TURBO_DRAFT_CHAIN_GRAPH"
 DEFAULT_GAMMA = 3
+DEFAULT_TOP_P = 0.9
 GATE_MS_TOTAL = 1.2
 KILL_MS_TOTAL = 2.0
 
@@ -114,6 +115,7 @@ class DraftChainGraphRunner:
         dtype: torch.dtype,
         gamma: int = DEFAULT_GAMMA,
         temperature: float = 0.9,
+        top_p: float = DEFAULT_TOP_P,
         bucket_size: int = ACTIVE_PREFIX_BUCKET_SIZE,
         enable_native_kernels: bool = True,
         cuda_graph_warmup: int = 2,
@@ -124,6 +126,7 @@ class DraftChainGraphRunner:
         self.dtype = dtype
         self.gamma = int(gamma)
         self.temperature = float(temperature)
+        self.top_p = float(top_p)
         self.bucket_size = int(bucket_size)
         self.cuda_graph_warmup = int(cuda_graph_warmup)
         self.fastpath = DraftFastpathRunner(
@@ -208,7 +211,7 @@ class DraftChainGraphRunner:
 
     def _chain_signature(self, active_prefix_length: int, model_inputs: dict) -> tuple:
         base = _cuda_graph_signature(active_prefix_length, model_inputs)
-        return ("draft_chain", self.gamma, self.temperature, base)
+        return ("draft_chain", self.gamma, self.temperature, self.top_p, base)
 
     def _sample_into(
         self,
@@ -216,11 +219,11 @@ class DraftChainGraphRunner:
         token_out: torch.Tensor,
         token_in: torch.Tensor,
     ) -> None:
-        """Philox-graphable temperature softmax + multinomial (no top-p)."""
+        """Philox-graphable temp+top-p sample (matches offline probe / rejection q)."""
         if self.temperature <= 1e-5:
             token_out.copy_(torch.argmax(logits_ws, dim=-1).view_as(token_out))
         else:
-            probs = F.softmax(logits_ws / self.temperature, dim=-1)
+            probs = apply_temp_top_p(logits_ws, self.temperature, self.top_p)
             sampled = torch.multinomial(probs, num_samples=1).view_as(token_out)
             token_out.copy_(sampled)
         token_in.copy_(token_out.view(1, 1))
@@ -450,7 +453,7 @@ class DraftChainGraphRunner:
             length=self.fastpath._cur_len,
             device=self._device,
         )
-        # q_probs from the proposal actually used in-graph (temp softmax, no top-p).
+        # q_probs must match the proposal distribution used in-graph (temp+top-p).
         pre = torch.empty(
             (self.gamma, self._vocab),
             device=self._device,
@@ -464,7 +467,7 @@ class DraftChainGraphRunner:
             q_probs = torch.zeros_like(pre)
             q_probs.scatter_(1, pre.argmax(dim=-1, keepdim=True), 1.0)
         else:
-            q_probs = F.softmax(pre / self.temperature, dim=-1)
+            q_probs = apply_temp_top_p(pre, self.temperature, self.top_p)
         logits_after = [self._logits_steps[i].clone() for i in range(self.gamma)]
         # Keep-KV: γ-th forward logits become next cycle seed.
         self._seed_logits.copy_(self._logits_ws)
@@ -492,6 +495,7 @@ class DraftChainGraphRunner:
                 "turbo_draft_chain_graph": True,
                 "turbo_draft_chain_gamma": self.gamma,
                 "turbo_draft_chain_temperature": self.temperature,
+                "turbo_draft_chain_top_p": self.top_p,
                 "turbo_draft_chain_captures": self.stats.chain_captures,
                 "turbo_draft_chain_replays": self.stats.chain_replays,
                 "turbo_draft_chain_hit_counters": dict(self.stats.hit_counters),

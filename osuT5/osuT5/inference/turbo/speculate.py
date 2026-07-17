@@ -6,9 +6,10 @@ Distribution-equivalent under rejection sampling; TIER1 required before ship.
 from __future__ import annotations
 
 import os
+import statistics
 import time
-from contextlib import nullcontext
-from typing import Any, Sequence
+from contextlib import contextmanager, nullcontext
+from typing import Any, Iterator, Sequence
 
 import torch
 from transformers import DynamicCache, LogitsProcessorList
@@ -98,6 +99,12 @@ def _align_decoder_mask(
     model_kwargs.pop("cache_position", None)
 
 
+def structural_processors_enabled() -> bool:
+    """§55: offline probe used temp/top-p only; set env=0 to match (§43 align)."""
+    raw = os.environ.get("MAPPERATORINATOR_TURBO_STRUCTURAL_PROCESSORS", "1").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
 def build_structural_processors(
     tokenizer,
     *,
@@ -113,6 +120,8 @@ def build_structural_processors(
             "(conditional temperature warper)."
         )
     processors = LogitsProcessorList()
+    if not structural_processors_enabled():
+        return processors
     processors.append(MonotonicTimeShiftLogitsProcessor(tokenizer))
     if timeshift_bias != 0:
         processors.append(
@@ -132,6 +141,19 @@ def build_structural_processors(
             )
         )
     return processors
+
+
+@contextmanager
+def _nvtx_phase(name: str, *, enabled: bool) -> Iterator[None]:
+    """Always-on NVTX for §55 scout phases (independent of detail_ranges)."""
+    if not enabled or not torch.cuda.is_available():
+        yield
+        return
+    torch.cuda.nvtx.range_push(f"mapperatorinator.turbo.{name}")
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 
 class _PhaseTimer:
@@ -202,6 +224,11 @@ class _PhaseTimer:
             ),
             "turbo_phase_ms_per_token": (
                 1000.0 * total / accepted_total if accepted_total else 0.0
+            ),
+            # §55: host rejection/commit bookkeeping = cycle glue (gate ≤0.4 ms).
+            "turbo_cycle_glue_ms_total": 1000.0 * self.host_s,
+            "turbo_cycle_glue_ms_per_verify": (
+                1000.0 * self.host_s / verify_steps if verify_steps else 0.0
             ),
         }
 
@@ -536,6 +563,7 @@ def speculative_generate_window(
         lookback_time=lookback_time,
         device=teacher.device,
     )
+    structural_on = structural_processors_enabled()
 
     # Persist StaticCache + verify_fp across windows (session); never rebuild
     # graph/bucket caches per window (§47/§52).
@@ -593,12 +621,20 @@ def speculative_generate_window(
     chain_runner: DraftChainGraphRunner | None = None
     if use_draft_chain:
         chain_runner = getattr(session, "draft_chain_runner", None)
-        if chain_runner is None or chain_runner.model is not draft:
+        need_new_chain = (
+            chain_runner is None
+            or chain_runner.model is not draft
+            or int(chain_runner.gamma) != int(gamma)
+            or float(chain_runner.temperature) != float(spec_temperature)
+            or float(chain_runner.top_p) != float(spec_top_p)
+        )
+        if need_new_chain:
             chain_runner = DraftChainGraphRunner(
                 draft,
                 dtype=draft_dtype,
                 gamma=int(gamma),
                 temperature=float(spec_temperature),
+                top_p=float(spec_top_p),
             )
             session.draft_chain_runner = chain_runner
     teacher_runtime = (
@@ -615,6 +651,7 @@ def speculative_generate_window(
     window_keep_kv_rewinds = 0
     window_draft_chain_cycles = 0
     window_draft_eager_cycles = 0
+    accepted_per_cycle: list[int] = []
 
     with teacher_runtime:
         teacher_last, teacher_mk = _prefill(
@@ -667,284 +704,292 @@ def speculative_generate_window(
                 and chain_runner is not None
                 and this_gamma == int(chain_runner.gamma)
             )
-            if used_chain_this_cycle:
-                (
-                    draft_ids,
-                    q_probs,
-                    draft_logits_after,
-                    _draft_tail_logits,
-                ) = chain_runner.replay_chain(seed_logits=draft_last)
-                # Truncate on EOS (chain does not early-stop in-graph).
-                trimmed: list[int] = []
-                trimmed_logits: list[torch.Tensor] = []
-                for i, tok in enumerate(draft_ids):
-                    trimmed.append(int(tok))
-                    trimmed_logits.append(draft_logits_after[i])
-                    if int(tok) in eos_ids:
-                        break
-                draft_ids = trimmed
-                draft_logits_after = trimmed_logits
-                q_probs = q_probs[: len(draft_ids)]
-                _draft_hit_eos = bool(draft_ids and int(draft_ids[-1]) in eos_ids)
-                window_draft_chain_cycles += 1
-            else:
-                if use_draft_chain and chain_runner is not None:
-                    chain_runner.stats.hit_counters["draft_chain_eager_fallback"] += 1
-                    # Resync eager DynamicCache from current sequences once.
-                    reset_self_cache(draft_cache)
-                    draft_mk["past_key_values"] = draft_cache
-                    draft_last, draft_mk = _prefill(
-                        draft, prompt_ids=sequences, model_kwargs=draft_mk
+            with _nvtx_phase("draft", enabled=step_profile):
+                if used_chain_this_cycle:
+                    (
+                        draft_ids,
+                        q_probs,
+                        draft_logits_after,
+                        _draft_tail_logits,
+                    ) = chain_runner.replay_chain(seed_logits=draft_last)
+                    # Truncate on EOS (chain does not early-stop in-graph).
+                    trimmed: list[int] = []
+                    trimmed_logits: list[torch.Tensor] = []
+                    for i, tok in enumerate(draft_ids):
+                        trimmed.append(int(tok))
+                        trimmed_logits.append(draft_logits_after[i])
+                        if int(tok) in eos_ids:
+                            break
+                    draft_ids = trimmed
+                    draft_logits_after = trimmed_logits
+                    q_probs = q_probs[: len(draft_ids)]
+                    _draft_hit_eos = bool(draft_ids and int(draft_ids[-1]) in eos_ids)
+                    window_draft_chain_cycles += 1
+                else:
+                    if use_draft_chain and chain_runner is not None:
+                        chain_runner.stats.hit_counters[
+                            "draft_chain_eager_fallback"
+                        ] += 1
+                        # Resync eager DynamicCache from current sequences once.
+                        reset_self_cache(draft_cache)
+                        draft_mk["past_key_values"] = draft_cache
+                        draft_last, draft_mk = _prefill(
+                            draft, prompt_ids=sequences, model_kwargs=draft_mk
+                        )
+                        if draft_mk.get("encoder_outputs") is not None:
+                            for _audio_key in ("frames", "inputs", "input_features"):
+                                draft_mk.pop(_audio_key, None)
+                    (
+                        draft_ids,
+                        q_probs,
+                        draft_mk,
+                        _draft_hit_eos,
+                        _draft_tail_logits,
+                        draft_logits_after,
+                    ) = _draft_k_tokens(
+                        draft,
+                        prompt_ids=sequences,
+                        last_logits=draft_last,
+                        model_kwargs=draft_mk,
+                        gamma=this_gamma,
+                        greedy=greedy,
+                        temperature=spec_temperature,
+                        top_p=spec_top_p,
+                        processors=processors,
+                        rng=rng,
+                        max_new_tokens=remaining,
+                        eos_ids=eos_ids,
                     )
-                    if draft_mk.get("encoder_outputs") is not None:
-                        for _audio_key in ("frames", "inputs", "input_features"):
-                            draft_mk.pop(_audio_key, None)
-                (
-                    draft_ids,
-                    q_probs,
-                    draft_mk,
-                    _draft_hit_eos,
-                    _draft_tail_logits,
-                    draft_logits_after,
-                ) = _draft_k_tokens(
-                    draft,
-                    prompt_ids=sequences,
-                    last_logits=draft_last,
-                    model_kwargs=draft_mk,
-                    gamma=this_gamma,
-                    greedy=greedy,
-                    temperature=spec_temperature,
-                    top_p=spec_top_p,
-                    processors=processors,
-                    rng=rng,
-                    max_new_tokens=remaining,
-                    eos_ids=eos_ids,
-                )
-                window_draft_eager_cycles += 1
+                    window_draft_eager_cycles += 1
             timer.add("draft")
             draft_calls += 1
             actual_gamma = len(draft_ids)
             occupied_end = L + actual_gamma
 
-            (
-                p_logits,
-                p_probs,
-                bonus_logits,
-                teacher_raw_after,
-                teacher_mk,
-                verify_fwd,
-            ) = _verify_draft_tokens(
-                teacher,
-                prompt_ids=sequences,
-                draft_ids=draft_ids,
-                last_logits=teacher_last,
-                model_kwargs=teacher_mk,
-                processors=processors,
-                greedy=greedy,
-                temperature=spec_temperature,
-                top_p=spec_top_p,
-                verify_fastpath=verify_fp,
-            )
+            with _nvtx_phase("verify", enabled=step_profile):
+                (
+                    p_logits,
+                    p_probs,
+                    bonus_logits,
+                    teacher_raw_after,
+                    teacher_mk,
+                    verify_fwd,
+                ) = _verify_draft_tokens(
+                    teacher,
+                    prompt_ids=sequences,
+                    draft_ids=draft_ids,
+                    last_logits=teacher_last,
+                    model_kwargs=teacher_mk,
+                    processors=processors,
+                    greedy=greedy,
+                    temperature=spec_temperature,
+                    top_p=spec_top_p,
+                    verify_fastpath=verify_fp,
+                )
             timer.add("verify")
             verify_steps += 1
             window_teacher_forwards += int(verify_fwd)
             window_teacher_verify_forwards += int(verify_fwd)
 
-            if greedy:
-                n_accepted = 0
-                residual = None
-                for i, tok in enumerate(draft_ids):
-                    teacher_tok = int(torch.argmax(p_logits[i]).item())
-                    if tok == teacher_tok:
-                        n_accepted += 1
-                    else:
-                        residual = teacher_tok
-                        break
-            else:
-                n_accepted, residual = reject_sample_prefix(
-                    p_probs=p_probs[:actual_gamma],
-                    q_probs=q_probs[:actual_gamma],
-                    draft_token_ids=draft_ids,
-                    rng=rng,
-                )
+            with _nvtx_phase("accept", enabled=step_profile):
+                if greedy:
+                    n_accepted = 0
+                    residual = None
+                    for i, tok in enumerate(draft_ids):
+                        teacher_tok = int(torch.argmax(p_logits[i]).item())
+                        if tok == teacher_tok:
+                            n_accepted += 1
+                        else:
+                            residual = teacher_tok
+                            break
+                else:
+                    n_accepted, residual = reject_sample_prefix(
+                        p_probs=p_probs[:actual_gamma],
+                        q_probs=q_probs[:actual_gamma],
+                        draft_token_ids=draft_ids,
+                        rng=rng,
+                    )
 
-            n_keep = min(n_accepted, remaining)
-            bonus_tok: int | None = None
-            residual_tok: int | None = None
-            if residual is not None and n_keep < remaining:
-                residual_tok = int(residual)
-            elif (
-                residual is None
-                and n_accepted == actual_gamma
-                and n_keep == actual_gamma
-                and n_keep < remaining
-                and not any(int(t) in eos_ids for t in draft_ids[:n_keep])
-            ):
-                bonus_prefix = torch.cat(
-                    [
-                        sequences,
-                        torch.tensor(
-                            [draft_ids],
-                            device=sequences.device,
-                            dtype=sequences.dtype,
-                        ),
-                    ],
-                    dim=-1,
-                )
-                bonus_processed = _apply_processors(
-                    processors,
-                    bonus_prefix,
-                    bonus_logits.unsqueeze(0),
-                ).squeeze(0)
-                bonus_tok, _ = _sample_from_logits(
-                    bonus_processed,
-                    greedy=greedy,
-                    temperature=spec_temperature,
-                    top_p=spec_top_p,
-                    rng=rng,
-                )
+                n_keep = min(n_accepted, remaining)
+                bonus_tok: int | None = None
+                residual_tok: int | None = None
+                if residual is not None and n_keep < remaining:
+                    residual_tok = int(residual)
+                elif (
+                    residual is None
+                    and n_accepted == actual_gamma
+                    and n_keep == actual_gamma
+                    and n_keep < remaining
+                    and not any(int(t) in eos_ids for t in draft_ids[:n_keep])
+                ):
+                    bonus_prefix = torch.cat(
+                        [
+                            sequences,
+                            torch.tensor(
+                                [draft_ids],
+                                device=sequences.device,
+                                dtype=sequences.dtype,
+                            ),
+                        ],
+                        dim=-1,
+                    )
+                    bonus_processed = _apply_processors(
+                        processors,
+                        bonus_prefix,
+                        bonus_logits.unsqueeze(0),
+                    ).squeeze(0)
+                    bonus_tok, _ = _sample_from_logits(
+                        bonus_processed,
+                        greedy=greedy,
+                        temperature=spec_temperature,
+                        top_p=spec_top_p,
+                        rng=rng,
+                    )
 
-            extra: list[int] = []
-            if residual_tok is not None:
-                extra.append(residual_tok)
-            elif bonus_tok is not None:
-                extra.append(int(bonus_tok))
+                extra: list[int] = []
+                if residual_tok is not None:
+                    extra.append(residual_tok)
+                elif bonus_tok is not None:
+                    extra.append(int(bonus_tok))
 
-            commit = list(draft_ids[:n_keep]) + extra
-            commit = commit[:remaining]
+                commit = list(draft_ids[:n_keep]) + extra
+                commit = commit[:remaining]
             if not commit:
                 raise RuntimeError("turbo speculative step committed zero tokens")
+            accepted_per_cycle.append(len(commit))
 
+            # Host gap = accept/reject/commit bookkeeping (cycle-glue; gate ≤0.4 ms).
             timer.add("host")
-            if canary_kv_mode:
-                # TIER1a canary: crop-to-L + full replay (aligned Q=1).
-                crop_self_cache(teacher_cache, L)
-                crop_self_cache(draft_cache, L)
-                _align_decoder_mask(teacher_mk, length=L, device=sequences.device)
-                _align_decoder_mask(draft_mk, length=L, device=sequences.device)
+            with _nvtx_phase("glue", enabled=step_profile):
+                if canary_kv_mode:
+                    # TIER1a canary: crop-to-L + full replay (aligned Q=1).
+                    crop_self_cache(teacher_cache, L)
+                    crop_self_cache(draft_cache, L)
+                    _align_decoder_mask(teacher_mk, length=L, device=sequences.device)
+                    _align_decoder_mask(draft_mk, length=L, device=sequences.device)
 
-                commit_t = torch.tensor(
-                    [commit], device=sequences.device, dtype=sequences.dtype
-                )
-                sequences = torch.cat([sequences, commit_t], dim=-1)
-                _align_decoder_mask(
-                    teacher_mk, length=int(sequences.shape[1]), device=sequences.device
-                )
-                _align_decoder_mask(
-                    draft_mk, length=int(sequences.shape[1]), device=sequences.device
-                )
-                if verify_fp is not None:
-                    teacher_last_local = teacher_last
-                    mk_rebuild = teacher_mk
-                    ids_rebuild = sequences[:, :L]
-                    for tok in commit:
-                        ids_rebuild = torch.cat(
-                            [
-                                ids_rebuild,
-                                torch.tensor(
-                                    [[int(tok)]],
-                                    device=sequences.device,
-                                    dtype=sequences.dtype,
-                                ),
-                            ],
-                            dim=-1,
+                    commit_t = torch.tensor(
+                        [commit], device=sequences.device, dtype=sequences.dtype
+                    )
+                    sequences = torch.cat([sequences, commit_t], dim=-1)
+                    _align_decoder_mask(
+                        teacher_mk, length=int(sequences.shape[1]), device=sequences.device
+                    )
+                    _align_decoder_mask(
+                        draft_mk, length=int(sequences.shape[1]), device=sequences.device
+                    )
+                    if verify_fp is not None:
+                        teacher_last_local = teacher_last
+                        mk_rebuild = teacher_mk
+                        ids_rebuild = sequences[:, :L]
+                        for tok in commit:
+                            ids_rebuild = torch.cat(
+                                [
+                                    ids_rebuild,
+                                    torch.tensor(
+                                        [[int(tok)]],
+                                        device=sequences.device,
+                                        dtype=sequences.dtype,
+                                    ),
+                                ],
+                                dim=-1,
+                            )
+                            teacher_out, mk_rebuild = verify_fp.forward_q1(
+                                decoder_input_ids=ids_rebuild,
+                                model_kwargs=mk_rebuild,
+                            )
+                            teacher_last_local = (
+                                teacher_out.logits[:, -1, :].float().squeeze(0).clone()
+                            )
+                            window_teacher_forwards += 1
+                            window_teacher_accepted_reforwards += 1
+                        teacher_mk = mk_rebuild
+                        teacher_last = teacher_last_local
+                    else:
+                        teacher_out, teacher_mk = _forward_decoder(
+                            teacher, decoder_input_ids=sequences, model_kwargs=teacher_mk
                         )
-                        teacher_out, mk_rebuild = verify_fp.forward_q1(
-                            decoder_input_ids=ids_rebuild,
-                            model_kwargs=mk_rebuild,
-                        )
-                        teacher_last_local = (
+                        teacher_last = (
                             teacher_out.logits[:, -1, :].float().squeeze(0).clone()
                         )
                         window_teacher_forwards += 1
-                        window_teacher_accepted_reforwards += 1
-                    teacher_mk = mk_rebuild
-                    teacher_last = teacher_last_local
-                else:
-                    teacher_out, teacher_mk = _forward_decoder(
-                        teacher, decoder_input_ids=sequences, model_kwargs=teacher_mk
+                        window_teacher_accepted_reforwards += len(commit)
+                    draft_out, draft_mk = _forward_decoder(
+                        draft, decoder_input_ids=sequences, model_kwargs=draft_mk
                     )
-                    teacher_last = (
-                        teacher_out.logits[:, -1, :].float().squeeze(0).clone()
-                    )
-                    window_teacher_forwards += 1
-                    window_teacher_accepted_reforwards += len(commit)
-                draft_out, draft_mk = _forward_decoder(
-                    draft, decoder_input_ids=sequences, model_kwargs=draft_mk
-                )
-                draft_last = draft_out.logits[:, -1, :].float().squeeze(0).clone()
-                window_draft_accepted_reforwards += len(commit)
-                timer.add("rebuild")
-            else:
-                # Sampled keep-accepted-KV: O(1) rewind; never re-forward accepted.
-                keep_len = L + n_keep
-                rewind_self_cache(
-                    teacher_cache, keep_len, occupied_end=occupied_end
-                )
-                if used_chain_this_cycle and chain_runner is not None:
-                    chain_runner.rewind_keep_kv(keep_len)
+                    draft_last = draft_out.logits[:, -1, :].float().squeeze(0).clone()
+                    window_draft_accepted_reforwards += len(commit)
+                    timer.add("rebuild")
                 else:
+                    # Sampled keep-accepted-KV: O(1) rewind; never re-forward accepted.
+                    keep_len = L + n_keep
                     rewind_self_cache(
-                        draft_cache, keep_len, occupied_end=occupied_end
+                        teacher_cache, keep_len, occupied_end=occupied_end
                     )
-                window_keep_kv_rewinds += 1
-                if n_keep > 0:
-                    keep_t = torch.tensor(
-                        [draft_ids[:n_keep]],
-                        device=sequences.device,
-                        dtype=sequences.dtype,
-                    )
-                    sequences = torch.cat([sequences, keep_t], dim=-1)
-                align_kwargs_after_rewind(
-                    teacher_mk, length=keep_len, device=sequences.device
-                )
-                if not (used_chain_this_cycle and chain_runner is not None):
+                    if used_chain_this_cycle and chain_runner is not None:
+                        chain_runner.rewind_keep_kv(keep_len)
+                    else:
+                        rewind_self_cache(
+                            draft_cache, keep_len, occupied_end=occupied_end
+                        )
+                    window_keep_kv_rewinds += 1
+                    if n_keep > 0:
+                        keep_t = torch.tensor(
+                            [draft_ids[:n_keep]],
+                            device=sequences.device,
+                            dtype=sequences.dtype,
+                        )
+                        sequences = torch.cat([sequences, keep_t], dim=-1)
                     align_kwargs_after_rewind(
-                        draft_mk, length=keep_len, device=sequences.device
+                        teacher_mk, length=keep_len, device=sequences.device
                     )
+                    if not (used_chain_this_cycle and chain_runner is not None):
+                        align_kwargs_after_rewind(
+                            draft_mk, length=keep_len, device=sequences.device
+                        )
 
-                if extra:
-                    extra_t = torch.tensor(
-                        [extra], device=sequences.device, dtype=sequences.dtype
-                    )
-                    sequences = torch.cat([sequences, extra_t], dim=-1)
-                    # q1 bucket from rolled-back length (+ appended extra).
-                    if verify_fp is not None:
-                        teacher_out, teacher_mk = verify_fp.forward_q1(
-                            decoder_input_ids=sequences,
-                            model_kwargs=teacher_mk,
+                    if extra:
+                        extra_t = torch.tensor(
+                            [extra], device=sequences.device, dtype=sequences.dtype
                         )
+                        sequences = torch.cat([sequences, extra_t], dim=-1)
+                        # q1 bucket from rolled-back length (+ appended extra).
+                        if verify_fp is not None:
+                            teacher_out, teacher_mk = verify_fp.forward_q1(
+                                decoder_input_ids=sequences,
+                                model_kwargs=teacher_mk,
+                            )
+                        else:
+                            teacher_out, teacher_mk = _forward_decoder(
+                                teacher,
+                                decoder_input_ids=sequences,
+                                model_kwargs=teacher_mk,
+                            )
+                        teacher_last = (
+                            teacher_out.logits[:, -1, :].float().squeeze(0).clone()
+                        )
+                        window_teacher_forwards += 1
+                        window_teacher_extra_q1 += 1
+                        if used_chain_this_cycle and chain_runner is not None:
+                            draft_last = chain_runner.fastpath.decode_token(int(extra[0]))
+                            chain_runner._seed_logits.copy_(draft_last.view(1, -1))
+                        else:
+                            draft_out, draft_mk = _forward_decoder(
+                                draft, decoder_input_ids=sequences, model_kwargs=draft_mk
+                            )
+                            draft_last = (
+                                draft_out.logits[:, -1, :].float().squeeze(0).clone()
+                            )
                     else:
-                        teacher_out, teacher_mk = _forward_decoder(
-                            teacher,
-                            decoder_input_ids=sequences,
-                            model_kwargs=teacher_mk,
-                        )
-                    teacher_last = (
-                        teacher_out.logits[:, -1, :].float().squeeze(0).clone()
-                    )
-                    window_teacher_forwards += 1
-                    window_teacher_extra_q1 += 1
-                    if used_chain_this_cycle and chain_runner is not None:
-                        draft_last = chain_runner.fastpath.decode_token(int(extra[0]))
-                        chain_runner._seed_logits.copy_(draft_last.view(1, -1))
-                    else:
-                        draft_out, draft_mk = _forward_decoder(
-                            draft, decoder_input_ids=sequences, model_kwargs=draft_mk
-                        )
-                        draft_last = (
-                            draft_out.logits[:, -1, :].float().squeeze(0).clone()
-                        )
-                else:
-                    if n_keep <= 0:
-                        raise RuntimeError(
-                            "keep-KV commit with n_keep==0 and no residual"
-                        )
-                    teacher_last = teacher_raw_after[n_keep - 1].float().clone()
-                    draft_last = draft_logits_after[n_keep - 1].float().clone()
-                    if used_chain_this_cycle and chain_runner is not None:
-                        chain_runner._seed_logits.copy_(draft_last.view(1, -1))
-                timer.add("rebuild")
+                        if n_keep <= 0:
+                            raise RuntimeError(
+                                "keep-KV commit with n_keep==0 and no residual"
+                            )
+                        teacher_last = teacher_raw_after[n_keep - 1].float().clone()
+                        draft_last = draft_logits_after[n_keep - 1].float().clone()
+                        if used_chain_this_cycle and chain_runner is not None:
+                            chain_runner._seed_logits.copy_(draft_last.view(1, -1))
+                    timer.add("rebuild")
             timer.steps += 1
 
             accepted_total += len(commit)
@@ -999,6 +1044,20 @@ def speculative_generate_window(
             "turbo_accepted_per_verify": (
                 accepted_total / verify_steps if verify_steps > 0 else 0.0
             ),
+            # §55: explicit in-loop E logging (per window / per cycle).
+            "turbo_E_accepted_per_verify": (
+                accepted_total / verify_steps if verify_steps > 0 else 0.0
+            ),
+            "turbo_E_mean_per_cycle": (
+                float(statistics.mean(accepted_per_cycle)) if accepted_per_cycle else 0.0
+            ),
+            "turbo_E_median_per_cycle": (
+                float(statistics.median(accepted_per_cycle))
+                if accepted_per_cycle
+                else 0.0
+            ),
+            "turbo_accepted_per_cycle": list(accepted_per_cycle),
+            "turbo_structural_processors": bool(structural_on),
             "turbo_prompt_tokens": prompt_len,
             "turbo_verify_fastpath": verify_fp is not None,
             "turbo_teacher_aligned_greedy": aligned_greedy,

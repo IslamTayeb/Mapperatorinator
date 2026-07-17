@@ -1,8 +1,9 @@
-"""Turbo runtime (Track C §52 integrator: §47+§49 path-hit scout).
+"""Turbo runtime (Track C §55 bank: multi-song draft + offline-aligned sampling).
 
-Immutable preset: §43 1-layer draft (K=1, γ=3, temp=0.9) + §49 graphed draft
-chain + §47 keep-KV + §48 graph-native verify (no grind). Not bit-exact.
-Campaign tip remains 55949274 / FP16 366.11.
+Immutable preset: §43 multi-song 2-layer draft (K=1, γ=5, temp/top-p 0.9) +
+§49 graphed draft chain (temp+top-p) + §47 keep-KV + graph-native verify.
+Structural processors opt-out via MAPPERATORINATOR_TURBO_STRUCTURAL_PROCESSORS=0
+to match §43 offline probe. Not bit-exact. Campaign tip remains 55949274 / 366.11.
 """
 from __future__ import annotations
 
@@ -16,10 +17,10 @@ import torch
 from ..engine_binding import InferenceEngineBinding
 from .draft import DEFAULT_DRAFT_CKPT_ENV, load_draft_from_ckpt
 from .rejection import apply_temp_top_p, reject_sample_prefix
-from .speculate import speculative_generate_window
+from .speculate import speculative_generate_window, structural_processors_enabled
 
-TURBO_PRESET_VERSION = "turbo-integrator-s52-kv-dg-v1"
-PRIMARY_GAMMA = 3
+TURBO_PRESET_VERSION = "turbo-integrator-s55-multsong-offline-v1"
+PRIMARY_GAMMA = 5
 
 
 @dataclass
@@ -97,6 +98,7 @@ class TurboRuntime:
             "turbo_top_p": self.preset.top_p,
             "turbo_draft_ckpt": self.draft_meta.get("ckpt_path"),
             "turbo_draft_init_layers": self.draft_meta.get("init_layers"),
+            "turbo_structural_processors": structural_processors_enabled(),
             "turbo_speculative_generate_window": (
                 "wired" if self.speculative_generate_wired else "scaffold_pending"
             ),
