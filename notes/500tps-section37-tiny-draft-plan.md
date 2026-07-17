@@ -1,6 +1,6 @@
 # §37 Tiny draft — plan (Track C)
 
-**Status:** OPEN — FIX smoke `50146230` E[acc]=**1.750** (1.3–1.8) → longer CE/KL train toward **≥1.8**.
+**Status:** OPEN — train `50146289` E[acc]=**2.921** → turbo scaffold @ `8a9e1e98` (speculative generate_window next; TIER1 before ship).
 **Tip:** `55949274` / FP16 **366.11** (unchanged). **No merge.** TIER1 required before any 500 / `turbo` claim.
 **Not this work:** §39 hybrid TIER3 (sibling); INT8-as-FP16.
 
@@ -45,3 +45,5 @@ If longer CE/KL lands **1.3≤E&lt;1.8**, do **not** open full turbo ship yet. N
 - Scripts: `utils/s37_build_distill_shards.py`, `utils/s37_tiny_draft_train_smoke.py`
 - Sbatch: `jobs/s37-tiny-draft-smoke.sbatch`, `jobs/s37-tiny-draft-train.sbatch`
 - Smoke: `/work/imt11/Mapperatorinator/runs/s37-tiny-draft-smoke-50146230/`
+- Train: `/work/imt11/Mapperatorinator/runs/s37-tiny-draft-train-50146289/` (E=2.921)
+- Turbo: `osuT5/osuT5/inference/turbo/` + `inference_engine=turbo`
