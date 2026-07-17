@@ -20,6 +20,8 @@ UNIQUE="$WORK/tmp/s57-train-$JOB"
 EXT="$WORK/torch_extensions/s57-train-$JOB"
 SHARDS_DIR=${S57_SHARDS_DIR:-$WORK/runs/s57-continuation-shards}
 RESUME=${S57_RESUME_CKPT:-$WORK/runs/s43-draft-quality-50147299/draft_multsong.pt}
+TRAIN_STEPS=${S57_TRAIN_STEPS:-3000}
+LR=${S57_LR:-3e-5}
 
 mkdir -p "$RUN_ROOT" "$UNIQUE" "$EXT" "$WORK/logs"
 export PATH="$ENV/bin:$PATH"
@@ -40,6 +42,8 @@ echo "commit=$(git rev-parse HEAD)"
 echo "branch=$(git branch --show-current)"
 echo "shards_dir=$SHARDS_DIR"
 echo "resume=$RESUME"
+echo "train_steps=$TRAIN_STEPS"
+echo "lr=$LR"
 nvidia-smi -L
 
 if [[ ! -f "$SHARDS_DIR/continuation_shards.json" ]]; then
@@ -59,8 +63,8 @@ fi
   --precision fp16 \
   --temperature 0.9 \
   --top-p 0.9 \
-  --train-steps 3000 \
-  --lr 3e-5 \
+  --train-steps "$TRAIN_STEPS" \
+  --lr "$LR" \
   --kl-weight 0.5 \
   --kl-temp 2.0 \
   --w-map0 1.0 \
