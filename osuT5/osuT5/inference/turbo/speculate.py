@@ -196,10 +196,11 @@ def _draft_k_tokens(
     rng: torch.Generator | None,
     max_new_tokens: int,
     eos_ids: set[int],
-) -> tuple[list[int], torch.Tensor, dict[str, Any], bool]:
+) -> tuple[list[int], torch.Tensor, dict[str, Any], bool, torch.Tensor]:
     """Autoregressive draft up to γ tokens.
 
-    Returns draft_ids, q_probs[γ,V], updated kwargs, stopped_on_eos.
+    Returns draft_ids, q_probs[γ,V], updated kwargs, stopped_on_eos,
+    logits after the last drafted token (or pre-EOS logits if stopped).
     """
     ids = prompt_ids
     probs_q: list[torch.Tensor] = []
@@ -229,7 +230,7 @@ def _draft_k_tokens(
 
     if not draft_ids:
         raise RuntimeError("draft produced zero tokens")
-    return draft_ids, torch.stack(probs_q, dim=0), mk, stopped
+    return draft_ids, torch.stack(probs_q, dim=0), mk, stopped, cur_logits
 
 
 def _verify_draft_tokens(
@@ -392,7 +393,7 @@ def speculative_generate_window(
         L = int(sequences.shape[1])
         this_gamma = min(int(gamma), remaining)
 
-        draft_ids, q_probs, draft_mk, _draft_hit_eos = _draft_k_tokens(
+        draft_ids, q_probs, draft_mk, _draft_hit_eos, draft_tail_logits = _draft_k_tokens(
             draft,
             prompt_ids=sequences,
             last_logits=draft_last,
@@ -440,13 +441,20 @@ def speculative_generate_window(
                 rng=rng,
             )
 
-        commit: list[int] = list(draft_ids[:n_accepted])
-        if residual is not None:
-            commit.append(int(residual))
-        elif n_accepted == actual_gamma and not any(
-            int(t) in eos_ids for t in commit
+        # Keep accepted draft KV prefix in teacher cache (L+n); only forward
+        # residual/bonus. Avoids crop-to-L + full replay drift.
+        n_keep = min(n_accepted, remaining)
+        bonus_tok: int | None = None
+        residual_tok: int | None = None
+        if residual is not None and n_keep < remaining:
+            residual_tok = int(residual)
+        elif (
+            residual is None
+            and n_accepted == actual_gamma
+            and n_keep == actual_gamma
+            and n_keep < remaining
+            and not any(int(t) in eos_ids for t in draft_ids[:n_keep])
         ):
-            # Bonus only when the full draft was accepted and did not end on EOS.
             bonus_prefix = torch.cat(
                 [
                     sequences,
@@ -468,21 +476,17 @@ def speculative_generate_window(
                 top_p=spec_top_p,
                 rng=rng,
             )
-            commit.append(bonus_tok)
 
-        if not commit:
+        if n_keep == 0 and residual_tok is None:
             raise RuntimeError("turbo speculative step committed zero tokens")
 
-        commit = commit[:remaining]
-
-        # Verify/draft wrote γ slots past L; roll back and materialize only commit.
-        crop_self_cache(teacher_cache, L)
-        crop_self_cache(draft_cache, L)
-        _align_decoder_mask(teacher_mk, length=L, device=sequences.device)
-        _align_decoder_mask(draft_mk, length=L, device=sequences.device)
-
-        commit_t = torch.tensor([commit], device=sequences.device, dtype=sequences.dtype)
-        sequences = torch.cat([sequences, commit_t], dim=-1)
+        crop_self_cache(teacher_cache, L + n_keep)
+        crop_self_cache(draft_cache, L + n_keep)
+        if n_keep > 0:
+            keep_t = torch.tensor(
+                [draft_ids[:n_keep]], device=sequences.device, dtype=sequences.dtype
+            )
+            sequences = torch.cat([sequences, keep_t], dim=-1)
         _align_decoder_mask(
             teacher_mk, length=int(sequences.shape[1]), device=sequences.device
         )
@@ -490,15 +494,42 @@ def speculative_generate_window(
             draft_mk, length=int(sequences.shape[1]), device=sequences.device
         )
 
-        teacher_out, teacher_mk = _forward_decoder(
-            teacher, decoder_input_ids=sequences, model_kwargs=teacher_mk
-        )
-        teacher_last = teacher_out.logits[:, -1, :].float().squeeze(0)
-        draft_out, draft_mk = _forward_decoder(
-            draft, decoder_input_ids=sequences, model_kwargs=draft_mk
-        )
-        draft_last = draft_out.logits[:, -1, :].float().squeeze(0)
+        extra: list[int] = []
+        if residual_tok is not None:
+            extra.append(residual_tok)
+        elif bonus_tok is not None:
+            extra.append(int(bonus_tok))
 
+        if extra:
+            extra_t = torch.tensor(
+                [extra], device=sequences.device, dtype=sequences.dtype
+            )
+            sequences = torch.cat([sequences, extra_t], dim=-1)
+            _align_decoder_mask(
+                teacher_mk, length=int(sequences.shape[1]), device=sequences.device
+            )
+            _align_decoder_mask(
+                draft_mk, length=int(sequences.shape[1]), device=sequences.device
+            )
+            teacher_out, teacher_mk = _forward_decoder(
+                teacher, decoder_input_ids=sequences, model_kwargs=teacher_mk
+            )
+            teacher_last = teacher_out.logits[:, -1, :].float().squeeze(0)
+            draft_out, draft_mk = _forward_decoder(
+                draft, decoder_input_ids=sequences, model_kwargs=draft_mk
+            )
+            draft_last = draft_out.logits[:, -1, :].float().squeeze(0)
+        else:
+            # No residual/bonus forward: caches already hold the kept prefix.
+            if n_keep == actual_gamma:
+                teacher_last = bonus_logits.float()
+                draft_last = draft_tail_logits.float()
+            else:
+                # n_keep < gamma without residual should not happen under Leviathan.
+                teacher_last = p_logits[n_keep].float()
+                draft_last = draft_tail_logits.float()
+
+        commit = list(draft_ids[:n_keep]) + extra
         accepted_total += len(commit)
         session.accepted_tokens_total += len(commit)
         session.verify_steps += 1
