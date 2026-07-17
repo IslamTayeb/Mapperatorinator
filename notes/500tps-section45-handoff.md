@@ -2,7 +2,7 @@
 
 **Status:** TIER1a PASS; FP16 scout PENDING (2026-07-17)  
 **Branch / WT:** `codex/turbo-integrator` @ `/work/projects/Mapperatorinator-worktrees/turbo-integrator`  
-**Integration tip:** `70599188` (CM fix `d7ed9f73`; base `7033d62f`)  
+**Integration tip:** `530cafe1` (CM fix `d7ed9f73`; base `7033d62f`)  
 **Campaign tip unchanged:** `55949274` / FP16 **366.11** — **no 500 claim** without full TIER1.
 
 ## Absorbs
