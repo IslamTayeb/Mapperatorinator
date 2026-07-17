@@ -2,7 +2,7 @@
 
 **Status:** TIER1a PENDING (2026-07-17)  
 **Branch / WT:** `codex/turbo-integrator` @ `/work/projects/Mapperatorinator-worktrees/turbo-integrator`  
-**Integration tip:** `d77ed6ee`
+**Integration tip:** `d7ed9f73`
 **Base tip:** `7033d62f` (`codex/turbo-verify-fastpath` — §41 canary@110 PASS / c_verify 1.686× MISS)  
 **Campaign tip unchanged:** `55949274` / FP16 **366.11** — **no 500 claim** without full TIER1.
 
@@ -36,7 +36,8 @@
 
 | Job | Role | Status |
 | --- | --- | --- |
-| `50148420` | TIER1a canary | PENDING |
+| `50148420` | TIER1a canary | FAILED (teacher_ctx reuse) |
+| `50148575` | TIER1a canary | PENDING (CM fix `d7ed9f73`) |
 | (pending) | FP16 perf scout | only after canary PASS |
 
 ## Not this lever
