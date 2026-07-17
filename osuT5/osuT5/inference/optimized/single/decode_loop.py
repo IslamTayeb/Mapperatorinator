@@ -8,7 +8,6 @@ from transformers.modeling_outputs import BaseModelOutput
 from ....runtime_profiling import profile_range
 from ..kernels.whole_token_step_cuda_graph import (
     record_whole_token_step_cuda_graph_hit,
-    set_whole_token_active_length_tensor,
     whole_token_step_cuda_graph_requested,
 )
 from .runtime_context import active_prefix_self_attention_context
@@ -158,24 +157,18 @@ def _capture_decode_cuda_graph(
     return graph, graph_outputs, time.perf_counter() - started
 
 
-def _capture_whole_token_step_cuda_graph(
-    model,
-    static_inputs: dict[str, Any],
+def _capture_whole_token_sample_cuda_graph(
     *,
-    active_prefix_length: int,
-    warmup: int,
-    logits_processor,
-    processor_input_ids: torch.Tensor,
-    logits_workspace: torch.Tensor,
+    scores_workspace: torch.Tensor,
     next_tokens: torch.Tensor,
     write_index: torch.Tensor,
     sequence: torch.Tensor,
     do_sample: bool,
-) -> tuple[torch.cuda.CUDAGraph, Any, float]:
-    """Capture forward + logits/sample/append (no per-token hard sync).
+) -> tuple[torch.cuda.CUDAGraph, float]:
+    """Capture softmax/multinomial/append against fixed workspaces.
 
-    ``processor_input_ids`` must be a fixed-shape tensor (the preallocated
-    sequence buffer). Growing active-prefix views are not CUDA-graph safe.
+    Logits processors stay eager on the growing active prefix (exact). This
+    graph only owns the fixed-shape sample + ``index_copy_`` tail.
     """
 
     if not torch.cuda.is_available():
@@ -186,43 +179,25 @@ def _capture_whole_token_step_cuda_graph(
         raise ValueError("next_tokens must be int64 shape [1]")
     if sequence.ndim != 2 or sequence.shape[0] != 1:
         raise ValueError("sequence must have shape [1, max_length]")
-    if processor_input_ids.shape != sequence.shape:
-        raise ValueError("processor_input_ids must match preallocated sequence shape")
+    if scores_workspace.ndim != 2 or scores_workspace.shape[0] != 1:
+        raise ValueError("scores_workspace must have shape [1, vocab]")
 
-    def _token_step() -> Any:
-        with active_prefix_self_attention_context(active_prefix_length):
-            graph_outputs = model(**static_inputs, return_dict=True)
-        last = graph_outputs.logits[:, -1, :]
-        if last.dtype == torch.float32:
-            logits_workspace.copy_(last)
-        else:
-            logits_workspace.copy_(last.to(dtype=torch.float32))
-        scores = logits_processor(processor_input_ids, logits_workspace)
+    def _sample_step() -> None:
         if do_sample:
-            probabilities = nn.functional.softmax(scores, dim=-1)
+            probabilities = nn.functional.softmax(scores_workspace, dim=-1)
             sampled = torch.multinomial(probabilities, num_samples=1).squeeze(1)
             next_tokens.copy_(sampled)
         else:
-            next_tokens.copy_(torch.argmax(scores, dim=-1))
+            next_tokens.copy_(torch.argmax(scores_workspace, dim=-1))
         sequence.index_copy_(1, write_index, next_tokens.unsqueeze(0))
-        return graph_outputs
 
     started = time.perf_counter()
-    capture_stream = torch.cuda.Stream()
-    capture_stream.wait_stream(torch.cuda.current_stream())
-    graph_outputs = None
-    with torch.cuda.stream(capture_stream):
-        for _ in range(max(int(warmup), 0)):
-            graph_outputs = _token_step()
-    torch.cuda.current_stream().wait_stream(capture_stream)
-
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        graph_outputs = _token_step()
-    # Capture execution already produced this step's sample/append. Do not
-    # replay here (would double-consume CUDA RNG). Later tokens replay only.
+        _sample_step()
+    # Capture execution already sampled/appended. Do not replay here.
     torch.cuda.synchronize()
-    return graph, graph_outputs, time.perf_counter() - started
+    return graph, time.perf_counter() - started
 
 
 def _cuda_graph_signature(
@@ -388,6 +363,11 @@ def active_prefix_decode_generate(
                             device=input_ids.device,
                             dtype=torch.float32,
                         ),
+                        "scores_workspace": torch.empty(
+                            (batch_size, vocab),
+                            device=input_ids.device,
+                            dtype=torch.float32,
+                        ),
                         "next_tokens": torch.empty(
                             (batch_size,),
                             device=input_ids.device,
@@ -399,11 +379,56 @@ def active_prefix_decode_generate(
                             dtype=torch.long,
                         ),
                     }
-                graph_key = (
-                    "whole_token_step",
+                # 1) Forward CUDA graph (same shape pinning as tip).
+                forward_key = (
+                    "whole_token_forward",
                     *_cuda_graph_signature(prefix_length, model_inputs),
                 )
-                graph_entry = graph_cache.get(graph_key)
+                forward_entry = graph_cache.get(forward_key)
+                if forward_entry is None:
+                    static_inputs = _clone_static_graph_inputs(model_inputs)
+                    with profile_range("generation.decode_graph_capture_setup"):
+                        graph, outputs, capture_seconds = _capture_decode_cuda_graph(
+                            model,
+                            static_inputs,
+                            active_prefix_length=prefix_length,
+                            warmup=cuda_graph_warmup,
+                        )
+                    forward_entry = {
+                        "graph": graph,
+                        "outputs": outputs,
+                        "static_inputs": static_inputs,
+                        "active_prefix_length": prefix_length,
+                        "capture_seconds": capture_seconds,
+                        "decode_replays": 0,
+                    }
+                    graph_cache[forward_key] = forward_entry
+                else:
+                    _copy_static_graph_inputs(
+                        forward_entry["static_inputs"],
+                        model_inputs,
+                    )
+                    with profile_range("generation.decode_graph_replay"):
+                        forward_entry["graph"].replay()
+                forward_entry["decode_replays"] += 1
+                outputs = forward_entry["outputs"]
+
+                # 2) Eager processors on the growing active prefix (exact).
+                last = outputs.logits[:, -1, :]
+                if last.dtype == torch.float32:
+                    whole_token_buffers["logits_workspace"].copy_(last)
+                else:
+                    whole_token_buffers["logits_workspace"].copy_(
+                        last.to(dtype=torch.float32)
+                    )
+                with profile_range("generation.logits_processors"):
+                    scores = logits_processor(
+                        sequence_state.active,
+                        whole_token_buffers["logits_workspace"],
+                    )
+                whole_token_buffers["scores_workspace"].copy_(scores)
+
+                # 3) Sample + index_copy_ CUDA graph on fixed workspaces.
                 write_at = int(sequence_state.length)
                 max_length = int(sequence_state.sequence.shape[1])
                 if write_at < 0 or write_at >= max_length:
@@ -412,24 +437,19 @@ def active_prefix_decode_generate(
                         f"{write_at} not in [0, {max_length})"
                     )
                 whole_token_buffers["write_index"].fill_(write_at)
-                # Processors must ignore the pad tail; bind the live write_index
-                # tensor so CUDA-graph replay sees the updated length each step.
-                set_whole_token_active_length_tensor(
-                    whole_token_buffers["write_index"]
+                sample_key = (
+                    "whole_token_sample",
+                    bool(generation_config.do_sample),
+                    vocab,
+                    max_length,
                 )
-                if graph_entry is None:
-                    static_inputs = _clone_static_graph_inputs(model_inputs)
+                sample_entry = graph_cache.get(sample_key)
+                if sample_entry is None:
                     with profile_range("generation.decode_graph_capture_setup"):
-                        graph, outputs, capture_seconds = (
-                            _capture_whole_token_step_cuda_graph(
-                                model,
-                                static_inputs,
-                                active_prefix_length=prefix_length,
-                                warmup=cuda_graph_warmup,
-                                logits_processor=logits_processor,
-                                processor_input_ids=sequence_state.sequence,
-                                logits_workspace=whole_token_buffers[
-                                    "logits_workspace"
+                        sample_graph, sample_capture_seconds = (
+                            _capture_whole_token_sample_cuda_graph(
+                                scores_workspace=whole_token_buffers[
+                                    "scores_workspace"
                                 ],
                                 next_tokens=whole_token_buffers["next_tokens"],
                                 write_index=whole_token_buffers["write_index"],
@@ -437,27 +457,18 @@ def active_prefix_decode_generate(
                                 do_sample=bool(generation_config.do_sample),
                             )
                         )
-                    graph_entry = {
-                        "graph": graph,
-                        "outputs": outputs,
-                        "static_inputs": static_inputs,
-                        "active_prefix_length": prefix_length,
-                        "capture_seconds": capture_seconds,
+                    sample_entry = {
+                        "graph": sample_graph,
+                        "capture_seconds": sample_capture_seconds,
                         "decode_replays": 0,
-                        "whole_token_step": True,
                     }
-                    graph_cache[graph_key] = graph_entry
+                    graph_cache[sample_key] = sample_entry
                 else:
-                    _copy_static_graph_inputs(
-                        graph_entry["static_inputs"],
-                        model_inputs,
-                    )
                     with profile_range("generation.decode_graph_replay"):
-                        graph_entry["graph"].replay()
-                graph_entry["decode_replays"] += 1
+                        sample_entry["graph"].replay()
+                sample_entry["decode_replays"] += 1
                 whole_token_hits += 1
                 record_whole_token_step_cuda_graph_hit()
-                outputs = graph_entry["outputs"]
                 used_whole_token_graph = True
             elif use_graph:
                 graph_key = _cuda_graph_signature(prefix_length, model_inputs)
