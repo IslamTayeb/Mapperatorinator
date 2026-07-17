@@ -286,9 +286,15 @@ def _generate_window(
         "pad_token_id",
         getattr(tokenizer, "pad_id", None),
     )
+    from ..kernels.active_prefix_exact_length import (
+        active_prefix_exact_length_requested,
+        effective_active_prefix_bucket_size,
+    )
+
+    _effective_bucket = effective_active_prefix_bucket_size(ACTIVE_PREFIX_BUCKET_SIZE)
     custom_generate = partial(
         active_prefix_decode_generate,
-        active_prefix_bucket_size=ACTIVE_PREFIX_BUCKET_SIZE,
+        active_prefix_bucket_size=_effective_bucket,
         cuda_graph_forward=True,
         cuda_graph_warmup=0,
         cuda_graph_min_decode_steps=1,
@@ -439,6 +445,16 @@ def _generate_window(
             else None
         ),
         "optimized_dispatch_capture_hits": dict(dispatch_counts),
+        "active_prefix_exact_length": {
+            "requested": active_prefix_exact_length_requested(),
+            "tip_default": int(ACTIVE_PREFIX_BUCKET_SIZE),
+            "effective": int(_effective_bucket),
+            "candidate_size": (
+                int(_effective_bucket)
+                if active_prefix_exact_length_requested()
+                else None
+            ),
+        },
         "decode_graph_count_before": graph_count_before,
         "decode_graph_count_after": int(getattr(context_state, "graph_count", 0)),
         "decode_graph_count_delta": (
