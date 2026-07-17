@@ -263,12 +263,18 @@ def collect_map_logits(
 
 
 def alphas_from_logit_pack(pack: dict[str, Any], temperature: float, top_p: float) -> list[float]:
+    """Per-position α; drop rows with non-finite teacher/draft logits."""
     alphas: list[float] = []
     for w in pack["windows"]:
-        p = apply_temp_top_p(w["logits_teacher"].float(), temperature, top_p)
-        q = apply_temp_top_p(w["logits_draft"].float(), temperature, top_p)
+        lt = w["logits_teacher"].float()
+        ld = w["logits_draft"].float()
+        finite = torch.isfinite(lt).all(dim=-1) & torch.isfinite(ld).all(dim=-1)
+        if int(finite.sum()) == 0:
+            continue
+        p = apply_temp_top_p(lt[finite], temperature, top_p)
+        q = apply_temp_top_p(ld[finite], temperature, top_p)
         a = acceptance_alpha(p, q)
-        alphas.extend(float(x) for x in a.tolist())
+        alphas.extend(float(x) for x in a.tolist() if x == x)  # finite
     return alphas
 
 
