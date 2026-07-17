@@ -1,49 +1,48 @@
 # §38 TIER2 fused decoder step — handoff
 
-**Status:** **OPEN** (rung-1b quality PASS on ~8k; expand 100k + microbench SUBMITTED) — 2026-07-17  
+**Status:** **STOP_NO_PROMOTE** (quality PASS; perf budget MISS) — 2026-07-17  
 **Branch / WT:** `codex/turbo-tier2-fused-step` @ `/work/projects/Mapperatorinator-worktrees/turbo-tier2-fused-step`  
-**Code tip:** see `git rev-parse HEAD` (fusion `24ee13bd`+)  
+**Code tip:** `03f8a494` (fusion `24ee13bd`)  
 **Base tip:** `55949274`  
-**Campaign tip unchanged:** `55949274` / FP16 **366.11** — **no 500 claim**; **no tip graduate**; **no merge**.
+**Campaign tip unchanged:** `55949274` / FP16 **366.11** — **no 500 claim**; **no tip graduate**; **no merge**; **no reciprocal**.
 
 
-## Rung 1b harvest (true 7-stage) — QUALITY PASS @ ~8k
+## Decision
 
-| Job | Prec | positions | max_rel | top1 | gates |
+| Gate | Result |
+| --- | --- |
+| TIER2 quality (max_rel≤1e-2 ∧ top1≥99.5% ∧ n≥100k) | **PASS** |
+| Perf budget ≥0.15 ms/token vs tip (before reciprocal) | **MISS** — saved **0.0069** ms/tok |
+| Promote / merge / 500 claim | **No** |
+
+**Revisit:** only with a deeper CUDA launch-collapse (true fewer kernels on **one-token decode**, not teacher-forced proxy) showing measured ≥0.15 ms/token. Do not bare-retry this Python 7-stage rearrange.
+
+
+## Quality evidence
+
+| Job | Prec | n | max_rel | top1 | gate |
 | --- | --- | --- | --- | --- | --- |
-| `50149619` | FP16 | 7809 | **0.0** | **1.0** | rel+top1 **PASS**; 100k pending |
-| `50149620` | FP32 | 7809 | **0.0** | **1.0** | rel+top1 **PASS**; 100k pending |
-| Code | `24ee13bd` | | | | `quality_gate_looks_reachable=true` |
-| Artifact | `/work/imt11/Mapperatorinator/runs/s38-tier2-logit-agreement-{fp16,fp32}-$JOB/` | | | | |
+| `50149619` | FP16 | 7809 | 0.0 | 1.0 | rel+top1 PASS |
+| `50149620` | FP32 | 7809 | 0.0 | 1.0 | rel+top1 PASS |
+| `50149733` | FP16 | **102055** | **0.0** | **1.0** | **tier2_quality_gate_pass=true** (9× lambada hybrid seeds) |
 
-## Prior rung 1a (blanket wrap — superseded FAIL)
+Artifacts: `/work/imt11/Mapperatorinator/runs/s38-tier2-logit-agreement-*` / `s38-tier2-logit-100k-fp16-50149733/`.
 
-| Job | Prec | Result |
-| --- | --- | --- |
-| `50149339` | FP16 | top1 0.9983; max_rel **30384** FAIL |
-| `50149340` | FP32 | top1 1.0; max_rel **179** FAIL |
 
-## Live follow-ups
+## Perf evidence
 
-| Job | Purpose | Status |
-| --- | --- | --- |
-| `50149733` | Expand ≥100k (lambada seeds) | SUBMITTED @ `6e6af371` |
-| `50149734` | Microbench ≥0.15 ms/token | SUBMITTED @ `6e6af371` |
+| Job | Prec | tip ms/tok | turbo ms/tok | saved | budget |
+| --- | --- | --- | --- | --- | --- |
+| `50149734` | FP16 | 0.1005 | 0.0936 | **0.0069** | need ≥0.15 → **MISS** |
 
-## Implementation (`24ee13bd`)
+Note: teacher-forced full-seq proxy (`use_cache=False`). One-token decode microbench preferred on revisit.
 
-7-stage patched `VarWhisperDecoderLayer.forward` behind turbo only:
-norm+Wqkv → q1 → Wo+res → cross → fc1 → fc2+res → glue.  
-One-token uses tip native CUDA (fp32 reductions). Multi-token storage-dtype / module norms (teacher-forced matched tip → max_rel 0).  
-Preset `turbo-tier2-fused-step-s38-v2`. Optimized default untouched.
 
-## Wake / next
+## Superseded
 
-1. Harvest 100k + microbench jobs.
-2. If 100k quality PASS **and** microbench ≥0.15 ms/tok → reciprocal / TIER1c path.
-3. If microbench MISS → STOP budget; keep quality evidence; revisit with deeper CUDA fusion.
-4. Tip stays `55949274` / **366.11**.
+Rung 1a blanket fp32 Linear wrap (`50149339`/`50149340`) — top1 PASS, max_rel FAIL — not true fusion.
+
 
 ## Not this lever
 
-§39 hybrid / `turbo_mixed`; speculative re-open; INT8-as-FP16; merge to main.
+§39 hybrid / `turbo_mixed`; speculative re-open; INT8-as-FP16; merge; reciprocal without ≥0.15 ms/tok.

@@ -230,7 +230,7 @@ Packaging note: `notes/exact-shared-runtime-packaging.md`. Exactness sealed. **N
 | **§35** | Layer-skip acceptance probe (cheap; FIRST) | **DONE** — E[acc]=**1.014** → **GO_SECTION_37** (`50145885`) |
 | **§36** | Turbo speculative runtime (tiny-draft draft+verify) | **OPEN** — scout **`50147054`** harvested main_tps **11.94** (directional); TIER1a → §40 |
 | **§37** | Tiny draft (2-layer CE/KL) → turbo runtime | **OPEN** — tip `3bfd7bdb`; train **`50146289`** E=**2.921**; speculative generate_window wired |
-| **§38** | Tier-2 relaxed fused decoder step (7-kernel; fp32 acc) | **OPEN** — `24ee13bd` / rung-1b jobs `50149619`/`50149620` |
+| **§38** | Tier-2 relaxed fused decoder step (7-kernel; fp32 acc) | **STOP_NO_PROMOTE** — quality PASS (`50149733` n=102k); microbench MISS 0.0069≪0.15 (`50149734`) |
 | **§44** | TIER1 evidence pack harness (30×3 + KS + canary) | **HARNESS READY** — `codex/turbo-tier1-harness` / `scripts/run_tier1_evidence_pack.sh` (GPU execute deferred; no 500 claim; §39 not duplicated) |
 | **§40** | TIER1a canary fix (mismatch@110) | **STOP_ESCALATE** — cross-engine FP16 numerics (`50147276`); → **§41** |
 | **§41** | Verify fastpath + graph-aligned teacher (W2) | **PARTIAL** — tip `7033d62f`; c_verify **1.686×** MISS (`50147970`); canary@110 **PASS** (`50148210`) |

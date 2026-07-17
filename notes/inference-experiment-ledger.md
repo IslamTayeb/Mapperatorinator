@@ -28,3 +28,5 @@ idea merely because its isolated number was promising.
 Historical artifact hashes, intermediate failures, and per-job commands are
 evidence, not standing instructions. Use Git history only when auditing a
 specific old decision.
+
+**§38 TIER2 fused step — STOP_NO_PROMOTE**: quality PASS (`50149733` n=102055 max_rel=0 top1=1.0); microbench MISS saved 0.0069≪0.15 ms/tok (`50149734`). Tip still `55949274` / **366.11**. Handoff: `notes/500tps-section38-handoff.md`.

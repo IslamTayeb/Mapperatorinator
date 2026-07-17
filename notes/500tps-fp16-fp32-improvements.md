@@ -908,19 +908,19 @@ Primary path to 500 under the scope ruling. Bit-exact Track A remains valid but 
 | Not this lever | §39 sibling; INT8-as-FP16 |
 | Ledger rule | Own section only |
 
-## 38. Tier-2 relaxed fused decoder step — **OPEN**
+## 38. Tier-2 relaxed fused decoder step — **STOP_NO_PROMOTE**
 
 | Field | Value |
 | --- | --- |
-| What | TIER2 relaxed-numerics fused decoder step (7-kernel layer: norm+Wqkv, q1, Wo+res, cross block, fc1, fc2+res, glue; fp32 accumulate) behind `inference_engine=turbo` |
-| Status | **OPEN** — rung-1b true 7-stage fusion probe SUBMITTED |
-| Branch / WT | `codex/turbo-tier2-fused-step` / `turbo-tier2-fused-step` (base `55949274`; tip `24ee13bd`) |
-| Budget claim | ≥**0.15 ms/token** from collapsing ~**400** launches/glue/token (nsight `49966210`: elem+mem ~30% / ~0.64 ms; gemm_gemv ~26%; q1 ~19%; fused MLP ~15%) before full reciprocal |
-| Rung 1a | Blanket fp32 Linear wrap — FP16 `50149339` / FP32 `50149340` @ `c77aab55`: top1 PASS; max_rel **FAIL** (superseded) |
-| Rung 1b | True 7-stage — FP16 `50149619` / FP32 `50149620` @ `24ee13bd`: max_rel **0** / top1 **1.0** / n=7809 (**PASS** quality; 100k pending) |
-| Rung 1c | Expand ≥100k `50149733` + microbench `50149734` @ `6e6af371` **SUBMITTED** |
-| Quality gates | max rel logit Δ ≤1e-2 AND top-1 ≥99.5% over ≥100k positions; then TIER1(c) 30-seed KS + gallery |
-| Perf gate | ≥5% vs tip then →500; song wall wins |
+| What | TIER2 relaxed-numerics fused decoder step (7-kernel layer: norm+Wqkv, q1, Wo+res, cross block, fc1, fc2+res, glue; fp32 reductions) behind `inference_engine=turbo` |
+| Status | **STOP_NO_PROMOTE** — TIER2 quality **PASS**; perf budget **MISS** |
+| Branch / WT | `codex/turbo-tier2-fused-step` / tip `03f8a494` (fusion `24ee13bd`; base `55949274`) |
+| Rung 1a | Blanket fp32 Linear wrap — `50149339`/`50149340` @ `c77aab55`: top1 PASS; max_rel **FAIL** (superseded) |
+| Rung 1b | True 7-stage — `50149619`/`50149620` @ `24ee13bd`: max_rel **0** / top1 **1.0** / n=7809 |
+| Rung 1c quality | `50149733` FP16: n=**102055**; max_rel **0**; top1 **1.0** → **tier2_quality_gate_pass=true** |
+| Microbench | `50149734` FP16 proxy: tip 0.1005 → turbo 0.0936 ms/tok; saved **0.0069 ≪ 0.15** → **MISS** |
+| Decision | **STOP_NO_PROMOTE** — do not reciprocal; tip stays `55949274` / **366.11** |
+| Revisit | Deeper one-token CUDA launch-collapse with measured ≥0.15 ms/tok — not bare-retry Python rearrange |
 | Optimized default | **unchanged** (bit-exact) |
 | Campaign tip | still `55949274` / FP16 **366.11** — **no 500 claim**; **no merge** |
 | Handoff | `notes/500tps-section38-handoff.md` |
