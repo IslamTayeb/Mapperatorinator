@@ -917,7 +917,8 @@ Primary path to 500 under the scope ruling. Bit-exact Track A remains valid but 
 | Branch / WT | `codex/turbo-tier2-fused-step` / `turbo-tier2-fused-step` (base `55949274`; tip `24ee13bd`) |
 | Budget claim | ≥**0.15 ms/token** from collapsing ~**400** launches/glue/token (nsight `49966210`: elem+mem ~30% / ~0.64 ms; gemm_gemv ~26%; q1 ~19%; fused MLP ~15%) before full reciprocal |
 | Rung 1a | Blanket fp32 Linear wrap — FP16 `50149339` / FP32 `50149340` @ `c77aab55`: top1 PASS; max_rel **FAIL** (superseded) |
-| Rung 1b | True 7-stage fused layer — FP16 `50149619` / FP32 `50149620` @ `24ee13bd` **SUBMITTED** |
+| Rung 1b | True 7-stage — FP16 `50149619` / FP32 `50149620` @ `24ee13bd`: max_rel **0** / top1 **1.0** / n=7809 (**PASS** quality; 100k pending) |
+| Rung 1c | Expand ≥100k `50149733` + microbench `50149734` @ `6e6af371` **SUBMITTED** |
 | Quality gates | max rel logit Δ ≤1e-2 AND top-1 ≥99.5% over ≥100k positions; then TIER1(c) 30-seed KS + gallery |
 | Perf gate | ≥5% vs tip then →500; song wall wins |
 | Optimized default | **unchanged** (bit-exact) |

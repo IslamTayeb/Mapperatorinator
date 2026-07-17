@@ -25,10 +25,10 @@
 
 ## Live follow-ups
 
-| Job / script | Purpose |
-| --- | --- |
-| `jobs/s38-tier2-logit-100k.sbatch` | Expand ≥100k via lambada hybrid seeds (forced tokens) |
-| `jobs/s38-tier2-microbench.sbatch` | ≥0.15 ms/token budget smoke vs tip |
+| Job | Purpose | Status |
+| --- | --- | --- |
+| `50149733` | Expand ≥100k (lambada seeds) | SUBMITTED @ `6e6af371` |
+| `50149734` | Microbench ≥0.15 ms/token | SUBMITTED @ `6e6af371` |
 
 ## Implementation (`24ee13bd`)
 
