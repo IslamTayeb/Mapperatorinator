@@ -3,10 +3,17 @@ from typing import Any
 
 import torch
 from torch import nn
+from transformers.generation.logits_process import (
+    TemperatureLogitsWarper,
+    TopPLogitsWarper,
+)
+from transformers.generation.logits_process import LogitsProcessorList
 from transformers.modeling_outputs import BaseModelOutput
 
 from ....runtime_profiling import profile_range
 from .runtime_context import active_prefix_self_attention_context
+
+_SAMPLING_WARPER_TYPES = (TemperatureLogitsWarper, TopPLogitsWarper)
 
 
 def _bucketed_prefix_length(cur_len: int, bucket_size: int, max_cache_len: int) -> int:
@@ -123,6 +130,77 @@ def _capture_decode_cuda_graph(
     return graph, graph_outputs, time.perf_counter() - started
 
 
+def _split_sampling_warpers(
+    logits_processor,
+) -> tuple[LogitsProcessorList, list[Any]]:
+    """Move Temperature/TopP warpers into the sampling-tail graph."""
+
+    eager = LogitsProcessorList()
+    sampling: list[Any] = []
+    for processor in logits_processor:
+        if isinstance(processor, _SAMPLING_WARPER_TYPES):
+            sampling.append(processor)
+        else:
+            eager.append(processor)
+    return eager, sampling
+
+
+def _capture_sampling_tail_cuda_graph(
+    *,
+    scores_workspace: torch.Tensor,
+    next_tokens: torch.Tensor,
+    dummy_input_ids: torch.Tensor,
+    sampling_warpers: list[Any],
+    do_sample: bool,
+) -> tuple[torch.cuda.CUDAGraph, float]:
+    """Capture temp+top-p+softmax/multinomial with Philox-safe generator state.
+
+    Capture is warmup only: register the default CUDA generator, restore RNG
+    after capture, and let the caller always ``replay()`` so the first real
+    token matches eager Philox (§29b / smoke ``50145494``).
+    """
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("sampling-tail CUDA graph requires CUDA")
+    if next_tokens.shape != (1,) or next_tokens.dtype != torch.long:
+        raise ValueError("next_tokens must be int64 shape [1]")
+    if scores_workspace.ndim != 2 or scores_workspace.shape[0] != 1:
+        raise ValueError("scores_workspace must have shape [1, vocab]")
+    if dummy_input_ids.shape[0] != 1:
+        raise ValueError("dummy_input_ids must have batch size 1")
+    if scores_workspace.device != next_tokens.device:
+        raise ValueError("scores_workspace and next_tokens must share a device")
+    if scores_workspace.device.type != "cuda":
+        raise RuntimeError("sampling-tail graph requires CUDA tensors")
+
+    def _sample_step() -> None:
+        scores = scores_workspace
+        for warper in sampling_warpers:
+            scores = warper(dummy_input_ids, scores)
+        if do_sample:
+            probabilities = nn.functional.softmax(scores, dim=-1)
+            sampled = torch.multinomial(probabilities, num_samples=1).squeeze(1)
+            next_tokens.copy_(sampled)
+        else:
+            next_tokens.copy_(torch.argmax(scores, dim=-1))
+
+    started = time.perf_counter()
+    device = scores_workspace.device
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    generator = torch.cuda.default_generators[device_index]
+    rng_before = torch.cuda.get_rng_state(device)
+
+    graph = torch.cuda.CUDAGraph()
+    graph.register_generator_state(generator)
+    with torch.cuda.graph(graph):
+        _sample_step()
+    torch.cuda.set_rng_state(rng_before, device)
+    torch.cuda.synchronize()
+    return graph, time.perf_counter() - started
+
+
 def _cuda_graph_signature(
     active_prefix_length: int,
     model_inputs: dict[str, Any],
@@ -155,6 +233,8 @@ def active_prefix_decode_generate(
     shared_graph_cache: dict[tuple[Any, ...], dict[str, Any]] | None = None,
     stable_encoder_holder: dict[str, BaseModelOutput] | None = None,
     preallocated_batch1_state: bool = False,
+    pinned_eos_flag: bool = False,
+    sampling_tail_cuda_graph: bool = False,
     **model_kwargs,
 ) -> torch.LongTensor:
     """Fixed-batch HF loop with persistent active-prefix CUDA graphs."""
@@ -185,6 +265,17 @@ def active_prefix_decode_generate(
     )
     batch_size, cur_len = input_ids.shape[:2]
     sequence_state = None
+    use_sampling_tail = bool(sampling_tail_cuda_graph)
+    if use_sampling_tail and not preallocated_batch1_state:
+        raise RuntimeError(
+            "sampling-tail CUDA graph requires preallocated batch-one sequence state"
+        )
+    if use_sampling_tail and not cuda_graph_forward:
+        raise RuntimeError(
+            "sampling-tail CUDA graph requires cuda_graph_forward=True"
+        )
+    if pinned_eos_flag and not preallocated_batch1_state:
+        raise RuntimeError("pinned EOS flag requires preallocated batch-one state")
     if preallocated_batch1_state:
         if batch_size != 1:
             raise ValueError(
@@ -197,6 +288,7 @@ def active_prefix_decode_generate(
         sequence_state = allocate_batch_one_sequence_state(
             input_ids,
             stopping_criteria,
+            pinned_eos=pinned_eos_flag,
         )
         input_ids = sequence_state.active
     if batch_size > 1:
@@ -226,9 +318,21 @@ def active_prefix_decode_generate(
     is_prefill = True
     scores = None
     decode_steps = 0
+    # Forward + sampling-tail graphs share the session cache so capture is
+    # amortized across windows (the §29 failure mode was per-window teardown).
     graph_cache = shared_graph_cache if shared_graph_cache is not None else {}
     this_peer_finished = False
     unfinished = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
+
+    eager_processors = logits_processor
+    sampling_warpers: list[Any] = []
+    if use_sampling_tail:
+        eager_processors, sampling_warpers = _split_sampling_warpers(logits_processor)
+        from ..kernels.sampling_tail_cuda_graph import (
+            record_sampling_tail_cuda_graph_hit,
+        )
+
+    sampling_tail_hits = 0
 
     while model._has_unfinished_sequences(
         this_peer_finished,
@@ -308,13 +412,82 @@ def active_prefix_decode_generate(
                 dtype=torch.float32,
                 device=input_ids.device,
             )
-            next_scores = logits_processor(input_ids, next_logits)
-        with profile_range("generation.sampling"):
-            if generation_config.do_sample:
-                probabilities = nn.functional.softmax(next_scores, dim=-1)
-                next_tokens = torch.multinomial(probabilities, num_samples=1).squeeze(1)
+            next_scores = eager_processors(input_ids, next_logits)
+
+        if use_sampling_tail:
+            assert sequence_state is not None
+            vocab = int(next_scores.shape[-1])
+            do_sample = bool(generation_config.do_sample)
+            # Session-static workspaces live in shared_graph_cache so capture is
+            # amortized across windows (address-safe; not per-window buffers).
+            sample_key = (
+                "sampling_tail",
+                do_sample,
+                vocab,
+                tuple(type(warper).__name__ for warper in sampling_warpers),
+                tuple(
+                    getattr(warper, "top_p", None) for warper in sampling_warpers
+                ),
+                tuple(
+                    getattr(warper, "temperature", None)
+                    for warper in sampling_warpers
+                ),
+                str(input_ids.device),
+            )
+            sample_entry = graph_cache.get(sample_key)
+            if sample_entry is None:
+                scores_workspace = torch.empty(
+                    (batch_size, vocab),
+                    device=input_ids.device,
+                    dtype=torch.float32,
+                )
+                next_tokens_buf = torch.empty(
+                    (batch_size,),
+                    device=input_ids.device,
+                    dtype=torch.long,
+                )
+                dummy_input_ids = input_ids.new_zeros((batch_size, 1))
+                scores_workspace.copy_(next_scores)
+                with profile_range("generation.decode_graph_capture_setup"):
+                    sample_graph, sample_capture_seconds = (
+                        _capture_sampling_tail_cuda_graph(
+                            scores_workspace=scores_workspace,
+                            next_tokens=next_tokens_buf,
+                            dummy_input_ids=dummy_input_ids,
+                            sampling_warpers=sampling_warpers,
+                            do_sample=do_sample,
+                        )
+                    )
+                sample_entry = {
+                    "kind": "sampling_tail",
+                    "graph": sample_graph,
+                    "scores_workspace": scores_workspace,
+                    "next_tokens": next_tokens_buf,
+                    "dummy_input_ids": dummy_input_ids,
+                    "sampling_warpers": sampling_warpers,
+                    "capture_seconds": sample_capture_seconds,
+                    "decode_replays": 0,
+                    "active_prefix_length": -1,
+                }
+                graph_cache[sample_key] = sample_entry
             else:
-                next_tokens = torch.argmax(next_scores, dim=-1)
+                sample_entry["scores_workspace"].copy_(next_scores)
+            with profile_range("generation.sampling"):
+                # Always replay: capture was Philox warmup only.
+                sample_entry["graph"].replay()
+            next_tokens = sample_entry["next_tokens"]
+            sample_entry["decode_replays"] += 1
+            sampling_tail_hits += 1
+            record_sampling_tail_cuda_graph_hit()
+        else:
+            with profile_range("generation.sampling"):
+                if generation_config.do_sample:
+                    probabilities = nn.functional.softmax(next_scores, dim=-1)
+                    next_tokens = torch.multinomial(
+                        probabilities, num_samples=1
+                    ).squeeze(1)
+                else:
+                    next_tokens = torch.argmax(next_scores, dim=-1)
 
         with profile_range("generation.token_append_and_stopping"):
             if sequence_state is not None:
@@ -322,7 +495,9 @@ def active_prefix_decode_generate(
                 cur_len = sequence_state.length
             else:
                 if has_eos:
-                    next_tokens = next_tokens * unfinished + pad_token_id * (1 - unfinished)
+                    next_tokens = next_tokens * unfinished + pad_token_id * (
+                        1 - unfinished
+                    )
                 input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
                 stopped = stopping_criteria(input_ids, scores)
                 if not isinstance(stopped, torch.Tensor) or tuple(stopped.shape) != (
@@ -336,4 +511,8 @@ def active_prefix_decode_generate(
                 cur_len += 1
         del outputs
 
+    if use_sampling_tail and decode_steps > 0 and sampling_tail_hits <= 0:
+        raise RuntimeError(
+            "sampling-tail CUDA graph requested but recorded zero replays"
+        )
     return input_ids

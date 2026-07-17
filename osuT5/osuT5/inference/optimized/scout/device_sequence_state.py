@@ -4,6 +4,9 @@ The accepted decoder loop deliberately remains the default.  This module owns
 only a narrow experiment which replaces per-token ``torch.cat`` and generic
 Transformers stopping dispatch with fixed-address token storage plus the exact
 EOS/max-length policy used by optimized single-song generation.
+
+§46 adds an optional pinned-host EOS flag: device-side EOS match is copied to
+pinned memory with a recorded event instead of ``unfinished.max() == 0``.
 """
 
 from __future__ import annotations
@@ -77,7 +80,7 @@ class BatchOneStoppingPolicy:
             max_length=max_length,
         )
 
-    def stopped(self, next_tokens: torch.Tensor, *, next_length: int) -> bool:
+    def eos_hit_device(self, next_tokens: torch.Tensor) -> torch.Tensor:
         if (
             not isinstance(next_tokens, torch.Tensor)
             or next_tokens.shape != (1,)
@@ -86,6 +89,9 @@ class BatchOneStoppingPolicy:
             raise ValueError("next_tokens must have shape [1] and torch.long dtype")
         if next_tokens.device != self.eos_token_ids.device:
             raise ValueError("next_tokens and EOS ids must share a device")
+        return (next_tokens[:, None] == self.eos_token_ids[None, :]).any(dim=-1)
+
+    def stopped(self, next_tokens: torch.Tensor, *, next_length: int) -> bool:
         if isinstance(next_length, bool) or not isinstance(next_length, int):
             raise TypeError("next_length must be an integer")
         if next_length <= 0 or next_length > self.max_length:
@@ -94,7 +100,41 @@ class BatchOneStoppingPolicy:
             return True
         # Equality against the tiny fixed EOS vector preserves EosTokenCriteria
         # semantics without invoking torch.isin.
-        return bool((next_tokens[:, None] == self.eos_token_ids[None, :]).any())
+        return bool(self.eos_hit_device(next_tokens).item())
+
+
+@dataclass(slots=True)
+class PinnedEosFlag:
+    """Device→pinned host EOS/max-length flag with event sync (no .max()==0)."""
+
+    device_flag: torch.Tensor
+    host_flag: torch.Tensor
+    event: torch.cuda.Event
+
+    @classmethod
+    def allocate(cls, device: torch.device) -> "PinnedEosFlag":
+        if device.type != "cuda":
+            raise RuntimeError("pinned EOS flag requires a CUDA device")
+        return cls(
+            device_flag=torch.zeros((1,), dtype=torch.bool, device=device),
+            host_flag=torch.zeros((1,), dtype=torch.bool, pin_memory=True),
+            event=torch.cuda.Event(),
+        )
+
+    def publish(self, stopped_device: torch.Tensor) -> None:
+        if (
+            not isinstance(stopped_device, torch.Tensor)
+            or stopped_device.numel() != 1
+            or stopped_device.dtype != torch.bool
+        ):
+            raise ValueError("stopped_device must be a bool tensor with one element")
+        self.device_flag.copy_(stopped_device.reshape(1))
+        self.host_flag.copy_(self.device_flag, non_blocking=True)
+        self.event.record()
+
+    def read(self) -> bool:
+        self.event.synchronize()
+        return bool(self.host_flag.item())
 
 
 @dataclass(slots=True)
@@ -102,6 +142,7 @@ class BatchOneSequenceState:
     sequence: torch.Tensor
     length: int
     stopping_policy: BatchOneStoppingPolicy
+    pinned_eos: PinnedEosFlag | None = None
 
     @classmethod
     def allocate(
@@ -109,6 +150,7 @@ class BatchOneSequenceState:
         input_ids: torch.Tensor,
         *,
         stopping_policy: BatchOneStoppingPolicy,
+        pinned_eos: bool = False,
     ) -> "BatchOneSequenceState":
         if not isinstance(input_ids, torch.Tensor):
             raise TypeError("input_ids must be a tensor")
@@ -125,10 +167,14 @@ class BatchOneSequenceState:
             raise ValueError("prompt length must be smaller than max_length")
         sequence = input_ids.new_empty((1, stopping_policy.max_length))
         sequence[:, :prompt_length].copy_(input_ids)
+        flag = None
+        if pinned_eos:
+            flag = PinnedEosFlag.allocate(input_ids.device)
         return cls(
             sequence=sequence,
             length=prompt_length,
             stopping_policy=stopping_policy,
+            pinned_eos=flag,
         )
 
     @property
@@ -150,16 +196,29 @@ class BatchOneSequenceState:
         next_length = self.length + 1
         self.sequence[:, self.length : next_length].copy_(next_tokens[:, None])
         self.length = next_length
-        stopped = self.stopping_policy.stopped(
-            next_tokens,
-            next_length=next_length,
-        )
+        if self.pinned_eos is not None:
+            if next_length >= self.stopping_policy.max_length:
+                self.pinned_eos.publish(
+                    torch.ones((1,), dtype=torch.bool, device=self.sequence.device)
+                )
+            else:
+                self.pinned_eos.publish(
+                    self.stopping_policy.eos_hit_device(next_tokens)
+                )
+            stopped = self.pinned_eos.read()
+        else:
+            stopped = self.stopping_policy.stopped(
+                next_tokens,
+                next_length=next_length,
+            )
         return self.active, stopped
 
 
 def allocate_batch_one_sequence_state(
     input_ids: torch.Tensor,
     stopping_criteria: Any,
+    *,
+    pinned_eos: bool = False,
 ) -> BatchOneSequenceState:
     policy = BatchOneStoppingPolicy.from_transformers(
         stopping_criteria,
@@ -168,6 +227,7 @@ def allocate_batch_one_sequence_state(
     return BatchOneSequenceState.allocate(
         input_ids,
         stopping_policy=policy,
+        pinned_eos=pinned_eos,
     )
 
 
@@ -210,10 +270,54 @@ def device_sequence_state_candidate_context():
         engine.active_prefix_decode_generate = original
 
 
+@contextmanager
+def baseline_glue_v2_candidate_context():
+    """§46 W-BASE: device buffer + pinned EOS + persistent sampling-tail graph."""
+
+    from ..kernels.sampling_tail_cuda_graph import (
+        sampling_tail_cuda_graph_candidate_context,
+    )
+    from ..single import engine
+
+    original = engine.active_prefix_decode_generate
+    activation = DeviceSequenceStateActivation()
+
+    @wraps(original)
+    def candidate(*args, **kwargs):
+        owned = {
+            "preallocated_batch1_state",
+            "pinned_eos_flag",
+            "sampling_tail_cuda_graph",
+        }
+        conflict = owned.intersection(kwargs)
+        if conflict:
+            raise RuntimeError(
+                "baseline-glue-v2 candidate owns "
+                + ", ".join(sorted(conflict))
+            )
+        activation.calls += 1
+        return original(
+            *args,
+            preallocated_batch1_state=True,
+            pinned_eos_flag=True,
+            sampling_tail_cuda_graph=True,
+            **kwargs,
+        )
+
+    engine.active_prefix_decode_generate = candidate
+    try:
+        with sampling_tail_cuda_graph_candidate_context():
+            yield activation
+    finally:
+        engine.active_prefix_decode_generate = original
+
+
 __all__ = [
     "BatchOneSequenceState",
     "BatchOneStoppingPolicy",
     "DeviceSequenceStateActivation",
+    "PinnedEosFlag",
     "allocate_batch_one_sequence_state",
+    "baseline_glue_v2_candidate_context",
     "device_sequence_state_candidate_context",
 ]

@@ -119,6 +119,9 @@ class ProductionDecodeSession:
         """Return address-free CUDA-graph evidence suitable for profiles."""
         buckets: dict[str, dict[str, int | float]] = {}
         for entry in self.graph_cache.values():
+            # Sampling-tail graphs share this cache but are not prefix buckets.
+            if entry.get("kind") == "sampling_tail":
+                continue
             prefix = int(entry.get("active_prefix_length", -1))
             if prefix < 0:
                 raise RuntimeError("optimized graph entry is missing active_prefix_length")
