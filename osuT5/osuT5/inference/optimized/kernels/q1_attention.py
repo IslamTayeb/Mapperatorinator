@@ -119,6 +119,14 @@ def _native_mask(
             f"attention_mask must contain {expected_numel} elements, "
             f"got {attention_mask.numel()}"
         )
+    from .q1_mask_workspace import active_q1_mask_workspace
+
+    workspace = active_q1_mask_workspace()
+    if workspace is not None:
+        return workspace.materialize(
+            attention_mask,
+            expected_numel=expected_numel,
+        )
     return attention_mask.reshape(-1).to(dtype=torch.float32).contiguous()
 
 

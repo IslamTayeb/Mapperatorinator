@@ -306,7 +306,28 @@ def _generate_window(
         "native_q1_self_attention": 0,
         "q1_bmm_cross_attention": 0,
         "native_cross_mlp_tail": 0,
+        "q1_mask_workspace": 0,
     }
+
+    from ..kernels.q1_mask_workspace import (
+        prepare_q1_mask_workspace,
+        q1_mask_workspace_activation_context,
+        q1_mask_workspace_requested,
+    )
+
+    q1_mask_ws = None
+    if q1_mask_workspace_requested() and native_q1_rope_cache_self_attention:
+        # Active-prefix decode buckets mask length up to cache capacity.
+        cache_cap = 0
+        getter = getattr(cache, "get_max_cache_shape", None)
+        if callable(getter):
+            cache_cap = int(getter() or 0)
+        if cache_cap <= 0:
+            cache_cap = int(generate_kwargs.get("max_length") or 1024)
+        q1_mask_ws = prepare_q1_mask_workspace(
+            device=model.device,
+            capacity=max(cache_cap, ACTIVE_PREFIX_BUCKET_SIZE),
+        )
 
     rng_before = (
         rng_progression_signature(model.device)
@@ -317,6 +338,8 @@ def _generate_window(
         device_type=model.device.type,
         dtype=torch.bfloat16,
         enabled=precision == "amp",
+    ), q1_mask_workspace_activation_context(
+        q1_mask_ws
     ), generation_profile_context(
         q1_bmm_cross_attention=q1_bmm_cross_attention,
         native_q1_self_attention=native_q1_self_attention,
@@ -366,6 +389,9 @@ def _generate_window(
                     expected_device=model.device,
                 ),
             }
+
+    if q1_mask_ws is not None:
+        dispatch_counts["q1_mask_workspace"] = int(q1_mask_ws.hits)
 
     with profile_range("generation.final_device_to_host"):
         result = result.cpu()
@@ -428,6 +454,25 @@ def _generate_window(
                     else "timing_context"
                 ),
             },
+            "q1_mask_workspace": {
+                "requested": q1_mask_workspace_requested(),
+                "enabled": q1_mask_ws is not None,
+                "disabled_reason": (
+                    None
+                    if q1_mask_ws is not None
+                    else (
+                        None
+                        if not q1_mask_workspace_requested()
+                        else (
+                            batched_policy_disabled_reason
+                            if not specialized_batch
+                            else "timing_context"
+                            if not native_q1_rope_cache_self_attention
+                            else "prepare_failed"
+                        )
+                    )
+                ),
+            },
         },
         "native_cross_mlp_tail_requested": specialized_batch,
         "native_cross_mlp_tail_enabled": native_cross_mlp_tail,
@@ -439,6 +484,9 @@ def _generate_window(
             else None
         ),
         "optimized_dispatch_capture_hits": dict(dispatch_counts),
+        "q1_mask_workspace": (
+            None if q1_mask_ws is None else q1_mask_ws.evidence()
+        ),
         "decode_graph_count_before": graph_count_before,
         "decode_graph_count_after": int(getattr(context_state, "graph_count", 0)),
         "decode_graph_count_delta": (
