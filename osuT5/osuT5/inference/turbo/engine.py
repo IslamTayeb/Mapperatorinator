@@ -87,8 +87,9 @@ class TurboRuntime:
                 "wired" if self.speculative_generate_wired else "scaffold_pending"
             ),
             "turbo_tier1_required": True,
+            "turbo_verify_fastpath_default": True,
             "note": (
-                "§37 turbo speculative draft+verify. "
+                "§37 turbo speculative draft+verify; §41 StaticCache teacher verify. "
                 "Not a production TPS claim. TIER1 before ship."
             ),
         }

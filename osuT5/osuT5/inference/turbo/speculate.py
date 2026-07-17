@@ -20,6 +20,12 @@ from ..logit_processors import (
     TimeshiftBias,
 )
 from .rejection import apply_temp_top_p, reject_sample_prefix
+from .verify_fastpath import (
+    TeacherVerifyFastpath,
+    allocate_teacher_static_cache,
+    build_teacher_verify_fastpath,
+    verify_fastpath_enabled,
+)
 
 
 def get_turbo_cache(*, cfg_scale: float = 1.0) -> MapperatorinatorCache:
@@ -29,8 +35,39 @@ def get_turbo_cache(*, cfg_scale: float = 1.0) -> MapperatorinatorCache:
     return MapperatorinatorCache(DynamicCache(), DynamicCache(), cfg_scale)
 
 
+def get_teacher_cache(teacher, *, cfg_scale: float = 1.0) -> MapperatorinatorCache:
+    """Teacher cache: StaticCache when §41 verify fastpath is on, else Dynamic."""
+    if verify_fastpath_enabled():
+        return allocate_teacher_static_cache(teacher, cfg_scale=cfg_scale)
+    return get_turbo_cache(cfg_scale=cfg_scale)
+
+
 def crop_self_cache(cache: MapperatorinatorCache, length: int) -> None:
-    cache.self_attention_cache.crop(int(length))
+    """Crop teacher/draft self KV after reject.
+
+    DynamicCache uses HF crop. StaticCache (§41 teacher) has no working
+    EncoderDecoderCache.crop path — zero trailing slots so get_seq_length
+    (nonzero occupancy) returns ``length``.
+    """
+    length = int(length)
+    self_cache = cache.self_attention_cache
+    if isinstance(self_cache, DynamicCache):
+        cache.crop(length)
+        return
+    from transformers.cache_utils import StaticCache
+
+    if not isinstance(self_cache, StaticCache):
+        raise TypeError(
+            f"unsupported self cache for crop: {type(self_cache).__name__}"
+        )
+    for layer in self_cache.layers:
+        if not getattr(layer, "is_initialized", False):
+            continue
+        if length < layer.keys.shape[2]:
+            layer.keys[:, :, length:, :].zero_()
+            layer.values[:, :, length:, :].zero_()
+        if hasattr(layer, "cumulative_length"):
+            layer.cumulative_length = length
 
 
 def _align_decoder_mask(
@@ -246,19 +283,29 @@ def _verify_draft_tokens(
     greedy: bool,
     temperature: float,
     top_p: float,
+    verify_fastpath: TeacherVerifyFastpath | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
     """One multi-token teacher forward over drafted ids.
 
     Returns p_logits[γ,V], p_probs[γ,V], bonus_logits[V], updated kwargs.
+    When verify_fastpath is set, uses StaticCache + active-prefix (optional
+    per-K CUDA graph) machinery under the turbo package (§41).
     """
     gamma = len(draft_ids)
     draft_t = torch.tensor([list(draft_ids)], device=prompt_ids.device, dtype=prompt_ids.dtype)
     ids = torch.cat([prompt_ids, draft_t], dim=-1)
-    outputs, mk = _forward_decoder(
-        teacher,
-        decoder_input_ids=ids,
-        model_kwargs=model_kwargs,
-    )
+    if verify_fastpath is not None:
+        outputs, mk = verify_fastpath.forward_k(
+            decoder_input_ids=ids,
+            model_kwargs=model_kwargs,
+            k=gamma,
+        )
+    else:
+        outputs, mk = _forward_decoder(
+            teacher,
+            decoder_input_ids=ids,
+            model_kwargs=model_kwargs,
+        )
     verify_logits = outputs.logits[:, -gamma:, :].float().squeeze(0)  # [γ, V]
     if gamma == 1:
         p_raw = last_logits.unsqueeze(0)
@@ -354,10 +401,11 @@ def speculative_generate_window(
         device=teacher.device,
     )
 
-    teacher_cache = get_turbo_cache(cfg_scale=1.0)
+    teacher_cache = get_teacher_cache(teacher, cfg_scale=1.0)
     draft_cache = get_turbo_cache(cfg_scale=1.0)
     teacher_mk["past_key_values"] = teacher_cache
     teacher_mk["use_cache"] = True
+    verify_fp = build_teacher_verify_fastpath(teacher)
 
     draft_mk = _move_model_kwargs(draft, model_kwargs)
     draft_mk.pop("decoder_input_ids", None)
@@ -422,6 +470,7 @@ def speculative_generate_window(
             greedy=greedy,
             temperature=spec_temperature,
             top_p=spec_top_p,
+            verify_fastpath=verify_fp,
         )
         verify_steps += 1
 
@@ -507,9 +556,16 @@ def speculative_generate_window(
         _align_decoder_mask(
             draft_mk, length=int(sequences.shape[1]), device=sequences.device
         )
-        teacher_out, teacher_mk = _forward_decoder(
-            teacher, decoder_input_ids=sequences, model_kwargs=teacher_mk
-        )
+        if verify_fp is not None:
+            teacher_out, teacher_mk = verify_fp.forward_k(
+                decoder_input_ids=sequences,
+                model_kwargs=teacher_mk,
+                k=len(commit),
+            )
+        else:
+            teacher_out, teacher_mk = _forward_decoder(
+                teacher, decoder_input_ids=sequences, model_kwargs=teacher_mk
+            )
         teacher_last = teacher_out.logits[:, -1, :].float().squeeze(0).clone()
         draft_out, draft_mk = _forward_decoder(
             draft, decoder_input_ids=sequences, model_kwargs=draft_mk
@@ -551,6 +607,8 @@ def speculative_generate_window(
                 accepted_total / verify_steps if verify_steps > 0 else 0.0
             ),
             "turbo_prompt_tokens": prompt_len,
+            "turbo_verify_fastpath": verify_fp is not None,
+            **(verify_fp.profile_metadata() if verify_fp is not None else {}),
         }
     )
     return result, stats
