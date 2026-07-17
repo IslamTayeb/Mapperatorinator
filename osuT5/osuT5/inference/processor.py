@@ -1601,6 +1601,11 @@ class Processor(object):
             "turbo_draft_init_layers",
             "turbo_teacher_aligned_greedy",
             "turbo_kv_commit_mode",
+            "turbo_canary_kv_mode",
+            "turbo_teacher_forwards_per_cycle",
+            "turbo_teacher_extra_q1_per_cycle",
+            "turbo_teacher_accepted_reforwards_window",
+            "turbo_draft_accepted_reforwards_window",
             "turbo_draft_ms_total",
             "turbo_verify_ms_total",
             "turbo_rebuild_ms_total",
@@ -1614,6 +1619,8 @@ class Processor(object):
             "turbo_verify_eager_calls",
             "turbo_verify_graph_captures",
             "turbo_verify_graph_replays",
+            "turbo_verify_graph_entries",
+            "turbo_persistent_verify_fp",
         ):
             if stats.get(key) is not None:
                 record[key] = stats[key]

@@ -18,17 +18,29 @@ from .draft import DEFAULT_DRAFT_CKPT_ENV, load_draft_from_ckpt
 from .rejection import apply_temp_top_p, reject_sample_prefix
 from .speculate import speculative_generate_window
 
-TURBO_PRESET_VERSION = "turbo-integrator-s45-1layer-g3-v1"
+TURBO_PRESET_VERSION = "turbo-keep-accepted-kv-s47-v1"
 PRIMARY_GAMMA = 3
 
 
 @dataclass
 class TurboDecodeSession:
-    """Request-local mutable state for turbo speculative decode."""
+    """Request-local mutable state for turbo speculative decode.
+
+    Teacher StaticCache + verify_fp persist across windows so CUDA-graph /
+    bucket entries are not rebuilt per window (§47).
+    """
 
     accepted_tokens_total: int = 0
     verify_steps: int = 0
     draft_calls: int = 0
+    teacher_cache: Any | None = None
+    draft_cache: Any | None = None
+    verify_fp: Any | None = None
+    teacher_forwards: int = 0
+    teacher_verify_forwards: int = 0
+    teacher_extra_q1_forwards: int = 0
+    teacher_accepted_reforwards: int = 0
+    draft_accepted_reforwards: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,9 +103,9 @@ class TurboRuntime:
             "turbo_verify_fastpath_default": True,
             "turbo_tree_k": 1,
             "note": (
-                "§45 turbo integrator: §43 1-layer K=1 γ=3 draft + §41 "
-                "eager-native aligned teacher verify. Not a production TPS "
-                "claim. Full TIER1 before ship. Campaign tip 55949274/366.11."
+                "§47 W-KV: sampled keep-accepted-KV O(1) rewind (DOCUMENTED "
+                "DRIFT under §34); greedy TIER1a keeps crop-rebuild/aligned-Q1. "
+                "Campaign tip 55949274/366.11. No 500 claim."
             ),
         }
 
