@@ -64,6 +64,18 @@ def allocate_teacher_static_cache(model, *, cfg_scale: float = 1.0) -> Mapperato
     return get_cache(model, batch_size=1, num_beams=1, cfg_scale=1.0)
 
 
+def _model_output_dtype(model) -> torch.dtype:
+    """LM head dtype on Mapperatorinator or nested HF whisper backbone."""
+    for obj in (model, getattr(model, "transformer", None)):
+        if obj is None:
+            continue
+        proj = getattr(obj, "proj_out", None)
+        if proj is not None and hasattr(proj, "weight"):
+            return proj.weight.dtype
+    param = next(model.parameters())
+    return param.dtype
+
+
 @contextmanager
 def teacher_aligned_runtime_context(*, precision: str) -> Iterator[None]:
     """Arm the same native decode hooks optimized MAP generation uses."""
@@ -347,7 +359,7 @@ class TeacherVerifyFastpath:
     ) -> VerifyGraphEntry:
         from ..optimized.single.runtime_context import active_prefix_self_attention_context
 
-        dtype = self.model.proj_out.weight.dtype
+        dtype = _model_output_dtype(self.model)
         built = self._build_graph_native_static(
             model_kwargs=model_kwargs,
             k=k,
@@ -433,7 +445,7 @@ class TeacherVerifyFastpath:
         if not isinstance(dec, torch.Tensor) or not isinstance(cache_pos, torch.Tensor):
             raise RuntimeError("legacy verify graph missing ids/cache_position")
         # Minimal mask placeholder for dataclass; legacy copies full inputs.
-        dtype = self.model.proj_out.weight.dtype
+        dtype = _model_output_dtype(self.model)
         mask = static_inputs.get("decoder_attention_mask")
         if not isinstance(mask, torch.Tensor):
             mask = torch.empty((1, 1, k, k), device=dec.device, dtype=dtype)
