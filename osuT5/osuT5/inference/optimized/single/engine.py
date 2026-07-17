@@ -306,7 +306,13 @@ def _generate_window(
         "native_q1_self_attention": 0,
         "q1_bmm_cross_attention": 0,
         "native_cross_mlp_tail": 0,
+        "q1_out_reshape": 0,
     }
+    from ..kernels.q1_out_reshape_activation import q1_out_reshape_requested
+
+    q1_out_reshape_on = bool(
+        q1_out_reshape_requested() and native_q1_rope_cache_self_attention
+    )
 
     rng_before = (
         rng_progression_signature(model.device)
@@ -438,6 +444,8 @@ def _generate_window(
             if not native_cross_mlp_tail
             else None
         ),
+        "q1_out_reshape_requested": q1_out_reshape_requested(),
+        "q1_out_reshape_enabled": q1_out_reshape_on,
         "optimized_dispatch_capture_hits": dict(dispatch_counts),
         "decode_graph_count_before": graph_count_before,
         "decode_graph_count_after": int(getattr(context_state, "graph_count", 0)),

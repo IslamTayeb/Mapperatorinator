@@ -270,8 +270,29 @@ def q1_rope_cache_self_attention_forward(
             attention_mask_for_native,
             int(prefix_length),
         )
-    output = output.transpose(1, 2).contiguous()
-    output = output.view(bs, -1, module.all_head_size)
+    from .q1_out_reshape_activation import q1_out_reshape_requested
+
+    if q1_out_reshape_requested():
+        # Contiguous [1, H, 1, D] is already head-major packed; reshape to
+        # [B, S, H*D] matches transpose(1,2).contiguous().view(...) bytes
+        # without an extra D2D copy (nsight elementwise/memory family).
+        if (
+            not isinstance(output, torch.Tensor)
+            or output.ndim != 4
+            or tuple(output.shape) != (bs, module.num_heads, 1, module.head_dim)
+            or not output.is_contiguous()
+        ):
+            raise RuntimeError(
+                "q1 out reshape requires contiguous [B, H, 1, D] native output"
+            )
+        output = output.reshape(bs, -1, module.all_head_size)
+        if dispatch_counts is not None:
+            dispatch_counts["q1_out_reshape"] = (
+                dispatch_counts.get("q1_out_reshape", 0) + 1
+            )
+    else:
+        output = output.transpose(1, 2).contiguous()
+        output = output.view(bs, -1, module.all_head_size)
     if dispatch_counts is not None:
         dispatch_counts["native_q1_rope_cache_self_attention"] += 1
     return (output,)
