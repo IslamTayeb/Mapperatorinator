@@ -207,23 +207,35 @@ def q1_rope_cache_self_attention_forward(
     if not use_native_q1_rope_cache_self_attention:
         return None
 
+    from .self_wqkv_linear import (
+        effective_self_wqkv_linear_outputs_per_block,
+        self_wqkv_linear_requested,
+    )
+
+    use_self_wqkv_linear = self_wqkv_linear_requested()
+
+    def _compute_qkv() -> torch.Tensor:
+        if use_self_wqkv_linear:
+            from .decoder_layer import native_one_token_linear_rect
+
+            projected = native_one_token_linear_rect(
+                hidden_states,
+                module.Wqkv.weight,
+                module.Wqkv.bias,
+                outputs_per_block=effective_self_wqkv_linear_outputs_per_block(),
+            )
+        else:
+            projected = module.Wqkv(hidden_states)
+        return projected.view(bs, -1, 3, module.num_heads, module.head_dim)
+
     if profile_ranges:
         with profile_range(f"{range_prefix}.qkv_proj"):
-            qkv = module.Wqkv(hidden_states).view(
-                bs,
-                -1,
-                3,
-                module.num_heads,
-                module.head_dim,
-            )
+            qkv = _compute_qkv()
     else:
-        qkv = module.Wqkv(hidden_states).view(
-            bs,
-            -1,
-            3,
-            module.num_heads,
-            module.head_dim,
-        )
+        qkv = _compute_qkv()
+
+    if dispatch_counts is not None and use_self_wqkv_linear:
+        dispatch_counts["self_wqkv_linear"] += 1
 
     if profile_ranges:
         with profile_range(f"{range_prefix}.rope"):

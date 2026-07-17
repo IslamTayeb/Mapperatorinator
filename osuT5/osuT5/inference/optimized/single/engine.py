@@ -306,7 +306,17 @@ def _generate_window(
         "native_q1_self_attention": 0,
         "q1_bmm_cross_attention": 0,
         "native_cross_mlp_tail": 0,
+        "self_wqkv_linear": 0,
     }
+
+    from ..kernels.self_wqkv_linear import (
+        TIP_DEFAULT_OUTPUTS_PER_BLOCK as _SELF_WQKV_LINEAR_TIP_DEFAULT_OUTPUTS_PER_BLOCK,
+        effective_self_wqkv_linear_outputs_per_block,
+        self_wqkv_linear_requested,
+    )
+
+    _self_wqkv_linear_requested = self_wqkv_linear_requested()
+    _self_wqkv_linear_effective_opb = effective_self_wqkv_linear_outputs_per_block()
 
     rng_before = (
         rng_progression_signature(model.device)
@@ -439,6 +449,18 @@ def _generate_window(
             else None
         ),
         "optimized_dispatch_capture_hits": dict(dispatch_counts),
+        "self_wqkv_linear": {
+            "requested": _self_wqkv_linear_requested,
+            "tip_default_outputs_per_block": int(
+                _SELF_WQKV_LINEAR_TIP_DEFAULT_OUTPUTS_PER_BLOCK
+            ),
+            "effective_outputs_per_block": int(_self_wqkv_linear_effective_opb),
+            "candidate_outputs_per_block": (
+                int(_self_wqkv_linear_effective_opb)
+                if _self_wqkv_linear_requested
+                else None
+            ),
+        },
         "decode_graph_count_before": graph_count_before,
         "decode_graph_count_after": int(getattr(context_state, "graph_count", 0)),
         "decode_graph_count_delta": (
