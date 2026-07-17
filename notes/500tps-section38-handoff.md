@@ -5,6 +5,16 @@
 **Base tip:** `55949274`  
 **Campaign tip unchanged:** `55949274` / FP16 **366.11** — **no 500 claim**; **no tip graduate**; **no merge**.
 
+
+## Live jobs (rung 1)
+
+| Job | Prec | Status |
+| --- | --- | --- |
+| `50149260` | FP16 | PENDING |
+| `50149261` | FP32 | PENDING |
+| Code tip | `9d27d4bc` | |
+| Artifact root | `/work/imt11/Mapperatorinator/runs/s38-tier2-logit-agreement-{fp16,fp32}-$JOB/` | |
+
 ## Pivot
 
 Track C speculative (§45) **STOP_DEAD_END** (~44.5 TPS; optimistic ceiling ~310 ≪ tip).  

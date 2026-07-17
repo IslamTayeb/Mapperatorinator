@@ -916,7 +916,7 @@ Primary path to 500 under the scope ruling. Bit-exact Track A remains valid but 
 | Status | **OPEN** — Track C primary after §45 speculative STOP_DEAD_END |
 | Branch / WT | `codex/turbo-tier2-fused-step` / `turbo-tier2-fused-step` (base `55949274`) |
 | Budget claim | ≥**0.15 ms/token** from collapsing ~**400** launches/glue/token (nsight `49966210`: elem+mem ~30% / ~0.64 ms; gemm_gemv ~26%; q1 ~19%; fused MLP ~15%) before full reciprocal |
-| Rung 1 | Teacher-forced logit agreement on real tensors (`utils/s38_tier2_logit_agreement_probe.py` / `jobs/s38-tier2-logit-agreement.sbatch`) |
+| Rung 1 | Teacher-forced logit agreement — FP16 `50149260` / FP32 `50149261` @ `9d27d4bc` (`utils/s38_tier2_logit_agreement_probe.py`) |
 | Quality gates | max rel logit Δ ≤1e-2 AND top-1 ≥99.5% over ≥100k positions; then TIER1(c) 30-seed KS + gallery |
 | Perf gate | ≥5% vs tip then →500; song wall wins |
 | Optimized default | **unchanged** (bit-exact) |
