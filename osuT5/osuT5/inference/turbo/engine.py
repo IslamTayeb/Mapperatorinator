@@ -1,7 +1,8 @@
-"""Turbo runtime (Track C §37).
+"""Turbo runtime (Track C §45 integrator).
 
-Immutable preset: 2-layer CE/KL draft + Leviathan rejection sampling vs tip teacher.
-Not bit-exact. TIER1 evidence pack required before any 500 / ship claim.
+Immutable preset: §43 1-layer draft (K=1, γ=3, temp=0.9) + Leviathan rejection
+sampling vs §41 graph-aligned teacher. Not bit-exact. Full TIER1 before any
+500 / ship claim. Campaign tip remains 55949274 / FP16 366.11.
 """
 from __future__ import annotations
 
@@ -17,8 +18,8 @@ from .draft import DEFAULT_DRAFT_CKPT_ENV, load_draft_from_ckpt
 from .rejection import apply_temp_top_p, reject_sample_prefix
 from .speculate import speculative_generate_window
 
-TURBO_PRESET_VERSION = "turbo-tiny-draft-s37-speculative-v1"
-PRIMARY_GAMMA = 5
+TURBO_PRESET_VERSION = "turbo-integrator-s45-1layer-g3-v1"
+PRIMARY_GAMMA = 3
 
 
 @dataclass
@@ -88,9 +89,11 @@ class TurboRuntime:
             ),
             "turbo_tier1_required": True,
             "turbo_verify_fastpath_default": True,
+            "turbo_tree_k": 1,
             "note": (
-                "§37 turbo speculative draft+verify; §41 StaticCache teacher verify. "
-                "Not a production TPS claim. TIER1 before ship."
+                "§45 turbo integrator: §43 1-layer K=1 γ=3 draft + §41 "
+                "eager-native aligned teacher verify. Not a production TPS "
+                "claim. Full TIER1 before ship. Campaign tip 55949274/366.11."
             ),
         }
 
