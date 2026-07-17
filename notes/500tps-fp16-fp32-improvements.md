@@ -913,10 +913,11 @@ Primary path to 500 under the scope ruling. Bit-exact Track A remains valid but 
 | Field | Value |
 | --- | --- |
 | What | TIER2 relaxed-numerics fused decoder step (7-kernel layer: norm+Wqkv, q1, Wo+res, cross block, fc1, fc2+res, glue; fp32 accumulate) behind `inference_engine=turbo` |
-| Status | **OPEN** — Track C primary after §45 speculative STOP_DEAD_END |
-| Branch / WT | `codex/turbo-tier2-fused-step` / `turbo-tier2-fused-step` (base `55949274`) |
+| Status | **OPEN** — rung-1b true 7-stage fusion probe SUBMITTED |
+| Branch / WT | `codex/turbo-tier2-fused-step` / `turbo-tier2-fused-step` (base `55949274`; tip `24ee13bd`) |
 | Budget claim | ≥**0.15 ms/token** from collapsing ~**400** launches/glue/token (nsight `49966210`: elem+mem ~30% / ~0.64 ms; gemm_gemv ~26%; q1 ~19%; fused MLP ~15%) before full reciprocal |
-| Rung 1 | Teacher-forced logit agreement — FP16 `50149339` / FP32 `50149340` @ `c77aab55`: top1 **0.9983/1.0** PASS; max_rel **FAIL** (FP16 3e4 / FP32 179); n=7809 |
+| Rung 1a | Blanket fp32 Linear wrap — FP16 `50149339` / FP32 `50149340` @ `c77aab55`: top1 PASS; max_rel **FAIL** (superseded) |
+| Rung 1b | True 7-stage fused layer — FP16 `50149619` / FP32 `50149620` @ `24ee13bd` **SUBMITTED** |
 | Quality gates | max rel logit Δ ≤1e-2 AND top-1 ≥99.5% over ≥100k positions; then TIER1(c) 30-seed KS + gallery |
 | Perf gate | ≥5% vs tip then →500; song wall wins |
 | Optimized default | **unchanged** (bit-exact) |
