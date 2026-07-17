@@ -14,7 +14,7 @@ import torch
 from transformers.activations import GELUActivation
 from transformers.cache_utils import EncoderDecoderCache, StaticCache
 
-from ....runtime_profiling import profile_range
+from ...runtime_profiling import profile_range
 from ..optimized.kernels.m_row import (
     MAX_M,
     native_m_row_linear_residual,
