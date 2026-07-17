@@ -66,7 +66,16 @@ def load_draft_from_ckpt(
     state = payload.get("draft_state_dict", payload)
     init_layers = tuple(payload.get("init_layers", DRAFT_INIT_LAYERS))
     draft = build_two_layer_draft(teacher, init_layers)
-    missing, unexpected = draft.load_state_dict(state, strict=False)
+    # Timing / non-gamemode teachers can differ in vocab size from the §37
+    # gamemode=0 distill ckpt. Load only shape-compatible tensors.
+    model_sd = draft.state_dict()
+    filtered = {
+        key: value
+        for key, value in state.items()
+        if key in model_sd and model_sd[key].shape == value.shape
+    }
+    skipped_shape = sorted(set(state) - set(filtered))
+    missing, unexpected = draft.load_state_dict(filtered, strict=False)
     if device is not None:
         draft = draft.to(device)
     if dtype is not None:
@@ -77,6 +86,8 @@ def load_draft_from_ckpt(
         "init_layers": list(init_layers),
         "missing_keys": list(missing),
         "unexpected_keys": list(unexpected),
+        "skipped_shape_keys": skipped_shape,
+        "loaded_param_count": len(filtered),
         "train_steps": payload.get("train_steps"),
         "tip_commit": payload.get("tip_commit"),
     }
