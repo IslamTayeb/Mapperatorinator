@@ -147,6 +147,64 @@ def _ensure_encoder_outputs(model, model_kwargs: dict[str, Any]) -> dict[str, An
     return mk2
 
 
+@torch.no_grad()
+def _time_eager_native_ms(
+    runner: DraftFastpathRunner,
+    *,
+    prefix_length: int,
+    warmup: int,
+    iters: int,
+) -> dict[str, Any]:
+    """Fallback: time one eager native decode step at a fixed length."""
+    runner.cuda_graph = False
+    while runner._cur_len < prefix_length:
+        runner.decode_token(1)
+    torch.cuda.synchronize()
+    # Time decode_token by rolling one step then restoring via rebuild is too
+    # heavy; instead time a repeated forward of the current next-step inputs.
+    assert runner._model_kwargs is not None and runner._input_ids is not None
+    from osuT5.osuT5.inference.optimized.single.decode_loop import (
+        _bucketed_prefix_length,
+    )
+    from osuT5.osuT5.inference.optimized.single.runtime_context import (
+        active_prefix_self_attention_context,
+    )
+
+    with runner._profile_context():
+        runner._model_kwargs.pop("cache_position", None)
+        model_inputs = runner.model.prepare_inputs_for_generation(
+            runner._input_ids,
+            **runner._model_kwargs,
+        )
+        bucket = _bucketed_prefix_length(
+            int(runner._input_ids.shape[1]),
+            runner.bucket_size,
+            runner._max_cache_len,
+        )
+        for _ in range(max(int(warmup), 0)):
+            with active_prefix_self_attention_context(bucket):
+                _ = runner.model(**model_inputs, return_dict=True)
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(int(iters)):
+            with active_prefix_self_attention_context(bucket):
+                _ = runner.model(**model_inputs, return_dict=True)
+        end.record()
+        torch.cuda.synchronize()
+        ms = float(start.elapsed_time(end)) / float(iters)
+    return {
+        "prefix_length": int(prefix_length),
+        "bucket_prefix_length": int(bucket),
+        "ms_per_token": ms,
+        "capture_seconds": 0.0,
+        "warmup": int(warmup),
+        "iters": int(iters),
+        "dispatch_counts": dict(runner.stats.dispatch_counts),
+    }
+
+
 def bench_model_graph(
     *,
     model,
@@ -168,6 +226,7 @@ def bench_model_graph(
     bind_kwargs.pop("decoder_input_ids", None)
     runner.bind(model_kwargs=bind_kwargs, prompt_ids=prompt_ids)
     runner.prefill()
+    runner.warm_native_kernels()
     rows = []
     for prefix in prefixes:
         # Fresh runner per prefix so timing starts from a clean graph capture.
@@ -176,18 +235,37 @@ def bench_model_graph(
             dtype=dtype,
             enable_native_kernels=True,
             cuda_graph=True,
+            cuda_graph_warmup=2,
         )
         r.bind(model_kwargs=bind_kwargs, prompt_ids=prompt_ids)
         r.prefill()
-        row = time_graph_replay_ms(
-            r, prefix_length=prefix, warmup=warmup, iters=iters
-        )
+        r.warm_native_kernels()
+        try:
+            row = time_graph_replay_ms(
+                r, prefix_length=prefix, warmup=warmup, iters=iters
+            )
+            row["timing_mode"] = "cuda_graph_replay"
+        except Exception as exc:  # noqa: BLE001 - surface and fall back
+            print(
+                f"[{label}] graph timing failed at prefix={prefix}: {exc!r}; "
+                "falling back to eager native step timing",
+                flush=True,
+            )
+            row = _time_eager_native_ms(
+                r,
+                prefix_length=prefix,
+                warmup=warmup,
+                iters=iters,
+            )
+            row["timing_mode"] = "eager_native_fallback"
+            row["graph_error"] = repr(exc)
         row["label"] = label
         row["layers"] = r.layer_count
         rows.append(row)
         print(
             f"[{label}] prefix={prefix} bucket={row['bucket_prefix_length']} "
-            f"ms/token={row['ms_per_token']:.4f} layers={r.layer_count}",
+            f"ms/token={row['ms_per_token']:.4f} layers={r.layer_count} "
+            f"mode={row['timing_mode']}",
             flush=True,
         )
     ms_values = [float(r["ms_per_token"]) for r in rows]

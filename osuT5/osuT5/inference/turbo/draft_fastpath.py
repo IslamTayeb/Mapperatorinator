@@ -212,6 +212,24 @@ class DraftFastpathRunner:
         self.stats.prefill_seconds += time.perf_counter() - t0
         return logits
 
+    def warm_native_kernels(self) -> None:
+        """Eager one-token decode so CUDA extensions JIT before graph capture."""
+        if self._input_ids is None or self._model_kwargs is None:
+            raise RuntimeError("draft fastpath bind()/prefill() required")
+        if self._input_ids.device.type != "cuda":
+            return
+        snap_ids = self._input_ids.clone()
+        prev = self.cuda_graph
+        self.cuda_graph = False
+        try:
+            _ = self.decode_token(1)
+            torch.cuda.synchronize()
+        finally:
+            self.cuda_graph = prev
+        # Restore exact prompt state after the probe forward dirtied the cache.
+        self.rebuild_from_ids(snap_ids)
+        torch.cuda.synchronize()
+
     def _decode_one_graph(self, input_ids: torch.LongTensor) -> torch.Tensor:
         assert self._model_kwargs is not None
         graph_cache = self.session.graph_cache
@@ -335,18 +353,27 @@ def time_graph_replay_ms(
         raise ValueError(
             f"runner cur_len={runner._cur_len} exceeds requested prefix={prefix_length}"
         )
-    # Advance with dummy tokens to the target length if needed (eager, once).
-    while runner._cur_len < prefix_length:
-        runner.decode_token(1)
+    # Reach the target length with eager decode so graph capture stays clean.
+    prev_graph = runner.cuda_graph
+    runner.cuda_graph = False
+    try:
+        while runner._cur_len < prefix_length:
+            runner.decode_token(1)
+    finally:
+        runner.cuda_graph = prev_graph
+    torch.cuda.synchronize()
 
     assert runner._model_kwargs is not None
     with runner._profile_context():
+        # Build the one-token decode inputs at the current length without
+        # advancing the logical sequence; clone for static capture buffers.
         runner._model_kwargs.pop("cache_position", None)
         _align_decoder_mask(
             runner._model_kwargs,
             length=int(runner._input_ids.shape[1]),
             device=runner._input_ids.device,
         )
+        # prepare_inputs typically emits the last token only when cache is hot.
         model_inputs = runner.model.prepare_inputs_for_generation(
             runner._input_ids,
             **runner._model_kwargs,
@@ -357,11 +384,17 @@ def time_graph_replay_ms(
             runner._max_cache_len,
         )
         static_inputs = _clone_static_graph_inputs(model_inputs)
+        # Warmup outside the capture helper so the first JIT/extension load
+        # cannot land inside the capture stream.
+        for _ in range(max(int(runner.cuda_graph_warmup), 2)):
+            with active_prefix_self_attention_context(bucket):
+                _ = runner.model(**static_inputs, return_dict=True)
+        torch.cuda.synchronize()
         graph, _outputs, capture_seconds = _capture_decode_cuda_graph(
             runner.model,
             static_inputs,
             active_prefix_length=bucket,
-            warmup=runner.cuda_graph_warmup,
+            warmup=0,
         )
         for _ in range(max(int(warmup), 0)):
             graph.replay()
