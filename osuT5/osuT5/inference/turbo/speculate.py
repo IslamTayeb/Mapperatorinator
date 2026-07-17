@@ -19,6 +19,7 @@ from ..logit_processors import (
     MonotonicTimeShiftLogitsProcessor,
     TimeshiftBias,
 )
+from .draft_fastpath import DraftFastpathRunner, draft_fastpath_enabled
 from .rejection import apply_temp_top_p, reject_sample_prefix
 
 
@@ -198,6 +199,7 @@ def _draft_k_tokens(
     rng: torch.Generator | None,
     max_new_tokens: int,
     eos_ids: set[int],
+    draft_fastpath: DraftFastpathRunner | None = None,
 ) -> tuple[list[int], torch.Tensor, dict[str, Any], bool, torch.Tensor]:
     """Autoregressive draft up to γ tokens.
 
@@ -222,13 +224,45 @@ def _draft_k_tokens(
         )
         probs_q.append(probs)
         draft_ids.append(tok)
-        tok_t = torch.tensor([[tok]], device=ids.device, dtype=ids.dtype)
-        ids = torch.cat([ids, tok_t], dim=-1)
         if tok in eos_ids:
+            if draft_fastpath is not None:
+                # Keep runner sequence aligned even when stopping on EOS.
+                draft_fastpath._input_ids = torch.cat(
+                    [
+                        draft_fastpath._input_ids,
+                        torch.tensor(
+                            [[tok]],
+                            device=ids.device,
+                            dtype=ids.dtype,
+                        ),
+                    ],
+                    dim=-1,
+                )
+                ids = draft_fastpath._input_ids
+            else:
+                ids = torch.cat(
+                    [
+                        ids,
+                        torch.tensor([[tok]], device=ids.device, dtype=ids.dtype),
+                    ],
+                    dim=-1,
+                )
             stopped = True
             break
-        outputs, mk = _forward_decoder(draft, decoder_input_ids=ids, model_kwargs=mk)
-        cur_logits = outputs.logits[:, -1, :].float().squeeze(0)
+        if draft_fastpath is not None:
+            cur_logits = draft_fastpath.decode_token(int(tok))
+            ids = draft_fastpath._input_ids
+            mk = draft_fastpath._model_kwargs or mk
+        else:
+            ids = torch.cat(
+                [
+                    ids,
+                    torch.tensor([[tok]], device=ids.device, dtype=ids.dtype),
+                ],
+                dim=-1,
+            )
+            outputs, mk = _forward_decoder(draft, decoder_input_ids=ids, model_kwargs=mk)
+            cur_logits = outputs.logits[:, -1, :].float().squeeze(0)
 
     if not draft_ids:
         raise RuntimeError("draft produced zero tokens")
@@ -355,14 +389,13 @@ def speculative_generate_window(
     )
 
     teacher_cache = get_turbo_cache(cfg_scale=1.0)
-    draft_cache = get_turbo_cache(cfg_scale=1.0)
     teacher_mk["past_key_values"] = teacher_cache
     teacher_mk["use_cache"] = True
 
-    draft_mk = _move_model_kwargs(draft, model_kwargs)
-    draft_mk.pop("decoder_input_ids", None)
-    draft_mk["past_key_values"] = draft_cache
-    draft_mk["use_cache"] = True
+    use_draft_fastpath = draft_fastpath_enabled()
+    draft_fastpath: DraftFastpathRunner | None = None
+    draft_cache = None
+    draft_mk: dict[str, Any] = {}
 
     rng = None
     if not greedy:
@@ -377,11 +410,29 @@ def speculative_generate_window(
     teacher_last, teacher_mk = _prefill(
         teacher, prompt_ids=prompt_ids, model_kwargs=teacher_mk
     )
-    if teacher_mk.get("encoder_outputs") is not None:
-        draft_mk["encoder_outputs"] = teacher_mk["encoder_outputs"]
-    draft_last, draft_mk = _prefill(
-        draft, prompt_ids=prompt_ids, model_kwargs=draft_mk
-    )
+    if use_draft_fastpath:
+        draft_dtype = getattr(draft, "dtype", teacher.dtype)
+        draft_fastpath = DraftFastpathRunner(
+            draft,
+            dtype=draft_dtype if isinstance(draft_dtype, torch.dtype) else teacher.dtype,
+        )
+        draft_bind_kwargs = _move_model_kwargs(draft, model_kwargs)
+        if teacher_mk.get("encoder_outputs") is not None:
+            draft_bind_kwargs["encoder_outputs"] = teacher_mk["encoder_outputs"]
+        draft_fastpath.bind(model_kwargs=draft_bind_kwargs, prompt_ids=prompt_ids)
+        draft_last = draft_fastpath.prefill()
+        draft_mk = draft_fastpath._model_kwargs or {}
+    else:
+        draft_cache = get_turbo_cache(cfg_scale=1.0)
+        draft_mk = _move_model_kwargs(draft, model_kwargs)
+        draft_mk.pop("decoder_input_ids", None)
+        draft_mk["past_key_values"] = draft_cache
+        draft_mk["use_cache"] = True
+        if teacher_mk.get("encoder_outputs") is not None:
+            draft_mk["encoder_outputs"] = teacher_mk["encoder_outputs"]
+        draft_last, draft_mk = _prefill(
+            draft, prompt_ids=prompt_ids, model_kwargs=draft_mk
+        )
 
     sequences = prompt_ids
     prompt_len = int(prompt_ids.shape[1])
@@ -408,6 +459,7 @@ def speculative_generate_window(
             rng=rng,
             max_new_tokens=remaining,
             eos_ids=eos_ids,
+            draft_fastpath=draft_fastpath,
         )
         draft_calls += 1
         actual_gamma = len(draft_ids)
@@ -493,9 +545,11 @@ def speculative_generate_window(
             raise RuntimeError("turbo speculative step committed zero tokens")
 
         crop_self_cache(teacher_cache, L)
-        crop_self_cache(draft_cache, L)
+        if draft_cache is not None:
+            crop_self_cache(draft_cache, L)
         _align_decoder_mask(teacher_mk, length=L, device=sequences.device)
-        _align_decoder_mask(draft_mk, length=L, device=sequences.device)
+        if draft_fastpath is None:
+            _align_decoder_mask(draft_mk, length=L, device=sequences.device)
 
         commit_t = torch.tensor(
             [commit], device=sequences.device, dtype=sequences.dtype
@@ -504,17 +558,21 @@ def speculative_generate_window(
         _align_decoder_mask(
             teacher_mk, length=int(sequences.shape[1]), device=sequences.device
         )
-        _align_decoder_mask(
-            draft_mk, length=int(sequences.shape[1]), device=sequences.device
-        )
         teacher_out, teacher_mk = _forward_decoder(
             teacher, decoder_input_ids=sequences, model_kwargs=teacher_mk
         )
         teacher_last = teacher_out.logits[:, -1, :].float().squeeze(0).clone()
-        draft_out, draft_mk = _forward_decoder(
-            draft, decoder_input_ids=sequences, model_kwargs=draft_mk
-        )
-        draft_last = draft_out.logits[:, -1, :].float().squeeze(0).clone()
+        if draft_fastpath is not None:
+            draft_last = draft_fastpath.rebuild_from_ids(sequences)
+            draft_mk = draft_fastpath._model_kwargs or draft_mk
+        else:
+            _align_decoder_mask(
+                draft_mk, length=int(sequences.shape[1]), device=sequences.device
+            )
+            draft_out, draft_mk = _forward_decoder(
+                draft, decoder_input_ids=sequences, model_kwargs=draft_mk
+            )
+            draft_last = draft_out.logits[:, -1, :].float().squeeze(0).clone()
 
         accepted_total += len(commit)
         session.accepted_tokens_total += len(commit)
@@ -551,6 +609,9 @@ def speculative_generate_window(
                 accepted_total / verify_steps if verify_steps > 0 else 0.0
             ),
             "turbo_prompt_tokens": prompt_len,
+            "turbo_draft_fastpath": bool(draft_fastpath is not None),
         }
     )
+    if draft_fastpath is not None:
+        stats.update(draft_fastpath.profile_metadata())
     return result, stats

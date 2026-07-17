@@ -32,11 +32,14 @@ def build_two_layer_draft(
             raise ValueError(f"init layer {i} out of range for {n} layers")
     dec_d.layers = nn.ModuleList([copy.deepcopy(dec_t.layers[i]) for i in init_layers])
     # Keep config in sync so cache / layer-count helpers see a 2-layer decoder.
-    if hasattr(draft.config, "decoder_layers"):
-        draft.config.decoder_layers = len(init_layers)
-    transformer_cfg = getattr(getattr(draft, "transformer", None), "config", None)
-    if transformer_cfg is not None and hasattr(transformer_cfg, "decoder_layers"):
-        transformer_cfg.decoder_layers = len(init_layers)
+    n_layers = len(init_layers)
+    for cfg in (
+        getattr(draft, "config", None),
+        getattr(getattr(draft, "transformer", None), "config", None),
+        getattr(getattr(draft, "config", None), "backbone_config", None),
+    ):
+        if cfg is not None and hasattr(cfg, "decoder_layers"):
+            cfg.decoder_layers = n_layers
     for p in draft.parameters():
         p.requires_grad = False
     draft.eval()

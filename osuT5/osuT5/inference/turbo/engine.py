@@ -14,10 +14,11 @@ import torch
 
 from ..engine_binding import InferenceEngineBinding
 from .draft import DEFAULT_DRAFT_CKPT_ENV, load_draft_from_ckpt
+from .draft_fastpath import DRAFT_FASTPATH_ENV, draft_fastpath_enabled
 from .rejection import apply_temp_top_p, reject_sample_prefix
 from .speculate import speculative_generate_window
 
-TURBO_PRESET_VERSION = "turbo-tiny-draft-s37-speculative-v1"
+TURBO_PRESET_VERSION = "turbo-tiny-draft-s37-speculative-v2-draft-fastpath"
 PRIMARY_GAMMA = 5
 
 
@@ -86,9 +87,12 @@ class TurboRuntime:
             "turbo_speculative_generate_window": (
                 "wired" if self.speculative_generate_wired else "scaffold_pending"
             ),
+            "turbo_draft_fastpath": draft_fastpath_enabled(),
+            "turbo_draft_fastpath_env": DRAFT_FASTPATH_ENV,
             "turbo_tier1_required": True,
             "note": (
-                "§37 turbo speculative draft+verify. "
+                "§37/§42 turbo speculative draft+verify with optional draft "
+                "fastpath (optimized q1 kernels + draft CUDA graphs). "
                 "Not a production TPS claim. TIER1 before ship."
             ),
         }
