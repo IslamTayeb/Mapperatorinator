@@ -482,9 +482,10 @@ def main() -> None:
         raise SystemExit(f"expected 12 decoder layers, got {n_layers}")
     print(f"draft_init_layers={list(DRAFT_INIT_LAYERS)} of {n_layers}", flush=True)
     draft = build_two_layer_draft(teacher, DRAFT_INIT_LAYERS)
-    if args.precision == "fp16":
-        draft = draft.half()
+    # Train draft in fp32 even when teacher eval is fp16 — fp16 CE blew up (50146182 NaN).
+    draft = draft.float()
     draft.to(device)
+    train_precision = "fp32"
 
     preprocessor = Preprocessor(args_inf, parallel=False)
     # Processor binds to teacher for prompt/tokenization helpers only
@@ -550,6 +551,7 @@ def main() -> None:
     draft.train()
     t_train = time.perf_counter()
     losses: list[float] = []
+    skipped_nonfinite = 0
     for step in range(args.train_steps):
         w = windows[step % len(windows)]
         opt.zero_grad(set_to_none=True)
@@ -560,10 +562,17 @@ def main() -> None:
             decoder_attention_mask=w["dec_attn"],
             labels=w["labels"],
             song_position=w["song_pos"],
-            precision=args.precision,
+            precision=train_precision,
             cond_kwargs=cond_kwargs,
         )
+        if not torch.isfinite(loss):
+            skipped_nonfinite += 1
+            losses.append(float("nan"))
+            if step == 0 or (step + 1) % 20 == 0 or step + 1 == args.train_steps:
+                print(f"step={step+1}/{args.train_steps} loss=nan (skip)", flush=True)
+            continue
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(trainable, 1.0)
         opt.step()
         losses.append(float(loss.detach().float().cpu()))
         if step == 0 or (step + 1) % 20 == 0 or step + 1 == args.train_steps:
@@ -576,7 +585,7 @@ def main() -> None:
         draft,
         windows=windows,
         cond_kwargs=cond_kwargs,
-        precision=args.precision,
+        precision=train_precision,
         temperature=args.temperature,
         top_p=args.top_p,
     )
@@ -617,8 +626,12 @@ def main() -> None:
         "train_steps": args.train_steps,
         "lr": args.lr,
         "train_wall_seconds": train_s,
+        "train_precision": train_precision,
         "train_loss_first": losses[0] if losses else None,
         "train_loss_last": losses[-1] if losses else None,
+        "skipped_nonfinite_steps": skipped_nonfinite,
+        "prior_smoke_job": "50146182",
+        "fix": "fp32 draft train + grad clip (fp16 CE NaN)",
         "baseline_acceptance": baseline,
         "after_train_acceptance": after,
         "gate_decision": after["gate_decision"],

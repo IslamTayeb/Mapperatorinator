@@ -52,6 +52,6 @@ nvidia-smi -L
   --top-p 0.9 \
   --max-map-windows 16 \
   --train-steps 100 \
-  --lr 1e-4
+  --lr 3e-5
 
 echo DONE
