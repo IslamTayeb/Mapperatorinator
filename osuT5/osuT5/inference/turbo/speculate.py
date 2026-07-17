@@ -457,11 +457,18 @@ def speculative_generate_window(
         teacher_last, teacher_mk = _prefill(
             teacher, prompt_ids=prompt_ids, model_kwargs=teacher_mk
         )
+    # Drop raw audio after prefill so Q=1 CUDA graphs never re-enter the encoder
+    # (capture-illegal host sync / dtype branches — see microbench 50147547).
     if teacher_mk.get("encoder_outputs") is not None:
+        for _audio_key in ("frames", "inputs", "input_features"):
+            teacher_mk.pop(_audio_key, None)
         draft_mk["encoder_outputs"] = teacher_mk["encoder_outputs"]
     draft_last, draft_mk = _prefill(
         draft, prompt_ids=prompt_ids, model_kwargs=draft_mk
     )
+    if draft_mk.get("encoder_outputs") is not None:
+        for _audio_key in ("frames", "inputs", "input_features"):
+            draft_mk.pop(_audio_key, None)
 
     sequences = prompt_ids
     prompt_len = int(prompt_ids.shape[1])

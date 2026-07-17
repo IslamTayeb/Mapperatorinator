@@ -151,6 +151,16 @@ def timed_cuda(fn, *, warmup: int, iters: int) -> float:
     return (time.perf_counter() - t0) / iters
 
 
+def _strip_audio_after_prefill(mk: dict[str, Any]) -> dict[str, Any]:
+    """Keep encoder_outputs only — re-encoding inside CUDA graphs is illegal."""
+    out = dict(mk)
+    for key in ("frames", "inputs", "input_features"):
+        out.pop(key, None)
+    if out.get("encoder_outputs") is None:
+        raise RuntimeError("prefill did not produce encoder_outputs")
+    return out
+
+
 @torch.no_grad()
 def measure_optimized_q1_step(
     model,
@@ -160,12 +170,17 @@ def measure_optimized_q1_step(
     warmup: int,
     iters: int,
 ) -> dict[str, Any]:
-    """Prefill + capture one active-prefix Q=1 CUDA graph; time replay."""
+    """Prefill + time one active-prefix Q=1 step (graph replay, else eager)."""
+    from osuT5.osuT5.inference.optimized.single.runtime_context import (
+        active_prefix_self_attention_context,
+    )
+
     cache = get_cache(model, batch_size=1, num_beams=1, cfg_scale=1.0)
     mk = dict(model_kwargs)
     mk["past_key_values"] = cache
     mk["use_cache"] = True
     _, mk = prefill(model, prompt_ids, mk)
+    mk = _strip_audio_after_prefill(mk)
 
     # Append one dummy token position for decode step timing.
     tok = torch.tensor([[1]], device=prompt_ids.device, dtype=prompt_ids.dtype)
@@ -175,27 +190,66 @@ def measure_optimized_q1_step(
     )
     mk.pop("cache_position", None)
     model_inputs = model.prepare_inputs_for_generation(ids, **mk)
+    # Defensive: never capture with raw audio tensors.
+    for key in ("frames", "inputs", "input_features"):
+        model_inputs.pop(key, None)
     cur_len = int(ids.shape[1])
     max_cache = int(cache.get_max_cache_shape())
     prefix = _bucketed_prefix_length(cur_len, 64, max_cache)
-    static_inputs = _clone_static_graph_inputs(model_inputs)
-    graph, outputs, capture_s = _capture_decode_cuda_graph(
-        model,
-        static_inputs,
-        active_prefix_length=prefix,
-        warmup=1,
-    )
 
-    def replay():
-        _copy_static_graph_inputs(static_inputs, model_inputs)
-        graph.replay()
-        _ = outputs.logits
+    mode = "cuda_graph"
+    capture_s = None
+    try:
+        static_inputs = _clone_static_graph_inputs(model_inputs)
+        graph, outputs, capture_s = _capture_decode_cuda_graph(
+            model,
+            static_inputs,
+            active_prefix_length=prefix,
+            warmup=0,
+        )
 
-    ms = timed_cuda(replay, warmup=warmup, iters=iters) * 1000.0
+        def replay():
+            _copy_static_graph_inputs(static_inputs, model_inputs)
+            graph.replay()
+            _ = outputs.logits
+
+        ms = timed_cuda(replay, warmup=warmup, iters=iters) * 1000.0
+    except Exception as exc:  # noqa: BLE001 — budget microbench fallback
+        mode = f"eager_fallback:{type(exc).__name__}"
+        # Crop the failed capture write, then time eager Q=1 under active-prefix.
+        L = int(prompt_ids.shape[1])
+        self_cache = cache.self_attention_cache
+        for layer in self_cache.layers:
+            if getattr(layer, "is_initialized", False) and L < layer.keys.shape[2]:
+                layer.keys[:, :, L:, :].zero_()
+                layer.values[:, :, L:, :].zero_()
+        mk_e = dict(mk)
+        mk_e.pop("cache_position", None)
+
+        def eager_step():
+            for layer in self_cache.layers:
+                if getattr(layer, "is_initialized", False) and L < layer.keys.shape[2]:
+                    layer.keys[:, :, L:, :].zero_()
+                    layer.values[:, :, L:, :].zero_()
+            mk_local = dict(mk_e)
+            mk_local.pop("cache_position", None)
+            mk_local["decoder_attention_mask"] = torch.ones(
+                (1, int(ids.shape[1])), device=ids.device, dtype=torch.long
+            )
+            inp = model.prepare_inputs_for_generation(ids, **mk_local)
+            for key in ("frames", "inputs", "input_features"):
+                inp.pop(key, None)
+            with active_prefix_self_attention_context(prefix):
+                out = model(**inp, return_dict=True)
+            _ = out.logits
+
+        ms = timed_cuda(eager_step, warmup=warmup, iters=iters) * 1000.0
+
     return {
         "q1_step_ms": ms,
         "prefix_bucket": prefix,
         "capture_seconds": capture_s,
+        "q1_mode": mode,
         "graph_signature": list(_cuda_graph_signature(prefix, model_inputs)),
     }
 
@@ -217,6 +271,7 @@ def measure_verify_k(
     mk["past_key_values"] = cache
     mk["use_cache"] = True
     _, mk = prefill(model, prompt_ids, mk)
+    mk = _strip_audio_after_prefill(mk)
 
     draft = torch.randint(
         low=10,

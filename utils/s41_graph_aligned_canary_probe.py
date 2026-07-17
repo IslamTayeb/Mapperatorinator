@@ -78,6 +78,9 @@ def aligned_teacher_argmax_at(
     mk["use_cache"] = True
     with teacher_aligned_runtime_context(precision=precision):
         last, mk = spec._prefill(teacher, prompt_ids=prompt_ids, model_kwargs=mk)
+        if mk.get("encoder_outputs") is not None:
+            for key in ("frames", "inputs", "input_features"):
+                mk.pop(key, None)
         ids = prompt_ids
         for tok in forced_prefix:
             # Logits before consuming tok are for verifying tok; after Q=1 we
