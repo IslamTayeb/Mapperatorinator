@@ -8,6 +8,9 @@ from ...logit_processors import (
     MonotonicTimeShiftLogitsProcessor as _V32MonotonicTimeShiftLogitsProcessor,
     build_logits_processor_list,
 )
+from ..kernels.whole_token_step_cuda_graph import (
+    whole_token_step_cuda_graph_requested,
+)
 
 
 class MonotonicTimeShiftLogitsProcessor(_V32MonotonicTimeShiftLogitsProcessor):
@@ -30,15 +33,62 @@ class MonotonicTimeShiftLogitsProcessor(_V32MonotonicTimeShiftLogitsProcessor):
             return self._stateful_batch1_call(input_ids, scores)
         return super().__call__(input_ids, scores)
 
+    def _full_scan_call(
+        self,
+        input_ids: torch.LongTensor,
+        scores: torch.FloatTensor,
+    ) -> torch.FloatTensor:
+        """Capture-safe full scan (gather + where; no data-dependent index)."""
+
+        device = input_ids.device
+        batch_size, seq_len = input_ids.shape
+        is_time_shift = (
+            (input_ids >= self.time_shift_start) & (input_ids < self.time_shift_end)
+        )
+        is_sos = self._is_sos(input_ids)
+        indices = torch.arange(seq_len, device=device).expand(batch_size, -1)
+        last_time_shift_idx = torch.max(
+            torch.where(is_time_shift, indices, -1),
+            dim=1,
+        ).values
+        last_sos_idx = torch.max(torch.where(is_sos, indices, -1), dim=1).values
+        safe_idx = last_time_shift_idx.clamp(min=0).unsqueeze(1)
+        gathered = input_ids.gather(1, safe_idx).squeeze(1)
+        last_time_shift_values = torch.where(
+            last_time_shift_idx != -1,
+            gathered - self.time_shift_start,
+            torch.zeros(batch_size, dtype=input_ids.dtype, device=device),
+        )
+        apply_mask = (last_time_shift_idx != -1) & (last_time_shift_idx > last_sos_idx)
+        time_shift_vocab = torch.arange(
+            self.time_shift_start,
+            self.time_shift_end,
+            device=device,
+        )
+        invalid_mask = time_shift_vocab.unsqueeze(0) < (
+            self.time_shift_start + last_time_shift_values
+        ).unsqueeze(1)
+        scores_ts = scores[:, self.time_shift_start : self.time_shift_end]
+        masked_ts = scores_ts.masked_fill(invalid_mask, -torch.inf)
+        scores = scores.clone()
+        scores[:, self.time_shift_start : self.time_shift_end] = torch.where(
+            apply_mask.unsqueeze(1),
+            masked_ts,
+            scores_ts,
+        )
+        return scores
+
     def _stateful_batch1_call(
         self,
         input_ids: torch.LongTensor,
         scores: torch.FloatTensor,
     ) -> torch.FloatTensor:
+        # Whole-token CUDA graphs pass a fixed-width pad-filled buffer and must
+        # avoid data-dependent indexing / boolean row assigns during capture.
+        if whole_token_step_cuda_graph_requested():
+            return self._full_scan_call(input_ids, scores)
+
         seq_len = input_ids.shape[1]
-        # Preallocated whole-token buffers keep a fixed shape[1]; growing-view
-        # incremental updates never apply. Full-scan matches active-prefix
-        # semantics when the unused tail is pad-filled.
         if self._state_seq_len is not None and seq_len == self._state_seq_len:
             return self._full_scan_call(input_ids, scores)
         if self._state_seq_len is None or seq_len != self._state_seq_len + 1:
@@ -75,9 +125,11 @@ class MonotonicTimeShiftLogitsProcessor(_V32MonotonicTimeShiftLogitsProcessor):
             dim=0,
         ).values
         last_sos_idx = torch.max(torch.where(is_sos, indices, -1), dim=0).values
+        safe_idx = last_time_shift_idx.clamp(min=0)
+        gathered = tokens.gather(0, safe_idx.reshape(1)).squeeze(0)
         last_time_shift_value = torch.where(
             last_time_shift_idx != -1,
-            tokens[last_time_shift_idx] - self.time_shift_start,
+            gathered - self.time_shift_start,
             torch.zeros((), dtype=tokens.dtype, device=tokens.device),
         )
 
