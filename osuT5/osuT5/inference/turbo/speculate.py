@@ -147,6 +147,9 @@ def _forward_decoder(
         decoder_input_ids,
         **model_kwargs,
     )
+    # HF _update_model_kwargs_for_generation expects cache_position on kwargs.
+    if "cache_position" in model_inputs:
+        model_kwargs["cache_position"] = model_inputs["cache_position"]
     outputs = model(**model_inputs, return_dict=True)
     model_kwargs = model._update_model_kwargs_for_generation(
         outputs,
