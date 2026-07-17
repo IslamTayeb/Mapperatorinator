@@ -314,23 +314,44 @@ def _generate_window(
     from ..kernels.compiled_proj_out_activation import compiled_proj_out_requested
 
     if compiled_proj_out_requested():
-        from ..kernels.compiled_proj_out import prepare_compiled_proj_out
-
-        prepared_proj_out, compiled_proj_out_evidence = prepare_compiled_proj_out(
-            model, expected_dtype
+        # §15 FIX / §20: skip prepare on TIMING windows and when proj_out is not
+        # a rank-2 Linear weight (timing models lack a usable LM head).
+        proj_out_module = getattr(model, "proj_out", None)
+        proj_out_weight = getattr(proj_out_module, "weight", None)
+        can_prepare_compiled_proj_out = (
+            context_type != ContextType.TIMING
+            and isinstance(proj_out_weight, torch.Tensor)
+            and proj_out_weight.ndim == 2
+            and proj_out_weight.dtype == expected_dtype
         )
+        if can_prepare_compiled_proj_out:
+            from ..kernels.compiled_proj_out import prepare_compiled_proj_out
 
-        def compiled_proj_out(hidden_states, weight, bias):
-            if (
-                not isinstance(hidden_states, torch.Tensor)
-                or hidden_states.ndim < 2
-                or tuple(hidden_states.shape[:2]) != (1, 1)
-            ):
-                raise RuntimeError(
-                    "compiled proj_out is decode-only (1,1,*); refusing shape "
-                    f"{tuple(getattr(hidden_states, 'shape', ()))}"
-                )
-            return prepared_proj_out(hidden_states, weight, bias)
+            prepared_proj_out, compiled_proj_out_evidence = prepare_compiled_proj_out(
+                model, expected_dtype
+            )
+
+            def compiled_proj_out(hidden_states, weight, bias):
+                if (
+                    not isinstance(hidden_states, torch.Tensor)
+                    or hidden_states.ndim < 2
+                    or tuple(hidden_states.shape[:2]) != (1, 1)
+                ):
+                    raise RuntimeError(
+                        "compiled proj_out is decode-only (1,1,*); refusing shape "
+                        f"{tuple(getattr(hidden_states, 'shape', ()))}"
+                    )
+                return prepared_proj_out(hidden_states, weight, bias)
+        else:
+            compiled_proj_out_evidence = {
+                "enabled": False,
+                "decode_only": True,
+                "disabled_reason": (
+                    "timing_context"
+                    if context_type == ContextType.TIMING
+                    else "missing_rank2_proj_out_weight"
+                ),
+            }
 
     rng_before = (
         rng_progression_signature(model.device)
