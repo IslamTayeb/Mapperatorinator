@@ -1,7 +1,7 @@
-"""Turbo runtime (Track C §45 integrator).
+"""Turbo runtime (Track C §45 integrator + §48 graph-native verify).
 
 Immutable preset: §43 1-layer draft (K=1, γ=3, temp=0.9) + Leviathan rejection
-sampling vs §41 graph-aligned teacher. Not bit-exact. Full TIER1 before any
+sampling vs §41/§48 teacher verify. Not bit-exact. Full TIER1 before any
 500 / ship claim. Campaign tip remains 55949274 / FP16 366.11.
 """
 from __future__ import annotations
@@ -17,6 +17,7 @@ from ..engine_binding import InferenceEngineBinding
 from .draft import DEFAULT_DRAFT_CKPT_ENV, load_draft_from_ckpt
 from .rejection import apply_temp_top_p, reject_sample_prefix
 from .speculate import speculative_generate_window
+from .verify_fastpath import TeacherVerifyFastpath, build_teacher_verify_fastpath
 
 TURBO_PRESET_VERSION = "turbo-integrator-s45-1layer-g3-v1"
 PRIMARY_GAMMA = 3
@@ -29,6 +30,8 @@ class TurboDecodeSession:
     accepted_tokens_total: int = 0
     verify_steps: int = 0
     draft_calls: int = 0
+    # §48: reuse teacher verify graphs across windows (never rebuild per window).
+    verify_fastpath: TeacherVerifyFastpath | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,18 +66,28 @@ TURBO_PRESETS = MappingProxyType(
 
 @dataclass
 class TurboRuntime:
-    """Opt-in turbo runtime bound to a teacher + §37 tiny draft."""
+    """Opt-in turbo runtime bound to a teacher + §43 tiny draft."""
 
     preset: TurboPreset
     draft: Any
     draft_meta: dict[str, Any]
     speculative_generate_wired: bool = True
+    # Persistent across requests/windows — graph cache lives here (§48).
+    verify_fastpath: TeacherVerifyFastpath | None = None
+    _teacher_ref: Any = None
+
+    def ensure_verify_fastpath(self, teacher) -> TeacherVerifyFastpath | None:
+        if self.verify_fastpath is not None and self._teacher_ref is teacher:
+            return self.verify_fastpath
+        self.verify_fastpath = build_teacher_verify_fastpath(teacher)
+        self._teacher_ref = teacher
+        return self.verify_fastpath
 
     def new_context_state(self) -> TurboDecodeSession:
-        return TurboDecodeSession()
+        return TurboDecodeSession(verify_fastpath=self.verify_fastpath)
 
     def profile_metadata(self) -> dict[str, Any]:
-        return {
+        meta = {
             "turbo_effective_config_version": self.preset.version,
             "turbo_runtime_owner": "osuT5.osuT5.inference.turbo.engine",
             "turbo_result_class": self.preset.result_class,
@@ -89,13 +102,17 @@ class TurboRuntime:
             ),
             "turbo_tier1_required": True,
             "turbo_verify_fastpath_default": True,
+            "turbo_verify_persistent_cache": True,
             "turbo_tree_k": 1,
             "note": (
-                "§45 turbo integrator: §43 1-layer K=1 γ=3 draft + §41 "
-                "eager-native aligned teacher verify. Not a production TPS "
-                "claim. Full TIER1 before ship. Campaign tip 55949274/366.11."
+                "§45 turbo integrator + §48 graph-native K=γ verify. "
+                "Not a production TPS claim. Full TIER1 before ship. "
+                "Campaign tip 55949274/366.11."
             ),
         }
+        if self.verify_fastpath is not None:
+            meta.update(self.verify_fastpath.profile_metadata())
+        return meta
 
     def reject_sample_prefix(
         self,
@@ -151,6 +168,9 @@ class TurboRuntime:
         gamma_env = os.environ.get("MAPPERATORINATOR_TURBO_GAMMA", "").strip()
         if gamma_env:
             gamma = max(1, int(gamma_env))
+        verify_fp = self.ensure_verify_fastpath(model)
+        if context_state.verify_fastpath is None:
+            context_state.verify_fastpath = verify_fp
         return speculative_generate_window(
             teacher=model,
             draft=self.draft,
@@ -161,6 +181,7 @@ class TurboRuntime:
             temperature=self.preset.temperature,
             top_p=self.preset.top_p,
             session=context_state,
+            verify_fastpath=context_state.verify_fastpath,
         )
 
 
@@ -180,12 +201,14 @@ def load_turbo_runtime(
         device=device,
         dtype=dtype,
     )
-    return TurboRuntime(
+    runtime = TurboRuntime(
         preset=TURBO_PRESETS[precision],
         draft=draft,
         draft_meta=meta,
         speculative_generate_wired=True,
     )
+    runtime.ensure_verify_fastpath(teacher)
+    return runtime
 
 
 def load_turbo_engine(

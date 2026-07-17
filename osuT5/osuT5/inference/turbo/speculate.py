@@ -453,8 +453,12 @@ def speculative_generate_window(
     temperature: float,
     top_p: float,
     session: Any,
+    verify_fastpath: TeacherVerifyFastpath | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Run speculative decode for one window; return (sequences_cpu, stats)."""
+    """Run speculative decode for one window; return (sequences_cpu, stats).
+
+    ``verify_fastpath`` must be shared across windows (§48 persistent graph cache).
+    """
     gw = dict(generate_kwargs)
     precision = gw.pop("precision", "fp32")
     cfg_scale = float(gw.pop("cfg_scale", 1.0))
@@ -511,7 +515,17 @@ def speculative_generate_window(
     draft_cache = get_turbo_cache(cfg_scale=1.0)
     teacher_mk["past_key_values"] = teacher_cache
     teacher_mk["use_cache"] = True
-    verify_fp = build_teacher_verify_fastpath(teacher)
+    # §48: never rebuild verify_fp / graph caches per window.
+    verify_fp = verify_fastpath
+    if verify_fp is None and getattr(session, "verify_fastpath", None) is not None:
+        verify_fp = session.verify_fastpath
+    if verify_fp is None:
+        verify_fp = build_teacher_verify_fastpath(teacher)
+    if getattr(session, "verify_fastpath", None) is None and verify_fp is not None:
+        try:
+            session.verify_fastpath = verify_fp
+        except Exception:
+            pass
 
     draft_mk = _move_model_kwargs(draft, model_kwargs)
     draft_mk.pop("decoder_input_ids", None)
@@ -784,6 +798,19 @@ def speculative_generate_window(
             "turbo_verify_fastpath": verify_fp is not None,
             "turbo_teacher_aligned_greedy": aligned_greedy,
             "turbo_kv_commit_mode": "crop_to_L_full_rebuild",
+            "turbo_verify_path": (
+                "aligned_q1"
+                if aligned_greedy
+                else (
+                    "graph_native_k"
+                    if (
+                        verify_fp is not None
+                        and getattr(verify_fp, "graph_native", False)
+                        and getattr(verify_fp, "use_cuda_graph", False)
+                    )
+                    else ("fastpath_k" if verify_fp is not None else "eager_k")
+                )
+            ),
             **timer.as_stats(
                 accepted_total=accepted_total, verify_steps=verify_steps
             ),
@@ -791,3 +818,4 @@ def speculative_generate_window(
         }
     )
     return result, stats
+

@@ -28,3 +28,5 @@ idea merely because its isolated number was promising.
 Historical artifact hashes, intermediate failures, and per-job commands are
 evidence, not standing instructions. Use Git history only when auditing a
 specific old decision.
+
+**§48 W-VG graph-native K=γ verify — OPEN** (2026-07-17): branch `codex/turbo-graph-native-verify`. Lifted k>1 graph gate; static `{ids[1,γ], cache_position[γ]}`; mask in-graph; no HF prepare_inputs on hot path; production side-stream warmup; persistent verify_fp across windows. In-loop probe `utils/s48_graph_native_verify_inloop.py`. Gate ≤1.2× / kill >1.35×. Handoff: `notes/500tps-section48-handoff.md`. Tip still `55949274` / **366.11**. No 500 claim.
