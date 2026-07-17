@@ -9,6 +9,7 @@ from ...logit_processors import (
     build_logits_processor_list,
 )
 from ..kernels.whole_token_step_cuda_graph import (
+    whole_token_active_length_tensor,
     whole_token_step_cuda_graph_requested,
 )
 
@@ -47,6 +48,20 @@ class MonotonicTimeShiftLogitsProcessor(_V32MonotonicTimeShiftLogitsProcessor):
         )
         is_sos = self._is_sos(input_ids)
         indices = torch.arange(seq_len, device=device).expand(batch_size, -1)
+        active_length = whole_token_active_length_tensor()
+        if active_length is not None:
+            if (
+                not isinstance(active_length, torch.Tensor)
+                or active_length.shape != (1,)
+                or active_length.dtype != torch.long
+                or active_length.device != device
+            ):
+                raise RuntimeError(
+                    "whole-token active length must be int64 CUDA tensor shape [1]"
+                )
+            valid = indices < active_length.reshape(1, 1)
+            is_time_shift = is_time_shift & valid
+            is_sos = is_sos & valid
         last_time_shift_idx = torch.max(
             torch.where(is_time_shift, indices, -1),
             dim=1,

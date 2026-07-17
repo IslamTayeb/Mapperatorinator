@@ -8,6 +8,7 @@ from transformers.modeling_outputs import BaseModelOutput
 from ....runtime_profiling import profile_range
 from ..kernels.whole_token_step_cuda_graph import (
     record_whole_token_step_cuda_graph_hit,
+    set_whole_token_active_length_tensor,
     whole_token_step_cuda_graph_requested,
 )
 from .runtime_context import active_prefix_self_attention_context
@@ -411,6 +412,11 @@ def active_prefix_decode_generate(
                         f"{write_at} not in [0, {max_length})"
                     )
                 whole_token_buffers["write_index"].fill_(write_at)
+                # Processors must ignore the pad tail; bind the live write_index
+                # tensor so CUDA-graph replay sees the updated length each step.
+                set_whole_token_active_length_tensor(
+                    whole_token_buffers["write_index"]
+                )
                 if graph_entry is None:
                     static_inputs = _clone_static_graph_inputs(model_inputs)
                     with profile_range("generation.decode_graph_capture_setup"):
