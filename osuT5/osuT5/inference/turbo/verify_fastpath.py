@@ -1,15 +1,21 @@
-"""§41 K-token teacher verify on optimized-style StaticCache machinery.
+"""§41 teacher verify: K-token fastpath + graph-aligned Q=1 (TIER1a).
 
-Turbo-only. Does not change bit-exact optimized engine presets or semantics.
-Reuses StaticCache + active-prefix CUDA-graph patterns from optimized/single
-for multi-token (K≈4–8) teacher verify; optional per-K graph capture.
+Turbo-only. Does not change bit-exact optimized engine presets/semantics.
+Reuses StaticCache, active-prefix, native q1/cross-mlp hooks, and optional
+CUDA graphs from optimized machinery via the turbo package.
+
+Two modes:
+- **perf / K-token**: one multi-token teacher forward (c_verify ≤1.2× Q=1).
+- **canary / greedy**: sequential Q=1 graph-aligned steps so teacher logits
+  match optimized `active_prefix_cuda_graph` decode (§40 STOP_ESCALATE).
 """
 from __future__ import annotations
 
 import os
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterator, Sequence
 
 import torch
 from transformers.cache_utils import StaticCache
@@ -27,10 +33,16 @@ def verify_fastpath_enabled() -> bool:
 
 
 def use_verify_cuda_graphs() -> bool:
-    # Default off: capture must be the live first forward (no warmup on StaticCache).
-    # Microbench opts in via MAPPERATORINATOR_TURBO_VERIFY_CUDA_GRAPH=1.
-    raw = os.environ.get("MAPPERATORINATOR_TURBO_VERIFY_CUDA_GRAPH", "0").strip().lower()
-    return raw in {"1", "true", "on", "yes"}
+    # Default ON for Q=1 canary alignment; K-token capture still opt-in via
+    # allow_graph on forward_k (microbench sets True).
+    raw = os.environ.get("MAPPERATORINATOR_TURBO_VERIFY_CUDA_GRAPH", "1").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+def graph_aligned_teacher_enabled() -> bool:
+    """Sequential Q=1 teacher path for greedy / TIER1a canary."""
+    raw = os.environ.get("MAPPERATORINATOR_TURBO_TEACHER_ALIGNED", "1").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
 
 
 def _bucketed_prefix_length(cur_len: int, bucket_size: int, max_cache_len: int) -> int:
@@ -41,16 +53,31 @@ def _bucketed_prefix_length(cur_len: int, bucket_size: int, max_cache_len: int) 
 
 
 def allocate_teacher_static_cache(model, *, cfg_scale: float = 1.0) -> MapperatorinatorCache:
-    """Static KV for teacher verify (crop-capable; same allocator as optimized)."""
     if cfg_scale != 1.0:
         raise ValueError("turbo verify fastpath requires cfg_scale=1.0")
     return get_cache(model, batch_size=1, num_beams=1, cfg_scale=1.0)
 
 
+@contextmanager
+def teacher_aligned_runtime_context(*, precision: str) -> Iterator[None]:
+    """Arm the same native decode hooks optimized MAP generation uses."""
+    from ..optimized.single.runtime_context import (
+        attention_runtime_context,
+        decoder_layer_runtime_context,
+    )
+
+    dtype = torch.float16 if precision == "fp16" else torch.float32
+    with attention_runtime_context(
+        q1_bmm_cross_attention=True,
+        native_q1_self_attention=True,
+        native_q1_rope_cache_self_attention=True,
+        expected_dtype=dtype,
+    ), decoder_layer_runtime_context(native_cross_mlp_tail=True):
+        yield
+
+
 @dataclass(slots=True)
 class DeviceTokenBuffer:
-    """Fixed-address token storage for multi-token verify/commit (device-side)."""
-
     sequence: torch.Tensor
     length: int
     max_length: int
@@ -141,15 +168,17 @@ class VerifyGraphEntry:
 
 @dataclass
 class TeacherVerifyFastpath:
-    """K-token teacher verify with StaticCache + optional per-K CUDA graphs."""
+    """Teacher verify: K-token perf path + Q=1 graph-aligned canary path."""
 
     model: Any
     bucket_size: int = ACTIVE_PREFIX_BUCKET_SIZE
     use_cuda_graph: bool = True
+    graph_aligned: bool = True
     graph_cache: dict[tuple[int, int], VerifyGraphEntry] = field(default_factory=dict)
     eager_calls: int = 0
     graph_replays: int = 0
     graph_captures: int = 0
+    q1_steps: int = 0
 
     def _max_cache_len(self, model_kwargs: dict[str, Any]) -> int:
         cache = model_kwargs.get("past_key_values")
@@ -157,7 +186,7 @@ class TeacherVerifyFastpath:
             return int(cache.get_max_cache_shape())
         return int(self.model.config.max_target_positions)
 
-    def _prepare_verify_inputs(
+    def _prepare_inputs(
         self,
         *,
         decoder_input_ids: torch.LongTensor,
@@ -176,7 +205,7 @@ class TeacherVerifyFastpath:
             **mk,
         )
         if "cache_position" in model_inputs:
-            mk["cache_position"] = model_inputs["cache_position"]
+            model_kwargs["cache_position"] = model_inputs["cache_position"]
         return model_inputs
 
     def _capture_graph(
@@ -186,10 +215,10 @@ class TeacherVerifyFastpath:
         prefix_length: int,
         k: int,
     ) -> VerifyGraphEntry:
-        """Capture is the live first forward (StaticCache must not be warmed)."""
         from ..optimized.single.runtime_context import active_prefix_self_attention_context
 
         static_inputs = _clone_static_graph_inputs(model_inputs)
+        # warmup=0 — match optimized production capture (StaticCache live write).
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         t0 = time.perf_counter()
@@ -197,7 +226,6 @@ class TeacherVerifyFastpath:
             with active_prefix_self_attention_context(prefix_length):
                 outputs = self.model(**static_inputs, return_dict=True)
         torch.cuda.synchronize()
-        capture_s = time.perf_counter() - t0
         self.graph_captures += 1
         return VerifyGraphEntry(
             graph=graph,
@@ -205,49 +233,37 @@ class TeacherVerifyFastpath:
             static_inputs=static_inputs,
             prefix_length=prefix_length,
             k=k,
-            capture_seconds=capture_s,
+            capture_seconds=time.perf_counter() - t0,
         )
 
-    def forward_k(
+    def _forward_shaped(
         self,
         *,
         decoder_input_ids: torch.LongTensor,
         model_kwargs: dict[str, Any],
         k: int,
-        allow_graph: bool | None = None,
+        allow_graph: bool,
     ) -> tuple[Any, dict[str, Any]]:
-        """One multi-token teacher forward over the last K tokens (full ids)."""
-        if k <= 0:
-            raise ValueError("k must be positive")
-        if int(decoder_input_ids.shape[1]) < k:
-            raise ValueError("decoder_input_ids shorter than k")
+        from ..optimized.single.runtime_context import active_prefix_self_attention_context
 
-        use_graph = self.use_cuda_graph if allow_graph is None else bool(allow_graph)
-        model_inputs = self._prepare_verify_inputs(
+        model_inputs = self._prepare_inputs(
             decoder_input_ids=decoder_input_ids,
             model_kwargs=model_kwargs,
         )
-        # Sync cache_position into kwargs for HF update helper.
-        if "cache_position" in model_inputs:
-            model_kwargs["cache_position"] = model_inputs["cache_position"]
-
         past = model_kwargs.get("past_key_values")
         can_graph = (
-            use_graph
+            allow_graph
+            and self.use_cuda_graph
             and torch.cuda.is_available()
             and isinstance(getattr(past, "self_attention_cache", None), StaticCache)
             and decoder_input_ids.device.type == "cuda"
         )
-
-        from ..optimized.single.runtime_context import active_prefix_self_attention_context
-
         cur_len = int(decoder_input_ids.shape[1])
         prefix_length = _bucketed_prefix_length(
             cur_len,
             self.bucket_size,
             self._max_cache_len(model_kwargs),
         )
-
         if can_graph:
             key = (prefix_length, int(k))
             entry = self.graph_cache.get(key)
@@ -258,7 +274,6 @@ class TeacherVerifyFastpath:
                     k=int(k),
                 )
                 self.graph_cache[key] = entry
-                # Capture advanced StaticCache; treat it as this call's forward.
                 outputs = entry.outputs
             else:
                 _copy_static_graph_inputs(entry.static_inputs, model_inputs)
@@ -278,15 +293,81 @@ class TeacherVerifyFastpath:
         )
         return outputs, model_kwargs
 
+    def forward_k(
+        self,
+        *,
+        decoder_input_ids: torch.LongTensor,
+        model_kwargs: dict[str, Any],
+        k: int,
+        allow_graph: bool | None = None,
+    ) -> tuple[Any, dict[str, Any]]:
+        """Multi-token teacher forward (perf path)."""
+        if k <= 0:
+            raise ValueError("k must be positive")
+        if int(decoder_input_ids.shape[1]) < k:
+            raise ValueError("decoder_input_ids shorter than k")
+        # Default: no CUDA graph for K>1 (capture shape zoo); microbench opts in.
+        use_graph = False if allow_graph is None else bool(allow_graph)
+        if k == 1 and allow_graph is None:
+            use_graph = self.use_cuda_graph
+        return self._forward_shaped(
+            decoder_input_ids=decoder_input_ids,
+            model_kwargs=model_kwargs,
+            k=k,
+            allow_graph=use_graph,
+        )
+
+    def forward_q1(
+        self,
+        *,
+        decoder_input_ids: torch.LongTensor,
+        model_kwargs: dict[str, Any],
+    ) -> tuple[Any, dict[str, Any]]:
+        """One optimized-style Q=1 step (graph-aligned when CUDA graph on)."""
+        self.q1_steps += 1
+        return self._forward_shaped(
+            decoder_input_ids=decoder_input_ids,
+            model_kwargs=model_kwargs,
+            k=1,
+            allow_graph=self.use_cuda_graph,
+        )
+
+    def verify_sequential_q1(
+        self,
+        *,
+        prompt_ids: torch.LongTensor,
+        draft_ids: Sequence[int],
+        model_kwargs: dict[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        """Teacher-force draft via sequential Q=1 steps (TIER1a / greedy).
+
+        Returns verify_logits[γ,V] (logits after each draft token), bonus_logits[V]
+        (logits after last draft token — same as verify_logits[-1]), updated kwargs.
+        """
+        mk = model_kwargs
+        ids = prompt_ids
+        step_logits: list[torch.Tensor] = []
+        for tok in draft_ids:
+            tok_t = torch.tensor([[int(tok)]], device=ids.device, dtype=ids.dtype)
+            ids = torch.cat([ids, tok_t], dim=-1)
+            outputs, mk = self.forward_q1(decoder_input_ids=ids, model_kwargs=mk)
+            step_logits.append(outputs.logits[:, -1, :].float().squeeze(0))
+        if not step_logits:
+            raise RuntimeError("sequential Q=1 verify produced no logits")
+        verify = torch.stack(step_logits, dim=0)
+        return verify, verify[-1].clone(), mk
+
     def profile_metadata(self) -> dict[str, Any]:
         return {
             "turbo_verify_fastpath": True,
             "turbo_verify_bucket_size": self.bucket_size,
             "turbo_verify_cuda_graph": self.use_cuda_graph,
+            "turbo_teacher_graph_aligned": self.graph_aligned,
             "turbo_verify_eager_calls": self.eager_calls,
             "turbo_verify_graph_replays": self.graph_replays,
             "turbo_verify_graph_captures": self.graph_captures,
             "turbo_verify_graph_entries": len(self.graph_cache),
+            "turbo_verify_q1_steps": self.q1_steps,
         }
 
 
@@ -297,6 +378,7 @@ def build_teacher_verify_fastpath(model) -> TeacherVerifyFastpath | None:
         model=model,
         bucket_size=ACTIVE_PREFIX_BUCKET_SIZE,
         use_cuda_graph=use_verify_cuda_graphs(),
+        graph_aligned=graph_aligned_teacher_enabled(),
     )
 
 
@@ -307,6 +389,8 @@ __all__ = [
     "TeacherVerifyFastpath",
     "allocate_teacher_static_cache",
     "build_teacher_verify_fastpath",
+    "graph_aligned_teacher_enabled",
+    "teacher_aligned_runtime_context",
     "verify_fastpath_enabled",
     "use_verify_cuda_graphs",
 ]

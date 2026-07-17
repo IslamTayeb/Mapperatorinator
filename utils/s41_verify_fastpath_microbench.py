@@ -330,11 +330,11 @@ def main() -> int:
     model, _runtime = unwrap_engine_binding(model_binding)
     model.eval()
 
-    preprocessor = Preprocessor(args_inf)
+    preprocessor = Preprocessor(args_inf, parallel=False)
     processor = Processor(args_inf, model_binding, tokenizer)
     audio = Path(args_inf.audio_path)
-    song_length = preprocessor.get_song_length(str(audio))
-    sequences = preprocessor.load(str(audio))
+    sequences = preprocessor.segment(preprocessor.load(str(audio)))
+    song_length = float(sequences[2])
 
     osu_path = Path(args.osu) if args.osu else None
     if osu_path is None or not osu_path.is_file():

@@ -5,11 +5,11 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
 #SBATCH --gres=gpu:2080:1
-#SBATCH --time=00:45:00
+#SBATCH --time=01:00:00
 #SBATCH --output=/work/imt11/Mapperatorinator/logs/%x-%j.out
 #SBATCH --error=/work/imt11/Mapperatorinator/logs/%x-%j.err
 
-# §41 budget-gate: c_verify(K) vs optimized Q=1 step on 2080 Ti.
+# §41: (1) c_verify(K) vs Q=1 microbench  (2) graph-aligned canary probe @110
 # Unique TMPDIR / TORCH_EXTENSIONS. Not a 500 claim / full reciprocal.
 
 set -euo pipefail
@@ -22,6 +22,7 @@ UNIQUE="$WORK/tmp/s41-verify-$JOB"
 EXT="$WORK/torch_extensions/s41-verify-$JOB"
 AUDIO=${MAPPERATORINATOR_AUDIO:-$WORK/data/salvalai.mp3}
 OSU=${MAPPERATORINATOR_OSU:-}
+DUMP=${MAPPERATORINATOR_DUMP_RUN:-$WORK/runs/exact-rope-device-state-fp16-auth-49964133}
 
 mkdir -p "$RUN_ROOT" "$UNIQUE" "$EXT" "$WORK/logs"
 export PATH="$ENV/bin:$PATH"
@@ -35,6 +36,7 @@ export TORCH_EXTENSIONS_DIR="$EXT"
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 export MAPPERATORINATOR_TURBO_VERIFY_FASTPATH=1
+export MAPPERATORINATOR_TURBO_TEACHER_ALIGNED=1
 export MAPPERATORINATOR_AUDIO="$AUDIO"
 
 cd "$REPO"
@@ -49,20 +51,18 @@ cd "$REPO"
   nvidia-smi -L
 } | tee "$RUN_ROOT/preflight.txt"
 
-# Prefer tip FP16 dump .osu when present.
 if [[ -z "$OSU" ]]; then
-  mapfile -t osus < <(find "$WORK/runs/shared-rope-device-state-fp16-auth-49964133" -name 'beatmap*.osu' 2>/dev/null | sort)
+  mapfile -t osus < <(find "$DUMP" -name 'beatmap*.osu' 2>/dev/null | sort)
   if [[ ${#osus[@]} -ge 1 ]]; then
     OSU="${osus[0]}"
   fi
 fi
-
 EXTRA=()
 if [[ -n "$OSU" ]]; then
   EXTRA+=(--osu "$OSU")
 fi
 
-# Eager StaticCache path first (budget gate). Optional graph job can follow.
+set +e
 "$ENV/bin/python" utils/s41_verify_fastpath_microbench.py \
   --config-name profile_salvalai \
   --audio "$AUDIO" \
@@ -71,9 +71,9 @@ fi
   --warmup 5 \
   --iters 40 \
   "${EXTRA[@]}" \
-  | tee "$RUN_ROOT/stdout_eager.txt"
+  > "$RUN_ROOT/stdout_eager.txt" 2> "$RUN_ROOT/stderr_eager.txt"
+EAGER_RC=$?
 
-# Per-K CUDA graph path (same job; still budget microbench).
 "$ENV/bin/python" utils/s41_verify_fastpath_microbench.py \
   --config-name profile_salvalai \
   --audio "$AUDIO" \
@@ -83,32 +83,60 @@ fi
   --iters 40 \
   --cuda-graph-verify \
   "${EXTRA[@]}" \
-  | tee "$RUN_ROOT/stdout_cudagraph.txt"
+  > "$RUN_ROOT/stdout_cudagraph.txt" 2> "$RUN_ROOT/stderr_cudagraph.txt"
+GRAPH_RC=$?
+
+"$ENV/bin/python" utils/s41_graph_aligned_canary_probe.py \
+  --audio "$AUDIO" \
+  --dump-run "$DUMP" \
+  --out "$RUN_ROOT/canary_probe.json" \
+  > "$RUN_ROOT/stdout_canary.txt" 2> "$RUN_ROOT/stderr_canary.txt"
+CANARY_RC=$?
+set -e
 
 "$ENV/bin/python" - <<PY | tee "$RUN_ROOT/summary.json"
 import json
 from pathlib import Path
 root = Path("$RUN_ROOT")
-eager = json.loads((root / "microbench_eager.json").read_text())
-graph = json.loads((root / "microbench_cudagraph.json").read_text())
+
+def load(name):
+    p = root / name
+    if not p.is_file():
+        return None
+    return json.loads(p.read_text())
+
+eager = load("microbench_eager.json")
+graph = load("microbench_cudagraph.json")
+canary = load("canary_probe.json")
 out = {
     "section": 41,
     "job_id": "$JOB",
-    "commit": eager.get("commit"),
-    "optimized_q1_step_ms_eager_run": eager["optimized_q1_step"]["q1_step_ms"],
-    "optimized_q1_step_ms_graph_run": graph["optimized_q1_step"]["q1_step_ms"],
-    "eager": eager["verify"],
-    "cudagraph": graph["verify"],
-    "best_ratio_eager": eager.get("best_ratio"),
-    "best_ratio_cudagraph": graph.get("best_ratio"),
-    "gate_pass_eager": eager.get("all_gate_pass"),
-    "gate_pass_cudagraph": graph.get("all_gate_pass"),
+    "commit": "$(git rev-parse HEAD)",
+    "eager_rc": $EAGER_RC,
+    "cudagraph_rc": $GRAPH_RC,
+    "canary_rc": $CANARY_RC,
+    "optimized_q1_step_ms": (eager or {}).get("optimized_q1_step", {}).get("q1_step_ms"),
+    "eager": (eager or {}).get("verify"),
+    "cudagraph": (graph or {}).get("verify"),
+    "best_ratio_eager": (eager or {}).get("best_ratio"),
+    "best_ratio_cudagraph": (graph or {}).get("best_ratio"),
+    "gate_pass_eager": (eager or {}).get("all_gate_pass"),
+    "gate_pass_cudagraph": (graph or {}).get("all_gate_pass"),
+    "canary_path_status": (canary or {}).get("canary_path_status"),
+    "canary_argmax_match": (canary or {}).get("argmax_match"),
+    "canary": canary,
     "target_ratio": 1.2,
     "campaign_tip": "55949274",
     "campaign_tip_fp16_main_tps": 366.11,
-    "note": "Budget-gate microbench only. No 500 / full reciprocal.",
+    "note": "Budget-gate only. No 500 / full reciprocal. §40 STOP_ESCALATE owned here.",
 }
 print(json.dumps(out, indent=2))
 PY
 
+# Fail job if microbench crashed; canary FAIL is recorded but still surfaces.
+if [[ $EAGER_RC -ne 0 && $GRAPH_RC -ne 0 ]]; then
+  echo "both microbenches failed" >&2
+  tail -n 40 "$RUN_ROOT/stderr_eager.txt" >&2 || true
+  exit 2
+fi
 echo DONE

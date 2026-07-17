@@ -6,6 +6,7 @@ Distribution-equivalent under rejection sampling; TIER1 required before ship.
 from __future__ import annotations
 
 import time
+from contextlib import nullcontext
 from typing import Any, Sequence
 
 import torch
@@ -24,6 +25,7 @@ from .verify_fastpath import (
     TeacherVerifyFastpath,
     allocate_teacher_static_cache,
     build_teacher_verify_fastpath,
+    teacher_aligned_runtime_context,
     verify_fastpath_enabled,
 )
 
@@ -285,28 +287,46 @@ def _verify_draft_tokens(
     top_p: float,
     verify_fastpath: TeacherVerifyFastpath | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
-    """One multi-token teacher forward over drafted ids.
+    """Teacher verify over drafted ids.
 
     Returns p_logits[γ,V], p_probs[γ,V], bonus_logits[V], updated kwargs.
-    When verify_fastpath is set, uses StaticCache + active-prefix (optional
-    per-K CUDA graph) machinery under the turbo package (§41).
+
+    §41: greedy + graph_aligned → sequential Q=1 (matches optimized cuda-graph
+    decode for TIER1a). Otherwise one multi-token K-forward for c_verify speed.
     """
     gamma = len(draft_ids)
     draft_t = torch.tensor([list(draft_ids)], device=prompt_ids.device, dtype=prompt_ids.dtype)
     ids = torch.cat([prompt_ids, draft_t], dim=-1)
-    if verify_fastpath is not None:
+    use_aligned_q1 = (
+        verify_fastpath is not None
+        and verify_fastpath.graph_aligned
+        and (greedy or temperature <= 1e-5)
+    )
+    if use_aligned_q1:
+        # Sequential Q=1: logits after each draft token.
+        # p_raw[0] is still last_logits (pre-draft); verify rows shift like HF.
+        step_logits, _bonus_unused, mk = verify_fastpath.verify_sequential_q1(
+            prompt_ids=prompt_ids,
+            draft_ids=draft_ids,
+            model_kwargs=model_kwargs,
+        )
+        # step_logits[i] = teacher logits AFTER consuming draft_ids[i]
+        # Same layout as multi-token verify_logits[:, -gamma:].
+        verify_logits = step_logits
+    elif verify_fastpath is not None:
         outputs, mk = verify_fastpath.forward_k(
             decoder_input_ids=ids,
             model_kwargs=model_kwargs,
             k=gamma,
         )
+        verify_logits = outputs.logits[:, -gamma:, :].float().squeeze(0)
     else:
         outputs, mk = _forward_decoder(
             teacher,
             decoder_input_ids=ids,
             model_kwargs=model_kwargs,
         )
-    verify_logits = outputs.logits[:, -gamma:, :].float().squeeze(0)  # [γ, V]
+        verify_logits = outputs.logits[:, -gamma:, :].float().squeeze(0)
     if gamma == 1:
         p_raw = last_logits.unsqueeze(0)
         bonus_logits = verify_logits[0]
@@ -422,9 +442,21 @@ def speculative_generate_window(
         sync_cuda_for_model(teacher)
     start_time = time.perf_counter()
 
-    teacher_last, teacher_mk = _prefill(
-        teacher, prompt_ids=prompt_ids, model_kwargs=teacher_mk
+    # Draft stays on DynamicCache / eager; teacher arms optimized hooks (§41).
+    precision_key = "fp16" if precision == "fp16" else "fp32"
+    teacher_ctx = (
+        teacher_aligned_runtime_context(precision=precision_key)
+        if verify_fp is not None
+        else nullcontext()
     )
+    aligned_greedy = bool(
+        verify_fp is not None and verify_fp.graph_aligned and greedy
+    )
+
+    with teacher_ctx:
+        teacher_last, teacher_mk = _prefill(
+            teacher, prompt_ids=prompt_ids, model_kwargs=teacher_mk
+        )
     if teacher_mk.get("encoder_outputs") is not None:
         draft_mk["encoder_outputs"] = teacher_mk["encoder_outputs"]
     draft_last, draft_mk = _prefill(
@@ -460,18 +492,19 @@ def speculative_generate_window(
         draft_calls += 1
         actual_gamma = len(draft_ids)
 
-        p_logits, p_probs, bonus_logits, teacher_mk = _verify_draft_tokens(
-            teacher,
-            prompt_ids=sequences,
-            draft_ids=draft_ids,
-            last_logits=teacher_last,
-            model_kwargs=teacher_mk,
-            processors=processors,
-            greedy=greedy,
-            temperature=spec_temperature,
-            top_p=spec_top_p,
-            verify_fastpath=verify_fp,
-        )
+        with teacher_ctx:
+            p_logits, p_probs, bonus_logits, teacher_mk = _verify_draft_tokens(
+                teacher,
+                prompt_ids=sequences,
+                draft_ids=draft_ids,
+                last_logits=teacher_last,
+                model_kwargs=teacher_mk,
+                processors=processors,
+                greedy=greedy,
+                temperature=spec_temperature,
+                top_p=spec_top_p,
+                verify_fastpath=verify_fp,
+            )
         verify_steps += 1
 
         if greedy:
@@ -492,10 +525,8 @@ def speculative_generate_window(
                 rng=rng,
             )
 
-        # Commit tokens from verify logits, then rebuild KV from L via a single
-        # multi-token forward of the commit. Keeping the verify-time accepted
-        # prefix (L+n) + residual-only forward caused TIER1a mismatch@110
-        # (prompt_len=108 → 3rd generated token) on smoke 50146929.
+        # Commit tokens from verify logits, then rebuild KV from L.
+        # Aligned greedy: sequential Q=1 (same as optimized decode). Else K-forward.
         n_keep = min(n_accepted, remaining)
         bonus_tok: int | None = None
         residual_tok: int | None = None
@@ -556,17 +587,49 @@ def speculative_generate_window(
         _align_decoder_mask(
             draft_mk, length=int(sequences.shape[1]), device=sequences.device
         )
-        if verify_fp is not None:
-            teacher_out, teacher_mk = verify_fp.forward_k(
-                decoder_input_ids=sequences,
-                model_kwargs=teacher_mk,
-                k=len(commit),
-            )
-        else:
-            teacher_out, teacher_mk = _forward_decoder(
-                teacher, decoder_input_ids=sequences, model_kwargs=teacher_mk
-            )
-        teacher_last = teacher_out.logits[:, -1, :].float().squeeze(0).clone()
+        with teacher_ctx:
+            if aligned_greedy and verify_fp is not None:
+                # Rebuild commit via sequential Q=1 (graph-aligned).
+                teacher_last_local = teacher_last
+                mk_rebuild = teacher_mk
+                ids_rebuild = sequences[:, :L]
+                for tok in commit:
+                    ids_rebuild = torch.cat(
+                        [
+                            ids_rebuild,
+                            torch.tensor(
+                                [[int(tok)]],
+                                device=sequences.device,
+                                dtype=sequences.dtype,
+                            ),
+                        ],
+                        dim=-1,
+                    )
+                    teacher_out, mk_rebuild = verify_fp.forward_q1(
+                        decoder_input_ids=ids_rebuild,
+                        model_kwargs=mk_rebuild,
+                    )
+                    teacher_last_local = (
+                        teacher_out.logits[:, -1, :].float().squeeze(0).clone()
+                    )
+                teacher_mk = mk_rebuild
+                teacher_last = teacher_last_local
+            elif verify_fp is not None:
+                teacher_out, teacher_mk = verify_fp.forward_k(
+                    decoder_input_ids=sequences,
+                    model_kwargs=teacher_mk,
+                    k=len(commit),
+                )
+                teacher_last = (
+                    teacher_out.logits[:, -1, :].float().squeeze(0).clone()
+                )
+            else:
+                teacher_out, teacher_mk = _forward_decoder(
+                    teacher, decoder_input_ids=sequences, model_kwargs=teacher_mk
+                )
+                teacher_last = (
+                    teacher_out.logits[:, -1, :].float().squeeze(0).clone()
+                )
         draft_out, draft_mk = _forward_decoder(
             draft, decoder_input_ids=sequences, model_kwargs=draft_mk
         )
@@ -608,6 +671,7 @@ def speculative_generate_window(
             ),
             "turbo_prompt_tokens": prompt_len,
             "turbo_verify_fastpath": verify_fp is not None,
+            "turbo_teacher_aligned_greedy": aligned_greedy,
             **(verify_fp.profile_metadata() if verify_fp is not None else {}),
         }
     )
