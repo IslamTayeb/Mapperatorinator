@@ -1,14 +1,16 @@
-"""§51 EAGLE-style draft head scaffold (Track C).
+"""§53 EAGLE-style draft head scaffold (Track C endgame).
 
-Target: draft cost c_d ≈ 0.05–0.1× tip decode step, with offline/runtime
-E[acc] ≥ 1.7 so keep-KV + verify ceilings restore ≥420 TPS.
+Target: draft cost c_d ≈ 0.05–0.1× tip decode step, with held-out
+E[acc] ≥ 2.4 before runtime wire and runtime E ≥ 2.2 so keep-KV + verify
+ceilings restore ≥420 TPS.
 
 Not wired into ``generate_window`` yet. Not a 500 / TIER1 claim.
 Campaign tip remains ``55949274`` / FP16 366.11.
+
+Note: ledger §51 is reclaimed for verify kernels; this lever is §53.
 """
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -21,7 +23,9 @@ TIP_STEP_MS = 1.85
 C_DRAFT_TARGET_LO = 0.05 * TIP_STEP_MS  # ~0.0925 ms
 C_DRAFT_TARGET_HI = 0.10 * TIP_STEP_MS  # ~0.185 ms
 C_VERIFY_MS = 3.075  # §48 in-loop absolute
-GATE_E = 1.7
+GATE_HELD_OUT_E = 2.4  # before runtime wire
+GATE_RUNTIME_E = 2.2  # scout / in-loop runtime bar
+GATE_E = GATE_HELD_OUT_E  # alias for ceiling tables at wire bar
 GATE_CEILING_TPS = 420.0
 
 
@@ -45,7 +49,7 @@ def ceiling_tps(*, c_draft_ms: float, e_acc: float, c_verify_ms: float = C_VERIF
     return 1000.0 * float(e_acc) / step
 
 
-def budget_table(e_values: tuple[float, ...] = (1.7, 2.0, 2.4)) -> list[dict[str, float]]:
+def budget_table(e_values: tuple[float, ...] = (2.2, 2.4, 2.8)) -> list[dict[str, float]]:
     rows: list[dict[str, float]] = []
     for frac in (0.05, 0.10):
         c_d = draft_budget_ms(fraction=frac)
@@ -64,22 +68,25 @@ def budget_table(e_values: tuple[float, ...] = (1.7, 2.0, 2.4)) -> list[dict[str
 
 @dataclass(frozen=True)
 class EagleProbeGate:
-    """Cheap-probe promote / kill for §51 before heavy train."""
+    """§53 cheap-probe promote / kill before runtime wire."""
 
     teacher_force_E: float
+    held_out_E: float | None
     in_loop_E: float | None
     c_draft_ms_est: float
-    ceiling_at_E17: float
+    ceiling_at_held_out: float
 
     @property
-    def pass_teacher_force(self) -> bool:
-        return self.teacher_force_E >= GATE_E
+    def pass_held_out(self) -> bool:
+        if self.held_out_E is None:
+            return False
+        return self.held_out_E >= GATE_HELD_OUT_E
 
     @property
     def pass_in_loop(self) -> bool:
         if self.in_loop_E is None:
             return False
-        return self.in_loop_E >= GATE_E
+        return self.in_loop_E >= GATE_RUNTIME_E
 
     @property
     def pass_budget(self) -> bool:
@@ -87,33 +94,35 @@ class EagleProbeGate:
 
     @property
     def pass_ceiling(self) -> bool:
-        return self.ceiling_at_E17 >= GATE_CEILING_TPS
+        return self.ceiling_at_held_out >= GATE_CEILING_TPS
 
     def decision(self) -> str:
-        """GO_HEAVY_TRAIN only if TF E and budget/ceiling look recoverable.
+        """Wire only if held-out E≥2.4 + budget/ceiling; in-loop ≥2.2 for scout.
 
         §52 lesson: teacher-force tip-dump E overstates in-loop E — never
-        promote on TF alone. Smoke train may proceed on TF≥1.7 + budget, but
-        runtime gate remains in_loop_E≥1.7.
+        promote on TF alone.
         """
         if not self.pass_budget or not self.pass_ceiling:
             return "STOP_BUDGET"
-        if not self.pass_teacher_force:
-            return "STOP_TF_E"
+        if self.held_out_E is not None and not self.pass_held_out:
+            return "STOP_HELD_OUT_E"
         if self.in_loop_E is not None and not self.pass_in_loop:
             return "STOP_IN_LOOP_E"
-        if self.pass_in_loop:
+        if self.pass_held_out and self.pass_in_loop:
             return "GO_RUNTIME_WIRE"
-        return "GO_SMOKE_TRAIN"
+        if self.pass_held_out:
+            return "GO_RUNTIME_SCOUT"
+        if self.teacher_force_E >= GATE_RUNTIME_E:
+            return "GO_SMOKE_TRAIN"
+        return "STOP_TF_E"
 
 
 class EagleDraftHead(nn.Module):
     """Minimal EAGLE-style autoregressive draft head.
 
     Consumes previous decoder hidden state ``h_{t-1}`` (d_model) and predicts
-    next-token logits. Optional one-layer self-attn stub reserved for later;
-    v0 is a 2-layer MLP + tied/vocab projection — cheap enough for c_d budget
-    probes before heavy train.
+    next-token logits. v0 is a 2-layer MLP + vocab projection — cheap enough
+    for c_d budget probes before heavy train.
     """
 
     def __init__(
@@ -136,19 +145,29 @@ class EagleDraftHead(nn.Module):
         self.drop = nn.Dropout(dropout)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 
+    def project_features(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Map h_{t-1} → predicted feature for step t (pre-lm_head residual)."""
+        x = self.norm(hidden_states)
+        x = self.fc1(x)
+        x = F.gelu(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        return hidden_states + self.drop(x)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Args:
             hidden_states: [..., d_model] previous-step features.
         Returns:
             logits: [..., vocab]
         """
-        x = self.norm(hidden_states)
-        x = self.fc1(x)
-        x = F.gelu(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = hidden_states + self.drop(x)
-        return self.lm_head(x)
+        return self.lm_head(self.project_features(hidden_states))
+
+    def forward_with_features(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (logits, next_features) for in-loop γ draft chains."""
+        feats = self.project_features(hidden_states)
+        return self.lm_head(feats), feats
 
     def init_from_teacher_proj(self, teacher: nn.Module) -> dict[str, Any]:
         """Copy teacher ``proj_out`` / ``lm_head`` weights when shapes match."""
@@ -181,7 +200,6 @@ def estimate_mlp_head_ms(
 ) -> dict[str, float]:
     """Order-of-magnitude GPU time from FLOPs (not a measured claim)."""
     hid = d_model * hidden_mult
-    # GEMMs per draft token: d→hid, hid→d, d→V (multiply-adds ≈ 2*m*n*k)
     flops_tok = 2.0 * (
         d_model * hid + hid * d_model + d_model * vocab_size
     )

@@ -831,6 +831,12 @@ SCOPE RULING (2026-07-17, user-approved — add as ledger §34, verbatim): non-b
 | Evidence packs | `docs/inference_evidence_packs.md` (TIER1/TIER2/TIER3) |
 | Ledger rule | Own section only; verbatim ruling above is authoritative |
 
+### §34 addendum (2026-07-17 endgame — verbatim intent)
+
+Strict rejection-sampling turbo (distribution-exact) is the **MERGE CANDIDATE**; bounded-drift/relaxed acceptance is **last-resort only**, as a **separate preset**, gated by beatmap-level quality eval — **never folded into `turbo`**.
+
+Authoritative package: `notes/500tps-turbo-endgame-package.md`.
+
 ---
 
 ## Evidence packs (TIER1 / TIER2 / TIER3) — definitions
@@ -1083,59 +1089,70 @@ Primary path to 500 under the scope ruling. Bit-exact Track A remains valid but 
 4. **No §44 / no 500 claim** until a scout ≥**384** sustained; song wall wins; tip stays `55949274`/366.11 until then.
 5. **Persistent caches across windows** everywhere — never rebuild verify_fp/graph caches per window (`speculate.py` per-window teardown class of bug).
 
-## 46. Baseline glue-elimination v2 (W-BASE) — **OPEN STUB**
+## 46. Baseline glue-elimination v2 (W-BASE) — **STOP_NO_PROMOTE**
 
 | Field | Value |
 | --- | --- |
 | What | Independent no-speculation path: cut ~0.88 ms/tok non-model glue on optimized engine |
-| Worker | **W-BASE** — own branch; possibly bit-exact |
-| Targets | persistent sampling-tail graph (temp+top-p sort+softmax+multinomial; §29c Philox PASS); device token buffer vs `torch.cat`; pinned-flag EOS vs per-token `.max()==0` sync |
-| Not | bare §29 retry — v2 mandates persistent cross-window caches + separate small tail graph |
-| Ceiling | **~540 TPS** (1/1.853 ms) — projection |
-| Gate | e2e scout ≥**450**; if bitwise holds, can graduate EXACT tip itself |
-| Status | **OPEN** |
-| Campaign tip | `55949274` / **366.11** — no 500 claim yet |
+| Worker | **W-BASE** — branch `codex/exact-baseline-glue-v2` |
+| Tip / commit | **`3987bd5c`** (base `55949274`) |
+| Targets | persistent sampling-tail graph (temp+top-p sort+softmax+multinomial; §29b Philox); tip device token buffer; pinned-flag EOS |
+| Not | bare §29 retry — persistent cross-window sample cache + separate small tail graph |
+| Opt-in | `baseline_glue_v2_candidate_context` (V32 cold default) |
+| Smoke | FP16 **`50150069`** z25-21 — **exact PASS** tok **1322**; RNG equal; hits **1322** |
+| Budget | base **297.63** → cand **297.33** TPS; **−0.003 ≪ 0.15** ms/tok → **MISS** |
+| Scout | **not submitted** (kill) |
+| Decision | **STOP_NO_PROMOTE** — Philox/top-p-in-graph exactness holds; no glue headroom on tip composition |
+| Revisit | Only with new ≥0.15 ms/tok evidence that removes the host/forward↔sample round-trip — not another sample-graph tweak |
+| Handoff | `notes/500tps-section46-handoff.md` |
+| Campaign tip | still `55949274` / **366.11** — no tip graduate; no 500 claim |
 | Ledger rule | Own section only |
 
-## 47. Keep-accepted-KV + O(1) rollback (W-KV) — **GATING**
+## 47. Keep-accepted-KV + O(1) rollback (W-KV) — **GATES PASS**
 
 | Field | Value |
 | --- | --- |
 | What | keep-accepted-KV under sampled DOCUMENTED DRIFT; O(1) `cache_position` rewind + in-graph stale masking |
-| Worker | **W-KV** — branch `codex/turbo-keep-accepted-kv` (base integrator `e6898743`) |
+| Worker | **W-KV** — branch `codex/turbo-keep-accepted-kv` @ **`d3cd6939`** |
 | Rules | accepted tokens NEVER re-forwarded (teacher or draft); q1 bucket from rolled-back length; greedy TIER1a stays crop-rebuild/aligned-Q1 |
-| Implementation | `kv_rollback.rewind_self_cache` (StaticCache zeros only `[new_len, occupied_end)` ≤γ); sampled `keep_accepted_o1_rewind` vs canary `crop_to_L_full_rebuild`; session-persistent `verify_fp` + caches |
 | Gates | teacher forwards/cycle == **1**; **−10 ms/cycle** vs §45; TIER1a still PASS in canary mode |
 | Kill | cannot get teacher forwards/cycle==1 without breaking canary-mode separation → STOP with number |
-| Status | **GATING** — jobs `s47-turbo-tier1a-canary.sbatch`, `s47-turbo-fp16-perf-scout.sbatch` |
+| Canary | **`50150072` PASS** (crop-rebuild TIER1a; 3/3 seeds) |
+| Scout | **`50150073`**: forwards/cycle **1.0**; accepted_reforwards **0**; median cycle **32.61 ms** (Δ **−12.39** vs §45 ~45); main_tps **36.69** directional |
+| Status | **GATES PASS** — ready for integrator merge with §48/§49; **no merge**; kill not triggered |
 | Handoff | `notes/500tps-section47-handoff.md` |
-| Campaign tip | `55949274` / **366.11** |
+| Campaign tip | `55949274` / **366.11** — **no 500 claim** |
 | Ledger rule | Own section only |
 
-## 48. Graph-native K=γ verify (W-VG) — **OPEN STUB**
+## 48. Graph-native K=γ verify (W-VG) — **STOP_KILL**
 
 | Field | Value |
 | --- | --- |
 | What | Lift k>1 graph gate; graph-native verify with static `{ids[1,γ], cache_position[γ]}`; mask in-graph; **no HF prepare_inputs** (device-scalar sync) |
-| Worker | **W-VG** — own branch |
+| Worker | **W-VG** — branch `codex/turbo-graph-native-verify` @ `be491a4f` |
 | Pattern | production capture + side-stream warmup (§41 zero-logits bug) |
-| Gate | in-loop c_verify ≤**1.2×** (≤2.22 ms) measured inside the real cycle, not a harness |
-| Kill | verify stuck &gt;1.35× after graph-native attempt → STOP |
-| Status | **OPEN** |
-| Campaign tip | `55949274` / **366.11** |
+| Wiring | `verify_fastpath.py` graph-native path; persistent `TurboRuntime.verify_fastpath`; `utils/s48_graph_native_verify_inloop.py` |
+| In-loop | job **`50150290`**: path `graph_native_k`, prepare_inputs=**0**, c_verify=**3.075 ms**, Q1=**1.842 ms**, ratio=**1.669×** |
+| Gate | in-loop c_verify ≤**1.2×** (≤2.22 ms) — **MISS** |
+| Kill | verify stuck &gt;1.35× after graph-native attempt → **STOP_KILL** (1.669×) |
+| Status | **STOP_KILL** — do not grind; revisit only with new mechanism |
+| Handoff | `notes/500tps-section48-handoff.md` |
+| Campaign tip | `55949274` / **366.11** — **no 500 claim** |
 | Ledger rule | Own section only |
 
-## 49. Graphed draft chain (W-DG) — **OPEN STUB**
+## 49. Graphed draft chain (W-DG) — **MISS_UNDER_KILL**
 
 | Field | Value |
 | --- | --- |
 | What | Merge §42; draft on StaticCache; chain γ=3 steps in **ONE** graph incl. in-graph sampling (Philox graph-safe per §29c) + embedding feedback |
-| Worker | **W-DG** — own branch |
-| Note | with keep-KV the discarded 3rd forward becomes next cycle's first |
+| Worker | **W-DG** — `codex/turbo-graphed-draft-chain` @ **`d2f09578`** (impl `9fa531ab`) |
+| Note | with keep-KV the discarded 3rd forward becomes next cycle's first; persistent session chain-graph cache |
 | Gate | 3 drafts ≤**1.2 ms** total |
 | Kill | draft chain &gt;2 ms → STOP |
-| Status | **OPEN** |
-| Campaign tip | `55949274` / **366.11** |
+| Measured | job **`50150142`** (2080 Ti FP16, pure graph replay): γ=3 chain median **1.257 ms** (prefix128 **1.219**, prefix256 **1.257**); ~**0.42 ms/tok** vs §42's 1.08 |
+| Status | **MISS_UNDER_KILL** — STOP_NO_PROMOTE; no grind (kill not triggered) |
+| Handoff | `notes/500tps-section49-graphed-draft-chain.md` |
+| Campaign tip | `55949274` / **366.11** — **no 500 claim** |
 | Ledger rule | Own section only |
 
 ## 50. Config / margin sweep (W-ACC) — **QUEUED** (after cycle &lt;10 ms)
@@ -1149,9 +1166,99 @@ Primary path to 500 under the scope ruling. Bit-exact Track A remains valid but 
 | Campaign tip | `55949274` / **366.11** |
 | Ledger rule | Own section only |
 
+## Post-rung ceiling decision — **(A) integrator path-hit scout**
+
+| Field | Value |
+| --- | --- |
+| Inputs | keep-KV ON; c_verify **3.075**; draft_chain_γ3 **1.257**; E∈{**2.0**, **2.4**} |
+| Authorizing ceilings | **461.68** / **554.02** TPS (step 4.332 ms) — both ≥420 |
+| KV-only sensitivity | 316.71 / 380.05 (&lt;420) — DG credit required for A |
+| Decision | **(A)** merge §47+§49 into `codex/turbo-integrator`; one instrumented scout; mandatory path-hit counters |
+| Not | (B) EAGLE yet (now **§53**); (C) campaign dead-end; §48 grind; main merge; §44; 500 claim |
+| EAGLE | was parked as “§51”; **continues as §53** after A falsified |
+| Script | `utils/s45_turbo_structural_bound.py` |
+| Handoff | `notes/500tps-post-rung-ceiling-decision.md` |
+| Campaign tip | `55949274` / **366.11** |
+| Ledger rule | Own section only |
+
 ### Parked behind §46–§50
 
 | Ledger § | Status |
 | --- | --- |
 | **§38** TIER2 fused decoder step | **PARKED** — STOP_NO_PROMOTE (quality PASS / microbench MISS); reopen only after turbo/baseline workers settle or deeper CUDA collapse ≥0.15 ms/tok |
 | **§44** TIER1 evidence pack | **HARNESS READY** — fire full pack only on ≥**384** scout (W-CERT) |
+
+## §52 integrator path-hit scout — **SEALED HISTORY** (STOP/DIAGNOSE)
+
+| Item | Value |
+| --- | --- |
+| Tip | `44ab1f3e` `codex/turbo-integrator` |
+| Job | **50150615** COMPLETED |
+| main_tps | **38.61** |
+| E[acc] median | **1.00** (mean 1.06) |
+| Path hits | chain replay **1510**, native **1259**, keep-KV on |
+| Ruling | **STOP/DIAGNOSE** — A falsified (E&lt;1.7); no §44; EAGLE eligible as **§53** |
+| E-collapse | **Primary:** TF tip-dump E≠in-loop (map weighted ≈1.25). Ckpt 1-layer OK. Eager §47≈1.09 ⇒ not DG-only. **No §52b.** |
+| Sealed | **Do not reuse §52** for new work; bankable post-E-fix scout is **§55** |
+| Handoff | `notes/500tps-section52-handoff.md` |
+
+## §51 number — **VACATED** (collision avoid)
+
+Former §51 EAGLE scaffold **continues as §53**. Package-original “§51 verify kernels” is **§54** (not §51). Do not reopen §51 for new levers.
+
+## TURBO ENDGAME PACKAGE — numbering + tracks
+
+Full text: `notes/500tps-turbo-endgame-package.md`. Tip still `55949274` / **366.11**. **No merge.**
+
+| Track | Ledger | Role | Sequence |
+| --- | --- | --- | --- |
+| **1** | **§55** | Bankable graduation scout (after E fix) | **FIRST** (serial) |
+| **2** | **§54** | Verify kernels Stage A/B | after §55, **∥ §53** |
+| **3** | **§53** | EAGLE head (was §51 scaffold) | after §55, **∥ §54** |
+| last-resort | W-RX | relaxed acceptance — **separate preset** | only if §54+§53 fail &lt;500 |
+
+## §53 EAGLE-style draft head — OPEN (was §51)
+
+| Field | Value |
+| --- | --- |
+| Status | **OPEN** after §52 A falsified; **renumbered from §51** |
+| Track | Endgame **Track 3** (500-enabler B) |
+| Branch / WT | `codex/turbo-eagle-draft-head` / `turbo-eagle-draft-head` (base integrator `44ab1f3e`) |
+| Target | held-out E≥**2.4** @ γ=3 before runtime wire; runtime E≥**2.2**; c_d 0.05–0.1×; ceiling ≥420 |
+| Scaffold | `osuT5/.../turbo/eagle_draft.py`, `utils/s53_dump_teacher_hiddens.py`, `utils/s53_eagle_acceptance_probe.py`, `jobs/s53-*.sbatch` |
+| Next | DCC hidden dumps (SALVALAI+nube) → smoke_head (mandatory in-loop) → gate |
+| Jobs | dump/probe pending submit |
+| Plan / handoff | `notes/500tps-section53-eagle-draft-head.md`, `notes/500tps-section53-handoff.md` |
+| Campaign tip | still `55949274` / **366.11** — no merge; no §44; no 500 |
+| Ledger rule | Own section only |
+
+## §54 Verify kernels Stage A/B — **OPEN** (Track 2; not §51)
+
+| Field | Value |
+| --- | --- |
+| Status | **OPEN** — staged plan; no jobs yet |
+| Track | Endgame **Track 2** (500-enabler A) |
+| Stage A | m≤8-row warp-group kernel extensions around SDPA; interim c_verify ≤**1.35×** (~2.5 ms) |
+| Stage B | m-row split-KV rope-cache attention; gate ≤**1.25×** (~2.3 ms); kill **>1.45×** |
+| Mandatory | re-measure runtime E (ΔE≥−0.05); TIER1a canary assert |
+| Grid | Stage B + current draft → **505–554** TPS |
+| Do not | re-grind unfused §48 (3.075 / 1.669× sealed) |
+| Handoff | `notes/500tps-section54-handoff.md` |
+| Campaign tip | `55949274` / **366.11** — no merge; no 500 claim |
+| Ledger rule | Own section only |
+
+## §55 Bankable graduation scout — **QUEUED** (Track 1; after E fix)
+
+| Field | Value |
+| --- | --- |
+| Status | **QUEUED** — serial after E fix; **not** a bare §52 re-scout |
+| Track | Endgame **Track 1** (highest priority) |
+| Composition | §47 keep-KV + §49 draft chain + §48 verify AS-IS (3.075); 1-layer γ=3 K=1 |
+| Must log | accepted/verify, NVTX draft/verify/accept/glue, graph hits, cycle-glue ≤**0.4 ms** |
+| Projection | **417–436** TPS; if scout **>8% under**, STOP diagnose wall |
+| Graduate gate | ≥**384.4** sustained → §44 full TIER1 → graduate **strict** turbo tip (merge candidate) |
+| Bit-exact tip | `55949274` / **366.11** unchanged as compat surface |
+| Handoff | `notes/500tps-section55-handoff.md` |
+| Campaign tip | `55949274` / **366.11** — no merge; no 500 claim |
+| Ledger rule | Own section only |
+
