@@ -13,7 +13,10 @@ from typing import Any
 import torch
 
 from ...runtime_profiling import generation_profile_context
-from ..cache_utils import MapperatorinatorCache, get_cache
+from transformers import StaticCache
+from transformers.modeling_outputs import BaseModelOutput
+
+from ..cache_utils import MapperatorinatorCache
 from ..optimized.single.decode_loop import (
     _bucketed_prefix_length,
     _capture_decode_cuda_graph,
@@ -28,6 +31,13 @@ from .draft import get_decoder
 
 ACTIVE_PREFIX_BUCKET_SIZE = 64
 DRAFT_FASTPATH_ENV = "MAPPERATORINATOR_TURBO_DRAFT_FASTPATH"
+_AUDIO_INPUT_KEYS = (
+    "frames",
+    "inputs",
+    "input_features",
+    "input_values",
+    "inputs_embeds",
+)
 
 
 def draft_fastpath_enabled() -> bool:
@@ -49,6 +59,47 @@ def sync_draft_decoder_layer_count(draft) -> int:
         if hasattr(cfg, "decoder_layers"):
             cfg.decoder_layers = n
     return n
+
+
+def get_draft_cache(model, *, batch_size: int = 1, cfg_scale: float = 1.0) -> MapperatorinatorCache:
+    """StaticCache sized to the model's decoder depth (not encoder depth).
+
+    ``get_cache(model.config)`` uses MapperatorinatorConfig.num_hidden_layers
+    (encoder depth, often 12). Whisper-style ``backbone_config`` with
+    ``get_text_config(decoder=True)`` yields the true decoder layer count.
+    """
+    n_layers = sync_draft_decoder_layer_count(model)
+    backbone = getattr(getattr(model, "config", None), "backbone_config", None)
+    cache_config = backbone if backbone is not None else model.config
+    if hasattr(cache_config, "decoder_layers"):
+        cache_config.decoder_layers = n_layers
+    cache_kwargs = {
+        "config": cache_config,
+        "max_batch_size": batch_size * (2 if cfg_scale > 1 else 1),
+        "max_cache_len": int(model.config.max_target_positions),
+        "device": model.device,
+        "dtype": model.dtype,
+    }
+    decoder_cache = StaticCache(**cache_kwargs)
+    encoder_kwargs = dict(cache_kwargs)
+    encoder_kwargs["max_cache_len"] = int(model.config.max_source_positions)
+    encoder_cache = StaticCache(**encoder_kwargs)
+    # Sanity: self-attn layers should match decoder depth when backbone is used.
+    self_layers = len(getattr(decoder_cache, "layers", []) or [])
+    if self_layers and self_layers != n_layers:
+        raise RuntimeError(
+            f"draft StaticCache has {self_layers} layers but decoder has {n_layers}"
+        )
+    return MapperatorinatorCache(decoder_cache, encoder_cache, cfg_scale)
+
+
+def _strip_audio_inputs(model_inputs: dict[str, Any]) -> dict[str, Any]:
+    """Drop audio tensors once encoder_outputs exist (keeps CUDA graphs decode-only)."""
+    if model_inputs.get("encoder_outputs") is None:
+        return model_inputs
+    for key in _AUDIO_INPUT_KEYS:
+        model_inputs.pop(key, None)
+    return model_inputs
 
 
 def _align_decoder_mask(
@@ -136,12 +187,23 @@ class DraftFastpathRunner:
     ) -> None:
         if prompt_ids.ndim != 2 or prompt_ids.shape[0] != 1:
             raise ValueError("draft fastpath requires batch_size=1 prompt_ids")
-        self._cache = self.session.cache_for_window(
-            self.model,
-            batch_size=1,
-            num_beams=1,
-            cfg_scale=1.0,
+        # Own a decoder-depth StaticCache; do not use ProductionDecodeSession's
+        # get_cache(model.config) path (encoder-depth layer count).
+        signature = ProductionDecodeSession._state_signature(
+            self.model, batch_size=1, num_beams=1, cfg_scale=1.0
         )
+        cache = self.session.caches.get(signature)
+        if cache is None:
+            cache = get_draft_cache(self.model, batch_size=1, cfg_scale=1.0)
+            self.session.caches[signature] = cache
+        else:
+            cache.self_attention_cache.reset()
+            cache.cross_attention_cache.reset()
+            for layer_idx in list(cache.is_updated):
+                cache.is_updated[layer_idx] = False
+        self.session.active_state_signature = signature
+        self.session.stable_encoder_holders.setdefault(signature, {})
+        self._cache = cache
         mk = {
             key: value.to(self.model.device) if isinstance(value, torch.Tensor) else value
             for key, value in model_kwargs.items()
@@ -180,6 +242,7 @@ class DraftFastpathRunner:
             input_ids,
             **self._model_kwargs,
         )
+        model_inputs = _strip_audio_inputs(model_inputs)
         if "cache_position" in model_inputs:
             self._model_kwargs["cache_position"] = model_inputs["cache_position"]
         prefix_length = _bucketed_prefix_length(
@@ -209,6 +272,11 @@ class DraftFastpathRunner:
         t0 = time.perf_counter()
         with self._profile_context():
             logits = self._forward_eager(self._input_ids)
+        # After the first forward, keep encoder_outputs and drop audio tensors so
+        # decode CUDA graphs never capture the spectrogram/encoder path.
+        if self._model_kwargs.get("encoder_outputs") is not None:
+            for key in _AUDIO_INPUT_KEYS:
+                self._model_kwargs.pop(key, None)
         self.stats.prefill_seconds += time.perf_counter() - t0
         return logits
 
@@ -243,6 +311,7 @@ class DraftFastpathRunner:
             input_ids,
             **self._model_kwargs,
         )
+        model_inputs = _strip_audio_inputs(model_inputs)
         if "cache_position" in model_inputs:
             self._model_kwargs["cache_position"] = model_inputs["cache_position"]
         prefix_length = _bucketed_prefix_length(
@@ -378,23 +447,26 @@ def time_graph_replay_ms(
             runner._input_ids,
             **runner._model_kwargs,
         )
+        model_inputs = _strip_audio_inputs(model_inputs)
+        if not isinstance(model_inputs.get("encoder_outputs"), BaseModelOutput):
+            raise RuntimeError(
+                "draft graph timing requires BaseModelOutput encoder_outputs"
+            )
         bucket = _bucketed_prefix_length(
             int(runner._input_ids.shape[1]),
             runner.bucket_size,
             runner._max_cache_len,
         )
         static_inputs = _clone_static_graph_inputs(model_inputs)
-        # Warmup outside the capture helper so the first JIT/extension load
-        # cannot land inside the capture stream.
-        for _ in range(max(int(runner.cuda_graph_warmup), 2)):
-            with active_prefix_self_attention_context(bucket):
-                _ = runner.model(**static_inputs, return_dict=True)
+        # One eager validate + JIT outside capture, then capture with its warmup.
+        with active_prefix_self_attention_context(bucket):
+            _ = runner.model(**static_inputs, return_dict=True)
         torch.cuda.synchronize()
         graph, _outputs, capture_seconds = _capture_decode_cuda_graph(
             runner.model,
             static_inputs,
             active_prefix_length=bucket,
-            warmup=0,
+            warmup=max(int(runner.cuda_graph_warmup), 1),
         )
         for _ in range(max(int(warmup), 0)):
             graph.replay()
