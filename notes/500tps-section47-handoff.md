@@ -1,8 +1,8 @@
 # §47 W-KV keep-accepted-KV + O(1) rollback — handoff
 
-**Status:** **IMPLEMENTING / GATING** — 2026-07-17  
+**Status:** **GATING** — 2026-07-17  
 **Branch / WT:** `codex/turbo-keep-accepted-kv` @ `/work/projects/Mapperatorinator-worktrees/turbo-keep-accepted-kv`  
-**Base:** `codex/turbo-integrator` tip `e6898743`  
+**Impl tip:** `ec0bfbc4` (base `codex/turbo-integrator` `e6898743`)  
 **Campaign tip unchanged:** `55949274` / FP16 **366.11** — **no 500 claim**; **no tip graduate**; **no merge**.
 
 ## Ruling (binding)
@@ -37,10 +37,12 @@ If teacher forwards/cycle cannot be 1 without collapsing canary mode separation 
 
 ## Jobs
 
-| Job | Script | Purpose |
-| --- | --- | --- |
-| TIER1a canary | `jobs/s47-turbo-tier1a-canary.sbatch` | Prove canary path still PASS |
-| FP16 scout | `jobs/s47-turbo-fp16-perf-scout.sbatch` | Path hits + forwards/cycle + ms/cycle delta |
+| Job | Script | Slurm | Purpose |
+| --- | --- | ---: | --- |
+| TIER1a canary | `jobs/s47-turbo-tier1a-canary.sbatch` | **50150072** | Prove canary path still PASS |
+| FP16 scout | `jobs/s47-turbo-fp16-perf-scout.sbatch` | **50150073** | Path hits + forwards/cycle + ms/cycle delta |
+
+Unique `TMPDIR` / `TORCH_EXTENSIONS_DIR` per job. Submitted behind sibling GPU work (≤2 concurrent).
 
 ## Not this lever
 
