@@ -1592,6 +1592,28 @@ class Processor(object):
             "decode_graph_replays_delta",
             "optimized_cuda_graphs",
             "strict_exactness",
+            # turbo speculative phase profile (§45 diagnose)
+            "turbo_accepted_per_verify",
+            "turbo_accepted_tokens",
+            "turbo_verify_steps",
+            "turbo_draft_calls",
+            "turbo_gamma",
+            "turbo_draft_init_layers",
+            "turbo_teacher_aligned_greedy",
+            "turbo_kv_commit_mode",
+            "turbo_draft_ms_total",
+            "turbo_verify_ms_total",
+            "turbo_rebuild_ms_total",
+            "turbo_host_gap_ms_total",
+            "turbo_draft_ms_per_verify",
+            "turbo_verify_ms_per_verify",
+            "turbo_rebuild_ms_per_verify",
+            "turbo_host_gap_ms_per_verify",
+            "turbo_phase_ms_per_token",
+            "turbo_verify_q1_steps",
+            "turbo_verify_eager_calls",
+            "turbo_verify_graph_captures",
+            "turbo_verify_graph_replays",
         ):
             if stats.get(key) is not None:
                 record[key] = stats[key]

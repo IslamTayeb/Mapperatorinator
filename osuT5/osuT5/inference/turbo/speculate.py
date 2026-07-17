@@ -5,6 +5,7 @@ Distribution-equivalent under rejection sampling; TIER1 required before ship.
 """
 from __future__ import annotations
 
+import os
 import time
 from contextlib import nullcontext
 from typing import Any, Sequence
@@ -121,6 +122,78 @@ def build_structural_processors(
             )
         )
     return processors
+
+
+class _PhaseTimer:
+    """Accumulate draft / verify / rebuild / host gaps (CUDA-synced when armed)."""
+
+    __slots__ = (
+        "sync",
+        "device",
+        "draft_s",
+        "verify_s",
+        "rebuild_s",
+        "host_s",
+        "steps",
+        "_mark",
+    )
+
+    def __init__(self, *, sync: bool, device: torch.device | None) -> None:
+        self.sync = bool(sync) and device is not None and device.type == "cuda"
+        self.device = device
+        self.draft_s = 0.0
+        self.verify_s = 0.0
+        self.rebuild_s = 0.0
+        self.host_s = 0.0
+        self.steps = 0
+        self._mark = time.perf_counter()
+
+    def _sync(self) -> None:
+        if self.sync:
+            torch.cuda.synchronize(self.device)
+
+    def begin(self) -> None:
+        self._sync()
+        self._mark = time.perf_counter()
+
+    def add(self, bucket: str) -> None:
+        self._sync()
+        now = time.perf_counter()
+        dt = now - self._mark
+        if bucket == "draft":
+            self.draft_s += dt
+        elif bucket == "verify":
+            self.verify_s += dt
+        elif bucket == "rebuild":
+            self.rebuild_s += dt
+        elif bucket == "host":
+            self.host_s += dt
+        self._mark = now
+
+    def as_stats(self, *, accepted_total: int, verify_steps: int) -> dict[str, Any]:
+        total = self.draft_s + self.verify_s + self.rebuild_s + self.host_s
+        return {
+            "turbo_profile_steps": int(self.steps),
+            "turbo_draft_ms_total": 1000.0 * self.draft_s,
+            "turbo_verify_ms_total": 1000.0 * self.verify_s,
+            "turbo_rebuild_ms_total": 1000.0 * self.rebuild_s,
+            "turbo_host_gap_ms_total": 1000.0 * self.host_s,
+            "turbo_draft_ms_per_verify": (
+                1000.0 * self.draft_s / verify_steps if verify_steps else 0.0
+            ),
+            "turbo_verify_ms_per_verify": (
+                1000.0 * self.verify_s / verify_steps if verify_steps else 0.0
+            ),
+            "turbo_rebuild_ms_per_verify": (
+                1000.0 * self.rebuild_s / verify_steps if verify_steps else 0.0
+            ),
+            "turbo_host_gap_ms_per_verify": (
+                1000.0 * self.host_s / verify_steps if verify_steps else 0.0
+            ),
+            "turbo_phase_ms_per_token": (
+                1000.0 * total / accepted_total if accepted_total else 0.0
+            ),
+        }
 
 
 def _move_model_kwargs(model, model_kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -491,12 +564,19 @@ def speculative_generate_window(
         verify_steps = 0
         draft_calls = 0
         stopped = False
+        # Phase profile when outer sync timing is on (profiler) or env opt-in.
+        step_profile = sync_model_timing or (
+            os.environ.get("MAPPERATORINATOR_TURBO_STEP_PROFILE", "").strip().lower()
+            in {"1", "true", "on", "yes"}
+        )
+        timer = _PhaseTimer(sync=step_profile, device=teacher.device)
 
         while sequences.shape[1] < max_length and not stopped:
             remaining = max_length - int(sequences.shape[1])
             L = int(sequences.shape[1])
             this_gamma = min(int(gamma), remaining)
 
+            timer.begin()
             draft_ids, q_probs, draft_mk, _draft_hit_eos, _draft_tail_logits = (
                 _draft_k_tokens(
                     draft,
@@ -513,6 +593,7 @@ def speculative_generate_window(
                     eos_ids=eos_ids,
                 )
             )
+            timer.add("draft")
             draft_calls += 1
             actual_gamma = len(draft_ids)
 
@@ -528,6 +609,7 @@ def speculative_generate_window(
                 top_p=spec_top_p,
                 verify_fastpath=verify_fp,
             )
+            timer.add("verify")
             verify_steps += 1
 
             if greedy:
@@ -549,7 +631,9 @@ def speculative_generate_window(
                 )
 
             # Commit tokens from verify logits, then rebuild KV from L.
-            # Aligned greedy: sequential Q=1 (same as optimized decode). Else K-forward.
+            # Keep-accepted-KV (crop to L+n) caused TIER1a mismatch@110 on
+            # smoke 50146929 — canary/exact path requires crop-to-L + replay.
+            # That doubles teacher work vs a pure Leviathan keep-prefix design.
             n_keep = min(n_accepted, remaining)
             bonus_tok: int | None = None
             residual_tok: int | None = None
@@ -612,6 +696,7 @@ def speculative_generate_window(
             _align_decoder_mask(
                 draft_mk, length=int(sequences.shape[1]), device=sequences.device
             )
+            timer.add("host")
             if aligned_greedy and verify_fp is not None:
                 # Rebuild commit via sequential Q=1 (graph-aligned).
                 teacher_last_local = teacher_last
@@ -658,6 +743,8 @@ def speculative_generate_window(
                 draft, decoder_input_ids=sequences, model_kwargs=draft_mk
             )
             draft_last = draft_out.logits[:, -1, :].float().squeeze(0).clone()
+            timer.add("rebuild")
+            timer.steps += 1
 
             accepted_total += len(commit)
             session.accepted_tokens_total += len(commit)
@@ -696,6 +783,10 @@ def speculative_generate_window(
             "turbo_prompt_tokens": prompt_len,
             "turbo_verify_fastpath": verify_fp is not None,
             "turbo_teacher_aligned_greedy": aligned_greedy,
+            "turbo_kv_commit_mode": "crop_to_L_full_rebuild",
+            **timer.as_stats(
+                accepted_total=accepted_total, verify_steps=verify_steps
+            ),
             **(verify_fp.profile_metadata() if verify_fp is not None else {}),
         }
     )
