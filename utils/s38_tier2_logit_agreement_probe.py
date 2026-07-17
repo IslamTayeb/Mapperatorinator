@@ -75,22 +75,27 @@ def find_profile(run_root: Path) -> Path:
     return cands[0]
 
 
-def resolve_inference_config(cfg) -> InferenceConfig:
-    """Build InferenceConfig without requiring hydra MISSING fields."""
-    from dataclasses import fields
+def find_osu(run_root: Path) -> Path:
+    cands = sorted(run_root.glob("**/beatmap*.osu"))
+    # prefer non-profile .osu beside candidate_first
+    plain = [p for p in cands if not str(p).endswith(".profile.json")]
+    for p in plain:
+        if "candidate_first" in str(p):
+            return p
+    if plain:
+        return plain[0]
+    raise SystemExit(f"no .osu under {run_root}")
 
-    base = InferenceConfig()
-    container = OmegaConf.to_container(cfg, resolve=True)
-    if not isinstance(container, dict):
-        raise TypeError("expected hydra cfg container dict")
-    for f in fields(InferenceConfig):
-        if f.name == "hydra":
-            continue
-        if f.name in container:
-            setattr(base, f.name, container[f.name])
-        elif f.name in cfg:
-            setattr(base, f.name, OmegaConf.select(cfg, f.name))
-    return base
+
+def resolve_inference_config(cfg) -> InferenceConfig:
+    """Build nested InferenceConfig (incl. train.data) despite hydra MISSING."""
+    merged = OmegaConf.merge(OmegaConf.structured(InferenceConfig), cfg)
+    # Structured InferenceConfig marks hydra as MISSING; probes do not need it.
+    OmegaConf.update(merged, "hydra", {}, merge=False)
+    args_inf = OmegaConf.to_object(merged)
+    if not isinstance(args_inf, InferenceConfig):
+        raise TypeError(f"expected InferenceConfig, got {type(args_inf)}")
+    return args_inf
 
 
 def raw_model(model):
@@ -260,48 +265,19 @@ def main() -> None:
         descriptors=list(args_inf.descriptors) if args_inf.descriptors else None,
     )
 
-    print("injecting timing dump tokens…", flush=True)
-    output_type = list(args_inf.output_type)
-    gen_in, gen_out, req_special = processor._get_viable_template(
-        in_context=[ContextType.NONE],
-        out_context=[ContextType.TIMING],
-        gamemode=generation_config.gamemode,
-    )
-    model_kwargs = processor._get_model_cond_kwargs(generation_config)
-    in_ctx = processor.get_in_context(
-        in_context=gen_in,
-        beatmap_path=None,
-        extra_in_context=None,
-        song_length=song_length,
-    )
-    out_ctx = processor.get_out_context(
-        out_context=gen_out,
-        generation_config=generation_config,
-        given_context=[ContextType.NONE],
-        beatmap_path=None,
-        extra_in_context=None,
-        song_length=song_length,
-        verbose=False,
-    )
-    inject_dump_context(
-        processor,
-        sequences=sequences,
-        out_context=out_ctx,
-        dumps=dumps,
-        context_type=ContextType.TIMING,
-    )
-    for context in out_ctx:
-        context["event_times"] = []
-        update_event_times(
-            context["events"], context["event_times"], song_length, processor.types_first
-        )
-    timing_events, timing_times = out_ctx[0]["events"], out_ctx[0]["event_times"]
-    timing_events, timing_times = events_of_type(timing_events, timing_times, TIMING_TYPES)
-    timing = postprocessor.generate_timing(timing_events)
+    # Use tip-auth .osu TimingPoints (same FIX as §35 50145885).
+    from slider import Beatmap
+
+    osu_path = find_osu(args.dump_run)
+    print(f"timing_source_osu={osu_path}", flush=True)
+    tip_beatmap = Beatmap.from_path(osu_path)
+    timing = list(tip_beatmap.timing_points)
+    if len(timing) == 0:
+        raise SystemExit(f"tip .osu has no timing points: {osu_path}")
     extra_in_context = {ContextType.TIMING: timing}
-    if ContextType.TIMING in output_type:
-        output_type = [t for t in output_type if t != ContextType.TIMING]
+    output_type = [t for t in list(args_inf.output_type) if t != ContextType.TIMING]
     print(f"timing_points={len(timing)}", flush=True)
+    model_kwargs = processor._get_model_cond_kwargs(generation_config)
 
     gen_in, gen_out, req_special = processor._get_viable_template(
         in_context=list(args_inf.in_context) if args_inf.in_context else [],
