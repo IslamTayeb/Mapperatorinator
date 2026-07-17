@@ -306,7 +306,31 @@ def _generate_window(
         "native_q1_self_attention": 0,
         "q1_bmm_cross_attention": 0,
         "native_cross_mlp_tail": 0,
+        "compiled_self_wo_residual": 0,
     }
+
+    from ..kernels.compiled_self_wo_residual_activation import (
+        compiled_self_wo_residual_activation_context,
+        compiled_self_wo_residual_requested,
+    )
+
+    compiled_wo_residual = None
+    compiled_wo_residual_evidence = None
+    if compiled_self_wo_residual_requested() and native_q1_rope_cache_self_attention:
+        from ..kernels.compiled_self_wo_residual import (
+            prepare_compiled_self_wo_residual_from_model,
+        )
+
+        # Unwrap InferenceEngineBinding so named_modules sees real layers.
+        prepare_model = model
+        if isinstance(model, InferenceEngineBinding):
+            prepare_model = model.model
+        compiled_wo_residual, compiled_wo_residual_evidence = (
+            prepare_compiled_self_wo_residual_from_model(
+                prepare_model,
+                expected_dtype,
+            )
+        )
 
     rng_before = (
         rng_progression_signature(model.device)
@@ -317,11 +341,14 @@ def _generate_window(
         device_type=model.device.type,
         dtype=torch.bfloat16,
         enabled=precision == "amp",
+    ), compiled_self_wo_residual_activation_context(
+        compiled_wo_residual
     ), generation_profile_context(
         q1_bmm_cross_attention=q1_bmm_cross_attention,
         native_q1_self_attention=native_q1_self_attention,
         native_q1_rope_cache_self_attention=native_q1_rope_cache_self_attention,
         native_cross_mlp_tail=native_cross_mlp_tail,
+        compiled_self_wo_residual=compiled_wo_residual is not None,
         optimized_expected_dtype=expected_dtype,
         optimized_dispatch_counts=dispatch_counts,
     ):
@@ -428,6 +455,19 @@ def _generate_window(
                     else "timing_context"
                 ),
             },
+            "compiled_self_wo_residual": {
+                "requested": compiled_self_wo_residual_requested(),
+                "enabled": compiled_wo_residual is not None,
+                "disabled_reason": (
+                    None
+                    if compiled_wo_residual is not None
+                    else None
+                    if not compiled_self_wo_residual_requested()
+                    else "native_q1_rope_cache_self_attention_disabled"
+                    if not native_q1_rope_cache_self_attention
+                    else "prepare_failed"
+                ),
+            },
         },
         "native_cross_mlp_tail_requested": specialized_batch,
         "native_cross_mlp_tail_enabled": native_cross_mlp_tail,
@@ -455,6 +495,11 @@ def _generate_window(
         ),
         "optimized_cuda_graphs": context_state.graph_profile_summary(),
     })
+    if compiled_wo_residual_evidence is not None:
+        stats["compiled_self_wo_residual"] = {
+            **compiled_wo_residual_evidence,
+            "enabled": True,
+        }
     if strict_exactness is not None:
         stats["strict_exactness"] = strict_exactness
     return result, stats

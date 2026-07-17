@@ -671,11 +671,12 @@ class VarWhisperAttention(nn.Module):
                         )
 
         hidden_states, *rest = attn_outputs
-        if profile_ranges:
-            with profile_range(f"{range_prefix}.out_proj"):
+        if not attention_runtime_hooks().skip_out_proj:
+            if profile_ranges:
+                with profile_range(f"{range_prefix}.out_proj"):
+                    hidden_states = self.out_drop(self.Wo(hidden_states))
+            else:
                 hidden_states = self.out_drop(self.Wo(hidden_states))
-        else:
-            hidden_states = self.out_drop(self.Wo(hidden_states))
 
         return hidden_states, *rest, past_key_value
 
@@ -833,7 +834,39 @@ class VarWhisperDecoderLayer(GradientCheckpointingLayer):
                 output_attentions=output_attentions
             )
         hidden_states = self_attn_outputs[0]
-        if profile_ranges:
+        self_out_residual_forward = (
+            decoder_layer_runtime_hooks().self_out_residual_forward
+        )
+        if self_out_residual_forward is not None:
+            fused_hidden = self_out_residual_forward(
+                module=self,
+                attn_output=hidden_states,
+                residual=residual,
+                layer_name=layer_name,
+            )
+            if fused_hidden is not None:
+                hidden_states = fused_hidden
+            else:
+                if attention_runtime_hooks().skip_out_proj:
+                    if profile_ranges:
+                        with profile_range(f"{layer_name}.self.out_proj"):
+                            hidden_states = self.self_attn.out_drop(
+                                self.self_attn.Wo(hidden_states)
+                            )
+                    else:
+                        hidden_states = self.self_attn.out_drop(
+                            self.self_attn.Wo(hidden_states)
+                        )
+                if profile_ranges:
+                    with profile_range(f"{layer_name}.self.residual"):
+                        hidden_states = residual + hidden_states
+                else:
+                    hidden_states = residual + hidden_states
+        elif attention_runtime_hooks().skip_out_proj:
+            raise RuntimeError(
+                "skip_out_proj requires decoder_layer self_out_residual_forward"
+            )
+        elif profile_ranges:
             with profile_range(f"{layer_name}.self.residual"):
                 hidden_states = residual + hidden_states
         else:

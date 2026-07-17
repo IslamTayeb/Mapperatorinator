@@ -53,6 +53,7 @@ def generation_profile_context(
         native_q1_self_attention: bool = False,
         native_q1_rope_cache_self_attention: bool = False,
         native_cross_mlp_tail: bool = False,
+        compiled_self_wo_residual: bool = False,
         optimized_expected_dtype: torch.dtype = torch.float32,
         optimized_dispatch_counts: dict[str, int] | None = None,
 ) -> Iterator[None]:
@@ -74,6 +75,7 @@ def generation_profile_context(
             q1_bmm_cross_attention
             or native_q1_self_attention
             or native_q1_rope_cache_self_attention
+            or compiled_self_wo_residual
         ):
             from osuT5.osuT5.inference.optimized.single.runtime_context import (
                 attention_runtime_context,
@@ -85,19 +87,21 @@ def generation_profile_context(
                 native_q1_rope_cache_self_attention=(
                     native_q1_rope_cache_self_attention
                 ),
+                skip_out_proj=compiled_self_wo_residual,
                 expected_dtype=optimized_expected_dtype,
                 dispatch_counts=optimized_dispatch_counts,
             )
         optimized_decoder_layer_context = decoder_layer_runtime_hooks_context(
             DecoderLayerRuntimeHooks()
         )
-        if native_cross_mlp_tail:
+        if native_cross_mlp_tail or compiled_self_wo_residual:
             from osuT5.osuT5.inference.optimized.single.runtime_context import (
                 decoder_layer_runtime_context,
             )
 
             optimized_decoder_layer_context = decoder_layer_runtime_context(
-                native_cross_mlp_tail=True,
+                native_cross_mlp_tail=native_cross_mlp_tail,
+                compiled_self_wo_residual=compiled_self_wo_residual,
                 dispatch_counts=optimized_dispatch_counts,
             )
         optimized_active_prefix_context = nullcontext()
