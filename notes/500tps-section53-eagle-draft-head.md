@@ -1,6 +1,6 @@
 # §53 EAGLE-style draft head — plan (Track C endgame)
 
-**Status:** **OPEN** — renumbered from former §51 scaffold (ledger §51 reclaimed for verify kernels)  
+**Status:** **STOP_KILL** — renumbered from former §51 scaffold (ledger §51 reclaimed for verify kernels)  
 **Branch / WT:** `codex/turbo-eagle-draft-head` @ `/work/projects/Mapperatorinator-worktrees/turbo-eagle-draft-head`  
 **Base:** integrator `44ab1f3e` (campaign tip still `55949274` / **366.11**)  
 **Do not:** merge to main; claim 500; open §44 until scout ≥384; grind §48/§52 verify path.

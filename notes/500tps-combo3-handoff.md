@@ -564,17 +564,18 @@ Artifacts: `/work/imt11/Mapperatorinator/runs/{exact-decode-cast-copy-fp16-49974
 27. **§49 W-DG MISS_UNDER_KILL** — `50150142` γ=3 **1.257 ms**. Handoff: `notes/500tps-section49-graphed-draft-chain.md`.
 28. **Post-rung ceiling → (A)** — keep-KV + c_verify 3.075 + draft_chain 1.257 → **461.68 / 554.02** TPS at E=2.0/2.4 (≥420). KV-only eager &lt;420. **Merge §47+§49 into integrator for one path-hit scout.** §48 not ground. §51 EAGLE parked. W-BASE/§38/hybrid already sealed. Script: `utils/s45_turbo_structural_bound.py`. Decision: `notes/500tps-post-rung-ceiling-decision.md`. Tip `55949274` / **366.11**. No main. No §44. No 500 claim.
 29. **§52 integrator scout STOP/DIAGNOSE** — tip `44ab1f3e`; job **`50150615`** COMPLETED: main_tps **38.61**; path hits LAND (chain 1510 / native 1259) but **E≈1.06 &lt; 1.7** falsifies authorizing ceiling; residual Q1/cycle=1; draft 2.25 / verify 14.7 / rebuild 15.9 ms. **No §44.** Handoff: `notes/500tps-section52-handoff.md`. Tip still `55949274` / **366.11**.
-30. **§52 E-collapse + EAGLE renumber** — primary TF tip-dump≠in-loop (map weighted E≈1.25); no §52b. **§51 RECLAIMED** (verify kernels, sibling). EAGLE → **§53** on `codex/turbo-eagle-draft-head`.
-31. **§53 EAGLE OPEN** — dump+smoke+in-loop probe; gates held-out E≥**2.4** / runtime E≥**2.2** / c_d→ceiling≥420. Handoff: `notes/500tps-section53-handoff.md`.
+30. **§52 E-collapse + EAGLE renumber** — primary TF tip-dump≠in-loop (map weighted E≈1.25); no §52b. **§52 sealed.** EAGLE → **§53** on `codex/turbo-eagle-draft-head`. **§51 vacated** (do not reuse for verify).
+31. **§53 EAGLE STOP_KILL** — dump `50151156` + smoke `50151157` @ `0178e9e0`: held-out in-loop E=**1.163**≪2.4; emp E=**0.353**≪2.2; c_d=**0.806 ms**≫budget → **STOP_BUDGET**. No wire. Handoff: `notes/500tps-section53-handoff.md`.
+32. **TURBO ENDGAME PACKAGE** — `notes/500tps-turbo-endgame-package.md`. **§34 addendum:** strict rejection-sampling turbo = MERGE CANDIDATE; bounded-drift/relaxed = last-resort **separate preset** (never folded into `turbo`). Numbering: verify kernels **§54** (not §51); bankable graduation scout **§55**. Sequence: Track1 (§55) then Track2∥Track3 (§54∥§53). Tip still `55949274` / **366.11**. No merge.
 
 ## Standing orders
 
 - Prefer **Grok 4.5 High** / auto (non-fast); do **not** use `cursor-grok-4.5-high-fast`.
 - One candidate per worktree/node; serialize graduation / integrator merges.
 - Never present projections as production TPS.
-- V32 cold default; `optimized` under `osuT5/.../inference/optimized/` (bit-exact, default-off unchanged); future `turbo` is a separate immutable preset.
-- **Track C next:** §52 diagnosed (no §52b). **§53 EAGLE OPEN** — hidden dumps → smoke+mandatory in-loop; held-out E≥2.4 before wire; runtime E≥2.2. **§51** = verify kernels (sibling). **§48 STOP_KILL**. Tip still `55949274` / **366.11**. No merge. No §44. No 500 claim.
-- Wake: §53 EAGLE dump/probe; tip 55949274/366.11; no main; no §44; no 500 claim. Keep nohup loop.
+- V32 cold default; `optimized` under `osuT5/.../inference/optimized/` (bit-exact, default-off unchanged); `turbo` = separate immutable preset (**strict** rejection-sampling = merge candidate per §34 addendum).
+- **Endgame:** **Track 1 §55** FIRST (after E fix; not bare §52b) → then **§54 verify** (Track 2). **§53 EAGLE STOP_KILL** (cheap head miss). **§51 vacated.** **§52 sealed.** **§48 STOP_KILL**. Tip still `55949274` / **366.11**. No merge. No §44 until ≥384. No 500 claim.
+- Wake: §53 STOP_KILL recorded; tip 55949274/366.11; no main; no §44; no 500 claim. Keep nohup loop.
 
 ## Outside-research ranking (FP16/FP32)
 

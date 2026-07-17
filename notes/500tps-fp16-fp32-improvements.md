@@ -1217,17 +1217,18 @@ Full text: `notes/500tps-turbo-endgame-package.md`. Tip still `55949274` / **366
 | **3** | **§53** | EAGLE head (was §51 scaffold) | after §55, **∥ §54** |
 | last-resort | W-RX | relaxed acceptance — **separate preset** | only if §54+§53 fail &lt;500 |
 
-## §53 EAGLE-style draft head — OPEN (was §51)
+## §53 EAGLE-style draft head — STOP_KILL (was §51)
 
 | Field | Value |
 | --- | --- |
-| Status | **OPEN** after §52 A falsified; **renumbered from §51** |
+| Status | **STOP_KILL** after dump+smoke; **renumbered from §51** |
 | Track | Endgame **Track 3** (500-enabler B) |
-| Branch / WT | `codex/turbo-eagle-draft-head` / `turbo-eagle-draft-head` (base integrator `44ab1f3e`) |
-| Target | held-out E≥**2.4** @ γ=3 before runtime wire; runtime E≥**2.2**; c_d 0.05–0.1×; ceiling ≥420 |
-| Scaffold | `osuT5/.../turbo/eagle_draft.py`, `utils/s53_dump_teacher_hiddens.py`, `utils/s53_eagle_acceptance_probe.py`, `jobs/s53-*.sbatch` |
-| Next | DCC hidden dumps (SALVALAI+nube) → smoke_head (mandatory in-loop) → gate |
-| Jobs | dump/probe pending submit |
+| Branch / WT | `codex/turbo-eagle-draft-head` @ `0178e9e0` |
+| Jobs | dump **50151156** COMPLETED; smoke **50151157** COMPLETED |
+| Held-out in-loop E | **1.163** (bar ≥2.4) |
+| Empirical in-loop E | **0.353** (bar ≥2.2) |
+| c_d median γ=3 | **0.806 ms** (bar 0.093–0.185) |
+| Ruling | **STOP_BUDGET** — also miss E bars; no wire / no heavy-train grind |
 | Plan / handoff | `notes/500tps-section53-eagle-draft-head.md`, `notes/500tps-section53-handoff.md` |
 | Campaign tip | still `55949274` / **366.11** — no merge; no §44; no 500 |
 | Ledger rule | Own section only |
