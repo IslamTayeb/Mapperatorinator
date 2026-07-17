@@ -1,6 +1,6 @@
 # §37 Tiny draft — plan (Track C)
 
-**Status:** OPEN — train `50146289` E[acc]=**2.921** → turbo speculative `generate_window` wired (this tip). TIER1 before ship.
+**Status:** OPEN — train `50146289` E[acc]=**2.921**; §43 held-out **DONE** (`50147299`, tip mean E≈2.03 / multi≈2.44; prefer K=1 — `notes/500tps-section43-handoff.md`). Turbo speculative wired separately; TIER1 before ship.
 **Tip (campaign auth):** `55949274` / FP16 **366.11** (unchanged). **No merge.** Do not claim tip graduate / 500 until TIER1+perf.
 **Not this work:** §39 hybrid TIER3 (sibling); INT8-as-FP16.
 
