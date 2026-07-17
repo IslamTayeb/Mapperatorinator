@@ -38,7 +38,7 @@ from osuT5.osuT5.dataset.data_utils import (  # noqa: E402
     events_of_type,
     update_event_times,
 )
-from osuT5.osuT5.inference import Postprocessor, Preprocessor, Processor  # noqa: E402
+from osuT5.osuT5.inference import Preprocessor, Processor  # noqa: E402
 from osuT5.osuT5.inference.engine_binding import unwrap_engine_binding  # noqa: E402
 from osuT5.osuT5.inference.turbo.fused_step import (  # noqa: E402
     relative_logit_delta,
@@ -190,9 +190,13 @@ def main() -> None:
     ap.add_argument(
         "--dump-run",
         type=Path,
-        default=Path(
-            "/work/imt11/Mapperatorinator/runs/exact-rope-device-state-fp16-auth-49964133"
-        ),
+        nargs="+",
+        default=[
+            Path(
+                "/work/imt11/Mapperatorinator/runs/exact-rope-device-state-fp16-auth-49964133"
+            )
+        ],
+        help="One or more dump roots (profile+.osu). Accumulates positions.",
     )
     ap.add_argument(
         "--audio",
@@ -210,11 +214,8 @@ def main() -> None:
     if str(args.repo) not in sys.path:
         sys.path.insert(0, str(args.repo))
 
-    profile_path = find_profile(args.dump_run)
-    dumps = load_dump_tokens(profile_path)
-    map_keys = sorted(k for k in dumps if k[0] == "map")
-    print(f"dump={profile_path}", flush=True)
-    print(f"map_windows={len(map_keys)}", flush=True)
+    dump_runs = list(args.dump_run)
+    print(f"dump_runs={len(dump_runs)}", flush=True)
 
     config_dir = str(args.repo / "configs" / "inference")
     with initialize_config_dir(version_base="1.1", config_dir=config_dir):
@@ -246,7 +247,6 @@ def main() -> None:
 
     preprocessor = Preprocessor(args_inf, parallel=False)
     processor = Processor(args_inf, teacher, tokenizer)
-    postprocessor = Postprocessor(args_inf)
 
     audio = preprocessor.load(str(args.audio))
     sequences = preprocessor.segment(audio)
@@ -266,153 +266,175 @@ def main() -> None:
         descriptors=list(args_inf.descriptors) if args_inf.descriptors else None,
     )
 
-    # Use tip-auth .osu TimingPoints (same FIX as §35 50145885).
     from slider import Beatmap
-
-    osu_path = find_osu(args.dump_run)
-    print(f"timing_source_osu={osu_path}", flush=True)
-    tip_beatmap = Beatmap.from_path(osu_path)
-    timing = list(tip_beatmap.timing_points)
-    if len(timing) == 0:
-        raise SystemExit(f"tip .osu has no timing points: {osu_path}")
-    extra_in_context = {ContextType.TIMING: timing}
-    output_type = [t for t in list(args_inf.output_type) if t != ContextType.TIMING]
-    print(f"timing_points={len(timing)}", flush=True)
-    model_kwargs = processor._get_model_cond_kwargs(generation_config)
-
-    gen_in, gen_out, req_special = processor._get_viable_template(
-        in_context=list(args_inf.in_context) if args_inf.in_context else [],
-        out_context=output_type,
-        extra_in_context=extra_in_context,
-        gamemode=generation_config.gamemode,
-    )
-    model_kwargs = processor._get_model_cond_kwargs(generation_config)
-    in_ctx = processor.get_in_context(
-        in_context=gen_in,
-        beatmap_path=None,
-        extra_in_context=extra_in_context,
-        song_length=song_length,
-    )
-    out_ctx = processor.get_out_context(
-        out_context=gen_out,
-        generation_config=generation_config,
-        given_context=list(args_inf.in_context) if args_inf.in_context else [],
-        beatmap_path=None,
-        extra_in_context=extra_in_context,
-        song_length=song_length,
-        verbose=False,
-    )
-    map_ctx = next(c for c in out_ctx if c["context_type"] == ContextType.MAP)
 
     max_rel_all = 0.0
     agree_n = 0
     pos_n = 0
     windows_done = 0
     per_window: list[dict[str, Any]] = []
-    max_windows = args.max_map_windows if args.max_map_windows > 0 else len(map_keys)
-
+    dump_profiles: list[str] = []
     t_fwd = time.perf_counter()
-    for sequence_index, (frames, frame_time) in enumerate(zip(*sequences[:2])):
-        if windows_done >= max_windows:
-            break
-        key = ("map", sequence_index)
-        if key not in dumps:
-            raise SystemExit(f"missing map dump {key}")
-        dump_tokens = dumps[key]
-        if len(dump_tokens) < 1:
-            continue
 
-        trim_lookback = (
-            sequence_index != 0 and processor.types_first and processor.lookback_time > 0
-        )
-        trim_lookahead = sequence_index != len(sequences[0]) - 1
-        frames = processor.prepare_frames(frames)
-        frame_time_v = frame_time.item()
-
-        map_i = next(i for i, c in enumerate(out_ctx) if c["context_type"] == ContextType.MAP)
-        cond_prompt, uncond_prompt = processor.get_prompts(
-            processor.prepare_context_sequences(in_ctx, frame_time_v, False, req_special),
-            processor.prepare_context_sequences(out_ctx[: map_i + 1], frame_time_v, True, req_special),
-        )
-        [prompt, _uncond], _max_len = processor.pad_prompts([cond_prompt, uncond_prompt])
-        prompt_ids = prompt[0, : int(prompt[0].ne(processor.tokenizer.pad_id).sum().item())]
-
-        gen = torch.tensor(dump_tokens, dtype=torch.long)
-        full = torch.cat([prompt_ids.cpu(), gen], dim=0).unsqueeze(0)
-        if full.shape[1] < 2:
-            processor.add_predicted_tokens_to_context(
-                map_ctx, gen, frame_time_v, trim_lookback, trim_lookahead
-            )
-            continue
-
-        dec_in = full[:, :-1]
-        dec_attn = dec_in.ne(processor.tokenizer.pad_id)
-        mk = dict(model_kwargs)
-        if processor.do_song_position_embed:
-            global_pos_start = frame_time_v / song_length
-            global_pos_end = (
-                frame_time_v + processor.miliseconds_per_sequence
-            ) / song_length
-            mk["song_position"] = torch.tensor(
-                [global_pos_start, global_pos_end], dtype=torch.float32
-            ).unsqueeze(0)
-
-        logits_t = teacher_force_logits(
-            teacher,
-            frames=frames,
-            decoder_input_ids=dec_in,
-            decoder_attention_mask=dec_attn,
-            model_kwargs=mk,
-            precision=args.precision,
-        )
-        logits_c = teacher_force_logits(
-            candidate,
-            frames=frames,
-            decoder_input_ids=dec_in,
-            decoder_attention_mask=dec_attn,
-            model_kwargs=mk,
-            precision=args.precision,
-        )
-
-        prompt_len = int(prompt_ids.numel())
-        start = max(prompt_len - 1, 0)
-        end = start + len(dump_tokens)
-        lt = logits_t[0, start:end]
-        lc = logits_c[0, start:end]
-        L = min(lt.shape[0], lc.shape[0])
-        lt = lt[:L]
-        lc = lc[:L]
-        if L == 0:
-            processor.add_predicted_tokens_to_context(
-                map_ctx, gen, frame_time_v, trim_lookback, trim_lookahead
-            )
-            continue
-
-        rel = relative_logit_delta(lt, lc)
-        agr = top1_agreement(lt, lc)
-        w_max = float(rel.max().item())
-        w_agree = float(agr.float().mean().item())
-        max_rel_all = max(max_rel_all, w_max)
-        agree_n += int(agr.sum().item())
-        pos_n += int(agr.numel())
-        windows_done += 1
-        per_window.append(
-            {
-                "key": list(key),
-                "positions": int(agr.numel()),
-                "max_rel_logit_delta": w_max,
-                "top1_agreement": w_agree,
-            }
-        )
-        processor.add_predicted_tokens_to_context(
-            map_ctx, gen, frame_time_v, trim_lookback, trim_lookahead
-        )
-        print(
-            f"window={key} pos={L} max_rel={w_max:.4e} top1={w_agree:.6f} cum_pos={pos_n}",
-            flush=True,
-        )
+    for dump_i, dump_run in enumerate(dump_runs):
         if args.max_positions > 0 and pos_n >= args.max_positions:
             break
+        profile_path = find_profile(dump_run)
+        dumps = load_dump_tokens(profile_path)
+        map_keys = sorted(k for k in dumps if k[0] == "map")
+        dump_profiles.append(str(profile_path))
+        print(f"dump[{dump_i}]={profile_path} map_windows={len(map_keys)}", flush=True)
+
+        osu_path = find_osu(dump_run)
+        tip_beatmap = Beatmap.from_path(osu_path)
+        timing = list(tip_beatmap.timing_points)
+        if len(timing) == 0:
+            raise SystemExit(f"dump .osu has no timing points: {osu_path}")
+        extra_in_context = {ContextType.TIMING: timing}
+        output_type = [t for t in list(args_inf.output_type) if t != ContextType.TIMING]
+        model_kwargs = processor._get_model_cond_kwargs(generation_config)
+        gen_in, gen_out, req_special = processor._get_viable_template(
+            in_context=list(args_inf.in_context) if args_inf.in_context else [],
+            out_context=output_type,
+            extra_in_context=extra_in_context,
+            gamemode=generation_config.gamemode,
+        )
+        in_ctx = processor.get_in_context(
+            in_context=gen_in,
+            beatmap_path=None,
+            extra_in_context=extra_in_context,
+            song_length=song_length,
+        )
+        out_ctx = processor.get_out_context(
+            out_context=gen_out,
+            generation_config=generation_config,
+            given_context=list(args_inf.in_context) if args_inf.in_context else [],
+            beatmap_path=None,
+            extra_in_context=extra_in_context,
+            song_length=song_length,
+            verbose=False,
+        )
+        map_ctx = next(c for c in out_ctx if c["context_type"] == ContextType.MAP)
+        max_windows = args.max_map_windows if args.max_map_windows > 0 else len(map_keys)
+        dump_windows = 0
+
+        for sequence_index, (frames, frame_time) in enumerate(zip(*sequences[:2])):
+            if dump_windows >= max_windows:
+                break
+            if args.max_positions > 0 and pos_n >= args.max_positions:
+                break
+            key = ("map", sequence_index)
+            if key not in dumps:
+                print(f"skip missing dump key {key} in {profile_path}", flush=True)
+                continue
+            dump_tokens = dumps[key]
+            if len(dump_tokens) < 1:
+                continue
+
+            trim_lookback = (
+                sequence_index != 0
+                and processor.types_first
+                and processor.lookback_time > 0
+            )
+            trim_lookahead = sequence_index != len(sequences[0]) - 1
+            frames = processor.prepare_frames(frames)
+            frame_time_v = frame_time.item()
+
+            map_i = next(
+                i for i, c in enumerate(out_ctx) if c["context_type"] == ContextType.MAP
+            )
+            cond_prompt, uncond_prompt = processor.get_prompts(
+                processor.prepare_context_sequences(
+                    in_ctx, frame_time_v, False, req_special
+                ),
+                processor.prepare_context_sequences(
+                    out_ctx[: map_i + 1], frame_time_v, True, req_special
+                ),
+            )
+            [prompt, _uncond], _max_len = processor.pad_prompts(
+                [cond_prompt, uncond_prompt]
+            )
+            prompt_ids = prompt[
+                0, : int(prompt[0].ne(processor.tokenizer.pad_id).sum().item())
+            ]
+
+            gen = torch.tensor(dump_tokens, dtype=torch.long)
+            full = torch.cat([prompt_ids.cpu(), gen], dim=0).unsqueeze(0)
+            if full.shape[1] < 2:
+                processor.add_predicted_tokens_to_context(
+                    map_ctx, gen, frame_time_v, trim_lookback, trim_lookahead
+                )
+                continue
+
+            dec_in = full[:, :-1]
+            dec_attn = dec_in.ne(processor.tokenizer.pad_id)
+            mk = dict(model_kwargs)
+            if processor.do_song_position_embed:
+                global_pos_start = frame_time_v / song_length
+                global_pos_end = (
+                    frame_time_v + processor.miliseconds_per_sequence
+                ) / song_length
+                mk["song_position"] = torch.tensor(
+                    [global_pos_start, global_pos_end], dtype=torch.float32
+                ).unsqueeze(0)
+
+            logits_t = teacher_force_logits(
+                teacher,
+                frames=frames,
+                decoder_input_ids=dec_in,
+                decoder_attention_mask=dec_attn,
+                model_kwargs=mk,
+                precision=args.precision,
+            )
+            logits_c = teacher_force_logits(
+                candidate,
+                frames=frames,
+                decoder_input_ids=dec_in,
+                decoder_attention_mask=dec_attn,
+                model_kwargs=mk,
+                precision=args.precision,
+            )
+
+            prompt_len = int(prompt_ids.numel())
+            start = max(prompt_len - 1, 0)
+            end = start + len(dump_tokens)
+            lt = logits_t[0, start:end]
+            lc = logits_c[0, start:end]
+            L = min(lt.shape[0], lc.shape[0])
+            lt = lt[:L]
+            lc = lc[:L]
+            if L == 0:
+                processor.add_predicted_tokens_to_context(
+                    map_ctx, gen, frame_time_v, trim_lookback, trim_lookahead
+                )
+                continue
+
+            rel = relative_logit_delta(lt, lc)
+            agr = top1_agreement(lt, lc)
+            w_max = float(rel.max().item())
+            w_agree = float(agr.float().mean().item())
+            max_rel_all = max(max_rel_all, w_max)
+            agree_n += int(agr.sum().item())
+            pos_n += int(agr.numel())
+            windows_done += 1
+            dump_windows += 1
+            per_window.append(
+                {
+                    "dump": str(dump_run),
+                    "key": list(key),
+                    "positions": int(agr.numel()),
+                    "max_rel_logit_delta": w_max,
+                    "top1_agreement": w_agree,
+                }
+            )
+            processor.add_predicted_tokens_to_context(
+                map_ctx, gen, frame_time_v, trim_lookback, trim_lookahead
+            )
+            print(
+                f"dump={dump_i} window={key} pos={L} max_rel={w_max:.4e} "
+                f"top1={w_agree:.6f} cum_pos={pos_n}",
+                flush=True,
+            )
 
     top1 = (agree_n / pos_n) if pos_n else 0.0
     gate_rel = max_rel_all <= MAX_REL_GATE
@@ -425,7 +447,8 @@ def main() -> None:
         "campaign_tip": "55949274",
         "auth_fp16_main_tps": 366.11,
         "precision": args.precision,
-        "dump_profile": str(profile_path),
+        "dump_profiles": dump_profiles,
+        "dump_profile": dump_profiles[0] if dump_profiles else None,
         "teacher_engine": "optimized",
         "candidate_engine": "turbo",
         "candidate_preset": "turbo-tier2-fused-step-s38-v2",
