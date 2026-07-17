@@ -31,7 +31,6 @@ from osuT5.osuT5.inference import GenerationConfig, Preprocessor, Processor  # n
 from osuT5.osuT5.inference.engine_binding import unwrap_engine_binding  # noqa: E402
 from osuT5.osuT5.inference.turbo.draft_fastpath import (  # noqa: E402
     DraftFastpathRunner,
-    time_graph_replay_ms,
 )
 TIP_FP16_MAIN_MS = 1000.0 / 366.11  # ~2.731 ms/token auth tip
 TARGET_RATIO = 0.15
@@ -148,60 +147,47 @@ def _ensure_encoder_outputs(model, model_kwargs: dict[str, Any]) -> dict[str, An
 
 
 @torch.no_grad()
-def _time_eager_native_ms(
+def _time_decode_token_ms(
     runner: DraftFastpathRunner,
     *,
     prefix_length: int,
     warmup: int,
     iters: int,
 ) -> dict[str, Any]:
-    """Fallback: time one eager native decode step at a fixed length."""
-    runner.cuda_graph = False
+    """Time live decode_token steps (real draft AR path, incl. graph replay)."""
     while runner._cur_len < prefix_length:
         runner.decode_token(1)
+    for _ in range(max(int(warmup), 0)):
+        runner.decode_token(1)
     torch.cuda.synchronize()
-    # Time decode_token by rolling one step then restoring via rebuild is too
-    # heavy; instead time a repeated forward of the current next-step inputs.
-    assert runner._model_kwargs is not None and runner._input_ids is not None
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(int(iters)):
+        runner.decode_token(1)
+    end.record()
+    torch.cuda.synchronize()
+    ms = float(start.elapsed_time(end)) / float(iters)
     from osuT5.osuT5.inference.optimized.single.decode_loop import (
         _bucketed_prefix_length,
     )
-    from osuT5.osuT5.inference.optimized.single.runtime_context import (
-        active_prefix_self_attention_context,
-    )
 
-    with runner._profile_context():
-        runner._model_kwargs.pop("cache_position", None)
-        model_inputs = runner.model.prepare_inputs_for_generation(
-            runner._input_ids,
-            **runner._model_kwargs,
-        )
-        bucket = _bucketed_prefix_length(
-            int(runner._input_ids.shape[1]),
-            runner.bucket_size,
-            runner._max_cache_len,
-        )
-        for _ in range(max(int(warmup), 0)):
-            with active_prefix_self_attention_context(bucket):
-                _ = runner.model(**model_inputs, return_dict=True)
-        torch.cuda.synchronize()
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(int(iters)):
-            with active_prefix_self_attention_context(bucket):
-                _ = runner.model(**model_inputs, return_dict=True)
-        end.record()
-        torch.cuda.synchronize()
-        ms = float(start.elapsed_time(end)) / float(iters)
+    bucket = _bucketed_prefix_length(
+        int(runner._cur_len),
+        runner.bucket_size,
+        runner._max_cache_len,
+    )
     return {
         "prefix_length": int(prefix_length),
         "bucket_prefix_length": int(bucket),
         "ms_per_token": ms,
-        "capture_seconds": 0.0,
+        "capture_seconds": float(runner.stats.capture_seconds),
         "warmup": int(warmup),
         "iters": int(iters),
+        "graph_captures": int(runner.stats.graph_captures),
+        "graph_replays": int(runner.stats.graph_replays),
         "dispatch_counts": dict(runner.stats.dispatch_counts),
+        "end_len": int(runner._cur_len),
     }
 
 
@@ -220,8 +206,7 @@ def bench_model_graph(
     bind_kwargs.pop("decoder_input_ids", None)
     rows = []
     for prefix in prefixes:
-        # Eager native first (fresh runner) so a later graph CUDA fault cannot
-        # erase the only measurement.
+        # Eager native (no graph).
         eager_runner = DraftFastpathRunner(
             model,
             dtype=dtype,
@@ -230,8 +215,7 @@ def bench_model_graph(
         )
         eager_runner.bind(model_kwargs=bind_kwargs, prompt_ids=prompt_ids)
         eager_runner.prefill()
-        eager_runner.warm_native_kernels()
-        eager_row = _time_eager_native_ms(
+        eager_row = _time_decode_token_ms(
             eager_runner,
             prefix_length=prefix,
             warmup=warmup,
@@ -240,64 +224,42 @@ def bench_model_graph(
         eager_row["timing_mode"] = "eager_native"
         print(
             f"[{label}] eager prefix={prefix} "
-            f"ms/token={eager_row['ms_per_token']:.4f}",
+            f"ms/token={eager_row['ms_per_token']:.4f} "
+            f"dispatch={eager_row['dispatch_counts']}",
             flush=True,
         )
 
-        graph_row = None
-        graph_error = None
-        try:
-            # In-process graph attempt after eager measurement for this prefix.
-            graph_runner = DraftFastpathRunner(
-                model,
-                dtype=dtype,
-                enable_native_kernels=True,
-                cuda_graph=True,
-                cuda_graph_warmup=2,
-            )
-            graph_runner.bind(model_kwargs=bind_kwargs, prompt_ids=prompt_ids)
-            graph_runner.prefill()
-            graph_runner.warm_native_kernels()
-            graph_row = time_graph_replay_ms(
-                graph_runner,
-                prefix_length=prefix,
-                warmup=warmup,
-                iters=iters,
-            )
-            graph_row["timing_mode"] = "cuda_graph_replay"
-            print(
-                f"[{label}] graph prefix={prefix} "
-                f"ms/token={graph_row['ms_per_token']:.4f}",
-                flush=True,
-            )
-        except Exception as exc:  # noqa: BLE001
-            graph_error = repr(exc)
-            print(
-                f"[{label}] graph timing failed at prefix={prefix}: {exc!r}",
-                flush=True,
-            )
-            # Device may be poisoned; stop further prefixes after recording eager.
-            row = dict(eager_row)
-            row["graph_error"] = graph_error
-            row["label"] = label
-            row["layers"] = eager_runner.layer_count
-            rows.append(row)
-            break
-
-        row = dict(graph_row or eager_row)
-        row["eager_ms_per_token"] = float(eager_row["ms_per_token"])
+        # CUDA-graph decode_token path (captures per bucket, then replays).
+        graph_runner = DraftFastpathRunner(
+            model,
+            dtype=dtype,
+            enable_native_kernels=True,
+            cuda_graph=True,
+            cuda_graph_warmup=2,
+        )
+        graph_runner.bind(model_kwargs=bind_kwargs, prompt_ids=prompt_ids)
+        graph_runner.prefill()
+        graph_row = _time_decode_token_ms(
+            graph_runner,
+            prefix_length=prefix,
+            warmup=max(warmup, 8),  # absorb first captures
+            iters=iters,
+        )
+        graph_row["timing_mode"] = "cuda_graph_decode_token"
+        graph_row["eager_ms_per_token"] = float(eager_row["ms_per_token"])
+        print(
+            f"[{label}] graph prefix={prefix} "
+            f"ms/token={graph_row['ms_per_token']:.4f} "
+            f"captures={graph_row['graph_captures']} "
+            f"replays={graph_row['graph_replays']}",
+            flush=True,
+        )
+        row = dict(graph_row)
         row["label"] = label
-        row["layers"] = eager_runner.layer_count
+        row["layers"] = graph_runner.layer_count
         rows.append(row)
 
-    if not rows:
-        raise RuntimeError(f"no timing rows for {label}")
-    # Prefer graph timings when present.
-    ms_values = [
-        float(r.get("ms_per_token"))
-        for r in rows
-        if r.get("timing_mode") == "cuda_graph_replay"
-    ] or [float(r["ms_per_token"]) for r in rows]
+    ms_values = [float(r["ms_per_token"]) for r in rows]
     return {
         "label": label,
         "layers": int(rows[0]["layers"]),
@@ -306,9 +268,7 @@ def bench_model_graph(
         "min_ms_per_token": float(min(ms_values)),
         "max_ms_per_token": float(max(ms_values)),
         "dispatch_counts_last": rows[-1].get("dispatch_counts", {}),
-        "used_cuda_graph": any(
-            r.get("timing_mode") == "cuda_graph_replay" for r in rows
-        ),
+        "used_cuda_graph": any(int(r.get("graph_replays", 0)) > 0 for r in rows),
     }
 
 
