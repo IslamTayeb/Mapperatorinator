@@ -37,6 +37,7 @@ export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 export MAPPERATORINATOR_TURBO_DRAFT_CKPT="$DRAFT_CKPT"
 export MAPPERATORINATOR_TURBO_DRAFT_FASTPATH=1
+# Leave unblocked for timing; diagnose job uses CUDA_LAUNCH_BLOCKING=1.
 export CUDA_LAUNCH_BLOCKING=${CUDA_LAUNCH_BLOCKING:-0}
 
 cd "$REPO"
@@ -65,9 +66,9 @@ fi
   --audio "$AUDIO" \
   --draft-ckpt "$DRAFT_CKPT" \
   --precision fp16 \
-  --prefixes 128,256,512 \
-  --warmup 10 \
-  --iters 50 \
+  --prefixes 128,256 \
+  --warmup 5 \
+  --iters 30 \
   --output "$RUN_ROOT/summary.json" \
   "${OSU_ARGS[@]}" \
   > "$RUN_ROOT/stdout.txt" 2> "$RUN_ROOT/stderr.txt"

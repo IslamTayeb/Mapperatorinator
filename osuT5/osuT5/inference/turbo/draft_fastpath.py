@@ -171,11 +171,14 @@ class DraftFastpathRunner:
         self._max_cache_len = int(model.config.max_target_positions)
 
     def _native_flags(self) -> dict[str, bool]:
+        # RoPE+cache fused q1 needs tip shared-rope cos/sin layout [1,1,D].
+        # Turbo draft sessions do not install that device-state path, so keep
+        # q1 self (non-fused) + q1 cross BMM + cross-MLP and leave rope eager.
         on = self.enable_native_kernels
         return {
             "q1_bmm_cross_attention": on,
             "native_q1_self_attention": on,
-            "native_q1_rope_cache_self_attention": on,
+            "native_q1_rope_cache_self_attention": False,
             "native_cross_mlp_tail": on,
         }
 
