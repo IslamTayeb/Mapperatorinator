@@ -271,7 +271,9 @@ class TeacherVerifyFastpath:
             self._max_cache_len(model_kwargs),
         )
         if can_graph:
-            key = (prefix_length, int(k))
+            dec = model_inputs.get("decoder_input_ids")
+            dec_shape = tuple(dec.shape) if isinstance(dec, torch.Tensor) else ()
+            key = (prefix_length, int(k), dec_shape)
             entry = self.graph_cache.get(key)
             if entry is None:
                 entry = self._capture_graph(
@@ -282,11 +284,21 @@ class TeacherVerifyFastpath:
                 self.graph_cache[key] = entry
                 outputs = entry.outputs
             else:
-                _copy_static_graph_inputs(entry.static_inputs, model_inputs)
-                entry.graph.replay()
-                entry.replays += 1
-                self.graph_replays += 1
-                outputs = entry.outputs
+                try:
+                    _copy_static_graph_inputs(entry.static_inputs, model_inputs)
+                    entry.graph.replay()
+                    entry.replays += 1
+                    self.graph_replays += 1
+                    outputs = entry.outputs
+                except RuntimeError:
+                    # Shape/address drift — recapture under same key.
+                    entry = self._capture_graph(
+                        model_inputs=model_inputs,
+                        prefix_length=prefix_length,
+                        k=int(k),
+                    )
+                    self.graph_cache[key] = entry
+                    outputs = entry.outputs
         else:
             with active_prefix_self_attention_context(prefix_length):
                 outputs = self.model(**model_inputs, return_dict=True)
