@@ -382,43 +382,48 @@ def compile_derived_args(args: InferenceConfig):
 
 
 def validate_reserved_runtime_flags(args: InferenceConfig):
-    supported_engines = {"v32", "optimized"}
+    supported_engines = {"v32", "optimized", "turbo"}
     if args.inference_engine not in supported_engines:
         raise ValueError(
             "inference_engine must be one of: " + ", ".join(sorted(supported_engines)) + "."
         )
-    if args.inference_engine == "optimized":
+    if args.inference_engine in {"optimized", "turbo"}:
+        engine = args.inference_engine
         if args.precision not in {"fp32", "fp16"}:
             raise ValueError(
-                "inference_engine=optimized requires precision=fp32 or precision=fp16."
+                f"inference_engine={engine} requires precision=fp32 or precision=fp16."
             )
         if args.use_server:
             raise ValueError(
-                "inference_engine=optimized requires use_server=false."
+                f"inference_engine={engine} requires use_server=false."
             )
         if args.parallel:
             raise ValueError(
-                "inference_engine=optimized cannot be combined with the legacy parallel inference path."
+                f"inference_engine={engine} cannot be combined with the legacy parallel inference path."
             )
         if args.device != "cuda":
-            raise ValueError("inference_engine=optimized currently requires device=cuda.")
+            raise ValueError(f"inference_engine={engine} currently requires device=cuda.")
         if args.attn_implementation != "sdpa":
             raise ValueError(
-                "inference_engine=optimized currently requires attn_implementation=sdpa."
+                f"inference_engine={engine} currently requires attn_implementation=sdpa."
             )
         if args.cfg_scale != 1.0:
-            raise ValueError("inference_engine=optimized currently requires cfg_scale=1.0.")
+            raise ValueError(f"inference_engine={engine} currently requires cfg_scale=1.0.")
         if args.num_beams != 1:
-            raise ValueError("inference_engine=optimized currently requires num_beams=1.")
+            raise ValueError(f"inference_engine={engine} currently requires num_beams=1.")
         if args.super_timing and args.timer_num_beams != 1:
             raise ValueError(
-                "inference_engine=optimized super_timing requires "
+                f"inference_engine={engine} super_timing requires "
                 "timer_num_beams=1."
             )
         if args.super_timing and args.timer_cfg_scale != 1.0:
             raise ValueError(
-                "inference_engine=optimized super_timing requires "
+                f"inference_engine={engine} super_timing requires "
                 "timer_cfg_scale=1.0."
+            )
+        if engine == "turbo" and args.super_timing:
+            raise ValueError(
+                "inference_engine=turbo does not support super_timing in the §37 scaffold."
             )
 
     def effective_generation_batch_size() -> int:
@@ -819,14 +824,19 @@ def load_model_with_engine(
     }
     if inference_engine == "v32":
         return load_model_with_server(**loader_kwargs)
-    if inference_engine != "optimized":
-        raise ValueError("inference_engine must be one of: optimized, v32.")
-
-    adapter = importlib.import_module("osuT5.osuT5.inference.optimized.adapter")
-    return adapter.load_optimized_engine(
-        model_loader=load_model_with_server,
-        loader_kwargs=loader_kwargs,
-    )
+    if inference_engine == "optimized":
+        adapter = importlib.import_module("osuT5.osuT5.inference.optimized.adapter")
+        return adapter.load_optimized_engine(
+            model_loader=load_model_with_server,
+            loader_kwargs=loader_kwargs,
+        )
+    if inference_engine == "turbo":
+        adapter = importlib.import_module("osuT5.osuT5.inference.turbo.adapter")
+        return adapter.load_turbo_engine(
+            model_loader=load_model_with_server,
+            loader_kwargs=loader_kwargs,
+        )
+    raise ValueError("inference_engine must be one of: optimized, turbo, v32.")
 
 
 def get_server_address(

@@ -125,3 +125,58 @@ def test_v32_loader_never_imports_or_dispatches_to_optimized_adapter():
         generation_compile=False,
     )
     optimized_import.assert_not_called()
+
+
+def test_turbo_engine_accepts_frozen_precision_presets():
+    for precision in ("fp32", "fp16"):
+        validate_reserved_runtime_flags(
+            InferenceConfig(
+                inference_engine="turbo",
+                precision=precision,
+                use_server=False,
+                parallel=False,
+                device="cuda",
+                attn_implementation="sdpa",
+                cfg_scale=1.0,
+                num_beams=1,
+                super_timing=False,
+            )
+        )
+
+
+def test_turbo_rejects_super_timing_in_scaffold():
+    _assert_raises(
+        ValueError,
+        "does not support super_timing",
+        lambda: validate_reserved_runtime_flags(
+            InferenceConfig(
+                inference_engine="turbo",
+                precision="fp16",
+                use_server=False,
+                parallel=False,
+                device="cuda",
+                attn_implementation="sdpa",
+                cfg_scale=1.0,
+                num_beams=1,
+                super_timing=True,
+                timer_num_beams=1,
+                timer_cfg_scale=1.0,
+            )
+        ),
+    )
+
+
+def test_turbo_loader_dispatches_to_turbo_adapter():
+    with patch.object(inference, "load_model_with_server", return_value=("model", "tokenizer")):
+        with patch.object(inference.importlib, "import_module") as import_module:
+            adapter = import_module.return_value
+            adapter.load_turbo_engine.return_value = ("bound", "tok")
+            result = load_model_with_engine(
+                ckpt_path=None,
+                t5_args=None,
+                device="cpu",
+                inference_engine="turbo",
+            )
+    assert result == ("bound", "tok")
+    import_module.assert_called_once_with("osuT5.osuT5.inference.turbo.adapter")
+    adapter.load_turbo_engine.assert_called_once()
