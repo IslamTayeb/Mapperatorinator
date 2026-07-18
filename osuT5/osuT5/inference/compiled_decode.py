@@ -26,9 +26,12 @@ T1 safety rails (§59):
 
 T3 compile-then-capture (pivot package):
   - Optional ``torch.compile`` of the shape-static decode step **before** CUDA
-    graph capture (``fullgraph=True``, ``dynamic=False``,
-    ``mode="max-autotune-no-cudagraphs"``). Never ``reduce-overhead`` near
-    manual capture (§22 Inductor-in-capture lesson).
+    graph capture (``fullgraph=True``, ``dynamic=False``). Default mode is
+    ``default`` (not ``max-autotune-no-cudagraphs``): harvest-2 showed
+    max-autotune GEMM/epilogue shopping flips fp16 greedy argmax (same
+    31418 vs 26464 ``.osu`` split across harvests; first byte diff in
+    TimingPoints). Override via ``MAPPERATORINATOR_COMPILE_MODE``.
+    Never ``reduce-overhead`` near manual capture (§22 Inductor-in-capture).
   - Warm every bucket (incl. any future turbo ``q_len``) before its capture.
   - Shape-static per-token sampling tail (monotonic hoist + temperature) stays
     **eager**: Inductor-compiling ``_tail`` specialized on warm ``(B,V)``
@@ -59,9 +62,22 @@ from ..event import ContextType, EventType
 from .logit_processors import MonotonicTimeShiftLogitsProcessor
 
 # T3: never use reduce-overhead next to manual CUDAGraph capture.
-_COMPILE_MODE = "max-autotune-no-cudagraphs"
+# Default ``default`` preserves greedy argmax vs eager capture; max-autotune
+# is opt-in via MAPPERATORINATOR_COMPILE_MODE (perf may rise, exactness may fail).
+_FORBIDDEN_COMPILE_MODES = frozenset({"reduce-overhead"})
 _COMPILE_WARMUP_ITERS = 5
 _EAGER_CAPTURE_WARMUP_ITERS = 3
+
+
+def _compile_mode() -> str:
+    raw = (os.environ.get("MAPPERATORINATOR_COMPILE_MODE") or "default").strip()
+    mode = raw or "default"
+    if mode in _FORBIDDEN_COMPILE_MODES:
+        raise ValueError(
+            f"MAPPERATORINATOR_COMPILE_MODE={mode!r} is forbidden next to manual "
+            "CUDAGraph capture (use default or max-autotune-no-cudagraphs)."
+        )
+    return mode
 
 
 class CaptureError(RuntimeError):
@@ -98,12 +114,34 @@ def _pin_inductor_cache_dir() -> str | None:
     return cache
 
 
+def _pin_compile_numerics() -> None:
+    """Prefer eager-matching fp16 reductions for greedy argmax parity.
+
+    Inductor max-autotune / reduced-precision reductions can flip near-tie
+    logits under fp16; disable the known matmul reduction knobs when compiling.
+    """
+    matmul = getattr(torch.backends.cuda, "matmul", None)
+    if matmul is None:
+        return
+    for attr in (
+        "allow_fp16_reduced_precision_reduction",
+        "allow_bf16_reduced_precision_reduction",
+    ):
+        if hasattr(matmul, attr):
+            try:
+                setattr(matmul, attr, False)
+            except Exception:
+                pass
+
+
 def _compile_callable(fn, *, label: str):
     """Compile ``fn`` with the binding T3 knobs; regional fallback on failure.
 
     NEVER uses ``reduce-overhead`` (conflicts with manual CUDAGraph capture).
     """
     _pin_inductor_cache_dir()
+    _pin_compile_numerics()
+    mode = _compile_mode()
     # Warm-all-buckets compiles one specialized graph per cache_len; default
     # recompile_limit=8 is too low for (_CACHE_BUCKETS + model_max).
     try:
@@ -118,14 +156,14 @@ def _compile_callable(fn, *, label: str):
     kwargs: dict = {
         "fullgraph": True,
         "dynamic": False,
-        "mode": _COMPILE_MODE,
+        "mode": mode,
     }
     try:
         compiled = torch.compile(fn, **kwargs)
-        return compiled, {"mode": _COMPILE_MODE, "fullgraph": True, "fallback": None}
+        return compiled, {"mode": mode, "fullgraph": True, "fallback": None}
     except Exception as e:
         warnings.warn(
-            f"T3 torch.compile({label}) fullgraph/{_COMPILE_MODE} failed ({e!r}); "
+            f"T3 torch.compile({label}) fullgraph/{mode} failed ({e!r}); "
             "trying regional/default fallback (still no reduce-overhead).",
             RuntimeWarning,
             stacklevel=2,
@@ -953,9 +991,11 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
         if len(rest) != len(logits_processor_list):  # one was actually removed
             mono_mask = _IncrementalMonotonicMask(tokenizer, device)
             logits_processor_list = rest
+        # Hoist on every fast path (not only compile): keeps greedy/sampling
+        # tails identical across COMPILE_DECODE on/off so exactness diffs isolate
+        # decode Inductor numerics rather than processor wiring.
         if (
-            compile_decode_enabled()
-            and mono_mask is not None
+            mono_mask is not None
             and len(logits_processor_list) == 1
             and isinstance(logits_processor_list[0], TemperatureLogitsWarper)
         ):
