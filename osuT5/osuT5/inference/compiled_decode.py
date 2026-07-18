@@ -100,6 +100,17 @@ def _compile_callable(fn, *, label: str):
     NEVER uses ``reduce-overhead`` (conflicts with manual CUDAGraph capture).
     """
     _pin_inductor_cache_dir()
+    # Warm-all-buckets compiles one specialized graph per cache_len; default
+    # recompile_limit=8 is too low for (_CACHE_BUCKETS + model_max).
+    try:
+        import torch._dynamo.config as dynamo_config
+
+        need = 64  # covers all cache buckets + sampling-tail specializations
+        dynamo_config.cache_size_limit = max(int(dynamo_config.cache_size_limit), need)
+        if hasattr(dynamo_config, "recompile_limit"):
+            dynamo_config.recompile_limit = max(int(dynamo_config.recompile_limit), need)
+    except Exception:
+        pass
     kwargs: dict = {
         "fullgraph": True,
         "dynamic": False,
@@ -334,15 +345,23 @@ class _IncrementalMonotonicMask:
     def apply_with_temperature(self, scores, temperature: float):
         """Mono mask + uniform temperature (shape-static (B, V) sampling tail)."""
         if self._compiled_tail is not None:
-            return self._compiled_tail(
-                scores,
-                self.ts_vocab,
-                self.last_ts_value,
-                self.active,
-                self.ts_start,
-                self.ts_end,
-                float(temperature),
-            )
+            try:
+                return self._compiled_tail(
+                    scores.contiguous(),
+                    self.ts_vocab,
+                    self.last_ts_value,
+                    self.active,
+                    self.ts_start,
+                    self.ts_end,
+                    float(temperature),
+                )
+            except Exception as e:
+                warnings.warn(
+                    f"T3 compiled sampling tail failed ({e!r}); using eager mono+temp.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self._compiled_tail = None
         out = self.apply(scores)
         if temperature != 1.0:
             out = out / temperature
@@ -369,14 +388,23 @@ class _IncrementalMonotonicMask:
         device = self.ts_vocab.device
         b = max(1, int(batch_size))
         v = max(int(vocab_size), int(self.ts_end) + 1)
-        warm_scores = torch.zeros((b, v), dtype=torch.float32, device=device)
+        warm_scores = torch.zeros((b, v), dtype=torch.float32, device=device).contiguous()
         last = torch.zeros((b,), dtype=torch.long, device=device)
         active = torch.zeros((b,), dtype=torch.bool, device=device)
-        for _ in range(_COMPILE_WARMUP_ITERS):
-            compiled(warm_scores, self.ts_vocab, last, active, self.ts_start, self.ts_end, 1.0)
-        torch.cuda.synchronize()
-        self._compiled_tail = compiled
-        self._compiled_tail_meta = meta
+        try:
+            for _ in range(_COMPILE_WARMUP_ITERS):
+                compiled(warm_scores, self.ts_vocab, last, active, self.ts_start, self.ts_end, 1.0)
+            torch.cuda.synchronize()
+            self._compiled_tail = compiled
+            self._compiled_tail_meta = meta
+        except Exception as e:
+            warnings.warn(
+                f"T3 sampling-tail warmup failed ({e!r}); leaving eager mono+temp.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._compiled_tail = None
+            self._compiled_tail_meta = {"fallback": "warmup_failed", "error": repr(e)}
 
     def update(self, tok):
         t = tok.reshape(-1)
