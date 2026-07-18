@@ -2,7 +2,8 @@
 
 **Status:** **STEP 2 WIRED — SPEC WINDOW SCOUT QUEUED** (2026-07-18)  
 **Strategy pivot:** turbo stacks on Tiger14n PR #120 `feat/compiled-decode`, **not** on optimized tip.  
-**Branch / WT:** `codex/turbo-on-tiger-pr120` @ *(see job preflight)*  
+**Branch / WT:** `codex/turbo-on-tiger-pr120` @ **`cbaf76eb`**  
+**STEP 2 job:** **`50192971`** PD `gpu:2080:1` · run `/work/imt11/Mapperatorinator/runs/s58-tiger-specwin-50192971/`  
 **Local WT:** `/work/projects/Mapperatorinator-worktrees/turbo-on-tiger-pr120`  
 **DCC WT:** `/hpc/group/romerolab/imt11/projects/Mapperatorinator-worktrees/turbo-on-tiger-pr120`  
 **Base:** `w1/tiger14n-compiled-decode` / `d01cdd2799891f78c871ff5889cfbb6a661a9e46` (verified)  
