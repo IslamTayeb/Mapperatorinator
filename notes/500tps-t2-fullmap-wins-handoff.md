@@ -1,74 +1,69 @@
 # T2 Certain Full-Map Wins — handoff
 
-**Status:** **WIRED — MEASURE PENDING** (2026-07-18)  
-**Package:** Pivot execution **T2** (−~23% full-map before compile)  
-**Branch / WT:** `codex/t2-fullmap-wins` @ *(fill after commit)*  
+**Status:** **MEASURED — PROMOTE Y (partial; −23% not sealed)** (2026-07-18)  
+**Package:** Pivot execution **T2**  
+**Branch / WT:** `codex/t2-fullmap-wins` @ **`f171f0b3`**  
 **Local WT:** `/work/projects/Mapperatorinator-worktrees/t2-fullmap-wins`  
 **DCC WT:** `/hpc/group/romerolab/imt11/projects/Mapperatorinator-worktrees/t2-fullmap-wins`  
 **Base:** tiger PR #120 mirror `d01cdd27`  
 **Optimized tip FROZEN:** `55949274` / FP16 **366.11** — **do not modify**; **no merge**; **no push to PR #120**  
-**T4 turbo:** **PARKED** (§57b E≪2.2) — not wired  
-**Sibling T1:** rails may share `codex/turbo-on-tiger-pr120`; this track is a **clean tiger branch** (no turbo)
+**T4 turbo:** **PARKED** — not wired  
+**Sibling T1:** `s59-t1-rails` `50194265` PD (separate); this track is clean tiger branch
 
 ## Intent
 
-Cut full-map **ms/map-token** on tiger-base before any torch.compile (T3):
+Cut full-map **ms/map-token** on tiger-base before compile (T3):
 
-1. **Hoist warmup/captures** (`session_warmup_captures`) — encoder cudnn + common CUDA-graph buckets run after model load (cold_start), not inside measured map.
-2. **Encoder-precompute dedupe** (`encoder_precompute_dedupe`) — process-wide cache keyed by `(model id, frames fingerprint, cond)`; same-model timing→map with matching windows reuses hidden states.
-3. **Timing-stride tune** (`timing_lookback` / `timing_lookahead`) — coarser timing windows (candidate: 0.3/0.3 → stride 0.4 vs default 0.1).
+1. **Hoist warmup/captures** (`session_warmup_captures`) — encoder + CUDA-graph buckets after load (cold_start).
+2. **Encoder-precompute dedupe** (`encoder_precompute_dedupe`) — process cache by `(model id, frames fingerprint, cond)`.
+3. **Timing-stride tune** (`timing_lookback=0.3`, `timing_lookahead=0.3`) — fewer timing windows.
 
-**Gate:** real full-map wall improvement; **no silent fast-path latch** (capture failure raises unless `MAPPERATORINATOR_ALLOW_CAPTURE_FALLBACK=1`; jobs force SDPA).
+**Gates:** real full-map wall improvement; **no silent fast-path latch** (capture raises unless `MAPPERATORINATOR_ALLOW_CAPTURE_FALLBACK=1`; jobs force SDPA).
 
-## Baseline (W1 A5000 tiger fp16 `50181770`)
+## Jobs (authoritative A5000 fp16)
 
-| Metric | Value |
-| --- | ---: |
-| exclude wall | **30.85 s** |
-| map tokens | **7526** |
-| **ms/map-token** | **4.10** |
-| main (map+sv) | 21.51 s / ~**349.9 TPS** |
-| timing | 4.31 s (~14%) |
-| cold_start proxy | 142.2 s |
+| Variant | Job | State | Artifact |
+| --- | --- | --- | --- |
+| baseline | **`50194534`** | COMPLETED 0:0 00:01:00 | `/work/imt11/Mapperatorinator/runs/t2-fullmap-baseline-fp16-50194534/` |
+| t2 | **`50194535`** | COMPLETED 0:0 00:01:01 | `/work/imt11/Mapperatorinator/runs/t2-fullmap-t2-fp16-50194535/` |
 
-## Candidate flags
+Infra fails (ffprobe PATH): `50194016`/`50194017`, `50194393`/`50194394` — fixed in `f171f0b3` (`PATH="$(dirname "$PYTHON"):$PATH"`). Cancelled dupes `50194407`/`50194408`.
 
-```
-session_warmup_captures=true
-encoder_precompute_dedupe=true
-timing_lookback=0.3
-timing_lookahead=0.3
-fast_decoder_loop=true
-attn_implementation=sdpa
-```
+## Results (like-with-like @ `f171f0b3`, A5000, SALVALAI)
 
-## Jobs
+| Variant | ms/map-token | exclude wall (s) | main_tps | cold_start (s) | map_tok | timing |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| **baseline** (T2 flags off) | **3.741** | 28.15 | **344.7** | 21.40 | 7526 | 3.76 s / 821 tok / 87 win |
+| **t2** (all three on) | **3.296** | 26.87 | **356.7** | 24.00 | 8151 | 2.38 s / 777 tok / **23** win |
+| Δ vs baseline | **−11.9%** | **−4.6%** | +3.5% | +2.60 (warmup) | +625 | stride engaged |
+| W1 ref `50181770` | **4.10** | 30.85 | ~349.9 | 142.2 | 7526 | — |
 
-| Variant | Job | Artifact |
-| --- | --- | --- |
-| baseline | *(fill)* | `/work/imt11/Mapperatorinator/runs/t2-fullmap-baseline-fp16-<job>/` |
-| t2 | *(fill)* | `/work/imt11/Mapperatorinator/runs/t2-fullmap-t2-fp16-<job>/` |
+Stdout evidence (t2): session warmup on map+timing models; `Timing-stride tune: … 23 timing windows (map uses 87)`. Encoder **dedupe did not hit** (separate timing vs gamemode models + different window counts).
 
-Harness: `scripts/dcc/t2_fullmap_cell.py` + `scripts/dcc/t2_fullmap_wins.sbatch`
+## Gate check
 
-## Results
+| Gate | Result |
+| --- | --- |
+| Real full-map wall improvement | **PASS** (−4.6% exclude wall) |
+| No silent fast-path latch | **PASS** (SDPA; fallback unset; both completed with graphs) |
+| −~23% package claim | **MISS** (−11.9% ms/map-token like-with-like; −19.5% vs cold W1 only) |
 
-| Variant | ms/map-token | main_tps | cold_start_s | Decision |
-| --- | ---: | ---: | ---: | --- |
-| baseline | | | | |
-| t2 | | | | |
+## Promote
 
-**Promote Y/N:** *(fill after harvest)*
+**Y (partial).** Land opt-in T2 flags on tiger-base mirror; do **not** advertise −23% sealed.
+
+- **Ship:** `session_warmup_captures` (cold_start tax ~+2.6 s; measured wall win).
+- **Ship opt-in with T5 follow-up:** `timing_lookback/lookahead` — changes timing → map token count (7526→8151); needs quality/token-match gate before default-on.
+- **Keep:** `encoder_precompute_dedupe` for same-model same-stride; no win on W1-style dual-model path.
 
 ## Do-not
 
 - Push to Tiger14n / PR #120  
 - Wire turbo / T4  
 - Modify tip `55949274`  
-- Claim 500 / merge to main  
+- Claim 500 / merge to main / claim −23% sealed  
 - Silent capture latch  
-- Exceed ≤2 concurrent GPU (Ada W1 cells are PD only)
 
 ## Ruling
 
-T2 is the fastest path to user-felt full-map wins on tiger-base. Promote only on measured ms/map-token improvement vs like-with-like baseline on A5000; report main_tps + cold_start alongside.
+T2 delivers real full-map wall + ms/map-token gains on A5000 without silent latch. Package −23% not sealed; next = tighten timing-stride under T5, then T3 compile-then-capture.
