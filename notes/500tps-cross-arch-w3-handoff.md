@@ -1,23 +1,21 @@
 # W3 — Tiger Batched Encoder Prefill (Handoff)
 
-**Status:** **SCAFFOLD READY** — CPU unit/smoke green; **GPU reciprocal DEFERRED** until W1 harvest seals  
+**Status:** **GPU RECIPROCAL SUBMITTED / HARVEST PENDING** — scout path wired; FP16 2080 Ti B/C/C/B vs tip optimized  
 **Branch:** `codex/w3-batched-encoder-prefill`  
 **Base tip:** `55949274` / FP16 **366.11** — **no merge to main**; **no 500 claim**  
 **Package:** `notes/500tps-cross-arch-package.md` · W1: `notes/500tps-cross-arch-w1-handoff.md`
 
-## Why W3 (provisional)
+## Why W3 (provisional; Ada still pending ~Jul 19–20)
 
-A5000 W1 lean: Tiger compiled-decode fp16 recon **~350 ≥** optimized **~316**. Package prefers **W3** (Tiger 16-wide window encoder prefill) over **W2** (bf16) **if Ada confirms** tiger ≥ optimized. Firm call still waits on W1a/W1b harvest.
+A5000 W1 lean: Tiger compiled-decode fp16 recon **~350 ≥** optimized **~316**. Package prefers **W3** over **W2**. 2080: opt **267** > tiger **229** (specialist). Tip sanity: W1 cell opt fp16 **267 ≠ 366** — **do not demote tip**; measure W3 vs tip auth carefully (song wall + main TPS) and vs same-job tip optimized baseline.
 
-Prior related STOP: encoder precompute `49903861` **STOP_ENCODER_PRECOMPUTE** (B1 complete-request wall regress). W3 revisits with **B16**, CPU store, and decode-skip credited to complete wall — not a B1-only encoder microbench.
+Prior related STOP: encoder precompute `49903861` **STOP_ENCODER_PRECOMPUTE** (B1 complete-request wall regress). W3 revisits with **B16**, CPU store, and decode-skip credited to complete wall.
 
 ## Tiger source (PR #120)
 
-Upstream / local WT `w1-tiger14n-compiled-decode`:
-
-- `server.precompute_encoder_outputs` — chunked encoder over all windows (`batch_size=16` default via `max_batch_size`)
-- Processor path hoists precompute before sequential window decode; each window passes `encoder_outputs=enc_hidden[wi:wi+1]`
-- Store on **CPU**; quality-equivalent / **not bit-identical** to one-window-at-a-time (batched kernel drift)
+- `server.precompute_encoder_outputs` — chunked encoder over all windows (`batch_size=16`)
+- Processor path hoists precompute before sequential window decode
+- Store on **CPU**; quality-equivalent / **not bit-identical** (batched kernel drift)
 - Opt-in; V32 path unchanged when disabled
 
 ## Our port (ownership)
@@ -25,8 +23,11 @@ Upstream / local WT `w1-tiger14n-compiled-decode`:
 | Piece | Path | Role |
 | --- | --- | --- |
 | Core scout | `osuT5/.../optimized/scout/batched_encoder_prefill.py` | B16 precompute + opt-in Processor hooks |
+| Lazy scout export | `osuT5/.../optimized/scout/__init__.py` | `__getattr__` only — no cold eager import |
+| Reciprocal runner | `utils/run_batched_encoder_prefill_candidate.py` | baseline cold / candidate install |
+| DCC wrapper | `scripts/dcc/profile_batched_encoder_prefill_reciprocal.sbatch` | FP16 2080 Ti B/C/C/B + gates |
 | Unit/smoke | `tests/test_batched_encoder_prefill_scaffold.py` | CPU-only; mock encoder B1≡B16 |
-| Ceiling harness (existing) | `utils/profile_batched_encoder_precompute_ceiling.py` | Verifier-only B1..B16 timings |
+| Ceiling harness | `utils/profile_batched_encoder_precompute_ceiling.py` | Verifier-only B1..B16 timings |
 
 **Not wired into** accepted `OptimizedSingleRuntime` / selectors / server. Install only via:
 
@@ -41,57 +42,48 @@ with install_batched_encoder_prefill_candidate(Processor, batch_size=16, storage
 
 Defaults: `batch_size=16`, `storage="cpu"`, precisions `{fp16, fp32}`, `result_class=documented-drift`.
 
-## Implemented vs TODO
-
-### Implemented (this scaffold)
-
-- Tiger-aligned `chunk_ranges` / B16 precompute loop via `model.get_encoder()`
-- CPU store default + per-window H2D at inject (VRAM-safe)
-- Opt-in `install_batched_encoder_prefill_candidate` (no cold-default import)
-- Timing→main store reuse; conditioning / source-window identity checks
-- Profiler metadata key `optimized_batched_encoder_prefill`
-- CPU unit + mock-encoder smoke (no full song, no GPU)
-
-### TODO (after W1 seals — do not fire GPU yet)
-
-1. **Firm W3 go/no-go** from sealed W1 matrix (2080 Ti + Ada + A5000).
-2. **DCC reciprocal** vs tip `55949274` / 366.11 on same song / seed policy:
-   - baseline: optimized tip sequential encoder-in-loop
-   - candidate: tip + `install_batched_encoder_prefill_candidate(..., batch_size=16)`
-3. Exactness / drift report (greedy tokens + `.osu` bytes policy for documented-drift).
-4. Complete-request wall gate (≥5% realistic headroom; JIT excluded from TPS claim).
-5. Optional production wiring under `optimized/single/` **only after** gates pass — still no V32 / server change.
-6. Decide whether turbo stack wants encoder prefill under the same request wall (see below).
-
 ## Gates (promotion)
-
-Compare **like with like** on tip hardware (prefer 2080 Ti for tip-class TPS; A5000/Ada for cross-arch).
 
 | Gate | Pass rule |
 | --- | --- |
-| **Ownership** | Changes only under `inference/optimized/`; V32 cold path / tip bytes unchanged when candidate off |
-| **Exactness** | Documented-drift preset: greedy token IDs / `.osu` within declared policy vs tip optimized; do **not** require bit-identical encoder hidden states |
-| **Wall** | Candidate complete-request wall (first-main-to-last-main + request-to-output) improves ≥**5%** vs tip optimized; precompute time charged to request; no projection-as-production |
-| **TPS** | Main-gen model TPS must not regress ≥1% vs tip **366.11** class on same GPU/precision (encoder skip should be ~neutral-to-positive on model TPS; wall is the primary W3 claim) |
+| **Ownership** | Changes only under `inference/optimized/` (+ scout runner/sbatch); V32 cold / tip bytes unchanged when candidate off |
+| **Exactness** | Documented-drift: default require greedy token streams + `.osu` equal vs same-job tip optimized; do **not** require bit-identical encoder hiddens |
+| **Wall** | Candidate complete-request wall improves ≥**5%** vs same-job tip optimized; precompute charged to request |
+| **TPS** | Main-gen model TPS must not regress ≥1% vs **same-job baseline**; also report vs tip auth **366.11** (do not demote tip on SANITY_GAP) |
 | **Memory** | Peak VRAM with CPU store ≤ tip + small H2D scratch; fail loudly on OOM |
-| **Stop** | First exactness / negative-wall / ownership / insufficient-gain failure → remove wiring, keep scout + verifiers |
+| **Stop** | First exactness / negative-wall / ownership / insufficient-gain failure → no production wiring |
 
-Do **not** treat PR #120 marketing tok/s or isolated encoder ceiling rows as production throughput.
+## DCC reciprocal
 
-## Stacking with turbo endgame
+```bash
+# on DCC, after push + worktree sync
+export MAPPERATORINATOR_REPO=/hpc/group/romerolab/imt11/projects/Mapperatorinator-worktrees/w3-batched-encoder-prefill
+# (actual path set at submit time)
+export MAPPERATORINATOR_COMMIT=<pushed HEAD>
+export MAPPERATORINATOR_BRANCH=codex/w3-batched-encoder-prefill
+export MAPPERATORINATOR_REMOTE_REF=refs/remotes/origin/codex/w3-batched-encoder-prefill
+export MAPPERATORINATOR_PRECISION=fp16
+export MAPPERATORINATOR_ALLOW_PARALLEL_RECIPROCAL=1   # Ada W1 + §57b may be pending
+sbatch scripts/dcc/profile_batched_encoder_prefill_reciprocal.sbatch
+```
 
-Turbo (`notes/500tps-turbo-endgame-package.md`, remapped §§53–57) is **decode-bound** (E binding on map_rest / lookback). W3 is **encoder / complete-wall**.
+Unique per-job `TMPDIR` / `TORCH_EXTENSIONS_DIR`. Harvest: `$WORK/runs/w3-b16-encoder-prefill-fp16-<job>/gate.json`.
 
-| Interaction | Guidance |
+## Jobs / harvest
+
+| Field | Value |
 | --- | --- |
-| Independent | W3 does not fix §56 E; turbo does not replace W3 encoder hoist |
-| Compose later | Only after each track seals its own gate; measure stacked complete wall + main TPS + E separately |
-| Claim hygiene | Never fold W3 wall savings into a turbo TPS projection, or turbo E into a W3 wall claim |
-| Capacity | One GPU experiment at a time per worker; ≤2 concurrent if idle; W1 harvest + §57 take priority over W3 reciprocal |
+| Job | _(fill on submit)_ |
+| Decision | _(PROMOTE_SCOUT / STOP)_ |
+| Wall Δ | _(fill)_ |
+| Main TPS Δ vs baseline / tip auth | _(fill)_ |
 
-## Ready-for-GPU?
+## Next after harvest
 
-**N** — scaffold + CPU tests only. Fire GPU reciprocal **after** W1 harvest seals (next productive wake ≥ **2026-07-18 10:28 EDT** for 2080 Ti; Ada later) and coordinator confirms W3 over W2.
+1. If **STOP** (wall &lt;5% or drift): keep scout+runner; no `optimized/single/` wiring; record revisit condition.
+2. If **PROMOTE_SCOUT**: optional production wiring under `optimized/single/` still needs a separate gate pass — still no V32/server/merge.
+3. Ada firm-up can wait (~Jul 19–20); do not block W3 harvest on Ada.
+4. Do not stack with turbo until each track seals independently.
 
 ## Smoke (CPU)
 
@@ -102,4 +94,4 @@ python -m pytest tests/test_batched_encoder_prefill_scaffold.py -q
 
 ## One-line summary
 
-W3 scaffold ports Tiger PR #120 16-wide encoder prefill under `optimized/scout/` as opt-in documented-drift (CPU store, fp16/fp32); tip `55949274` untouched; GPU reciprocal deferred until W1 seals Ada/2080 lean.
+W3 B16 encoder prefill is an opt-in optimized scout (CPU store, documented-drift) with a DCC FP16 reciprocal harness vs tip `55949274`/366.11; no merge, no 500 claim; Ada firm-up deferred.

@@ -294,3 +294,20 @@ def test_assert_processor_accepts_fp16_tip_precision():
 def test_store_rejects_invalid_batch_sizes(batch_size):
     with pytest.raises((TypeError, ValueError)):
         BatchedEncoderPrefillStore(batch_size=batch_size)
+
+
+def test_scout_package_lazy_exports_w3_symbols():
+    import importlib
+
+    import osuT5.osuT5.inference.optimized.scout as scout
+
+    # Reload retains prior submodule bindings; drop W3 so we assert true laziness
+    # (importlib.reload does not clear names absent from the new __init__ body).
+    scout = importlib.reload(scout)
+    scout.__dict__.pop("batched_encoder_prefill", None)
+    assert "batched_encoder_prefill" not in scout.__dict__
+    assert callable(scout.__getattr__)
+    assert scout.DEFAULT_ENCODER_BATCH_SIZE == 16
+    assert scout.PREFILL_VERSION.startswith("w3-")
+    assert callable(scout.install_batched_encoder_prefill_candidate)
+    assert "batched_encoder_prefill" in scout.__dict__
