@@ -1,7 +1,7 @@
 # §59 T1 SAFETY RAILS — handoff
 
 **Status:** **WIRED** (2026-07-18)  
-**Branch / WT:** `codex/turbo-on-tiger-pr120` @ **`26e465b3`** (`26e465b3638674bc2dbadd6fbb364b7c97ae7c59`)  
+**Branch / WT:** `codex/turbo-on-tiger-pr120` @ **`f6ec6f1b`** (rails `26e465b3`)  
 **Local WT:** `/work/projects/Mapperatorinator-worktrees/turbo-on-tiger-pr120`  
 **DCC WT:** `/hpc/group/romerolab/imt11/projects/Mapperatorinator-worktrees/turbo-on-tiger-pr120`  
 **Base:** tiger PR #120 `d01cdd27` (local turbo scaffold on top)  
@@ -34,8 +34,8 @@ FA2 `kv[:, :cache_position[-1]+1]` dynamic slice (modeling_varwhisper) is why th
 | Job | `jobs/s59-t1-safety-rails.sbatch` → **`50194265`** (PD) |
 | Asserts | require_sdpa / CFG mask+cumsum / eviction@1MiB / loud latch / force-SDPA |
 | Env | `unset MAPPERATORINATOR_ALLOW_CAPTURE_FALLBACK` |
-| DCC sync | `f45c25a4` ff-only |
-| Decision | pending harvest |
+| DCC sync | `f6ec6f1b` ff-only |
+| Decision | pending harvest (`50194265`) |
 
 ## Do not
 
