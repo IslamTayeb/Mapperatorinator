@@ -174,8 +174,18 @@ def main() -> None:
     parser.add_argument("--run-root", required=True, type=Path)
     parser.add_argument("--precision", default="fp16", choices=("fp16", "fp32", "bf16"))
     parser.add_argument("--seed", type=int, default=12345)
-    parser.add_argument("--variant", required=True, choices=("baseline", "t2"))
+    parser.add_argument(
+        "--variant",
+        required=True,
+        choices=("baseline", "t2", "t2_warmup"),
+        help="baseline=T2 off; t2=all three levers; t2_warmup=session_warmup_captures only",
+    )
     parser.add_argument("--expected-gpu-substr", default="")
+    parser.add_argument(
+        "--greedy",
+        action="store_true",
+        help="do_sample=false for T5 greedy seal (still reports ms/map-token)",
+    )
     args = parser.parse_args()
 
     run_root: Path = args.run_root
@@ -226,12 +236,25 @@ def main() -> None:
         "descriptors=[skillset/streams,streams/flow aim,streams/spaced streams,streams/bursts]",
         "generate_positions=false",
         "export_osz=false",
-        "temperature=0.9",
-        "top_p=0.9",
         "fast_decoder_loop=true",
         "super_timing_fast_loop=true",
         "output_type=[TIMING,MAP,SV]",
     ]
+    if args.greedy:
+        overrides.extend(
+            [
+                "do_sample=false",
+                "temperature=1.0",
+                "top_p=1.0",
+            ]
+        )
+    else:
+        overrides.extend(
+            [
+                "temperature=0.9",
+                "top_p=0.9",
+            ]
+        )
     if args.variant == "t2":
         overrides.extend(
             [
@@ -242,6 +265,9 @@ def main() -> None:
                 "timing_lookahead=0.3",
             ]
         )
+    elif args.variant == "t2_warmup":
+        # Isolated clean-promote lever — no timing-stride, no dedupe.
+        overrides.append("session_warmup_captures=true")
 
     cmd = [
         str(args.python),
@@ -285,6 +311,12 @@ def main() -> None:
         "variant": args.variant,
         "precision": args.precision,
         "seed": args.seed,
+        "greedy": bool(args.greedy),
+        "t2_levers": (
+            ["session_warmup_captures", "encoder_precompute_dedupe", "timing_stride"]
+            if args.variant == "t2"
+            else (["session_warmup_captures"] if args.variant == "t2_warmup" else [])
+        ),
         "repo": str(args.repo),
         "repo_commit": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=str(args.repo), text=True
@@ -300,6 +332,7 @@ def main() -> None:
         "process_wall_seconds": process_wall,
         "calls": stats.get("calls"),
         "tiger_stats_path": str(stats_path),
+        "output_path": str(output),
     }
     _write_json(run_root / "summary.json", summary)
     print(
