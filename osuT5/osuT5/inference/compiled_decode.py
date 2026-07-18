@@ -24,26 +24,17 @@ T1 safety rails (§59):
   - CFG left-pad prompt masks are preserved into decode (stock HF extends the 2D
     pad mask; the prior graph path passed mask=None and attended pad K/V).
 
-T3 compile-then-capture (pivot package):
-  - Harvest 1–3: full-step Inductor of shape-static ``forward_only`` before
-    CUDAGraph capture got +23–29% A5000 main_tps but **greedy FAIL** (fp16
-    near-tie flips). That path is sealed STOP — do not bare-retry.
-  - Harvest 4+: compile **owned tip Linear / post-attn FFN / ``proj_out``**
-    modules only, then capture still-eager outer ``forward_only``
-    (``fullgraph=True``, ``dynamic=False``, mode ``default``). Attention /
-    SDPA / StaticCache stay eager. Override mode via
-    ``MAPPERATORINATOR_COMPILE_MODE`` (never ``reduce-overhead`` near manual
-    capture — §22 Inductor-in-capture).
-  - Sub-op select: ``MAPPERATORINATOR_COMPILE_SUBOPS`` (default
-    ``proj_out,ffn``). ``MAPPERATORINATOR_COMPILE_FULL_STEP=1`` is refused
-    for the package gate (loud error).
+T3 compile-then-capture (pivot package; exactness RELAXED 2026-07-18):
+  - Promote candidate: full decode-step Inductor of shape-static
+    ``forward_only`` **before** CUDAGraph capture (``fullgraph=True``,
+    ``dynamic=False``, ``mode=default``). Eager sampling ``_tail``.
+  - Exactness bar: coherent / mostly-good maps + T5 KS — NOT bit-identical
+    greedy ``.osu``. Inductor fp16 near-tie flips are documented T3 drift.
+  - Never ``reduce-overhead`` near manual capture (§22 Inductor-in-capture).
   - Warm every bucket (incl. any future turbo ``q_len``) before its capture.
-  - Shape-static per-token sampling tail (monotonic hoist + temperature) stays
-    **eager**: Inductor-compiling ``_tail`` specialized on warm ``(B,V)``
-    strides, then hit production B=1 views (``.contiguous()`` no-op) →
-    Dynamo ``recompile_limit`` thrash (−46% A5000) + greedy drift. Do not
-    reintroduce compiled ``_tail`` without a fixed-stride staging buffer
-    *outside* Dynamo guards.
+  - Do not reintroduce compiled ``_tail`` without fixed-stride staging
+    (harvest-1 stride thrash −46% A5000). Harvest-4 owned sub-ops are
+    STOPPED / not the package default.
   - Opt-in via ``MAPPERATORINATOR_COMPILE_DECODE=1`` (default off so tiger
     plain-graph behavior is unchanged unless T3 jobs enable it).
 """
@@ -97,245 +88,8 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 
 def compile_decode_enabled() -> bool:
-    """T3 opt-in: owned sub-op compile-then-capture (sampling tail stays eager)."""
+    """T3 opt-in: compile-then-capture decode step (sampling tail stays eager)."""
     return _env_flag("MAPPERATORINATOR_COMPILE_DECODE", default=False)
-
-
-def compile_full_step_requested() -> bool:
-    """Harvest 1–3 full-step Inductor — sealed STOP; refuse for package gate."""
-    return _env_flag("MAPPERATORINATOR_COMPILE_FULL_STEP", default=False)
-
-
-def _parse_compile_subops() -> frozenset[str]:
-    """Owned regions to Inductor-compile before outer CUDAGraph capture.
-
-    Tokens (comma-separated via ``MAPPERATORINATOR_COMPILE_SUBOPS``):
-      proj_out / logits — LM-head ``nn.Linear``
-      ffn / post_attn   — decoder-layer ``fc1`` + ``fc2`` (post-attn FFN)
-      linear            — alias for ``proj_out,ffn``
-
-    Default when unset: ``proj_out,ffn`` (smallest tip-owned Linear set that
-    still has a plausible +≥10% launch-bound shot on A5000).
-    """
-    raw = (os.environ.get("MAPPERATORINATOR_COMPILE_SUBOPS") or "proj_out,ffn").strip()
-    if not raw:
-        raw = "proj_out,ffn"
-    out: set[str] = set()
-    for tok in raw.split(","):
-        t = tok.strip().lower()
-        if not t:
-            continue
-        if t in ("proj_out", "logits"):
-            out.add("proj_out")
-        elif t in ("ffn", "post_attn"):
-            out.add("ffn")
-        elif t == "linear":
-            out.update(("proj_out", "ffn"))
-        else:
-            raise ValueError(
-                f"Unknown MAPPERATORINATOR_COMPILE_SUBOPS token {tok!r}; "
-                "expected proj_out|logits|ffn|post_attn|linear"
-            )
-    if not out:
-        raise ValueError("MAPPERATORINATOR_COMPILE_SUBOPS resolved to empty set")
-    return frozenset(out)
-
-
-def _compile_module(mod: torch.nn.Module, *, label: str):
-    """torch.compile an nn.Module with T3 knobs; regional fallback on failure."""
-    _pin_inductor_cache_dir()
-    _pin_compile_numerics()
-    mode = _compile_mode()
-    try:
-        import torch._dynamo.config as dynamo_config
-
-        need = 64
-        dynamo_config.cache_size_limit = max(int(dynamo_config.cache_size_limit), need)
-        if hasattr(dynamo_config, "recompile_limit"):
-            dynamo_config.recompile_limit = max(int(dynamo_config.recompile_limit), need)
-    except Exception:
-        pass
-    try:
-        compiled = torch.compile(mod, fullgraph=True, dynamic=False, mode=mode)
-        return compiled, {"mode": mode, "fullgraph": True, "fallback": None, "label": label}
-    except Exception as e:
-        warnings.warn(
-            f"T3 torch.compile({label}) fullgraph/{mode} failed ({e!r}); "
-            "trying regional/default fallback (still no reduce-overhead).",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-    try:
-        compiled = torch.compile(mod, fullgraph=False, dynamic=False, mode="default")
-        return compiled, {
-            "mode": "default",
-            "fullgraph": False,
-            "fallback": "regional_or_default",
-            "label": label,
-        }
-    except Exception as e:
-        warnings.warn(
-            f"T3 torch.compile({label}) fallback also failed ({e!r}); using eager.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        return mod, {
-            "mode": "eager",
-            "fullgraph": False,
-            "fallback": "eager",
-            "label": label,
-        }
-
-
-def _backbone(model):
-    """Mapperatorinator wraps the HF backbone as ``.transformer``; else ``model``."""
-    return getattr(model, "transformer", None) or model
-
-
-def _decoder_layers(model) -> list:
-    """Best-effort locator for RoPE/Var/NWhisper (and Mapperatorinator) decoder layers."""
-    roots = [model, _backbone(model)]
-    paths = (
-        ("model", "decoder", "layers"),
-        ("model", "model", "decoder", "layers"),
-        ("decoder", "layers"),
-    )
-    for root in roots:
-        if root is None:
-            continue
-        # Prefer get_decoder() when present (Mapperatorinator / HF).
-        getter = getattr(root, "get_decoder", None)
-        if callable(getter):
-            try:
-                dec = getter()
-                layers = getattr(dec, "layers", None)
-                if layers is not None:
-                    return list(layers)
-            except Exception:
-                pass
-        for path in paths:
-            cur = root
-            ok = True
-            for attr in path:
-                if not hasattr(cur, attr):
-                    ok = False
-                    break
-                cur = getattr(cur, attr)
-            if ok and cur is not None:
-                try:
-                    return list(cur)
-                except TypeError:
-                    continue
-    return []
-
-
-def _resolve_proj_out(model):
-    """Return ``(owner, attr_name, module)`` for the LM head used in decode.
-
-    Mapperatorinator has no top-level ``proj_out`` — logits come from
-    ``model.transformer.proj_out``. Refuse silent miss (prior §15–21).
-    """
-    candidates = []
-    for owner in (model, _backbone(model)):
-        if owner is None:
-            continue
-        if hasattr(owner, "proj_out"):
-            candidates.append((owner, "proj_out", getattr(owner, "proj_out")))
-        getter = getattr(owner, "get_output_embeddings", None)
-        if callable(getter):
-            try:
-                emb = getter()
-            except Exception:
-                emb = None
-            if emb is not None:
-                # Prefer setting via set_output_embeddings when available.
-                candidates.append((owner, "__output_embeddings__", emb))
-    for owner, attr, mod in candidates:
-        if mod is None:
-            continue
-        weight = getattr(mod, "weight", None)
-        if isinstance(weight, torch.Tensor) and weight.ndim == 2:
-            return owner, attr, mod
-    return None, None, None
-
-
-def install_compiled_subops(model) -> dict:
-    """Inductor-compile owned tip modules in-place; idempotent per model.
-
-    Leaves attention / SDPA / cache eager. Outer decode step stays eager and is
-    CUDAGraph-captured after these modules are warm.
-    """
-    if compile_full_step_requested():
-        raise RuntimeError(
-            "MAPPERATORINATOR_COMPILE_FULL_STEP=1 is sealed STOP (harvest 1–3 "
-            "greedy FAIL). Use owned sub-ops via MAPPERATORINATOR_COMPILE_SUBOPS "
-            "(default proj_out,ffn) or document greedy drift outside the package gate."
-        )
-    existing = getattr(model, "_t3_subops_meta", None)
-    if existing is not None and getattr(model, "_t3_subops_installed", False):
-        return dict(existing)
-
-    subops = _parse_compile_subops()
-    metas: list[dict] = []
-    installed: list[str] = []
-
-    if "proj_out" in subops:
-        owner, attr, proj = _resolve_proj_out(model)
-        if proj is None:
-            raise RuntimeError(
-                "T3 sub-op compile requested proj_out but no rank-2 LM head was "
-                "found on model or model.transformer (timing/alternate head?). "
-                "Refuse silent skip."
-            )
-        compiled, meta = _compile_module(proj, label="proj_out")
-        if attr == "__output_embeddings__":
-            setter = getattr(owner, "set_output_embeddings", None)
-            if not callable(setter):
-                raise RuntimeError(
-                    "T3 sub-op compile: get_output_embeddings found proj_out but "
-                    "owner has no set_output_embeddings to install the compiled module."
-                )
-            setter(compiled)
-        else:
-            setattr(owner, attr, compiled)
-        metas.append(meta)
-        installed.append("proj_out")
-
-    if "ffn" in subops:
-        layers = _decoder_layers(model)
-        if not layers:
-            raise RuntimeError(
-                "T3 sub-op compile requested ffn/post_attn but no decoder layers "
-                "were found on the model (tried transformer/get_decoder paths)."
-            )
-        for i, layer in enumerate(layers):
-            for name in ("fc1", "fc2"):
-                mod = getattr(layer, name, None)
-                if mod is None:
-                    raise RuntimeError(
-                        f"T3 sub-op compile: decoder layer {i} missing {name}"
-                    )
-                compiled, meta = _compile_module(mod, label=f"decoder{i}.{name}")
-                setattr(layer, name, compiled)
-                metas.append(meta)
-                installed.append(f"decoder{i}.{name}")
-
-    if not installed:
-        raise RuntimeError(
-            f"T3 sub-op compile installed zero modules for subops={sorted(subops)}"
-        )
-
-    meta = {
-        "kind": "owned_subops",
-        "subops": sorted(subops),
-        "installed": installed,
-        "n_installed": len(installed),
-        "modules": metas,
-        "mode": _compile_mode(),
-    }
-    model._t3_subops_meta = meta
-    model._t3_subops_installed = True
-    return meta
 
 
 def _pin_inductor_cache_dir() -> str | None:
@@ -682,10 +436,9 @@ class CUDAGraphDecoder:
     def capture(self, cache, *, pad_aware: bool = False, cache_len: int | None = None):
         """Warmup + capture the decode forward into a CUDA graph.
 
-        T3: when ``MAPPERATORINATOR_COMPILE_DECODE=1``, Inductor-compile owned
-        tip modules (``proj_out`` / decoder FFN linears) **before** capture,
-        warm them outside the graph, then capture the still-eager outer step.
-        Never ``reduce-overhead``. Never full-step Inductor (harvest 1–3 STOP).
+        T3: when ``MAPPERATORINATOR_COMPILE_DECODE=1``, Inductor-compile the
+        shape-static step **before** capture (warm outside the graph), then
+        capture the already-compiled kernels. Never ``reduce-overhead``.
 
         ``pad_aware=True`` keeps a full-length 2D decoder attention mask in the
         graph so left-pad (CFG) slots stay masked every replay. The 2D mask is
@@ -748,37 +501,29 @@ class CUDAGraphDecoder:
 
         step_fn = forward_only
         if compile_decode_enabled():
-            # Harvest 4: owned sub-ops only — never Inductor the outer step.
+            # §22: Inductor must finish compiling/warming OUTSIDE capture.
+            compiled, meta = _compile_callable(forward_only, label=f"decode_q{self.q_len}")
+            self._compiled_step = compiled
+            self._compile_meta = meta
             try:
-                meta = install_compiled_subops(model)
-                self._compile_meta = meta
-                self._compiled_step = None  # outer step stays eager
-            except Exception as e:
-                raise RuntimeError(
-                    f"T3 owned sub-op compile install failed ({e!r})"
-                ) from e
-            try:
-                # §22: Inductor must finish compiling/warming OUTSIDE capture.
                 s2 = torch.cuda.Stream()
                 s2.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(s2):
                     for _ in range(_COMPILE_WARMUP_ITERS):
-                        forward_only()
+                        compiled()
                 torch.cuda.current_stream().wait_stream(s2)
                 torch.cuda.synchronize()
-                step_fn = forward_only
+                step_fn = compiled
             except Exception as e:
-                # Inductor often fails on first invoke (NFS tempfile / graph break).
-                # Outer step stays eager; compiled modules may remain installed.
+                # Inductor often fails on first invoke (NFS tempfile / graph break),
+                # not at torch.compile() construction — fall back to eager capture.
                 warnings.warn(
-                    f"T3 compiled sub-op warmup failed ({e!r}); capturing outer "
-                    "eager step (compiled modules may remain installed).",
+                    f"T3 compiled decode warmup failed ({e!r}); capturing eager step.",
                     RuntimeWarning,
                     stacklevel=2,
                 )
                 self._compiled_step = None
                 self._compile_meta = {
-                    "kind": "owned_subops",
                     "mode": "eager",
                     "fullgraph": False,
                     "fallback": "warmup_failed",
@@ -1056,7 +801,6 @@ def warm_all_decode_buckets(
     return {
         "warmed": warmed,
         "compile_decode": compile_decode_enabled(),
-        "compile_subops": sorted(_parse_compile_subops()) if compile_decode_enabled() else None,
         "elapsed_s": time.perf_counter() - t0,
         "inductor_cache_dir": os.environ.get("TORCHINDUCTOR_CACHE_DIR"),
         "cache_stats": {"q1": _cache_stats("q1"), "k": _cache_stats("k")},

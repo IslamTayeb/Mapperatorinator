@@ -1,0 +1,66 @@
+# T5 quality gates defaults (PIVOT EXECUTION PACKAGE).
+# Authoritative acceptance: docs/inference_evidence_packs.md (§34). No relaxed thresholds.
+
+section: T5
+pack_name: t5-quality-gates
+campaign_tip_frozen: "55949274"
+
+engines:
+  # Generic labels — scouts override per track (optimized/turbo, uncompiled/compiled, …)
+  baseline: baseline
+  candidate: candidate
+
+ks:
+  alpha: 0.01
+  density_bin_ms: 1000
+  metrics:
+    - ho_count
+    - density
+    - ho_type
+    - timeshift
+    - slider_length
+
+greedy:
+  baseline_hint: "uncompiled tiger fast path OR tip 55949274 reference dump"
+  candidate_hint: "candidate scout dump (T3=compiled; T2=tiger+t2 flags; turbo=parked)"
+
+# T2 lever matrix (jobs 50194534/50194535). timing_stride is OPT-IN until T5 seals KS.
+t2_levers:
+  session_warmup_captures:
+    expect_greedy_match: true
+    promote: clean
+    note: "Warmup-hoist alone = preferred clean promote path."
+  encoder_precompute_dedupe:
+    expect_greedy_match: true
+    promote: clean_if_hit
+  timing_stride:
+    expect_greedy_match: false
+    promote: opt_in_until_t5
+    evidence:
+      baseline_map_tok: 7526
+      candidate_map_tok: 8151
+      jobs: ["50194534", "50194535"]
+    note: >
+      Timing-stride drifts map tokens (7526→8151). Keep opt-in; require T5
+      greedy (document intentional mismatch) + KS PASS before default-on.
+
+# Optional GPU seal — only when sealing a canary. Default harness is CPU.
+canary:
+  command: null
+
+songs:
+  - song_id: salvalai
+    audio_path: /work/imt11/Mapperatorinator/data/five-song-profile/salvalai.mp3
+  - song_id: ela-ke-leitada
+    audio_path: /work/imt11/Mapperatorinator/data/five-song-profile/ela-ke-leitada.mp3
+  - song_id: pegasus
+    audio_path: /work/imt11/Mapperatorinator/data/five-song-profile/pegasus.mp3
+
+songs_flat_data_root: /work/imt11/Mapperatorinator/data
+
+drift_line: >-
+  T5 gates are mandatory on every T1/T2/T3 scout summary (t5_quality_gates block).
+  Greedy token-match where defined; KS/metric parity for sampled paths per TIER1(c).
+  T2 timing_stride is opt-in until KS seals known map_tok drift; warmup-hoist is
+  the clean promote path. Never fold relaxed acceptance into turbo (§34).
+  Tip 55949274 frozen. T4 PARKED.

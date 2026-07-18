@@ -28,7 +28,7 @@ def _run_variant(repo: Path, python: Path, audio: Path, run_root: Path, variant:
     if variant == "compile":
         env["MAPPERATORINATOR_COMPILE_DECODE"] = "1"
         env["MAPPERATORINATOR_WARM_ALL_BUCKETS"] = "1"
-        env.setdefault("MAPPERATORINATOR_COMPILE_SUBOPS", "proj_out,ffn")
+        env.pop("MAPPERATORINATOR_COMPILE_SUBOPS", None)
         env.pop("MAPPERATORINATOR_COMPILE_FULL_STEP", None)
     else:
         env.pop("MAPPERATORINATOR_COMPILE_DECODE", None)
@@ -98,7 +98,6 @@ def main() -> None:
         "n_osu_compile": len(cand_osu),
         "baseline_bytes": [len(b) for b in base_osu],
         "compile_bytes": [len(b) for b in cand_osu],
-        "compile_subops": os.environ.get("MAPPERATORINATOR_COMPILE_SUBOPS", "proj_out,ffn"),
         "elapsed_s": time.perf_counter() - t0,
         "repo_commit": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=str(args.repo), text=True
