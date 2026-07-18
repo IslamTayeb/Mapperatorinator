@@ -1,0 +1,38 @@
+{
+  "section": 58,
+  "track": "turbo-on-tiger",
+  "job_id": "50192694",
+  "commit": "3641f39ed47e620a791ae519e1b4c39b40e46ef9",
+  "rc": 0,
+  "best_k": 3,
+  "best_ratio": 0.8464114782681254,
+  "q1_ms": 3.9837040066719056,
+  "verify": [
+    {
+      "k": 3,
+      "c_verify_ms": 3.3718527972698213,
+      "path": "tiger_cuda_graph_qk",
+      "cache_len": 768,
+      "prefix_len": 256,
+      "c_verify_ratio_vs_q1": 0.8464114782681254,
+      "gate_expect_lo": 1.1,
+      "gate_expect_hi": 1.3,
+      "in_expect_band": false
+    },
+    {
+      "k": 5,
+      "c_verify_ms": 3.3858487963676454,
+      "path": "tiger_cuda_graph_qk",
+      "cache_len": 768,
+      "prefix_len": 256,
+      "c_verify_ratio_vs_q1": 0.8499247912739067,
+      "gate_expect_lo": 1.1,
+      "gate_expect_hi": 1.3,
+      "in_expect_band": false
+    }
+  ],
+  "gpu": "NVIDIA GeForce RTX 2080 Ti",
+  "gate": "c_verify/q1 expect ~1.1\u20131.3\u00d7",
+  "campaign_tip_frozen": "55949274",
+  "note": "First gate only. No fused verify. No 500 claim."
+}
