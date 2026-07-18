@@ -30,8 +30,12 @@ T3 compile-then-capture (pivot package):
     ``mode="max-autotune-no-cudagraphs"``). Never ``reduce-overhead`` near
     manual capture (§22 Inductor-in-capture lesson).
   - Warm every bucket (incl. any future turbo ``q_len``) before its capture.
-  - Shape-static per-token sampling tail (monotonic hoist + temperature) is
-    also compiled when enabled.
+  - Shape-static per-token sampling tail (monotonic hoist + temperature) stays
+    **eager**: Inductor-compiling ``_tail`` specialized on warm ``(B,V)``
+    strides, then hit production B=1 views (``.contiguous()`` no-op) →
+    Dynamo ``recompile_limit`` thrash (−46% A5000) + greedy drift. Do not
+    reintroduce compiled ``_tail`` without a fixed-stride staging buffer
+    *outside* Dynamo guards.
   - Opt-in via ``MAPPERATORINATOR_COMPILE_DECODE=1`` (default off so tiger
     plain-graph behavior is unchanged unless T3 jobs enable it).
 """
@@ -72,7 +76,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 
 def compile_decode_enabled() -> bool:
-    """T3 opt-in: compile-then-capture decode step + sampling tail."""
+    """T3 opt-in: compile-then-capture decode step (sampling tail stays eager)."""
     return _env_flag("MAPPERATORINATOR_COMPILE_DECODE", default=False)
 
 
@@ -105,7 +109,7 @@ def _compile_callable(fn, *, label: str):
     try:
         import torch._dynamo.config as dynamo_config
 
-        need = 64  # covers all cache buckets + sampling-tail specializations
+        need = 64  # covers all cache buckets (decode-step specializations)
         dynamo_config.cache_size_limit = max(int(dynamo_config.cache_size_limit), need)
         if hasattr(dynamo_config, "recompile_limit"):
             dynamo_config.recompile_limit = max(int(dynamo_config.recompile_limit), need)
@@ -314,8 +318,6 @@ class _IncrementalMonotonicMask:
         self.ts_vocab = torch.arange(self.ts_start, self.ts_end, device=device)
         self.last_ts_value = None  # (batch,) long
         self.active = None         # (batch,) bool
-        self._compiled_tail = None
-        self._compiled_tail_meta = None
 
     def init_from_prompt(self, input_ids):
         device = input_ids.device
@@ -343,68 +345,15 @@ class _IncrementalMonotonicMask:
         return scores
 
     def apply_with_temperature(self, scores, temperature: float):
-        """Mono mask + uniform temperature (shape-static (B, V) sampling tail)."""
-        if self._compiled_tail is not None:
-            try:
-                return self._compiled_tail(
-                    scores.contiguous(),
-                    self.ts_vocab,
-                    self.last_ts_value,
-                    self.active,
-                    self.ts_start,
-                    self.ts_end,
-                    float(temperature),
-                )
-            except Exception as e:
-                warnings.warn(
-                    f"T3 compiled sampling tail failed ({e!r}); using eager mono+temp.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-                self._compiled_tail = None
+        """Eager mono mask + uniform temperature (shape-static (B, V) sampling tail).
+
+        Intentionally not ``torch.compile``'d — see module docstring (stride
+        recompile storm on B=1 production views).
+        """
         out = self.apply(scores)
         if temperature != 1.0:
             out = out / temperature
         return out
-
-    def ensure_compiled_tail(self, *, batch_size: int, vocab_size: int):
-        """Compile shape-static mono+temperature once (T3 sampling tail)."""
-        if self._compiled_tail is not None or not compile_decode_enabled():
-            return
-        if not torch.cuda.is_available():
-            return
-
-        def _tail(scores, ts_vocab, last_ts_value, active, ts_start, ts_end, temperature):
-            thresh = (ts_start + last_ts_value).unsqueeze(1)
-            invalid = (ts_vocab.unsqueeze(0) < thresh) & active.unsqueeze(1)
-            out = scores.clone()
-            out[:, ts_start:ts_end].masked_fill_(invalid, -float("inf"))
-            if temperature != 1.0:
-                out = out / temperature
-            return out
-
-        compiled, meta = _compile_callable(_tail, label="sampling_tail")
-        # Warm outside any CUDAGraph capture at the production (B, V) shape.
-        device = self.ts_vocab.device
-        b = max(1, int(batch_size))
-        v = max(int(vocab_size), int(self.ts_end) + 1)
-        warm_scores = torch.zeros((b, v), dtype=torch.float32, device=device).contiguous()
-        last = torch.zeros((b,), dtype=torch.long, device=device)
-        active = torch.zeros((b,), dtype=torch.bool, device=device)
-        try:
-            for _ in range(_COMPILE_WARMUP_ITERS):
-                compiled(warm_scores, self.ts_vocab, last, active, self.ts_start, self.ts_end, 1.0)
-            torch.cuda.synchronize()
-            self._compiled_tail = compiled
-            self._compiled_tail_meta = meta
-        except Exception as e:
-            warnings.warn(
-                f"T3 sampling-tail warmup failed ({e!r}); leaving eager mono+temp.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            self._compiled_tail = None
-            self._compiled_tail_meta = {"fallback": "warmup_failed", "error": repr(e)}
 
     def update(self, tok):
         t = tok.reshape(-1)
@@ -993,8 +942,9 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
     # masker. Only safe without CFG (CFG merges the 2-stream logits before the
     # monotonic mask and the merged-batch state bookkeeping differs); with CFG we
     # keep the stock O(T^2) processor.
-    # T3: also hoist uniform TemperatureLogitsWarper into the compiled mono+temp
-    # sampling tail when present (v32: monotonic hoist + temperature only).
+    # T3: hoist uniform TemperatureLogitsWarper into the mono+temp sampling
+    # tail when present (v32: monotonic hoist + temperature only). Tail stays
+    # eager — Inductor ``_tail`` caused stride recompile storm (sealed FAIL).
     mono_mask = None
     hoist_temperature = None
     if cfg_scale <= 1:
@@ -1011,10 +961,6 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
         ):
             hoist_temperature = float(logits_processor_list[0].temperature)
             logits_processor_list = LogitsProcessorList()
-            mono_mask.ensure_compiled_tail(
-                batch_size=decoder_input_ids.shape[0],
-                vocab_size=int(model.config.vocab_size),
-            )
 
     prompt_len = decoder_input_ids.shape[1]
     b0 = decoder_input_ids.shape[0]

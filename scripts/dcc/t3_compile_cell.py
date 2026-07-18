@@ -3,7 +3,7 @@
 
 Variants:
   baseline — plain CUDA graphs (MAPPERATORINATOR_COMPILE_DECODE unset)
-  compile  — compile-then-capture + warm-all-buckets + sampling tail
+  compile  — compile-then-capture decode + warm-all-buckets (eager mono+temp tail)
 
 Gates (reported in summary; promote decided offline):
   A5000 main-gen +≥10% vs like-with-like baseline
