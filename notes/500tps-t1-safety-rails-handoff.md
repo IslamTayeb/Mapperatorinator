@@ -1,7 +1,7 @@
 # §59 T1 SAFETY RAILS — handoff
 
-**Status:** **WIRED** (2026-07-18)  
-**Branch / WT:** `codex/turbo-on-tiger-pr120` @ **`f6ec6f1b`** (rails `26e465b3`)  
+**Status:** **SMOKE PASS** (2026-07-18)  
+**Branch / WT:** `codex/turbo-on-tiger-pr120` @ **`72d6ed72`** (rails `26e465b3`; import-path fix)  
 **Local WT:** `/work/projects/Mapperatorinator-worktrees/turbo-on-tiger-pr120`  
 **DCC WT:** `/hpc/group/romerolab/imt11/projects/Mapperatorinator-worktrees/turbo-on-tiger-pr120`  
 **Base:** tiger PR #120 `d01cdd27` (local turbo scaffold on top)  
@@ -31,11 +31,37 @@ FA2 `kv[:, :cache_position[-1]+1]` dynamic slice (modeling_varwhisper) is why th
 | Item | Value |
 | --- | --- |
 | Scout | `utils/s59_t1_safety_rails_scout.py` |
-| Job | `jobs/s59-t1-safety-rails.sbatch` → **`50194265`** (PD) |
-| Asserts | require_sdpa / CFG mask+cumsum / eviction@1MiB / loud latch / force-SDPA |
+| Job | `jobs/s59-t1-safety-rails.sbatch` → **`50212775`** (**COMPLETED**, ExitCode `0:0`, Elapsed `00:00:34`, Node `dcc-core-ferc-s-z25-20`) |
+| Asserts | require_sdpa / CFG mask+cumsum / eviction@1MiB / loud latch / force-SDPA — **all PASS** |
 | Env | `unset MAPPERATORINATOR_ALLOW_CAPTURE_FALLBACK` |
-| DCC sync | `f6ec6f1b` ff-only |
-| Decision | pending harvest (`50194265`) |
+| DCC sync | job commit `72d6ed72` (PYTHONPATH=repo root; preflight `import_ok CaptureError`) |
+| Decision | **PASS** |
+
+### Prior smoke (superseded)
+
+| Item | Value |
+| --- | --- |
+| Job | **`50194265`** (**FAILED**, ExitCode `1:0`) |
+| Reason | `ModuleNotFoundError: No module named 'osuT5.osuT5'` (scout inserted `REPO/osuT5` on `sys.path`) |
+| Fix | `72d6ed72` — insert repo root only; sbatch exports `PYTHONPATH=$REPO` + preflight import |
+
+## Harvest seal
+
+- **Sealed:** 2026-07-18
+- **Job:** `50212775` State=`COMPLETED` ExitCode=`0:0` Elapsed=`00:00:34` Node=`dcc-core-ferc-s-z25-20`
+- **Smoke verdict:** **PASS** (`OK=true`, `DECISION=PASS`, `RC=0`)
+- **Commit (job):** `72d6ed72987f3ea8f1ca28edacadfd3852bb935c`
+- **Campaign tip frozen:** `55949274` — untouched
+- **Per-rail asserts:**
+  - SDPA (`require_sdpa` / `force_sdpa_setup`): **PASS** / **PASS**
+  - Loud capture (`loud_capture_failure`): **PASS**
+  - Cache (`graph_cache_eviction`): **PASS** (1 eviction under 1 MiB budget)
+  - CFG (`cfg_left_pad_mask`): **PASS**
+- **Preflight:** `import_ok CaptureError`; `pythonpath=` DCC WT root
+- **Remote run dir:** `/work/imt11/Mapperatorinator/runs/s59-t1-rails-50212775/`
+- **Remote logs:** `/work/imt11/Mapperatorinator/logs/s59-t1-rails-50212775.{out,err}`
+- **Local artifacts:** `/home/islam/projects/Mapperatorinator/notes/s59-artifacts/` (`verdict-50212775.txt`, `summary-50212775.json`, `asserts-50212775.json`, `preflight-50212775.txt`, `stdout-50212775.txt`, `stderr-50212775.txt`, `s59-t1-rails-50212775.{out,err}`)
+- **No 500 claim.** No PR #120 push.
 
 ## Do not
 
