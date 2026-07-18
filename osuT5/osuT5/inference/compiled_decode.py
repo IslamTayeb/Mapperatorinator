@@ -120,27 +120,34 @@ class _IncrementalMonotonicMask:
 
 
 class CUDAGraphDecoder:
-    """Captures a fixed-shape single-token decode step into a CUDA graph.
+    """Captures a fixed-shape decode step into a CUDA graph.
 
-    All inputs are static buffers; callers write new values then replay.
-    The encoder hidden state and cache are also static (rewritten/reset externally).
-    Captured once, reused across windows.
+    ``q_len=1`` is the production decode path (logits squeezed to ``(B, V)``).
+    ``q_len=K>1`` is the turbo teacher-verify path on the same uniform HF+graph
+    machinery (logits ``(B, K, V)``) — no fused-kernel / active-prefix overlay.
     """
 
-    def __init__(self, model, batch_size, enc_shape, dtype):
+    def __init__(self, model, batch_size, enc_shape, dtype, q_len: int = 1):
         self.model = model
         self.batch_size = batch_size
+        self.q_len = int(q_len)
+        if self.q_len < 1:
+            raise ValueError("q_len must be >= 1")
         device = model.device
         self.vocab = model.config.vocab_size
 
         # Static input buffers
-        self.static_token = torch.zeros((batch_size, 1), dtype=torch.long, device=device)
-        self.static_cache_pos = torch.zeros((1,), dtype=torch.long, device=device)
+        self.static_token = torch.zeros((batch_size, self.q_len), dtype=torch.long, device=device)
+        self.static_cache_pos = torch.zeros((self.q_len,), dtype=torch.long, device=device)
         # encoder hidden state as a static buffer (rewritten per window)
         self.static_enc_hidden = torch.zeros(enc_shape, dtype=dtype, device=device)
-        # static output
-        self.static_logits = torch.zeros((batch_size, self.vocab),
-                                         dtype=torch.float32, device=device)
+        # static output — keep q_len=1 squeezed for the existing decode loop
+        if self.q_len == 1:
+            self.static_logits = torch.zeros((batch_size, self.vocab),
+                                             dtype=torch.float32, device=device)
+        else:
+            self.static_logits = torch.zeros((batch_size, self.q_len, self.vocab),
+                                             dtype=torch.float32, device=device)
         self._graph = None
         self._cache = None  # set at capture; reused (reset) across windows
 
@@ -170,7 +177,10 @@ class CUDAGraphDecoder:
 
         def forward_only():
             outputs = model(**{**self._extra_kwargs, **self._static_inputs})
-            self.static_logits.copy_(outputs.logits[:, -1, :].float())
+            if self.q_len == 1:
+                self.static_logits.copy_(outputs.logits[:, -1, :].float())
+            else:
+                self.static_logits.copy_(outputs.logits.float())
 
         # Warmup on a side stream (required for cudagraph capture safety)
         s = torch.cuda.Stream()
@@ -190,24 +200,29 @@ class CUDAGraphDecoder:
         self.static_enc_hidden.copy_(enc_hidden)
 
     def replay(self, token, cache_position):
-        """Write the only two per-step inputs into the static buffers, replay.
+        """Write per-step inputs into the static buffers, then replay.
 
-        The graph probe (see ``capture``) showed only two tensor inputs vary
-        across decode steps — ``decoder_input_ids`` (the last token) and
-        ``cache_position``; everything else (encoder outputs, cache, attention
-        mask, position ids) is static and baked into the graph. So we skip
-        ``prepare_inputs_for_generation`` entirely in the hot loop and copy the
-        two directly.
+        For ``q_len=1`` the production hot path only refreshes
+        ``decoder_input_ids`` + ``cache_position`` (mask/position_ids stay baked).
+        For ``q_len=K`` verify we also refresh position ids when the probe
+        exposed them, so the same graph can be replayed at different prefixes.
         """
         self._static_inputs["decoder_input_ids"].copy_(token)
         self._static_inputs["cache_position"].copy_(cache_position)
+        if self.q_len > 1:
+            for key in ("decoder_position_ids", "position_ids"):
+                pos = self._static_inputs.get(key)
+                if pos is not None and pos.shape[-1] == cache_position.numel():
+                    pos.copy_(cache_position.unsqueeze(0))
         self._graph.replay()
-        return self.static_logits  # (B, vocab)
+        return self.static_logits  # (B, vocab) if q_len==1 else (B, q_len, vocab)
 
 
 # Module-level cache of (decoder, cache) keyed by (model, batch_size, cfg, cache_len)
 # so one graph is captured per cache-length bucket and reused across windows.
 _decoder_cache = {}
+# Separate bucket for q_len=K verify graphs (does not disturb production q_len=1).
+_k_decoder_cache = {}
 
 # Decoder self-attention cache-length buckets. A static cache attends over its
 # full allocated length every decode step, so we pick the smallest bucket that
@@ -242,7 +257,7 @@ def _get_decoder(model, batch_size, cfg_scale, enc_shape, dtype, cache_len):
     key = (id(model), batch_size, cfg_scale, cache_len)
     if key not in _decoder_cache:
         cache = get_cache(model, batch_size, 1, cfg_scale, max_cache_len=cache_len)
-        decoder = CUDAGraphDecoder(model, batch_size, enc_shape, dtype)
+        decoder = CUDAGraphDecoder(model, batch_size, enc_shape, dtype, q_len=1)
         try:
             decoder.capture(cache)
         except Exception as e:
@@ -252,6 +267,27 @@ def _get_decoder(model, batch_size, cfg_scale, enc_shape, dtype, cache_len):
         # restores correct state, so the capture corruption is harmless.
         _decoder_cache[key] = (decoder, cache)
     return _decoder_cache[key]
+
+
+def get_k_decoder(model, batch_size, cfg_scale, enc_shape, dtype, cache_len, q_len: int):
+    """Capture / reuse a tiger-uniform decode graph at ``q_len=K`` for turbo verify.
+
+    Shares StaticCache sizing with the production bucketed path. Does not install
+    fused kernels or active-prefix overlays — same HF forward as q_len=1.
+    """
+    q_len = int(q_len)
+    if q_len < 1:
+        raise ValueError("q_len must be >= 1")
+    key = (id(model), batch_size, cfg_scale, cache_len, q_len)
+    if key not in _k_decoder_cache:
+        cache = get_cache(model, batch_size, 1, cfg_scale, max_cache_len=cache_len)
+        decoder = CUDAGraphDecoder(model, batch_size, enc_shape, dtype, q_len=q_len)
+        try:
+            decoder.capture(cache)
+        except Exception as e:
+            raise CaptureError(str(e)) from e
+        _k_decoder_cache[key] = (decoder, cache)
+    return _k_decoder_cache[key]
 
 
 def _reset_cache(cache):
