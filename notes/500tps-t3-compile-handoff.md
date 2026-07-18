@@ -1,8 +1,8 @@
 # T3 TORCH.COMPILE — handoff (PIVOT EXECUTION PACKAGE)
 
-**Status:** **WIRED — MEASURE PENDING** (2026-07-18)  
+**Status:** **WIRED — A5000 QUEUED** (2026-07-18)  
 **Package:** Pivot **T3** compile-then-capture  
-**Branch / WT:** `codex/t3-compile-then-capture` @ *(fill after commit)*  
+**Branch / WT:** `codex/t3-compile-then-capture` @ `5c48a60c`  
 **Local WT:** `/work/projects/Mapperatorinator-worktrees/t3-compile-then-capture`  
 **DCC WT:** `/hpc/group/romerolab/imt11/projects/Mapperatorinator-worktrees/t3-compile-then-capture`  
 **Base:** `codex/turbo-on-tiger-pr120` @ `b96c3e38` (tiger PR #120 `d01cdd27` + §58/§59 rails)  
@@ -61,13 +61,14 @@ Cold start:
 
 | Cell | Job | GPU | State | Artifact |
 | --- | --- | --- | --- | --- |
-| baseline A5000 | *(pending)* | a5000 | — | `/work/imt11/Mapperatorinator/runs/t3-compile-baseline-fp16-<job>/` |
-| compile A5000 | *(pending)* | a5000 | — | `/work/imt11/Mapperatorinator/runs/t3-compile-compile-fp16-<job>/` |
-| baseline 2080 | *(pending)* | 2080 | — | … |
-| compile 2080 | *(pending)* | 2080 | — | … |
-| greedy match | *(pending)* | a5000 | — | `/work/imt11/Mapperatorinator/runs/t3-greedy-match-<job>/` |
+| baseline A5000 | **50194985** | a5000 | PENDING | `/work/imt11/Mapperatorinator/runs/t3-compile-baseline-fp16-50194985/` |
+| compile A5000 | **50194986** | a5000 | PENDING | `/work/imt11/Mapperatorinator/runs/t3-compile-compile-fp16-50194986/` |
+| baseline 2080 | *(submit after DCC login recovers / A5000)* | 2080 | — | … |
+| compile 2080 | *(submit after DCC login recovers / A5000)* | 2080 | — | … |
+| greedy match | *(afterok 50194986)* | a5000 | — | … |
 
-Harness: `scripts/dcc/t3_compile_cell.py` + `t3_compile.sbatch` · `t3_greedy_match_cell.py` + `t3_greedy_match.sbatch`
+Harness: `scripts/dcc/t3_compile_cell.py` + `t3_compile.sbatch` · `t3_greedy_match_cell.py` + `t3_greedy_match.sbatch`  
+Remote: `islamtayeb/codex/t3-compile-then-capture` only — **no tiger14n / PR #120**
 
 ## Results
 
@@ -78,7 +79,7 @@ Harness: `scripts/dcc/t3_compile_cell.py` + `t3_compile.sbatch` · `t3_greedy_ma
 | 2080 | baseline | — | — | — | — |
 | 2080 | compile | — | — | — | — |
 
-**Promote Y/N:** **pending** (need sealed A5000 +≥10% AND 2080 no-regress AND greedy PASS)
+**Promote Y/N:** **N** (pending harvest — gates not sealed)
 
 ## Do-not
 
@@ -91,4 +92,4 @@ Harness: `scripts/dcc/t3_compile_cell.py` + `t3_compile.sbatch` · `t3_greedy_ma
 
 ## Ruling
 
-T3 is the settled compile-then-capture integration (vLLM + §3/§22 + Tiger experiment +30–45% prior). Promote only on sealed gates above.
+T3 is the settled compile-then-capture integration (vLLM + §3/§22 + Tiger experiment +30–45% prior). Promote only on sealed gates above. A5000 pair queued (`50194985`/`50194986`); 2080+greedy submit deferred when DCC login timed out — retry after login recovers.

@@ -20,13 +20,19 @@ REPO=${T3_REPO:-/hpc/group/romerolab/imt11/projects/Mapperatorinator-worktrees/t
 SEED=${SEED:-12345}
 JOB_ID=${SLURM_JOB_ID:-manual}
 RUN_ROOT="$WORK/runs/t3-greedy-match-${JOB_ID}"
-JOB_TMP="${SLURM_TMPDIR:-$WORK/tmp}/t3-greedy-${JOB_ID}"
+if [[ -n "${SLURM_TMPDIR:-}" && -d "${SLURM_TMPDIR}" ]]; then
+  JOB_TMP="${SLURM_TMPDIR}/t3-greedy-${JOB_ID}"
+else
+  JOB_TMP="/tmp/${USER:-imt11}-t3-greedy-${JOB_ID}"
+fi
 JOB_EXT="$WORK/torch_extensions/t3-greedy-${JOB_ID}"
 INDUCTOR_CACHE="$WORK/cache/torchinductor/t3-greedy-${JOB_ID}"
 
 mkdir -p "$WORK/logs" "$WORK/runs" "$JOB_TMP" "$JOB_EXT" "$INDUCTOR_CACHE" "$RUN_ROOT"
 export PATH="$(dirname "$PYTHON"):$PATH"
 export TMPDIR="$JOB_TMP"
+export TEMP="$JOB_TMP"
+export TMP="$JOB_TMP"
 export TORCH_EXTENSIONS_DIR="$JOB_EXT"
 export TORCHINDUCTOR_CACHE_DIR="$INDUCTOR_CACHE"
 export HF_HOME="${HF_HOME:-$WORK/cache/huggingface}"

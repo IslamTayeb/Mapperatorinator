@@ -494,14 +494,31 @@ class CUDAGraphDecoder:
             compiled, meta = _compile_callable(forward_only, label=f"decode_q{self.q_len}")
             self._compiled_step = compiled
             self._compile_meta = meta
-            s2 = torch.cuda.Stream()
-            s2.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(s2):
-                for _ in range(_COMPILE_WARMUP_ITERS):
-                    compiled()
-            torch.cuda.current_stream().wait_stream(s2)
-            torch.cuda.synchronize()
-            step_fn = compiled
+            try:
+                s2 = torch.cuda.Stream()
+                s2.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s2):
+                    for _ in range(_COMPILE_WARMUP_ITERS):
+                        compiled()
+                torch.cuda.current_stream().wait_stream(s2)
+                torch.cuda.synchronize()
+                step_fn = compiled
+            except Exception as e:
+                # Inductor often fails on first invoke (NFS tempfile / graph break),
+                # not at torch.compile() construction — fall back to eager capture.
+                warnings.warn(
+                    f"T3 compiled decode warmup failed ({e!r}); capturing eager step.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self._compiled_step = None
+                self._compile_meta = {
+                    "mode": "eager",
+                    "fullgraph": False,
+                    "fallback": "warmup_failed",
+                    "error": repr(e),
+                }
+                step_fn = forward_only
 
         # Capture (plain CUDAGraph — never reduce-overhead / cudagraphs-in-compile).
         self._graph = torch.cuda.CUDAGraph()
