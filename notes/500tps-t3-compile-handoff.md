@@ -3,7 +3,7 @@
 **Status:** **HARVEST 4 IN PROGRESS** — owned sub-op compile revisit (2026-07-18 relaunch)  
 **Prior sealed:** Harvest 3 **PROMOTE N / STOP** @ `3e0aacb7` / `502d0a65` (full-step Inductor greedy FAIL)  
 **Package:** Pivot **T3** compile-then-capture  
-**Branch / WT:** `codex/t3-compile-then-capture` @ `1e3fc081`  
+**Branch / WT:** `codex/t3-compile-then-capture` @ `e407b255`  
 **Local WT:** `/work/projects/Mapperatorinator-worktrees/t3-compile-then-capture`  
 **DCC WT:** `/hpc/group/romerolab/imt11/projects/Mapperatorinator-worktrees/t3-compile-then-capture`  
 **Base:** `codex/turbo-on-tiger-pr120` @ `b96c3e38` (tiger PR #120 `d01cdd27` + §58/§59 rails)  
@@ -38,7 +38,8 @@ Opt-in env:
 | 2026-07-18 ~19:20 | Relaunch after orphaned agent; tip frozen; T4 PARKED; T1 smoke PASS |
 | 2026-07-18 ~20:48 | Code @ `1e3fc081` pushed to `islamtayeb/codex/t3-compile-then-capture` (owned `proj_out,ffn`; refuse full-step) |
 | 2026-07-18 ~20:49 | DCC pull FF; submitted A5000 pair (queue Priority) |
-| — | Jobs: baseline **50228030**, compile **50228031** PENDING; greedy held for ≤2 GPU |
+| 2026-07-18 ~20:50 | Greedy **50228096** submitted with `afterany:50228030:50228031` (≤2 GPU while pair runs). Dupes 50228032/33 cancelled. |
+| — | Waiting on Priority queue: **50228030** baseline, **50228031** compile, **50228096** greedy |
 
 ## Gates (harvest 4)
 
@@ -180,7 +181,7 @@ Remote: `islamtayeb/codex/t3-compile-then-capture` only — **no tiger14n / PR #
 | --- | --- | ---: | --- | --- |
 | baseline A5000 | **50228030** | a5000 | **PENDING** (Priority) | `/work/imt11/Mapperatorinator/runs/t3-compile-baseline-fp16-50228030/` |
 | compile A5000 | **50228031** | a5000 | **PENDING** (Priority) | `/work/imt11/Mapperatorinator/runs/t3-compile-compile-fp16-50228031/` |
-| greedy match | — | a5000 | held (≤2 GPU) | — |
+| greedy match | **50228096** | a5000 | **PENDING** (afterany:50228030:50228031) | `/work/imt11/Mapperatorinator/runs/t3-greedy-match-50228096/` |
 
 ## Do-not
 
