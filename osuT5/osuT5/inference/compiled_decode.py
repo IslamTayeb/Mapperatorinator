@@ -16,8 +16,23 @@ Output is quality-equivalent (not bit-identical) to HF generate: the sampling RN
 draw order differs, and the batched encoder precompute perturbs the encoder
 hidden states at the last bit, so sampled tokens can diverge. Greedy decoding
 matches HF token-for-token.
+
+T1 safety rails (§59):
+  - Fast path requires SDPA (FA2 auto-select breaks capture via dynamic KV trim).
+  - Capture failure is loud and does not silently latch OFF unless explicitly allowed.
+  - Graph+StaticCache entries are LRU-evicted under a VRAM budget (8–12GB cards).
+  - CFG left-pad prompt masks are preserved into decode (stock HF extends the 2D
+    pad mask; the prior graph path passed mask=None and attended pad K/V).
 """
+from __future__ import annotations
+
+import os
+import sys
 import time
+import traceback
+import warnings
+from collections import OrderedDict
+
 import torch
 import torch.nn.functional as F
 from transformers.modeling_outputs import BaseModelOutput
@@ -31,6 +46,133 @@ from .logit_processors import MonotonicTimeShiftLogitsProcessor
 
 class CaptureError(RuntimeError):
     """CUDA graph capture failed (unsupported GPU/backend or model architecture)."""
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _graph_cache_budget_bytes() -> int:
+    """VRAM budget for captured decode graphs + StaticCaches.
+
+    Default 2 GiB — sized for 8–12GB consumer cards that also hold weights.
+    Override with MAPPERATORINATOR_GRAPH_CACHE_BUDGET_MB.
+    """
+    raw = os.environ.get("MAPPERATORINATOR_GRAPH_CACHE_BUDGET_MB", "2048").strip()
+    try:
+        mb = int(raw)
+    except ValueError as e:
+        raise ValueError(
+            f"MAPPERATORINATOR_GRAPH_CACHE_BUDGET_MB must be an int, got {raw!r}"
+        ) from e
+    if mb <= 0:
+        raise ValueError("MAPPERATORINATOR_GRAPH_CACHE_BUDGET_MB must be > 0")
+    return mb * 1024 * 1024
+
+
+def _nbytes(obj) -> int:
+    if torch.is_tensor(obj):
+        return int(obj.numel() * obj.element_size())
+    total = 0
+    if isinstance(obj, (list, tuple)):
+        for item in obj:
+            total += _nbytes(item)
+        return total
+    if isinstance(obj, dict):
+        for item in obj.values():
+            total += _nbytes(item)
+        return total
+    key_cache = getattr(obj, "key_cache", None)
+    value_cache = getattr(obj, "value_cache", None)
+    if key_cache is not None or value_cache is not None:
+        total += _nbytes(key_cache)
+        total += _nbytes(value_cache)
+        return total
+    self_attn = getattr(obj, "self_attention_cache", None)
+    cross_attn = getattr(obj, "cross_attention_cache", None)
+    if self_attn is not None or cross_attn is not None:
+        total += _nbytes(self_attn)
+        total += _nbytes(cross_attn)
+        return total
+    return 0
+
+
+def _entry_nbytes(decoder, cache) -> int:
+    total = _nbytes(cache)
+    for name in (
+        "static_token",
+        "static_cache_pos",
+        "static_enc_hidden",
+        "static_logits",
+        "_static_inputs",
+    ):
+        total += _nbytes(getattr(decoder, name, None))
+    # CUDAGraph storage is opaque; charge a conservative multiple of the
+    # static workspace so multi-bucket captures cannot silently OOM 8–12GB cards.
+    return int(total * 1.25) + (8 << 20)
+
+
+def require_sdpa_for_fast_path(model) -> str:
+    """Fast-path capture requires SDPA. FA2's dynamic KV trim breaks graphs."""
+    impl = None
+    config = getattr(model, "config", None)
+    if config is not None:
+        impl = getattr(config, "_attn_implementation", None)
+    if impl is None:
+        transformer = getattr(model, "transformer", None)
+        tconfig = getattr(transformer, "config", None) if transformer is not None else None
+        if tconfig is not None:
+            impl = getattr(tconfig, "_attn_implementation", None)
+    impl = impl or "unknown"
+    if impl != "sdpa":
+        raise CaptureError(
+            f"fast decoder loop requires attn_implementation='sdpa' (got {impl!r}). "
+            "FA2 auto-select breaks CUDA graph capture (dynamic KV slice at "
+            "modeling_varwhisper FA2 path) and previously latched the fast path OFF "
+            "process-wide. Pass attn_implementation=sdpa or let inference setup "
+            "force SDPA when fast_decoder_loop is enabled."
+        )
+    return impl
+
+
+def _merge_cfg_prompt_mask(
+    decoder_attention_mask,
+    negative_prompt_attention_mask,
+    batch_size: int,
+    prompt_len: int,
+    device,
+):
+    """Build (eff_batch, prompt_len) 1=valid mask for CFG-doubled prefill."""
+    if decoder_attention_mask is None:
+        cond = torch.ones((batch_size, prompt_len), dtype=torch.long, device=device)
+    else:
+        cond = decoder_attention_mask.to(device=device, dtype=torch.long)
+        if cond.shape != (batch_size, prompt_len):
+            raise ValueError(
+                f"decoder_attention_mask shape {tuple(cond.shape)} != "
+                f"({batch_size}, {prompt_len})"
+            )
+    if negative_prompt_attention_mask is None:
+        uncond = torch.ones_like(cond)
+    else:
+        uncond = negative_prompt_attention_mask.to(device=device, dtype=torch.long)
+        if uncond.shape != (batch_size, prompt_len):
+            raise ValueError(
+                f"negative_prompt_attention_mask shape {tuple(uncond.shape)} != "
+                f"({batch_size}, {prompt_len})"
+            )
+    # prepare_inputs_for_generation places uncond in the first half.
+    return torch.cat([uncond, cond], dim=0)
+
+
+def _needs_pad_aware_decode(prompt_mask_2d: torch.Tensor | None) -> bool:
+    """True when any left-pad (or other) zero exists in the prompt mask."""
+    if prompt_mask_2d is None:
+        return False
+    return bool((prompt_mask_2d == 0).any().item())
 
 
 def neutralize_dynamic_rope(model) -> int:
@@ -143,11 +285,21 @@ class CUDAGraphDecoder:
                                          dtype=torch.float32, device=device)
         self._graph = None
         self._cache = None  # set at capture; reused (reset) across windows
+        self._pad_aware = False
 
-    def capture(self, cache):
-        """Warmup + capture the decode forward into a CUDA graph."""
+    def capture(self, cache, *, pad_aware: bool = False, cache_len: int | None = None):
+        """Warmup + capture the decode forward into a CUDA graph.
+
+        ``pad_aware=True`` keeps a full-length 2D decoder attention mask in the
+        graph so left-pad (CFG) slots stay masked every replay. The 2D mask is
+        intentional: prepare_inputs would expand it to a 4D mask frozen at the
+        capture-time cache_position; passing 2D lets in-graph
+        ``_update_causal_mask`` rebuild causal+pad from the live cache_position.
+        """
         model = self.model
         self._cache = cache
+        self._pad_aware = bool(pad_aware)
+        require_sdpa_for_fast_path(model)
 
         # Discover model_inputs structure with a probe call (outside graph)
         enc_out = BaseModelOutput(last_hidden_state=self.static_enc_hidden)
@@ -167,6 +319,20 @@ class CUDAGraphDecoder:
             self._static_inputs[k] = torch.empty_like(t)
             self._static_inputs[k].copy_(t)
         self._extra_kwargs = {k: v for k, v in probe.items() if not isinstance(v, torch.Tensor)}
+
+        if self._pad_aware:
+            if cache_len is None:
+                cache_len = int(cache.get_max_cache_shape())
+            device = model.device
+            # Full-length 2D pad mask (1=valid). Kept 2D on purpose — see docstring.
+            mask = torch.ones((self.batch_size, cache_len), dtype=torch.long, device=device)
+            self._static_inputs["decoder_attention_mask"] = mask
+            # Position ids for the current q_len window (refreshed every replay).
+            pos = torch.zeros((self.batch_size, 1), dtype=torch.long, device=device)
+            self._static_inputs["decoder_position_ids"] = pos
+            for key in ("decoder_attention_mask", "decoder_position_ids"):
+                if key not in self._input_keys:
+                    self._input_keys.append(key)
 
         def forward_only():
             outputs = model(**{**self._extra_kwargs, **self._static_inputs})
@@ -189,25 +355,35 @@ class CUDAGraphDecoder:
         """Copy a new encoder hidden state into the static buffer (per window)."""
         self.static_enc_hidden.copy_(enc_hidden)
 
-    def replay(self, token, cache_position):
-        """Write the only two per-step inputs into the static buffers, replay.
+    def replay(self, token, cache_position, *, pad_mask_2d=None, position_ids=None):
+        """Write per-step inputs into the static buffers, then replay.
 
-        The graph probe (see ``capture``) showed only two tensor inputs vary
-        across decode steps — ``decoder_input_ids`` (the last token) and
-        ``cache_position``; everything else (encoder outputs, cache, attention
-        mask, position ids) is static and baked into the graph. So we skip
-        ``prepare_inputs_for_generation`` entirely in the hot loop and copy the
-        two directly.
+        For the production hot path without left-pad, only
+        ``decoder_input_ids`` + ``cache_position`` refresh (mask/position_ids stay baked).
+        Pad-aware / CFG graphs also refresh the 2D pad mask and position ids.
         """
         self._static_inputs["decoder_input_ids"].copy_(token)
         self._static_inputs["cache_position"].copy_(cache_position)
+        if pad_mask_2d is not None:
+            self._static_inputs["decoder_attention_mask"].copy_(pad_mask_2d)
+            if position_ids is None:
+                raise ValueError("pad-aware replay requires position_ids")
+            self._static_inputs["decoder_position_ids"].copy_(position_ids)
         self._graph.replay()
         return self.static_logits  # (B, vocab)
 
+    def close(self):
+        """Drop graph + static buffers so VRAM can be reclaimed on eviction."""
+        self._graph = None
+        self._cache = None
+        self._static_inputs = {}
 
-# Module-level cache of (decoder, cache) keyed by (model, batch_size, cfg, cache_len)
-# so one graph is captured per cache-length bucket and reused across windows.
-_decoder_cache = {}
+
+# Module-level LRU cache of (decoder, cache, nbytes) keyed by shape signature.
+# Evicted under MAPPERATORINATOR_GRAPH_CACHE_BUDGET_MB (default 2048).
+_decoder_cache: OrderedDict = OrderedDict()
+_decoder_cache_bytes = 0
+_decoder_cache_evictions = 0
 
 # Decoder self-attention cache-length buckets. A static cache attends over its
 # full allocated length every decode step, so we pick the smallest bucket that
@@ -238,20 +414,76 @@ def _bucket_ceil(need, model_max):
     return model_max
 
 
-def _get_decoder(model, batch_size, cfg_scale, enc_shape, dtype, cache_len):
-    key = (id(model), batch_size, cfg_scale, cache_len)
-    if key not in _decoder_cache:
-        cache = get_cache(model, batch_size, 1, cfg_scale, max_cache_len=cache_len)
-        decoder = CUDAGraphDecoder(model, batch_size, enc_shape, dtype)
+def _cache_stats(which: str = "q1") -> dict:
+    del which  # only q1 cache exists on tiger base (no turbo k-decoder)
+    return {
+        "entries": len(_decoder_cache),
+        "bytes": _decoder_cache_bytes,
+        "evictions": _decoder_cache_evictions,
+        "budget_bytes": _graph_cache_budget_bytes(),
+    }
+
+
+def _evict_until_fit(cache: OrderedDict, bytes_attr: str, evict_attr: str, need: int) -> None:
+    """LRU-evict captured graphs until ``need`` bytes fit under the budget."""
+    global _decoder_cache_bytes, _decoder_cache_evictions
+    del bytes_attr, evict_attr
+    budget = _graph_cache_budget_bytes()
+    current = _decoder_cache_bytes
+    while cache and current + need > budget:
+        _key, (decoder, _cached, nbytes) = cache.popitem(last=False)
         try:
-            decoder.capture(cache)
-        except Exception as e:
-            raise CaptureError(str(e)) from e
-        # After capture the cache holds garbage from the warmup forwards. The
-        # decode loop calls _reset_cache + prefill before each window, which
-        # restores correct state, so the capture corruption is harmless.
-        _decoder_cache[key] = (decoder, cache)
-    return _decoder_cache[key]
+            decoder.close()
+        except Exception:
+            pass
+        current = max(0, current - int(nbytes))
+        _decoder_cache_evictions += 1
+    _decoder_cache_bytes = current
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _get_decoder(model, batch_size, cfg_scale, enc_shape, dtype, cache_len, *, pad_aware: bool = False):
+    global _decoder_cache_bytes
+    key = (id(model), batch_size, cfg_scale, cache_len, bool(pad_aware))
+    if key in _decoder_cache:
+        _decoder_cache.move_to_end(key)
+        decoder, cache, _nbytes = _decoder_cache[key]
+        return decoder, cache
+    require_sdpa_for_fast_path(model)
+    cache = get_cache(model, batch_size, 1, cfg_scale, max_cache_len=cache_len)
+    decoder = CUDAGraphDecoder(model, batch_size, enc_shape, dtype)
+    try:
+        decoder.capture(cache, pad_aware=pad_aware, cache_len=cache_len)
+    except Exception as e:
+        try:
+            decoder.close()
+        except Exception:
+            pass
+        raise CaptureError(str(e)) from e
+    # After capture the cache holds garbage from the warmup forwards. The
+    # decode loop calls _reset_cache + prefill before each window, which
+    # restores correct state, so the capture corruption is harmless.
+    nbytes = _entry_nbytes(decoder, cache)
+    _evict_until_fit(_decoder_cache, "q1", "q1", nbytes)
+    _decoder_cache[key] = (decoder, cache, nbytes)
+    _decoder_cache_bytes += nbytes
+    return decoder, cache
+
+
+def clear_decoder_caches() -> dict:
+    """Drop all captured graphs (tests / budget scouts)."""
+    global _decoder_cache_bytes
+    while _decoder_cache:
+        _key, (decoder, _c, _n) = _decoder_cache.popitem(last=False)
+        try:
+            decoder.close()
+        except Exception:
+            pass
+    _decoder_cache_bytes = 0
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return {"q1": _cache_stats("q1")}
 
 
 def _reset_cache(cache):
@@ -266,9 +498,26 @@ def _reset_cache(cache):
     cache.reset()
 
 
-# Set on the first capture failure (e.g. a CUDA-like backend without working
-# graph capture); all subsequent calls go straight to the stock generate.
+# Set on the first capture failure when fallback is explicitly allowed.
+# Default T1 posture: capture failure is LOUD and raises (no silent latch-off).
 _capture_unsupported = False
+_capture_failure_logged = False
+
+
+def _loud_capture_failure(exc: BaseException) -> None:
+    """Print a non-quiet capture failure (stderr + traceback). Never swallow."""
+    global _capture_failure_logged
+    msg = (
+        "CUDA graph capture FAILED for the fast decoder loop. "
+        "This previously latched the fast path OFF process-wide after a quiet "
+        "print — often because attn_implementation auto-selected flash_attention_2 "
+        "(FA2 dynamic KV trim is not capturable). Fix: force SDPA for the fast "
+        f"path. Underlying error: {exc}"
+    )
+    print(msg, file=sys.stderr, flush=True)
+    traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
+    warnings.warn(msg, RuntimeWarning, stacklevel=3)
+    _capture_failure_logged = True
 
 
 @torch.no_grad()
@@ -276,19 +525,29 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
     """Custom decode loop with CUDA-graph-captured forward.
 
     Expects precomputed encoder hidden states as model_kwargs['encoder_outputs']
-    (a (B, L_enc, D) tensor, see server.precompute_encoder_outputs). If graph
-    capture fails on this system, falls back to the stock generate permanently
-    for this process.
+    (a (B, L_enc, D) tensor, see server.precompute_encoder_outputs). Capture
+    failure is loud (stderr + traceback). Fallback to stock generate is opt-in
+    via MAPPERATORINATOR_ALLOW_CAPTURE_FALLBACK=1; otherwise the error raises
+    and the fast path is not silently latched off.
     """
     global _capture_unsupported
+    allow_fallback = _env_flag("MAPPERATORINATOR_ALLOW_CAPTURE_FALLBACK", default=False)
     if _capture_unsupported:
-        return model_generate(model, tokenizer, model_kwargs, generate_kwargs)
+        if allow_fallback:
+            return model_generate(model, tokenizer, model_kwargs, generate_kwargs)
+        raise CaptureError(
+            "fast decoder loop previously failed capture in this process; "
+            "refusing silent stock fallback. Set "
+            "MAPPERATORINATOR_ALLOW_CAPTURE_FALLBACK=1 to allow, or fix SDPA/"
+            "capture prerequisites and restart the process."
+        )
     # Shallow copies so a capture-failure fallback still sees the kwargs consumed below
     fallback_args = (dict(model_kwargs), dict(generate_kwargs))
 
     # Dynamic-RoPE models (e.g. v30) can't be graph-captured until their no-op
     # frequency update is disabled. Idempotent: a no-op once already flipped.
     neutralize_dynamic_rope(model)
+    require_sdpa_for_fast_path(model)
 
     model_kwargs = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v
                     for k, v in model_kwargs.items()}
@@ -321,7 +580,8 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
     pad_token_id = getattr(tokenizer, 'pad_id', None)
     device = model.device
 
-    eff_batch = decoder_input_ids.shape[0] * (2 if (cfg_scale > 1 and negative_prompt is not None) else 1)
+    use_cfg = cfg_scale > 1 and negative_prompt is not None
+    eff_batch = decoder_input_ids.shape[0] * (2 if use_cfg else 1)
     eos_token_ids = get_eos_token_id(tokenizer, lookback_time=lookback_time,
                                      lookahead_time=lookahead_time, context_type=context_type)
     logits_processor_list = build_logits_processors(
@@ -351,21 +611,49 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
     # this just because a bucket was too small.
     hard_cap = min(max_length, model_max)
 
+    # CFG left-pad: build the doubled prompt mask. Pad-aware decode is enabled
+    # whenever any zero exists (unequal cond/uncond lengths after pad_prompts).
+    prompt_mask_2d = None
+    if use_cfg:
+        prompt_mask_2d = _merge_cfg_prompt_mask(
+            decoder_attention_mask,
+            negative_prompt_attention_mask,
+            b0,
+            prompt_len,
+            device,
+        )
+    elif decoder_attention_mask is not None and _needs_pad_aware_decode(
+        decoder_attention_mask.to(device=device, dtype=torch.long)
+    ):
+        prompt_mask_2d = decoder_attention_mask.to(device=device, dtype=torch.long)
+    pad_aware = _needs_pad_aware_decode(prompt_mask_2d)
+
     def _run_window(cache_len):
         """Prefill + captured decode with a given static-cache length.
 
         Returns (generated_tokens, truncated) where ``truncated`` means the loop
         stopped because it filled the cache (``win_max``) rather than emitting EOS.
-        A static cache attends over its full length every step, so a right-sized
+        A static cache attends over its full allocated length every step, so a right-sized
         cache is cheaper; we start small and only grow on truncation (below).
         """
         win_max = min(hard_cap, cache_len)
-        decoder, cache = _get_decoder(model, eff_batch, cfg_scale, enc_hidden.shape,
-                                      model.dtype, cache_len)
+        decoder, cache = _get_decoder(
+            model, eff_batch, cfg_scale, enc_hidden.shape, model.dtype, cache_len,
+            pad_aware=pad_aware,
+        )
         _reset_cache(cache)                    # fresh generation for this window
         decoder.set_encoder_hidden(enc_hidden)  # write this window's encoder state
         if mono_mask is not None:
             mono_mask.init_from_prompt(decoder_input_ids)  # reset per (re)attempt
+
+        # Full-length 2D pad mask for pad-aware graphs (prompt zeros preserved;
+        # generated positions filled with 1 as we go — matches stock HF extend).
+        full_pad_mask = None
+        if pad_aware:
+            full_pad_mask = torch.zeros(
+                (eff_batch, cache_len), dtype=torch.long, device=device
+            )
+            full_pad_mask[:, :prompt_len] = prompt_mask_2d
 
         # 1. PREFILL (eager) — process the whole prompt, fill the cache. Must use
         # the SAME cache object the graph references so decode steps see it.
@@ -415,7 +703,22 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
                 truncated = False
                 break
             cache_position = torch.tensor([cur_len - 1], device=device, dtype=torch.long)
-            last_logits = decoder.replay(next_token, cache_position)
+            replay_token = next_token
+            if use_cfg and replay_token.shape[0] == b0:
+                replay_token = replay_token.repeat(2, 1)
+            if pad_aware:
+                # New token is always valid on both CFG streams (same sampled id).
+                full_pad_mask[:, cur_len - 1] = 1
+                # RoPE positions follow mask cumsum (not raw cache index) so left
+                # pads do not shift generated positions — matches stock HF.
+                pos_full = (full_pad_mask.cumsum(-1) - 1).clamp(min=0)
+                position_ids = pos_full[:, cur_len - 1 : cur_len].contiguous()
+                last_logits = decoder.replay(
+                    replay_token, cache_position,
+                    pad_mask_2d=full_pad_mask, position_ids=position_ids,
+                )
+            else:
+                last_logits = decoder.replay(replay_token, cache_position)
         return generated, truncated
 
     start_time = time.perf_counter()
@@ -432,10 +735,17 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
             cache_len = _bucket_ceil(hard_cap, model_max)
             generated, truncated = _run_window(cache_len)
     except CaptureError as e:
+        _loud_capture_failure(e)
         _capture_unsupported = True
-        print(f"CUDA graph capture is not supported on this system; "
-              f"falling back to the stock generate loop. ({e})")
-        return model_generate(model, tokenizer, *fallback_args)
+        if allow_fallback:
+            print(
+                "MAPPERATORINATOR_ALLOW_CAPTURE_FALLBACK=1: falling back to stock "
+                f"generate after capture failure. ({e})",
+                file=sys.stderr,
+                flush=True,
+            )
+            return model_generate(model, tokenizer, *fallback_args)
+        raise
     elapsed = time.perf_counter() - start_time
 
     gen_tensor = torch.cat(generated, dim=1) if generated else torch.empty(
