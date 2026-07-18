@@ -1,32 +1,64 @@
 # T3 TORCH.COMPILE — handoff (PIVOT EXECUTION PACKAGE)
 
-**Status:** **SEALED PROMOTE N** (2026-07-18 harvest 3 — STOP)  
+**Status:** **HARVEST 4 IN PROGRESS** — owned sub-op compile revisit (2026-07-18 relaunch)  
+**Prior sealed:** Harvest 3 **PROMOTE N / STOP** @ `3e0aacb7` / `502d0a65` (full-step Inductor greedy FAIL)  
 **Package:** Pivot **T3** compile-then-capture  
-**Branch / WT:** `codex/t3-compile-then-capture` @ `3e0aacb7` (default-mode + shared hoist; exactness still FAIL)  
+**Branch / WT:** `codex/t3-compile-then-capture` @ `502d0a65` + harvest-4 WIP  
 **Local WT:** `/work/projects/Mapperatorinator-worktrees/t3-compile-then-capture`  
 **DCC WT:** `/hpc/group/romerolab/imt11/projects/Mapperatorinator-worktrees/t3-compile-then-capture`  
 **Base:** `codex/turbo-on-tiger-pr120` @ `b96c3e38` (tiger PR #120 `d01cdd27` + §58/§59 rails)  
 **Frozen tip:** `55949274` / FP16 **366.11** — **regression reference only**; **no merge**; **no push to PR #120**  
-**T4 turbo:** **PARKED** — do not wire speculative
+**T4 turbo:** **PARKED** — do not wire speculative  
+**T1 smoke:** PASS (`50215788`) — rails green; T3 may proceed
 
-## Binding pattern
+## Harvest 4 hypothesis (NEW — not bare full-step retry)
 
-Compile-then-capture decoder step **per bucket**:
+Full-step Inductor rewrite of shape-static `forward_only` flips fp16 near-tie greedy tokens (harvest 1–3 sealed). Revisit compiles **only tip-owned Linear / post-attn FFN / `proj_out` modules**, then captures the still-eager outer decode step (compile-then-capture discipline preserved). Attention / SDPA / cache path stay eager.
+
+| Knob | Harvest 4 value |
+| --- | --- |
+| Outer step | **eager** `forward_only` (never Inductor full-step) |
+| Sub-ops | `MAPPERATORINATOR_COMPILE_SUBOPS=proj_out,ffn` (default when decode compile on) |
+| `fullgraph` / `dynamic` / `mode` | `True` / `False` / **`default`** |
+| Warm | EVERY bucket before capture; warm compiled modules outside graph |
+| Forbidden | full-step compile; `reduce-overhead`; recompile `_tail` |
+
+Opt-in env:
+
+- `MAPPERATORINATOR_COMPILE_DECODE=1` — enable T3 compile path (now **sub-op**, not full-step)
+- `MAPPERATORINATOR_COMPILE_SUBOPS` — comma list: `proj_out`, `ffn`/`post_attn`, `linear` (=both). Default `proj_out,ffn`
+- `MAPPERATORINATOR_COMPILE_FULL_STEP=1` — **forbidden for package gate** (harvest 1–3 STOP); loud refuse unless explicitly documenting drift
+- `MAPPERATORINATOR_WARM_ALL_BUCKETS=1` — session warm all buckets
+- `MAPPERATORINATOR_COMPILE_MODE` — default `default`
+
+## Progress (relaunch)
+
+| Time (UTC) | Note |
+| --- | --- |
+| 2026-07-18 ~19:20 | Relaunch after orphaned agent; tip frozen; T4 PARKED; T1 smoke PASS |
+| 2026-07-18 ~19:25 | Implementing owned sub-op compile in WT; **Shell/DCC SSH temporarily unavailable** from agent host — code first, submit when shell recovers |
+| — | Jobs: **pending submit** (≤2 GPU A5000: baseline + compile, then greedy) |
+
+## Gates (harvest 4)
+
+| Gate | Criterion | Result |
+| --- | --- | --- |
+| A5000 | main-gen **+≥10%** vs like-with-like uncompiled fast path | **PENDING** |
+| Exactness | greedy token-match (`.osu` bytes) vs uncompiled fast path | **PENDING** |
+| 2080 Ti | **no-regression** | **N/A until greedy PASS** |
+
+## Binding pattern (harvest 1–3, sealed)
+
+Compile-then-capture decoder step **per bucket** — harvest 3 used **full** Inductor `forward_only` → STOP.
 
 | Knob | Value |
 | --- | --- |
 | `fullgraph` | `True` |
 | `dynamic` | `False` |
 | `mode` | **`default`** (harvest 3); override `MAPPERATORINATOR_COMPILE_MODE` (never `reduce-overhead`) |
-| Warm | **EVERY** bucket (incl. any future turbo `q_len`) **before** its capture — §22 Inductor-in-capture |
+| Warm | **EVERY** bucket before its capture — §22 Inductor-in-capture |
 | Sampling tail | shape-static mono hoist + uniform temperature (**eager**, both compile on/off) |
 | Forbidden | `reduce-overhead` near manual CUDAGraph capture |
-
-Opt-in env:
-
-- `MAPPERATORINATOR_COMPILE_DECODE=1` — Inductor compile of **decode step only** (tail stays eager)
-- `MAPPERATORINATOR_WARM_ALL_BUCKETS=1` — session warm all buckets in cold_start (also auto when compile env set)
-- `MAPPERATORINATOR_COMPILE_MODE` — default `default`; `max-autotune-no-cudagraphs` worsens greedy drift (harvest 1/2)
 
 Cold start:
 
@@ -41,16 +73,7 @@ Cold start:
 2. **no triton** → plain CUDA graphs (current PR #120 default)
 3. **no capture** → eager / stock generate (loud failure unless `MAPPERATORINATOR_ALLOW_CAPTURE_FALLBACK=1`)
 
-## Gates (harvest 3)
-
-| Gate | Criterion | Result |
-| --- | --- | --- |
-| A5000 | main-gen **+≥10%** vs like-with-like uncompiled fast path | **PASS** (+22.7% main_tps; was +28.8% under max-autotune) |
-| 2080 Ti | **no-regression** (main_tps / ms/map-token) | **N/A** (no 2080 until greedy PASS) |
-| Exactness | greedy token-match (`.osu` bytes) vs uncompiled fast path | **FAIL** (31418 vs **31747**) |
-| Report | full-map **ms/map-token** + **main_tps** + **cold_start** | sealed below |
-
-## Root cause (harvest 3)
+## Root cause (harvest 3) — sealed
 
 **Decode-step Inductor numerics under compile-then-capture**, not RNG / warm-all / `_tail` / compile-only hoist:
 
@@ -91,10 +114,16 @@ Cold start:
 
 **Revisit (new hypothesis required — do not bare-retry full decode-step compile):**
 
-- Owned tip-exact sub-op compile (e.g. decode-only `proj_out` / attn GEMV) before outer capture — not full `forward_only`.
+- Owned tip-exact sub-op compile (e.g. decode-only `proj_out` / attn GEMV) before outer capture — not full `forward_only`. ← **harvest 4**
 - Or teacher-forced first-N-token logit dump (eager graph vs compiled graph) to localize the diverging op.
 - Or documented opt-in compile with **declared** greedy drift (outside package promote gate).
 - Kill if next attempt reintroduces `_tail` stride thrash or max-autotune without a new exactness plan.
+
+### Harvest 4 (owned sub-op) — **IN PROGRESS**
+
+**Change (WIP):** when `MAPPERATORINATOR_COMPILE_DECODE=1`, Inductor-compile only owned modules (`proj_out`, decoder `fc1`/`fc2` FFN linears); outer CUDAGraph captures eager `forward_only`. Refuse `MAPPERATORINATOR_COMPILE_FULL_STEP=1` for package runs.
+
+**Jobs:** pending (agent Shell/DCC outage at relaunch).
 
 ## Jobs
 
@@ -144,6 +173,14 @@ Cold start:
 Local pulls: `notes/t3-artifacts/match-50203099.json`, `summary-50203100.json`, `summary-50203101.json`  
 Remote: `islamtayeb/codex/t3-compile-then-capture` only — **no tiger14n / PR #120**
 
+### Harvest 4 (owned sub-op) — pending submit
+
+| Cell | Job | GPU | State | Artifact |
+| --- | --- | ---: | --- | --- |
+| baseline A5000 | — | a5000 | pending | — |
+| compile A5000 | — | a5000 | pending | — |
+| greedy match | — | a5000 | pending | — |
+
 ## Do-not
 
 - Push to Tiger14n / PR #120  
@@ -159,4 +196,5 @@ Remote: `islamtayeb/codex/t3-compile-then-capture` only — **no tiger14n / PR #
 
 ## Ruling
 
-**Promote N. STOP.** Harvest 3 confirms root cause is decode Inductor numerics (max-autotune worsens; `default` softens but does not restore greedy token-match). Perf gate still PASS (+22.7%). 2080 not run. T4 stays PARKED. No PR #120 push. Revisit only with owned sub-op compile, logit localization, or documented-drift packaging — not another full-step compile scout.
+**Harvest 3: Promote N. STOP** (full-step).  
+**Harvest 4: IN PROGRESS** — owned `proj_out`+FFN sub-op compile; promote only if A5000 +≥10% **and** greedy PASS. Else STOP.
