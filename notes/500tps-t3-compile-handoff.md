@@ -3,7 +3,7 @@
 **Status:** **HARVEST 4 IN PROGRESS** — owned sub-op compile revisit (2026-07-18 relaunch)  
 **Prior sealed:** Harvest 3 **PROMOTE N / STOP** @ `3e0aacb7` / `502d0a65` (full-step Inductor greedy FAIL)  
 **Package:** Pivot **T3** compile-then-capture  
-**Branch / WT:** `codex/t3-compile-then-capture` @ `502d0a65` + harvest-4 WIP  
+**Branch / WT:** `codex/t3-compile-then-capture` @ `1e3fc081`  
 **Local WT:** `/work/projects/Mapperatorinator-worktrees/t3-compile-then-capture`  
 **DCC WT:** `/hpc/group/romerolab/imt11/projects/Mapperatorinator-worktrees/t3-compile-then-capture`  
 **Base:** `codex/turbo-on-tiger-pr120` @ `b96c3e38` (tiger PR #120 `d01cdd27` + §58/§59 rails)  
@@ -36,8 +36,9 @@ Opt-in env:
 | Time (UTC) | Note |
 | --- | --- |
 | 2026-07-18 ~19:20 | Relaunch after orphaned agent; tip frozen; T4 PARKED; T1 smoke PASS |
-| 2026-07-18 ~19:25 | Implementing owned sub-op compile in WT; **Shell/DCC SSH temporarily unavailable** from agent host — code first, submit when shell recovers |
-| — | Jobs: **pending submit** (≤2 GPU A5000: baseline + compile, then greedy) |
+| 2026-07-18 ~20:48 | Code @ `1e3fc081` pushed to `islamtayeb/codex/t3-compile-then-capture` (owned `proj_out,ffn`; refuse full-step) |
+| 2026-07-18 ~20:49 | DCC pull FF; submitted A5000 pair (queue Priority) |
+| — | Jobs: baseline **50228030**, compile **50228031** PENDING; greedy held for ≤2 GPU |
 
 ## Gates (harvest 4)
 
@@ -123,7 +124,7 @@ Cold start:
 
 **Change (WIP):** when `MAPPERATORINATOR_COMPILE_DECODE=1`, Inductor-compile only owned modules (`proj_out`, decoder `fc1`/`fc2` FFN linears); outer CUDAGraph captures eager `forward_only`. Refuse `MAPPERATORINATOR_COMPILE_FULL_STEP=1` for package runs.
 
-**Jobs:** pending (agent Shell/DCC outage at relaunch).
+**Jobs:** baseline **50228030** + compile **50228031** queued (Priority); greedy after ≤1 free GPU.
 
 ## Jobs
 
@@ -173,13 +174,13 @@ Cold start:
 Local pulls: `notes/t3-artifacts/match-50203099.json`, `summary-50203100.json`, `summary-50203101.json`  
 Remote: `islamtayeb/codex/t3-compile-then-capture` only — **no tiger14n / PR #120**
 
-### Harvest 4 (owned sub-op) — pending submit
+### Harvest 4 (owned sub-op) — **queued** @ `1e3fc081`
 
 | Cell | Job | GPU | State | Artifact |
 | --- | --- | ---: | --- | --- |
-| baseline A5000 | — | a5000 | pending | — |
-| compile A5000 | — | a5000 | pending | — |
-| greedy match | — | a5000 | pending | — |
+| baseline A5000 | **50228030** | a5000 | **PENDING** (Priority) | `/work/imt11/Mapperatorinator/runs/t3-compile-baseline-fp16-50228030/` |
+| compile A5000 | **50228031** | a5000 | **PENDING** (Priority) | `/work/imt11/Mapperatorinator/runs/t3-compile-compile-fp16-50228031/` |
+| greedy match | — | a5000 | held (≤2 GPU) | — |
 
 ## Do-not
 
