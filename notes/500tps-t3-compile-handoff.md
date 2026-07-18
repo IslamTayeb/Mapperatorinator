@@ -1,9 +1,9 @@
 # T3 TORCH.COMPILE — handoff (PIVOT EXECUTION PACKAGE)
 
-**Status:** **FULL-STEP RESTORE IN PROGRESS** · H4 cancelled · A5000 reseal submitting  
+**Status:** **A5000 RESEAL QUEUED** · full-step restored @ `946bff1e`  
 **This agent:** REPLACEMENT (2026-07-18 relaunch) — restore harvest-3 full-step + reseal under relaxed gates  
 **Package:** Pivot **T3** compile-then-capture  
-**Branch / WT:** `codex/t3-compile-then-capture` (local tip updating)  
+**Branch / WT:** `codex/t3-compile-then-capture` @ **`946bff1e`**  
 **Local WT:** `/work/projects/Mapperatorinator-worktrees/t3-compile-then-capture`  
 **DCC WT:** `/hpc/group/romerolab/imt11/projects/Mapperatorinator-worktrees/t3-compile-then-capture`  
 **Base:** `codex/turbo-on-tiger-pr120` @ `b96c3e38` (tiger PR #120 `d01cdd27` + §58/§59 rails)  
@@ -18,7 +18,7 @@
 | Scancel H4 | **50228030/031/096** already CANCELLED; live relaunch **50230336/337/339** CANCELLED |
 | Restore full-step | `compiled_decode.py` + cells restored from `3e0aacb7` (eager `_tail`, `mode=default`); sub-op default removed |
 | T5 track rule | T3 `required_pass` = **ks_parity** (greedy FAIL = documented drift) |
-| A5000 reseal | submitting via `scripts/dcc/t3_submit_reseal.sh a5000` |
+| A5000 reseal | **50230514** baseline + **50230515** compile (`t3-reseal-*-a5000`) PENDING |
 | 2080 reseal | after A5000 pair (≤2 concurrent GPU) |
 | Promote | pending harvest |
 
