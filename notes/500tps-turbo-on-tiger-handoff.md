@@ -1,8 +1,8 @@
 # §58 Turbo-on-Tiger (PRIMARY TRACK) — handoff
 
-**Status:** **C_VERIFY PASS (better than expect)** (2026-07-18)  
+**Status:** **C_VERIFY GATE PASS** (2026-07-18) — ratio **≪1.3×** (better than expect band)  
 **Strategy pivot:** turbo stacks on Tiger14n PR #120 `feat/compiled-decode`, **not** on optimized tip.  
-**Branch / WT:** `codex/turbo-on-tiger-pr120` @ **`0eb51365`**  
+**Branch / WT:** `codex/turbo-on-tiger-pr120` @ **`3641f39e`** (scaffold `447df085`)  
 **Local WT:** `/work/projects/Mapperatorinator-worktrees/turbo-on-tiger-pr120`  
 **DCC WT:** `/hpc/group/romerolab/imt11/projects/Mapperatorinator-worktrees/turbo-on-tiger-pr120`  
 **Base:** `w1/tiger14n-compiled-decode` / `d01cdd2799891f78c871ff5889cfbb6a661a9e46` (verified)  
@@ -13,57 +13,56 @@
 
 Port strict rejection-sampling turbo (§34) + keep-accepted-KV (`cache_position` rewind on bucketed StaticCache) + graphed draft chain onto tiger's decode loop. Teacher verify = **tiger `CUDAGraphDecoder` at q_len=K** (uniform HF path). **Do not** port §54 Stage B fused-kernel grind.
 
-Upstream posture: additive so this can later stack as a PR on #120 (when user asks).
+Upstream posture: additive so this can later stack as a PR on #120.
 
-## First gate — c_verify ratio — **SEALED**
+## First gate — c_verify ratio — **PASS**
 
 | Field | Value |
 | --- | --- |
-| Expect | **~1.1–1.3×** vs tiger q_len=1 (kill >1.35× class) |
+| Expect | **~1.1–1.3×** vs tiger q_len=1 (kill ≫1.3 without capture bug) |
 | Scout | `utils/s58_tiger_c_verify_scout.py` |
-| Job | **`50192694`** COMPLETED 00:00:31 · `gpu:2080:1` · RTX 2080 Ti |
-| Commit | `3641f39e` |
-| Artifact | `/work/imt11/Mapperatorinator/runs/s58-tiger-cverify-50192694/` |
+| Job | **`50192694`** COMPLETED 00:00:31 on **RTX 2080 Ti** @ `3641f39e` |
+| Metric | CUDA-event avg replay ms |
+| Artifacts | `/work/imt11/Mapperatorinator/runs/s58-tiger-cverify-50192694/` · local `notes/s58-artifacts/` |
 
-**Measured (CUDA-event avg, prefix=256, cache_len=768, fp16):**
+**Measured (2080 Ti, fp16, cache_len=768, prefix=256):**
 
 | K | c_verify ms | q1 ms | ratio | vs expect |
 | --- | ---: | ---: | ---: | --- |
-| 3 | **3.372** | **3.984** | **0.846×** | **PASS** (≪1.3; below 1.1 band = cheaper verify) |
-| 5 | **3.386** | **3.984** | **0.850×** | **PASS** |
+| **3** | **3.372** | **3.984** | **0.846×** | **PASS** (below 1.1 — better) |
+| 5 | 3.386 | 3.984 | 0.850× | **PASS** |
 
-**Verdict:** tiger uniform path has **no fused-kernel forfeiture** — K≈Q1 (slightly under). Gate clears; do not grind. Absolute Q1 ~4.0 ms matches W1 tiger-2080 ~229 TPS ballpark.
+Interpretation: on tiger's uniform StaticCache path, K-token verify is **not** the §48/§54 tax (1.67× / 1.41× on optimized fused stack). Cache-length attention dominates; widening q_len to γ is nearly free. Duplicate scout `50192778` canceled.
 
 ## Scaffold landed
 
 | Piece | Path | Notes |
 | --- | --- | --- |
 | q_len=K graph | `compiled_decode.CUDAGraphDecoder(q_len=…)` + `get_k_decoder` | q_len=1 production unchanged |
-| tiger verify | `turbo/tiger_verify.py` | persistent session; rewind after probe |
+| tiger verify helper | `turbo/tiger_verify.py` | persistent session; rewind after probe |
 | rejection | `turbo/rejection.py` | §34 Leviathan |
 | keep-KV | `turbo/kv_rollback.py` | O(γ) StaticCache zero |
-| draft chain scaffold | `turbo/draft_chain_graph.py` | tiger q_len=1 × γ + rewind; in-graph sample next |
-| engine scaffold | `turbo/engine.py` | preset; speculative window **not wired yet** |
+| engine scaffold | `turbo/engine.py` | preset; full window loop **not wired yet** |
+| draft chain scaffold | `turbo/draft_chain_graph.py` | pending tiger-native capture |
 
-## Next
+## Next gate
 
-1. **Wire speculative window** on tiger: draft propose → tiger `verify_k` → rejection → keep-KV rewind  
-2. Measure **in-loop E** + path-hit counters  
-3. Full-map `ms_per_map_token` + `cold_start_seconds` + `main_tps` (metric ruling)  
-4. Optional: A5000/Ada c_verify confirm (not blocking — 2080 already clears)
+1. **Wire speculative window** onto tiger decode: rejection + keep-KV + graphed draft chain (still no fused verify).  
+2. **In-loop E** (accepted/verify) on tiger teacher + draft.  
+3. Full-map `ms_per_map_token` + `cold_start_seconds` + `main_tps` (metric ruling).  
+4. Prefer A5000/Ada for song walls once §57b A5000 dumps drain (Turing q1 ~4 ms is not the production target).
 
 ## GPU coordination
 
-§57b on A5000 + this scout on 2080 = 2 GPU (at limit). Prefer 2080 for tiger microbenches while dumps run.
+§57b may hold A5000 — c_verify used **2080**. Keep ≤2 concurrent GPU with §57b.
 
 ## Do-not
 
 - Modify optimized tip `55949274` internals  
 - Port §54 fused mrow / Stage B verify grind onto tiger  
 - Claim 500 / merge to main from this track yet  
-- Fold relaxed acceptance into `turbo` (§34)  
-- Push to Tiger14n / PR #120 without explicit user request  
+- Fold relaxed acceptance into `turbo` (§34)
 
 ## Ruling
 
-Primary track = **turbo-on-tiger**. Tip remains frozen evidence, not the integration base. c_verify gate **PASS** @ **0.85×**.
+Primary track = **turbo-on-tiger**. c_verify gate **cleared** at **0.85×**. Tip remains frozen evidence, not the integration base.

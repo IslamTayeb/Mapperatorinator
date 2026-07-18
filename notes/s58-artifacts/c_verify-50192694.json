@@ -7,8 +7,15 @@
   "precision": "fp16",
   "window": {
     "prompt_len": 256,
-    "enc_shape": [1, 1024, 768],
-    "frames_shape": [1, 262016],
+    "enc_shape": [
+      1,
+      1024,
+      768
+    ],
+    "frames_shape": [
+      1,
+      262016
+    ],
     "audio": "/work/imt11/Mapperatorinator/data/salvalai.mp3"
   },
   "cache_len": 768,
@@ -45,8 +52,7 @@
   ],
   "best_k": 3,
   "best_ratio": 0.8464114782681254,
-  "gate": "c_verify / q1 expect ~1.1–1.3× on tiger uniform path",
+  "gate": "c_verify / q1 expect ~1.1\u20131.3\u00d7 on tiger uniform path",
   "note": "Tiger CUDAGraphDecoder q_len=K vs q_len=1. No fused verify. Optimized tip 55949274 frozen. No 500 claim.",
-  "campaign_tip_frozen": "55949274",
-  "job_id": "50192694"
+  "campaign_tip_frozen": "55949274"
 }
