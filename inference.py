@@ -3,6 +3,7 @@ import multiprocessing
 import sys
 
 import utils.excepthook  # noqa
+import os
 import os.path
 import uuid
 from functools import reduce
@@ -721,6 +722,32 @@ def main(args: InferenceConfig):
             auto_select_gamemode_model=False,
             fast_decoder_loop=args.fast_decoder_loop,
         )
+
+    # T3: warm EVERY decode bucket (compile-then-capture) in cold_start when enabled.
+    _warm = os.environ.get("MAPPERATORINATOR_WARM_ALL_BUCKETS", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+    _compile = os.environ.get("MAPPERATORINATOR_COMPILE_DECODE", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+    if args.fast_decoder_loop and args.device == "cuda" and (_warm or _compile):
+        from osuT5.osuT5.inference.compiled_decode import warmup_fast_decode_session
+
+        raw_len = (args.train.data.src_seq_len - 1) * args.train.model.spectrogram.hop_length
+        cfg = float(args.cfg_scale)
+        batch = 2 if cfg > 1 else 1
+        for label, m in (("map", model),) + (
+            (("timing", timing_model),) if timing_model is not None and timing_model is not model else ()
+        ):
+            print(f"T3 session warmup ({label})...")
+            warmup_fast_decode_session(
+                m,
+                cfg_scale=cfg,
+                batch_size=batch,
+                raw_seq_len=raw_len,
+                encoder_batch_size=min(16, max(1, int(args.max_batch_size))),
+                verbose=True,
+            )
 
     diff_model, diff_tokenizer, refine_model = None, None, None
     if args.generate_positions:

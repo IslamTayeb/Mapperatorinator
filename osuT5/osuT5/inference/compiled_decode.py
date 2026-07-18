@@ -23,6 +23,17 @@ T1 safety rails (§59):
   - Graph+StaticCache entries are LRU-evicted under a VRAM budget (8–12GB cards).
   - CFG left-pad prompt masks are preserved into decode (stock HF extends the 2D
     pad mask; the prior graph path passed mask=None and attended pad K/V).
+
+T3 compile-then-capture (pivot package):
+  - Optional ``torch.compile`` of the shape-static decode step **before** CUDA
+    graph capture (``fullgraph=True``, ``dynamic=False``,
+    ``mode="max-autotune-no-cudagraphs"``). Never ``reduce-overhead`` near
+    manual capture (§22 Inductor-in-capture lesson).
+  - Warm every bucket (incl. any future turbo ``q_len``) before its capture.
+  - Shape-static per-token sampling tail (monotonic hoist + temperature) is
+    also compiled when enabled.
+  - Opt-in via ``MAPPERATORINATOR_COMPILE_DECODE=1`` (default off so tiger
+    plain-graph behavior is unchanged unless T3 jobs enable it).
 """
 from __future__ import annotations
 
@@ -36,12 +47,17 @@ from collections import OrderedDict
 import torch
 import torch.nn.functional as F
 from transformers.modeling_outputs import BaseModelOutput
-from transformers import LogitsProcessorList
+from transformers import LogitsProcessorList, TemperatureLogitsWarper
 
 from .cache_utils import get_cache
 from .server import get_eos_token_id, _build_generation_stats, build_logits_processors, model_generate
 from ..event import ContextType, EventType
 from .logit_processors import MonotonicTimeShiftLogitsProcessor
+
+# T3: never use reduce-overhead next to manual CUDAGraph capture.
+_COMPILE_MODE = "max-autotune-no-cudagraphs"
+_COMPILE_WARMUP_ITERS = 5
+_EAGER_CAPTURE_WARMUP_ITERS = 3
 
 
 class CaptureError(RuntimeError):
@@ -53,6 +69,67 @@ def _env_flag(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def compile_decode_enabled() -> bool:
+    """T3 opt-in: compile-then-capture decode step + sampling tail."""
+    return _env_flag("MAPPERATORINATOR_COMPILE_DECODE", default=False)
+
+
+def _pin_inductor_cache_dir() -> str | None:
+    """Pin TORCHINDUCTOR_CACHE_DIR per install when unset (cold-start hygiene).
+
+    Does not ship arch/driver-bound artifacts; only uses an existing install-local
+    cache root if the operator provided one via env, else a job-local default under
+    TMPDIR / TORCH_EXTENSIONS_DIR parent.
+    """
+    existing = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+    if existing:
+        os.makedirs(existing, exist_ok=True)
+        return existing
+    base = os.environ.get("TORCH_EXTENSIONS_DIR") or os.environ.get("TMPDIR") or "/tmp"
+    cache = os.path.join(base, "torchinductor")
+    os.makedirs(cache, exist_ok=True)
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = cache
+    return cache
+
+
+def _compile_callable(fn, *, label: str):
+    """Compile ``fn`` with the binding T3 knobs; regional fallback on failure.
+
+    NEVER uses ``reduce-overhead`` (conflicts with manual CUDAGraph capture).
+    """
+    _pin_inductor_cache_dir()
+    kwargs: dict = {
+        "fullgraph": True,
+        "dynamic": False,
+        "mode": _COMPILE_MODE,
+    }
+    try:
+        compiled = torch.compile(fn, **kwargs)
+        return compiled, {"mode": _COMPILE_MODE, "fullgraph": True, "fallback": None}
+    except Exception as e:
+        warnings.warn(
+            f"T3 torch.compile({label}) fullgraph/{_COMPILE_MODE} failed ({e!r}); "
+            "trying regional/default fallback (still no reduce-overhead).",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    # Regional / softer fallback — still shape-static intent, no cudagraphs-in-compile.
+    try:
+        compiled = torch.compile(fn, fullgraph=False, dynamic=False, mode="default")
+        return compiled, {
+            "mode": "default",
+            "fullgraph": False,
+            "fallback": "regional_or_default",
+        }
+    except Exception as e:
+        warnings.warn(
+            f"T3 torch.compile({label}) fallback also failed ({e!r}); using eager.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return fn, {"mode": "eager", "fullgraph": False, "fallback": "eager"}
 
 
 def _graph_cache_budget_bytes() -> int:
@@ -226,6 +303,8 @@ class _IncrementalMonotonicMask:
         self.ts_vocab = torch.arange(self.ts_start, self.ts_end, device=device)
         self.last_ts_value = None  # (batch,) long
         self.active = None         # (batch,) bool
+        self._compiled_tail = None
+        self._compiled_tail_meta = None
 
     def init_from_prompt(self, input_ids):
         device = input_ids.device
@@ -251,6 +330,53 @@ class _IncrementalMonotonicMask:
         invalid = (self.ts_vocab.unsqueeze(0) < thresh) & self.active.unsqueeze(1)
         scores[:, self.ts_start:self.ts_end].masked_fill_(invalid, -float('inf'))
         return scores
+
+    def apply_with_temperature(self, scores, temperature: float):
+        """Mono mask + uniform temperature (shape-static (B, V) sampling tail)."""
+        if self._compiled_tail is not None:
+            return self._compiled_tail(
+                scores,
+                self.ts_vocab,
+                self.last_ts_value,
+                self.active,
+                self.ts_start,
+                self.ts_end,
+                float(temperature),
+            )
+        out = self.apply(scores)
+        if temperature != 1.0:
+            out = out / temperature
+        return out
+
+    def ensure_compiled_tail(self, *, batch_size: int, vocab_size: int):
+        """Compile shape-static mono+temperature once (T3 sampling tail)."""
+        if self._compiled_tail is not None or not compile_decode_enabled():
+            return
+        if not torch.cuda.is_available():
+            return
+
+        def _tail(scores, ts_vocab, last_ts_value, active, ts_start, ts_end, temperature):
+            thresh = (ts_start + last_ts_value).unsqueeze(1)
+            invalid = (ts_vocab.unsqueeze(0) < thresh) & active.unsqueeze(1)
+            out = scores.clone()
+            out[:, ts_start:ts_end].masked_fill_(invalid, -float("inf"))
+            if temperature != 1.0:
+                out = out / temperature
+            return out
+
+        compiled, meta = _compile_callable(_tail, label="sampling_tail")
+        # Warm outside any CUDAGraph capture at the production (B, V) shape.
+        device = self.ts_vocab.device
+        b = max(1, int(batch_size))
+        v = max(int(vocab_size), int(self.ts_end) + 1)
+        warm_scores = torch.zeros((b, v), dtype=torch.float32, device=device)
+        last = torch.zeros((b,), dtype=torch.long, device=device)
+        active = torch.zeros((b,), dtype=torch.bool, device=device)
+        for _ in range(_COMPILE_WARMUP_ITERS):
+            compiled(warm_scores, self.ts_vocab, last, active, self.ts_start, self.ts_end, 1.0)
+        torch.cuda.synchronize()
+        self._compiled_tail = compiled
+        self._compiled_tail_meta = meta
 
     def update(self, tok):
         t = tok.reshape(-1)
@@ -293,9 +419,15 @@ class CUDAGraphDecoder:
         self._graph = None
         self._cache = None  # set at capture; reused (reset) across windows
         self._pad_aware = False
+        self._compiled_step = None
+        self._compile_meta = None
 
     def capture(self, cache, *, pad_aware: bool = False, cache_len: int | None = None):
         """Warmup + capture the decode forward into a CUDA graph.
+
+        T3: when ``MAPPERATORINATOR_COMPILE_DECODE=1``, Inductor-compile the
+        shape-static step **before** capture (warm outside the graph), then
+        capture the already-compiled kernels. Never ``reduce-overhead``.
 
         ``pad_aware=True`` keeps a full-length 2D decoder attention mask in the
         graph so left-pad (CFG) slots stay masked every replay. The 2D mask is
@@ -348,18 +480,33 @@ class CUDAGraphDecoder:
             else:
                 self.static_logits.copy_(outputs.logits.float())
 
-        # Warmup on a side stream (required for cudagraph capture safety)
+        # Eager warmup on a side stream (required for cudagraph capture safety).
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
-            for _ in range(3):
+            for _ in range(_EAGER_CAPTURE_WARMUP_ITERS):
                 forward_only()
         torch.cuda.current_stream().wait_stream(s)
 
-        # Capture
+        step_fn = forward_only
+        if compile_decode_enabled():
+            # §22: Inductor must finish compiling/warming OUTSIDE capture.
+            compiled, meta = _compile_callable(forward_only, label=f"decode_q{self.q_len}")
+            self._compiled_step = compiled
+            self._compile_meta = meta
+            s2 = torch.cuda.Stream()
+            s2.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s2):
+                for _ in range(_COMPILE_WARMUP_ITERS):
+                    compiled()
+            torch.cuda.current_stream().wait_stream(s2)
+            torch.cuda.synchronize()
+            step_fn = compiled
+
+        # Capture (plain CUDAGraph — never reduce-overhead / cudagraphs-in-compile).
         self._graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self._graph):
-            forward_only()
+            step_fn()
 
     def set_encoder_hidden(self, enc_hidden):
         """Copy a new encoder hidden state into the static buffer (per window)."""
@@ -394,6 +541,8 @@ class CUDAGraphDecoder:
         self._graph = None
         self._cache = None
         self._static_inputs = {}
+        self._compiled_step = None
+        self._compile_meta = None
 
 
 # Module-level LRU caches of (decoder, cache, nbytes) keyed by shape signature.
@@ -575,6 +724,123 @@ def clear_decoder_caches() -> dict:
     return {"q1": _cache_stats("q1"), "k": _cache_stats("k")}
 
 
+def warm_all_decode_buckets(
+    model,
+    batch_size: int,
+    cfg_scale: float,
+    enc_shape,
+    dtype,
+    *,
+    q_lens: tuple[int, ...] = (1,),
+    pad_aware: bool = False,
+    buckets: tuple[int, ...] | None = None,
+) -> dict:
+    """Compile+capture every cache bucket (and each ``q_len``) before measured work.
+
+    Binding T3 rule: warm EVERY bucket — including any future turbo ``q_len`` —
+    before its capture. Call from session cold-start (outside measured map).
+    T4 turbo remains PARKED; pass extra ``q_lens`` only when those graphs exist.
+    """
+    require_sdpa_for_fast_path(model)
+    neutralize_dynamic_rope(model)
+    model_max = int(model.config.max_target_positions)
+    if buckets is None:
+        buckets = tuple(b for b in _CACHE_BUCKETS if b <= model_max)
+        if model_max not in buckets:
+            buckets = buckets + (model_max,)
+    warmed = []
+    t0 = time.perf_counter()
+    seen = set()
+    for cache_len in buckets:
+        cl = min(int(cache_len), model_max)
+        if cl in seen:
+            continue
+        seen.add(cl)
+        for q_len in q_lens:
+            q_len = int(q_len)
+            if q_len < 1:
+                raise ValueError("q_len must be >= 1")
+            if q_len == 1:
+                _get_decoder(
+                    model, batch_size, cfg_scale, enc_shape, dtype, cl,
+                    pad_aware=pad_aware,
+                )
+            else:
+                get_k_decoder(model, batch_size, cfg_scale, enc_shape, dtype, cl, q_len)
+            warmed.append({"cache_len": cl, "q_len": q_len, "pad_aware": bool(pad_aware)})
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return {
+        "warmed": warmed,
+        "compile_decode": compile_decode_enabled(),
+        "elapsed_s": time.perf_counter() - t0,
+        "inductor_cache_dir": os.environ.get("TORCHINDUCTOR_CACHE_DIR"),
+        "cache_stats": {"q1": _cache_stats("q1"), "k": _cache_stats("k")},
+    }
+
+
+def warmup_fast_decode_session(
+    model,
+    *,
+    cfg_scale: float = 1.0,
+    batch_size: int = 1,
+    buckets: tuple[int, ...] | None = None,
+    q_lens: tuple[int, ...] = (1,),
+    raw_seq_len: int | None = None,
+    encoder_batch_size: int = 16,
+    verbose: bool = True,
+) -> dict:
+    """Cold-start: encoder cudnn warm + compile-then-capture every decode bucket.
+
+    Counts as cold_start / load_jit proxy. Capture failures raise (no silent latch).
+    """
+    from .server import precompute_encoder_outputs
+
+    if not torch.cuda.is_available():
+        raise CaptureError("session warmup requires CUDA")
+    neutralize_dynamic_rope(model)
+    model.eval()
+    if raw_seq_len is None:
+        raise CaptureError(
+            "warmup_fast_decode_session requires raw_seq_len "
+            "(pass train src_seq_len-1 * hop_length from inference)"
+        )
+
+    t0 = time.perf_counter()
+    frames = torch.zeros((max(1, encoder_batch_size), raw_seq_len), dtype=torch.float32, device="cpu")
+    hidden = precompute_encoder_outputs(
+        model, frames, {}, None, batch_size=encoder_batch_size,
+    )
+    enc_shape = (batch_size, int(hidden.shape[1]), int(hidden.shape[2]))
+    encoder_s = time.perf_counter() - t0
+
+    t1 = time.perf_counter()
+    warm = warm_all_decode_buckets(
+        model,
+        batch_size,
+        cfg_scale,
+        enc_shape,
+        model.dtype,
+        q_lens=q_lens,
+        buckets=buckets,
+    )
+    capture_s = time.perf_counter() - t1
+    stats = {
+        "encoder_warmup_seconds": encoder_s,
+        "capture_warmup_seconds": capture_s,
+        "enc_shape": list(enc_shape),
+        "raw_seq_len": raw_seq_len,
+        **warm,
+    }
+    if verbose:
+        print(
+            f"Session warmup: encoder {encoder_s:.2f}s + "
+            f"capture/compile {capture_s:.2f}s over {len(warm.get('warmed') or [])} "
+            f"bucket entries (compile_decode={compile_decode_enabled()})"
+        )
+    return stats
+
+
 def _reset_cache(cache):
     """Reset the cache buffers for reuse (avoid realloc).
 
@@ -682,13 +948,28 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
     # masker. Only safe without CFG (CFG merges the 2-stream logits before the
     # monotonic mask and the merged-batch state bookkeeping differs); with CFG we
     # keep the stock O(T^2) processor.
+    # T3: also hoist uniform TemperatureLogitsWarper into the compiled mono+temp
+    # sampling tail when present (v32: monotonic hoist + temperature only).
     mono_mask = None
+    hoist_temperature = None
     if cfg_scale <= 1:
         rest = LogitsProcessorList([p for p in logits_processor_list
                                     if not isinstance(p, MonotonicTimeShiftLogitsProcessor)])
         if len(rest) != len(logits_processor_list):  # one was actually removed
             mono_mask = _IncrementalMonotonicMask(tokenizer, device)
             logits_processor_list = rest
+        if (
+            compile_decode_enabled()
+            and mono_mask is not None
+            and len(logits_processor_list) == 1
+            and isinstance(logits_processor_list[0], TemperatureLogitsWarper)
+        ):
+            hoist_temperature = float(logits_processor_list[0].temperature)
+            logits_processor_list = LogitsProcessorList()
+            mono_mask.ensure_compiled_tail(
+                batch_size=decoder_input_ids.shape[0],
+                vocab_size=int(model.config.vocab_size),
+            )
 
     prompt_len = decoder_input_ids.shape[1]
     b0 = decoder_input_ids.shape[0]
@@ -774,12 +1055,17 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
         # then replay for the next position. The EOS token is kept (appended) so
         # downstream trimming matches HF.
         while cur_len < win_max:
-            if mono_mask is not None:
-                last_logits = mono_mask.apply(last_logits)
-            proc_logits = logits_processor_list(id_buffer[:, :cur_len], last_logits)
-            # Temperature is already applied by logits_processor_list, so _sample
-            # must NOT re-apply it — pass 1.0. It still handles top-p / top-k, which
-            # the processor list omits (matching model.generate's sampling step).
+            if mono_mask is not None and hoist_temperature is not None:
+                last_logits = mono_mask.apply_with_temperature(last_logits, hoist_temperature)
+                proc_logits = last_logits
+            else:
+                if mono_mask is not None:
+                    last_logits = mono_mask.apply(last_logits)
+                proc_logits = logits_processor_list(id_buffer[:, :cur_len], last_logits)
+            # Temperature is already applied by logits_processor_list (or the
+            # compiled mono+temp tail), so _sample must NOT re-apply it — pass 1.0.
+            # It still handles top-p / top-k, which the processor list omits
+            # (matching model.generate's sampling step).
             next_token = _sample(proc_logits, do_sample, top_p, top_k, 1.0)
 
             id_buffer[:, cur_len] = next_token.reshape(b0)
