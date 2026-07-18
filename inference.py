@@ -421,6 +421,46 @@ def should_generate_timing_context(args: InferenceConfig, output_type: list[Cont
     )
 
 
+def _timing_window_fractions(args: InferenceConfig) -> tuple[float, float]:
+    """Effective (lookback, lookahead) for the timing-only pass (T2 stride tune)."""
+    lb = args.lookback if getattr(args, "timing_lookback", None) is None else float(args.timing_lookback)
+    la = args.lookahead if getattr(args, "timing_lookahead", None) is None else float(args.timing_lookahead)
+    return lb, la
+
+
+def _timing_stride_matches_map(args: InferenceConfig) -> bool:
+    tlb, tla = _timing_window_fractions(args)
+    return abs(tlb - args.lookback) < 1e-9 and abs(tla - args.lookahead) < 1e-9
+
+
+def _session_warmup_models(args: InferenceConfig, model, timing_model=None, verbose: bool = True) -> None:
+    """T2: hoist encoder + CUDA-graph capture into cold_start (persistent session)."""
+    if not getattr(args, "session_warmup_captures", False):
+        return
+    if not args.fast_decoder_loop:
+        return
+    from osuT5.osuT5.inference.compiled_decode import warmup_fast_decode_session
+
+    raw_len = (args.train.data.src_seq_len - 1) * args.train.model.spectrogram.hop_length
+    cfg = float(args.cfg_scale)
+    # Graph capture uses doubled batch under CFG; warm the effective batch.
+    batch = 2 if cfg > 1 else 1
+    targets = [("map", model)]
+    if timing_model is not None and timing_model is not model:
+        targets.append(("timing", timing_model))
+    for label, m in targets:
+        if verbose:
+            print(f"Session warmup ({label} model)...")
+        warmup_fast_decode_session(
+            m,
+            cfg_scale=cfg,
+            batch_size=batch,
+            raw_seq_len=raw_len,
+            encoder_batch_size=min(16, max(1, int(args.max_batch_size))),
+            verbose=verbose,
+        )
+
+
 def should_load_separate_timing_model(args: InferenceConfig, output_type: list[ContextType] | None = None) -> bool:
     output_type = args.output_type if output_type is None else output_type
     needs_generated_timing = (
@@ -501,10 +541,24 @@ def generate(
         if ContextType.TIMING in output_type:
             output_type.remove(ContextType.TIMING)
     elif should_generate_timing_context(args, output_type):
-        # Generate timing context with the base model and reuse it for the main generation pass.
-        timing_processor = Processor(args, timing_model, timing_tokenizer)
+        # Generate timing context with the base (or shared) model; T2 timing-stride
+        # may use coarser windows than the map pass.
+        tlb, tla = _timing_window_fractions(args)
+        timing_preprocessor = Preprocessor(args, parallel=args.parallel, lookback=tlb, lookahead=tla)
+        timing_sequences = timing_preprocessor.segment(audio)
+        timing_processor = Processor(args, timing_model, timing_tokenizer, lookback=tlb, lookahead=tla)
+        if getattr(args, "encoder_precompute_dedupe", False):
+            timing_processor.encoder_precompute_dedupe = True
+            processor.encoder_precompute_dedupe = True
+        if verbose and (tlb != args.lookback or tla != args.lookahead):
+            n_map = sequences[0].shape[0]
+            n_tim = timing_sequences[0].shape[0]
+            print(
+                f"Timing-stride tune: lookback={tlb}, lookahead={tla} "
+                f"→ {n_tim} timing windows (map uses {n_map})"
+            )
         timing_events, timing_times = timing_processor.generate(
-            sequences=sequences,
+            sequences=timing_sequences,
             generation_config=generation_config,
             in_context=[ContextType.NONE],
             out_context=[ContextType.TIMING],
@@ -523,6 +577,8 @@ def generate(
 
     # Generate beatmap
     if len(output_type) > 0:
+        if getattr(args, "encoder_precompute_dedupe", False):
+            processor.encoder_precompute_dedupe = True
         result = processor.generate(
             sequences=sequences,
             generation_config=generation_config,
@@ -721,6 +777,9 @@ def main(args: InferenceConfig):
             diff_model.forward = torch.compile(diff_model.forward, mode="reduce-overhead", fullgraph=True)
 
     generation_config, beatmap_config = get_config(args)
+
+    # T2: hoist one-time warmup/captures into cold_start (before measured generate).
+    _session_warmup_models(args, model, timing_model=timing_model, verbose=True)
 
     return generate(
         args,

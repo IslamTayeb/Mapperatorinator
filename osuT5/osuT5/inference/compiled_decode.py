@@ -17,7 +17,9 @@ draw order differs, and the batched encoder precompute perturbs the encoder
 hidden states at the last bit, so sampled tokens can diverge. Greedy decoding
 matches HF token-for-token.
 """
+import os
 import time
+import warnings
 import torch
 import torch.nn.functional as F
 from transformers.modeling_outputs import BaseModelOutput
@@ -254,6 +256,91 @@ def _get_decoder(model, batch_size, cfg_scale, enc_shape, dtype, cache_len):
     return _decoder_cache[key]
 
 
+@torch.no_grad()
+def warmup_fast_decode_session(
+    model,
+    *,
+    cfg_scale: float = 1.0,
+    batch_size: int = 1,
+    buckets: tuple[int, ...] | None = None,
+    raw_seq_len: int | None = None,
+    encoder_batch_size: int = 16,
+    verbose: bool = True,
+) -> dict:
+    """Hoist one-time encoder cudnn + CUDA-graph captures out of the measured map.
+
+    Persistent-session prepare: run a tiny batched encoder forward (warms cudnn /
+    autotune) then capture the common StaticCache decode buckets so the first
+    real window does not pay capture inside full-map wall. Counts as cold_start.
+
+    Does **not** silently latch the fast path off — capture failures raise
+    ``CaptureError`` to the caller (T2 gate; pair with SDPA / T1 rails).
+    """
+    from .server import precompute_encoder_outputs
+
+    if not torch.cuda.is_available():
+        raise CaptureError("session warmup requires CUDA")
+
+    neutralize_dynamic_rope(model)
+    model.eval()
+    device = model.device
+    dtype = model.dtype
+
+    # Raw audio length for one spectrogram window (matches Preprocessor).
+    if raw_seq_len is None:
+        raise CaptureError(
+            "warmup_fast_decode_session requires raw_seq_len "
+            "(pass train src_seq_len-1 * hop_length from inference)"
+        )
+
+    t0 = time.perf_counter()
+    frames = torch.zeros((max(1, encoder_batch_size), raw_seq_len), dtype=torch.float32, device="cpu")
+    hidden = precompute_encoder_outputs(
+        model, frames, {}, None, batch_size=encoder_batch_size,
+    )
+    enc_len = int(hidden.shape[1])
+    enc_dim = int(hidden.shape[2])
+    enc_shape = (batch_size, enc_len, enc_dim)
+    encoder_s = time.perf_counter() - t0
+
+    # Capture common buckets (and the model max) so first-window capture is free.
+    model_max = int(model.config.max_target_positions)
+    if buckets is None:
+        buckets = tuple(b for b in _CACHE_BUCKETS if b <= model_max) + (
+            () if model_max in _CACHE_BUCKETS else (model_max,)
+        )
+    # Deduplicate while preserving order
+    seen = set()
+    warm_buckets = []
+    for b in buckets:
+        bb = min(int(b), model_max)
+        if bb not in seen:
+            seen.add(bb)
+            warm_buckets.append(bb)
+
+    t1 = time.perf_counter()
+    for cache_len in warm_buckets:
+        _get_decoder(model, batch_size, cfg_scale, enc_shape, dtype, cache_len)
+    torch.cuda.synchronize(device)
+    capture_s = time.perf_counter() - t1
+
+    stats = {
+        "encoder_warmup_seconds": encoder_s,
+        "capture_warmup_seconds": capture_s,
+        "buckets": warm_buckets,
+        "enc_shape": list(enc_shape),
+        "raw_seq_len": raw_seq_len,
+    }
+    if verbose:
+        print(
+            f"Session warmup: encoder {encoder_s:.2f}s + "
+            f"capture {capture_s:.2f}s over buckets {warm_buckets} "
+            f"(enc_shape={tuple(enc_shape)})"
+        )
+    return stats
+
+
+
 def _reset_cache(cache):
     """Reset the cache buffers for reuse (avoid realloc).
 
@@ -432,9 +519,21 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
             cache_len = _bucket_ceil(hard_cap, model_max)
             generated, truncated = _run_window(cache_len)
     except CaptureError as e:
+        # T2 gate: do not silently latch the fast path OFF process-wide unless
+        # explicitly allowed (T1 rails also force SDPA so capture should work).
+        allow = os.environ.get("MAPPERATORINATOR_ALLOW_CAPTURE_FALLBACK", "").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+        msg = (
+            f"CUDA graph capture failed ({e}). "
+            "Set MAPPERATORINATOR_ALLOW_CAPTURE_FALLBACK=1 to fall back to stock generate "
+            "for this process; otherwise this is a hard error (no silent latch)."
+        )
+        if not allow:
+            raise CaptureError(msg) from e
         _capture_unsupported = True
-        print(f"CUDA graph capture is not supported on this system; "
-              f"falling back to the stock generate loop. ({e})")
+        warnings.warn(msg, RuntimeWarning, stacklevel=2)
+        print(msg)
         return model_generate(model, tokenizer, *fallback_args)
     elapsed = time.perf_counter() - start_time
 

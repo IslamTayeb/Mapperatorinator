@@ -63,6 +63,10 @@ use_server: false        # Use server for optimized multiprocess inference (adds
 max_batch_size: 16       # Maximum batch size for inference
 fast_decoder_loop: false # Replace HF generate with a CUDA-graph decode loop; ~2-6x faster decode (fp16/bf16 > fp32), quality-equivalent. Requires CUDA; falls back to the stock loop where unsupported.
 super_timing_fast_loop: false # Use the fast decoder loop for super timing instead of the batched-parallel path; benchmark on your GPU before enabling
+session_warmup_captures: false # T2: hoist CUDA-graph + encoder warmup out of measured map
+encoder_precompute_dedupe: false # T2: reuse encoder precompute when model+frames+cond match
+timing_lookback: null # T2: timing-only lookback (null = use lookback)
+timing_lookahead: null # T2: timing-only lookahead (null = use lookahead)
 resnap_events: true      # Resnap events to the timing after generation
 snap_near_perfect_overlaps: true  # Snap nearly overlapping positions to each other
 

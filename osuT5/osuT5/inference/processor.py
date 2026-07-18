@@ -14,6 +14,54 @@ from tqdm import tqdm
 from config import InferenceConfig
 from .compiled_decode import model_generate_compiled
 from .server import InferenceClient, model_generate, model_forward, precompute_encoder_outputs
+
+# T2: process-wide encoder precompute cache keyed by (model id, frames fingerprint,
+# conditioning). Lets timing→map reuse when the same model + same windows reappear.
+_ENCODER_PRECOMPUTE_CACHE: dict[tuple, torch.Tensor] = {}
+_ENCODER_PRECOMPUTE_CACHE_HITS = 0
+_ENCODER_PRECOMPUTE_CACHE_MISSES = 0
+
+
+def _frames_fingerprint(frames: torch.Tensor) -> tuple:
+    """Cheap content fingerprint for encoder-cache keys (CPU float32 windows)."""
+    flat = frames.detach().float().cpu().contiguous()
+    n = int(flat.numel())
+    if n == 0:
+        return (tuple(flat.shape), 0.0, 0.0, 0.0)
+    # Sample corners + total sum — enough to distinguish timing vs map strides.
+    return (
+        tuple(int(s) for s in flat.shape),
+        float(flat.sum().item()),
+        float(flat.view(-1)[0].item()),
+        float(flat.view(-1)[n // 2].item()),
+        float(flat.view(-1)[-1].item()),
+    )
+
+
+def _cond_fingerprint(cond_kwargs: dict, song_positions) -> tuple:
+    parts = []
+    for k in ("beatmap_idx", "difficulty", "mapper_idx"):
+        v = cond_kwargs.get(k)
+        if v is None:
+            parts.append((k, None))
+        elif torch.is_tensor(v):
+            parts.append((k, tuple(v.detach().float().cpu().flatten().tolist()[:8]), int(v.numel())))
+        else:
+            parts.append((k, v))
+    if song_positions is None:
+        parts.append(("song_position", None))
+    else:
+        sp = song_positions.detach().float().cpu()
+        parts.append(
+            (
+                "song_position",
+                tuple(sp.shape),
+                float(sp.sum().item()),
+                float(sp.view(-1)[0].item()),
+                float(sp.view(-1)[-1].item()),
+            )
+        )
+    return tuple(parts)
 from ..dataset.osu_parser import OsuParser
 from ..dataset.data_utils import (update_event_times, remove_events_of_type, get_hold_note_ratio,
                                   get_scroll_speed_ratio, get_hitsounded_status, calculate_difficulty)
@@ -70,8 +118,12 @@ def generation_config_from_beatmap(beatmap: Beatmap, beatmap_path, tokenizer: Op
 
 
 class Processor(object):
-    def __init__(self, args: InferenceConfig, model: Mapperatorinator | InferenceClient, tokenizer: Tokenizer, cfg_scale: float = None):
-        """Model inference stage that processes sequences."""
+    def __init__(self, args: InferenceConfig, model: Mapperatorinator | InferenceClient, tokenizer: Tokenizer, cfg_scale: float = None,
+                 lookback: float | None = None, lookahead: float | None = None):
+        """Model inference stage that processes sequences.
+
+        Optional ``lookback`` / ``lookahead`` override ``args`` (T2 timing-stride).
+        """
         self.device = args.device
         self.precision = args.precision
         self.args = args
@@ -83,10 +135,14 @@ class Processor(object):
         self.sample_rate = args.train.model.spectrogram.sample_rate
         self.samples_per_sequence = self.frame_seq_len * self.frame_size
         self.miliseconds_per_sequence = self.samples_per_sequence * MILISECONDS_PER_SECOND / self.sample_rate
-        self.lookback_time = args.lookback * self.miliseconds_per_sequence
+        lb = args.lookback if lookback is None else float(lookback)
+        la = args.lookahead if lookahead is None else float(lookahead)
+        self.lookback = lb
+        self.lookahead = la
+        self.lookback_time = lb * self.miliseconds_per_sequence
         self.lookback_time_range = range(tokenizer.event_start[EventType.TIME_SHIFT], tokenizer.encode(Event(EventType.TIME_SHIFT, int(self.lookback_time / MILISECONDS_PER_STEP))))
-        self.lookahead_max_time = (1 - args.lookahead) * self.miliseconds_per_sequence
-        self.lookahead_time = args.lookahead * self.miliseconds_per_sequence
+        self.lookahead_max_time = (1 - la) * self.miliseconds_per_sequence
+        self.lookahead_time = la * self.miliseconds_per_sequence
         self.lookahead_time_range = range(tokenizer.encode(Event(EventType.TIME_SHIFT, int(self.lookahead_max_time / MILISECONDS_PER_STEP))), tokenizer.event_end[EventType.TIME_SHIFT])
         self.eos_time = (1 - args.train.data.lookahead) * self.miliseconds_per_sequence
         self.center_pad_decoder = args.train.data.center_pad_decoder
@@ -157,6 +213,8 @@ class Processor(object):
         # InferenceClient this flag lives on the server instead.
         self.fast_decoder_loop = args.fast_decoder_loop
         self.last_generation_stats: dict[str, float | int] | None = None
+        # T2 opt-in: reuse process-wide encoder precompute when frames+cond match.
+        self.encoder_precompute_dedupe = bool(getattr(args, "encoder_precompute_dedupe", False))
 
     def model_generate(self, model_kwargs, **generate_kwargs: Any) -> Any:
         generate_kwargs2 = generate_kwargs | dict(
@@ -356,6 +414,7 @@ class Processor(object):
         t0 = _time.perf_counter() if verbose else 0
         if verbose:
             print(f"Precomputing encoder outputs for {n_windows} windows...")
+        cache_hit = False
         if isinstance(self.model, InferenceClient):
             # The client doesn't own the model, so the server precomputes.
             # Conditioning is expanded per window because the server may split
@@ -366,12 +425,34 @@ class Processor(object):
                 precompute_kwargs["song_position"] = song_positions
             enc_hidden = self.model.precompute_encoder(precompute_kwargs)  # (N, L_enc, D)
         else:
-            with torch.no_grad():
-                enc_hidden = precompute_encoder_outputs(
-                    self.model, all_frames, cond_kwargs, song_positions,
-                    batch_size=self.max_batch_size,
+            global _ENCODER_PRECOMPUTE_CACHE_HITS, _ENCODER_PRECOMPUTE_CACHE_MISSES
+            if self.encoder_precompute_dedupe:
+                cache_key = (
+                    id(self.model),
+                    _frames_fingerprint(all_frames),
+                    _cond_fingerprint(cond_kwargs, song_positions),
                 )
-        if verbose:
+                cached = _ENCODER_PRECOMPUTE_CACHE.get(cache_key)
+                if cached is not None:
+                    enc_hidden = cached
+                    _ENCODER_PRECOMPUTE_CACHE_HITS += 1
+                    cache_hit = True
+                    if verbose:
+                        print(
+                            f"Encoder precompute: CACHE HIT "
+                            f"(hits={_ENCODER_PRECOMPUTE_CACHE_HITS}, "
+                            f"misses={_ENCODER_PRECOMPUTE_CACHE_MISSES})"
+                        )
+            if not cache_hit:
+                with torch.no_grad():
+                    enc_hidden = precompute_encoder_outputs(
+                        self.model, all_frames, cond_kwargs, song_positions,
+                        batch_size=self.max_batch_size,
+                    )
+                if self.encoder_precompute_dedupe:
+                    _ENCODER_PRECOMPUTE_CACHE[cache_key] = enc_hidden
+                    _ENCODER_PRECOMPUTE_CACHE_MISSES += 1
+        if verbose and not cache_hit:
             print(f"Encoder precompute: {_time.perf_counter() - t0:.2f}s "
                   f"({(_time.perf_counter() - t0) / n_windows * 1000:.1f} ms/window)")
 

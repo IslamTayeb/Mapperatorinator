@@ -78,6 +78,11 @@ class InferenceConfig:
     snap_near_perfect_overlaps: bool = True  # Snap nearly overlapping positions to each other
     fast_decoder_loop: bool = False  # Replace HF generate with a CUDA-graph decode loop; ~2-6x faster decode (fp16/bf16 > fp32), quality-equivalent. Requires CUDA; falls back to the stock loop where unsupported.
     super_timing_fast_loop: bool = False  # Use the fast decoder loop for super timing instead of the batched-parallel path. Separate from fast_decoder_loop because super timing's parallel path may be faster on some GPUs; benchmark before enabling.
+    # T2 certain full-map wins (opt-in; see notes/500tps-t2-fullmap-wins-handoff.md)
+    session_warmup_captures: bool = False  # Hoist CUDA-graph capture + encoder cudnn warmup out of measured map into cold_start (persistent session).
+    encoder_precompute_dedupe: bool = False  # Same-model TIMING+MAP(+SV) single generate → one encoder precompute (requires matching timing/map stride).
+    timing_lookback: Optional[float] = None  # Timing-only lookback; None = use lookback. Larger stride (smaller lookback+lookahead) → fewer timing windows.
+    timing_lookahead: Optional[float] = None  # Timing-only lookahead; None = use lookahead.
 
     # Metadata settings
     bpm: Optional[int] = None  # Beats per minute of input audio

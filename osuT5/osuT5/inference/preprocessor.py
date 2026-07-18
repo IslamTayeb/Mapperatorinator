@@ -9,20 +9,41 @@ from ..dataset.data_utils import load_audio_file, MILISECONDS_PER_SECOND
 
 
 class Preprocessor(object):
-    def __init__(self, args: InferenceConfig, parallel: bool = False):
-        """Preprocess audio data into sequences."""
+    def __init__(
+            self,
+            args: InferenceConfig,
+            parallel: bool = False,
+            lookback: float | None = None,
+            lookahead: float | None = None,
+    ):
+        """Preprocess audio data into sequences.
+
+        Optional ``lookback`` / ``lookahead`` override ``args`` (T2 timing-stride).
+        """
         self.frame_seq_len = args.train.data.src_seq_len - 1
         self.frame_size = args.train.data.hop_length
         self.sample_rate = args.train.data.sample_rate
         self.samples_per_sequence = self.frame_seq_len * self.frame_size
-        self.sequence_stride = int(self.samples_per_sequence * (1 - args.lookback - args.lookahead))
+        lb = args.lookback if lookback is None else float(lookback)
+        la = args.lookahead if lookahead is None else float(lookahead)
+        if lb < 0 or la < 0 or lb + la >= 1.0:
+            raise ValueError(
+                f"lookback+lookahead must be in [0, 1); got lookback={lb}, lookahead={la}"
+            )
+        self.lookback = lb
+        self.lookahead = la
+        self.sequence_stride = int(self.samples_per_sequence * (1 - lb - la))
         self.parallel = parallel
         if parallel:
             self.sequence_stride = self.samples_per_sequence
+        if self.sequence_stride <= 0:
+            raise ValueError(
+                f"sequence_stride must be > 0 (lookback={lb}, lookahead={la})"
+            )
         self.miliseconds_per_stride = self.sequence_stride * MILISECONDS_PER_SECOND / self.sample_rate
         self.miliseconds_per_sequence = self.samples_per_sequence * MILISECONDS_PER_SECOND / self.sample_rate
-        self.lookback_max_time = args.lookback * self.miliseconds_per_sequence
-        self.lookahead_max_time = (1 - args.lookahead) * self.miliseconds_per_sequence
+        self.lookback_max_time = lb * self.miliseconds_per_sequence
+        self.lookahead_max_time = (1 - la) * self.miliseconds_per_sequence
         self.start_time = args.start_time
         self.end_time = args.end_time
         self.normalize_audio = args.train.data.normalize_audio
