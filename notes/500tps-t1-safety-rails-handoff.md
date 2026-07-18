@@ -1,7 +1,7 @@
 # §59 T1 SAFETY RAILS — handoff
 
 **Status:** **WIRED** (2026-07-18)  
-**Branch / WT:** `codex/turbo-on-tiger-pr120` (local tip after this commit)  
+**Branch / WT:** `codex/turbo-on-tiger-pr120` @ **`26e465b3`** (`26e465b3638674bc2dbadd6fbb364b7c97ae7c59`)  
 **Local WT:** `/work/projects/Mapperatorinator-worktrees/turbo-on-tiger-pr120`  
 **DCC WT:** `/hpc/group/romerolab/imt11/projects/Mapperatorinator-worktrees/turbo-on-tiger-pr120`  
 **Base:** tiger PR #120 `d01cdd27` (local turbo scaffold on top)  
