@@ -3,7 +3,8 @@
 **Status:** **PROMOTE Y** under relaxed gates (full-step reseal sealed)  
 **This agent:** REPLACEMENT (2026-07-18 relaunch) — complete  
 **Package:** Pivot **T3** compile-then-capture  
-**Branch / WT:** `codex/t3-compile-then-capture` @ **`fb02adc0`** (+ seal note commit pending)  
+**Branch / WT:** `codex/t3-compile-then-capture` @ **`88d4ddf8`**  
+
 **Local WT:** `/work/projects/Mapperatorinator-worktrees/t3-compile-then-capture`  
 **DCC WT:** `/hpc/group/romerolab/imt11/projects/Mapperatorinator-worktrees/t3-compile-then-capture`  
 **Frozen tip:** `55949274` / FP16 **366.11** — **no merge**; **no PR #120 push**  
