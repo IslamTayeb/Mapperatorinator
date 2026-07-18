@@ -3,7 +3,8 @@
 
 Variants:
   baseline — plain CUDA graphs (MAPPERATORINATOR_COMPILE_DECODE unset)
-  compile  — compile-then-capture decode + warm-all-buckets (eager mono+temp tail)
+  compile  — owned sub-op compile-then-capture (proj_out+ffn default) +
+             warm-all-buckets (eager mono+temp tail; outer step eager)
 
 Gates (reported in summary; promote decided offline):
   A5000 main-gen +≥10% vs like-with-like baseline
@@ -214,12 +215,19 @@ def main() -> None:
     env["MAPPERATORINATOR_W1_COLD_START"] = str(cold_start)
     env.pop("MAPPERATORINATOR_ALLOW_CAPTURE_FALLBACK", None)
 
+    compile_subops = None
     if args.variant == "compile":
         env["MAPPERATORINATOR_COMPILE_DECODE"] = "1"
         env["MAPPERATORINATOR_WARM_ALL_BUCKETS"] = "1"
+        # Harvest 4: owned sub-ops only (never full-step — sealed STOP).
+        env.setdefault("MAPPERATORINATOR_COMPILE_SUBOPS", "proj_out,ffn")
+        env.pop("MAPPERATORINATOR_COMPILE_FULL_STEP", None)
+        compile_subops = env["MAPPERATORINATOR_COMPILE_SUBOPS"]
     else:
         env.pop("MAPPERATORINATOR_COMPILE_DECODE", None)
         env.pop("MAPPERATORINATOR_WARM_ALL_BUCKETS", None)
+        env.pop("MAPPERATORINATOR_COMPILE_SUBOPS", None)
+        env.pop("MAPPERATORINATOR_COMPILE_FULL_STEP", None)
 
     overrides = [
         f"audio_path={args.audio}",
@@ -290,6 +298,8 @@ def main() -> None:
         "seed": args.seed,
         "do_sample": args.do_sample,
         "compile_decode": args.variant == "compile",
+        "compile_subops": compile_subops,
+        "compile_kind": "owned_subops" if args.variant == "compile" else None,
         "repo": str(args.repo),
         "repo_commit": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=str(args.repo), text=True
