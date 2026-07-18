@@ -78,12 +78,14 @@ def tiger_verify_forward_k(
     draft_tokens: torch.Tensor,
     prefix_len: int,
     time_it: bool = False,
+    rewind_to_prefix: bool = False,
 ) -> torch.Tensor:
     """Replay K-token verify; returns logits ``(K, V)`` for batch-1.
 
     Caller must have prefilled ``session.cache`` through ``prefix_len``.
-    On return, cache is rewound to ``prefix_len`` (caller commits accepted
-    tokens separately via keep-KV / re-forward).
+    Default leaves KV at ``prefix_len+K`` so keep-accepted-KV can rewind to
+    the accepted length. Pass ``rewind_to_prefix=True`` for probe/microbench
+    paths that need a clean prefix before the next replay.
     """
     k = int(session.q_len)
     if draft_tokens.ndim != 2 or draft_tokens.shape[0] != 1 or draft_tokens.shape[1] != k:
@@ -107,9 +109,8 @@ def tiger_verify_forward_k(
 
     session.replays += 1
     session.hit_counters["tiger_verify_graph_replay"] += 1
-    # Leave KV at prefix+K for optional keep-accepted; rewind is caller's choice.
-    # Default: rewind so reject path is safe without commit.
-    rewind_self_cache(session.cache, int(prefix_len), occupied_end=int(prefix_len) + k)
+    if rewind_to_prefix:
+        rewind_self_cache(session.cache, int(prefix_len), occupied_end=int(prefix_len) + k)
     if logits.ndim == 3:
         return logits[0].float()
     return logits.float()

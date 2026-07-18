@@ -98,6 +98,7 @@ class TigerDraftChainRunner:
         device = seed_logits.device
         tokens: list[int] = []
         q_rows: list[torch.Tensor] = []
+        logits_after: list[torch.Tensor] = []
         logits = seed_logits.float()
         cur = int(past_length)
         for _ in range(int(self.gamma)):
@@ -108,12 +109,18 @@ class TigerDraftChainRunner:
             tok_t = torch.tensor([[tok]], device=device, dtype=torch.long)
             cache_pos = torch.tensor([cur], device=device, dtype=torch.long)
             logits = self.decoder.replay(tok_t, cache_pos)
+            if logits.ndim == 2:
+                step_logits = logits[0].float()
+            else:
+                step_logits = logits.float().view(-1)
+            logits_after.append(step_logits)
             cur += 1
             self.chain_replays += 1
         return {
             "tokens": tokens,
             "q_probs": torch.stack(q_rows, dim=0),
-            "tail_logits": logits,
+            "logits_after": logits_after,
+            "tail_logits": logits_after[-1] if logits_after else seed_logits.float(),
             "end_length": cur,
             "path": "tiger_draft_q1_chain",
         }

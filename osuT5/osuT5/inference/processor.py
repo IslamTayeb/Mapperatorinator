@@ -178,6 +178,35 @@ class Processor(object):
         if isinstance(self.model, InferenceClient):
             response = self.model.generate(model_kwargs, generate_kwargs2)
             return response, getattr(self.model, "last_generation_stats", None)
+        # §58 turbo-on-tiger: opt-in via MAPPERATORINATOR_TURBO=1 + draft ckpt.
+        # Additive dispatch; production fast_decoder_loop path unchanged when unset.
+        try:
+            from .turbo.engine import attach_turbo_to_processor, turbo_env_enabled
+        except Exception:
+            turbo_env_enabled = None  # type: ignore[assignment]
+            attach_turbo_to_processor = None  # type: ignore[assignment]
+        if (
+            turbo_env_enabled is not None
+            and turbo_env_enabled()
+            and not getattr(self, "turbo_disabled", False)
+            and isinstance(model_kwargs.get("encoder_outputs"), torch.Tensor)
+            and model_kwargs["encoder_outputs"].shape[0] == 1
+            and self.num_beams == 1
+            and float(self.cfg_scale) == 1.0
+        ):
+            runtime = getattr(self, "turbo_runtime", None)
+            session = getattr(self, "turbo_session", None)
+            if runtime is None and attach_turbo_to_processor is not None:
+                runtime = attach_turbo_to_processor(self, precision=self.precision)
+                session = getattr(self, "turbo_session", None)
+            if runtime is not None and session is not None:
+                return runtime.generate_window(
+                    model=self.model,
+                    tokenizer=self.tokenizer,
+                    model_kwargs=model_kwargs,
+                    generate_kwargs=generate_kwargs2,
+                    context_state=session,
+                )
         # Batch-1 requests with precomputed encoder outputs go through the fast
         # decoder loop when enabled (it is captured for a fixed batch size and
         # cannot do beam search). With an InferenceClient the equivalent dispatch

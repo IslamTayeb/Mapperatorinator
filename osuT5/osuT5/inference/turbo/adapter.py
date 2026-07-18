@@ -1,4 +1,4 @@
-"""Lazy entrypoint for turbo-on-tiger (scaffold; full loop wiring follows c_verify)."""
+"""Lazy entrypoint for turbo-on-tiger (strict rejection-sampling window)."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ def load_turbo_engine(
     model_loader=None,
     loader_kwargs: dict[str, Any] | None = None,
 ):
-    """Load the turbo-on-tiger scaffold (strict rejection-sampling preset)."""
+    """Load the turbo-on-tiger runtime (draft + speculative window)."""
 
     if not callable(model_loader):
         raise TypeError("turbo inference requires an injected model_loader.")
