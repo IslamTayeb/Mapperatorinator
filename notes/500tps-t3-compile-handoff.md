@@ -2,7 +2,7 @@
 
 **Status:** **FIX WIRED — A5000 RE-MEASURE QUEUED** (2026-07-18)  
 **Package:** Pivot **T3** compile-then-capture  
-**Branch / WT:** `codex/t3-compile-then-capture` @ *(pending push)*  
+**Branch / WT:** `codex/t3-compile-then-capture` @ `eb85f4b3`  
 **Local WT:** `/work/projects/Mapperatorinator-worktrees/t3-compile-then-capture`  
 **DCC WT:** `/hpc/group/romerolab/imt11/projects/Mapperatorinator-worktrees/t3-compile-then-capture`  
 **Base:** `codex/turbo-on-tiger-pr120` @ `b96c3e38` (tiger PR #120 `d01cdd27` + §58/§59 rails)  
@@ -77,13 +77,13 @@ Cold start:
 
 **Greedy (50196043):** **FAIL** — baseline 31418 vs compile 26464 bytes. **Promote N.**
 
-### Harvest 2 (eager-tail fix)
+### Harvest 2 (eager-tail fix @ `eb85f4b3`)
 
 | Cell | Job | GPU | State | Artifact |
 | --- | --- | ---: | --- | --- |
-| baseline A5000 | *(queued)* | a5000 | — | … |
-| compile A5000 | *(queued)* | a5000 | — | … |
-| greedy match | *(afterok compile)* | a5000 | — | … |
+| baseline A5000 | **50196882** | a5000 | PENDING | `/work/imt11/Mapperatorinator/runs/t3-compile-baseline-fp16-50196882/` |
+| compile A5000 | **50196883** | a5000 | PENDING | `/work/imt11/Mapperatorinator/runs/t3-compile-compile-fp16-50196883/` |
+| greedy match | **50196884** | a5000 | Dependency afterok:50196883 | `/work/imt11/Mapperatorinator/runs/t3-greedy-match-50196884/` |
 | baseline/comp 2080 | *(after A5000+greedy PASS)* | 2080 | — | … |
 
 Local pulls: `notes/t3-artifacts/`  
