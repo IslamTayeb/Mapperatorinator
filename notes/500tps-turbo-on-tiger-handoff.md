@@ -2,7 +2,7 @@
 
 **Status:** **C_VERIFY PASS (better than expect)** (2026-07-18)  
 **Strategy pivot:** turbo stacks on Tiger14n PR #120 `feat/compiled-decode`, **not** on optimized tip.  
-**Branch / WT:** `codex/turbo-on-tiger-pr120` @ **`3641f39e`**  
+**Branch / WT:** `codex/turbo-on-tiger-pr120` @ **`0eb51365`**  
 **Local WT:** `/work/projects/Mapperatorinator-worktrees/turbo-on-tiger-pr120`  
 **DCC WT:** `/hpc/group/romerolab/imt11/projects/Mapperatorinator-worktrees/turbo-on-tiger-pr120`  
 **Base:** `w1/tiger14n-compiled-decode` / `d01cdd2799891f78c871ff5889cfbb6a661a9e46` (verified)  
