@@ -31,10 +31,11 @@ FA2 `kv[:, :cache_position[-1]+1]` dynamic slice (modeling_varwhisper) is why th
 | Item | Value |
 | --- | --- |
 | Scout | `utils/s59_t1_safety_rails_scout.py` |
-| Job | `jobs/s59-t1-safety-rails.sbatch` |
+| Job | `jobs/s59-t1-safety-rails.sbatch` → **`50194265`** (PD) |
 | Asserts | require_sdpa / CFG mask+cumsum / eviction@1MiB / loud latch / force-SDPA |
 | Env | `unset MAPPERATORINATOR_ALLOW_CAPTURE_FALLBACK` |
-| Decision | fill after harvest |
+| DCC sync | `f45c25a4` ff-only |
+| Decision | pending harvest |
 
 ## Do not
 
