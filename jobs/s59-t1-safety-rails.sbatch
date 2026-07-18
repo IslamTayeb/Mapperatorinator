@@ -25,6 +25,8 @@ EXT="$WORK/torch_extensions/s59-t1-rails-$JOB"
 mkdir -p "$RUN_ROOT" "$UNIQUE" "$EXT" "$WORK/logs"
 export PATH="$ENV/bin:$PATH"
 export PROBE_REPO="$REPO"
+# Repo root on PYTHONPATH so `osuT5.osuT5` imports (never REPO/osuT5 alone).
+export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 export HF_HOME="$WORK/hf_home"
 export TRANSFORMERS_CACHE="$WORK/hf_home/transformers"
 export HF_HUB_CACHE="$WORK/hf_home/hub"
@@ -44,8 +46,11 @@ cd "$REPO"
   echo "branch=$(git branch --show-current)"
   echo "tmpdir=$UNIQUE"
   echo "torch_extensions=$EXT"
+  echo "pythonpath=$PYTHONPATH"
   nvidia-smi -L
   squeue -u "$USER" -o "%.18i %.2t %.40j %b" | head -20 || true
+  # Sanity: nested package must import before scout asserts run.
+  "$ENV/bin/python" -c "from osuT5.osuT5.inference.compiled_decode import CaptureError; print('import_ok', CaptureError.__name__)"
 } | tee "$RUN_ROOT/preflight.txt"
 
 set +e

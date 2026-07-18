@@ -22,9 +22,12 @@ from types import SimpleNamespace
 
 import torch
 
-REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO))
-sys.path.insert(0, str(REPO / "osuT5"))
+# Repo root only — do NOT put REPO/osuT5 on sys.path. That shadows the outer
+# package so `import osuT5.osuT5` resolves the inner package as top-level and
+# raises ModuleNotFoundError: No module named 'osuT5.osuT5' (DCC WT pitfall).
+REPO = Path(os.environ.get("PROBE_REPO", Path(__file__).resolve().parents[1])).resolve()
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
 
 
 def _assert(cond: bool, msg: str) -> None:
