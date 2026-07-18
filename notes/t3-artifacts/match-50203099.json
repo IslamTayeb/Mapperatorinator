@@ -1,0 +1,16 @@
+{
+  "baseline_bytes": [
+    31418
+  ],
+  "compile_bytes": [
+    31747
+  ],
+  "elapsed_s": 367.83111593220383,
+  "equal": false,
+  "n_osu_baseline": 1,
+  "n_osu_compile": 1,
+  "note": "greedy do_sample=false; compare final .osu bytes (token-level via map dump)",
+  "repo_commit": "3e0aacb7cc424f3a63667ef502e80dc9efab8e1c",
+  "slurm_job_id": "50203099",
+  "status": "FAIL"
+}

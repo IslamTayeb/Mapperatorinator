@@ -1,8 +1,8 @@
 # T3 TORCH.COMPILE — handoff (PIVOT EXECUTION PACKAGE)
 
-**Status:** **SEALED PROMOTE N** (2026-07-18 harvest 2)  
+**Status:** **SEALED PROMOTE N** (2026-07-18 harvest 3 — STOP)  
 **Package:** Pivot **T3** compile-then-capture  
-**Branch / WT:** `codex/t3-compile-then-capture` @ `eb85f4b3` (eager-tail fix; handoff tip may lag)  
+**Branch / WT:** `codex/t3-compile-then-capture` @ `3e0aacb7` (default-mode + shared hoist; exactness still FAIL)  
 **Local WT:** `/work/projects/Mapperatorinator-worktrees/t3-compile-then-capture`  
 **DCC WT:** `/hpc/group/romerolab/imt11/projects/Mapperatorinator-worktrees/t3-compile-then-capture`  
 **Base:** `codex/turbo-on-tiger-pr120` @ `b96c3e38` (tiger PR #120 `d01cdd27` + §58/§59 rails)  
@@ -17,22 +17,23 @@ Compile-then-capture decoder step **per bucket**:
 | --- | --- |
 | `fullgraph` | `True` |
 | `dynamic` | `False` |
-| `mode` | `max-autotune-no-cudagraphs` |
+| `mode` | **`default`** (harvest 3); override `MAPPERATORINATOR_COMPILE_MODE` (never `reduce-overhead`) |
 | Warm | **EVERY** bucket (incl. any future turbo `q_len`) **before** its capture — §22 Inductor-in-capture |
-| Sampling tail | shape-static mono hoist + uniform temperature (**eager** — not Inductor) |
+| Sampling tail | shape-static mono hoist + uniform temperature (**eager**, both compile on/off) |
 | Forbidden | `reduce-overhead` near manual CUDAGraph capture |
 
 Opt-in env:
 
 - `MAPPERATORINATOR_COMPILE_DECODE=1` — Inductor compile of **decode step only** (tail stays eager)
 - `MAPPERATORINATOR_WARM_ALL_BUCKETS=1` — session warm all buckets in cold_start (also auto when compile env set)
+- `MAPPERATORINATOR_COMPILE_MODE` — default `default`; `max-autotune-no-cudagraphs` worsens greedy drift (harvest 1/2)
 
 Cold start:
 
 - Pin `TORCHINDUCTOR_CACHE_DIR` per job/install (sbatch sets unique dir)
 - Unique **node-local** `TMPDIR`/`TEMP`/`TMP` (`$SLURM_TMPDIR` or `/tmp/$USER-…`) + unique `TORCH_EXTENSIONS_DIR`
 - Optional Mega-Cache: reuse `TORCHINDUCTOR_CACHE_DIR` across jobs on same arch/driver only — **do not ship** arch/driver-bound artifacts
-- Regional / `default` compile fallback if fullgraph/`max-autotune-no-cudagraphs` fails; warmup failure → eager capture; never silent latch
+- Regional / `default` compile fallback if fullgraph fails; warmup failure → eager capture; never silent latch
 
 ### Windows ladder (document)
 
@@ -40,14 +41,31 @@ Cold start:
 2. **no triton** → plain CUDA graphs (current PR #120 default)
 3. **no capture** → eager / stock generate (loud failure unless `MAPPERATORINATOR_ALLOW_CAPTURE_FALLBACK=1`)
 
-## Gates
+## Gates (harvest 3)
 
 | Gate | Criterion | Result |
 | --- | --- | --- |
-| A5000 | main-gen **+≥10%** vs like-with-like uncompiled fast path | **PASS** (+28.8% main_tps) |
-| 2080 Ti | **no-regression** (main_tps / ms/map-token) | **N/A** (cancelled after greedy seal N) |
-| Exactness | greedy token-match (`.osu` bytes) vs uncompiled fast path | **FAIL** (31418 vs 26464) |
+| A5000 | main-gen **+≥10%** vs like-with-like uncompiled fast path | **PASS** (+22.7% main_tps; was +28.8% under max-autotune) |
+| 2080 Ti | **no-regression** (main_tps / ms/map-token) | **N/A** (no 2080 until greedy PASS) |
+| Exactness | greedy token-match (`.osu` bytes) vs uncompiled fast path | **FAIL** (31418 vs **31747**) |
 | Report | full-map **ms/map-token** + **main_tps** + **cold_start** | sealed below |
+
+## Root cause (harvest 3)
+
+**Decode-step Inductor numerics under compile-then-capture**, not RNG / warm-all / `_tail` / compile-only hoist:
+
+| Ruled out | Evidence |
+| --- | --- |
+| RNG order | greedy `do_sample=false` → `argmax` |
+| Warm-all-buckets alone | T2 sealed greedy PASS for warmup-hoist |
+| Compiled `_tail` stride thrash | harvest 2 cleared; same 31418/26464 split remained under max-autotune |
+| Compile-only temp hoist | harvest 3 ungates hoist on both paths; baseline still 31418 |
+| Missing warm bucket | both variants warm; coherent maps (not garbage) |
+
+**In:** Inductor rewrite of the shape-static decode forward (fp16 GEMM/epilogue/fusion) flips near-tie greedy tokens; cascades into divergent `.osu`. First byte diffs land in TimingPoints/SV lines (harvest 2 byte 1426; harvest 3 byte 2080).
+
+- **max-autotune** (harvest 1/2): stderr showed `addmm`/`bias_addmm` autotune + “Not enough SMs for max_autotune_gemm”; compile `.osu` **26464** vs baseline **31418**.
+- **default mode** (harvest 3): removes most autotune shopping; compile `.osu` moves to **31747** (closer, still ≠ 31418). Perf retained **+22.7%**.
 
 ## Fix history
 
@@ -59,9 +77,24 @@ Cold start:
 
 **Change:** drop Inductor compile of sampling `_tail`; keep decode compile-then-capture + eager mono+temp hoist.
 
-**Outcome:** stride/recompile storm **cleared** (no Dynamo stride warnings; A5000 main_tps **+28.8%**). Greedy still **FAIL** with **identical** byte split to harvest 1 (31418 vs 26464) → remaining blocker is **decode-compile exactness**, not `_tail` stride thrash. **Not** kill-same-root-cause (perf root fixed). Promote still **N** on exactness.
+**Outcome:** stride/recompile storm **cleared**; A5000 main_tps **+28.8%**. Greedy still **FAIL** 31418 vs 26464.
 
-**Revisit:** isolate greedy token divergence under decode Inductor (numerical / hoist / warm-all-buckets) without reintroducing compiled `_tail`. Kill only if next FAIL is again `_tail` stride/recompile storm.
+### Harvest 3 fix @ `3e0aacb7` — **STOP**
+
+**Change:**
+
+1. Default `torch.compile` mode → **`default`** (env override for max-autotune retained but not package-default).
+2. Pin `allow_fp16/bf16_reduced_precision_reduction=False` at compile.
+3. Hoist mono+temp on **both** compile on/off paths (exactness diffs isolate decode Inductor).
+
+**Outcome:** A5000 perf still **+22.7%** (gate PASS). Greedy still **FAIL** 31418 vs 31747. **One corrective scout consumed → STOP.**
+
+**Revisit (new hypothesis required — do not bare-retry full decode-step compile):**
+
+- Owned tip-exact sub-op compile (e.g. decode-only `proj_out` / attn GEMV) before outer capture — not full `forward_only`.
+- Or teacher-forced first-N-token logit dump (eager graph vs compiled graph) to localize the diverging op.
+- Or documented opt-in compile with **declared** greedy drift (outside package promote gate).
+- Kill if next attempt reintroduces `_tail` stride thrash or max-autotune without a new exactness plan.
 
 ## Jobs
 
@@ -85,16 +118,30 @@ Cold start:
 | baseline A5000 | **50196882** | a5000 | **COMPLETED 0:0** | `/work/imt11/Mapperatorinator/runs/t3-compile-baseline-fp16-50196882/` |
 | compile A5000 | **50196883** | a5000 | **COMPLETED 0:0** | `/work/imt11/Mapperatorinator/runs/t3-compile-compile-fp16-50196883/` |
 | greedy match | **50196884** | a5000 | **FAILED 1:0** (exactness) | `/work/imt11/Mapperatorinator/runs/t3-greedy-match-50196884/` |
-| baseline/comp 2080 | — | 2080 | **not submitted** | after seal N |
 
 | GPU | Variant | Job | ms/map-token | main_tps | cold_start_s | Δ main_tps |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | A5000 | baseline | 50196882 | **3.809** | **343.30** | **26.03** | — |
 | A5000 | compile | 50196883 | **3.147** | **442.20** | **417.37** | **+28.8%** |
 
-**Greedy (50196884):** **FAIL** — `.osu` bytes unequal (baseline 31418 vs compile 26464); same split as 50196043.
+**Greedy (50196884):** **FAIL** — baseline 31418 vs compile 26464.
 
-Local pulls: `notes/t3-artifacts/summary-50196882.json`, `summary-50196883.json`, `match-50196884.json`  
+### Harvest 3 (default-mode @ `3e0aacb7`) — **STOP**
+
+| Cell | Job | GPU | State | Artifact |
+| --- | --- | ---: | --- | --- |
+| greedy match | **50203099** | a5000 | **FAILED 1:0** (exactness) | `/work/imt11/Mapperatorinator/runs/t3-greedy-match-50203099/` |
+| compile A5000 | **50203100** | a5000 | **COMPLETED 0:0** | `/work/imt11/Mapperatorinator/runs/t3-compile-compile-fp16-50203100/` |
+| baseline A5000 | **50203101** | a5000 | **COMPLETED 0:0** | `/work/imt11/Mapperatorinator/runs/t3-compile-baseline-fp16-50203101/` |
+
+| GPU | Variant | Job | ms/map-token | main_tps | cold_start_s | Δ main_tps |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| A5000 | baseline | 50203101 | **3.673** | **348.61** | **22.98** | — |
+| A5000 | compile | 50203100 | **3.253** | **427.71** | **235.24** | **+22.7%** |
+
+**Greedy (50203099):** **FAIL** — baseline 31418 vs compile 31747 (first_diff_byte 2080, TimingPoints/SV).
+
+Local pulls: `notes/t3-artifacts/match-50203099.json`, `summary-50203100.json`, `summary-50203101.json`  
 Remote: `islamtayeb/codex/t3-compile-then-capture` only — **no tiger14n / PR #120**
 
 ## Do-not
@@ -107,7 +154,9 @@ Remote: `islamtayeb/codex/t3-compile-then-capture` only — **no tiger14n / PR #
 - Exceed ≤2 concurrent GPU with live T1/T2  
 - Put Triton `TMPDIR` on NFS `/work`  
 - Recompile sampling `_tail` without fixed-stride staging outside Dynamo  
+- Bare-retry full decode-step Inductor without a **new** exactness hypothesis  
+- Re-default `max-autotune-no-cudagraphs` for package greedy gate  
 
 ## Ruling
 
-**Promote N.** Harvest 2 clears the `_tail` stride/recompile storm and passes A5000 +≥10% main-gen (**+28.8%**), but greedy `.osu` exactness still fails (same 31418/26464 split). 2080 not run. T4 stays PARKED. No PR #120 push.
+**Promote N. STOP.** Harvest 3 confirms root cause is decode Inductor numerics (max-autotune worsens; `default` softens but does not restore greedy token-match). Perf gate still PASS (+22.7%). 2080 not run. T4 stays PARKED. No PR #120 push. Revisit only with owned sub-op compile, logit localization, or documented-drift packaging — not another full-step compile scout.
