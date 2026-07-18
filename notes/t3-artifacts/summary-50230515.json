@@ -1,0 +1,36 @@
+{
+  "calls": [
+    {
+      "elapsed_seconds": 3.5943406065925956,
+      "generated_tokens": 821,
+      "label": "timing"
+    },
+    {
+      "elapsed_seconds": 17.182896303012967,
+      "generated_tokens": 7363,
+      "label": "map+sv"
+    }
+  ],
+  "cold_start_seconds": 377.0060452744365,
+  "compile_decode": true,
+  "compile_kind": "full_step",
+  "compile_mode": "default",
+  "do_sample": true,
+  "e2e_wall_s_exclude_load_jit": 29.312362853437662,
+  "e2e_wall_s_include_load_jit": 406.31840812787414,
+  "gpu_name": "NVIDIA RTX A5000",
+  "inductor_cache_dir": "/work/imt11/Mapperatorinator/cache/torchinductor/t3-50230515-compile",
+  "main_gen_model_tps": 428.50750363365233,
+  "main_model_seconds": 17.182896303012967,
+  "map_tokens": 7363,
+  "ms_per_map_token": 3.9810352917883556,
+  "precision": "fp16",
+  "process_wall_seconds": 410.72397757600993,
+  "repo": "/hpc/group/romerolab/imt11/projects/Mapperatorinator-worktrees/t3-compile-then-capture",
+  "repo_commit": "fb02adc0b8080f2b1a0c6129dd75592e88366dbc",
+  "seed": 12345,
+  "slurm_job_id": "50230515",
+  "status": "OK",
+  "tiger_stats_path": "/work/imt11/Mapperatorinator/runs/t3-compile-compile-fp16-50230515/tiger_generation_stats.json",
+  "variant": "compile"
+}

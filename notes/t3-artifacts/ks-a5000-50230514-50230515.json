@@ -1,0 +1,49 @@
+{
+  "song_id": null,
+  "baseline_root": "/work/imt11/Mapperatorinator/runs/t3-ks-a5000-reseal/baseline",
+  "candidate_root": "/work/imt11/Mapperatorinator/runs/t3-ks-a5000-reseal/compile",
+  "n_baseline_osu": 1,
+  "n_candidate_osu": 1,
+  "alpha": 0.01,
+  "bonferroni_alpha": 0.002,
+  "n_tests": 5,
+  "metrics": {
+    "ho_count": {
+      "statistic": 1.0,
+      "pvalue": 1.0,
+      "n_a": 1,
+      "n_b": 1,
+      "error": null
+    },
+    "density": {
+      "statistic": 0.026649799704828166,
+      "pvalue": 0.999999915511406,
+      "n_a": 155,
+      "n_b": 153,
+      "error": null
+    },
+    "ho_type": {
+      "statistic": 0.0023664036994275415,
+      "pvalue": 1.0,
+      "n_a": 583,
+      "n_b": 569,
+      "error": null
+    },
+    "timeshift": {
+      "statistic": 0.03291830017908136,
+      "pvalue": 0.8995638873868709,
+      "n_a": 582,
+      "n_b": 568,
+      "error": null
+    },
+    "slider_length": {
+      "statistic": 0.12317817014446228,
+      "pvalue": 0.12252988495221147,
+      "n_a": 178,
+      "n_b": 175,
+      "error": null
+    }
+  },
+  "pass": true,
+  "fail_metrics": []
+}

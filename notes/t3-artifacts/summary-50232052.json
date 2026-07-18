@@ -1,0 +1,36 @@
+{
+  "calls": [
+    {
+      "elapsed_seconds": 4.262635255232453,
+      "generated_tokens": 821,
+      "label": "timing"
+    },
+    {
+      "elapsed_seconds": 31.58701684139669,
+      "generated_tokens": 7704,
+      "label": "map+sv"
+    }
+  ],
+  "cold_start_seconds": 51.58514582179487,
+  "compile_decode": false,
+  "compile_kind": null,
+  "compile_mode": "default",
+  "do_sample": true,
+  "e2e_wall_s_exclude_load_jit": 38.903849561698735,
+  "e2e_wall_s_include_load_jit": 90.4889953834936,
+  "gpu_name": "NVIDIA GeForce RTX 2080 Ti",
+  "inductor_cache_dir": "/work/imt11/Mapperatorinator/cache/torchinductor/t3-50232052-baseline",
+  "main_gen_model_tps": 243.89767601932715,
+  "main_model_seconds": 31.58701684139669,
+  "map_tokens": 7704,
+  "ms_per_map_token": 5.049824709462452,
+  "precision": "fp16",
+  "process_wall_seconds": 91.92043542210013,
+  "repo": "/hpc/group/romerolab/imt11/projects/Mapperatorinator-worktrees/t3-compile-then-capture",
+  "repo_commit": "fb02adc0b8080f2b1a0c6129dd75592e88366dbc",
+  "seed": 12345,
+  "slurm_job_id": "50232052",
+  "status": "OK",
+  "tiger_stats_path": "/work/imt11/Mapperatorinator/runs/t3-compile-baseline-fp16-50232052/tiger_generation_stats.json",
+  "variant": "baseline"
+}

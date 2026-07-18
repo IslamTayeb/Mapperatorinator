@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "pack": "T5",
+  "track": "T3",
+  "scout": "t3-fullstep-reseal-a5000",
+  "commit": "fb02adc0",
+  "campaign_tip_frozen": "55949274",
+  "created_utc": "20260718T224819Z",
+  "section34_standing": "Never fold relaxed acceptance into turbo. Distribution claims use TIER1/TIER3 packs as defined in docs/inference_evidence_packs.md \u2014 no invented thresholds.",
+  "track_notes": "T3 full-step compile-then-capture: promote on coherent maps + KS PASS (or soft-fail with numbers). Greedy FAIL is documented Inductor fp16 near-tie drift \u2014 report it, do not require PASS. Scope: T3 only.",
+  "gates": {
+    "greedy_token_match": {
+      "status": "FAIL",
+      "pass": false,
+      "detail": {
+        "pass": false,
+        "equal": false,
+        "note": "sampled reseal; greedy not required under T3 relaxation"
+      }
+    },
+    "ks_parity": {
+      "status": "PASS",
+      "pass": true,
+      "artifact": "/work/imt11/Mapperatorinator/runs/t3-ks-a5000-reseal/ks.json",
+      "detail": {
+        "song_id": null,
+        "baseline_root": "/work/imt11/Mapperatorinator/runs/t3-ks-a5000-reseal/baseline",
+        "candidate_root": "/work/imt11/Mapperatorinator/runs/t3-ks-a5000-reseal/compile",
+        "n_baseline_osu": 1,
+        "n_candidate_osu": 1,
+        "alpha": 0.01,
+        "bonferroni_alpha": 0.002,
+        "n_tests": 5,
+        "metrics": {
+          "ho_count": {
+            "statistic": 1.0,
+            "pvalue": 1.0,
+            "n_a": 1,
+            "n_b": 1,
+            "error": null
+          },
+          "density": {
+            "statistic": 0.026649799704828166,
+            "pvalue": 0.999999915511406,
+            "n_a": 155,
+            "n_b": 153,
+            "error": null
+          },
+          "ho_type": {
+            "statistic": 0.0023664036994275415,
+            "pvalue": 1.0,
+            "n_a": 583,
+            "n_b": 569,
+            "error": null
+          },
+          "timeshift": {
+            "statistic": 0.03291830017908136,
+            "pvalue": 0.8995638873868709,
+            "n_a": 582,
+            "n_b": 568,
+            "error": null
+          },
+          "slider_length": {
+            "statistic": 0.12317817014446228,
+            "pvalue": 0.12252988495221147,
+            "n_a": 178,
+            "n_b": 175,
+            "error": null
+          }
+        },
+        "pass": true,
+        "fail_metrics": []
+      }
+    }
+  },
+  "required_pass": [
+    "ks_parity"
+  ],
+  "overall": "PASS",
+  "fail_list": [],
+  "claims": {
+    "five_hundred_tps": false,
+    "tip_graduate": false,
+    "relaxed_turbo_acceptance": false
+  }
+}
