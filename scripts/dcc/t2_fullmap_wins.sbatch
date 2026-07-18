@@ -28,13 +28,25 @@ JOB_TMP="$WORK/tmp/t2-${JOB_ID}"
 JOB_EXT="$WORK/torch_extensions/t2-${JOB_ID}-${VARIANT}-${PRECISION}"
 
 mkdir -p "$WORK/logs" "$WORK/runs" "$JOB_TMP" "$JOB_EXT" "$RUN_ROOT"
+export PATH="$(dirname "$PYTHON"):$PATH"
 export TMPDIR="$JOB_TMP"
 export TORCH_EXTENSIONS_DIR="$JOB_EXT"
 export HF_HOME="${HF_HOME:-$WORK/cache/huggingface}"
 export TORCH_HOME="${TORCH_HOME:-$WORK/cache/torch}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$WORK/cache/xdg}"
+export CUDA_CACHE_PATH="$WORK/cache/cuda"
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export TOKENIZERS_PARALLELISM=false
 # No silent capture fallback (T2 gate).
 unset MAPPERATORINATOR_ALLOW_CAPTURE_FALLBACK || true
+
+for tool in ffmpeg ffprobe; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "missing $tool on PATH=$PATH" >&2
+    exit 2
+  fi
+done
 
 echo "host=$(hostname)"
 echo "job=$JOB_ID"
@@ -42,6 +54,8 @@ echo "variant=$VARIANT"
 echo "precision=$PRECISION"
 echo "repo=$REPO"
 echo "commit=$(git -C "$REPO" rev-parse HEAD)"
+echo "ffmpeg=$(command -v ffmpeg)"
+echo "ffprobe=$(command -v ffprobe)"
 echo "gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
 
 cd "$REPO"
