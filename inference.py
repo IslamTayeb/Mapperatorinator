@@ -3,6 +3,7 @@ import multiprocessing
 import sys
 
 import utils.excepthook  # noqa
+import os
 import os.path
 import uuid
 from functools import reduce
@@ -132,7 +133,7 @@ def compile_device_and_seed(args: InferenceConfig, verbose=True):
 
     # The fast decoder loop uses CUDA graphs, which need a CUDA device. On CUDA
     # devices where graph capture fails at runtime (e.g. some ROCm setups) it
-    # falls back to the stock generate loop on its own.
+    # fails loudly unless MAPPERATORINATOR_ALLOW_CAPTURE_FALLBACK=1.
     if args.fast_decoder_loop and args.device != "cuda":
         if verbose:
             print(f"fast_decoder_loop requires CUDA; disabling on '{args.device}'.")
@@ -153,6 +154,16 @@ def compile_device_and_seed(args: InferenceConfig, verbose=True):
         elif args.precision not in ("bf16", "fp16") or args.device != "cuda":
             message = "Flash Attention requires bf16/fp16 precision and CUDA device. Falling back to SDPA."
             args.attn_implementation = "sdpa"
+
+    # Thin PR120 wrapper: FA2 is not CUDA-graph capturable; force SDPA for fast loops.
+    fast_loop = bool(getattr(args, "fast_decoder_loop", False) or getattr(args, "super_timing_fast_loop", False))
+    if fast_loop and args.attn_implementation != "sdpa":
+        forced = (
+            f"fast_decoder_loop requires SDPA; forcing attn_implementation "
+            f"{args.attn_implementation!r} -> 'sdpa' (FA2 is not CUDA-graph capturable)."
+        )
+        args.attn_implementation = "sdpa"
+        message = forced if message is None else f"{message} {forced}"
 
     if verbose and message is not None:
         print(message)
@@ -709,6 +720,33 @@ def main(args: InferenceConfig):
             auto_select_gamemode_model=False,
             fast_decoder_loop=args.fast_decoder_loop,
         )
+
+
+    # Opt-in compile-then-capture: warm every decode bucket in cold_start.
+    _warm = os.environ.get("MAPPERATORINATOR_WARM_ALL_BUCKETS", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+    _compile = os.environ.get("MAPPERATORINATOR_COMPILE_DECODE", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+    if args.fast_decoder_loop and args.device == "cuda" and (_warm or _compile):
+        from osuT5.osuT5.inference.compiled_decode import warmup_fast_decode_session
+
+        raw_len = (args.train.data.src_seq_len - 1) * args.train.model.spectrogram.hop_length
+        cfg = float(args.cfg_scale)
+        batch = 2 if cfg > 1 else 1
+        for label, m in (("map", model),) + (
+            (("timing", timing_model),) if timing_model is not None and timing_model is not model else ()
+        ):
+            print(f"compile session warmup ({label})...")
+            warmup_fast_decode_session(
+                m,
+                cfg_scale=cfg,
+                batch_size=batch,
+                raw_seq_len=raw_len,
+                encoder_batch_size=min(16, max(1, int(args.max_batch_size))),
+                verbose=True,
+            )
 
     diff_model, diff_tokenizer, refine_model = None, None, None
     if args.generate_positions:
