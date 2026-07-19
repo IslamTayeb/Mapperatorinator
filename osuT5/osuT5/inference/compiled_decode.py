@@ -1,42 +1,16 @@
 """Custom decode loop for osuT5 using direct CUDA graph capture.
 
-model.generate() rebuilds tensors and runs host-syncing logits processors every
-step, which leaves this small decoder GPU-underutilised. This module replaces it
-with a tight loop:
-  1. prefill  — eager, processes the prompt, fills the StaticCache
-  2. decode   — the single-token forward is captured into a CUDA graph and
-                replayed per token. prepare_inputs runs on CPU between replays
-                (cheap), logits processors + top-p sampling run in Python.
+Tiger PR #120 fast path, plus a thin opt-in compile-then-capture wrapper:
 
-The decode graph is shape-static (batch, 1 token) and is captured ONCE then
-reused across all windows. The encoder hidden state is a static buffer rewritten
-per window; the StaticCache is reset (not reallocated) per window.
+- ``MAPPERATORINATOR_COMPILE_DECODE=1`` — Inductor-compile the shape-static
+  decode step (``fullgraph=True``, ``dynamic=False``, ``mode=default``) before
+  CUDAGraph capture. Sampling ``_tail`` stays eager.
+- Fast path forces SDPA (FA2 is not capturable). Capture failure is loud unless
+  ``MAPPERATORINATOR_ALLOW_CAPTURE_FALLBACK=1``.
+- Graph+StaticCache entries are LRU-evicted under a VRAM budget.
 
-Output is quality-equivalent (not bit-identical) to HF generate: the sampling RNG
-draw order differs, and the batched encoder precompute perturbs the encoder
-hidden states at the last bit, so sampled tokens can diverge. Greedy decoding
-matches HF token-for-token.
-
-T1 safety rails (§59):
-  - Fast path requires SDPA (FA2 auto-select breaks capture via dynamic KV trim).
-  - Capture failure is loud and does not silently latch OFF unless explicitly allowed.
-  - Graph+StaticCache entries are LRU-evicted under a VRAM budget (8–12GB cards).
-  - CFG left-pad prompt masks are preserved into decode (stock HF extends the 2D
-    pad mask; the prior graph path passed mask=None and attended pad K/V).
-
-T3 compile-then-capture (pivot package; exactness RELAXED 2026-07-18):
-  - Promote candidate: full decode-step Inductor of shape-static
-    ``forward_only`` **before** CUDAGraph capture (``fullgraph=True``,
-    ``dynamic=False``, ``mode=default``). Eager sampling ``_tail``.
-  - Exactness bar: coherent / mostly-good maps + T5 KS — NOT bit-identical
-    greedy ``.osu``. Inductor fp16 near-tie flips are documented T3 drift.
-  - Never ``reduce-overhead`` near manual capture (§22 Inductor-in-capture).
-  - Warm every bucket (incl. any future turbo ``q_len``) before its capture.
-  - Do not reintroduce compiled ``_tail`` without fixed-stride staging
-    (harvest-1 stride thrash −46% A5000). Harvest-4 owned sub-ops are
-    STOPPED / not the package default.
-  - Opt-in via ``MAPPERATORINATOR_COMPILE_DECODE=1`` (default off so tiger
-    plain-graph behavior is unchanged unless T3 jobs enable it).
+Output is quality-equivalent (not bit-identical) to HF generate under sampling;
+compile mode may add documented Inductor fp16 drift vs uncompiled fast path.
 """
 from __future__ import annotations
 
