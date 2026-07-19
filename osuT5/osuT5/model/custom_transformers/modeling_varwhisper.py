@@ -560,6 +560,9 @@ class VarWhisperAttention(nn.Module):
                         key_states, value_states, self.layer_idx, {"cache_position": cache_position}
                     )
                     kv = torch.stack((key_states, value_states), dim=2).transpose(1, 3)  # (bs, seqlen, 2, nheads, head_dim)
+                    # T1 / §59: this dynamic slice is NOT CUDA-graph capturable and is
+                    # why fast_decoder_loop forces SDPA (FA2 auto-select previously
+                    # broke capture and silently latched the fast path OFF).
                     kv = kv[:, :cache_position[-1] + 1]  # trim to the current cache position
 
                     attn_outputs = attn_func(qkv=q, kv=kv)
